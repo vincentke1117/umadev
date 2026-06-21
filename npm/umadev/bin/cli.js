@@ -24,6 +24,8 @@ const PLATFORM_PACKAGES = {
   'linux-x64': '@umacloud/cli-linux-x64',
   'linux-arm64': '@umacloud/cli-linux-arm64',
   'win32-x64': '@umacloud/cli-win32-x64',
+  // Windows on ARM runs x64 binaries via built-in emulation; reuse the x64 build.
+  'win32-arm64': '@umacloud/cli-win32-x64',
 };
 
 function platformKey() {
