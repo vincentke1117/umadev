@@ -19,6 +19,7 @@ umadev-agent = { workspace = true, features = ["vector"] }
 umadev-runtime = { workspace = true }
 umadev-host = { workspace = true }
 umadev-tui = { workspace = true }
+umadev-i18n = { workspace = true }
 
 clap = { workspace = true }
 tokio = { workspace = true }

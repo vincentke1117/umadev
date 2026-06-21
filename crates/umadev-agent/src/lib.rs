@@ -58,8 +58,9 @@ pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use gates::{classify_reply, Gate, GateOutcome};
 pub use lessons::{
     capture_dev_errors, capture_gate_revision, capture_quality_failures,
-    capture_validated_patterns, list_sedimented_lessons, pitfall_efficacy_summary,
-    pitfall_overview, sediment_lessons, PitfallEfficacySummary,
+    capture_validated_patterns, lessons_report, list_sedimented_lessons, pitfall_efficacy_summary,
+    pitfall_overview, sediment_lessons, LessonsReport, PitfallEfficacySummary, PitfallEntry,
+    PitfallStatus, ValidatedEntry,
 };
 pub use manifest::{ConformanceLevel, Profile, SpecManifest};
 pub use phases::{knowledge_top_files, phase_knowledge_digest, PhaseOutput};

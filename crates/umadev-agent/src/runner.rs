@@ -3308,6 +3308,235 @@ pub fn usage_summary() -> String {
     out
 }
 
+/// One parsed row from `~/.umadev/usage.jsonl`.
+///
+/// The on-disk record collapses input + output into a single `tokens` field at
+/// write time (see [`record_usage`]), so the split is NOT recoverable here — the
+/// report surfaces the combined total and is honest about that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsageRecord {
+    /// Unix epoch seconds when the worker call completed.
+    ts: u64,
+    /// Backend id that served the call (`claude-code` / `codex` / …).
+    backend: String,
+    /// Phase id (`research` / `frontend` / …).
+    phase: String,
+    /// Combined input+output tokens reported by the base (0 if unreported).
+    tokens: u64,
+}
+
+/// Token usage for one phase within a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseUsage {
+    /// Phase id (`research` / `frontend` / …).
+    pub phase: String,
+    /// How many worker calls landed in this phase.
+    pub calls: u32,
+    /// Combined input+output tokens across those calls.
+    pub tokens: u64,
+}
+
+/// Token usage for one contiguous run (segmented from the flat log by a
+/// [`RUN_GAP_SECS`] idle gap, since the log carries no explicit run id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunUsage {
+    /// 1-based run ordinal (oldest = 1), for display.
+    pub index: usize,
+    /// Backends that served this run (usually one).
+    pub backends: Vec<String>,
+    /// Per-phase breakdown, in pipeline order where known.
+    pub phases: Vec<PhaseUsage>,
+    /// Worker calls in this run.
+    pub calls: u32,
+    /// Combined tokens across the whole run.
+    pub tokens: u64,
+}
+
+/// A structured, language-neutral view over `~/.umadev/usage.jsonl`, ready for
+/// the CLI / TUI to format with i18n chrome. Pure read — never writes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageReport {
+    /// Each contiguous run, oldest first.
+    pub runs: Vec<RunUsage>,
+    /// Total worker calls across all runs.
+    pub total_calls: u32,
+    /// Combined tokens across all runs.
+    pub total_tokens: u64,
+    /// Distinct backends seen, sorted.
+    pub backends: Vec<String>,
+}
+
+impl UsageReport {
+    /// `true` when no usable record was found (drives the empty state).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+}
+
+/// Idle gap (seconds) that splits the flat usage log into separate "runs".
+/// 30 minutes: long enough that two phases of one pipeline never split, short
+/// enough that yesterday's session is its own run. Heuristic — the log has no
+/// run id, so this is a best-effort segmentation, not ground truth.
+const RUN_GAP_SECS: u64 = 30 * 60;
+
+/// Stable pipeline order used to sort a run's phases for display.
+fn phase_order(phase: &str) -> usize {
+    umadev_spec::PHASE_CHAIN
+        .iter()
+        .position(|p| p.id() == phase)
+        .unwrap_or(usize::MAX)
+}
+
+/// Parse the raw usage JSONL into typed records (skips blank / malformed lines).
+/// Re-uses the same tolerant field splitting as [`usage_summary`] so a hand-
+/// edited or partially-written line can never panic this read-only path.
+fn parse_usage_records(content: &str) -> Vec<UsageRecord> {
+    let field_u64 = |line: &str, key: &str| -> Option<u64> {
+        line.split(&format!("\"{key}\":"))
+            .nth(1)
+            .map(str::trim_start)
+            .and_then(|s| s.split([',', '}']).next())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let field_str = |line: &str, key: &str| -> Option<String> {
+        line.split(&format!("\"{key}\":\""))
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .map(str::to_string)
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| UsageRecord {
+            ts: field_u64(line, "ts").unwrap_or(0),
+            backend: field_str(line, "backend").unwrap_or_default(),
+            phase: field_str(line, "phase").unwrap_or_default(),
+            tokens: field_u64(line, "tokens").unwrap_or(0),
+        })
+        .collect()
+}
+
+/// Group parsed usage records into per-run, per-phase usage.
+///
+/// Records are sorted by timestamp, then segmented into runs wherever the gap to
+/// the previous record exceeds [`RUN_GAP_SECS`]. Extracted from [`usage_report`]
+/// so it can be unit-tested without touching the filesystem.
+fn build_usage_report(mut records: Vec<UsageRecord>) -> UsageReport {
+    if records.is_empty() {
+        return UsageReport::default();
+    }
+    // Stable sort by timestamp keeps original order for equal-second rows.
+    records.sort_by_key(|r| r.ts);
+
+    let mut all_backends: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut runs: Vec<RunUsage> = Vec::new();
+    let mut prev_ts: Option<u64> = None;
+    // Accumulator for the run currently being built.
+    let mut cur_phases: std::collections::BTreeMap<String, (u32, u64)> =
+        std::collections::BTreeMap::new();
+    let mut cur_backends: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cur_calls: u32 = 0;
+    let mut cur_tokens: u64 = 0;
+
+    let flush = |index: usize,
+                 phases: &std::collections::BTreeMap<String, (u32, u64)>,
+                 backends: &std::collections::BTreeSet<String>,
+                 calls: u32,
+                 tokens: u64|
+     -> RunUsage {
+        let mut phase_rows: Vec<PhaseUsage> = phases
+            .iter()
+            .map(|(phase, (c, t))| PhaseUsage {
+                phase: phase.clone(),
+                calls: *c,
+                tokens: *t,
+            })
+            .collect();
+        phase_rows.sort_by_key(|p| (phase_order(&p.phase), p.phase.clone()));
+        RunUsage {
+            index,
+            backends: backends.iter().cloned().collect(),
+            phases: phase_rows,
+            calls,
+            tokens,
+        }
+    };
+
+    for r in &records {
+        let new_run = prev_ts.is_some_and(|p| r.ts.saturating_sub(p) > RUN_GAP_SECS);
+        if new_run && cur_calls > 0 {
+            runs.push(flush(
+                runs.len() + 1,
+                &cur_phases,
+                &cur_backends,
+                cur_calls,
+                cur_tokens,
+            ));
+            cur_phases.clear();
+            cur_backends.clear();
+            cur_calls = 0;
+            cur_tokens = 0;
+        }
+        if !r.backend.is_empty() {
+            cur_backends.insert(r.backend.clone());
+            all_backends.insert(r.backend.clone());
+        }
+        let entry = cur_phases.entry(r.phase.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += r.tokens;
+        cur_calls += 1;
+        cur_tokens += r.tokens;
+        prev_ts = Some(r.ts);
+    }
+    if cur_calls > 0 {
+        runs.push(flush(
+            runs.len() + 1,
+            &cur_phases,
+            &cur_backends,
+            cur_calls,
+            cur_tokens,
+        ));
+    }
+
+    let total_calls = runs.iter().map(|r| r.calls).sum();
+    let total_tokens = runs.iter().map(|r| r.tokens).sum();
+    UsageReport {
+        runs,
+        total_calls,
+        total_tokens,
+        backends: all_backends.into_iter().collect(),
+    }
+}
+
+/// Build a structured [`UsageReport`] from `~/.umadev/usage.jsonl`.
+///
+/// Pure read: never writes, and fail-open — a missing or unreadable log yields
+/// an empty report (`UsageReport::is_empty()` → true) so the caller can show a
+/// friendly empty state. Powers `umadev usage` and the TUI `/usage` command.
+#[must_use]
+pub fn usage_report() -> UsageReport {
+    let Ok(content) = std::fs::read_to_string(usage_path()) else {
+        return UsageReport::default();
+    };
+    build_usage_report(parse_usage_records(&content))
+}
+
+/// A rough, advisory cost estimate (in US dollars) for a token total.
+///
+/// UmaDev owns no model endpoint and never sees per-token pricing — the base
+/// CLI bills the customer's own subscription — so this is deliberately a single
+/// flat blended rate, clearly labelled "仅供参考 / reference only" by the caller.
+/// It exists so a token count has a human-relatable magnitude, NOT to be an
+/// invoice. Returns dollars as `f64`; callers format to 2 dp.
+#[must_use]
+pub fn rough_cost_usd(total_tokens: u64) -> f64 {
+    // Blended ~$3 / 1M tokens — a conservative middle-of-the-road figure across
+    // the three bases' typical input/output mixes. Order-of-magnitude only.
+    const USD_PER_MILLION: f64 = 3.0;
+    (total_tokens as f64 / 1_000_000.0) * USD_PER_MILLION
+}
+
 /// A user-facing, plain-language description of what the worker is doing
 /// in each phase — shown while the user waits. Replaces the generic
 /// "调用 worker(X 阶段)" with something the user understands.
@@ -3389,6 +3618,103 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use tempfile::TempDir;
+
+    fn rec(ts: u64, backend: &str, phase: &str, tokens: u64) -> UsageRecord {
+        UsageRecord {
+            ts,
+            backend: backend.to_string(),
+            phase: phase.to_string(),
+            tokens,
+        }
+    }
+
+    #[test]
+    fn usage_empty_report_for_no_records() {
+        let r = build_usage_report(Vec::new());
+        assert!(r.is_empty());
+        assert_eq!(r.total_calls, 0);
+        assert_eq!(r.total_tokens, 0);
+        assert!(r.backends.is_empty());
+    }
+
+    #[test]
+    fn usage_groups_phases_and_totals_in_one_run() {
+        // Three calls within the gap window → one run; tokens sum per phase.
+        let recs = vec![
+            rec(1_000, "claude-code", "research", 100),
+            rec(1_010, "claude-code", "frontend", 200),
+            rec(1_020, "claude-code", "frontend", 50),
+        ];
+        let r = build_usage_report(recs);
+        assert_eq!(r.runs.len(), 1, "all within RUN_GAP_SECS → single run");
+        assert_eq!(r.total_calls, 3);
+        assert_eq!(r.total_tokens, 350);
+        assert_eq!(r.backends, vec!["claude-code".to_string()]);
+        let run = &r.runs[0];
+        assert_eq!(run.index, 1);
+        // Phases are ordered by pipeline position: research before frontend.
+        assert_eq!(run.phases[0].phase, "research");
+        assert_eq!(run.phases[1].phase, "frontend");
+        assert_eq!(run.phases[1].calls, 2);
+        assert_eq!(run.phases[1].tokens, 250);
+    }
+
+    #[test]
+    fn usage_splits_runs_on_idle_gap() {
+        // A gap larger than RUN_GAP_SECS starts a second run.
+        let recs = vec![
+            rec(1_000, "codex", "research", 10),
+            rec(1_000 + RUN_GAP_SECS + 1, "codex", "frontend", 20),
+        ];
+        let r = build_usage_report(recs);
+        assert_eq!(r.runs.len(), 2);
+        assert_eq!(r.runs[0].index, 1);
+        assert_eq!(r.runs[1].index, 2);
+        assert_eq!(r.runs[1].tokens, 20);
+        assert_eq!(r.total_tokens, 30);
+    }
+
+    #[test]
+    fn usage_sorts_out_of_order_timestamps() {
+        // Records arriving out of order are sorted before segmentation.
+        let recs = vec![
+            rec(2_000, "codex", "frontend", 20),
+            rec(1_000, "codex", "research", 10),
+        ];
+        let r = build_usage_report(recs);
+        assert_eq!(r.runs.len(), 1);
+        assert_eq!(r.runs[0].phases[0].phase, "research");
+    }
+
+    #[test]
+    fn parse_usage_records_tolerates_malformed_lines() {
+        let content = "\
+{\"ts\":1000,\"backend\":\"claude-code\",\"phase\":\"research\",\"tokens\":100}
+not json at all
+
+{\"ts\":1010,\"backend\":\"codex\",\"phase\":\"frontend\",\"tokens\":200}
+";
+        let recs = parse_usage_records(content);
+        assert_eq!(
+            recs.len(),
+            3,
+            "blank line skipped, garbage line kept as zeros"
+        );
+        assert_eq!(recs[0].tokens, 100);
+        assert_eq!(recs[0].phase, "research");
+        // The garbage line parses to all-defaults rather than panicking.
+        assert_eq!(recs[1].ts, 0);
+        assert_eq!(recs[1].tokens, 0);
+        assert_eq!(recs[2].backend, "codex");
+    }
+
+    #[test]
+    fn rough_cost_is_advisory_and_monotonic() {
+        assert!((rough_cost_usd(0) - 0.0).abs() < f64::EPSILON);
+        // 1M tokens ≈ a few dollars at the blended flat rate.
+        assert!(rough_cost_usd(1_000_000) > 0.0);
+        assert!(rough_cost_usd(2_000_000) > rough_cost_usd(1_000_000));
+    }
 
     #[test]
     fn model_for_phase_defaults_without_tier_env() {

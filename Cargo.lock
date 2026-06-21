@@ -3114,6 +3114,7 @@ dependencies = [
  "umadev-agent",
  "umadev-governance",
  "umadev-host",
+ "umadev-i18n",
  "umadev-runtime",
  "umadev-spec",
  "umadev-tui",

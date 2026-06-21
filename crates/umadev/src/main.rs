@@ -212,6 +212,41 @@ enum Command {
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
+    /// Show worker token usage (per run / per phase) + a rough cost estimate.
+    #[command(
+        long_about = "Show the token usage UmaDev has already recorded for this\n\
+                      machine: a per-run, per-phase breakdown of the input+output\n\
+                      tokens each base CLI reported, run + grand totals, and a ROUGH\n\
+                      blended-rate cost estimate (reference only — UmaDev drives your\n\
+                      own base subscription and never bills you).\n\
+                      \n\
+                      Read-only — reads `~/.umadev/usage.jsonl`, writes nothing. A\n\
+                      fresh machine with no runs yet shows a friendly empty state.",
+        after_help = "EXAMPLES:\n  \
+                      umadev usage             # full per-run / per-phase report\n  \
+                      umadev usage | less      # paged"
+    )]
+    Usage,
+    /// Show what UmaDev has learned: high-frequency pitfalls + proven patterns.
+    #[command(
+        long_about = "Make UmaDev's self-evolution visible. Reads the pitfall knowledge\n\
+                      base and prints: high-frequency pitfalls (with how often each\n\
+                      recurred and whether its fix is now validated), the failed fixes\n\
+                      UmaDev is currently steering AWAY from, and the success patterns\n\
+                      that passed the quality gate and are safe to reuse.\n\
+                      \n\
+                      Read-only — reads `.umadev/learned/`, writes nothing and never\n\
+                      changes the learning logic. A project that hasn't hit any\n\
+                      pitfalls yet shows a friendly empty state.",
+        after_help = "EXAMPLES:\n  \
+                      umadev lessons                      # what's been learned here\n  \
+                      umadev lessons --project-root ./app"
+    )]
+    Lessons {
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
     /// Print the `UMADEV_HOST_SPEC_V1` specification.
     #[command(
         hide = true,
@@ -539,6 +574,8 @@ async fn main() -> Result<()> {
             project_root,
         } => cmd_rollback(timestamp, project_root),
         Command::History { project_root } => cmd_history(project_root),
+        Command::Usage => cmd_usage(),
+        Command::Lessons { project_root } => cmd_lessons(project_root),
         Command::Spec { clauses } => cmd_spec(clauses),
         Command::Verify { project_root } => cmd_verify(project_root),
         Command::Report { slug, project_root } => cmd_report(slug, project_root),
@@ -2154,6 +2191,179 @@ fn cmd_history(project_root: Option<PathBuf>) -> Result<()> {
 Roll back with:  umadev rollback latest"
     );
     Ok(())
+}
+
+/// Resolve + set the process-wide UI language for CLI output, from the saved
+/// `~/.umadev/config.toml` (falling back to system-locale detection). Mirrors
+/// what the TUI does on launch so `umadev usage` / `umadev lessons` speak the
+/// same language as the chat. Returns the resolved language for `t`/`tf`.
+fn cli_lang() -> umadev_i18n::Lang {
+    let lang = umadev_tui::config::load().resolved_lang();
+    umadev_i18n::set_lang(lang);
+    lang
+}
+
+/// `umadev usage` — print recorded worker token usage per run / per phase, with
+/// run + grand totals and a rough advisory cost estimate. Pure read of
+/// `~/.umadev/usage.jsonl`; fail-open empty state when nothing is recorded.
+fn cmd_usage() -> Result<()> {
+    let lang = cli_lang();
+    let report = umadev_agent::runner::usage_report();
+    if report.is_empty() {
+        println!("{}", umadev_i18n::t(lang, "usage.empty"));
+        return Ok(());
+    }
+    let total_calls = report.total_calls.to_string();
+    let run_count = report.runs.len().to_string();
+    println!(
+        "{}",
+        umadev_i18n::tf(lang, "usage.title", &[&total_calls, &run_count])
+    );
+    println!();
+    for run in &report.runs {
+        let idx = run.index.to_string();
+        let backends = if run.backends.is_empty() {
+            "offline".to_string()
+        } else {
+            run.backends.join(", ")
+        };
+        println!(
+            "{}",
+            umadev_i18n::tf(lang, "usage.run_header", &[&idx, &backends])
+        );
+        for p in &run.phases {
+            let calls = p.calls.to_string();
+            let tokens = p.tokens.to_string();
+            println!(
+                "{}",
+                umadev_i18n::tf(lang, "usage.phase_line", &[&p.phase, &calls, &tokens])
+            );
+        }
+        let rcalls = run.calls.to_string();
+        let rtokens = run.tokens.to_string();
+        println!(
+            "{}",
+            umadev_i18n::tf(lang, "usage.run_total", &[&rcalls, &rtokens])
+        );
+        println!();
+    }
+    let grand = report.total_tokens.to_string();
+    println!("{}", umadev_i18n::tf(lang, "usage.grand_total", &[&grand]));
+    let cost = format!(
+        "{:.2}",
+        umadev_agent::runner::rough_cost_usd(report.total_tokens)
+    );
+    println!("{}", umadev_i18n::tf(lang, "usage.cost_estimate", &[&cost]));
+    println!("{}", umadev_i18n::t(lang, "usage.note_combined"));
+    Ok(())
+}
+
+/// `umadev lessons` — print what UmaDev has learned in this workspace: high-
+/// frequency pitfalls, the failed fixes it now steers away from, and validated
+/// success patterns. Pure read of `.umadev/learned/`; never mutates the KB.
+fn cmd_lessons(project_root: Option<PathBuf>) -> Result<()> {
+    let lang = cli_lang();
+    let project_root = resolve_root(project_root)?;
+    let report = umadev_agent::lessons::lessons_report(&project_root);
+    if report.is_empty() {
+        println!("{}", umadev_i18n::t(lang, "lessons.empty"));
+        return Ok(());
+    }
+    println!("{}", umadev_i18n::t(lang, "lessons.title"));
+    let e = report.efficacy;
+    println!(
+        "{}",
+        umadev_i18n::tf(
+            lang,
+            "lessons.efficacy",
+            &[
+                &e.total.to_string(),
+                &e.validated.to_string(),
+                &e.recurring.to_string(),
+                &e.active.to_string(),
+            ],
+        )
+    );
+    println!();
+
+    if !report.top_pitfalls.is_empty() {
+        println!("{}", umadev_i18n::t(lang, "lessons.top_header"));
+        for p in &report.top_pitfalls {
+            let (icon, status_key) = status_chrome(p.status);
+            let status = umadev_i18n::t(lang, status_key);
+            println!(
+                "{}",
+                umadev_i18n::tf(
+                    lang,
+                    "lessons.pitfall_line",
+                    &[icon, &p.title, &p.hits.to_string(), status],
+                )
+            );
+            if !p.fix.is_empty() {
+                println!(
+                    "{}",
+                    umadev_i18n::tf(lang, "lessons.pitfall_fix", &[&truncate_cli(&p.fix, 200)])
+                );
+            }
+            if !p.context.is_empty() {
+                println!(
+                    "{}",
+                    umadev_i18n::tf(lang, "lessons.pitfall_ctx", &[&p.context.join(", ")])
+                );
+            }
+        }
+        println!();
+    }
+
+    // Failed fixes UmaDev is now steering away from (deduped across pitfalls).
+    let mut avoid: Vec<String> = Vec::new();
+    for p in &report.recurring {
+        for f in &p.failed_fixes {
+            let f = truncate_cli(f, 160);
+            if !avoid.contains(&f) {
+                avoid.push(f);
+            }
+        }
+    }
+    if !avoid.is_empty() {
+        println!("{}", umadev_i18n::t(lang, "lessons.recurring_header"));
+        for f in &avoid {
+            println!("{}", umadev_i18n::tf(lang, "lessons.avoid_line", &[f]));
+        }
+        println!();
+    }
+
+    if !report.validated_patterns.is_empty() {
+        println!("{}", umadev_i18n::t(lang, "lessons.validated_header"));
+        for v in &report.validated_patterns {
+            println!(
+                "{}",
+                umadev_i18n::tf(lang, "lessons.validated_line", &[&v.title, &v.summary])
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Map a pitfall status to its (icon, i18n status-label key) for the lessons view.
+fn status_chrome(status: umadev_agent::lessons::PitfallStatus) -> (&'static str, &'static str) {
+    use umadev_agent::lessons::PitfallStatus;
+    match status {
+        PitfallStatus::Validated => ("[ok]", "lessons.status.validated"),
+        PitfallStatus::Recurring => ("[warn]", "lessons.status.recurring"),
+        PitfallStatus::Active => ("[pitfall]", "lessons.status.active"),
+    }
+}
+
+/// Truncate a string to `max` chars with an ellipsis (char-safe). Local helper
+/// so CLI output stays tidy without pulling the agent crate's private one.
+fn truncate_cli(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+    t.push('…');
+    t
 }
 
 fn cmd_rollback(timestamp: String, project_root: Option<PathBuf>) -> Result<()> {

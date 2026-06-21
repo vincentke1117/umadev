@@ -913,6 +913,10 @@ impl App {
         ("export", "export the latest proof-pack"),
         ("knowledge", "list knowledge + design files"),
         ("pitfalls", "show the self-learning pitfalls knowledge base"),
+        (
+            "lessons",
+            "show what UmaDev has learned (pitfalls + proven patterns)",
+        ),
         ("mcp", "manage MCP servers (/mcp list)"),
         ("skill", "manage skill packages (/skill list)"),
         ("spec", "show the UMADEV_HOST_SPEC_V1 spec"),
@@ -2368,6 +2372,7 @@ impl App {
                 ));
                 Action::None
             }
+            "lessons" => self.slash_lessons(),
             "mcp" => {
                 let output = self.run_subprocess_cli("mcp-manage list");
                 self.push(
@@ -4135,11 +4140,26 @@ impl App {
         Action::None
     }
 
-    /// `/usage` — show how many times the worker has been called, per phase.
-    /// Foundation for free/pro tier metering.
+    /// `/usage` — show recorded worker token usage per run / per phase, with run
+    /// totals, a grand total, and a rough advisory cost estimate. Pure read of
+    /// the usage log (mirrors the `umadev usage` CLI verb).
     fn slash_usage(&mut self) -> Action {
-        let summary = umadev_agent::runner::usage_summary();
-        self.push(ChatRole::System, summary);
+        let body = format_usage_report(self.lang, &umadev_agent::runner::usage_report());
+        self.push(ChatRole::System, body);
+        Action::None
+    }
+
+    /// `/lessons` — make UmaDev's self-evolution visible: high-frequency
+    /// pitfalls, the failed fixes it now steers away from, and validated
+    /// success patterns. Pure read of `.umadev/learned/` (mirrors the
+    /// `umadev lessons` CLI verb). Shown in a scrollable overlay.
+    fn slash_lessons(&mut self) -> Action {
+        let report = umadev_agent::lessons_report(&self.project_root);
+        let body = format_lessons_report(self.lang, &report);
+        self.overlay = Some(Overlay::from_body(
+            umadev_i18n::t(self.lang, "lessons.title"),
+            &body,
+        ));
         Action::None
     }
 
@@ -4684,6 +4704,177 @@ fn walkdir_count_md(dir: &std::path::Path) -> usize {
     let mut count = 0;
     walkdir_count_md_inner(dir, &mut count, 0);
     count
+}
+
+/// Truncate a string to `max` chars with an ellipsis (char-safe).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+    t.push('…');
+    t
+}
+
+/// Render a [`umadev_agent::runner::UsageReport`] as an i18n plain-text block
+/// for the `/usage` chat reply. Mirrors the `umadev usage` CLI layout so both
+/// surfaces read identically. Empty report → the friendly empty state.
+fn format_usage_report(
+    lang: umadev_i18n::Lang,
+    report: &umadev_agent::runner::UsageReport,
+) -> String {
+    if report.is_empty() {
+        return umadev_i18n::t(lang, "usage.empty").to_string();
+    }
+    let mut out = umadev_i18n::tf(
+        lang,
+        "usage.title",
+        &[
+            &report.total_calls.to_string(),
+            &report.runs.len().to_string(),
+        ],
+    );
+    out.push('\n');
+    for run in &report.runs {
+        let backends = if run.backends.is_empty() {
+            "offline".to_string()
+        } else {
+            run.backends.join(", ")
+        };
+        out.push('\n');
+        out.push_str(&umadev_i18n::tf(
+            lang,
+            "usage.run_header",
+            &[&run.index.to_string(), &backends],
+        ));
+        out.push('\n');
+        for p in &run.phases {
+            out.push_str(&umadev_i18n::tf(
+                lang,
+                "usage.phase_line",
+                &[&p.phase, &p.calls.to_string(), &p.tokens.to_string()],
+            ));
+            out.push('\n');
+        }
+        out.push_str(&umadev_i18n::tf(
+            lang,
+            "usage.run_total",
+            &[&run.calls.to_string(), &run.tokens.to_string()],
+        ));
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&umadev_i18n::tf(
+        lang,
+        "usage.grand_total",
+        &[&report.total_tokens.to_string()],
+    ));
+    out.push('\n');
+    let cost = format!(
+        "{:.2}",
+        umadev_agent::runner::rough_cost_usd(report.total_tokens)
+    );
+    out.push_str(&umadev_i18n::tf(lang, "usage.cost_estimate", &[&cost]));
+    out.push('\n');
+    out.push_str(umadev_i18n::t(lang, "usage.note_combined"));
+    out
+}
+
+/// Map a pitfall status to its (icon, i18n status-label key) for the lessons view.
+fn lesson_status_chrome(status: umadev_agent::PitfallStatus) -> (&'static str, &'static str) {
+    use umadev_agent::PitfallStatus;
+    match status {
+        PitfallStatus::Validated => ("[ok]", "lessons.status.validated"),
+        PitfallStatus::Recurring => ("[warn]", "lessons.status.recurring"),
+        PitfallStatus::Active => ("[pitfall]", "lessons.status.active"),
+    }
+}
+
+/// Render a [`umadev_agent::LessonsReport`] as an i18n plain-text block for the
+/// `/lessons` overlay. Mirrors the `umadev lessons` CLI layout. Empty report →
+/// the friendly empty state.
+fn format_lessons_report(lang: umadev_i18n::Lang, report: &umadev_agent::LessonsReport) -> String {
+    if report.is_empty() {
+        return umadev_i18n::t(lang, "lessons.empty").to_string();
+    }
+    let e = report.efficacy;
+    let mut out = umadev_i18n::tf(
+        lang,
+        "lessons.efficacy",
+        &[
+            &e.total.to_string(),
+            &e.validated.to_string(),
+            &e.recurring.to_string(),
+            &e.active.to_string(),
+        ],
+    );
+    out.push_str("\n\n");
+
+    if !report.top_pitfalls.is_empty() {
+        out.push_str(umadev_i18n::t(lang, "lessons.top_header"));
+        out.push('\n');
+        for p in &report.top_pitfalls {
+            let (icon, status_key) = lesson_status_chrome(p.status);
+            let status = umadev_i18n::t(lang, status_key);
+            out.push_str(&umadev_i18n::tf(
+                lang,
+                "lessons.pitfall_line",
+                &[icon, &p.title, &p.hits.to_string(), status],
+            ));
+            out.push('\n');
+            if !p.fix.is_empty() {
+                out.push_str(&umadev_i18n::tf(
+                    lang,
+                    "lessons.pitfall_fix",
+                    &[&truncate_chars(&p.fix, 200)],
+                ));
+                out.push('\n');
+            }
+            if !p.context.is_empty() {
+                out.push_str(&umadev_i18n::tf(
+                    lang,
+                    "lessons.pitfall_ctx",
+                    &[&p.context.join(", ")],
+                ));
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
+
+    // Failed fixes UmaDev is now steering away from (deduped across pitfalls).
+    let mut avoid: Vec<String> = Vec::new();
+    for p in &report.recurring {
+        for f in &p.failed_fixes {
+            let f = truncate_chars(f, 160);
+            if !avoid.contains(&f) {
+                avoid.push(f);
+            }
+        }
+    }
+    if !avoid.is_empty() {
+        out.push_str(umadev_i18n::t(lang, "lessons.recurring_header"));
+        out.push('\n');
+        for f in &avoid {
+            out.push_str(&umadev_i18n::tf(lang, "lessons.avoid_line", &[f]));
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    if !report.validated_patterns.is_empty() {
+        out.push_str(umadev_i18n::t(lang, "lessons.validated_header"));
+        out.push('\n');
+        for v in &report.validated_patterns {
+            out.push_str(&umadev_i18n::tf(
+                lang,
+                "lessons.validated_line",
+                &[&v.title, &v.summary],
+            ));
+            out.push('\n');
+        }
+    }
+    out
 }
 
 #[cfg(test)]

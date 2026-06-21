@@ -1791,6 +1791,132 @@ pub fn pitfall_overview(project_root: &Path) -> String {
     out
 }
 
+/// One high-frequency or noteworthy pitfall, distilled for the lessons view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PitfallEntry {
+    /// Short human title (already carries the signature for recognised errors).
+    pub title: String,
+    /// Stable dedup signature (`dependency/module-not-found/react-router-dom`).
+    pub signature: String,
+    /// How many times this exact pitfall has been hit across runs.
+    pub hits: u32,
+    /// Fix lifecycle: still-failing / unproven / validated.
+    pub status: PitfallStatus,
+    /// The recorded avoid-next-time fix.
+    pub fix: String,
+    /// Tech-stack fingerprint present when it was hit (its trigger context).
+    pub context: Vec<String>,
+    /// Fixes already tried that still let it recur — what UmaDev now steers AWAY
+    /// from. Empty unless the pitfall recurred after a warning.
+    pub failed_fixes: Vec<String>,
+}
+
+/// One pattern that passed the quality gate — a proven, reusable success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedEntry {
+    /// Pattern title (e.g. "Validated API contract for blog").
+    pub title: String,
+    /// Short body excerpt describing what was validated.
+    pub summary: String,
+}
+
+/// A structured, language-neutral view of "what UmaDev has learned" — its
+/// self-evolution made visible. Pure read; the CLI / TUI add i18n chrome.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LessonsReport {
+    /// Pitfall self-verification counters (total / validated / recurring / active).
+    pub efficacy: PitfallEfficacySummary,
+    /// High-frequency / noteworthy pitfalls, worst-first (recurring → most-hit).
+    pub top_pitfalls: Vec<PitfallEntry>,
+    /// Currently-avoided failing fixes — pitfalls whose recorded fix proved
+    /// insufficient, so the base is now steered toward a different approach.
+    pub recurring: Vec<PitfallEntry>,
+    /// Validated success patterns (passed the quality gate, reusable).
+    pub validated_patterns: Vec<ValidatedEntry>,
+}
+
+impl LessonsReport {
+    /// `true` when nothing has been learned yet (drives the empty state).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.top_pitfalls.is_empty() && self.validated_patterns.is_empty()
+    }
+}
+
+/// How many top pitfalls the lessons view surfaces. Generous enough to be
+/// useful, capped so the view stays a digest rather than a dump.
+const LESSONS_TOP_N: usize = 12;
+
+/// Build a structured [`LessonsReport`] from the pitfall + validated-pattern KB.
+///
+/// Pure read — never mutates the learning state. Reads `dev-errors.jsonl`
+/// (pitfalls) and `validated-decisions.jsonl` (proven patterns) under
+/// `.umadev/learned/_raw/`. Fail-open: missing/empty files yield an empty
+/// report so the caller shows a friendly empty state. Powers `umadev lessons`
+/// and the TUI `/lessons` command.
+#[must_use]
+pub fn lessons_report(project_root: &Path) -> LessonsReport {
+    let efficacy = pitfall_efficacy_summary(project_root);
+
+    let mut pits: Vec<Lesson> = read_raw_lessons(project_root, DEV_ERRORS_FILE)
+        .into_iter()
+        .filter(|l| l.kind == LessonKind::DevError)
+        .collect();
+    // Worst first: recurring fixes, then most-frequently-hit, then recent —
+    // the same ordering the `/pitfalls` overlay uses.
+    let rank = |l: &Lesson| match l.pitfall_status() {
+        PitfallStatus::Recurring => 0,
+        PitfallStatus::Active => 1,
+        PitfallStatus::Validated => 2,
+    };
+    pits.sort_by(|a, b| {
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| b.hits().cmp(&a.hits()))
+            .then_with(|| b.first_seen.cmp(&a.first_seen))
+    });
+
+    let to_entry = |l: &Lesson| PitfallEntry {
+        title: l.title.clone(),
+        signature: l.signature.clone(),
+        hits: l.hits(),
+        status: l.pitfall_status(),
+        fix: l.fix.clone(),
+        context: l.context.clone(),
+        failed_fixes: l
+            .efficacy
+            .as_ref()
+            .map(|e| e.failed_fixes.clone())
+            .unwrap_or_default(),
+    };
+
+    let recurring: Vec<PitfallEntry> = pits
+        .iter()
+        .filter(|l| l.pitfall_status() == PitfallStatus::Recurring)
+        .map(to_entry)
+        .collect();
+    let top_pitfalls: Vec<PitfallEntry> = pits.iter().take(LESSONS_TOP_N).map(to_entry).collect();
+
+    // Validated patterns: positive experience that cleared the quality gate.
+    let mut validated_patterns: Vec<ValidatedEntry> =
+        read_raw_lessons(project_root, "validated-decisions.jsonl")
+            .into_iter()
+            .filter(|l| l.kind == LessonKind::ValidatedPattern)
+            .map(|l| ValidatedEntry {
+                title: l.title,
+                summary: truncate(l.body.lines().next().unwrap_or("").trim(), 160),
+            })
+            .collect();
+    validated_patterns.truncate(LESSONS_TOP_N);
+
+    LessonsReport {
+        efficacy,
+        top_pitfalls,
+        recurring,
+        validated_patterns,
+    }
+}
+
 /// Compute the pitfall efficacy summary for `umadev report` / `/pitfalls`.
 #[must_use]
 pub fn pitfall_efficacy_summary(project_root: &Path) -> PitfallEfficacySummary {
@@ -2621,5 +2747,53 @@ mod tests {
         let files = list_sedimented_lessons(tmp.path());
         // No file should be under _raw.
         assert!(files.iter().all(|f| !f.to_string_lossy().contains("_raw")));
+    }
+
+    #[test]
+    fn lessons_report_empty_for_fresh_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let r = lessons_report(tmp.path());
+        assert!(r.is_empty());
+        assert!(r.top_pitfalls.is_empty());
+        assert!(r.validated_patterns.is_empty());
+        assert_eq!(r.efficacy.total, 0);
+    }
+
+    #[test]
+    fn lessons_report_surfaces_pitfalls_and_frequency() {
+        let tmp = TempDir::new().unwrap();
+        // Seed a recurring pitfall (hit twice) + a one-off pitfall.
+        let first = vec![
+            "Error: Cannot find module 'react-router-dom'".to_string(),
+            "TypeError: Cannot read properties of undefined (reading 'map')".to_string(),
+        ];
+        capture_dev_errors(tmp.path(), &first, "demo", "需求");
+        let again = vec!["Error: Cannot find module 'react-router-dom'".to_string()];
+        capture_dev_errors(tmp.path(), &again, "demo", "需求");
+
+        let r = lessons_report(tmp.path());
+        assert!(!r.is_empty());
+        assert_eq!(r.efficacy.total, 2, "two distinct pitfalls recorded");
+        // Worst-first ordering puts the twice-hit react-router pitfall first.
+        let top = &r.top_pitfalls[0];
+        assert_eq!(
+            top.signature,
+            "dependency/module-not-found/react-router-dom"
+        );
+        assert_eq!(top.hits, 2, "frequency reflects the recurrence");
+    }
+
+    #[test]
+    fn lessons_report_surfaces_validated_patterns() {
+        let tmp = TempDir::new().unwrap();
+        let spec = umadev_contract::parse_architecture(
+            "| Method | Path | Request | Response | Auth | Description |\n|---|---|---|---|---|---|\n| GET | /api/posts | - | - | none | List |\n",
+            "blog",
+        );
+        capture_validated_patterns(tmp.path(), "blog", "做一个博客", &spec);
+        let r = lessons_report(tmp.path());
+        assert!(!r.is_empty());
+        assert_eq!(r.validated_patterns.len(), 1);
+        assert!(r.validated_patterns[0].title.contains("blog"));
     }
 }
