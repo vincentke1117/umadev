@@ -86,6 +86,14 @@ pub struct PipelineConfig {
     /// Max review→fix rounds per document (default 3).
     #[serde(default = "default_review_rounds")]
     pub max_review_rounds: usize,
+    /// Strict spec-coverage enforcement (default `false`). When `true`, the
+    /// spec phase's FR→task coverage check BLOCKS the pipeline (pausing at
+    /// `spec`) if any PRD functional requirement has no covering task, instead
+    /// of merely emitting an advisory note. Default `false` keeps the existing
+    /// warn-only behaviour so a partial breakdown never silently halts a run.
+    /// Overridable per run by the `UMADEV_STRICT_COVERAGE=1` environment flag.
+    #[serde(default)]
+    pub strict_coverage: bool,
     /// Auto-approve all pipeline gates without waiting for user input
     /// (default `true`). UmaDev's pipeline is designed to run fully
     /// autonomously — like Claude Code's `/goal` mode. The gates
@@ -101,6 +109,7 @@ impl Default for PipelineConfig {
         Self {
             skip_phases: Vec::new(),
             max_review_rounds: default_review_rounds(),
+            strict_coverage: false,
             auto_approve_gates: default_auto_approve(),
         }
     }

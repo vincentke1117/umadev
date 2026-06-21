@@ -26,6 +26,14 @@ pub struct PhaseOutput {
     pub artifacts: Vec<PathBuf>,
     /// Whether this phase ends at a gate (caller must pause).
     pub gate: Option<crate::gates::Gate>,
+    /// `true` when this phase's artifacts are the OFFLINE FALLBACK template
+    /// (skeleton placeholder), NOT real base-generated content — set by the
+    /// runner when `use_runtime` was on but the base returned empty/errored and
+    /// the phase silently dropped to the deterministic template (#1). A degraded
+    /// phase is surfaced loudly to the user and must NOT be treated as a clean
+    /// success. Defaults to `false` (the phase functions never set it; only the
+    /// runner, which knows whether the base produced real output, does).
+    pub degraded: bool,
 }
 
 // =====================================================================
@@ -465,6 +473,7 @@ pub fn run_research(opts: &RunOptions, generated_body: Option<&str>) -> io::Resu
         phase: Phase::Research,
         artifacts: vec![research_path, bundle_path],
         gate: None,
+        degraded: false,
     })
 }
 
@@ -520,6 +529,7 @@ pub fn run_docs(opts: &RunOptions, content: &DocsContent) -> io::Result<PhaseOut
         phase: Phase::Docs,
         artifacts: vec![prd, arch, uiux],
         gate: Some(crate::gates::Gate::DocsConfirm),
+        degraded: false,
     })
 }
 
@@ -562,6 +572,7 @@ pub fn run_spec(opts: &RunOptions) -> io::Result<PhaseOutput> {
         phase: Phase::Spec,
         artifacts: vec![plan, tasks],
         gate: None,
+        degraded: false,
     })
 }
 
@@ -608,6 +619,7 @@ pub fn run_frontend(opts: &RunOptions) -> io::Result<PhaseOutput> {
         phase: Phase::Frontend,
         artifacts: vec![note],
         gate: Some(crate::gates::Gate::PreviewConfirm),
+        degraded: false,
     })
 }
 
@@ -647,6 +659,7 @@ pub fn run_backend(opts: &RunOptions) -> io::Result<PhaseOutput> {
         phase: Phase::Backend,
         artifacts: vec![note],
         gate: None,
+        degraded: false,
     })
 }
 
@@ -1057,13 +1070,16 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
         },
     });
 
-    // Frontend↔contract conformance
-    let fe_calls = umadev_contract::extract_frontend_calls(
-        &opts
-            .project_root
-            .join("output")
-            .join(format!("{slug}-frontend-notes.md")),
-    );
+    // Frontend↔contract conformance. UD-CODE-003: scan the REAL generated
+    // frontend SOURCE TREE — `extract_frontend_calls` takes a project ROOT and
+    // walks the actual `.ts`/`.tsx`/`.vue`/… files the worker wrote, returning
+    // typed (method, path, method_known) calls. The previous code handed it the
+    // worker-notes markdown path (`output/{slug}-frontend-notes.md`); since
+    // `output/` is in the extractor's skip-list and a single `.md` file is not a
+    // source tree, that scan was always empty — the check was diluted to a
+    // no-op. Scanning `opts.project_root` is what makes this a real consistency
+    // gate over the delivered code.
+    let fe_calls = umadev_contract::extract_frontend_calls(&opts.project_root);
     let fe_violations = umadev_contract::validate_frontend_vs_contract(&fe_calls, &contract_spec);
     checks.push(QualityCheck {
         name: "Frontend↔contract conformance".to_string(),
@@ -1495,31 +1511,8 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
         phase: Phase::Quality,
         artifacts: vec![json_path, md_path],
         gate: None,
+        degraded: false,
     })
-}
-
-#[allow(dead_code)]
-fn file_present_check(
-    name: &str,
-    category: &str,
-    desc: &str,
-    path: &Path,
-    weight: f32,
-) -> QualityCheck {
-    let present = path.is_file() && fs::metadata(path).is_ok_and(|m| m.len() > 0);
-    QualityCheck {
-        name: name.to_string(),
-        category: category.to_string(),
-        description: desc.to_string(),
-        status: if present { "passed" } else { "failed" }.to_string(),
-        score: if present { 100 } else { 0 },
-        weight,
-        details: if present {
-            format!("found {}", path.display())
-        } else {
-            format!("missing {}", path.display())
-        },
-    }
 }
 
 fn evidence_check(name: &str, desc: &str, path: &Path, weight: f32) -> QualityCheck {
@@ -1808,6 +1801,7 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
         phase: Phase::Delivery,
         artifacts,
         gate: None,
+        degraded: false,
     })
 }
 
@@ -2391,7 +2385,16 @@ fn check_api_url_consistency(opts: &RunOptions, slug: &str) -> (String, i32, Str
         .project_root
         .join(".umadev/audit/frontend-api-calls.jsonl");
     let api_log_content = fs::read_to_string(&api_log).unwrap_or_default();
-    let combined = format!("{fe_content}\n{api_log_content}");
+    // Also fold in the paths the contract extractor found in the REAL generated
+    // frontend source tree (not just the worker-notes blob / audit log). UD-
+    // CODE-003 is about the delivered code matching the architecture, so the
+    // primary signal must be the source the worker actually wrote.
+    let real_paths: String = umadev_contract::extract_frontend_calls(&opts.project_root)
+        .iter()
+        .map(|c| c.path.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let combined = format!("{fe_content}\n{api_log_content}\n{real_paths}");
 
     let mut missing: Vec<&str> = Vec::new();
     for path in &api_paths {
@@ -4079,6 +4082,54 @@ mod tests {
             count_slop_violations(tmp.path()),
             0,
             "quality-gate report should be skipped"
+        );
+    }
+
+    // #5: the FE↔contract check must scan the REAL generated frontend SOURCE
+    // tree, not the worker-notes markdown. The contract extractor walks the
+    // project root for `.ts`/`.tsx`/… files; if quality fed it the notes path
+    // (the old bug) the scan was always empty and the check was a no-op.
+    #[test]
+    fn frontend_contract_scan_reads_real_source_not_notes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Worker-notes markdown mentions /api/foo in prose only — must be IGNORED
+        // for the source-call scan (it's not real frontend code).
+        let out = root.join("output");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(
+            out.join("demo-frontend-notes.md"),
+            "# notes\n- call GET /api/from-notes-only\n",
+        )
+        .unwrap();
+        // Real frontend source with an actual fetch — THIS is what must be found.
+        let src = root.join("web/src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("api.ts"),
+            "export const load = () => fetch('/api/users');\n",
+        )
+        .unwrap();
+
+        // Scanning the project root finds the real call from the .ts source…
+        let calls = umadev_contract::extract_frontend_calls(root);
+        assert!(
+            calls.iter().any(|c| c.path == "/api/users"),
+            "must extract the real fetch('/api/users') from source: {calls:?}"
+        );
+        // …and does NOT surface the prose-only path that lives in the notes md
+        // (the notes file is under output/, which the extractor skips).
+        assert!(
+            !calls.iter().any(|c| c.path == "/api/from-notes-only"),
+            "must not pick up prose paths from the notes markdown: {calls:?}"
+        );
+        // Sanity: handing the extractor the NOTES FILE path (the old bug) yields
+        // nothing — proving the previous wiring diluted the check to a no-op.
+        let via_notes_path =
+            umadev_contract::extract_frontend_calls(&out.join("demo-frontend-notes.md"));
+        assert!(
+            via_notes_path.is_empty(),
+            "scanning the notes file path (old bug) finds no source calls: {via_notes_path:?}"
         );
     }
 }

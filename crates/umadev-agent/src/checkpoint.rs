@@ -122,6 +122,58 @@ pub fn create_checkpoint(project_root: &Path, label: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Snapshot the workspace at a PHASE boundary, but ONLY if the working tree
+/// changed since the last checkpoint — an empty phase boundary produces no new
+/// checkpoint. This is what the runner calls on every phase start so the
+/// headless `run` / `continue` paths get the same per-phase rewind points the
+/// TUI builds from its `PhaseStarted` handler, WITHOUT cluttering the rewind
+/// list with a run of identical empty commits when several phases start
+/// back-to-back before any file is written (e.g. the docs→spec gap).
+///
+/// Returns `Some(id)` when a NEW checkpoint was written, `None` when nothing
+/// changed (or `git` is unavailable — fail-open, never blocks the pipeline).
+/// The very first checkpoint of a fresh shadow repo is always written (so a
+/// run always has a baseline to rewind to), even if the tree looks "clean"
+/// relative to an empty HEAD.
+#[must_use]
+pub fn create_phase_checkpoint(project_root: &Path, label: &str) -> Option<String> {
+    if !ensure_init(project_root) {
+        return None;
+    }
+    // Stage everything, then ask whether the index differs from HEAD. `git
+    // diff --cached --quiet` exits 0 = no staged changes, 1 = changes. When
+    // there is no HEAD yet (fresh repo) the diff reports changes (or errors),
+    // so the baseline checkpoint is taken.
+    git(project_root, &["add", "-A"])?;
+    let has_head = has_checkpoints(project_root);
+    if has_head {
+        let clean =
+            git(project_root, &["diff", "--cached", "--quiet"]).is_some_and(|o| o.status.success());
+        if clean {
+            return None; // nothing changed since the last checkpoint
+        }
+    }
+    git(
+        project_root,
+        &[
+            "-c",
+            "user.email=umadev@local",
+            "-c",
+            "user.name=UmaDev",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            label,
+        ],
+    )?;
+    let head = git(project_root, &["rev-parse", "--short", "HEAD"])?;
+    head.status
+        .success()
+        .then(|| String::from_utf8_lossy(&head.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// List checkpoints, newest first (capped at 50). Empty when none / `git`
 /// missing.
 #[must_use]
@@ -231,6 +283,31 @@ mod tests {
             after.iter().any(|c| c.label.contains("回滚到")),
             "pre-rewind snapshot is reachable"
         );
+    }
+
+    #[test]
+    fn phase_checkpoint_baselines_then_skips_unchanged() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), "v1").unwrap();
+        // First phase boundary → baseline checkpoint is taken even though there's
+        // no prior HEAD.
+        let c1 = create_phase_checkpoint(root, "phase: research");
+        assert!(c1.is_some(), "first phase checkpoint is the baseline");
+        // A second phase boundary with NO file change → no new checkpoint (the
+        // headless run starts several phases back-to-back before any file lands;
+        // we must not clutter the rewind list with identical empty commits).
+        let c2 = create_phase_checkpoint(root, "phase: docs");
+        assert!(c2.is_none(), "unchanged tree yields no new checkpoint");
+        assert_eq!(list_checkpoints(root).len(), 1, "still one checkpoint");
+        // Now the base writes a file → the next phase boundary DOES checkpoint.
+        std::fs::write(root.join("b.txt"), "new").unwrap();
+        let c3 = create_phase_checkpoint(root, "phase: frontend");
+        assert!(c3.is_some(), "a changed tree produces a new checkpoint");
+        assert_eq!(list_checkpoints(root).len(), 2);
     }
 
     #[test]
