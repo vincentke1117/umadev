@@ -74,7 +74,8 @@ pub use index::{
     Bm25Index, Posting,
 };
 pub use retrieve::{
-    retrieve, retrieve_for_phase, retrieve_for_phase_with_vector, retrieve_with_vector,
+    retrieve, retrieve_for_phase, retrieve_for_phase_with_expansion,
+    retrieve_for_phase_with_vector, retrieve_with_vector, retrieve_with_vector_and_expansion,
     RetrievalConfig, RetrievalEngine, ScoredChunk,
 };
 pub use tokenizer::tokenize;

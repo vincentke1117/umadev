@@ -116,15 +116,100 @@ impl Bm25Index {
             .collect()
     }
 
+    /// Re-tokenise `query` and drop the tokens that carry the least
+    /// discriminative signal, returning the surviving tokens. This is a
+    /// purely lexical, zero-dependency query-cleaning pass that addresses
+    /// BM25's main lexical weakness from the *query* side: filler / very
+    /// common terms add almost no ranking signal but still dilute the
+    /// accumulated score (and, for CJK bigram queries, flood it with weak
+    /// near-matches). Stripping them BEFORE search lets the rare, on-topic
+    /// terms dominate the ranking.
+    ///
+    /// A token is masked when ANY of these hold:
+    /// - it is a hard-coded function word (a tiny English + CJK stop list of
+    ///   terms that are common in *every* corpus, so their corpus IDF is
+    ///   unreliable on a small index), or
+    /// - its corpus IDF is below `idf_floor` AND it is also below the query's
+    ///   own median token IDF — i.e. it is both globally common and the least
+    ///   useful token in THIS query. The relative test means a query made
+    ///   entirely of common words is judged against itself, so it never gets
+    ///   wiped to nothing on that branch.
+    ///
+    /// A token absent from the corpus (IDF undefined) is KEPT — it may be an
+    /// exact identifier the corpus simply doesn't contain yet, and dropping it
+    /// would lose a potential exact match.
+    ///
+    /// Fail-open: if masking would remove EVERY token (e.g. an all-stopword
+    /// query), the original token list is returned unchanged so the caller's
+    /// search is never starved. Pure function over the index stats — no I/O.
+    #[must_use]
+    pub fn mask_low_idf_terms(&self, query: &str, idf_floor: f64) -> Vec<String> {
+        let tokens = tokenize(query);
+        if tokens.len() <= 1 {
+            return tokens; // nothing to gain from masking a single term
+        }
+        let term_idx = self.term_index();
+        let n = self.doc_count.max(1) as f64;
+        // IDF for a token: None when it isn't in the corpus (keep it — could be
+        // an exact identifier). Uses the same BM25 +1-smoothed IDF as `search`.
+        let idf_of = |tok: &str| -> Option<f64> {
+            let pidx = *term_idx.get(tok)?;
+            let df = self.postings[pidx as usize].docs.len() as f64;
+            Some(((n - df + 0.5) / (df + 0.5) + 1.0).ln())
+        };
+        // Median IDF over the tokens that ARE in the corpus — the per-query
+        // relative bar. When no token is in the corpus, the relative test is a
+        // no-op (every token is kept by the absent-token rule anyway).
+        let mut known_idfs: Vec<f64> = tokens.iter().filter_map(|t| idf_of(t)).collect();
+        known_idfs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if known_idfs.is_empty() {
+            0.0
+        } else {
+            known_idfs[known_idfs.len() / 2]
+        };
+        let kept: Vec<String> = tokens
+            .iter()
+            .filter(|tok| {
+                if is_stop_token(tok) {
+                    return false;
+                }
+                match idf_of(tok) {
+                    // In corpus: drop only when BOTH globally common (below the
+                    // absolute floor) AND the least useful in this query (below
+                    // its median). Either test failing keeps the token.
+                    Some(idf) => !(idf < idf_floor && idf < median),
+                    // Not in corpus: keep (possible exact identifier).
+                    None => true,
+                }
+            })
+            .cloned()
+            .collect();
+        // Fail-open: never starve the search. If masking emptied the query,
+        // return the original tokens so BM25 still has something to match.
+        if kept.is_empty() {
+            tokens
+        } else {
+            kept
+        }
+    }
+
     /// Run a BM25 query. Returns `(chunk_idx, score)` pairs, highest score
     /// first. Scores are unbounded positive floats (BM25 has no fixed scale).
     #[must_use]
     pub fn search(&self, query: &str, top_k: usize) -> Vec<(usize, f64)> {
+        self.search_terms(&tokenize(query), top_k)
+    }
+
+    /// BM25 over a PRE-TOKENISED query. Same scoring as [`Self::search`] but
+    /// skips the tokeniser, so a caller that has already cleaned the query
+    /// (e.g. via [`Self::mask_low_idf_terms`]) can search the surviving terms
+    /// directly without re-stringifying + re-tokenising them.
+    #[must_use]
+    pub fn search_terms(&self, query_terms: &[String], top_k: usize) -> Vec<(usize, f64)> {
         if self.chunks.is_empty() || top_k == 0 {
             return Vec::new();
         }
         let term_idx = self.term_index();
-        let query_terms = tokenize(query);
         if query_terms.is_empty() {
             return Vec::new();
         }
@@ -133,7 +218,7 @@ impl Bm25Index {
         let mut scores: Vec<f64> = vec![0.0; self.chunks.len()];
         let n = self.doc_count.max(1) as f64;
 
-        for term in &query_terms {
+        for term in query_terms {
             let Some(&pidx) = term_idx.get(term.as_str()) else {
                 continue; // term not in corpus
             };
@@ -162,6 +247,68 @@ impl Bm25Index {
         ranked.truncate(top_k);
         ranked
     }
+}
+
+/// A deliberately TINY function-word list, used only by
+/// [`Bm25Index::mask_low_idf_terms`]. These words are common in essentially
+/// every corpus, so on a small index their measured IDF is noisy/unreliable —
+/// hard-listing them is safer than trusting a per-corpus IDF that may be
+/// inflated just because the curated knowledge base happens to be small.
+/// Kept short on purpose: only words that are PURE structure (never a topical
+/// keyword) are listed, so the mask never removes a term a user might mean.
+/// The CJK entries are single function characters whose own bigram tokens are
+/// already topical and survive separately.
+const STOP_TOKENS: &[&str] = &[
+    // English articles / conjunctions / prepositions / auxiliaries — never topical.
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "you",
+    "are",
+    "was",
+    "were",
+    "from",
+    "have",
+    "has",
+    "had",
+    "but",
+    "not",
+    "all",
+    "any",
+    "can",
+    "will",
+    "would",
+    "should",
+    "could",
+    "into",
+    "out",
+    "use",
+    "using",
+    "via",
+    "per",
+    "其中",
+    "我们",
+    "可以",
+    "需要",
+    "一个",
+    "一种",
+    "进行",
+    "通过",
+    "以及",
+    "或者",
+    "这个",
+    "那个",
+    "做一个",
+    "做个",
+];
+
+/// Whether `tok` is a hard-coded function word that should never carry
+/// retrieval signal. See [`STOP_TOKENS`].
+fn is_stop_token(tok: &str) -> bool {
+    STOP_TOKENS.contains(&tok)
 }
 
 /// Convenience: build an index then search in one call (used by tests).
@@ -871,6 +1018,79 @@ B: {sb}"
         assert!(text.contains("Login"));
         assert!(text.contains("OAuth"));
         assert!(text.contains("body"));
+    }
+
+    #[test]
+    fn mask_keeps_rare_terms_drops_common_ones() {
+        // "auth" appears in EVERY doc (common, low IDF); "pkce" in one (rare,
+        // high IDF). Masking must keep pkce and drop the common auth.
+        let idx = idx_from(&[
+            ("a.md", "# A\n\n## S\n\nauth auth pkce"),
+            ("b.md", "# B\n\n## S\n\nauth auth"),
+            ("c.md", "# C\n\n## S\n\nauth auth"),
+            ("d.md", "# D\n\n## S\n\nauth auth"),
+        ]);
+        let kept = idx.mask_low_idf_terms("auth pkce", 1.0);
+        assert!(kept.contains(&"pkce".to_string()), "rare term must survive");
+        assert!(
+            !kept.contains(&"auth".to_string()),
+            "common low-IDF term must be masked: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn mask_drops_stopwords() {
+        // Hard-coded function words go regardless of corpus stats.
+        let idx = idx_from(&[("a.md", "# A\n\n## S\n\nlogin oauth pkce session")]);
+        let kept = idx.mask_low_idf_terms("the login system with oauth", 1.0);
+        assert!(!kept.contains(&"the".to_string()), "stopword dropped");
+        assert!(!kept.contains(&"with".to_string()), "stopword dropped");
+        assert!(kept.contains(&"login".to_string()), "content term kept");
+        assert!(kept.contains(&"oauth".to_string()), "content term kept");
+    }
+
+    #[test]
+    fn mask_keeps_out_of_corpus_terms() {
+        // A term the corpus doesn't contain (IDF undefined) must be KEPT — it
+        // could be the exact identifier the user means.
+        let idx = idx_from(&[("a.md", "# A\n\n## S\n\nlogin oauth")]);
+        let kept = idx.mask_low_idf_terms("login brandnewidentifier", 1.0);
+        assert!(
+            kept.contains(&"brandnewidentifier".to_string()),
+            "out-of-corpus term must be kept as a possible exact match: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn mask_falls_back_when_all_low() {
+        // An all-stopword query would mask to empty → fail-open returns the
+        // original tokens so the search is never starved.
+        let idx = idx_from(&[("a.md", "# A\n\n## S\n\nlogin")]);
+        let kept = idx.mask_low_idf_terms("the and for with", 1.0);
+        assert!(
+            !kept.is_empty(),
+            "all-stopword query must fall back to the original tokens, not empty"
+        );
+    }
+
+    #[test]
+    fn mask_single_term_is_untouched() {
+        let idx = idx_from(&[("a.md", "# A\n\n## S\n\nlogin login login")]);
+        // A single (even common) term is returned as-is — masking it would
+        // leave nothing useful to search.
+        assert_eq!(idx.mask_low_idf_terms("login", 1.0), vec!["login"]);
+    }
+
+    #[test]
+    fn search_terms_matches_search() {
+        // The pre-tokenised path must score identically to the string path.
+        let idx = idx_from(&[
+            ("login.md", "# Login\n\n## S\n\noauth pkce login"),
+            ("db.md", "# DB\n\n## S\n\npostgres tuning"),
+        ]);
+        let a = idx.search("login oauth", 5);
+        let b = idx.search_terms(&tokenize("login oauth"), 5);
+        assert_eq!(a, b, "search_terms must equal search for the same query");
     }
 
     #[tokio::test]

@@ -970,6 +970,17 @@ impl<R: Runtime> AgentRunner<R> {
         // when the vector layer is off or no API key is set — fail-open to BM25.
         let qvec = self.preembed_requirement().await;
 
+        // HyDE: generate ONE hypothetical answer for the requirement up front
+        // (a single short base call) and reuse it across every phase. Its BM25
+        // ranking gets RRF-fused into retrieval, recalling curated docs the
+        // user's literal wording would miss. Fail-open (offline / error / empty
+        // → None → retrieval is byte-for-byte the pre-HyDE path).
+        let hyde = if use_runtime {
+            crate::coach::generate_hyde_expansion(&self.runtime, &effective_requirement).await
+        } else {
+            None
+        };
+
         // 1. research
         let research_text = if skip.iter().any(|s| s == "research") {
             self.emit(EngineEvent::Note(format!(
@@ -1000,10 +1011,11 @@ impl<R: Runtime> AgentRunner<R> {
                 )));
             }
             let text = if use_runtime {
-                let research_digest = crate::phases::phase_knowledge_digest_with_vector(
+                let research_digest = crate::phases::phase_knowledge_digest_with_retrieval(
                     &self.options,
                     Phase::Research,
                     qvec.as_deref(),
+                    hyde.as_deref(),
                 );
                 let rp = self.with_expert_knowledge(
                     research_prompt(

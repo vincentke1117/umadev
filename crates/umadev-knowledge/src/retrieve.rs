@@ -224,6 +224,43 @@ pub fn retrieve_with_vector(
     phase: Phase,
     query_vec: Option<&[f32]>,
 ) -> Vec<ScoredChunk> {
+    retrieve_with_vector_and_expansion(
+        project_root,
+        knowledge_dir,
+        config,
+        query,
+        phase,
+        query_vec,
+        None,
+    )
+}
+
+/// Retrieval with an optional HyDE-style query EXPANSION — the BM25-first
+/// answer to lexical mismatch.
+///
+/// BM25 only matches terms the user literally wrote; a requirement phrased in
+/// the user's words often shares few tokens with the curated docs that answer
+/// it. When `expansion` is `Some` (a base-generated *hypothetical answer /
+/// relevant code passage* for the requirement), its BM25 ranking is computed
+/// alongside the original query's and the two are RANK-FUSED via RRF (k=60).
+/// The hypothetical, being written in the *answer's* vocabulary, recalls
+/// docs the bare query would miss; fusing (rather than replacing) keeps the
+/// query's own exact matches in the running too.
+///
+/// Fail-open / additive: `expansion = None` (or an empty/whitespace string, or
+/// an expansion that matches nothing) is byte-for-byte identical to
+/// [`retrieve_with_vector`]. The hypothetical-answer GENERATION lives in the
+/// agent crate (where the base driver is); this crate only fuses the result.
+#[must_use]
+pub fn retrieve_with_vector_and_expansion(
+    project_root: &Path,
+    knowledge_dir: &Path,
+    config: &RetrievalConfig,
+    query: &str,
+    phase: Phase,
+    query_vec: Option<&[f32]>,
+    expansion: Option<&str>,
+) -> Vec<ScoredChunk> {
     if !config.enabled || query.trim().is_empty() {
         return Vec::new();
     }
@@ -248,7 +285,34 @@ pub fn retrieve_with_vector(
     }
 
     // BM25 results over the full index (over-fetch so RRF has room).
-    let bm25_raw = index.search(query, config.top_k * 3);
+    // Query-side cleaning: drop low-IDF / function-word tokens so the rare,
+    // on-topic terms dominate the ranking instead of being diluted by filler
+    // (and, for CJK bigram queries, by a flood of weak near-matches). The mask
+    // is fail-open — if it would empty the query it returns the raw tokens — and
+    // we additionally fall back to the unmasked search if the masked search
+    // somehow finds nothing, so masking can only ever HELP, never starve.
+    let over_fetch = config.top_k * 3;
+    let masked_terms = index.mask_low_idf_terms(query, idf_floor());
+    let bm25_masked = index.search_terms(&masked_terms, over_fetch);
+    let query_bm25 = if bm25_masked.is_empty() {
+        index.search(query, over_fetch)
+    } else {
+        bm25_masked
+    };
+    // HyDE fusion: when a hypothetical-answer expansion is present and itself
+    // matches something, RRF-fuse its ranking with the query's. Empty / no-match
+    // expansion → identity (just the query ranking), preserving prior behaviour.
+    let bm25_raw = match expansion {
+        Some(exp) if !exp.trim().is_empty() => {
+            let exp_bm25 = index.search(exp, over_fetch);
+            if exp_bm25.is_empty() {
+                query_bm25
+            } else {
+                rrf_fuse_bm25(&query_bm25, &exp_bm25, RRF_K, over_fetch)
+            }
+        }
+        _ => query_bm25,
+    };
     let bm25_hits = filter_by_phase(&index, &bm25_raw, phase, config.top_k);
 
     // Vector fusion only when: hybrid engine, vector layer enabled, a query
@@ -362,6 +426,33 @@ pub fn retrieve_for_phase_with_vector(
     query_vec: Option<&[f32]>,
 ) -> Vec<ScoredChunk> {
     retrieve_with_vector(project_root, knowledge_dir, config, query, phase, query_vec)
+}
+
+/// Phase-aware retrieval with a pre-embedded query vector AND an optional
+/// HyDE expansion. The single entry point the agent crate's coach seam uses
+/// once it has generated a hypothetical answer: the expansion's BM25 ranking
+/// is RRF-fused with the query's (see [`retrieve_with_vector_and_expansion`]),
+/// composing on top of the existing BM25+vector fusion and the low-IDF mask.
+/// `expansion = None` is identical to [`retrieve_for_phase_with_vector`].
+#[must_use]
+pub fn retrieve_for_phase_with_expansion(
+    project_root: &Path,
+    knowledge_dir: &Path,
+    config: &RetrievalConfig,
+    query: &str,
+    phase: Phase,
+    query_vec: Option<&[f32]>,
+    expansion: Option<&str>,
+) -> Vec<ScoredChunk> {
+    retrieve_with_vector_and_expansion(
+        project_root,
+        knowledge_dir,
+        config,
+        query,
+        phase,
+        query_vec,
+        expansion,
+    )
 }
 
 /// Filter raw BM25 `(chunk_idx, score)` results to only chunks whose path
@@ -493,6 +584,21 @@ fn min_score_filter() -> f32 {
         .unwrap_or(0.5)
 }
 
+/// The IDF below which a query token is a candidate for low-IDF masking (the
+/// absolute half of the test — see [`Bm25Index::mask_low_idf_terms`]). Default
+/// `1.0`: with BM25's +1-smoothed IDF, a token appearing in roughly more than
+/// ~40% of chunks falls under this, so only genuinely common terms qualify
+/// (and they are still kept unless ALSO below the query's median IDF). Override
+/// with `UMADEV_KNOWLEDGE_IDF_FLOOR` (e.g. `0.0` to effectively disable the
+/// relative-IDF branch and mask on the stop list only).
+fn idf_floor() -> f64 {
+    std::env::var("UMADEV_KNOWLEDGE_IDF_FLOOR")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|v| v.max(0.0))
+        .unwrap_or(1.0)
+}
+
 /// Applies a weak `quality_score` boost: a chunk with `quality_score: 95`
 /// gets ~1.24× its normalised score (clamped to 1.0), so curated docs rank
 /// slightly above equally-matching un-scored ones. Missing quality_score is
@@ -530,6 +636,35 @@ fn normalise(index: &Bm25Index, hits: Vec<(usize, f64)>) -> Vec<ScoredChunk> {
         .filter(|(rank, sc)| *rank == 0 || sc.score >= min_score)
         .map(|(_, sc)| sc)
         .collect()
+}
+
+/// Reciprocal Rank Fusion of TWO BM25 ranked lists that share the same
+/// address space (both key on the index's `chunk_idx`). Used to fuse the
+/// original query's ranking with a HyDE expansion's ranking: a chunk surfaced
+/// by EITHER list scores `1/(k+rank)` from that list, and a chunk surfaced by
+/// BOTH (the strongest signal — query AND hypothetical agree) sums the two.
+///
+/// Simpler than [`rrf_fuse`] (the BM25↔vector fuser) because no `(path,
+/// section) → idx` remapping is needed — both inputs already speak chunk
+/// indices. Returns chunk indices ranked by fused score, truncated to `top_k`.
+fn rrf_fuse_bm25(
+    primary: &[(usize, f64)],
+    secondary: &[(usize, f64)],
+    k: u32,
+    top_k: usize,
+) -> Vec<(usize, f64)> {
+    let kf = f64::from(k);
+    let mut scores: HashMap<usize, f64> = HashMap::new();
+    for (rank, (idx, _)) in primary.iter().enumerate() {
+        *scores.entry(*idx).or_insert(0.0) += 1.0 / (kf + rank as f64 + 1.0);
+    }
+    for (rank, (idx, _)) in secondary.iter().enumerate() {
+        *scores.entry(*idx).or_insert(0.0) += 1.0 / (kf + rank as f64 + 1.0);
+    }
+    let mut fused: Vec<(usize, f64)> = scores.into_iter().collect();
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    fused.truncate(top_k);
+    fused
 }
 
 /// Reciprocal Rank Fusion — merge BM25 and vector ranked lists by
@@ -818,6 +953,103 @@ mod tests {
         // Only the known BM25 chunk survives.
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].0, 0);
+    }
+
+    #[test]
+    fn rrf_fuse_bm25_sums_overlap_and_unions() {
+        // chunk 0 is top of BOTH lists → highest fused score; chunk 2 appears in
+        // only the secondary list → still included (union), but lower.
+        let primary: Vec<(usize, f64)> = vec![(0, 5.0), (1, 2.0)];
+        let secondary: Vec<(usize, f64)> = vec![(0, 4.0), (2, 1.0)];
+        let fused = rrf_fuse_bm25(&primary, &secondary, 60, 5);
+        assert_eq!(fused[0].0, 0, "the chunk in both lists must lead");
+        let ids: Vec<usize> = fused.iter().map(|(i, _)| *i).collect();
+        assert!(ids.contains(&1) && ids.contains(&2), "union of both lists");
+        // chunk 0 (in both) outscores chunk 1 and chunk 2 (each in one).
+        assert!(fused[0].1 > fused[1].1);
+    }
+
+    #[test]
+    fn expansion_none_equals_plain_retrieval() {
+        // The HyDE entry point with expansion=None must be byte-for-byte the
+        // prior behaviour.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kd = seed_corpus(tmp.path());
+        let cfg = RetrievalConfig::default();
+        let plain = retrieve(tmp.path(), &kd, &cfg, "login oauth", Phase::Research);
+        let with_none = retrieve_with_vector_and_expansion(
+            tmp.path(),
+            &kd,
+            &cfg,
+            "login oauth",
+            Phase::Research,
+            None,
+            None,
+        );
+        let paths_a: Vec<_> = plain.iter().map(|h| h.chunk.meta.path.clone()).collect();
+        let paths_b: Vec<_> = with_none
+            .iter()
+            .map(|h| h.chunk.meta.path.clone())
+            .collect();
+        assert_eq!(paths_a, paths_b, "expansion=None must not change results");
+    }
+
+    #[test]
+    fn expansion_recalls_a_doc_the_query_misses() {
+        // The query shares NO tokens with the postgres doc; the HyDE expansion
+        // (answer vocabulary) does. Fusing must surface postgres that the bare
+        // query alone would never reach.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kd = seed_corpus(tmp.path());
+        let cfg = RetrievalConfig::default();
+        // Bare query: only the login doc shares tokens.
+        let bare = retrieve(tmp.path(), &kd, &cfg, "sign-in flow", Phase::Research);
+        assert!(
+            !bare.iter().any(|h| h.chunk.meta.path.contains("postgres")),
+            "bare query should not reach the postgres doc"
+        );
+        // With a hypothetical answer mentioning the DB-tuning vocabulary.
+        let fused = retrieve_with_vector_and_expansion(
+            tmp.path(),
+            &kd,
+            &cfg,
+            "sign-in flow",
+            Phase::Research,
+            None,
+            Some("Use shared_buffers and work_mem tuning for the database to scale logins."),
+        );
+        assert!(
+            fused.iter().any(|h| h.chunk.meta.path.contains("postgres")),
+            "HyDE expansion must recall the doc the bare query missed"
+        );
+    }
+
+    #[test]
+    fn empty_expansion_is_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kd = seed_corpus(tmp.path());
+        let cfg = RetrievalConfig::default();
+        let none = retrieve_with_vector_and_expansion(
+            tmp.path(),
+            &kd,
+            &cfg,
+            "login",
+            Phase::Research,
+            None,
+            None,
+        );
+        let blank = retrieve_with_vector_and_expansion(
+            tmp.path(),
+            &kd,
+            &cfg,
+            "login",
+            Phase::Research,
+            None,
+            Some("   "),
+        );
+        let a: Vec<_> = none.iter().map(|h| h.chunk.meta.path.clone()).collect();
+        let b: Vec<_> = blank.iter().map(|h| h.chunk.meta.path.clone()).collect();
+        assert_eq!(a, b, "whitespace expansion must be a no-op");
     }
 
     #[test]

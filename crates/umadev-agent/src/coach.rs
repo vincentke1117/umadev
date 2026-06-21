@@ -25,6 +25,7 @@ use std::path::PathBuf;
 
 use umadev_spec::Phase;
 
+use crate::experts::Prompt;
 use crate::runner::RunOptions;
 
 /// Subdirectory under `.umadev/` where coach prompts live.
@@ -48,9 +49,23 @@ pub fn write_coach_prompt_with_vector(
     phase: Phase,
     query_vec: Option<&[f32]>,
 ) -> io::Result<PathBuf> {
+    write_coach_prompt_with_retrieval(opts, phase, query_vec, None)
+}
+
+/// Write the coach prompt with an optional pre-embedded query vector AND an
+/// optional HyDE expansion (a base-generated hypothetical answer used to widen
+/// BM25 recall). The async runner generates the expansion once and passes it
+/// here so the evolution-memory block fuses it into retrieval. `expansion =
+/// None` behaves identically to [`write_coach_prompt_with_vector`].
+pub fn write_coach_prompt_with_retrieval(
+    opts: &RunOptions,
+    phase: Phase,
+    query_vec: Option<&[f32]>,
+    expansion: Option<&str>,
+) -> io::Result<PathBuf> {
     let dir = opts.project_root.join(COACH_DIR);
     fs::create_dir_all(&dir)?;
-    let body = render_coach_prompt_with_vector(opts, phase, query_vec);
+    let body = render_coach_prompt_with_retrieval(opts, phase, query_vec, expansion);
     let path = dir.join(coach_filename(phase));
     fs::write(&path, body)?;
     // Mirror to CURRENT.md so the host's CLAUDE.md can point at one
@@ -62,7 +77,9 @@ pub fn write_coach_prompt_with_vector(
         coach_filename(phase),
     );
     let mut current_body = header;
-    current_body.push_str(&render_coach_prompt_with_vector(opts, phase, query_vec));
+    current_body.push_str(&render_coach_prompt_with_retrieval(
+        opts, phase, query_vec, expansion,
+    ));
     fs::write(&current, current_body)?;
     Ok(path)
 }
@@ -97,6 +114,22 @@ pub fn render_coach_prompt_with_vector(
     phase: Phase,
     query_vec: Option<&[f32]>,
 ) -> String {
+    render_coach_prompt_with_retrieval(opts, phase, query_vec, None)
+}
+
+/// Pure renderer with an optional query vector AND an optional HyDE expansion.
+/// The expansion is RRF-fused into the BM25 knowledge channel (widening recall
+/// for the lexical terms the user didn't write); `expansion = None` is
+/// identical to [`render_coach_prompt_with_vector`]. The hypothetical-answer
+/// generation that produces `expansion` lives in [`generate_hyde_expansion`]
+/// (which needs the base runtime); this renderer only consumes the result.
+#[must_use]
+pub fn render_coach_prompt_with_retrieval(
+    opts: &RunOptions,
+    phase: Phase,
+    query_vec: Option<&[f32]>,
+    expansion: Option<&str>,
+) -> String {
     let slug = opts.effective_slug();
     let req = &opts.requirement;
     let preamble = spec_preamble();
@@ -104,7 +137,7 @@ pub fn render_coach_prompt_with_vector(
     // fingerprint-decay lesson channel are now RANK-FUSED into ONE budgeted,
     // unified block (see [`merge_dual_channel`]) instead of being stacked
     // blindly. Gate phases carry neither channel, so the merge is a no-op there.
-    let evolution_memory = render_evolution_memory(opts, phase, query_vec);
+    let evolution_memory = render_evolution_memory(opts, phase, query_vec, expansion);
     let body = match phase {
         Phase::Research => render_research(&slug, req, opts, query_vec),
         // Docs writes the UIUX *spec* — it needs the archetype tokens + design
@@ -197,8 +230,13 @@ impl ChannelItem {
 /// via [`merge_dual_channel`], and render. Gate phases (no knowledge, no docs to
 /// learn from) yield an empty string. This REPLACES the previous blind stacking
 /// of the two channels in the coach prompt.
-fn render_evolution_memory(opts: &RunOptions, phase: Phase, query_vec: Option<&[f32]>) -> String {
-    let knowledge = structured_knowledge_hits(opts, phase, query_vec);
+fn render_evolution_memory(
+    opts: &RunOptions,
+    phase: Phase,
+    query_vec: Option<&[f32]>,
+    expansion: Option<&str>,
+) -> String {
+    let knowledge = structured_knowledge_hits(opts, phase, query_vec, expansion);
     let lessons =
         crate::lessons::relevant_lessons_for_prompt_ranked(&opts.project_root, &opts.requirement);
     merge_dual_channel(knowledge, lessons, RRF_K, EVOLUTION_BUDGET_TOKENS)
@@ -215,6 +253,7 @@ fn structured_knowledge_hits(
     opts: &RunOptions,
     phase: Phase,
     query_vec: Option<&[f32]>,
+    expansion: Option<&str>,
 ) -> Vec<umadev_knowledge::ScoredChunk> {
     let base = crate::phases::knowledge_root(&opts.project_root);
     if !base.is_dir() || matches!(phase, Phase::DocsConfirm | Phase::PreviewConfirm) {
@@ -233,14 +272,67 @@ fn structured_knowledge_hits(
         top_k: cfg.top_k,
         custom_dirs: Vec::new(),
     };
-    umadev_knowledge::retrieve_for_phase_with_vector(
+    // HyDE: when the runner generated a hypothetical answer, its BM25 ranking is
+    // RRF-fused with the requirement's (see the knowledge crate). `None` →
+    // identical to the prior `retrieve_for_phase_with_vector` behaviour.
+    umadev_knowledge::retrieve_for_phase_with_expansion(
         &opts.project_root,
         &base,
         &rcfg,
         &opts.requirement,
         phase,
         query_vec,
+        expansion,
     )
+}
+
+/// Approximate token cap for the HyDE hypothetical answer. It only needs to be
+/// a dense paragraph of the *vocabulary* the right docs would use — not a real
+/// answer — so a tight cap keeps the extra base call cheap.
+const HYDE_MAX_TOKENS: u32 = 400;
+
+/// HyDE (Hypothetical Document Embeddings, adapted for a BM25-first stack):
+/// ask the borrowed brain to write a short *hypothetical answer / relevant code
+/// passage* for the requirement, BEFORE retrieval. That paragraph is phrased in
+/// the answer's own technical vocabulary, so using it to drive a second BM25
+/// pass — RRF-fused with the literal requirement's pass (see the knowledge
+/// crate's [`umadev_knowledge::retrieve_for_phase_with_expansion`]) — recalls
+/// the curated docs that the user's wording alone would miss. This is the
+/// highest-leverage cure for BM25's lexical-mismatch weakness.
+///
+/// FAIL-OPEN by contract: returns `None` when there is no brain (offline), the
+/// call errors, or the reply is empty — and a `None` expansion makes retrieval
+/// byte-for-byte identical to the pre-HyDE path. The base call reuses the
+/// SAME host-driver subprocess seam everything else uses; UmaDev adds no model
+/// endpoint of its own. The caller (the runner) generates this ONCE per run and
+/// threads it into every phase's coach prompt, so the cost is a single extra
+/// short call, not one per phase.
+pub async fn generate_hyde_expansion(
+    runtime: &dyn umadev_runtime::Runtime,
+    requirement: &str,
+) -> Option<String> {
+    if runtime.is_offline() || requirement.trim().is_empty() {
+        return None;
+    }
+    let prompt = Prompt {
+        system: "You expand a software requirement into search vocabulary. Write ONE dense \
+                 paragraph (3-6 sentences) describing, as if it already existed, the technical \
+                 solution / relevant code & doc passage that BEST answers the requirement: name \
+                 the concrete patterns, components, APIs, data structures, standards, and \
+                 terminology an expert reference on this topic would use. Do NOT ask questions, \
+                 do NOT add preamble or headings — output only the paragraph. Match the \
+                 requirement's language."
+            .to_string(),
+        user: format!("Requirement:\n{requirement}"),
+    };
+    let req = prompt.into_request(String::new(), HYDE_MAX_TOKENS);
+    let resp = runtime.complete(req).await.ok()?;
+    let text = resp.text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
 }
 
 /// Rank-fuse the two retrieval channels into ONE budgeted, deterministically
@@ -1435,6 +1527,7 @@ mod tests {
             backend: String::new(),
             design_system: String::new(),
             seed_template: String::new(),
+            mode: crate::trust::TrustMode::Guarded,
         }
     }
 
@@ -1537,6 +1630,31 @@ mod tests {
             occurrences: 1,
             context: vec![],
             efficacy: None,
+            invalidated: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_hyde_expansion_is_fail_open_offline() {
+        // No brain (offline) → no hypothetical answer, so retrieval stays on the
+        // pre-HyDE path. This is the fail-open contract.
+        let rt = umadev_runtime::OfflineRuntime::new(umadev_runtime::RuntimeKind::Anthropic);
+        let out = generate_hyde_expansion(&rt, "build a login system").await;
+        assert!(out.is_none(), "offline must yield no HyDE expansion");
+        // Empty requirement also yields None (nothing to expand).
+        let out = generate_hyde_expansion(&rt, "   ").await;
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn render_with_retrieval_none_matches_plain_renderer() {
+        // expansion=None must render exactly the same prompt as the non-HyDE
+        // renderer (additive-only contract).
+        let o = opts(Path::new("/tmp"));
+        for phase in [Phase::Research, Phase::Frontend, Phase::Backend] {
+            let plain = render_coach_prompt(&o, phase);
+            let with_none = render_coach_prompt_with_retrieval(&o, phase, None, None);
+            assert_eq!(plain, with_none, "expansion=None must not change {phase:?}");
         }
     }
 

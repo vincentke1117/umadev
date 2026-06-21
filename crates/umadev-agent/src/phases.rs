@@ -73,6 +73,22 @@ pub fn phase_knowledge_digest_with_vector(
     phase: Phase,
     query_vec: Option<&[f32]>,
 ) -> String {
+    phase_knowledge_digest_with_retrieval(opts, phase, query_vec, None)
+}
+
+/// Phase knowledge digest with an optional query vector AND an optional HyDE
+/// expansion (a base-generated hypothetical answer whose BM25 ranking is
+/// RRF-fused with the requirement's — see the knowledge crate). `expansion =
+/// None` is identical to [`phase_knowledge_digest_with_vector`]. The
+/// hypothetical-answer generation lives in [`crate::coach::generate_hyde_expansion`]
+/// (it needs the base runtime); this only consumes the result. Fail-open.
+#[must_use]
+pub fn phase_knowledge_digest_with_retrieval(
+    opts: &RunOptions,
+    phase: Phase,
+    query_vec: Option<&[f32]>,
+    expansion: Option<&str>,
+) -> String {
     let base = knowledge_root(&opts.project_root);
     if !base.is_dir() {
         return String::new();
@@ -92,13 +108,14 @@ pub fn phase_knowledge_digest_with_vector(
             top_k: cfg.top_k,
             custom_dirs: Vec::new(),
         };
-        let hits = umadev_knowledge::retrieve_for_phase_with_vector(
+        let hits = umadev_knowledge::retrieve_for_phase_with_expansion(
             &opts.project_root,
             &base,
             &rcfg,
             &opts.requirement,
             phase,
             query_vec,
+            expansion,
         );
         if hits.is_empty() {
             return String::new();
@@ -3328,6 +3345,7 @@ mod tests {
             backend: String::new(),
             design_system: String::new(),
             seed_template: String::new(),
+            mode: crate::trust::TrustMode::Guarded,
         }
     }
 
