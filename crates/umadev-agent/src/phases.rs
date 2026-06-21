@@ -2125,7 +2125,9 @@ fn scan_secret_leaks(project_root: &Path) -> (usize, Vec<String>) {
             .strip_prefix(project_root)
             .unwrap_or(p.as_path())
             .to_string_lossy()
-            .to_string();
+            // Normalize to forward slashes so offender paths are identical on
+            // Windows and Unix (audit/report consistency + stable tests).
+            .replace(std::path::MAIN_SEPARATOR, "/");
         if umadev_governance::rules::check_hardcoded_secret(&rel, &content).block {
             offenders.push(rel);
         }
