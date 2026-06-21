@@ -38,6 +38,15 @@ pub const LEARNED_DIR: &str = ".umadev/learned";
 pub const GLOBAL_LEARNED_DIRNAME: &str = ".umadev/learned";
 /// Raw JSONL file holding captured development errors (the "踩坑" log).
 pub const DEV_ERRORS_FILE: &str = "dev-errors.jsonl";
+/// Where per-signature reflection logs live — the sliding window of
+/// base-generated correction strategies for pitfalls that recurred after a
+/// warning. One JSONL file per (normalised) signature.
+pub const REFLECTIONS_DIR: &str = ".umadev/reflections";
+
+/// How many recent reflections to retain per signature. Small — we only need
+/// the latest distilled strategy plus a little history for context, not a full
+/// audit trail (the audit log already covers that).
+const MAX_REFLECTIONS_PER_SIG: usize = 3;
 
 /// The kind of captured experience.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +143,15 @@ pub struct PitfallEfficacy {
     /// recurred. `#[serde(default)]` keeps older efficacy rows readable.
     #[serde(default)]
     pub failed_fixes: Vec<String>,
+    /// A higher-level corrective STRATEGY, produced by the base on a true
+    /// recurrence (not a template). Where [`Self::failed_fixes`] records what NOT
+    /// to re-run, this records what to do INSTEAD: a different, simple,
+    /// higher-altitude approach that sidesteps the way the previous fixes failed.
+    /// Populated only by [`reflect_on_recurrence`] when the pitfall recurred after
+    /// a warning, and surfaced ahead of the failed-fix ledger on the next match.
+    /// Empty until reflection runs. `#[serde(default)]` keeps older rows readable.
+    #[serde(default)]
+    pub next_strategy: String,
 }
 
 /// Lifecycle of a pitfall's fix, derived from its efficacy record.
@@ -700,6 +718,184 @@ fn remember_failed_fix(eff: &mut PitfallEfficacy, fix: &str) {
     if eff.failed_fixes.len() > MAX_FAILED_FIXES {
         eff.failed_fixes.remove(0);
     }
+}
+
+// =====================================================================
+// Reflection: base-generated correction strategy on a TRUE recurrence.
+//
+// The first time a pitfall is hit we hand the worker a cheap template-built
+// diagnosis (root cause + recorded fix). Only when a pitfall recurs *after*
+// we already warned about it (`recurred_after_warning`) is the template
+// clearly insufficient — that is the moment, and the only moment, worth
+// spending one extra base call to ask for a DIFFERENT, higher-altitude
+// approach. The product (a short strategy) is stored on the efficacy record
+// and snapshotted to a per-signature sliding window for auditing/inspection.
+// =====================================================================
+
+/// One reflection: a base-generated corrective strategy for a recurring
+/// pitfall, snapshotted to `.umadev/reflections/<signature>.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reflection {
+    /// The normalised pitfall signature this strategy targets.
+    pub signature: String,
+    /// Occurrence count at the moment of reflection (how chronic it was).
+    pub occurrences: u32,
+    /// The base-generated strategy: a different, simple, high-level approach
+    /// that avoids the way the recorded fixes failed.
+    pub strategy: String,
+    /// ISO-8601 UTC timestamp the reflection was produced.
+    pub at: String,
+}
+
+/// Build the reflection prompt for a recurring pitfall. The system half pins
+/// the base to a strategy designer that produces a *different approach*, not a
+/// restatement of the error; the user half supplies the concrete context (root
+/// cause, the fixes already proven to fail). Returns `(system, user)`.
+///
+/// Deliberately demands ONE short, high-altitude strategy — "what to do
+/// differently", not "what the error said" — so the output is actionable
+/// avoid-next-time guidance rather than a louder stderr echo.
+#[must_use]
+pub fn reflection_prompt(l: &Lesson) -> (String, String) {
+    let failed = l
+        .efficacy
+        .as_ref()
+        .map(|e| e.failed_fixes.as_slice())
+        .unwrap_or(&[]);
+    let failed_block = if failed.is_empty() {
+        "(none recorded)".to_string()
+    } else {
+        failed
+            .iter()
+            .map(|f| format!("- {}", truncate(f, 200)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let system = "\
+You are a senior engineer doing a blameless post-mortem on a defect that KEEPS \
+RECURRING even after the obvious fix was applied. Your job is NOT to restate the \
+error or repeat the previous fix. Diagnose, in one or two sentences, WHY the \
+earlier fix failed to hold, then design ONE different, simple, higher-level \
+approach that sidesteps that failure mode entirely. Answer with the strategy \
+only — a few sentences, imperative voice, no preamble, no code dump."
+        .to_string();
+    let user = format!(
+        "## Recurring pitfall\nSignature: {sig}\nTimes hit: {hits}\n\n\
+         ## Root cause (recorded)\n{root}\n\n\
+         ## Fixes already tried that STILL let it recur (do not repeat these)\n{failed}\n\n\
+         Design a different, simple, high-level approach to avoid this from now on.",
+        sig = l.signature,
+        hits = l.hits(),
+        root = if l.root_cause.is_empty() {
+            "(not recorded)"
+        } else {
+            &l.root_cause
+        },
+        failed = failed_block,
+    );
+    (system, user)
+}
+
+/// Persist a base-generated correction `strategy` for the pitfall whose
+/// signature is `signature`: store it on the pitfall's efficacy record (so
+/// recall can surface it) AND append it to the per-signature reflection sliding
+/// window. `signature` is normalised internally so a caller can pass a raw
+/// classified signature. Returns `true` if a matching pitfall was updated.
+///
+/// Fail-open: an empty strategy, a missing store, or any I/O error is a no-op —
+/// the caller falls back to the existing template path. Holds [`DEV_KB_LOCK`]
+/// for the dev-errors read-modify-write so it never races the capture path.
+pub fn record_pitfall_strategy(project_root: &Path, signature: &str, strategy: &str) -> bool {
+    let strategy = strategy.trim();
+    if strategy.is_empty() {
+        return false;
+    }
+    static DEV_KB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _kb_guard = DEV_KB_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let sig = normalize_signature(signature);
+    let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
+    if store.is_empty() {
+        return false;
+    }
+    let mut hit: Option<&Lesson> = None;
+    let mut changed = false;
+    for l in &mut store {
+        if l.kind == LessonKind::DevError && l.signature == sig {
+            let occ = l.hits();
+            let eff = l.efficacy.get_or_insert(PitfallEfficacy {
+                injected: 0,
+                occ_at_injection: occ,
+                recurred_after_warning: false,
+                proven_fix: false,
+                failed_fixes: Vec::new(),
+                next_strategy: String::new(),
+            });
+            eff.next_strategy = truncate(strategy, 600);
+            changed = true;
+        }
+    }
+    if !changed {
+        return false;
+    }
+    // Snapshot for the sliding window BEFORE the write borrow ends.
+    if let Some(l) = store
+        .iter()
+        .find(|l| l.kind == LessonKind::DevError && l.signature == sig)
+    {
+        hit = Some(l);
+    }
+    if let Some(l) = hit {
+        append_reflection(
+            project_root,
+            &Reflection {
+                signature: sig.clone(),
+                occurrences: l.hits(),
+                strategy: truncate(strategy, 600),
+                at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            },
+        );
+    }
+    write_raw_lessons(project_root, DEV_ERRORS_FILE, &store);
+    true
+}
+
+/// Append a reflection to its per-signature sliding window
+/// (`.umadev/reflections/<slug>.jsonl`), keeping only the most recent
+/// [`MAX_REFLECTIONS_PER_SIG`]. Fail-open.
+fn append_reflection(project_root: &Path, r: &Reflection) {
+    let dir = project_root.join(REFLECTIONS_DIR);
+    let _ = fs::create_dir_all(&dir);
+    // Signature → filesystem-safe slug.
+    let slug: String = r
+        .signature
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let path = dir.join(format!("{slug}.jsonl"));
+    let mut window: Vec<Reflection> = fs::read_to_string(&path)
+        .ok()
+        .map(|text| {
+            text.lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str::<Reflection>(l).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    window.push(r.clone());
+    let len = window.len();
+    if len > MAX_REFLECTIONS_PER_SIG {
+        window.drain(0..len - MAX_REFLECTIONS_PER_SIG);
+    }
+    let mut buf = String::new();
+    for entry in &window {
+        if let Ok(line) = serde_json::to_string(entry) {
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+    }
+    let _ = fs::write(&path, buf);
 }
 
 /// Merge `incoming` tokens into `dst` (deduped), capping at `max`.
@@ -1380,6 +1576,43 @@ fn lesson_decay_score(
     rel * lesson_importance(l) * recency_weight(&l.first_seen, now)
 }
 
+/// Find the best-matching pitfall for `failure_detail` IFF it has TRULY recurred
+/// after a warning — i.e. the recorded fix already failed and a different,
+/// reflected strategy is warranted.
+///
+/// Mirrors the matching of [`lessons_for_error`] (recognised-only, normalised
+/// signature, full-signature-or-family filter, recurring-first ordering) but
+/// returns the matched [`Lesson`] only when its status is
+/// [`PitfallStatus::Recurring`]. The runner uses this to gate the single extra
+/// reflection base call: first failures (status `Active`) return `None`, so they
+/// keep the cheap template path and add no cost. Fail-open: an unrecognised error
+/// or no match returns `None`.
+#[must_use]
+pub fn recurring_pitfall_for_error(project_root: &Path, failure_detail: &str) -> Option<Lesson> {
+    let insight = crate::error_kb::classify_error(failure_detail);
+    if !insight.recognized {
+        return None;
+    }
+    let sig = normalize_signature(&insight.signature);
+    let family: String = sig.splitn(3, '/').take(2).collect::<Vec<_>>().join("/");
+    let mut hits: Vec<Lesson> = read_raw_lessons(project_root, DEV_ERRORS_FILE)
+        .into_iter()
+        .filter(|l| l.signature == sig || (!family.is_empty() && l.signature.starts_with(&family)))
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort_by(|a, b| {
+        let recurring = |l: &Lesson| u8::from(l.pitfall_status() == PitfallStatus::Recurring);
+        recurring(b)
+            .cmp(&recurring(a))
+            .then(b.hits().cmp(&a.hits()))
+    });
+    hits.into_iter()
+        .next()
+        .filter(|l| l.pitfall_status() == PitfallStatus::Recurring)
+}
+
 /// Retrieve prior lessons whose error signature matches `failure_detail` — the
 /// HIGHEST-precision retrieval trigger in the whole loop: it fires on a CONCRETE
 /// failure (retrieve only when failing / uncertain), so the match key is an
@@ -1445,9 +1678,25 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
         },
     ));
     if recurring {
-        out.push_str(
-            "  [!] 上次已警示但仍复发——之前的修法不够彻底。这次必须换一个根本性的不同方案，并在修完后自检确认。\n",
-        );
+        // Prefer the base-generated correction STRATEGY when reflection has
+        // produced one — it says concretely "switch to THIS approach", which is
+        // far more actionable than the bare "换个根本不同方案" template line.
+        // Fall back to the template line only when no strategy exists yet.
+        let strategy = top
+            .efficacy
+            .as_ref()
+            .map(|e| e.next_strategy.trim())
+            .filter(|s| !s.is_empty());
+        if let Some(strategy) = strategy {
+            out.push_str(&format!(
+                "  [!] 上次已警示但仍复发——之前的修法不够彻底。改用这个不同的高层做法：\n    {}\n",
+                truncate(strategy, 600),
+            ));
+        } else {
+            out.push_str(
+                "  [!] 上次已警示但仍复发——之前的修法不够彻底。这次必须换一个根本性的不同方案，并在修完后自检确认。\n",
+            );
+        }
         // Name the specific fixes that were ALREADY tried and failed, so the
         // base is steered AWAY from re-running them, not just told "try
         // harder". This is the structured "失败修法 + 换思路" guidance.
@@ -1492,9 +1741,77 @@ fn render_failed_fixes(l: &Lesson) -> String {
 /// `phase_knowledge_digest`.
 #[must_use]
 pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> String {
+    let selected = select_relevant_lessons(project_root, requirement);
+    if selected.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "
+## Lessons from prior runs
+
+",
+    );
+    out.push_str("Experiences captured from previous runs on this project. ");
+    out.push_str(
+        "Apply these to avoid repeating mistakes:
+
+",
+    );
+    for lesson in &selected {
+        out.push_str(&render_one_lesson(lesson));
+    }
+
+    // Efficacy bookkeeping: mark the dev-error pitfalls we just surfaced as
+    // "injected" so a later capture can tell whether the warning actually
+    // prevented recurrence. Fail-open — purely advisory state.
+    record_pitfall_injections(project_root, &surfaced_signatures(&selected));
+
+    out
+}
+
+/// Structured sibling of [`relevant_lessons_for_prompt`]: returns the SAME
+/// ranked selection as `(rank, Lesson)` pairs (rank 0 = best) instead of a
+/// rendered string. The String API stays byte-for-byte unchanged; this variant
+/// exists so a higher-altitude assembler (the coach's dual-channel reranker)
+/// can fuse the fingerprint-decay channel with the BM25 knowledge channel by
+/// RANK without re-deriving the selection.
+///
+/// Performs the same efficacy "injected" bookkeeping as the String API, because
+/// returning these pairs to the caller means they ARE being surfaced into a
+/// prompt. Empty for first-ever runs.
+#[must_use]
+pub fn relevant_lessons_for_prompt_ranked(
+    project_root: &Path,
+    requirement: &str,
+) -> Vec<(usize, Lesson)> {
+    let selected = select_relevant_lessons(project_root, requirement);
+    if selected.is_empty() {
+        return Vec::new();
+    }
+    record_pitfall_injections(project_root, &surfaced_signatures(&selected));
+    selected.into_iter().enumerate().collect()
+}
+
+/// The dev-error signatures among `selected`, for efficacy "injected" bookkeeping.
+fn surfaced_signatures(selected: &[Lesson]) -> Vec<String> {
+    selected
+        .iter()
+        .filter(|l| l.kind == LessonKind::DevError && !l.signature.is_empty())
+        .map(|l| l.signature.clone())
+        .collect()
+}
+
+/// Shared selection core for both the String and structured lesson APIs: builds
+/// the trigger query (requirement words + project tech-stack fingerprint), scores
+/// every lesson on the (relevance, composite-decay) axes, and applies the same
+/// two-tier pick (≤2 positively-matched, then top up to 3 with recent dev-errors
+/// then quality failures). Returns the chosen lessons in final rank order. Pure
+/// read — efficacy bookkeeping is the caller's responsibility so it happens
+/// exactly once per surfacing.
+fn select_relevant_lessons(project_root: &Path, requirement: &str) -> Vec<Lesson> {
     let lessons = read_all_raw_lessons(project_root);
     if lessons.is_empty() {
-        return String::new();
+        return Vec::new();
     }
 
     // The trigger query = the requirement's words PLUS the project's real
@@ -1565,82 +1882,78 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
             }
         }
     }
-    if top_idx.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from(
-        "
-## Lessons from prior runs
+    top_idx.iter().map(|&i| scored[i].2.clone()).collect()
+}
 
-",
-    );
-    out.push_str("Experiences captured from previous runs on this project. ");
-    out.push_str(
-        "Apply these to avoid repeating mistakes:
+/// Render ONE lesson into its prompt fragment — the public entry point used by
+/// the coach's dual-channel reranker to render a fused lesson item with the SAME
+/// formatting the String API uses (so a lesson reads identically whether it
+/// arrives via the stacked path or the rank-fused path).
+#[must_use]
+pub fn render_lesson_for_prompt(lesson: &Lesson) -> String {
+    render_one_lesson(lesson)
+}
 
-",
-    );
-    for &i in &top_idx {
-        let lesson = scored[i].2;
-        let icon = match lesson.kind {
-            LessonKind::Failure => "[warn]",
-            LessonKind::Revision => "[write]",
-            LessonKind::ValidatedPattern => "[ok]",
-            LessonKind::DevError => "[pitfall]",
+/// Render ONE selected lesson into the prompt block (shared by the String API
+/// and any caller that surfaces a single lesson). Identical formatting to the
+/// previous inline renderer so existing snapshots/tests are unaffected.
+fn render_one_lesson(lesson: &Lesson) -> String {
+    let icon = match lesson.kind {
+        LessonKind::Failure => "[warn]",
+        LessonKind::Revision => "[write]",
+        LessonKind::ValidatedPattern => "[ok]",
+        LessonKind::DevError => "[pitfall]",
+    };
+    // Dev errors carry their root cause too, so the worker understands WHY
+    // to avoid the pitfall, not just the fix. The hit count signals how
+    // chronic it is — a pitfall hit many times deserves extra care.
+    if lesson.kind == LessonKind::DevError {
+        let freq = if lesson.hits() > 1 {
+            format!(" (已踩 {} 次)", lesson.hits())
+        } else {
+            String::new()
         };
-        // Dev errors carry their root cause too, so the worker understands WHY
-        // to avoid the pitfall, not just the fix. The hit count signals how
-        // chronic it is — a pitfall hit many times deserves extra care.
-        if lesson.kind == LessonKind::DevError {
-            let freq = if lesson.hits() > 1 {
-                format!(" (已踩 {} 次)", lesson.hits())
-            } else {
-                String::new()
-            };
-            // Escalate a pitfall whose previous fix failed — tell the worker
-            // the obvious fix didn't hold and to take a different, deeper tack.
-            // Also list the SPECIFIC failed fixes so it changes approach
-            // instead of re-running a known-failure (see
-            // [`render_failed_fixes`]).
-            let escalate = if lesson.pitfall_status() == PitfallStatus::Recurring {
+        // Escalate a pitfall whose previous fix failed — tell the worker
+        // the obvious fix didn't hold and to take a different, deeper tack.
+        // Prefer the base-reflected strategy when one exists; otherwise list the
+        // SPECIFIC failed fixes so it changes approach instead of re-running a
+        // known-failure (see [`render_failed_fixes`]).
+        let escalate = if lesson.pitfall_status() == PitfallStatus::Recurring {
+            let strategy = lesson
+                .efficacy
+                .as_ref()
+                .map(|e| e.next_strategy.trim())
+                .filter(|s| !s.is_empty());
+            let lead = if let Some(strategy) = strategy {
                 format!(
-                    "\n   ⚠ 上次已警示但仍复发 —— 之前的修法不够,这次必须换更彻底的方案并验证。\n{}",
-                    render_failed_fixes(lesson)
+                    "\n   ⚠ 上次已警示但仍复发 —— 改用这个不同的高层做法：\n   {}",
+                    truncate(strategy, 600)
                 )
             } else {
-                String::new()
+                "\n   ⚠ 上次已警示但仍复发 —— 之前的修法不够,这次必须换更彻底的方案并验证。"
+                    .to_string()
             };
-            out.push_str(&format!(
-                "{icon} **{}**{freq}
+            format!("{lead}\n{}", render_failed_fixes(lesson))
+        } else {
+            String::new()
+        };
+        format!(
+            "{icon} **{}**{freq}
    原因: {}
    规避: {}{escalate}
 
 ",
-                lesson.title, lesson.root_cause, lesson.fix
-            ));
-        } else {
-            out.push_str(&format!(
-                "{icon} **{}**
+            lesson.title, lesson.root_cause, lesson.fix
+        )
+    } else {
+        format!(
+            "{icon} **{}**
    {}
 
 ",
-                lesson.title, lesson.fix
-            ));
-        }
+            lesson.title, lesson.fix
+        )
     }
-
-    // Efficacy bookkeeping: mark the dev-error pitfalls we just surfaced as
-    // "injected" so a later capture can tell whether the warning actually
-    // prevented recurrence. Fail-open — purely advisory state.
-    let surfaced: Vec<String> = top_idx
-        .iter()
-        .map(|&i| scored[i].2)
-        .filter(|l| l.kind == LessonKind::DevError && !l.signature.is_empty())
-        .map(|l| l.signature.clone())
-        .collect();
-    record_pitfall_injections(project_root, &surfaced);
-
-    out
 }
 
 /// Mark dev-error pitfalls as surfaced-to-the-worker, snapshotting their hit
@@ -1666,6 +1979,7 @@ fn record_pitfall_injections(project_root: &Path, signatures: &[String]) {
                 recurred_after_warning: false,
                 proven_fix: false,
                 failed_fixes: Vec::new(),
+                next_strategy: String::new(),
             });
             eff.injected = eff.injected.saturating_add(1);
             eff.occ_at_injection = occ;
@@ -1706,6 +2020,7 @@ pub fn mark_pitfalls_resolved(project_root: &Path, raw_errors: &[String]) -> usi
                 recurred_after_warning: false,
                 proven_fix: false,
                 failed_fixes: Vec::new(),
+                next_strategy: String::new(),
             });
             eff.proven_fix = true;
             eff.recurred_after_warning = false;
@@ -2338,6 +2653,7 @@ mod tests {
             recurred_after_warning: true,
             proven_fix: false,
             failed_fixes: Vec::new(),
+            next_strategy: String::new(),
         }));
         let validated = mk(Some(PitfallEfficacy {
             injected: 2,
@@ -2345,11 +2661,123 @@ mod tests {
             recurred_after_warning: false,
             proven_fix: true,
             failed_fixes: Vec::new(),
+            next_strategy: String::new(),
         }));
         assert!(
             lesson_importance(&recurring) > lesson_importance(&validated),
             "a failing (recurring) fix must outweigh a handled (validated) one"
         );
+    }
+
+    #[test]
+    fn reflection_records_strategy_only_for_recurring_and_surfaces_it() {
+        // A recurring pitfall (recurred after a warning) is the ONLY case that
+        // warrants a reflected strategy; record it, then confirm it backfills the
+        // efficacy record, the per-signature sliding window, and the recall text.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let recurring = Lesson {
+            kind: LessonKind::DevError,
+            domain: "dependency".into(),
+            title: "踩坑 [dependency/module-not-found/lodash]".into(),
+            body: String::new(),
+            fix: "npm install lodash".into(),
+            root_cause: "missing dependency".into(),
+            keywords: vec![],
+            source_requirement: "r".into(),
+            first_seen: "2026-06-21T00:00:00Z".into(),
+            signature: "dependency/module-not-found/lodash".into(),
+            occurrences: 4,
+            context: vec!["lodash".into()],
+            efficacy: Some(PitfallEfficacy {
+                injected: 1,
+                occ_at_injection: 1,
+                recurred_after_warning: true, // ← already warned, still recurred
+                proven_fix: false,
+                failed_fixes: vec!["npm install lodash".into()],
+                next_strategy: String::new(),
+            }),
+        };
+        write_raw_lessons(root, DEV_ERRORS_FILE, std::slice::from_ref(&recurring));
+
+        // A FIRST failure (status Active) must NOT trigger reflection — the
+        // gate returns None so the caller keeps the cheap template path.
+        let active = Lesson {
+            efficacy: Some(PitfallEfficacy {
+                injected: 0,
+                occ_at_injection: 4,
+                recurred_after_warning: false,
+                proven_fix: false,
+                failed_fixes: Vec::new(),
+                next_strategy: String::new(),
+            }),
+            ..recurring.clone()
+        };
+        write_raw_lessons(tmp.path().join("active").as_path(), DEV_ERRORS_FILE, &[]);
+        let active_root = tmp.path().join("active");
+        std::fs::create_dir_all(active_root.join(RAW_DIR)).unwrap();
+        write_raw_lessons(&active_root, DEV_ERRORS_FILE, std::slice::from_ref(&active));
+        assert!(
+            recurring_pitfall_for_error(&active_root, "Cannot find module 'lodash'").is_none(),
+            "a first failure (Active) must not gate a reflection"
+        );
+
+        // The recurring store DOES gate reflection.
+        let matched = recurring_pitfall_for_error(root, "Cannot find module 'lodash'")
+            .expect("recurring pitfall must gate reflection");
+        assert_eq!(matched.signature, "dependency/module-not-found/lodash");
+        let (system, user) = reflection_prompt(&matched);
+        assert!(system.to_lowercase().contains("different"));
+        // The prompt must steer AWAY from the already-failed fix.
+        assert!(user.contains("npm install lodash"));
+
+        // Record a base-generated strategy and confirm the backfill.
+        let strategy = "Pin the dependency in package.json and run a clean install so the lockfile resolves it deterministically.";
+        assert!(record_pitfall_strategy(
+            root,
+            "dependency/module-not-found/lodash",
+            strategy
+        ));
+
+        // 1) efficacy.next_strategy is set on the stored pitfall.
+        let stored = read_raw_lessons(root, DEV_ERRORS_FILE);
+        let eff = stored[0].efficacy.as_ref().unwrap();
+        assert_eq!(eff.next_strategy, strategy);
+
+        // 2) the sliding window has exactly one reflection for this signature.
+        let win_dir = root.join(REFLECTIONS_DIR);
+        let entries: Vec<_> = std::fs::read_dir(&win_dir).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1, "one reflection file for the signature");
+
+        // 3) recall surfaces the strategy ahead of the bare template line.
+        let recall = lessons_for_error(root, "Cannot find module 'lodash'");
+        assert!(
+            recall.contains(strategy),
+            "lessons_for_error must surface the reflected strategy: {recall}"
+        );
+
+        // An empty strategy is a no-op (fail-open).
+        assert!(!record_pitfall_strategy(
+            root,
+            "dependency/module-not-found/lodash",
+            "   "
+        ));
+
+        // The sliding window keeps only the most recent MAX_REFLECTIONS_PER_SIG.
+        for n in 0..MAX_REFLECTIONS_PER_SIG + 2 {
+            record_pitfall_strategy(
+                root,
+                "dependency/module-not-found/lodash",
+                &format!("strategy variant {n}"),
+            );
+        }
+        let slug: String = "dependency/module-not-found/lodash"
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let win = std::fs::read_to_string(win_dir.join(format!("{slug}.jsonl"))).unwrap();
+        let kept = win.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(kept, MAX_REFLECTIONS_PER_SIG, "window is capped");
     }
 
     #[test]
@@ -2382,6 +2810,7 @@ mod tests {
                 recurred_after_warning: true,
                 proven_fix: false,
                 failed_fixes: Vec::new(),
+                next_strategy: String::new(),
             }),
         });
         // Fill past the cap with ancient, validated (handled) pitfalls.
@@ -2405,6 +2834,7 @@ mod tests {
                     recurred_after_warning: false,
                     proven_fix: true,
                     failed_fixes: Vec::new(),
+                    next_strategy: String::new(),
                 }),
             });
         }

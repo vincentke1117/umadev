@@ -611,6 +611,36 @@ impl<R: Runtime> AgentRunner<R> {
         } else {
             String::new()
         };
+        // Reflection: ONLY when this exact pitfall TRULY recurred after a prior
+        // warning (its recorded fix already failed) do we spend one extra cheap
+        // base call to design a DIFFERENT high-level approach. First failures
+        // stay on the template path above — no reflection, no added cost. The
+        // produced strategy is recorded on the pitfall + a sliding window, so the
+        // `lessons_for_error` injection below surfaces it. Fail-open: a base
+        // error/empty reply just leaves the template path unchanged.
+        if let Some(recurring) = crate::lessons::recurring_pitfall_for_error(
+            &self.options.project_root,
+            &first.failure_detail,
+        ) {
+            let (system, user) = crate::lessons::reflection_prompt(&recurring);
+            if let Some(text) = self
+                .try_generate(phase, Prompt { system, user })
+                .await
+                .filter(|t| !t.trim().is_empty())
+            {
+                let recorded = crate::lessons::record_pitfall_strategy(
+                    &self.options.project_root,
+                    &recurring.signature,
+                    &text,
+                );
+                if recorded {
+                    self.emit(EngineEvent::Note(
+                        "[learned] 同类踩坑反复出现，已让底座反思生成一个不同的高层纠错策略并注入本次修复。"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         // Closed-loop stage 5: at the exact moment of failure, surface prior
         // lessons with the SAME error signature ("you hit this N times before;
         // here's what worked; it keeps recurring"). Fingerprint-gated + abstains

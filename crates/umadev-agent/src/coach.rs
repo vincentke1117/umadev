@@ -100,10 +100,11 @@ pub fn render_coach_prompt_with_vector(
     let slug = opts.effective_slug();
     let req = &opts.requirement;
     let preamble = spec_preamble();
-    let expert_knowledge =
-        crate::phases::phase_knowledge_digest_with_vector(opts, phase, query_vec);
-    let lessons =
-        crate::lessons::relevant_lessons_for_prompt(&opts.project_root, &opts.requirement);
+    // Dual-channel evolution memory: the BM25 knowledge channel and the
+    // fingerprint-decay lesson channel are now RANK-FUSED into ONE budgeted,
+    // unified block (see [`merge_dual_channel`]) instead of being stacked
+    // blindly. Gate phases carry neither channel, so the merge is a no-op there.
+    let evolution_memory = render_evolution_memory(opts, phase, query_vec);
     let body = match phase {
         Phase::Research => render_research(&slug, req, opts, query_vec),
         // Docs writes the UIUX *spec* — it needs the archetype tokens + design
@@ -125,9 +126,243 @@ pub fn render_coach_prompt_with_vector(
          `umadev continue` to advance.\n\n\
          {preamble}\n\n\
          {body}\n\
-         {expert_knowledge}\n{lessons}\n{mcp_tools}",
+         {evolution_memory}\n{mcp_tools}",
         phase.id()
     )
+}
+
+/// Standard reciprocal-rank-fusion constant. `k=60` is the value used by the
+/// knowledge crate's own BM25+vector fusion and the original RRF literature; a
+/// larger `k` flattens the contribution of rank, a smaller one sharpens it.
+const RRF_K: usize = 60;
+
+/// Per-channel guaranteed slots in the fused output. The lesson channel is the
+/// scarce, high-signal "踩坑 avoid-next-time" memory — it gets at least ONE slot
+/// even if the BM25 channel's RRF scores would otherwise crowd it out. The
+/// knowledge channel keeps a wider floor so the professional library stays
+/// well-represented.
+const LESSON_FLOOR: usize = 1;
+const KNOWLEDGE_FLOOR: usize = 3;
+
+/// Approximate token budget for the whole fused evolution-memory block. A rough
+/// chars≈tokens·4 heuristic (matches the governance tokenizer's order of
+/// magnitude) keeps the merged block from ballooning the coach prompt. Generous
+/// enough that the floors always fit.
+const EVOLUTION_BUDGET_TOKENS: usize = 1400;
+
+/// One item from either retrieval channel, tagged with its WITHIN-CHANNEL rank
+/// (0 = top of its own list). RRF fuses on this rank only — never on the raw
+/// BM25 score or the lesson decay score — so the two incomparable score scales
+/// never need normalising.
+enum ChannelItem {
+    /// A BM25 (or BM25+vector) knowledge chunk.
+    Knowledge {
+        rank: usize,
+        hit: umadev_knowledge::ScoredChunk,
+    },
+    /// A fingerprint-decay-ranked prior-run lesson.
+    Lesson {
+        rank: usize,
+        lesson: crate::lessons::Lesson,
+    },
+}
+
+impl ChannelItem {
+    /// Within-channel rank (0 = best) used for RRF.
+    fn rank(&self) -> usize {
+        match self {
+            ChannelItem::Knowledge { rank, .. } | ChannelItem::Lesson { rank, .. } => *rank,
+        }
+    }
+    /// `true` for the scarce lesson channel — drives the per-channel floor.
+    fn is_lesson(&self) -> bool {
+        matches!(self, ChannelItem::Lesson { .. })
+    }
+    /// Render this item into its prompt fragment.
+    fn render(&self) -> String {
+        match self {
+            ChannelItem::Knowledge { hit, .. } => format!(
+                "### `{}` — *{}*\n\n{}\n\n",
+                hit.chunk.meta.path,
+                hit.chunk.meta.section,
+                hit.chunk.excerpt(400)
+            ),
+            ChannelItem::Lesson { lesson, .. } => crate::lessons::render_lesson_for_prompt(lesson),
+        }
+    }
+}
+
+/// Assemble the unified evolution-memory block for a phase: pull the BM25
+/// knowledge channel and the fingerprint-decay lesson channel, RANK-FUSE them
+/// via [`merge_dual_channel`], and render. Gate phases (no knowledge, no docs to
+/// learn from) yield an empty string. This REPLACES the previous blind stacking
+/// of the two channels in the coach prompt.
+fn render_evolution_memory(opts: &RunOptions, phase: Phase, query_vec: Option<&[f32]>) -> String {
+    let knowledge = structured_knowledge_hits(opts, phase, query_vec);
+    let lessons =
+        crate::lessons::relevant_lessons_for_prompt_ranked(&opts.project_root, &opts.requirement);
+    merge_dual_channel(knowledge, lessons, RRF_K, EVOLUTION_BUDGET_TOKENS)
+}
+
+/// Fetch the BM25 (or BM25+vector) knowledge channel as STRUCTURED hits, mirroring
+/// `phase_knowledge_digest_with_vector`'s retrieval but returning the ranked
+/// chunks instead of a rendered string — so the coach can rank-fuse them with the
+/// lesson channel. Stays OUT of the knowledge crate (uses only its public
+/// `retrieve_for_phase_with_vector`), preserving the `dedup_learned_chunks`
+/// channel boundary. Empty for gate phases, when the dir is missing, or when
+/// retrieval is disabled. Fail-open.
+fn structured_knowledge_hits(
+    opts: &RunOptions,
+    phase: Phase,
+    query_vec: Option<&[f32]>,
+) -> Vec<umadev_knowledge::ScoredChunk> {
+    let base = crate::phases::knowledge_root(&opts.project_root);
+    if !base.is_dir() || matches!(phase, Phase::DocsConfirm | Phase::PreviewConfirm) {
+        return Vec::new();
+    }
+    let cfg = crate::config::load_project_config(&opts.project_root).knowledge;
+    if !cfg.enabled {
+        return Vec::new();
+    }
+    let rcfg = umadev_knowledge::RetrievalConfig {
+        enabled: true,
+        engine: match cfg.engine.as_str() {
+            "hybrid" => umadev_knowledge::RetrievalEngine::Hybrid,
+            _ => umadev_knowledge::RetrievalEngine::Bm25,
+        },
+        top_k: cfg.top_k,
+        custom_dirs: Vec::new(),
+    };
+    umadev_knowledge::retrieve_for_phase_with_vector(
+        &opts.project_root,
+        &base,
+        &rcfg,
+        &opts.requirement,
+        phase,
+        query_vec,
+    )
+}
+
+/// Rank-fuse the two retrieval channels into ONE budgeted, deterministically
+/// ordered block via reciprocal rank fusion: `score = Σ 1/(k + rank)` over the
+/// channels an item appears in (here each item is in exactly one channel, so it
+/// is a single `1/(k+rank)` term). Fusing on RANK alone means the BM25 score and
+/// the lesson decay score never have to be normalised onto a common scale.
+///
+/// Two guarantees the bare RRF order wouldn't give:
+/// - **per-channel floors** — at least [`LESSON_FLOOR`] lesson(s) and
+///   [`KNOWLEDGE_FLOOR`] knowledge chunk(s) survive even if the other channel's
+///   ranks dominate, so the scarce 踩坑 memory is never fully crowded out.
+/// - **token budget** — items are admitted in fused order until
+///   [`EVOLUTION_BUDGET_TOKENS`] (chars≈4·tokens) is reached; floor items are
+///   admitted first so they always fit. An empty input yields an empty string
+///   (gate phases / first runs), leaving the prompt unchanged.
+fn merge_dual_channel(
+    knowledge: Vec<umadev_knowledge::ScoredChunk>,
+    lessons: Vec<(usize, crate::lessons::Lesson)>,
+    k: usize,
+    budget_tokens: usize,
+) -> String {
+    let mut items: Vec<ChannelItem> = Vec::with_capacity(knowledge.len() + lessons.len());
+    for (rank, hit) in knowledge.into_iter().enumerate() {
+        items.push(ChannelItem::Knowledge { rank, hit });
+    }
+    for (rank, lesson) in lessons {
+        items.push(ChannelItem::Lesson { rank, lesson });
+    }
+    if items.is_empty() {
+        return String::new();
+    }
+
+    // RRF score by rank only. Sort by score desc; lessons win ties so the scarce
+    // channel edges ahead at equal rank (deterministic, channel-stable).
+    let rrf = |rank: usize| 1.0_f64 / (k as f64 + rank as f64);
+    items.sort_by(|a, b| {
+        rrf(b.rank())
+            .partial_cmp(&rrf(a.rank()))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.is_lesson().cmp(&a.is_lesson()))
+    });
+
+    // Reserve the per-channel floor slots first (in fused order), then fill the
+    // rest by fused order under the token budget. Tracking admitted indices keeps
+    // the floor + budget passes from double-counting an item.
+    let budget_chars = budget_tokens.saturating_mul(4);
+    let mut admitted: Vec<usize> = Vec::new();
+    let mut used_chars = 0usize;
+    let mut lesson_taken = 0usize;
+    let mut knowledge_taken = 0usize;
+
+    let admit = |idx: usize,
+                 admitted: &mut Vec<usize>,
+                 used_chars: &mut usize,
+                 lesson_taken: &mut usize,
+                 knowledge_taken: &mut usize| {
+        if admitted.contains(&idx) {
+            return;
+        }
+        let cost = items[idx].render().chars().count();
+        *used_chars += cost;
+        if items[idx].is_lesson() {
+            *lesson_taken += 1;
+        } else {
+            *knowledge_taken += 1;
+        }
+        admitted.push(idx);
+    };
+
+    // Pass 1 — floors: take the top-ranked items of each channel up to its floor,
+    // unconditionally (so the scarce lesson memory always survives).
+    for (idx, it) in items.iter().enumerate() {
+        let need_floor = if it.is_lesson() {
+            lesson_taken < LESSON_FLOOR
+        } else {
+            knowledge_taken < KNOWLEDGE_FLOOR
+        };
+        if need_floor {
+            admit(
+                idx,
+                &mut admitted,
+                &mut used_chars,
+                &mut lesson_taken,
+                &mut knowledge_taken,
+            );
+        }
+    }
+    // Pass 2 — budget fill: admit remaining items in fused order until the next
+    // one would blow the budget.
+    for (idx, it) in items.iter().enumerate() {
+        if admitted.contains(&idx) {
+            continue;
+        }
+        let cost = it.render().chars().count();
+        if used_chars + cost > budget_chars {
+            continue;
+        }
+        admit(
+            idx,
+            &mut admitted,
+            &mut used_chars,
+            &mut lesson_taken,
+            &mut knowledge_taken,
+        );
+    }
+
+    // Emit in the FUSED order (not admission order) so the strongest items lead.
+    let mut out =
+        String::from("\n\n## Evolution memory (knowledge + prior-run lessons, rank-fused)\n\n");
+    let mut admitted_sorted = admitted;
+    admitted_sorted.sort_unstable();
+    // `items` is already in fused order, so iterating ascending index == fused order.
+    let mut any = false;
+    for idx in admitted_sorted {
+        out.push_str(&items[idx].render());
+        any = true;
+    }
+    if !any {
+        return String::new();
+    }
+    out
 }
 
 /// Load MCP tool information from `.mcp.json` so the coach prompt can tell
@@ -1266,5 +1501,93 @@ mod tests {
     fn coach_filename_is_zero_padded_phase_ordered() {
         assert_eq!(coach_filename(Phase::Research), "01-research.md");
         assert_eq!(coach_filename(Phase::Delivery), "09-delivery.md");
+    }
+
+    fn mk_chunk(path: &str, body: &str) -> umadev_knowledge::ScoredChunk {
+        umadev_knowledge::ScoredChunk {
+            chunk: umadev_knowledge::Chunk {
+                meta: umadev_knowledge::ChunkMeta {
+                    path: path.to_string(),
+                    title: path.to_string(),
+                    section: "S".to_string(),
+                    tags: vec![],
+                    domain: "d".to_string(),
+                    difficulty: None,
+                },
+                body: body.to_string(),
+                tokens: vec![],
+                quality_score: None,
+            },
+            score: 1.0,
+        }
+    }
+
+    fn mk_lesson(title: &str) -> crate::lessons::Lesson {
+        crate::lessons::Lesson {
+            kind: crate::lessons::LessonKind::DevError,
+            domain: "dependency".into(),
+            title: title.into(),
+            body: String::new(),
+            fix: "fix it".into(),
+            root_cause: "cause".into(),
+            keywords: vec![],
+            source_requirement: "r".into(),
+            first_seen: "2026-06-21T00:00:00Z".into(),
+            signature: "dependency/module-not-found/x".into(),
+            occurrences: 1,
+            context: vec![],
+            efficacy: None,
+        }
+    }
+
+    #[test]
+    fn merge_dual_channel_rrf_orders_and_guarantees_floors() {
+        // Knowledge channel ranks 0..N, lesson channel ranks 0..M. RRF fuses by
+        // rank only, so a rank-0 lesson and a rank-0 knowledge chunk both sit at
+        // the top; lessons win ties (channel-stable). A generous budget admits
+        // everything, and BOTH channels appear.
+        let knowledge = vec![
+            mk_chunk("k0.md", "knowledge zero"),
+            mk_chunk("k1.md", "knowledge one"),
+            mk_chunk("k2.md", "knowledge two"),
+        ];
+        let lessons = vec![
+            (0usize, mk_lesson("lesson-A")),
+            (1usize, mk_lesson("lesson-B")),
+        ];
+        let out = merge_dual_channel(knowledge, lessons, RRF_K, EVOLUTION_BUDGET_TOKENS);
+        assert!(out.contains("Evolution memory"));
+        // Both channels are represented.
+        assert!(out.contains("k0.md"), "knowledge present: {out}");
+        assert!(out.contains("lesson-A"), "lesson present: {out}");
+        // The rank-0 lesson wins the tie against the rank-0 knowledge chunk.
+        let pos_lesson = out.find("lesson-A").unwrap();
+        let pos_k0 = out.find("k0.md").unwrap();
+        assert!(
+            pos_lesson < pos_k0,
+            "rank-0 lesson must lead the rank-0 knowledge chunk: {out}"
+        );
+
+        // Floor guarantee: a TINY budget that can't fit everything still keeps at
+        // least LESSON_FLOOR lesson(s) and KNOWLEDGE_FLOOR knowledge chunk(s).
+        let knowledge: Vec<_> = (0..8)
+            .map(|n| mk_chunk(&format!("kk{n}.md"), "x"))
+            .collect();
+        let lessons = vec![(0usize, mk_lesson("lesson-floor"))];
+        let out = merge_dual_channel(knowledge, lessons, RRF_K, 1 /* token */);
+        assert!(
+            out.contains("lesson-floor"),
+            "scarce lesson must survive a tiny budget via its floor: {out}"
+        );
+        let kept_knowledge = (0..8)
+            .filter(|n| out.contains(&format!("kk{n}.md")))
+            .count();
+        assert!(
+            kept_knowledge >= KNOWLEDGE_FLOOR,
+            "knowledge floor must be honored even under budget pressure: kept {kept_knowledge}"
+        );
+
+        // Empty input → empty block (gate phases / first runs leave prompt clean).
+        assert!(merge_dual_channel(vec![], vec![], RRF_K, EVOLUTION_BUDGET_TOKENS).is_empty());
     }
 }
