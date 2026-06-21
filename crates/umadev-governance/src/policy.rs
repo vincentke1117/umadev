@@ -291,7 +291,9 @@ mod tests {
     fn write_template_creates_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = Policy::write_default_template(tmp.path()).unwrap();
-        assert!(path.to_string_lossy().contains(".umadev/rules.toml"));
+        // `ends_with` is component-based, so it matches regardless of the OS
+        // path separator (backslash on Windows).
+        assert!(path.ends_with(".umadev/rules.toml"));
     }
 
     #[test]
