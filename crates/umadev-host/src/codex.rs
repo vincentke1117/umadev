@@ -664,6 +664,9 @@ mod tests {
         assert!(matches!(d.probe().await, ProbeResult::NotInstalled { .. }));
     }
 
+    // The fake codex is a `#!/bin/sh` script, which Windows cannot exec; the
+    // JSONL parsing it exercises is covered by the unit tests above.
+    #[cfg(unix)]
     #[tokio::test]
     async fn complete_drives_a_fake_codex_binary() {
         // Fake codex models 0.141: read the prompt from STDIN and emit a JSONL
