@@ -742,7 +742,24 @@ pub fn check_hardcoded_secret(file_path: &str, content: &str) -> Decision {
             }
         }
     }
-    // 2. Connection strings with embedded credentials.
+    // 2. Bare key-shape prefixes carry no `=`/`:` separator, so a raw substring
+    //    match would fire on ordinary identifiers. `bare_secret_matches`
+    //    enforces a leading word boundary plus the real trailing key shape
+    //    before reporting a hit.
+    if let Some((label, len)) = bare_secret_matches(content) {
+        return Decision::block(
+            "UD-SEC-003",
+            format!(
+                "UmaDev: hardcoded secret detected (UD-SEC-003). \
+                 `{file_path}` embeds what looks like a real {label} key \
+                 (value length {len}). Secrets must come from environment \
+                 variables, never source code. Read it from \
+                 `process.env.<NAME>` / `std::env::var(...)` and move the \
+                 value to `.env` (gitignored).",
+            ),
+        );
+    }
+    // 3. Connection strings with embedded credentials.
     //    `postgres://user:password@host` / `mongodb://user:pass@host`
     for scheme in DB_SCHEMES {
         if let Some(idx) = lower.find(scheme) {
@@ -772,6 +789,84 @@ pub fn check_hardcoded_secret(file_path: &str, content: &str) -> Decision {
         }
     }
     Decision::pass()
+}
+
+/// Scan `content` for a bare key-shape secret (a Stripe-style `sk_`/`pk_` key,
+/// an AWS `AKIA` id, a GitHub `ghp_`/`gho_` token, a Slack `xoxb-` token, or a
+/// `stripe_`-prefixed key) that carries no `=`/`:` separator.
+///
+/// Returns `Some((label, value_len))` for the first hit, or `None`.
+///
+/// Each candidate is found by [`bare_secret_regex`], then re-checked here for a
+/// **leading word boundary** — the byte before the match must not be
+/// `[A-Za-z0-9_]`. That boundary is what stops `risk_score`, `task_runner`,
+/// `disk_usage`, `ask_user`, `spike_`, and `nakia`/`balalaika` from being read
+/// as secrets, while a genuine `const KEY = "..."` still fires. The trailing
+/// key shape is already enforced by the regex (length-gated alphanumerics for
+/// the `_` prefixes; the exact 16-char form for AWS).
+fn bare_secret_matches(content: &str) -> Option<(&'static str, usize)> {
+    let re = bare_secret_regex();
+    for m in re.captures_iter(content) {
+        let whole = m.get(0)?;
+        let start = whole.start();
+        // Leading word boundary: the byte before the match must not continue a
+        // word. (ASCII-only check — every prefix here is ASCII, so inspecting
+        // the preceding byte is sufficient and avoids a char-boundary walk.)
+        let prev_ok = content[..start]
+            .bytes()
+            .next_back()
+            .is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_'));
+        if !prev_ok {
+            continue;
+        }
+        let matched = whole.as_str();
+        // Re-check placeholders so example/test keys still pass, matching the
+        // separator-prefix path's policy.
+        let lower = matched.to_ascii_lowercase();
+        if SECRET_PLACEHOLDERS.iter().any(|p| lower.contains(p)) {
+            continue;
+        }
+        let label = bare_secret_label(&lower);
+        return Some((label, matched.len()));
+    }
+    None
+}
+
+/// Human-readable label for a bare-secret hit, derived from its prefix.
+fn bare_secret_label(lower: &str) -> &'static str {
+    if lower.starts_with("akia") {
+        "AWS access-key"
+    } else if lower.starts_with("ghp_") || lower.starts_with("gho_") {
+        "GitHub token"
+    } else if lower.starts_with("xoxb-") {
+        "Slack token"
+    } else if lower.starts_with("stripe_") {
+        "Stripe"
+    } else {
+        // Stripe-style publishable/secret key.
+        "secret/publishable"
+    }
+}
+
+/// Compiled detector for bare key-shape secrets (no `=`/`:` separator).
+///
+/// The leading word boundary is verified separately in [`bare_secret_matches`]
+/// (the `regex` crate has no look-behind). Shapes:
+/// - `(sk_|pk_)…{16,}` — Stripe-style keys (incl. live/test variants); the
+///   16-char floor keeps it off short identifiers.
+/// - `stripe_…{16,}` — a `stripe_`-prefixed key value.
+/// - `(ghp_|gho_)…{20,}` — GitHub personal-access / OAuth tokens.
+/// - `xoxb-…{10,}` — Slack bot tokens.
+/// - the exact AWS access-key-id form (case-insensitive), which no longer fires
+///   on `nakia` / `balalaika`.
+fn bare_secret_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:(?:sk_|pk_)[A-Za-z0-9_]{16,}|stripe_[A-Za-z0-9]{16,}|(?:ghp_|gho_)[A-Za-z0-9]{20,}|xoxb-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})",
+        )
+        .expect("bare-secret regex is well-formed")
+    })
 }
 
 /// **UD-SEC-004**: block direct database access from frontend code.
@@ -3075,22 +3170,29 @@ pub fn check_db_transaction_rollback(file_path: &str, content: &str) -> Decision
     ) {
         return Decision::pass();
     }
-    let lower = content.to_ascii_lowercase();
-    // Must contain a transaction start.
-    let has_tx = lower.contains("begin")
-        || lower.contains("transaction")
-        || lower.contains(".transaction(")
-        || lower.contains("start_transaction")
-        || lower.contains("begin transaction")
-        || lower.contains("tx.begin");
+    // Scan code only — a "begin"/"transaction" inside a comment or doc string
+    // is prose, not a transaction. Same comment-stripped view the emoji/color
+    // rules use.
+    let tz = crate::tokenizer::Tokenized::new(content);
+    let code = tz.without_comments(content);
+    let lower = code.to_ascii_lowercase();
+    // Must contain a *real transaction-start API form*, not the bare English
+    // words `begin` / `transaction` (those false-positive on `beginLoad()`,
+    // `transactionId`, prose, etc.). We require an actual call/statement shape.
+    let has_tx = lower.contains(".transaction(")   // ORM: db.transaction(...)
+        || lower.contains(".begin(")               // tx.begin() / conn.begin() / db.begin()
+        || lower.contains("begin transaction")     // SQL: BEGIN TRANSACTION
+        || lower.contains("start transaction")     // SQL: START TRANSACTION
+        || lower.contains("begin;")                // SQL: bare BEGIN; statement
+        || lower.contains("start_transaction")     // python/driver: start_transaction()
+        || lower.contains("begintransaction")      // begin_transaction / beginTransaction
+        || lower.contains("begin_transaction");
     if !has_tx {
         return Decision::pass();
     }
     // Must have a rollback / commit with error handling.
-    let has_rollback = lower.contains("rollback")
-        || lower.contains("revert")
-        || lower.contains("tx.rollback")
-        || lower.contains("abort");
+    let has_rollback =
+        lower.contains("rollback") || lower.contains("revert") || lower.contains("abort");
     let has_catch = lower.contains("catch")
         || lower.contains("except")
         || lower.contains("defer")
@@ -6646,8 +6748,16 @@ const SECRET_SCAN_EXTENSIONS: &[&str] = &[
     "js", "jsx", "ts", "tsx", "py", "rb", "go", "rs", "java", "kt", "swift", "php", "vue", "svelte",
 ];
 
-/// Key prefixes that indicate a hardcoded secret. Lowercase, with the
-/// separator (`=` or `:`) the scan looks for.
+/// Assignment-style key prefixes that indicate a hardcoded secret. Lowercase,
+/// each carries the separator (`=` or `:`) the scan looks for, so they only
+/// match a real `key = <value>` assignment and never a bare identifier
+/// substring.
+///
+/// The bare key-shape prefixes used to live here too, but matched as raw
+/// substrings they false-positived on ordinary identifiers (risk scores, task
+/// runners, disk usage, AWS-shaped names embedded mid-word). They now live in
+/// [`bare_secret_matches`], which requires a leading word boundary plus the
+/// real trailing key shape before it fires.
 const SECRET_PREFIXES: &[&str] = &[
     "api_key=",
     "apikey=",
@@ -6658,13 +6768,6 @@ const SECRET_PREFIXES: &[&str] = &[
     "accesstoken=",
     "auth_token=",
     "private_key=",
-    "stripe_",
-    "sk_",
-    "pk_",
-    "ghp_",  // GitHub PAT
-    "gho_",  // GitHub OAuth
-    "xoxb-", // Slack bot token
-    "akia",  // AWS access key id (lowercased by the scan)
 ];
 
 /// Placeholder values that mean "this isn't a real secret" — skip them.
@@ -7685,7 +7788,10 @@ const x = 1;",
     fn secret_blocks_api_key_in_ts() {
         let d = check_hardcoded_secret(
             "src/api.ts",
-            "const API_KEY = \"stripe_R8xQ2mK7vN4pL9wB3yT6jH1sD5gF0\";",
+            concat!(
+                "const API_KEY = \"stripe_R8xQ2mK7",
+                "vN4pL9wB3yT6jH1sD5gF0\";"
+            ),
         );
         assert!(d.block);
         assert_eq!(d.clause, "UD-SEC-003");
@@ -7696,7 +7802,7 @@ const x = 1;",
         // A realistic AWS access key (no placeholder words).
         let d = check_hardcoded_secret(
             "src/aws.ts",
-            "const key = \"AKIA7K3M9P2QX4RT6V8W0Z1A2B3C4D5E6F7\";",
+            concat!("const key = \"AKIA7K3M", "9P2QX4RT6V8W0Z1A2B3C4D5E6F7\";"),
         );
         assert!(d.block);
     }
@@ -7731,7 +7837,10 @@ const x = 1;",
     #[test]
     fn secret_ignores_non_source_files() {
         // .env files legitimately hold secrets.
-        let d = check_hardcoded_secret(".env", "API_KEY=stripe_R8xQ2mK7vN4pL9wB3yT6jH1sD5gF0");
+        let d = check_hardcoded_secret(
+            ".env",
+            concat!("API_KEY=stripe_R8xQ2mK7", "vN4pL9wB3yT6jH1sD5gF0"),
+        );
         assert!(!d.block);
     }
 
@@ -7739,9 +7848,99 @@ const x = 1;",
     fn secret_deny_reason_mentions_env_var() {
         let d = check_hardcoded_secret(
             "src/api.ts",
-            "const API_KEY = \"stripe_R8xQ2mK7vN4pL9wB3yT6jH1sD5gF0\";",
+            concat!(
+                "const API_KEY = \"stripe_R8xQ2mK7",
+                "vN4pL9wB3yT6jH1sD5gF0\";"
+            ),
         );
         assert!(d.reason.contains("process.env") || d.reason.contains("env"));
+    }
+
+    // False positives the old bare-substring prefixes (`sk_`, `AKIA`, ...)
+    // used to trip: ordinary identifiers must PASS now.
+    #[test]
+    fn secret_allows_risk_assessment_identifier() {
+        // `sk_` used to match inside `risk_core` / `risk_assessment`.
+        let d = check_hardcoded_secret(
+            "src/risk.ts",
+            "const risk_score = computeRiskScore(risk_assessment, riskFactors);",
+        );
+        assert!(
+            !d.block,
+            "risk_assessment must not trip UD-SEC-003: {}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn secret_allows_task_runner_and_disk_usage_identifiers() {
+        let d = check_hardcoded_secret(
+            "src/sys.ts",
+            "const taskRunner = new TaskRunner(); const diskUsage = getDiskUsage(); askUser();",
+        );
+        assert!(
+            !d.block,
+            "task_runner/disk_usage/ask_user must pass: {}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn secret_allows_nakia_word() {
+        // `AKIA` (AWS) used to match inside `nakia` / `balalaika`.
+        let d = check_hardcoded_secret(
+            "src/names.rs",
+            "let nakia = \"a singer named nakia, plus a balalaika\";",
+        );
+        assert!(
+            !d.block,
+            "nakia/balalaika must not trip UD-SEC-003: {}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn secret_allows_short_pk_identifier() {
+        // `pk_` floor is 16 trailing chars — `pk_id` / `pk_col` must pass.
+        let d = check_hardcoded_secret("src/db.rs", "let pk_id = row.pk_col; let spike_count = 0;");
+        assert!(!d.block, "short pk_ identifiers must pass: {}", d.reason);
+    }
+
+    // Real secrets in the SAME bare shapes must STILL block.
+    #[test]
+    fn secret_blocks_real_stripe_sk_live_key() {
+        let d = check_hardcoded_secret(
+            "src/pay.ts",
+            concat!(
+                "const key = \"sk_live_4eC39H",
+                "qLyjWDarjtT1zdp7dcABCDEFGH\";"
+            ),
+        );
+        assert!(d.block, "a real sk_live key must block");
+        assert_eq!(d.clause, "UD-SEC-003");
+    }
+
+    #[test]
+    fn secret_blocks_real_aws_akia_key_exact_form() {
+        // Exactly `AKIA` + 16 [0-9A-Z] is the AWS access-key-id shape.
+        let d = check_hardcoded_secret(
+            "src/aws.rs",
+            concat!("let id = \"AKIAIOSF", "ODNN7QRT4UVWZ\";"),
+        );
+        assert!(d.block, "a real AKIA access-key id must block");
+        assert_eq!(d.clause, "UD-SEC-003");
+    }
+
+    #[test]
+    fn secret_blocks_real_github_token() {
+        let d = check_hardcoded_secret(
+            "src/gh.ts",
+            concat!(
+                "const t = \"ghp_16C7e42F",
+                "292c6912E7710c838347Ae178B4a\";"
+            ),
+        );
+        assert!(d.block, "a real ghp_ token must block");
     }
 
     // --- frontend DB access (UD-SEC-004) -------------------------------
@@ -9051,6 +9250,46 @@ const x = 1;",
     fn arch_tx_ignores_non_backend() {
         let d = check_db_transaction_rollback("src/App.tsx", "begin render");
         assert!(!d.block);
+    }
+
+    #[test]
+    fn arch_tx_allows_beginload_function_name() {
+        // `beginLoad()` is not a transaction — the bare word `begin` must not
+        // trip the rule now.
+        let d = check_db_transaction_rollback(
+            "server/loader.ts",
+            "function beginLoad() { return fetchAll(); } const transactionId = 7;",
+        );
+        assert!(
+            !d.block,
+            "beginLoad/transactionId must not trip UD-ARCH-027: {}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn arch_tx_allows_transaction_word_in_comment() {
+        // "transaction"/"begin" inside a comment is prose, not a tx start.
+        let d = check_db_transaction_rollback(
+            "server/notes.ts",
+            "// we begin the transaction in another module\nconst x = loadRows();",
+        );
+        assert!(
+            !d.block,
+            "a commented 'transaction' must not trip UD-ARCH-027: {}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn arch_tx_blocks_real_db_transaction_without_rollback() {
+        // A real `db.transaction(...)` form with no rollback/commit must block.
+        let d = check_db_transaction_rollback(
+            "server/orm.ts",
+            "await db.transaction(async (t) => { await t.insert(rows); });",
+        );
+        assert!(d.block, "db.transaction without rollback must block");
+        assert_eq!(d.clause, "UD-ARCH-027");
     }
 
     // --- UD-ARCH-028: C buffer overflow ---------------------------------
