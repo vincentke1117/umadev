@@ -393,6 +393,9 @@ mod tests {
         assert!(RunLock::acquire(root).is_ok(), "lock released on drop");
     }
 
+    // Models a live foreign holder with PID 1 (init/launchd) — a Unix concept,
+    // so the whole test is unix-only (on Windows `root` would be unused).
+    #[cfg(unix)]
     #[test]
     fn foreign_live_run_is_the_real_another_umadev_refusal() {
         // CASE 3: a DIFFERENT, still-alive process on this host holds the lock —

@@ -5213,7 +5213,7 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         std::process::Command::new(prog)
             .args(["/C", "start", "", url])
             .spawn()?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(target_os = "windows"))]
     {
