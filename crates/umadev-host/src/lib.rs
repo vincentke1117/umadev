@@ -217,48 +217,150 @@ fn truncate_on_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..idx]
 }
 
-/// Drain a spawned child's stdout+stderr to EOF AND wait for its exit, all
-/// bounded by ONE timeout. The reads are deliberately inside the timeout: a
-/// child that writes some output and then hangs while keeping its stdout pipe
-/// open (e.g. a grandchild inherits the pipe) would otherwise block
-/// `read_to_end` forever — defeating the `child.wait()` timeout and hanging
-/// UmaDev. On timeout the child is killed to avoid orphaned processes.
+/// Drain a spawned child's stdout+stderr to EOF AND wait for its exit, bounded
+/// by BOTH a per-call hard ceiling AND a per-byte idle watchdog.
+///
+/// The reads are deliberately bounded: a child that writes some output and then
+/// hangs while keeping its stdout pipe open (e.g. a grandchild inherits the
+/// pipe) would otherwise block `read_to_end` forever — defeating the
+/// `child.wait()` timeout and hanging UmaDev. The hard `timeout` ceiling caught
+/// the *truly* silent case, but a base that emits a few bytes then hangs had to
+/// wait out the FULL ceiling (600s) before being killed. The streaming path
+/// already had a 300s idle watchdog for exactly this; this mirrors it for the
+/// non-streaming path (used by `complete`/probe and every advisory critic/judge
+/// `consult()` call) so a mid-output hang is killed after
+/// `UMADEV_IDLE_TIMEOUT_SECS` of stdout silence instead of the full ceiling.
+///
+/// **Timeout model (two-phase, "first-byte grace"), mirroring the streaming
+/// path.** The idle watchdog (`idle_timeout`, default 300s,
+/// `UMADEV_IDLE_TIMEOUT_SECS`) measures byte-to-byte *silence*, so it is armed
+/// only AFTER the first stdout byte. Before the first byte the sole bound is the
+/// remaining time to the hard `timeout` deadline — a base whose first token is
+/// slow is not wrongly killed before it has emitted anything. The hard `timeout`
+/// ceiling always applies and the grace can never bypass it (a truly silent hang
+/// still trips `timeout`). For a short total `timeout` (e.g. the 10s `probe`)
+/// `idle_timeout = min(timeout, 300)` collapses onto the ceiling, so the idle
+/// watchdog never fires before the hard timeout there — no false probe kills.
+/// On timeout (idle OR hard) the child is killed to avoid orphaned processes.
+/// The idle and hard-ceiling errors both contain `timed out` (so they classify
+/// as a retriable `Timeout`, preserving the prior write-then-hang behaviour) but
+/// are textually distinguishable (`… of stdout silence`).
 async fn drain_and_wait(
     child: &mut tokio::process::Child,
     timeout: std::time::Duration,
     program: &str,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    let started = Instant::now();
+
+    // Drain stderr on its own task: a child can flood stderr or hold it open,
+    // which would stall a single-task stdout+stderr join AND confuse the
+    // stdout-only idle watchdog (stderr traffic is not stdout liveness). Reading
+    // it independently keeps the stdout idle measurement honest. (Same shape as
+    // `run_subprocess_streaming`.) The task ends when stderr closes — which the
+    // kill below guarantees on every error path, so it is never orphaned.
+    let stderr_task = {
+        let se = child.stderr.take();
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut se) = se {
+                let _ = se.read_to_end(&mut buf).await;
+            }
+            buf
+        })
+    };
+
+    // Same env + default + collapse semantics as the streaming path.
+    let idle_timeout = std::cmp::min(
+        timeout,
+        Duration::from_secs(
+            std::env::var("UMADEV_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300),
+        ),
+    );
+
+    // Read stdout in chunks with a per-read idle watchdog + first-byte grace.
     let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
-    let mut child_stdout = child.stdout.take();
-    let mut child_stderr = child.stderr.take();
-    let collected = tokio::time::timeout(timeout, async {
-        let drain_out = async {
-            if let Some(s) = child_stdout.as_mut() {
-                let _ = s.read_to_end(&mut stdout_buf).await;
+    if let Some(mut stdout) = child.stdout.take() {
+        let mut seen_first_byte = false;
+        let mut chunk = [0u8; 8192];
+        loop {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(format!(
+                    "`{program}` timed out after {}s",
+                    timeout.as_secs()
+                ));
             }
-        };
-        let drain_err = async {
-            if let Some(s) = child_stderr.as_mut() {
-                let _ = s.read_to_end(&mut stderr_buf).await;
+            // First-byte grace: before the first byte the only deadline is the
+            // hard ceiling's remaining time; after it, the idle watchdog arms
+            // (still capped by `remaining` so a steady trickle can't outlive the
+            // ceiling).
+            let wait = if seen_first_byte {
+                idle_timeout.min(remaining)
+            } else {
+                remaining
+            };
+            match tokio::time::timeout(wait, stdout.read(&mut chunk)).await {
+                Ok(Ok(0)) => break, // EOF — stdout closed
+                Ok(Ok(n)) => {
+                    seen_first_byte = true;
+                    stdout_buf.extend_from_slice(&chunk[..n]);
+                }
+                Ok(Err(e)) => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(format!("`{program}` stdout read error: {e}"));
+                }
+                Err(_) if !seen_first_byte => {
+                    // The wait that elapsed was the hard-ceiling remaining time
+                    // (idle is not armed before the first byte) — a true silent
+                    // hang, reported as the overall timeout.
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(format!(
+                        "`{program}` timed out after {}s",
+                        timeout.as_secs()
+                    ));
+                }
+                Err(_) => {
+                    // **Idle timeout** — output started, then no further byte for
+                    // `idle_timeout` (a base that hangs while holding the stdout
+                    // pipe open). Kill + return a distinguishable, retriable error.
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    let bytes = stdout_buf.len();
+                    return Err(format!(
+                        "`{program}` timed out after {}s of stdout silence (hang while holding the pipe open? bytes so far: {bytes}). Set UMADEV_IDLE_TIMEOUT_SECS to adjust.",
+                        idle_timeout.as_secs()
+                    ));
+                }
             }
-        };
-        let ((), (), status) = tokio::join!(drain_out, drain_err, child.wait());
-        status
-    })
-    .await;
-    match collected {
-        Ok(Ok(s)) => Ok((s, stdout_buf, stderr_buf)),
-        Ok(Err(e)) => Err(format!("`{program}` failed: {e}")),
+        }
+    }
+
+    // stdout drained to EOF — the child is normally exiting now. Bound the exit
+    // wait by the remaining hard ceiling so a process that closes stdout but then
+    // refuses to exit can't hang us either.
+    let remaining = timeout.saturating_sub(started.elapsed());
+    let status = match tokio::time::timeout(remaining, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("`{program}` failed: {e}")),
         Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            Err(format!(
+            return Err(format!(
                 "`{program}` timed out after {}s",
                 timeout.as_secs()
-            ))
+            ));
         }
-    }
+    };
+
+    let stderr_buf = stderr_task.await.unwrap_or_default();
+    Ok((status, stdout_buf, stderr_buf))
 }
 
 /// Apply extra env overrides to a child command before spawn (an empty value
@@ -1585,15 +1687,133 @@ mod tests {
         );
     }
 
+    // A NON-streaming call that emits a byte and THEN goes silent must be killed
+    // by the idle watchdog (~idle_timeout after the first byte), NOT made to wait
+    // out the full hard ceiling. The error is distinguishable (`stdout silence`)
+    // yet still contains `timed out` so it classifies as a retriable Timeout —
+    // preserving the prior write-then-hang retry behaviour.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_subprocess_idle_kills_after_first_byte_then_silence() {
+        let _env = IDLE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+        let started = Instant::now();
+        let err = run_subprocess(SubprocessCall {
+            program: "sh",
+            args: &["-c".into(), "printf 'partial'; sleep 30".into()],
+            prompt: "",
+            channel: PromptChannel::Stdin,
+            workspace: tmp.path(),
+            // Ceiling far above the 1s idle so we KNOW the idle watchdog (not the
+            // hard ceiling) did the kill.
+            timeout: Duration::from_secs(30),
+            env: &[],
+        })
+        .await
+        .unwrap_err();
+        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
+        assert!(
+            err.contains("stdout silence"),
+            "expected the idle-silence error, got: {err}"
+        );
+        assert!(
+            err.contains("timed out"),
+            "idle error must still classify as a retriable timeout, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "idle watchdog should fire ~1s after the first byte, not wait the 30s ceiling"
+        );
+    }
+
+    // First-byte grace (non-streaming): a long silence BEFORE the first byte must
+    // NOT trip the idle watchdog, as long as it stays under the hard ceiling — a
+    // slow first token (big prompt / slow model) is healthy, not a hang.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_subprocess_first_byte_grace_survives_slow_first_output() {
+        let _env = IDLE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+        let started = Instant::now();
+        let out = run_subprocess(SubprocessCall {
+            program: "sh",
+            args: &["-c".into(), "sleep 2; printf 'the answer\\n'".into()],
+            prompt: "",
+            channel: PromptChannel::Stdin,
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(20),
+            env: &[],
+        })
+        .await;
+        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
+        let out = out.expect("a slow first byte under the ceiling must not be idle-killed");
+        assert!(out.stdout.contains("the answer"));
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "the test should have waited out the slow first byte"
+        );
+    }
+
+    // A truly silent hang (never writes a byte) is bounded only by the hard
+    // ceiling and reported as the overall timeout — NOT the idle-silence error
+    // (no byte was ever seen, so the idle watchdog never armed).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_subprocess_hard_ceiling_kills_truly_silent_hang() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let started = Instant::now();
+        let err = run_subprocess(SubprocessCall {
+            program: "sh",
+            args: &["-c".into(), "sleep 30".into()], // never writes a byte
+            prompt: "",
+            channel: PromptChannel::Stdin,
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(1),
+            env: &[],
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("timed out after 1s"),
+            "a truly silent hang trips the hard ceiling, got: {err}"
+        );
+        assert!(
+            !err.contains("stdout silence"),
+            "no byte was ever seen, so it is the hard ceiling, not idle, got: {err}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    // Normal fast completion is unaffected by the idle watchdog.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_subprocess_fast_completion_unaffected_by_idle_watchdog() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = run_subprocess(SubprocessCall {
+            program: "sh",
+            args: &["-c".into(), "printf 'hello world\\n'".into()],
+            prompt: "",
+            channel: PromptChannel::Stdin,
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(10),
+            env: &[],
+        })
+        .await
+        .expect("fast completion must not be affected by the idle watchdog");
+        assert!(out.stdout.contains("hello world"));
+    }
+
     // ---- run_subprocess_streaming: first-line grace watchdog ----
 
     /// Async-safe lock serialising the streaming tests that mutate the
     /// process-global `UMADEV_IDLE_TIMEOUT_SECS`. `ENV_LOCK` is a
     /// `std::sync::Mutex` whose guard can't be held across an `.await`; these
     /// tests `.await` the subprocess while the env must stay set, so they need a
-    /// `tokio::sync::Mutex` instead. Only these three tests touch this var, so
-    /// serialising them is sufficient. Gated to `unix` like its only users, so
-    /// it isn't a dead `static` on Windows (`-D warnings` rejects that).
+    /// `tokio::sync::Mutex` instead. Only the tests that set this var take this
+    /// lock, so serialising them is sufficient. Gated to `unix` like its only
+    /// users, so it isn't a dead `static` on Windows (`-D warnings` rejects that).
     #[cfg(unix)]
     static IDLE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
