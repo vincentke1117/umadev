@@ -644,8 +644,245 @@ fn spawn_agentic(
                 return;
             }
         };
-        drive_agentic_stream(brain.as_ref(), &task, &model, &label, &sink, &route_tx).await;
+        drive_agentic_stream(
+            brain.as_ref(),
+            &task,
+            &model,
+            &label,
+            &project_root,
+            &sink,
+            &route_tx,
+        )
+        .await;
     })
+}
+
+/// Snapshot the working tree as a `git status --porcelain` string, run in
+/// `root`. Returns the raw porcelain output (one `XY path` line per changed
+/// path) so two snapshots can be diffed into the set of files THIS turn actually
+/// touched, and so the live state can be injected into the agentic system
+/// prompt.
+///
+/// **Fail-open**: a non-git directory, a missing `git`, a non-zero exit, or any
+/// IO error returns `None` — the caller then SKIPS the reality enhancement
+/// entirely (it must never block or break the agentic turn). This is the
+/// load-bearing safety property; do not turn it into an error path.
+fn git_status_porcelain(root: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// A compact `git diff --stat` of the working tree (unstaged changes), run in
+/// `root`, used only to give the agentic system prompt a sense of what is
+/// already modified. **Fail-open**: any failure returns `None` and the prompt
+/// simply omits the diff-stat section.
+fn git_diff_stat(root: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--stat"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// The path token of a single `git status --porcelain` line. Porcelain v1 is
+/// `XY <path>` (or `XY <old> -> <new>` for renames); we key on the FINAL path
+/// (after `-> ` when present) so a rename is attributed to its new name. Returns
+/// `None` for a blank line.
+fn porcelain_path(line: &str) -> Option<String> {
+    let trimmed = line.strip_prefix('\u{feff}').unwrap_or(line);
+    if trimmed.trim().is_empty() {
+        return None;
+    }
+    // Drop the two status columns + the single separating space (`XY `).
+    let rest = trimmed.get(3..).unwrap_or("").trim();
+    if rest.is_empty() {
+        return None;
+    }
+    // A rename/copy is `old -> new`; attribute it to the new path.
+    let path = rest.rsplit(" -> ").next().unwrap_or(rest).trim();
+    // Porcelain quotes paths with special chars; strip the surrounding quotes
+    // for display (best-effort — we de-quote, we do not un-escape).
+    let path = path.trim_matches('"');
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+/// The set of paths that changed BETWEEN two `git status --porcelain` snapshots:
+/// every path whose presence/status differs from `before` to `after`. A file
+/// the base edited and then reverted (identical line in both) is correctly
+/// reported as unchanged. Output is sorted for deterministic display and tests.
+fn changed_files_between(before: &str, after: &str) -> Vec<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // Map path -> full porcelain line, so a STATUS change (e.g. ` M` -> `MM`)
+    // on the same path still counts as "changed this turn".
+    let parse = |snap: &str| -> BTreeMap<String, String> {
+        snap.lines()
+            .filter_map(|l| porcelain_path(l).map(|p| (p, l.trim_end().to_string())))
+            .collect()
+    };
+    let before = parse(before);
+    let after = parse(after);
+    let mut changed: BTreeSet<String> = BTreeSet::new();
+    for (path, line) in &after {
+        if before.get(path).map(String::as_str) != Some(line.as_str()) {
+            changed.insert(path.clone());
+        }
+    }
+    for path in before.keys() {
+        if !after.contains_key(path) {
+            changed.insert(path.clone());
+        }
+    }
+    changed.into_iter().collect()
+}
+
+/// Heuristic: does this base reply CLAIM it made code changes? Used only to
+/// decide whether to raise the "claimed-but-no-diff" warning when git shows the
+/// working tree is in fact unchanged. Deliberately broad and bilingual; a false
+/// positive only adds an advisory note, never blocks anything.
+fn claims_code_changes(text: &str) -> bool {
+    // English change verbs.
+    const EN: &[&str] = &[
+        "refactor",
+        "added",
+        "changed",
+        "edited",
+        "created",
+        "updated",
+        "modified",
+        "removed",
+        "deleted",
+        "implemented",
+        "renamed",
+        "rewrote",
+        "replaced",
+        "inserted",
+    ];
+    // Chinese change verbs (no case folding needed).
+    const ZH: &[&str] = &[
+        "重构",
+        "新增",
+        "删除",
+        "修改",
+        "实现",
+        "修复",
+        "改了",
+        "改动",
+        "更新",
+        "增加",
+        "移除",
+        "重命名",
+        "替换",
+        "已添加",
+        "已修改",
+        "写入",
+        "创建",
+    ];
+    let t = text.to_lowercase();
+    if EN.iter().any(|k| t.contains(k)) {
+        return true;
+    }
+    ZH.iter().any(|k| text.contains(k))
+}
+
+/// Build the reality-anchored fact line appended to the transcript AFTER each
+/// agentic turn. Given the file set that ACTUALLY changed on disk this turn (per
+/// the two git snapshots) and whether the base's reply CLAIMED changes, returns:
+///
+/// - `[note] 本轮无文件变更` when nothing changed,
+/// - `[note] 本轮实际文件变更: a, b, …` when files changed,
+/// - plus a prominent `[warn] …` warning line when the base claimed changes but
+///   git shows none (likely a hallucinated / session-recited change, not a real
+///   write).
+///
+/// (ASCII `[note]` / `[warn]` markers match the in-repo stream-note convention;
+/// the governance emoji rule forbids glyph icons in `.rs` source.)
+///
+/// Returns `None` only when git was unavailable for EITHER snapshot
+/// (`changed == None`) — the caller skips the fact line entirely (fail-open).
+fn agentic_fact_line(changed: Option<&[String]>, claimed: bool) -> Option<String> {
+    let changed = changed?;
+    if changed.is_empty() {
+        if claimed {
+            Some(
+                "[note] 本轮无文件变更\n[warn] 底座报告了改动,但工作区没有实际文件变更 —— \
+                 可能未真正落盘或为复述,请核对 / base reported changes but the working \
+                 tree is unchanged — verify before trusting"
+                    .to_string(),
+            )
+        } else {
+            Some("[note] 本轮无文件变更 / no file changes this turn".to_string())
+        }
+    } else {
+        // Cap the listed files so a huge change set stays one readable line.
+        const MAX: usize = 20;
+        let shown: Vec<&str> = changed.iter().take(MAX).map(String::as_str).collect();
+        let mut list = shown.join(", ");
+        if changed.len() > MAX {
+            list.push_str(&format!(" ... (+{})", changed.len() - MAX));
+        }
+        Some(format!("[note] 本轮实际文件变更: {list}"))
+    }
+}
+
+/// The reality-anchored system prompt for an agentic turn. It UNLOCKS tools
+/// (read/edit files, run commands — the whole point of the agentic path) and
+/// injects the live git state, then hard-constrains the base to verify any
+/// "what did I change" claim against the real disk/git state rather than
+/// reciting unverified session intent. `status`/`diff_stat` are the live
+/// snapshots (either may be `None`).
+fn agentic_system_prompt(status: Option<&str>, diff_stat: Option<&str>) -> String {
+    let mut p = String::from(
+        "You are running inside the project's working directory with FULL tool access. \
+         You MAY and SHOULD read files, edit files, and run commands to do the work — \
+         do not refuse to use your tools.\n\n\
+         REALITY CONTRACT (mandatory): every statement you make about WHICH FILES YOU \
+         CHANGED or WHAT EDITS YOU MADE must be grounded in the real files on disk and \
+         the real git state. Before claiming any change, verify it with `git diff` / \
+         `git status` or by reading the file. NEVER recite intended or remembered \
+         changes from earlier in the conversation as if they were already done — if you \
+         did not just verify it on disk, do not claim it. If you did not actually write \
+         a file this turn, say so plainly.\n",
+    );
+    match status {
+        Some(s) if !s.trim().is_empty() => {
+            p.push_str("\nCurrent `git status --porcelain` (the real, current working tree):\n");
+            p.push_str(s.trim_end());
+            p.push('\n');
+        }
+        _ => {
+            p.push_str(
+                "\nCurrent `git status --porcelain`: clean (no uncommitted changes right now).\n",
+            );
+        }
+    }
+    if let Some(d) = diff_stat {
+        p.push_str("\nCurrent `git diff --stat`:\n");
+        p.push_str(d.trim_end());
+        p.push('\n');
+    }
+    p
 }
 
 /// Build the tools-unlocked execution request and drive the base's streaming
@@ -653,18 +890,38 @@ fn spawn_agentic(
 /// terminal [`RouteDecision`] when the stream ends. Split out of [`spawn_agentic`]
 /// so a fake [`Runtime`] can exercise it in a unit test (the spawn wrapper only
 /// adds the `tokio::spawn` + `build_brain`).
+///
+/// Three reality-anchoring guards wrap the raw streaming call (all **fail-open** —
+/// if git is unavailable each guard silently no-ops):
+///
+/// 1. **Reality injection** — a `system` prompt that UNLOCKS tools and injects the
+///    live `git status` so the base can't drift from the real tree, and forbids
+///    reciting unverified session intent as done work.
+/// 2. **Post-turn fact check** — a git snapshot before and after the turn; the
+///    real changed-file set is appended to the transcript, with a prominent
+///    `[warn]` line when the base CLAIMED changes the working tree does not show.
+/// 3. **Truncation honesty** — a `Warning`/error stream finish carries an
+///    "may be incomplete / not flushed to disk" caveat instead of reading as a
+///    clean success.
 async fn drive_agentic_stream(
     brain: &dyn Runtime,
     task: &str,
     model: &str,
     label: &str,
+    project_root: &std::path::Path,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
 ) {
-    // The execution request: the user's raw task, tools UNLOCKED. No system
-    // prompt (so NONE of the chat-route tool-ban survives) and no max_tokens
-    // (so the base isn't cut off mid-loop). This is the whole point — the base
-    // CLI already has an agentic tool loop; here we simply stop forbidding it.
+    // (1) Reality injection — snapshot the live git state BEFORE the turn so the
+    // base is anchored to the real tree, and keep `before` for the post-turn
+    // diff. Both are `Option` (fail-open: git missing -> None -> guards no-op).
+    let before = git_status_porcelain(project_root);
+    let diff_stat = git_diff_stat(project_root);
+    let system = agentic_system_prompt(before.as_deref(), diff_stat.as_deref());
+
+    // The execution request: the user's raw task, tools UNLOCKED, no max_tokens
+    // (so the base isn't cut off mid-loop). The system prompt does NOT re-ban
+    // tools — it unlocks them and only adds the reality contract.
     let request = CompletionRequest {
         model: model.to_string(),
         messages: vec![Message {
@@ -673,22 +930,59 @@ async fn drive_agentic_stream(
         }],
         max_tokens: None,
         temperature: None,
-        system: None,
+        system: Some(system),
     };
     // Forward every stream event straight into the existing WorkerStream
-    // render pipeline (tool calls + text deltas show live).
+    // render pipeline (tool calls + text deltas show live). A `Warning` event is
+    // also latched into `truncated` so the terminal note can flag an incomplete
+    // finish (the base hit a rate limit / retry / cut-off mid-loop).
+    let truncated = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stream_sink = Arc::clone(sink);
+    let truncated_flag = Arc::clone(&truncated);
     let on_event = move |ev: umadev_runtime::StreamEvent| {
+        if matches!(ev, umadev_runtime::StreamEvent::Warning { .. }) {
+            truncated_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         stream_sink.emit(EngineEvent::WorkerStream { event: ev });
     };
     match brain.complete_streaming(request, &on_event).await {
         Ok(resp) => {
+            // (2) Post-turn fact check — snapshot git AGAIN and diff against the
+            // pre-turn snapshot to get the files THIS turn actually changed on
+            // disk. Fail-open: if either snapshot is missing (non-git / git
+            // unavailable), `changed` is `None` and the fact line is skipped.
+            let changed = match (before.as_deref(), git_status_porcelain(project_root)) {
+                (Some(b), Some(a)) => Some(changed_files_between(b, &a)),
+                _ => None,
+            };
+            // Emit the reality-anchored fact line to the transcript: the real
+            // changed-file set, plus a `[warn]` when the base CLAIMED changes the
+            // working tree does not show (likely a recited / hallucinated edit).
+            if let Some(line) =
+                agentic_fact_line(changed.as_deref(), claims_code_changes(&resp.text))
+            {
+                sink.emit(EngineEvent::Note(line));
+            }
+            // (3) Truncation honesty — a `Warning` event mid-stream means the
+            // turn likely ended early (rate limit / retry / cut-off). Append a
+            // caveat to the recorded reply so a truncated turn does NOT read as a
+            // clean, fully-flushed success.
+            let mut reply = resp.text;
+            if truncated.load(std::sync::atomic::Ordering::SeqCst) {
+                if !reply.is_empty() {
+                    reply.push('\n');
+                }
+                reply.push_str(
+                    "[warn] 本轮可能未完成或未全部落盘(底座中途告警/截断),请核对实际文件状态 \
+                     / turn may be incomplete or not fully written — verify the working tree",
+                );
+            }
             // The body already streamed live; hand the assembled text to the
             // event loop ONLY to record it as the assistant turn. An empty body
             // (the base emitted only tool calls / a side-effect) is still a clean
             // finish — send AgenticDone with what we have so `thinking` clears
             // uniformly.
-            let _ = route_tx.send(RouteDecision::AgenticDone(resp.text));
+            let _ = route_tx.send(RouteDecision::AgenticDone(reply));
         }
         Err(e) => {
             // Fail-open: the agentic call failed → a terminal Failed note (clears
@@ -1999,7 +2293,19 @@ mod tests {
             fail: false,
         };
 
-        drive_agentic_stream(&spy, "审一下", "m", "claude-code", &sink, &route_tx).await;
+        // A non-git temp dir → the reality guards fail-open (no fact line),
+        // keeping this test focused on the streaming-vs-one-shot contract.
+        let tmp = tempfile::TempDir::new().unwrap();
+        drive_agentic_stream(
+            &spy,
+            "审一下",
+            "m",
+            "claude-code",
+            tmp.path(),
+            &sink,
+            &route_tx,
+        )
+        .await;
 
         assert_eq!(
             complete_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -2042,7 +2348,17 @@ mod tests {
             fail: true,
         };
 
-        drive_agentic_stream(&spy, "审一下", "m", "claude-code", &sink, &route_tx).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        drive_agentic_stream(
+            &spy,
+            "审一下",
+            "m",
+            "claude-code",
+            tmp.path(),
+            &sink,
+            &route_tx,
+        )
+        .await;
 
         match route_rx.try_recv() {
             Ok(RouteDecision::Failed(note)) => {
@@ -2050,6 +2366,276 @@ mod tests {
             }
             other => panic!("expected fail-open Failed downgrade, got {other:?}"),
         }
+    }
+
+    // ---- agentic reality-anchoring (hallucinated-change defence) -----------
+    // (these tests use Atomic/streaming concurrency primitives below.)
+
+    #[test]
+    fn system_prompt_injects_git_state_and_unlocks_tools() {
+        // The reality-injection prompt must keep tools UNLOCKED — never re-add
+        // the chat-route tool ban — and embed the live git status plus a
+        // no-recitation contract.
+        let status = concat!(" M crates/umadev-tui/src/lib.rs\n", "?? new.rs\n");
+        let p = agentic_system_prompt(Some(status), Some("1 file changed"));
+        // Tools stay unlocked (the whole point of the agentic path).
+        assert!(p.contains("FULL tool access"));
+        assert!(p.to_lowercase().contains("edit files"));
+        // The real git state is injected verbatim.
+        assert!(p.contains("crates/umadev-tui/src/lib.rs"));
+        assert!(p.contains("git status --porcelain"));
+        assert!(p.contains("1 file changed"));
+        // The anti-recitation reality contract is present.
+        assert!(p.contains("REALITY CONTRACT"));
+        assert!(p.to_lowercase().contains("git diff"));
+    }
+
+    #[test]
+    fn changed_files_between_diffs_two_snapshots() {
+        // A file newly appearing, a file whose status changed, and a file that
+        // disappeared all count; an identical line in both is unchanged.
+        let before = concat!(" M a.rs\n", "?? keep.rs\n");
+        let after = concat!(" M a.rs\n", "MM a.rs2\n", "?? new.rs\n");
+        // a.rs identical -> not changed; a.rs2 new; new.rs new; keep.rs vanished.
+        let changed = changed_files_between(before, after);
+        assert_eq!(changed, vec!["a.rs2", "keep.rs", "new.rs"]);
+        // Rename: attributed to the new path.
+        let renamed = changed_files_between("", "R  old.rs -> new2.rs\n");
+        assert_eq!(renamed, vec!["new2.rs"]);
+        // Identical snapshots -> nothing changed.
+        assert!(changed_files_between(before, before).is_empty());
+    }
+
+    #[test]
+    fn fact_line_warns_on_claimed_but_absent_change() {
+        // No files changed but the reply CLAIMS work -> the loud warning fires.
+        let line = agentic_fact_line(Some(&[]), true).unwrap();
+        assert!(line.contains("[warn]"));
+        assert!(line.contains("没有实际文件变更") || line.contains("unchanged"));
+        // No files changed and no claim -> a calm note, no warning.
+        let calm = agentic_fact_line(Some(&[]), false).unwrap();
+        assert!(calm.contains("无文件变更"));
+        assert!(!calm.contains("[warn]"));
+    }
+
+    #[test]
+    fn fact_line_lists_real_changes() {
+        let files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        let line = agentic_fact_line(Some(&files), true).unwrap();
+        // Real changes present -> list them, NEVER warn (the claim is backed).
+        assert!(line.contains("src/a.rs"));
+        assert!(line.contains("src/b.rs"));
+        assert!(!line.contains("[warn]"));
+    }
+
+    #[test]
+    fn fact_line_fails_open_when_git_unavailable() {
+        // changed == None models git being unavailable -> no fact line at all,
+        // even when the reply loudly claims changes. The enhancement must never
+        // fabricate a verdict it cannot back.
+        assert!(agentic_fact_line(None, true).is_none());
+        assert!(agentic_fact_line(None, false).is_none());
+    }
+
+    #[test]
+    fn claims_heuristic_spots_change_language_bilingually() {
+        assert!(claims_code_changes(
+            "I refactored the parser and added a test"
+        ));
+        assert!(claims_code_changes("已修改 app.rs 并新增了一个函数"));
+        assert!(claims_code_changes("Created src/new.rs"));
+        // A pure read/answer with no change verb does not trip the heuristic.
+        assert!(!claims_code_changes("这段代码看起来没有问题,逻辑正确"));
+        assert!(!claims_code_changes(
+            "The function returns the sum; nothing to do."
+        ));
+    }
+
+    /// A runtime spy that, before finishing, runs a caller-supplied side effect
+    /// against the real working tree (e.g. writes a file) and returns a fixed
+    /// reply — so the post-turn git fact check can be exercised end to end. Set
+    /// `warn` to emit a `Warning` event (truncation-honesty path).
+    struct EffectSpy {
+        reply: String,
+        warn: bool,
+        effect: Box<dyn Fn() + Send + Sync>,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for EffectSpy {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Anthropic
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<umadev_runtime::CompletionResponse, umadev_runtime::RuntimeError> {
+            unreachable!("agentic path must stream")
+        }
+        async fn complete_streaming(
+            &self,
+            _req: CompletionRequest,
+            on_event: &(dyn Fn(umadev_runtime::StreamEvent) + Send + Sync),
+        ) -> Result<umadev_runtime::CompletionResponse, umadev_runtime::RuntimeError> {
+            if self.warn {
+                on_event(umadev_runtime::StreamEvent::Warning {
+                    message: "rate limited, partial".to_string(),
+                });
+            }
+            // Mutate the working tree mid-turn so the post-turn snapshot differs.
+            (self.effect)();
+            Ok(umadev_runtime::CompletionResponse {
+                text: self.reply.clone(),
+                id: "spy".to_string(),
+                model: "spy".to_string(),
+                usage: umadev_runtime::Usage::default(),
+            })
+        }
+    }
+
+    /// Initialise a throwaway git repo and return its temp dir.
+    fn init_git_repo() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.t"]);
+        run(&["config", "user.name", "t"]);
+        tmp
+    }
+
+    #[tokio::test]
+    async fn agentic_fact_check_lists_real_file_change() {
+        // A real write inside a git repo -> the post-turn note lists the file
+        // and does NOT warn (the change is backed by the working tree).
+        let tmp = init_git_repo();
+        let path = tmp.path().to_path_buf();
+        let target = path.join("touched.rs");
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, _route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spy = EffectSpy {
+            reply: "I created touched.rs".to_string(),
+            warn: false,
+            effect: Box::new(move || std::fs::write(&target, "fn x").unwrap()),
+        };
+        drive_agentic_stream(&spy, "do it", "m", "claude-code", &path, &sink, &route_tx).await;
+
+        let mut fact = None;
+        while let Ok(ev) = engine_rx.try_recv() {
+            if let EngineEvent::Note(n) = ev {
+                if n.contains("文件变更") || n.contains("touched.rs") {
+                    fact = Some(n);
+                }
+            }
+        }
+        let fact = fact.expect("a fact line must be emitted for a real change");
+        assert!(fact.contains("touched.rs"), "must name the changed file");
+        assert!(!fact.contains("[warn]"), "a real change must not warn");
+    }
+
+    #[tokio::test]
+    async fn agentic_fact_check_warns_on_claimed_phantom_change() {
+        // The core bug: the base CLAIMS a change but the working tree is
+        // untouched -> the loud warning must fire so the user never trusts a
+        // phantom edit.
+        let tmp = init_git_repo();
+        let path = tmp.path().to_path_buf();
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, _route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spy = EffectSpy {
+            reply: "我已经重构了 app.rs 并新增了三个函数".to_string(),
+            warn: false,
+            effect: Box::new(|| ()),
+        };
+        drive_agentic_stream(
+            &spy,
+            "重构一下",
+            "m",
+            "claude-code",
+            &path,
+            &sink,
+            &route_tx,
+        )
+        .await;
+
+        let mut warned = false;
+        while let Ok(ev) = engine_rx.try_recv() {
+            if let EngineEvent::Note(n) = ev {
+                if n.contains("[warn]") {
+                    warned = true;
+                }
+            }
+        }
+        assert!(
+            warned,
+            "a claimed-but-absent change must raise the phantom-change warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn agentic_truncation_marks_reply_incomplete() {
+        // A Warning event mid-stream -> the recorded reply carries an
+        // "incomplete / verify" caveat rather than reading as clean success.
+        let tmp = init_git_repo();
+        let path = tmp.path().to_path_buf();
+        let (sink, _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spy = EffectSpy {
+            reply: "done".to_string(),
+            warn: true,
+            effect: Box::new(|| ()),
+        };
+        drive_agentic_stream(&spy, "go", "m", "claude-code", &path, &sink, &route_tx).await;
+
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone(text)) => {
+                let incomplete = text.contains("未完成") || text.contains("incomplete");
+                assert!(
+                    text.contains("[warn]") && incomplete,
+                    "a truncated turn must flag possible incompleteness, got: {text}"
+                );
+            }
+            other => panic!("expected AgenticDone with caveat, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agentic_fact_check_fails_open_outside_git() {
+        // Outside any git repo the fact check must SILENTLY skip — no fact line,
+        // no warning, no panic — and the turn still completes cleanly.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spy = EffectSpy {
+            reply: "I refactored everything".to_string(),
+            warn: false,
+            effect: Box::new(|| ()),
+        };
+        drive_agentic_stream(&spy, "go", "m", "claude-code", &path, &sink, &route_tx).await;
+
+        // No [warn]/fact Note despite a loud claim — git was unavailable.
+        while let Ok(ev) = engine_rx.try_recv() {
+            if let EngineEvent::Note(n) = ev {
+                let leaked = n.contains("[warn]") || n.contains("文件变更");
+                assert!(!leaked, "fail-open: no fact/warn line outside a git repo");
+            }
+        }
+        // The turn still finishes cleanly.
+        assert!(matches!(
+            route_rx.try_recv(),
+            Ok(RouteDecision::AgenticDone(_))
+        ));
     }
 
     #[test]
