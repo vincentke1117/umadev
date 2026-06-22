@@ -1244,7 +1244,10 @@ impl App {
             }
             EngineEvent::PhaseCompleted { phase } => {
                 self.set_phase(phase, PhaseStatus::Done);
-                self.push(ChatRole::UmaDev, format!("[ok] {}", phase.id()));
+                self.push(
+                    ChatRole::UmaDev,
+                    umadev_i18n::tf(self.lang, "event.phase_done", &[phase.id()]),
+                );
             }
             EngineEvent::GateOpened { gate } => {
                 self.active_gate = Some(gate);
@@ -1402,23 +1405,26 @@ impl App {
             EngineEvent::VerifyStarted { phase, command } => {
                 self.push(
                     ChatRole::UmaDev,
-                    format!("[verify] verify [{}] running: {command}", phase.id()),
+                    umadev_i18n::tf(self.lang, "event.verify_started", &[phase.id(), &command]),
                 );
             }
             EngineEvent::VerifySkipped { phase, reason } => {
                 self.push(
                     ChatRole::UmaDev,
-                    format!("[skip] verify [{}] skipped — {reason}", phase.id()),
+                    umadev_i18n::tf(self.lang, "event.verify_skipped", &[phase.id(), &reason]),
                 );
             }
             EngineEvent::VerifyPassed { phase, duration_ms } => {
                 self.push(
                     ChatRole::UmaDev,
-                    format!(
-                        "[ok] verify [{}] passed in {}.{}s",
-                        phase.id(),
-                        duration_ms / 1000,
-                        (duration_ms % 1000) / 100
+                    umadev_i18n::tf(
+                        self.lang,
+                        "event.verify_passed",
+                        &[
+                            phase.id(),
+                            &(duration_ms / 1000).to_string(),
+                            &((duration_ms % 1000) / 100).to_string(),
+                        ],
                     ),
                 );
             }
@@ -1454,9 +1460,10 @@ impl App {
                 };
                 self.push(
                     ChatRole::System,
-                    format!(
-                        "[fail] verify [{}] FAILED (exit {exit_code}): {snippet}\n  {action}",
-                        phase.id()
+                    umadev_i18n::tf(
+                        self.lang,
+                        "event.verify_failed",
+                        &[phase.id(), &exit_code.to_string(), snippet, action],
                     ),
                 );
             }
@@ -1506,16 +1513,26 @@ impl App {
             } => {
                 self.push(
                     ChatRole::System,
-                    format!("▸ {phase:?} subtask `{task_id}` started: {label}"),
+                    umadev_i18n::tf(
+                        self.lang,
+                        "event.subtask_started",
+                        &[&format!("{phase:?}"), &task_id, &label],
+                    ),
                 );
             }
             EngineEvent::SubTaskCompleted { phase, task_id, ok } => {
-                let mark = if ok { "[ok]" } else { "[fail]" };
+                let outcome = if ok {
+                    umadev_i18n::t(self.lang, "event.subtask_done")
+                } else {
+                    umadev_i18n::t(self.lang, "event.subtask_failed")
+                };
+                let tag = if ok { "[ok]" } else { "[fail]" };
                 self.push(
                     ChatRole::System,
-                    format!(
-                        "{mark} {phase:?} subtask `{task_id}` {}",
-                        if ok { "done" } else { "failed" }
+                    umadev_i18n::tf(
+                        self.lang,
+                        "event.subtask_completed",
+                        &[tag, &format!("{phase:?}"), &task_id, outcome],
                     ),
                 );
             }
@@ -1626,7 +1643,13 @@ impl App {
                         // arrives (stream_text_active = false resets it).
                         self.stream_text_active = false;
                         self.stream_tool_batch = None;
-                        self.push(ChatRole::System, "[thinking] thinking…".to_string());
+                        self.push(
+                            ChatRole::System,
+                            format!(
+                                "[thinking] {}",
+                                umadev_i18n::t(self.lang, "status.thinking")
+                            ),
+                        );
                     }
                 }
             }
@@ -2415,11 +2438,11 @@ impl App {
         }
         self.push(
             ChatRole::System,
-            "[agentic] inspecting the repo…".to_string(),
+            umadev_i18n::t(self.lang, "agentic.inspecting").to_string(),
         );
         self.conversation.push(umadev_runtime::Message {
             role: "assistant".to_string(),
-            content: format!("[agentic] working on: {task}"),
+            content: umadev_i18n::tf(self.lang, "agentic.working_on", &[task]),
         });
         self.trim_conversation();
     }
@@ -2442,7 +2465,10 @@ impl App {
             // The base produced only tool calls / a side-effect with no closing
             // prose. Still a clean finish — leave the streamed activity as the
             // record, but drop a short marker so the turn reads as completed.
-            self.push(ChatRole::System, "[agentic] done.".to_string());
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "agentic.done").to_string(),
+            );
             return;
         }
         self.conversation.push(umadev_runtime::Message {
@@ -2601,7 +2627,10 @@ impl App {
                 // session on the next turn, not resume the old one.
                 self.host_chat_session_active = false;
                 self.chat_session_id = None;
-                self.push(ChatRole::System, "history cleared.");
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "slash.history_cleared"),
+                );
                 Action::None
             }
             "claude" | "claude-code" => self.slash_backend(Some("claude-code")),
@@ -2670,7 +2699,7 @@ impl App {
                 if let Some(gate) = self.active_gate.take() {
                     self.push(
                         ChatRole::UmaDev,
-                        format!("[ok] approved gate `{}` — continuing…", gate.id_str()),
+                        umadev_i18n::tf(self.lang, "slash.gate_approved", &[gate.id_str()]),
                     );
                     self.record_trust_pass(gate.id_str());
                     Action::Continue(gate)
@@ -2783,13 +2812,16 @@ impl App {
                 let output = self.run_subprocess_cli("mcp-manage list");
                 self.push(
                     ChatRole::System,
-                    format!("[package] MCP Servers:\n\n{output}"),
+                    umadev_i18n::tf(self.lang, "slash.mcp_header", &[&output]),
                 );
                 Action::None
             }
             "skill" => {
                 let output = self.run_subprocess_cli("skill list");
-                self.push(ChatRole::System, format!("[skill] Skills:\n\n{output}"));
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::tf(self.lang, "slash.skill_header", &[&output]),
+                );
                 Action::None
             }
             "adopt" => {
@@ -3948,39 +3980,52 @@ impl App {
         // `umadev spec` prints, so the overlay is always fresh.
         let body = include_str!("../../../spec/UMADEV_HOST_SPEC_V1.md");
         self.overlay = Some(Overlay::from_body(
-            " UMADEV_HOST_SPEC_V1 — press Esc to close, ↑↓ scroll ",
+            umadev_i18n::t(self.lang, "spec.overlay_title"),
             body,
         ));
     }
 
     fn open_doctor_overlay(&mut self) {
-        let mut body = String::from(
-            "Doctor\n\
-             ======\n\n",
-        );
-        body.push_str(&format!(
-            "binary       umadev {} (spec {})\n",
-            env!("CARGO_PKG_VERSION"),
-            umadev_spec::SPEC_VERSION,
+        let lang = self.lang;
+        let mut body = format!("{}\n======\n\n", umadev_i18n::t(lang, "doctor.heading"));
+        body.push_str(&umadev_i18n::tf(
+            lang,
+            "doctor.binary",
+            &[env!("CARGO_PKG_VERSION"), umadev_spec::SPEC_VERSION],
         ));
-        body.push_str(&format!("workspace    {}\n", self.project_root.display()));
-        body.push_str(&format!("worker       {}\n", self.backend_label));
+        body.push('\n');
+        body.push_str(&umadev_i18n::tf(
+            lang,
+            "doctor.workspace",
+            &[&self.project_root.display().to_string()],
+        ));
+        body.push('\n');
+        body.push_str(&umadev_i18n::tf(
+            lang,
+            "doctor.worker",
+            &[&self.backend_label],
+        ));
+        body.push('\n');
         // Spec manifest
         let manifest = umadev_agent::SpecManifest::read_from(&self.project_root);
-        match manifest {
-            Some(m) => body.push_str(&format!(
-                "manifest     umadev.yaml present (level {}, profile {})\n",
-                m.level.as_str(),
-                m.profile.as_str(),
-            )),
-            None => {
-                body.push_str("manifest     [warn] no umadev.yaml — type /init to create one\n");
-            }
+        if let Some(m) = manifest {
+            body.push_str(&umadev_i18n::tf(
+                lang,
+                "doctor.manifest_present",
+                &[m.level.as_str(), m.profile.as_str()],
+            ));
+            body.push('\n');
+        } else {
+            body.push_str(umadev_i18n::t(lang, "doctor.manifest_missing"));
+            body.push('\n');
         }
         // Backend probes
-        body.push_str("\nworker availability:\n");
+        body.push('\n');
+        body.push_str(umadev_i18n::t(lang, "doctor.worker_availability"));
+        body.push('\n');
         if self.backends.is_empty() {
-            body.push_str("  (probing…)\n");
+            body.push_str(umadev_i18n::t(lang, "doctor.probing"));
+            body.push('\n');
         } else {
             for b in &self.backends {
                 let mark = if b.ready { "[ok]" } else { "[fail]" };
@@ -3988,10 +4033,13 @@ impl App {
             }
         }
         // Design systems + seed templates
-        body.push_str("\ndesign infrastructure:\n");
+        body.push('\n');
+        body.push_str(umadev_i18n::t(lang, "doctor.design_infra"));
+        body.push('\n');
         let ds_list = self.list_design_systems();
         if ds_list.is_empty() {
-            body.push_str("  [warn] no design systems found in knowledge/design-systems/\n");
+            body.push_str(umadev_i18n::t(lang, "doctor.no_design_systems"));
+            body.push('\n');
         } else {
             let active = self.config.design_system.as_deref().unwrap_or("");
             for ds in &ds_list {
@@ -4002,7 +4050,7 @@ impl App {
         let tpl_list = self.list_seed_templates();
         if !tpl_list.is_empty() {
             let active = self.config.seed_template.as_deref().unwrap_or("");
-            body.push_str("  templates: ");
+            body.push_str(umadev_i18n::t(lang, "doctor.templates_label"));
             let labels: Vec<String> = tpl_list
                 .iter()
                 .map(|t| {
@@ -4018,7 +4066,9 @@ impl App {
         }
 
         // Knowledge base health
-        body.push_str("\nknowledge base:\n");
+        body.push('\n');
+        body.push_str(umadev_i18n::t(lang, "doctor.knowledge_base"));
+        body.push('\n');
         let experts_dir = self.project_root.join("knowledge/experts");
         if experts_dir.is_dir() {
             let roles: Vec<_> = std::fs::read_dir(&experts_dir)
@@ -4030,35 +4080,52 @@ impl App {
                         .collect()
                 })
                 .unwrap_or_default();
-            body.push_str(&format!(
-                "  [ok] {} expert roles: {}\n",
-                roles.len(),
-                roles.join(", ")
+            body.push_str(&umadev_i18n::tf(
+                lang,
+                "doctor.expert_roles",
+                &[&roles.len().to_string(), &roles.join(", ")],
             ));
+            body.push('\n');
         } else {
-            body.push_str("  [warn] no knowledge/experts/ directory\n");
+            body.push_str(umadev_i18n::t(lang, "doctor.no_experts"));
+            body.push('\n');
         }
         let knowledge_dir = self.project_root.join("knowledge");
         if knowledge_dir.is_dir() {
             let md_count = walkdir_count_md(&knowledge_dir);
-            body.push_str(&format!("  [ok] {md_count} knowledge files total\n"));
+            body.push_str(&umadev_i18n::tf(
+                lang,
+                "doctor.knowledge_files",
+                &[&md_count.to_string()],
+            ));
+            body.push('\n');
         }
 
         // .umadevrc
         let rc_path = self.project_root.join(".umadevrc");
-        body.push_str("\nproject config:\n");
+        body.push('\n');
+        body.push_str(umadev_i18n::t(lang, "doctor.project_config"));
+        body.push('\n');
         if rc_path.is_file() {
             let cfg = umadev_agent::config::load_project_config(&self.project_root);
-            body.push_str(&format!(
-                "  [ok] .umadevrc (threshold={}, rounds={})\n",
-                cfg.quality.threshold, cfg.pipeline.max_review_rounds
+            body.push_str(&umadev_i18n::tf(
+                lang,
+                "doctor.rc_present",
+                &[
+                    &cfg.quality.threshold.to_string(),
+                    &cfg.pipeline.max_review_rounds.to_string(),
+                ],
             ));
+            body.push('\n');
         } else {
-            body.push_str("  [pending] no .umadevrc (using defaults)\n");
+            body.push_str(umadev_i18n::t(lang, "doctor.rc_missing"));
+            body.push('\n');
         }
 
         // Audit trail
-        body.push_str("\naudit trail:\n");
+        body.push('\n');
+        body.push_str(umadev_i18n::t(lang, "doctor.audit_trail"));
+        body.push('\n');
         let audit_dir = self.project_root.join(".umadev/audit");
         if audit_dir.is_dir() {
             for name in [
@@ -4070,16 +4137,26 @@ impl App {
                 if p.is_file() {
                     let lines = std::fs::read_to_string(&p)
                         .map_or(0, |t| t.lines().filter(|l| !l.trim().is_empty()).count());
-                    body.push_str(&format!("  [ok] {name} ({lines} entries)\n"));
+                    body.push_str(&umadev_i18n::tf(
+                        lang,
+                        "doctor.audit_present",
+                        &[name, &lines.to_string()],
+                    ));
+                    body.push('\n');
                 } else {
-                    body.push_str(&format!("  [pending] {name} (not yet created)\n"));
+                    body.push_str(&umadev_i18n::tf(lang, "doctor.audit_missing", &[name]));
+                    body.push('\n');
                 }
             }
         } else {
-            body.push_str("  [pending] no audit trail yet (run a pipeline first)\n");
+            body.push_str(umadev_i18n::t(lang, "doctor.no_audit"));
+            body.push('\n');
         }
 
-        self.overlay = Some(Overlay::from_body(" doctor — press Esc to close ", &body));
+        self.overlay = Some(Overlay::from_body(
+            umadev_i18n::t(lang, "doctor.overlay_title"),
+            &body,
+        ));
     }
 
     fn open_verify_overlay(&mut self) {
@@ -5960,9 +6037,12 @@ mod tests {
             let _ = app.apply_key(KeyCode::Char(c));
         }
         let _ = app.apply_key(KeyCode::Enter);
-        // After /clear: only the "history cleared." system message remains.
+        // After /clear: only the localized "history cleared" system note remains.
         assert_eq!(app.history.len(), 1);
-        assert!(app.history.front().unwrap().body.contains("cleared"));
+        assert_eq!(
+            app.history.front().unwrap().body,
+            umadev_i18n::t(app.lang, "slash.history_cleared")
+        );
     }
 
     #[test]
@@ -6157,8 +6237,20 @@ mod tests {
         }
         let _ = a.apply_key(KeyCode::Enter);
         let ov = a.overlay.as_ref().expect("doctor overlay");
-        assert!(ov.lines.iter().any(|l| l.starts_with("binary")));
-        assert!(ov.lines.iter().any(|l| l.starts_with("workspace")));
+        // Locale-independent: the binary line carries the crate version, and the
+        // worker-availability section header is always present. (The labels
+        // themselves are localized, so we assert on the language-neutral parts.)
+        assert!(
+            ov.lines
+                .iter()
+                .any(|l| l.contains(env!("CARGO_PKG_VERSION"))),
+            "doctor overlay should show the binary version line"
+        );
+        let avail = umadev_i18n::t(a.lang, "doctor.worker_availability");
+        assert!(
+            ov.lines.iter().any(|l| l.contains(avail.trim())),
+            "doctor overlay should show the worker-availability section"
+        );
     }
 
     #[test]
@@ -6899,10 +6991,12 @@ mod tests {
             exit_code: 1,
             stderr: "error: cannot find module 'react'".into(),
         });
+        // The verify-failed line is now localized (the word "verify" itself is
+        // translated), so find it by its language-neutral [fail] tag instead.
         let msg = a
             .history
             .iter()
-            .find(|m| m.body.contains("verify"))
+            .find(|m| m.body.contains("[fail]"))
             .expect("verify failure message");
         assert!(msg.body.contains("依赖未安装"), "got: {}", msg.body);
     }
