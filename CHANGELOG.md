@@ -2,9 +2,20 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased] — 角色裁判团 · 自我进化记忆 · brownfield 接管 · 部署/PR 闭环 · 信任分级
+## [1.0.6] — Windows 检测铁桶 · 交互硬化 · 锁与稳定性（含角色裁判团 · 自我进化记忆 · brownfield · 部署/PR · 信任分级）
 
-### 新增
+### 修复与交互硬化（本轮重点）
+
+- **Windows 底座检测铁桶**：修复 npm 安装的 claude / codex / opencode 在 Windows 上报 `os error 193`（命中了 npm 的裸 *nix 垫片而非 `.cmd`）。`resolve_program` 改为 PATHEXT 扩展名优先 + 遍历所有已知安装目录兜底（Homebrew / volta / bun / deno / yarn / pnpm / nvm / asdf / `~/.<base>/bin` / Windows Programs·Scoop·Choco·winget）+ `UMADEV_<NAME>_BIN` 显式逃生口——无论用什么方式安装都能识别。`umadev doctor` 同步改用该检测，不再出现"装了却报未检测到"的假阴性。
+- **`run.lock` 三态化**：崩溃 / 被 Ctrl-C / 被杀留下的陈旧锁，按 PID 存活检测**立即回收**（不再卡 6 小时）；同一会话自冲突不再误报"另一个 umadev 占用"；仅当真有另一个存活进程时才拒绝，并给出强制清锁提示。
+- **交互硬化（对标成熟终端 AI 产品）**：
+  - 主对话**支持滚动回看**：PageUp/PageDown、Home/End、Ctrl+Alt+U/D（半页，避开 Ctrl-D 退出冲突）、Shift+↑↓、鼠标滚轮（`/mouse` 可开关）；小终端不再把状态栏 / 输入框挤出屏（最小尺寸提示卡）；窗口缩放即时重绘。
+  - **永不"看着卡死"**：进度圈动画 + 超过 3 秒无输出时状态栏染红；所有长阻塞阶段先发 `[wait]` 再周期心跳（首拍约 3 秒）；opencode 底座补齐真流式（逐行实时回显），且慢首 token 不再被 120 秒看门狗误杀重跑。
+  - **聊天能真干活**：新增 agentic 聊天——"审一下这段代码会不会出 bug""帮我看看这个报错"这类请求会驱动底座真正读文件 / 跑命令产出结果，而非只回一句"我来看看"。
+  - **输入永不丢**：运行中输入排队即显 `[queued N]` 且多条不互相覆盖；无关进度提示不再误熄 thinking 动画；防止重复提交并发串台同一会话；运行中 Ctrl-C 直接中断；Esc 在 agentic 回合中只中断、不退出程序。
+  - **错误可诊断**：超时 / 空回 / 失败附带根因猜测 + 下一步（引导 `umadev doctor` / `/redo`），质量门内联分数与前几条问题；`auto` 模式真正全自动（自动跳过澄清门）；用户可见文案补齐 zh-CN / zh-TW / en 三语。
+
+### 新增（角色裁判团 · 自我进化记忆 · brownfield · 部署/PR · 信任分级）
 
 - **角色裁判团（`critics`）**：把流水线里隐式扮演的角色（PM 立项 / tech-lead 文档评审 / 资深设计评审 / 验收总监）统一成 `RoleVerdict` schema + `RoleCritic` trait——每个角色在**只读的 fork 会话**上交叉评审共享工件并返回结构化裁决。fail-open、advisory-only（永不驱动循环终止）、绝不写盘、不新增模型端点（复用同一借来的脑）。
 - **自我进化记忆升级**：`lessons` 的踩坑库按归一化签名去重并**频率驱动召回**；当某踩坑在修复后仍复发时，向底座请求一条更高层的纠正**策略**并把 `Reflection` 快照进 `.umadev/reflections/`；检索新增 HyDE 式"假设答案"查询扩展，经 RRF 与原 query 排名融合，叠加在既有 BM25↔向量双通道融合之上。
