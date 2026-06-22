@@ -358,6 +358,12 @@ pub struct App {
     pub finished: bool,
     /// `true` once the user has kicked off a pipeline run in this session.
     pub run_started: bool,
+    /// `true` when the LAST block ended by aborting (returned an error → zero
+    /// phases produced) rather than reaching a gate or delivery. Set from the
+    /// `ABORT_SENTINEL` terminal note emitted by `spawn_block`; surfaced in the
+    /// status bar as an explicit "aborted" terminal state so a wedged run no
+    /// longer masquerades as idle "ready / 0/9". Cleared when a new run starts.
+    pub aborted: bool,
 
     /// A routed chat turn is in flight (message sent, waiting on the base's
     /// reply). Drives the animated "thinking…" status so a submit never looks
@@ -544,6 +550,7 @@ impl App {
             active_gate: None,
             finished: false,
             run_started: false,
+            aborted: false,
             thinking: false,
             thinking_started: None,
             agentic_in_flight: false,
@@ -742,6 +749,9 @@ impl App {
             .unwrap_or_default();
         let done_label = if self.finished {
             " · [ok] delivered".to_string()
+        } else if self.aborted {
+            // Explicit terminal state — never let an aborted run read as idle.
+            " · [aborted] 本轮已中止".to_string()
         } else {
             String::new()
         };
@@ -766,9 +776,33 @@ impl App {
 
     /// `true` while the user has started a run that hasn't reached
     /// delivery yet. Used by the Esc-to-quit confirmation.
+    ///
+    /// An **aborted** block is NOT active: the run is over (it produced zero
+    /// phases and bailed), so it must not keep claiming the workspace or block a
+    /// fresh `/run`. Without this, an aborted run would stay "active" forever and
+    /// a retry would be wrongly refused as "a pipeline is already running".
     #[must_use]
     pub fn is_pipeline_active(&self) -> bool {
-        self.run_started && !self.finished
+        self.run_started && !self.finished && !self.aborted
+    }
+
+    /// Mark the current block as **aborted**: it ended with an error before
+    /// producing any phase, so there is no gate and no delivery. Render the
+    /// explicit "this round aborted" line, drop the run out of the active state,
+    /// and stop the live elapsed counters so the status bar reflects a real
+    /// terminal state instead of the misleading idle "ready / 0/9" look. A new
+    /// `/run` (which fires `PipelineStarted`) clears the flag.
+    fn mark_block_aborted(&mut self, body: String) {
+        self.aborted = true;
+        self.active_gate = None;
+        self.run_started_at = None;
+        self.phase_started_at = None;
+        // The run is over — any worker-stall animation must stop.
+        self.thinking = false;
+        self.tool_in_progress = false;
+        self.last_output_at = None;
+        self.push(ChatRole::System, body);
+        self.refresh_status();
     }
 
     // ---- transcript scrollback -------------------------------------------
@@ -1213,6 +1247,9 @@ impl App {
                 self.slug = slug;
                 self.requirement.clone_from(&requirement);
                 self.run_started = true;
+                // A fresh block clears any prior aborted terminal state — this
+                // run is live again.
+                self.aborted = false;
                 self.run_started_at = Some(std::time::Instant::now());
                 self.push(
                     ChatRole::UmaDev,
@@ -1509,6 +1546,16 @@ impl App {
                 }
             }
             EngineEvent::Note(note) => {
+                // A TERMINAL-ABORT note (a block that returned `Err` → produced
+                // zero phases and is over) carries the `ABORT_SENTINEL`. Treat it
+                // as a real run-ending state, NOT an ordinary progress heartbeat:
+                // strip the marker, flip into the explicit `aborted` terminal
+                // state, and stop the live counters so the status bar shows
+                // "aborted" instead of the misleading idle "ready / 0/9" look.
+                if let Some(body) = note.strip_prefix(crate::ABORT_SENTINEL) {
+                    self.mark_block_aborted(body.to_string());
+                    return;
+                }
                 // A bare progress Note must NOT clear `thinking`. A route is
                 // still in flight here (its TERMINAL outcome arrives as a
                 // `RouteDecision` on the route channel — `Chat` / `Run` /
@@ -6294,6 +6341,68 @@ mod tests {
 
         assert!(app.phases.iter().all(|r| r.status == PhaseStatus::Pending));
         assert!(!app.finished);
+    }
+
+    #[test]
+    fn abort_sentinel_note_surfaces_explicit_terminal_state_not_idle() {
+        // THE VISIBILITY BUG: a block that ended with an error used to emit a
+        // bare, easily-missed note and leave the bar reading "ready / 0/9". A
+        // terminal-abort note (carrying `ABORT_SENTINEL`) must instead flip the
+        // run into an explicit aborted state and stop the live counters.
+        let mut app = fresh_app(Some("offline"));
+        app.run_started = true;
+        app.run_started_at = Some(std::time::Instant::now());
+        assert!(app.is_pipeline_active(), "run is active before the abort");
+
+        app.apply_engine(EngineEvent::Note(format!(
+            "{}本轮已中止:磁盘写入失败 — 释放空间后重试",
+            crate::ABORT_SENTINEL
+        )));
+
+        assert!(app.aborted, "the sentinel note flips the run into aborted");
+        assert!(
+            !app.is_pipeline_active(),
+            "an aborted run is NOT active — a retry must not be refused as busy"
+        );
+        assert!(
+            app.run_started_at.is_none() && app.phase_started_at.is_none(),
+            "live elapsed counters stop on abort so the bar isn't a fake idle"
+        );
+        // The user sees the cause, and the sentinel marker is stripped.
+        let last = app.history.back().unwrap();
+        assert!(last.body.contains("本轮已中止"));
+        assert!(
+            !last.body.contains(crate::ABORT_SENTINEL),
+            "the internal sentinel marker must never be shown to the user"
+        );
+        // The status bar carries the explicit aborted label, not an idle look.
+        app.refresh_status();
+        assert!(app.status.contains("aborted"));
+    }
+
+    #[test]
+    fn a_new_pipeline_start_clears_a_prior_aborted_state() {
+        // Retrying after an abort: `PipelineStarted` must clear `aborted` so the
+        // fresh run reads as live, not stuck in the previous terminal state.
+        let mut app = fresh_app(Some("offline"));
+        app.aborted = true;
+        app.apply_engine(EngineEvent::PipelineStarted {
+            slug: "demo".into(),
+            requirement: "retry it".into(),
+        });
+        assert!(!app.aborted, "a fresh block clears the prior aborted state");
+        assert!(app.is_pipeline_active(), "the retried run is active again");
+    }
+
+    #[test]
+    fn ordinary_progress_note_does_not_abort() {
+        // A normal progress note (no sentinel) must keep the run active — only
+        // the explicit terminal-abort marker flips it.
+        let mut app = fresh_app(Some("offline"));
+        app.run_started = true;
+        app.apply_engine(EngineEvent::Note("[plan] 动态规划:greenfield".into()));
+        assert!(!app.aborted, "a plain progress note never aborts");
+        assert!(app.is_pipeline_active());
     }
 
     #[test]

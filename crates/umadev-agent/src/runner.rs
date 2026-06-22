@@ -958,15 +958,16 @@ impl<R: Runtime> AgentRunner<R> {
         // requirement as-is (empty clarify answers) and drive straight into the
         // initial block, which pauses at the next checkpoint the auto loop then
         // also advances. `plan` / `guarded` keep the existing stop-and-ask. We do
-        // NOT hold the run-lock here — `run_initial_block` acquires its own; a
-        // double-acquire from the same PID would `WouldBlock` and wedge the run.
+        // NOT hold the run-lock here — `run_initial_block` acquires its own; the
+        // same-PID `acquire_for_run` below reclaims our own residue instead of
+        // `WouldBlock`-aborting, so the serial hand-off can't wedge the run.
         if self.options.mode.gates_auto_approve() {
             self.emit(EngineEvent::Note(
                 umadev_i18n::tl("auto.clarify_skipped").to_string(),
             ));
             return self.run_initial_block(use_runtime, None).await;
         }
-        let _run_lock = crate::run_lock::RunLock::acquire(&self.options.project_root)?;
+        let _run_lock = crate::run_lock::RunLock::acquire_for_run(&self.options.project_root)?;
         self.emit(EngineEvent::PipelineStarted {
             slug: self.options.effective_slug(),
             requirement: self.options.requirement.clone(),
@@ -1074,9 +1075,12 @@ impl<R: Runtime> AgentRunner<R> {
         use_runtime: bool,
         requirement_override: Option<&str>,
     ) -> std::io::Result<RunReport> {
-        // Single-writer lock: refuse if another run holds this workspace (held
-        // for the whole block, released on return).
-        let _run_lock = crate::run_lock::RunLock::acquire(&self.options.project_root)?;
+        // Single-writer lock: refuse if a DIFFERENT live run holds this workspace
+        // (held for the whole block, released on return). Use the run-execution
+        // intent: a lock left over from THIS session's own prior block is our
+        // residue and is reclaimed, not treated as a `WouldBlock` queue signal —
+        // otherwise the first real block would self-abort at `0/9`.
+        let _run_lock = crate::run_lock::RunLock::acquire_for_run(&self.options.project_root)?;
         let mut completed = Vec::new();
         let project_cfg = crate::config::load_project_config(&self.options.project_root);
         let max_reviews = project_cfg.pipeline.max_review_rounds;
@@ -3444,7 +3448,7 @@ impl<R: Runtime> AgentRunner<R> {
     /// creates real project scaffold, components, and pages based on the
     /// approved PRD + Architecture + UIUX documents.
     pub async fn continue_after_docs_confirm(&self) -> std::io::Result<RunReport> {
-        let _run_lock = crate::run_lock::RunLock::acquire(&self.options.project_root)?;
+        let _run_lock = crate::run_lock::RunLock::acquire_for_run(&self.options.project_root)?;
         let use_runtime = !self.runtime.is_offline();
         let project_cfg = crate::config::load_project_config(&self.options.project_root);
         // #3: re-derive the plan and CONSUME it. A `DocsOnly` task has no build
@@ -3693,7 +3697,7 @@ impl<R: Runtime> AgentRunner<R> {
     /// backend → quality → delivery → done. Call after the user has
     /// approved `preview_confirm`.
     pub async fn continue_after_preview_confirm(&self) -> std::io::Result<RunReport> {
-        let _run_lock = crate::run_lock::RunLock::acquire(&self.options.project_root)?;
+        let _run_lock = crate::run_lock::RunLock::acquire_for_run(&self.options.project_root)?;
         let use_runtime = !self.runtime.is_offline();
         // Re-derive the (deterministic) plan to honour its skips in this block
         // (#3): a `FrontendOnly` task has no backend phase, and a lean bug-fix /
@@ -3994,7 +3998,7 @@ impl<R: Runtime> AgentRunner<R> {
     /// records an auditable artifact + timing + the run-history row, so a Light
     /// run is leaner, not invisible. `use_runtime` forces the worker on/off.
     pub async fn run_light(&self, use_runtime: bool) -> std::io::Result<RunReport> {
-        let _run_lock = crate::run_lock::RunLock::acquire(&self.options.project_root)?;
+        let _run_lock = crate::run_lock::RunLock::acquire_for_run(&self.options.project_root)?;
         let plan = crate::planner::plan_light(&self.options.requirement);
         let mut completed = Vec::new();
 
@@ -4158,7 +4162,7 @@ impl<R: Runtime> AgentRunner<R> {
     /// [`crate::planner::phase_from_id`]); the runner only accepts a typed
     /// [`Phase`]. The single-writer run-lock is held for the redo.
     pub async fn redo_phase(&self, phase: Phase, use_runtime: bool) -> std::io::Result<RunReport> {
-        let _run_lock = crate::run_lock::RunLock::acquire(&self.options.project_root)?;
+        let _run_lock = crate::run_lock::RunLock::acquire_for_run(&self.options.project_root)?;
         self.emit(EngineEvent::Note(format!(
             "[redo] 用先前 run 的上下文重跑 `{}` 阶段(输入保持一致)…",
             phase.id()

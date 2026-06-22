@@ -402,27 +402,34 @@ fn spawn_block(
         };
         let use_runtime = spec.is_runtime();
         let runner = AgentRunner::new(brain, options).with_event_sink(sink.clone());
-        let outcome = match block {
-            Block::Clarify => {
+        // A failed `runner.start()` (workflow-state write failed before the block
+        // even began) is itself a zero-phase abort — surface it through the SAME
+        // explicit terminal-abort path, never a bare easily-missed note that
+        // leaves the bar reading idle. `start_failed` builds the abort body and
+        // signals "stop here".
+        macro_rules! start_or_abort {
+            () => {
                 if let Err(e) = runner.start() {
-                    sink.emit(EngineEvent::Note(start_failed_note(&e)));
+                    sink.emit(EngineEvent::Note(format!(
+                        "{ABORT_SENTINEL}{}",
+                        start_failed_note(&e)
+                    )));
                     return;
                 }
+            };
+        }
+        let outcome = match block {
+            Block::Clarify => {
+                start_or_abort!();
                 runner.run_clarify(use_runtime).await
             }
             Block::Initial => {
-                if let Err(e) = runner.start() {
-                    sink.emit(EngineEvent::Note(start_failed_note(&e)));
-                    return;
-                }
+                start_or_abort!();
                 runner.run_initial_block(use_runtime, None).await
             }
             Block::Continue(gate) => runner.continue_from_gate(gate).await,
             Block::Light => {
-                if let Err(e) = runner.start() {
-                    sink.emit(EngineEvent::Note(start_failed_note(&e)));
-                    return;
-                }
+                start_or_abort!();
                 runner.run_light(use_runtime).await
             }
             // A redo reuses the prior run's persisted state — it must NOT call
@@ -430,22 +437,68 @@ fn spawn_block(
             Block::Redo(phase) => runner.redo_phase(phase, use_runtime).await,
         };
         if let Err(e) = outcome {
-            let err_str = e.to_string();
-            let hint = if err_str.contains("timed out") {
-                umadev_i18n::tlf("worker.timeout", &[&label])
-            } else if err_str.contains("not found on PATH") {
-                umadev_i18n::tlf("worker.not_on_path", &[&label])
-            } else if err_str.contains("exited with code") {
+            // A block that returned `Err` produced ZERO phases and is over. The
+            // old path emitted one easily-missed progress Note and let the task
+            // return, leaving the status bar reading "ready / 0/9" as if the run
+            // were merely idle — the exact "looks wedged" bug. Surface an
+            // EXPLICIT terminal-abort line (carrying the `ABORT_SENTINEL` so the
+            // app renders a real "this round aborted" terminal state, not a
+            // silent idle) with a cause + an actionable next step keyed to the
+            // error kind. Build it from literals so it stays self-contained;
+            // fail-open — emitting a note can never block anything.
+            sink.emit(EngineEvent::Note(format!(
+                "{ABORT_SENTINEL}{}",
+                block_abort_note(&e, &label)
+            )));
+        }
+    })
+}
+
+/// Marker prefixed onto the terminal-abort note emitted by [`spawn_block`] when
+/// a block ends with `Err` (zero phases produced). The TUI app recognises this
+/// prefix to flip the run into an explicit **aborted** terminal state — clearing
+/// the misleading "ready / 0/9" idle look — instead of treating it as an
+/// ordinary progress note. A zero-width-ish, human-meaningless tag so it never
+/// shows up as visible text after the app strips it.
+pub(crate) const ABORT_SENTINEL: &str = "\u{2068}umadev-block-aborted\u{2069}";
+
+/// Build the user-facing "this round aborted: <cause> — <next step>" body for a
+/// block that ended with an error, classified by error kind. Self-contained (no
+/// i18n key): a lock-residue/race gets a queue/retry/`rm` hint, a genuine
+/// concurrent run gets the delete-the-lock hint, and any other IO error gets its
+/// concrete cause (disk / permission) so the user knows it failed and why.
+fn block_abort_note(e: &std::io::Error, label: &str) -> String {
+    use std::io::ErrorKind;
+    let detail = e.to_string();
+    match e.kind() {
+        // Same-session lock still held by our own in-flight block. With the
+        // run-execution lock semantics this should no longer reach a real
+        // execution path, but if it ever does it is a transient hand-off race,
+        // not a dead end — tell the user to retry in a beat.
+        ErrorKind::WouldBlock => format!(
+            "本轮已中止:本会话已有一个 run 占用工作区(底座 {label})。\
+             稍候片刻让上一轮收尾后重试,或先 /status 查看当前进度。"
+        ),
+        // A different, still-live run holds the workspace lock. The underlying
+        // message already carries the `rm <path>` hint.
+        ErrorKind::AlreadyExists => {
+            format!("本轮已中止:另一个 run 正占用该工作区(底座 {label})。\n{detail}")
+        }
+        // Any other IO failure: surface the concrete cause (disk full / read-only
+        // fs / permission) so the user sees a real reason, not a frozen bar.
+        _ => {
+            let hint = if detail.contains("timed out") {
+                umadev_i18n::tlf("worker.timeout", &[label])
+            } else if detail.contains("not found on PATH") {
+                umadev_i18n::tlf("worker.not_on_path", &[label])
+            } else if detail.contains("exited with code") {
                 umadev_i18n::tl("worker.exited").to_string()
             } else {
                 umadev_i18n::tl("pipeline.generic_error").to_string()
             };
-            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                "pipeline.error_note",
-                &[&e.to_string(), &hint],
-            )));
+            format!("本轮已中止:{detail} — {hint}")
         }
-    })
+    }
 }
 
 /// Everything a single routed chat turn needs — bundled so `spawn_route`

@@ -51,6 +51,34 @@ pub struct RunLock {
     owned: bool,
 }
 
+/// Why the lock is being taken — decides how a lock already held by **this same
+/// process** is treated. The two intents are genuinely different:
+///
+/// - [`AcquireIntent::Route`] is the **input-routing / queue** layer (the chat
+///   TUI deciding where a freshly-typed line goes). A same-PID lock means a run
+///   this session already kicked off is still in flight, so the right answer is
+///   *queue the input into it* — surfaced as a `WouldBlock` signal, never a
+///   reclaim. Two run blocks could legitimately co-exist here (one running, the
+///   user typing the next).
+/// - [`AcquireIntent::Run`] is a real **execution** path (`run_initial_block`,
+///   the `continue_after_*` blocks, `run_light`, `redo_phase`) actually about to
+///   drive the pipeline. Because one process runs these strictly serially, a
+///   same-PID lock can only be **our own residue** from a previous block whose
+///   guard hasn't dropped yet (or a block that aborted before `Drop` ran) — it
+///   can NEVER be a second concurrent execution in the same process. So the run
+///   path **reclaims** it and takes over instead of `WouldBlock`-aborting, which
+///   is exactly what wedged research at `0/9`.
+///
+/// In both intents an **external** PID is classified identically (dead →
+/// reclaim, alive → refuse): the run path only relaxes the *same-PID* case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcquireIntent {
+    /// Input-routing layer: same-PID lock → `WouldBlock` queue signal.
+    Route,
+    /// Real execution path: same-PID lock → reclaim our own residue + take over.
+    Run,
+}
+
 /// Parsed contents of a `run.lock` file: who claims to hold it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Owner {
@@ -63,15 +91,51 @@ struct Owner {
 }
 
 impl RunLock {
-    /// Acquire the workspace run lock.
+    /// Acquire the workspace run lock from the **input-routing / queue** layer.
+    ///
+    /// Use this where the caller is *deciding what to do with input*, not where
+    /// it is about to drive the pipeline. A lock already held by **this** process
+    /// means our session has a run in flight → the caller should queue the input
+    /// into it; that case is signalled with [`io::ErrorKind::WouldBlock`].
+    ///
+    /// # Errors
+    /// - `WouldBlock` when **this** process already holds the lock (queue signal).
+    /// - `AlreadyExists` with an actionable message when another **live** run on
+    ///   this host holds it.
+    ///
+    /// A lock left behind by a crashed/killed run on this host is detected via
+    /// PID liveness, reclaimed automatically, and taken over. Any other IO
+    /// problem fails open (returns an un-owned guard) so a lock bug can never
+    /// block a legitimate run.
+    pub fn acquire(project_root: &Path) -> io::Result<RunLock> {
+        Self::acquire_with(project_root, AcquireIntent::Route)
+    }
+
+    /// Acquire the workspace run lock for a real **execution** block
+    /// (`run_initial_block`, the `continue_after_*` blocks, `run_light`,
+    /// `redo_phase`).
+    ///
+    /// Differs from [`acquire`](Self::acquire) in exactly one place: a lock held
+    /// by **this same process** is treated as our own leftover residue and
+    /// **reclaimed** (the same process runs these blocks serially, so it can
+    /// never be a real second concurrent execution), instead of returning the
+    /// `WouldBlock` queue signal that the routing layer wants. This is what stops
+    /// a run from self-aborting at `0/9` when a previous block's lock guard hasn't
+    /// dropped yet. External holders are classified exactly as in `acquire`
+    /// (dead → reclaim, alive → refuse).
     ///
     /// # Errors
     /// Returns `AlreadyExists` with an actionable message when another **live**
-    /// run holds the lock. A lock left behind by a crashed/killed run on this
-    /// host is detected via PID liveness, reclaimed automatically, and taken
-    /// over. Any other IO problem fails open (returns an un-owned guard) so a
-    /// lock bug can never block a legitimate run.
-    pub fn acquire(project_root: &Path) -> io::Result<RunLock> {
+    /// run on this host holds the lock. Any other IO problem fails open (un-owned
+    /// guard) so a lock bug can never block a legitimate run.
+    pub fn acquire_for_run(project_root: &Path) -> io::Result<RunLock> {
+        Self::acquire_with(project_root, AcquireIntent::Run)
+    }
+
+    /// Shared acquisition core. `intent` only changes how a lock held by **this**
+    /// process is handled (see [`AcquireIntent`]); every external-holder path is
+    /// identical for both intents.
+    fn acquire_with(project_root: &Path, intent: AcquireIntent) -> io::Result<RunLock> {
         let dir = project_root.join(".umadev");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("run.lock");
@@ -103,14 +167,29 @@ impl RunLock {
                     // for all of them):
                     //
                     //   1. holder == THIS process  → our own session already has a
-                    //      run in flight. Not an error to escalate as "another
-                    //      umadev"; the caller should queue the input INTO that
-                    //      run. Signalled with `WouldBlock` + an accurate message.
+                    //      run in flight. Two intents diverge here (see
+                    //      `AcquireIntent`):
+                    //        * Route → queue the input INTO that run; signalled
+                    //          with `WouldBlock` + an accurate message.
+                    //        * Run → this can only be OUR OWN residue (the same
+                    //          process runs blocks serially), so reclaim it and
+                    //          take over rather than self-abort with WouldBlock.
                     //   2. holder is a dead PID on this host → crashed/killed run;
                     //      reclaim and take over (handled by is_stale below).
                     //   3. holder is a live foreign run → the genuine
                     //      "another umadev is running" refusal.
                     if holder_is_self(&path) {
+                        if intent == AcquireIntent::Run {
+                            // Our own leftover lock blocking our own next block.
+                            // Only retry if we actually removed it; a remove
+                            // failure (read-only fs) falls through to fail-open.
+                            if attempt == 0 && std::fs::remove_file(&path).is_ok() {
+                                continue;
+                            }
+                            // Couldn't clear it — fail open rather than wedge the
+                            // run on our own residue (a lock bug must never block).
+                            return Ok(RunLock { path, owned: false });
+                        }
                         return Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
                             "本会话已有一个 umadev run 正在进行中 —— \
@@ -391,6 +470,85 @@ mod tests {
         // Dropping the first releases the lock; a later acquire succeeds.
         drop(lock);
         assert!(RunLock::acquire(root).is_ok(), "lock released on drop");
+    }
+
+    #[test]
+    fn run_intent_reclaims_our_own_residual_lock_instead_of_would_block() {
+        // THE REGRESSION: research wedged at `0/9`. A real execution block uses
+        // `acquire_for_run`. When OUR OWN previous block left a same-PID lock
+        // behind (its guard not yet dropped, or it aborted before Drop), the run
+        // path must RECLAIM it and take over — never the `WouldBlock` queue signal
+        // the routing layer wants, which the `?` would have propagated and ended
+        // the run task with zero phases done.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        // Simulate our own residue: a lock file owned by THIS pid + host.
+        write_lock(
+            root,
+            &format!(
+                "pid={} host={} ts={}",
+                std::process::id(),
+                hostname(),
+                now_secs()
+            ),
+        );
+        let path = root.join(".umadev").join("run.lock");
+        assert!(
+            holder_is_self(&path),
+            "fixture must be our own residual lock"
+        );
+        // Routing intent still returns the queue signal (unchanged behaviour).
+        let routed = RunLock::acquire(root).expect_err("route intent still signals");
+        assert_eq!(
+            routed.kind(),
+            io::ErrorKind::WouldBlock,
+            "the routing/queue layer must keep its same-PID WouldBlock signal"
+        );
+        // Re-establish the residue (the failed route attempt didn't touch it),
+        // then the EXECUTION intent reclaims it and takes ownership.
+        let lock = RunLock::acquire_for_run(root).expect("run intent reclaims our residue");
+        assert!(lock.owned, "reclaimed lock is now owned by us");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains(&format!("pid={}", std::process::id())),
+            "the reclaimed lock records our identity"
+        );
+    }
+
+    // A live FOREIGN holder must still be refused even under the run-execution
+    // intent — `acquire_for_run` only relaxes the SAME-PID case, never an
+    // external live run. Modelled with PID 1 (init/launchd): a Unix concept.
+    #[cfg(unix)]
+    #[test]
+    fn run_intent_still_refuses_a_live_foreign_holder() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        write_lock(
+            root,
+            &format!("pid=1 host={} ts={}", hostname(), now_secs()),
+        );
+        let err = RunLock::acquire_for_run(root)
+            .expect_err("a live foreign run is refused even for execution");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            err.to_string().contains("另一个 umadev"),
+            "external live holder is still the genuine refusal under run intent"
+        );
+    }
+
+    #[test]
+    fn run_intent_reclaims_a_dead_external_pid_like_routing_does() {
+        // The PID-liveness reclaim path is shared by both intents: a dead
+        // external holder is stale and taken over regardless of intent.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        write_lock(
+            root,
+            &format!("pid={DEAD_PID} host={} ts={}", hostname(), now_secs()),
+        );
+        let lock =
+            RunLock::acquire_for_run(root).expect("dead external PID reclaimed under run intent");
+        assert!(lock.owned, "reclaimed lock is owned by us");
     }
 
     // Models a live foreign holder with PID 1 (init/launchd) — a Unix concept,
