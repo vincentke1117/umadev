@@ -207,13 +207,14 @@ Classify that latest message into exactly one of THREE modes, then return exactl
 1. Normal conversation (greetings, small talk, follow-up questions, explanations, discussion — anything answerable by just talking, without looking at the repository):
 {\"mode\":\"chat\",\"reply\":\"your direct reply, in the user's language, written as a natural continuation of the conversation\"}
 
-2. A task that needs you to actually READ, INSPECT, or make a SMALL CHANGE to the code in THIS repository — but is NOT building a whole new project. Examples: review/audit a snippet or file for bugs, diagnose a failure, explain how existing code works, answer \"will this code break / leak / regress?\", trace a call path, apply a small fix or tweak:
+2. A task that needs you to actually READ, INSPECT, or make a SMALL CHANGE to the code in THIS repository — but is NOT building a whole new project. Examples: review/audit a snippet or file for bugs, diagnose a failure, explain how existing code works, answer \"will this code break / leak / regress?\", trace a call path, apply a small fix or tweak, OR report what was actually changed / done or the repo's CURRENT state — e.g. \"what did you just change?\", \"did you do X?\", \"does Y exist?\", \"did the tests pass?\" (these MUST be read back from the real files + git, never recalled from memory):
 {\"mode\":\"agentic\",\"task\":\"a cleaned, self-contained instruction in the user's language that folds in any relevant detail from earlier turns — what to look at and what to produce\"}
 
 3. Concrete product/code work that should enter UmaDev's full 9-phase delivery pipeline (build, implement, create, design, or ship a whole feature / product / codebase from a requirement):
 {\"mode\":\"run\",\"requirement\":\"a cleaned, self-contained requirement in the user's language that folds in any relevant detail from earlier turns\"}
 
 Guidance: a plain greeting or opinion question is `chat`, never `agentic` — do not spend tool calls on small talk. If the user references THIS repo's code and wants it looked at, checked, explained, or minimally edited, that is `agentic`. Only a from-a-requirement build is `run`.
+CRITICAL: any question about what was just changed or done, the repo's CURRENT state, or whether some code / file / result exists or passed → `agentic` (it gets verified against the real files + git), NEVER `chat`. Answering \"what did you change / did you do X\" from conversation memory fabricates changes that may not exist on disk — that failure mode is exactly what `agentic` exists to prevent.
 When genuinely unsure between chat and agentic, prefer chat and ask a brief clarifying question.
 In chat mode just reply conversationally — do NOT perform the task, edit files, run commands, call tools, or mutate the workspace. (In agentic mode the shell makes a SEPARATE call where you ARE free to use your tools; this classification call must still only return the JSON.)";
 
@@ -2270,6 +2271,11 @@ mod tests {
         assert!(ROUTE_SYSTEM_PROMPT.contains("\"mode\":\"chat\""));
         assert!(ROUTE_SYSTEM_PROMPT.contains("\"mode\":\"agentic\""));
         assert!(ROUTE_SYSTEM_PROMPT.contains("\"mode\":\"run\""));
+        // L2 anti-confabulation: "what did you change / did you do X / current
+        // state" questions must route to agentic (verified against git), never
+        // chat (which would answer from memory and fabricate changes).
+        assert!(ROUTE_SYSTEM_PROMPT.contains("what did you just change"));
+        assert!(ROUTE_SYSTEM_PROMPT.contains("fabricates changes that may not exist"));
     }
 
     /// A fake runtime that records which entry point the agentic path used.
