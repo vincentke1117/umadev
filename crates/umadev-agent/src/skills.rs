@@ -908,7 +908,7 @@ mod tests {
             "| Method | Path | Request | Response | Auth | Description |\n|---|---|---|---|---|---|\n| GET | /api/articles | - | - | none | List |\n",
             "demo",
         );
-        crate::lessons::capture_validated_patterns(root, "demo", "做一个博客", &spec);
+        crate::lessons::capture_validated_patterns(root, "demo", "做一个博客", &spec, &[], true);
 
         let n = graduate_validated_patterns(root, "", true);
         assert_eq!(n, 1, "the validated pattern graduates into one skill");
@@ -919,7 +919,14 @@ mod tests {
         // A FAILED gate does not graduate.
         let tmp2 = TempDir::new().unwrap();
         seed_multi_step(tmp2.path());
-        crate::lessons::capture_validated_patterns(tmp2.path(), "demo", "做一个博客", &spec);
+        crate::lessons::capture_validated_patterns(
+            tmp2.path(),
+            "demo",
+            "做一个博客",
+            &spec,
+            &[],
+            true,
+        );
         assert_eq!(graduate_validated_patterns(tmp2.path(), "", false), 0);
         assert!(read_skills(tmp2.path()).is_empty());
     }

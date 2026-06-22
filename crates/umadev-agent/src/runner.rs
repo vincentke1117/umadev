@@ -134,6 +134,50 @@ fn run_budget() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Snapshot the project's OWN working tree as a `git status --porcelain` string,
+/// run in `root`. Two snapshots taken around a code phase let the runner detect
+/// "the base reported it implemented things, but the working tree did not
+/// change" — the file-level reality check the agentic chat already does, lifted
+/// into the `run` pipeline. Returns the raw porcelain output (one `XY path`
+/// line per changed path).
+///
+/// **Fail-open** (load-bearing): a non-git directory, a missing `git`, a
+/// non-zero exit, or any IO error returns `None`. The caller then SKIPS the
+/// file-change reality check entirely — it must NEVER block a phase, flip a
+/// clean run to degraded on a false signal, or otherwise break the pipeline.
+/// This is the same safety property the TUI's git snapshot relies on; do not
+/// turn it into an error path.
+fn git_worktree_snapshot(root: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // not a git repo (or git refused) → fail-open, skip check
+    }
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// `true` when the two `git status --porcelain` snapshots are byte-for-byte the
+/// same working-tree state — i.e. the phase that ran between them wrote NO file
+/// change at all (no new file, no edit, no deletion). Used only to raise the
+/// "claimed implementation but zero files changed" warning; a false negative
+/// (we think something changed when it didn't) merely skips the warning, never
+/// blocks. Comparison normalises trailing whitespace so a stray newline does
+/// not read as a change.
+fn worktree_unchanged(before: &str, after: &str) -> bool {
+    let norm = |s: &str| {
+        s.lines()
+            .map(str::trim_end)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    norm(before) == norm(after)
+}
+
 /// Whether the markdown section starting at byte `heading_pos` (the heading
 /// line for `heading`) has any non-empty body content before the next `##`
 /// heading. Catches "present but empty" sections a bare `## goal` would
@@ -3613,6 +3657,74 @@ impl<R: Runtime> AgentRunner<R> {
         }
     }
 
+    /// File-level reality check for an implementation phase, mirroring the
+    /// agentic chat's changed-files cross-check.
+    ///
+    /// The worker returning a non-empty reply ("I implemented every component")
+    /// is NOT evidence that any file was written — a base can narrate work it
+    /// never did. `base_reported` is `true` when the phase's `try_generate`
+    /// returned `Some` (a non-empty reply) and the phase did not already degrade
+    /// for another reason. `before`/`after` are `git status --porcelain`
+    /// snapshots taken around the worker body. When the base reported success
+    /// but the working tree did not change at all, we flag the phase **degraded**
+    /// and emit a loud `[warn]` so a "files-less claim" can never read as a clean
+    /// implementation.
+    ///
+    /// **Fail-open**: if either snapshot is `None` (non-git repo, missing `git`,
+    /// any git error) we cannot tell whether files changed, so we SKIP the check
+    /// and return `false` (do not degrade). Returns `true` only when we have BOTH
+    /// snapshots, the base reported success, and the tree is provably unchanged.
+    fn implementation_left_no_files(
+        &self,
+        phase: Phase,
+        base_reported: bool,
+        before: Option<&str>,
+        after: Option<&str>,
+    ) -> bool {
+        if !base_reported {
+            return false; // base already degraded / offline → nothing to cross-check
+        }
+        let (Some(before), Some(after)) = (before, after) else {
+            return false; // no git snapshot → fail-open, cannot judge, do not degrade
+        };
+        if !worktree_unchanged(before, after) {
+            return false; // real file changes landed → genuine implementation
+        }
+        self.emit(EngineEvent::Note(format!(
+            "[warn] {}:底座报告了实现,但工作区无文件变更 —— 按降级处理(疑似只回了文字、未落盘)。",
+            phase.id()
+        )));
+        true
+    }
+
+    /// Read an APPROVED context doc (`output/{slug}-{name}.md`) that a build
+    /// phase needs, and report whether it came back empty.
+    ///
+    /// `#4`: the build phases fed the base each doc via `unwrap_or_default()`, so
+    /// a missing or unreadable PRD/architecture/UIUX silently became an EMPTY
+    /// context — the base then built blind against nothing, yet the phase still
+    /// reported Done. This reads the doc and, when it is expected-but-empty,
+    /// emits a loud `[warn]` and signals the caller (so it can mark the phase
+    /// degraded instead of letting a blind build read as clean). Returns
+    /// `(content, missing)` where `missing` is `true` iff the doc was empty.
+    /// Fail-open: an IO error is just an empty doc → flagged, never an error.
+    fn read_expected_doc(&self, slug: &str, name: &str) -> (String, bool) {
+        let content = std::fs::read_to_string(
+            self.options
+                .project_root
+                .join(format!("output/{slug}-{name}.md")),
+        )
+        .unwrap_or_default();
+        let missing = content.trim().is_empty();
+        if missing {
+            self.emit(EngineEvent::Note(format!(
+                "[warn] 已批准文档 output/{slug}-{name}.md 读出为空 —— 底座将缺少该上下文,\
+                 本阶段按降级处理(不静默盲建)。",
+            )));
+        }
+        (content, missing)
+    }
+
     async fn generate_docs_content(&self, research: Option<&str>) -> DocsContent {
         let slug = self.options.effective_slug();
         let req = &self.options.requirement;
@@ -3876,31 +3988,28 @@ impl<R: Runtime> AgentRunner<R> {
                 "[preview] Worker implementing frontend (components, pages, API client)..."
                     .to_string(),
             ));
+            // #1: snapshot the working tree BEFORE the worker body so we can
+            // cross-check "base reported success" against real file changes
+            // (the agentic changed-files check, lifted into the run pipeline).
+            // The `after` snapshot is taken right after the budgeted body and
+            // BEFORE `run_frontend` writes its notes artifact, so the diff
+            // reflects only what the worker itself wrote.
+            let fe_before = git_worktree_snapshot(&self.options.project_root);
+            // #4: read the approved docs the base needs as CONTEXT here (not via
+            // a silent `unwrap_or_default` inside the closure). An expected doc
+            // that reads empty warns + marks the phase degraded, so a blind build
+            // against empty context can never report a clean Done.
+            let slug = self.options.effective_slug();
+            let (uiux, uiux_missing) = self.read_expected_doc(&slug, "uiux");
+            let (arch, arch_missing) = self.read_expected_doc(&slug, "architecture");
+            let (prd, prd_missing) = self.read_expected_doc(&slug, "prd");
+            let fe_ctx_missing = uiux_missing || arch_missing || prd_missing;
             // Wrap the frontend implementation in the phase budget. The async
             // block returns `true` when the base produced nothing. On overrun the
             // block is abandoned and the phase is flagged degraded; whatever code
             // the base already wrote stays on disk.
             let (fe_ok_opt, timed_out) = self
                 .with_phase_budget(Phase::Frontend, async {
-                    let slug = self.options.effective_slug();
-                    let uiux = std::fs::read_to_string(
-                        self.options
-                            .project_root
-                            .join(format!("output/{slug}-uiux.md")),
-                    )
-                    .unwrap_or_default();
-                    let arch = std::fs::read_to_string(
-                        self.options
-                            .project_root
-                            .join(format!("output/{slug}-architecture.md")),
-                    )
-                    .unwrap_or_default();
-                    let prd = std::fs::read_to_string(
-                        self.options
-                            .project_root
-                            .join(format!("output/{slug}-prd.md")),
-                    )
-                    .unwrap_or_default();
                     self.emit(EngineEvent::SubTaskStarted {
                         phase: Phase::Frontend,
                         task_id: "frontend.implement".into(),
@@ -3925,7 +4034,22 @@ impl<R: Runtime> AgentRunner<R> {
                     fe_ok
                 })
                 .await;
-            fe_degraded = timed_out || !fe_ok_opt.unwrap_or(false);
+            let base_reported = fe_ok_opt.unwrap_or(false);
+            // #4: a blind build against empty approved-doc context is degraded.
+            fe_degraded = timed_out || !base_reported || fe_ctx_missing;
+            // #1: base reported a non-empty implementation but the working tree
+            // is provably unchanged → degrade + warn (fail-open if no git).
+            if !fe_degraded {
+                let fe_after = git_worktree_snapshot(&self.options.project_root);
+                if self.implementation_left_no_files(
+                    Phase::Frontend,
+                    base_reported,
+                    fe_before.as_deref(),
+                    fe_after.as_deref(),
+                ) {
+                    fe_degraded = true;
+                }
+            }
         }
         let fe = self.record_phase_maybe_degraded(
             Phase::Frontend,
@@ -3994,24 +4118,22 @@ impl<R: Runtime> AgentRunner<R> {
                 "[backend] Worker implementing backend (routes, database, auth, tests)..."
                     .to_string(),
             ));
+            // #1: snapshot the working tree BEFORE the worker body for the same
+            // changed-files reality check the frontend phase does. `run_backend`
+            // writes its notes artifact only after this block, so the `after`
+            // snapshot reflects exactly what the worker wrote.
+            let be_before = git_worktree_snapshot(&self.options.project_root);
+            // #4: read the approved docs as context here; an expected doc that
+            // reads empty warns + degrades (no silent blind build).
+            let slug = self.options.effective_slug();
+            let (arch, arch_missing) = self.read_expected_doc(&slug, "architecture");
+            let (prd, prd_missing) = self.read_expected_doc(&slug, "prd");
+            let be_ctx_missing = arch_missing || prd_missing;
             // Wrap the backend implementation in the phase budget. On overrun the
             // block is abandoned (flagged degraded); whatever code the base already
             // wrote stays on disk.
             let (be_ok_opt, timed_out) = self
                 .with_phase_budget(Phase::Backend, async {
-                    let slug = self.options.effective_slug();
-                    let arch = std::fs::read_to_string(
-                        self.options
-                            .project_root
-                            .join(format!("output/{slug}-architecture.md")),
-                    )
-                    .unwrap_or_default();
-                    let prd = std::fs::read_to_string(
-                        self.options
-                            .project_root
-                            .join(format!("output/{slug}-prd.md")),
-                    )
-                    .unwrap_or_default();
                     self.emit(EngineEvent::SubTaskStarted {
                         phase: Phase::Backend,
                         task_id: "backend.implement".into(),
@@ -4035,7 +4157,22 @@ impl<R: Runtime> AgentRunner<R> {
                     be_ok
                 })
                 .await;
-            be_degraded = timed_out || !be_ok_opt.unwrap_or(false);
+            let base_reported = be_ok_opt.unwrap_or(false);
+            // #4: blind build against empty approved-doc context is degraded.
+            be_degraded = timed_out || !base_reported || be_ctx_missing;
+            // #1: base reported a non-empty implementation but the working tree
+            // is provably unchanged → degrade + warn (fail-open if no git).
+            if !be_degraded {
+                let be_after = git_worktree_snapshot(&self.options.project_root);
+                if self.implementation_left_no_files(
+                    Phase::Backend,
+                    base_reported,
+                    be_before.as_deref(),
+                    be_after.as_deref(),
+                ) {
+                    be_degraded = true;
+                }
+            }
         }
         completed.push(self.record_phase_maybe_degraded(
             Phase::Backend,
@@ -4585,9 +4722,13 @@ impl<R: Runtime> AgentRunner<R> {
             Phase::Frontend => {
                 let mut degraded = false;
                 if use_runtime {
-                    let uiux = read("uiux");
-                    let arch = read("architecture");
-                    let prd = read("prd");
+                    // #4: empty approved-doc context → warn + degrade (no blind redo).
+                    let (uiux, uiux_missing) = self.read_expected_doc(&slug, "uiux");
+                    let (arch, arch_missing) = self.read_expected_doc(&slug, "architecture");
+                    let (prd, prd_missing) = self.read_expected_doc(&slug, "prd");
+                    let ctx_missing = uiux_missing || arch_missing || prd_missing;
+                    // #1: snapshot before/after for the changed-files reality check.
+                    let before = git_worktree_snapshot(&self.options.project_root);
                     let fe_p = self.with_expert_knowledge(
                         frontend_prompt(
                             &slug,
@@ -4598,7 +4739,19 @@ impl<R: Runtime> AgentRunner<R> {
                         ),
                         &["frontend-lead", "uiux-designer"],
                     );
-                    degraded = self.try_generate(phase, fe_p).await.is_none();
+                    let base_reported = self.try_generate(phase, fe_p).await.is_some();
+                    degraded = !base_reported || ctx_missing;
+                    if !degraded {
+                        let after = git_worktree_snapshot(&self.options.project_root);
+                        if self.implementation_left_no_files(
+                            Phase::Frontend,
+                            base_reported,
+                            before.as_deref(),
+                            after.as_deref(),
+                        ) {
+                            degraded = true;
+                        }
+                    }
                     if !degraded {
                         self.maybe_verify_and_fix(Phase::Frontend).await;
                     }
@@ -4608,8 +4761,12 @@ impl<R: Runtime> AgentRunner<R> {
             Phase::Backend => {
                 let mut degraded = false;
                 if use_runtime {
-                    let arch = read("architecture");
-                    let prd = read("prd");
+                    // #4: empty approved-doc context → warn + degrade (no blind redo).
+                    let (arch, arch_missing) = self.read_expected_doc(&slug, "architecture");
+                    let (prd, prd_missing) = self.read_expected_doc(&slug, "prd");
+                    let ctx_missing = arch_missing || prd_missing;
+                    // #1: snapshot before/after for the changed-files reality check.
+                    let before = git_worktree_snapshot(&self.options.project_root);
                     let be_p = self.with_expert_knowledge(
                         backend_prompt(
                             &slug,
@@ -4619,7 +4776,19 @@ impl<R: Runtime> AgentRunner<R> {
                         ),
                         &["backend-lead", "architect"],
                     );
-                    degraded = self.try_generate(phase, be_p).await.is_none();
+                    let base_reported = self.try_generate(phase, be_p).await.is_some();
+                    degraded = !base_reported || ctx_missing;
+                    if !degraded {
+                        let after = git_worktree_snapshot(&self.options.project_root);
+                        if self.implementation_left_no_files(
+                            Phase::Backend,
+                            base_reported,
+                            before.as_deref(),
+                            after.as_deref(),
+                        ) {
+                            degraded = true;
+                        }
+                    }
                     if !degraded {
                         self.maybe_verify_and_fix(Phase::Backend).await;
                     }
@@ -8005,6 +8174,157 @@ error TS2304: Cannot find name 'Foo'
         assert!(
             saw_hyde_wait,
             "HyDE must run under the heartbeat so its silent gap emits a [wait] note"
+        );
+    }
+
+    // ---- Wave 3: file-level reality check on the run pipeline -----------------
+
+    /// `git init` + an initial commit so `git status --porcelain` works and the
+    /// later `output/*` writes show up as a stable, identical change in both
+    /// snapshots (so a worker that writes NOTHING leaves the tree unchanged
+    /// between the before/after snapshots).
+    fn git_init_repo(root: &std::path::Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(&args)
+                .output()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn worktree_unchanged_ignores_trailing_whitespace_and_blanks() {
+        assert!(worktree_unchanged("", ""));
+        assert!(worktree_unchanged(" M a.rs\n", " M a.rs   \n\n"));
+        assert!(
+            !worktree_unchanged(" M a.rs\n", " M a.rs\n?? b.rs\n"),
+            "a new untracked file is a real change"
+        );
+        assert!(
+            !worktree_unchanged("", "?? new.ts\n"),
+            "going from clean to having a new file is a change"
+        );
+    }
+
+    #[test]
+    fn git_worktree_snapshot_fails_open_on_non_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        // No `git init` → not a repo → None (fail-open, the caller skips the check).
+        assert!(git_worktree_snapshot(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn implementation_left_no_files_matrix() {
+        let tmp = TempDir::new().unwrap();
+        let runner = AgentRunner::new(FakeRuntime, opts(tmp.path()));
+        // Base did not report success → never degrade on this axis.
+        assert!(!runner.implementation_left_no_files(
+            Phase::Frontend,
+            false,
+            Some(""),
+            Some("?? x\n")
+        ));
+        // No git snapshot (None) → fail-open, do not degrade even if base reported.
+        assert!(!runner.implementation_left_no_files(Phase::Frontend, true, None, Some("")));
+        assert!(!runner.implementation_left_no_files(Phase::Frontend, true, Some(""), None));
+        // Real file change between snapshots → genuine implementation, not degraded.
+        assert!(!runner.implementation_left_no_files(
+            Phase::Frontend,
+            true,
+            Some(""),
+            Some("?? src/App.tsx\n")
+        ));
+        // Base reported success but the tree is provably unchanged → degrade.
+        assert!(runner.implementation_left_no_files(
+            Phase::Frontend,
+            true,
+            Some(" M output/x\n"),
+            Some(" M output/x\n")
+        ));
+    }
+
+    #[test]
+    fn read_expected_doc_flags_empty_doc_with_warn() {
+        use crate::events::RecordingSink;
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        let sink = RecordingSink::new();
+        let runner =
+            AgentRunner::new(FakeRuntime, opts(tmp.path())).with_event_sink(Arc::new(sink.clone()));
+        // Missing doc → empty + flagged + warn.
+        let (content, missing) = runner.read_expected_doc("demo", "prd");
+        assert!(content.is_empty());
+        assert!(missing, "a missing doc must read as missing");
+        // A real doc → present + not flagged.
+        std::fs::write(
+            tmp.path().join("output/demo-architecture.md"),
+            "# Arch\n\nReal content here.\n",
+        )
+        .unwrap();
+        let (c2, missing2) = runner.read_expected_doc("demo", "architecture");
+        assert!(!c2.is_empty());
+        assert!(!missing2);
+        let warns = sink
+            .events()
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Note(n) if n.starts_with("[warn]") && n.contains("demo-prd.md")))
+            .count();
+        assert_eq!(warns, 1, "exactly one warn for the empty PRD doc");
+    }
+
+    /// #1 end-to-end: the base returns a NON-EMPTY reply ("stub") but writes no
+    /// source files. With a real git repo + non-empty approved docs in place, the
+    /// frontend phase must be flagged DEGRADED and emit the changed-files warn,
+    /// instead of reading the files-less claim as a clean implementation.
+    #[tokio::test]
+    async fn frontend_degrades_when_base_reports_but_writes_no_files() {
+        use crate::events::RecordingSink;
+        let tmp = TempDir::new().unwrap();
+        git_init_repo(tmp.path());
+        // Approved docs must be NON-EMPTY so the #4 empty-context path does not
+        // fire — we want to isolate the #1 changed-files signal.
+        let out = tmp.path().join("output");
+        std::fs::create_dir_all(&out).unwrap();
+        for (name, body) in [
+            ("demo-prd.md", "# PRD\n\nReal product requirements.\n"),
+            (
+                "demo-architecture.md",
+                "# Architecture\n\nReal architecture.\n",
+            ),
+            ("demo-uiux.md", "# UIUX\n\nReal design tokens.\n"),
+        ] {
+            std::fs::write(out.join(name), body).unwrap();
+        }
+        let sink = RecordingSink::new();
+        // FakeRuntime returns "stub" (non-empty) but never writes a file.
+        let runner =
+            AgentRunner::new(FakeRuntime, opts(tmp.path())).with_event_sink(Arc::new(sink.clone()));
+        runner.start().unwrap();
+        // Drive spec→frontend→preview. FakeRuntime writes nothing to the tree.
+        let report = runner.continue_after_docs_confirm().await.unwrap();
+
+        let fe = report
+            .completed
+            .iter()
+            .find(|p| p.phase == Phase::Frontend)
+            .expect("frontend phase ran");
+        assert!(
+            fe.degraded,
+            "a non-empty reply that wrote ZERO files must flag the frontend degraded"
+        );
+        let saw_warn = sink.events().iter().any(|e| {
+            matches!(e, EngineEvent::Note(n)
+                if n.starts_with("[warn]") && n.contains("无文件变更"))
+        });
+        assert!(
+            saw_warn,
+            "must emit the changed-files reality-check warn for a files-less claim"
         );
     }
 }

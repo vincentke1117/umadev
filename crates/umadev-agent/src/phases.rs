@@ -567,7 +567,23 @@ pub fn run_spec(opts: &RunOptions) -> io::Result<PhaseOutput> {
     let plan = output_dir.join(format!("{slug}-execution-plan.md"));
     let tasks = changes_dir.join("tasks.md");
 
-    atomic_write(&plan, &render_execution_plan(&slug, &opts.requirement))?;
+    // The runner writes the base's REAL execution plan to `plan` BEFORE calling
+    // run_spec (continue-after-docs / redo / light paths). An unconditional
+    // `atomic_write` of the skeleton template clobbered that real plan on every
+    // run — the same loss `run_docs` avoids by preferring the richer body.
+    // Mirror that contract: KEEP whatever is already on disk when it is a real,
+    // substantive base plan — non-trivial (>200 chars) AND not itself the
+    // deterministic skeleton. A concise real plan can be SHORTER than the
+    // verbose skeleton, so a pure length comparison is wrong; the skeleton's
+    // marker line is the reliable discriminator. Otherwise write the skeleton,
+    // so an empty / leftover-skeleton / offline run still gets a deterministic
+    // artifact.
+    let skeleton = render_execution_plan(&slug, &opts.requirement);
+    let current = fs::read_to_string(&plan).unwrap_or_default();
+    let is_skeleton_stub = current.contains("Skeleton execution plan");
+    let keep_base = current.trim().len() > 200 && !is_skeleton_stub;
+    let body = if keep_base { current } else { skeleton };
+    atomic_write(&plan, &body)?;
     fs::write(&tasks, render_tasks(&slug))?;
 
     audit(
@@ -1754,6 +1770,18 @@ fn render_quality_md(r: &QualityReport) -> String {
 pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
 
+    // Read the REAL quality-gate result first — it gates both the skill
+    // graduation below AND the wording of the captured-pattern lesson (we must
+    // never sediment "passed the quality gate" when it did not pass). Fail-open:
+    // a missing/unreadable gate file reads as "not passed".
+    let quality_passed = fs::read_to_string(
+        opts.project_root
+            .join(format!("output/{slug}-quality-gate.json")),
+    )
+    .ok()
+    .and_then(|j| serde_json::from_str::<QualityReport>(&j).ok())
+    .is_some_and(|r| r.passed);
+
     // 0. Capture validated patterns (D2: success -> sediment -> retrieval loop)
     let arch_text = fs::read_to_string(
         opts.project_root
@@ -1764,11 +1792,18 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
     let arch_spec = umadev_contract::parse_architecture(&arch_text, &format!("{slug} API"));
     let derived = umadev_contract::derive_endpoints_from_requirement(&opts.requirement);
     let contract_spec = umadev_contract::merge_specs(&arch_spec, &derived);
+    // Subtract the planned endpoints that have NO implementation evidence in the
+    // delivered source, so we only sediment endpoints actually built (no false
+    // "validated" facts). Fail-open: no arch doc / no source -> empty gap list.
+    let gap_check = crate::acceptance::task_acceptance_gaps;
+    let acceptance_gaps = gap_check(&opts.project_root, &slug);
     crate::lessons::capture_validated_patterns(
         &opts.project_root,
         &slug,
         &opts.requirement,
         &contract_spec,
+        &acceptance_gaps,
+        quality_passed,
     );
     let _ = crate::lessons::sediment_lessons(&opts.project_root);
 
@@ -1780,13 +1815,6 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
     // module's deterministic template card is used; the runner's delivery seam
     // may pre-generate a richer base-written card via `skill_description_prompt`
     // before this point. Fail-open: any failure is a no-op.
-    let quality_passed = fs::read_to_string(
-        opts.project_root
-            .join(format!("output/{slug}-quality-gate.json")),
-    )
-    .ok()
-    .and_then(|j| serde_json::from_str::<QualityReport>(&j).ok())
-    .is_some_and(|r| r.passed);
     let _ = crate::skills::graduate_validated_patterns(
         &opts.project_root,
         "", // empty → deterministic template description (base call is optional)
@@ -3398,6 +3426,53 @@ mod tests {
             mode: crate::trust::TrustMode::Guarded,
             strict_coverage: false,
         }
+    }
+
+    #[test]
+    fn run_spec_keeps_base_execution_plan_and_does_not_clobber_with_skeleton() {
+        // #2: the runner writes the base's REAL execution plan to disk BEFORE
+        // calling run_spec; run_spec must NOT overwrite it with the skeleton.
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        let out_dir = tmp.path().join("output");
+        fs::create_dir_all(&out_dir).unwrap();
+        let plan_path = out_dir.join("demo-execution-plan.md");
+        // A rich, base-written plan already on disk (what the runner just wrote).
+        let base_plan = "# Real execution plan from the base\n\n\
+            ## Sprint 1\n- Build the auth module with bcrypt password hashing\n\
+            - Wire the session store and CSRF protection\n\n\
+            ## Sprint 2\n- Implement the profile page and settings\n\
+            - Add integration tests for the login flow\n\n\
+            ## Definition of done\n- All routes covered, lint clean, e2e green\n";
+        fs::write(&plan_path, base_plan).unwrap();
+
+        let out = run_spec(&o).unwrap();
+        assert_eq!(out.phase, Phase::Spec);
+
+        let after = fs::read_to_string(&plan_path).unwrap();
+        assert_eq!(
+            after, base_plan,
+            "run_spec clobbered the base's real execution plan with the skeleton"
+        );
+        assert!(
+            !after.contains("Skeleton execution plan"),
+            "skeleton template must not win over a real base plan"
+        );
+    }
+
+    #[test]
+    fn run_spec_writes_skeleton_when_no_base_plan_on_disk() {
+        // Offline / no-base path: nothing on disk → run_spec still produces the
+        // deterministic skeleton so the artifact always exists.
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        let out = run_spec(&o).unwrap();
+        assert_eq!(out.phase, Phase::Spec);
+        let plan = fs::read_to_string(tmp.path().join("output/demo-execution-plan.md")).unwrap();
+        assert!(
+            plan.contains("Skeleton execution plan"),
+            "skeleton fallback must be written when there is no base plan: {plan}"
+        );
     }
 
     #[test]

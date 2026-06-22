@@ -340,37 +340,80 @@ pub fn capture_gate_revision(
     adr_path
 }
 
-/// Capture validated patterns (schemas/decisions that passed the gate) as
-/// positive experience. Called at delivery completion.
+/// Capture validated patterns (API entity decompositions with REAL
+/// implementation evidence) as positive cross-run experience. Called at
+/// delivery completion.
+///
+/// Two correctness guards close a memory-poisoning gap (the old version
+/// sedimented EVERY parsed endpoint as "validated / passed the quality gate"
+/// regardless of whether a single line was implemented or whether the gate
+/// actually passed):
+///
+/// - `unimplemented_paths` is the set of planned endpoint paths with NO
+///   implementation evidence in the workspace (the acceptance-gap list). Those
+///   are subtracted, so only endpoints actually built are sedimented. If
+///   nothing implemented remains, NOTHING is written (a plan with zero
+///   delivered endpoints carries no reusable, proven pattern).
+/// - `quality_passed` gates the wording: the lesson only asserts the gate
+///   passed when it actually did.
+///
+/// Fail-open: a write error never blocks delivery.
 pub fn capture_validated_patterns(
     project_root: &Path,
     slug: &str,
     requirement: &str,
     spec: &ApiSpec,
+    unimplemented_paths: &[String],
+    quality_passed: bool,
 ) {
     if spec.is_empty() {
         return;
     }
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let entity_summary = spec
+    // Keep only endpoints whose path is NOT in the unimplemented-gap set — i.e.
+    // the ones with real implementation evidence in the delivered source. A path
+    // counts as a gap iff it appears as a whitespace-bounded token in any gap
+    // line, so the gap-string format does not matter.
+    let is_gap = |path: &str| {
+        unimplemented_paths
+            .iter()
+            .any(|g| g.split_whitespace().any(|tok| tok == path))
+    };
+    let implemented: Vec<String> = spec
         .declared_paths()
         .iter()
         .map(|(_, p)| (*p).to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+        .filter(|p| !is_gap(p))
+        .collect();
+    if implemented.is_empty() {
+        // Every planned endpoint is unimplemented → no proven pattern to keep.
+        return;
+    }
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let entity_summary = implemented.join(", ");
     let keywords = extract_keywords(slug, &entity_summary, requirement);
+    // Wording is evidence-accurate: "implemented (source-verified)" always; the
+    // gate-passed claim is added ONLY when the gate actually passed.
+    let gate_line = if quality_passed {
+        "These endpoints were implemented (verified against the delivered source) \
+         and the run passed the quality gate."
+    } else {
+        "These endpoints were implemented (verified against the delivered source). \
+         Note: the quality gate did NOT pass on this run."
+    };
     let lesson = Lesson {
         kind: LessonKind::ValidatedPattern,
         domain: "api".to_string(),
-        title: format!("Validated API contract for {slug}"),
+        title: format!("Implemented API contract for {slug}"),
         body: format!(
-            "The {slug} run produced a validated OpenAPI contract with these endpoints:\n\
-             {entity_summary}\n\n\
-             This schema passed the quality gate. Reuse this entity decomposition \
-             for similar requirements.\n\nRequirement: {requirement}",
+            "The {slug} run produced an OpenAPI contract with these IMPLEMENTED \
+             endpoints:\n{entity_summary}\n\n\
+             {gate_line} Reuse this entity decomposition for similar \
+             requirements.\n\nRequirement: {requirement}",
         ),
         fix: "Reuse this proven entity decomposition for similar projects.".to_string(),
-        root_cause: "This contract was generated from the requirement and validated.".to_string(),
+        root_cause: "This contract was generated from the requirement and the endpoints were \
+                     implemented in the delivered source."
+            .to_string(),
         keywords,
         source_requirement: requirement.to_string(),
         first_seen: now,
@@ -3344,18 +3387,79 @@ mod tests {
             "| Method | Path | Request | Response | Auth | Description |\n|---|---|---|---|---|---|\n| GET | /api/articles | - | - | none | List |\n",
             "demo",
         );
-        capture_validated_patterns(tmp.path(), "demo", "博客系统", &spec);
+        // No gaps (everything implemented), gate passed.
+        capture_validated_patterns(tmp.path(), "demo", "博客系统", &spec, &[], true);
         let lessons = read_raw_lessons(tmp.path(), "validated-decisions.jsonl");
         assert_eq!(lessons.len(), 1);
         assert_eq!(lessons[0].kind, LessonKind::ValidatedPattern);
         assert!(lessons[0].body.contains("/api/articles"));
+        // Gate-passed wording is present only when the gate actually passed.
+        assert!(lessons[0].body.contains("passed the quality gate"));
     }
 
     #[test]
     fn capture_validated_patterns_empty_spec_skips() {
         let tmp = TempDir::new().unwrap();
-        capture_validated_patterns(tmp.path(), "demo", "x", &ApiSpec::default());
+        capture_validated_patterns(tmp.path(), "demo", "x", &ApiSpec::default(), &[], true);
         assert!(read_raw_lessons(tmp.path(), "validated-decisions.jsonl").is_empty());
+    }
+
+    #[test]
+    fn capture_validated_patterns_only_sediments_implemented_endpoints() {
+        // #3: a planned endpoint with NO implementation evidence (in the gap
+        // list) must NOT be sedimented as a validated fact; only the implemented
+        // one survives.
+        let tmp = TempDir::new().unwrap();
+        let spec = umadev_contract::parse_architecture(
+            "| Method | Path | Request | Response | Auth | Description |\n|---|---|---|---|---|---|\n\
+             | GET | /api/articles | - | - | none | List |\n\
+             | POST | /api/comments | - | - | none | Create |\n",
+            "demo",
+        );
+        // /api/comments was planned but never built → it is a gap.
+        let gaps = vec!["POST /api/comments — Create".to_string()];
+        capture_validated_patterns(tmp.path(), "demo", "博客系统", &spec, &gaps, true);
+        let lessons = read_raw_lessons(tmp.path(), "validated-decisions.jsonl");
+        assert_eq!(lessons.len(), 1);
+        assert!(lessons[0].body.contains("/api/articles"));
+        assert!(
+            !lessons[0].body.contains("/api/comments"),
+            "unimplemented endpoint must not be sedimented as validated: {}",
+            lessons[0].body
+        );
+    }
+
+    #[test]
+    fn capture_validated_patterns_all_unimplemented_writes_nothing() {
+        // #3: if EVERY planned endpoint is a gap, nothing is sedimented.
+        let tmp = TempDir::new().unwrap();
+        let spec = umadev_contract::parse_architecture(
+            "| Method | Path | Request | Response | Auth | Description |\n|---|---|---|---|---|---|\n| GET | /api/articles | - | - | none | List |\n",
+            "demo",
+        );
+        let gaps = vec!["GET /api/articles — List".to_string()];
+        capture_validated_patterns(tmp.path(), "demo", "x", &spec, &gaps, true);
+        assert!(read_raw_lessons(tmp.path(), "validated-decisions.jsonl").is_empty());
+    }
+
+    #[test]
+    fn capture_validated_patterns_gate_not_passed_omits_passed_claim() {
+        // #3: when the quality gate did NOT pass, the lesson records the
+        // implemented decomposition but never asserts "passed the quality gate".
+        let tmp = TempDir::new().unwrap();
+        let spec = umadev_contract::parse_architecture(
+            "| Method | Path | Request | Response | Auth | Description |\n|---|---|---|---|---|---|\n| GET | /api/articles | - | - | none | List |\n",
+            "demo",
+        );
+        capture_validated_patterns(tmp.path(), "demo", "博客系统", &spec, &[], false);
+        let lessons = read_raw_lessons(tmp.path(), "validated-decisions.jsonl");
+        assert_eq!(lessons.len(), 1);
+        assert!(
+            !lessons[0].body.contains("passed the quality gate"),
+            "must not claim the gate passed when it did not: {}",
+            lessons[0].body
+        );
+        assert!(lessons[0].body.contains("quality gate did NOT pass"));
     }
 
     #[test]
@@ -3563,7 +3667,7 @@ mod tests {
             "| Method | Path | Request | Response | Auth | Description |\n|---|---|---|---|---|---|\n| GET | /api/posts | - | - | none | List |\n",
             "blog",
         );
-        capture_validated_patterns(tmp.path(), "blog", "做一个博客", &spec);
+        capture_validated_patterns(tmp.path(), "blog", "做一个博客", &spec, &[], true);
         let r = lessons_report(tmp.path());
         assert!(!r.is_empty());
         assert_eq!(r.validated_patterns.len(), 1);
