@@ -29,6 +29,18 @@ use crate::phases::{
 };
 use crate::state::{write_workflow_state, WorkflowState};
 
+/// Upper bound on review→fix rounds for the **research** phase specifically.
+///
+/// Research is the most expensive single base call in the whole pipeline (deep
+/// web research + long thinking) and its structural review rarely surfaces a
+/// real defect, so the config's `max_review_rounds` (which is right for the
+/// planning DOCS) over-budgets research into a stack of multi-minute re-passes —
+/// the "stuck at research for minutes" stall. We cap research at ONE round here
+/// (1 generate + at most 1 fix) and clamp the config value DOWNWARD to it, so a
+/// config asking for fewer reviews still wins. Only the research call site reads
+/// this; the docs phase keeps the full configured budget.
+const RESEARCH_MAX_REVIEW_ROUNDS: usize = 1;
+
 /// Whether the markdown section starting at byte `heading_pos` (the heading
 /// line for `heading`) has any non-empty body content before the next `##`
 /// heading. Catches "present but empty" sections a bare `## goal` would
@@ -1159,7 +1171,18 @@ impl<R: Runtime> AgentRunner<R> {
         // user's literal wording would miss. Fail-open (offline / error / empty
         // → None → retrieval is byte-for-byte the pre-HyDE path).
         let hyde = if use_runtime {
-            crate::coach::generate_hyde_expansion(&self.runtime, &effective_requirement).await
+            // HyDE is a NON-streaming `complete` (one short base call), so it
+            // emits nothing on its own — before research it was a silent gap of
+            // up to a couple of minutes that read as a hang on the way INTO the
+            // already-long research phase. Wrap it in the heartbeat so the user
+            // sees "still working (elapsed)" beats during that gap. Fail-open: the
+            // heartbeat only emits cosmetic Notes and returns the inner result
+            // (an `Option`) untouched.
+            self.with_heartbeat(
+                "联网研究做检索扩展(HyDE)",
+                crate::coach::generate_hyde_expansion(&self.runtime, &effective_requirement),
+            )
+            .await
         } else {
             None
         };
@@ -1208,8 +1231,26 @@ impl<R: Runtime> AgentRunner<R> {
                     ),
                     &["product-manager"],
                 );
-                self.generate_with_review(Phase::Research, rp, Self::review_research, max_reviews)
-                    .await
+                // Research is the single most EXPENSIVE call (deep web research +
+                // long thinking), and unlike the planning DOCS its structural
+                // review rarely finds real defects — so spending the full
+                // `max_review_rounds` budget here meant up to 1 generate + N
+                // review→fix rounds back-to-back, each a multi-minute base call,
+                // stacking into the 6-10 minute "stuck at research" stall users
+                // hit. Cap research at ONE review round (1 generate + at most 1
+                // fix): enough to catch a missing-section regression, without
+                // paying for 3 extra full-research re-passes. The config's
+                // `max_review_rounds` still governs the docs phase unchanged; this
+                // only clamps research, and only DOWNWARD (a config that already
+                // asked for 0 reviews still gets 0).
+                let research_reviews = max_reviews.min(RESEARCH_MAX_REVIEW_ROUNDS);
+                self.generate_with_review(
+                    Phase::Research,
+                    rp,
+                    Self::review_research,
+                    research_reviews,
+                )
+                .await
             } else {
                 None
             };
@@ -4956,7 +4997,14 @@ fn extract_json_object(text: &str) -> Option<String> {
 
 fn phase_progress_hint(phase: Phase) -> &'static str {
     match phase {
-        Phase::Research => "[search] 正在联网调研:分析竞品、技术选型、用户痛点…",
+        Phase::Research => {
+            // Research is the longest single phase (deep web research + thinking),
+            // so the hint sets the expectation up front — "几分钟是正常的" — and
+            // reminds the user ESC interrupts, so a multi-minute wait reads as
+            // working, not stuck. The heartbeat already prefixes the running
+            // elapsed (已 m:ss) to this line, giving the cumulative timer.
+            "[search] 正在联网调研:分析竞品、技术选型、用户痛点…(通常需几分钟,ESC 可中断)"
+        }
         Phase::Spec => "[docs] 正在制定执行计划:拆分任务、定接口契约…",
         Phase::Frontend => "[design] 正在开发前端:建项目、写组件、接图标库…",
         Phase::Backend => "[backend] 正在开发后端:写 API、数据模型、测试…",
@@ -7413,5 +7461,69 @@ error TS2304: Cannot find name 'Foo'
                 "strict block must stop before the frontend phase"
             );
         }
+    }
+
+    // The research phase is capped at ONE review round regardless of the config's
+    // `max_review_rounds` (default 3) — the clamp must be DOWNWARD: a config that
+    // already asked for fewer reviews keeps the smaller value. This is the cure
+    // for "stuck at research for minutes" (1 generate + up to 3 full re-passes).
+    #[test]
+    fn research_review_rounds_clamped_to_one_downward() {
+        assert_eq!(
+            RESEARCH_MAX_REVIEW_ROUNDS, 1,
+            "research must be limited to a single review round"
+        );
+        // Mirrors the call-site clamp `max_reviews.min(RESEARCH_MAX_REVIEW_ROUNDS)`.
+        let clamp = |configured: usize| configured.min(RESEARCH_MAX_REVIEW_ROUNDS);
+        assert_eq!(clamp(3), 1, "the default-3 config is clamped to 1");
+        assert_eq!(clamp(5), 1, "a high config is clamped to 1");
+        assert_eq!(clamp(1), 1, "an already-1 config is unchanged");
+        assert_eq!(
+            clamp(0),
+            0,
+            "a 0-review config is NOT raised — clamp is downward"
+        );
+    }
+
+    // The research progress hint sets the right expectation for a multi-minute
+    // phase: it must say research can take a few minutes and that ESC interrupts,
+    // so a long wait reads as working, not stuck. The heartbeat prefixes the
+    // elapsed timer onto this same string at runtime.
+    #[test]
+    fn research_progress_hint_signals_duration_and_interrupt() {
+        let hint = phase_progress_hint(Phase::Research);
+        assert!(
+            hint.contains("几分钟"),
+            "research hint must set the duration expectation: {hint}"
+        );
+        assert!(
+            hint.contains("ESC"),
+            "research hint must mention ESC interrupt: {hint}"
+        );
+    }
+
+    // The up-front HyDE retrieval expansion is a non-streaming `complete` that
+    // emits nothing on its own; wrapping it in `with_heartbeat` must surface an
+    // up-front `[wait]` Note when `run_initial_block` runs with the runtime on, so
+    // the gap on the way INTO research no longer reads as a frozen screen.
+    #[tokio::test]
+    async fn hyde_expansion_runs_under_heartbeat() {
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let sink = RecordingSink::new();
+        // FakeRuntime is NOT offline, so generate_hyde_expansion actually issues
+        // the wrapped call and the heartbeat's up-front [wait] header fires.
+        let runner =
+            AgentRunner::new(FakeRuntime, opts(tmp.path())).with_event_sink(Arc::new(sink.clone()));
+        runner.start().unwrap();
+        runner.run_initial_block(true, None).await.unwrap();
+        let saw_hyde_wait = sink.events().iter().any(
+            |e| matches!(e, EngineEvent::Note(n) if n.starts_with("[wait]") && n.contains("HyDE")),
+        );
+        assert!(
+            saw_hyde_wait,
+            "HyDE must run under the heartbeat so its silent gap emits a [wait] note"
+        );
     }
 }

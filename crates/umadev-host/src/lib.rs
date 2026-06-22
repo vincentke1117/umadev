@@ -671,7 +671,7 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
 /// `on_line` for real-time parsing.
 ///
 /// **Timeout model (two-phase, "first-line grace").** The per-line idle
-/// watchdog (`idle_timeout`, default 120s, `UMADEV_IDLE_TIMEOUT_SECS`) measures
+/// watchdog (`idle_timeout`, default 300s, `UMADEV_IDLE_TIMEOUT_SECS`) measures
 /// line-to-line *silence*, so it is armed only AFTER the first stdout line. Before
 /// the first line the sole bound is the remaining time to the hard `call.timeout`
 /// deadline — a base whose first token is slow (e.g. plain-text `opencode run`,
@@ -744,13 +744,21 @@ pub(crate) async fn run_subprocess_streaming(
     // full call timeout) catches a mid-stream hang (stream-json hang bug #53584)
     // fast — if no further line arrives within `idle_timeout`, we kill + error so
     // the caller can retry. The overall `call.timeout` is always the hard ceiling.
+    // Default 300s (was 120s): deep web-research / long "thinking" turns can go
+    // silent on stdout for >2min between the lifecycle lines and the next token —
+    // a real, healthy long pause, not a hang. A 120s idle watchdog mis-killed
+    // those mid-research and forced a full non-streaming re-run from scratch
+    // (exactly the multi-minute research stall this addresses). 300s still trips
+    // well before the hard `call.timeout` ceiling, so a genuine stream-json hang
+    // is still caught — and a tighter value is one `UMADEV_IDLE_TIMEOUT_SECS`
+    // away for callers who want the old aggressiveness.
     let idle_timeout = std::cmp::min(
         call.timeout,
         Duration::from_secs(
             std::env::var("UMADEV_IDLE_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(120),
+                .unwrap_or(300),
         ),
     );
     let mut all_lines = Vec::new();
@@ -1033,8 +1041,19 @@ pub fn driver_for(backend_id: &str) -> Option<Box<dyn HostDriver>> {
 /// CLI bases: Claude Code, Codex, and `OpenCode`.
 pub const BACKEND_IDS: &[&str] = &["claude-code", "codex", "opencode"];
 
-/// Default per-call timeout for a host CLI invocation.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Default per-call timeout for a host CLI invocation (the hard ceiling a
+/// single base call can ever take).
+///
+/// 600s (was 300s): a generation-class call that does deep web research can
+/// legitimately run several minutes, and the per-line idle watchdog already
+/// kills a *true* mid-stream hang far sooner (300s by default — see
+/// `run_subprocess_streaming`). Keeping the hard ceiling strictly ABOVE the
+/// idle default is what preserves mid-stream-hang protection: `idle_timeout =
+/// min(call.timeout, 300)` would collapse onto the ceiling if they were equal,
+/// silently disabling the watchdog. 600s is still a finite backstop for a base
+/// that hangs before ever emitting a line; tune per call via
+/// `UMADEV_WORKER_TIMEOUT`.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Availability of one host backend, as reported by [`probe_all`].
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1718,6 +1737,72 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "the hard ceiling must fire promptly even before the first line"
+        );
+    }
+
+    // The hard per-call ceiling defaults to 600s and stays STRICTLY above the
+    // 300s idle default — that ordering is load-bearing: `idle_timeout =
+    // min(call.timeout, 300)`, so if they were equal the idle watchdog would
+    // collapse onto the ceiling and silently stop catching mid-stream hangs.
+    #[test]
+    fn default_timeout_is_600s_and_above_idle_default() {
+        assert_eq!(
+            DEFAULT_TIMEOUT,
+            Duration::from_secs(600),
+            "hard per-call ceiling default changed unexpectedly"
+        );
+        assert!(
+            DEFAULT_TIMEOUT > Duration::from_secs(300),
+            "the hard ceiling must stay above the 300s idle default, or the idle \
+             watchdog (min(call.timeout, idle)) collapses onto the ceiling"
+        );
+    }
+
+    // With NO `UMADEV_IDLE_TIMEOUT_SECS` override, the idle watchdog default is
+    // now 300s (was 120s). A live stream that goes silent for ~2s after its
+    // first line — a perfectly normal long web-research / "thinking" pause —
+    // must NOT be idle-killed under the default, because 2s is far below 300s.
+    // (The 120s→300s bump is precisely so a >2min healthy research silence is no
+    // longer mis-killed; we assert the shape with a fast 2s proxy.) The
+    // companion `streaming_idle_kill_after_first_line_on_midstream_silence` test
+    // already proves the watchdog still FIRES when the override makes it tiny, so
+    // together they pin both the new default and that the mechanism still works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_idle_default_300s_tolerates_short_midstream_silence() {
+        let _env = IDLE_ENV_LOCK.lock().await;
+        // Make sure no leftover override is in scope — we want the DEFAULT.
+        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
+        let tmp = tempfile::TempDir::new().unwrap();
+        // First line immediately, ~2s mid-stream silence, then a second line and
+        // exit. Under the OLD 120s default this also passed, but under a 1s
+        // default (the kind of value that mis-killed research) it would not — the
+        // point is that the unset default is comfortably large.
+        let script = write_sh_fake(
+            tmp.path(),
+            "first-pause-second",
+            "#!/bin/sh\ncat >/dev/null 2>&1\nprintf 'first line\\n'\nsleep 2\nprintf 'second line\\n'\n",
+        );
+        let out = run_subprocess_streaming(
+            SubprocessCall {
+                program: script.to_str().unwrap(),
+                args: &[],
+                prompt: "",
+                channel: PromptChannel::Stdin,
+                // Hard ceiling well above the 2s pause so ONLY the idle default
+                // could (wrongly) fire — and with a 300s default it must not.
+                timeout: Duration::from_secs(30),
+                workspace: tmp.path(),
+                env: &[],
+            },
+            &|_line: &str| {},
+        )
+        .await
+        .expect("a short mid-stream silence must not trip the 300s idle default");
+        assert!(out.stdout.contains("first line"));
+        assert!(
+            out.stdout.contains("second line"),
+            "the post-pause line must survive — the idle default did not kill it"
         );
     }
 }
