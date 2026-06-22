@@ -207,28 +207,23 @@ pub fn prd_prompt(slug: &str, requirement: &str, research_excerpt: &str) -> Prom
     let system = format!(
         "{SPEC_PREAMBLE}\n\
          Role: senior product manager.\n\
-         Write a PRD that a dev team can implement without asking questions.\n\n\
-         Required sections (ALL mandatory):\n\
+         Write a LEAN PRD a dev team can implement without asking questions. Cover \
+         the sections below and nothing more — depth over breadth. Skip padding \
+         (no detailed risk/KPI matrices, no v2 backlog); spend the words on the FRs \
+         and acceptance criteria that actually drive the build.\n\n\
+         Required sections (ALL mandatory, in this order):\n\
          - # PRD — {slug}\n\
-         - ## Goal — what + why + for whom + success metric\n\
-         - ## Target users — 2-3 personas: role, context, pain point, \
-           what success looks like for them\n\
-         - ## Information architecture — site/app page structure as a tree:\n\
+         - ## Goal — what + why + for whom + the ONE success metric that matters\n\
+         - ## Target users — 2-3 personas: role, context, pain point\n\
+         - ## Information architecture — site/app page structure as a tree (the \
+           routes the frontend will build):\n\
            ```\n\
            / (Home)\n\
            ├── /dashboard\n\
-           ├── /settings\n\
-           │   ├── /settings/profile\n\
-           │   └── /settings/billing\n\
            └── /auth/login\n\
            ```\n\
-         - ## User flows — for each core flow (signup, main task, settings):\n\
-           numbered steps: user action → system response → next state.\n\
-           Include error paths (what happens when X fails?)\n\
-         - ## Scope\n\
-           - ### In scope — features for THIS iteration\n\
-           - ### Out of scope — explicitly excluded (prevents scope creep)\n\
-           - ### Future considerations — v2 ideas to keep in mind architecturally\n\
+         - ## Scope — a short `### In scope` list and a short `### Out of scope` \
+           list (one line each item; prevents scope creep). No v2 backlog.\n\
          - ## Functional requirements — table:\n\
            `| ID | Feature | Requirement (EARS) | Priority |`\n\
            Each ID is STABLE: `FR-001`, `FR-002`, … (never renumber; downstream \
@@ -237,30 +232,23 @@ pub fn prd_prompt(slug: &str, requirement: &str, research_excerpt: &str) -> Prom
            - Event:  `WHEN <trigger>, the system SHALL <response>`\n\
            - Unwanted:`IF <condition>, THEN the system SHALL <response>`\n\
            - State:  `WHILE <state>, the system SHALL <response>`\n\
-           - Optional:`WHERE <feature present>, the system SHALL <response>`\n\
            - Ubiquitous: `The system SHALL <response>`\n\
            P0 = must have, P1 = should have, P2 = nice to have. \
            Rows match actual features (don't pad; don't omit). If a detail is \
            genuinely undecidable and you can't pick a sensible default, append \
            `[NEEDS CLARIFICATION: <the open question>]` to that cell — but use \
            AT MOST 3 across the whole PRD; prefer stating a reasonable assumption.\n\
-         - ## Non-functional requirements\n\
-           - Performance: FCP < 1.5s, API p95 < 200ms, support N concurrent users\n\
-           - Security: auth method, data encryption, input validation\n\
-           - Accessibility: WCAG 2.1 AA minimum\n\
-           - Browser support: Chrome/Firefox/Safari/Edge latest 2 versions\n\
-           - Mobile: responsive or native, minimum viewport 360px\n\
-         - ## Acceptance criteria — one or more testable scenarios PER functional \
-           requirement, each citing its FR id, in Given/When/Then form so it maps \
-           1:1 to a test. Quantity matches complexity (simple = 3-5, complex = 10+).\n\
+         - ## Non-functional requirements — a short bullet list covering: \
+           performance target (FCP / API p95), security (auth + input validation), \
+           accessibility (WCAG 2.1 AA), and supported platforms/viewport.\n\
+         - ## Acceptance criteria — one or more testable scenarios PER core \
+           functional requirement, each citing its FR id, in Given/When/Then form \
+           so it maps 1:1 to a test. Quantity matches complexity (simple = 3-5, \
+           complex = 10+).\n\
            `- [ ] **FR-001** — Given [context], When [action], Then [expected result]`\n\
-           The happy path AND the error path of each `IF…THEN` requirement.\n\
-         - ## Success metrics — measurable KPIs with baseline + target:\n\
-           `| Metric | Baseline | Target | How to measure |`\n\
-         - ## Risks & mitigations — each with probability + impact + mitigation:\n\
-           `| Risk | P | I | Mitigation |`\n\
-         - ## Dependencies — external services, APIs, or teams needed\n\
-         - ## Open questions — unresolved decisions"
+           Cover the happy path AND the error path of each `IF…THEN` requirement.\n\
+         - ## Success metrics — 2-4 measurable KPIs as a short list \
+           (`metric: baseline → target`). Keep it brief — no large matrix."
     );
     let user = format!(
         "## Requirement\n\n{requirement}\n\n\
@@ -276,41 +264,31 @@ pub fn architecture_prompt(slug: &str, requirement: &str, prd_excerpt: &str) -> 
     let system = format!(
         "{SPEC_PREAMBLE}\n\
          Role: senior software architect.\n\
-         Task: write a production architecture that a dev team can implement directly. \
-         The API surface is load-bearing — every frontend `fetch` MUST match a row. \
-         Every endpoint MUST specify request/response shapes.\n\n\
-         Required sections (ALL mandatory):\n\
+         Task: write a LEAN production architecture a dev team can implement \
+         directly. The API surface + data model are load-bearing — every frontend \
+         `fetch` MUST match an API row, and every endpoint MUST specify \
+         request/response shapes. Spend the words THERE; don't pad with sections \
+         the build phase won't read. Cover the sections below and nothing more.\n\n\
+         Required sections (ALL mandatory, in this order):\n\
          - # Architecture — {slug}\n\
-         - ## System overview — component diagram in text, data flow direction, \
-           communication protocols (REST/gRPC/WebSocket)\n\
+         - ## System overview — components, data-flow direction, and the \
+           communication protocol(s) (REST/gRPC/WebSocket). A few lines is enough.\n\
          - ## API surface — table: `| Method | Path | Request | Response | Auth | Description |` \
            One row per real endpoint (don't pad with fake routes, don't omit real ones). \
-           Every path starts with `/`. Include auth requirements per endpoint.\n\
+           Every path starts with `/`. Include auth requirements per endpoint. This is \
+           the binding frontend↔backend contract — be complete here.\n\
          - ## API error convention — standard error envelope: \
            `{{ \"error\": {{ \"code\": \"...\", \"message\": \"...\" }} }}`. \
-           Table of error codes: `| HTTP | Code | Meaning |` (400/401/403/404/409/422/500)\n\
-         - ## Data model — for EACH entity:\n\
-           - Field table: `| Field | Type | Required | Default | Description |`\n\
-           - Relationships: `User 1:N Post`, `Post N:M Tag`\n\
-           - Indexes: which fields need indexes for query performance\n\
-           - Constraints: unique, foreign key, check\n\
-           - Sample data: 1-2 example rows so developers understand the shape\n\
-         - ## State management — how frontend manages state:\n\
-           - Global state (auth, theme, locale)\n\
-           - Server state (API data caching strategy)\n\
-           - Form state (validation approach)\n\
-           - URL state (what goes in query params vs local state)\n\
+           Short table of error codes: `| HTTP | Code | Meaning |` (400/401/403/404/409/422/500)\n\
+         - ## Data model — for EACH entity: a field table \
+           `| Field | Type | Required | Default | Description |`, key relationships \
+           (`User 1:N Post`), and the indexes/constraints that matter for queries.\n\
          - ## Authentication & authorization — auth method, token format, \
-           role definitions, permission matrix per API endpoint\n\
-         - ## Tech-stack — for each choice: what + why + rejected alternatives\n\
-         - ## Project structure — recommended directory layout for frontend + backend\n\
-         - ## Coding conventions — naming (camelCase/snake_case), error handling pattern, \
-           logging format, environment variable naming\n\
-         - ## Performance budget — FCP target, API p95 target, caching strategy\n\
-         - ## Security considerations — input validation, SQL injection prevention, \
-           XSS prevention, CORS policy, rate limiting\n\
-         - ## Deployment — environments, CI/CD steps, rollback strategy\n\
-         - ## Open trade-offs"
+           role definitions, and which endpoints each role may call.\n\
+         - ## Tech-stack — for each major choice: what + why (one line of \
+           rationale; name the rejected alternative only when it's a close call).\n\
+         - ## Project structure — recommended directory layout for frontend + \
+           backend, plus the naming + error-handling conventions to follow."
     );
     let user = format!(
         "## Requirement\n\n{requirement}\n\n\
@@ -325,87 +303,52 @@ pub fn architecture_prompt(slug: &str, requirement: &str, prd_excerpt: &str) -> 
 pub fn uiux_prompt(slug: &str, requirement: &str, prd_excerpt: &str) -> Prompt {
     let system = format!(
         "{SPEC_PREAMBLE}\n\
-         Role: senior UI/UX designer — creates design SYSTEMS, not mockups.\n\n\
-         MUST-DO:\n\
-         1. Output pure markdown with ALL sections below. Do NOT skip any.\n\
-         2. The `:root` CSS block must have 10+ semantic color tokens.\n\
-         3. Dark mode `@media (prefers-color-scheme: dark)` is REQUIRED — put it \
-            right after the light-mode `:root` block.\n\n\
-         TOKEN ARCHITECTURE (mandatory, how real shipped systems work): three \
-         layers — primitive (raw `--blue-600`) → semantic (`--color-primary: \
-         var(--blue-600)`) → component (`--button-bg: var(--color-primary)`). \
-         Components reference ONLY the semantic/component layer, never raw hex. \
-         Dark mode overrides the SEMANTIC layer only. A complete token set covers \
-         8 categories: color, typography, spacing, radius, border/hairline, \
-         elevation/shadow, z-index (semantic names, never 999/9999), motion.\n\n\
+         Role: senior UI/UX designer — creates a design SYSTEM, not mockups. Output \
+         pure markdown with ALL sections below, in order, and nothing more. Be \
+         concrete but tight: a complete token set + states beats long prose.\n\n\
+         TOKEN ARCHITECTURE (mandatory): semantic tokens (`--color-primary`, \
+         `--button-bg: var(--color-primary)`) — components reference ONLY the \
+         semantic layer, never raw hex. Dark mode overrides the semantic layer.\n\n\
          Required sections (in this EXACT order):\n\
          - # UI/UX — {slug}\n\
          - ## Visual direction — COMMIT to ONE named direction (editorial-clean / \
            modern-minimal / tech-utility / soft-warm / bold-geometric / brutalist-bold / \
-           glass-aurora / premium-luxury). Pick 1-3 recognizable, real reference \
-           products IN THE TARGET'S OWN DOMAIN as anchors, and for each borrow ONE \
-           specific move (e.g. information density from one, type treatment from another, \
-           surface/depth from a third) — name the move, not just the product. Then name \
-           THE ONE memorable thing a user will remember, and write one AVOID line \
-           (which direction this product is NOT). Reference-based beats descriptive.\n\
-         - ## Color palette — `:root` CSS block with: --color-bg, --color-surface, \
-           --color-text, --color-text-secondary, --color-primary, --color-primary-hover, \
-           --color-accent, --color-border, --color-error, --color-success. \
-           Name text tokens by EMPHASIS (ink/body/muted), not gray-number; name surfaces \
-           by ELEVATION step (surface-1/2/3); pair every dark surface with an on-dark \
-           text token. Use a near-black/near-white (NEVER #000/#fff), tint neutrals \
-           toward the brand hue. ONE scarce accent (≤3% of viewport, CTA/focus/link only).\n\
+           glass-aurora / premium-luxury). Anchor it to 1-3 real reference products \
+           IN THE TARGET'S OWN DOMAIN and borrow ONE specific move from each (name the \
+           move, not just the product). Name THE ONE memorable thing, and one AVOID \
+           line (what this product is NOT).\n\
+         - ## Color palette — a `:root` CSS block with AT LEAST these semantic \
+           tokens: --color-bg, --color-surface, --color-text, --color-text-secondary, \
+           --color-primary, --color-primary-hover, --color-accent, --color-border, \
+           --color-error, --color-success. Near-black/near-white (NEVER #000/#fff), \
+           neutrals tinted toward the brand hue, ONE scarce accent (CTA/focus/link only).\n\
          - ## Dark mode — `@media (prefers-color-scheme: dark)` overriding \
            bg/surface/text/border tokens. NOT optional.\n\
-         - ## Typography system — font stack (2 families max), 7-step type scale \
-           (--text-xs through --text-3xl) with BIG jumps (ratio ≥1.25, display 48-96px), \
-           line-height + weight tokens. Scale negative letter-spacing with size on \
-           display (-0.01 to -0.04em), POSITIVE tracking on uppercase eyebrows \
-           (+0.05 to +0.12em); display weight ceiling ≤600. Add ONE signature detail \
-           (an OpenType stylistic set on body, e.g. ss01/ss03, or tabular-nums on money) \
-           so the type is not generic default Inter.\n\
-         - ## Spacing scale — 4px base, 8+ steps. Section rhythm ~64-96px; tight \
-           interior, large gaps between bands.\n\
+         - ## Typography system — font stack (2 families max, NOT default Inter), a \
+           type scale `--text-xs … --text-3xl` with BIG jumps (ratio ≥1.25, display \
+           48-96px), and weight tokens. One signature detail (e.g. tabular-nums on \
+           numbers) so it isn't generic.\n\
+         - ## Spacing scale — 4px base, 8+ steps; tight interior, large gaps between \
+           sections (~64-96px rhythm).\n\
          - ## Icon library — exactly ONE: Lucide / Heroicons / Tabler.\n\
-         - ## Page hierarchy — nested list with route paths.\n\
-         - ## Component inventory — for each component:\n\
-           - Name + purpose\n\
-           - Props/variants (e.g. Button: primary/secondary/ghost/danger)\n\
-           - States: default / hover / active / focus / disabled / loading / error\n\
-           - Responsive behavior (how it changes on mobile)\n\
-         - ## Page-by-page interaction spec — for each page in the hierarchy:\n\
-           - What the user sees on load\n\
-           - Interactive elements and their behavior\n\
-           - Form validation rules (inline vs on-submit)\n\
-           - Loading states (skeleton/spinner/progressive)\n\
-           - Empty states (first-time user sees what?)\n\
-           - Error states (API failure shows what?)\n\
-         - ## Key interaction flows — for complex interactions:\n\
-           describe the state machine: State A → [user action] → State B → ...\n\
-           Include: form submit flow, auth flow, CRUD operations, \
-           drag-and-drop (if applicable)\n\
-         - ## Motion guidelines — duration buckets as tokens (fast ~120ms / base \
-           ~220ms / slow ~420ms; exit ≈ 75%% of enter), a crafted ease-out \
-           (cubic-bezier(0.16,1,0.3,1)) NOT bounce/elastic, animate transform/opacity \
-           only (never width/height), one orchestrated staggered page-load reveal over \
-           scattered micro-interactions, plus:\n\
-           - When to animate (state changes, reveals, feedback)\n\
-           - When NOT to animate (data updates, navigation)\n\
-           - Respect `prefers-reduced-motion` (a `@media (prefers-reduced-motion: reduce)` block is REQUIRED)\n\
-         - ## Accessibility\n\
-           - Color contrast ratios (body text ≥ 4.5:1, large text ≥ 3:1)\n\
-           - Keyboard navigation order\n\
-           - Screen reader landmarks and live regions\n\
-           - Focus management (modals trap focus, drawers return focus)\n\
-           - Touch targets (≥ 44px on mobile)\n\
-         - ## Known gaps — honestly list what this spec does NOT pin down \
-           (so the frontend phase asks rather than inventing a generic default).\n\n\
+         - ## Page hierarchy — nested list with route paths (match the PRD IA).\n\
+         - ## Component inventory — for each core component: purpose, variants \
+           (e.g. Button: primary/secondary/ghost/danger), and the states \
+           default / hover / active / focus / disabled / loading / error.\n\
+         - ## Page-by-page interaction spec — for each page: what loads, the key \
+           interactive elements, and the loading / empty / error states.\n\
+         - ## Motion guidelines — duration tokens (fast ~120ms / base ~220ms / slow \
+           ~420ms), a crafted ease-out (cubic-bezier(0.16,1,0.3,1)) not bounce, \
+           animate transform/opacity only, and a REQUIRED \
+           `@media (prefers-reduced-motion: reduce)` block.\n\
+         - ## Accessibility — contrast ratios (body ≥ 4.5:1), keyboard order, focus \
+           management (modals trap focus), touch targets ≥ 44px.\n\
+         - ## Known gaps — what this spec does NOT pin down (so the frontend phase \
+           asks rather than inventing a generic default).\n\n\
          Self-check: ONE named direction + real-product anchor + memorable thing? \
-         10+ semantic tokens (3-layer, no raw hex in components)? Dark mode? \
-         Typography 7 sizes with big jumps + scaled tracking + a signature detail? \
-         Motion duration buckets + reduced-motion? Every component has states? \
-         Every page has interaction spec? Thumbnail test — would a stranger know \
-         WHICH product this is, not just \"an AI page\"?"
+         10+ semantic tokens? Dark mode? Type scale with big jumps + a signature \
+         detail? Motion tokens + reduced-motion? Every component has states? \
+         Thumbnail test — would a stranger know WHICH product this is?"
     ) + "\n\n"
         + ANTI_SLOP_LAW;
     let user = format!(

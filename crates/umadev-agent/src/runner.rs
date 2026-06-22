@@ -41,6 +41,25 @@ use crate::state::{write_workflow_state, WorkflowState};
 /// this; the docs phase keeps the full configured budget.
 const RESEARCH_MAX_REVIEW_ROUNDS: usize = 1;
 
+/// Upper bound on review→fix rounds for the **docs** phase (PRD / architecture /
+/// UIUX) specifically.
+///
+/// Each docs doc is a full 4096-token generation, and a review→fix round is a
+/// SECOND full regeneration of the whole document. The config's
+/// `max_review_rounds` default of 3 meant up to 1 generate + 3 rewrites = FOUR
+/// full-document base calls PER doc, three docs = up to twelve multi-minute
+/// calls — the dominant cost in the "docs stage takes 20-50 minutes" stall users
+/// hit, where Claude Code produces the same three docs in 5-6 minutes. The
+/// structural reviewers ([`Self::review_prd`] / `review_architecture` /
+/// `review_uiux`) almost always pass on the first draft (the slimmed prompts map
+/// 1:1 to what they check), so the extra rounds rarely change the output — they
+/// just burn wall-clock. Cap docs at ONE review round (1 generate + at most 1
+/// structural fix): enough to repair a genuinely missing section, without paying
+/// for two more full rewrites. Clamped DOWNWARD only — a config asking for 0
+/// reviews still gets 0. Only the docs call sites read this; research has its own
+/// cap and the quality-gate review→fix budget is untouched.
+const DOCS_MAX_REVIEW_ROUNDS: usize = 1;
+
 /// Default wall-clock budget for ONE **advisory** `consult` call (critic /
 /// judge / surfacer), in seconds. These calls are ALL fail-open and discardable
 /// — a missed verdict never sinks a hard gate — so they must NOT inherit the
@@ -61,6 +80,21 @@ const ADVISORY_TIMEOUT_SECS: u64 = 120;
 /// wedge, never discard already-written files). Override via
 /// `UMADEV_PHASE_BUDGET_SECS` (>0). See [`phase_budget`].
 const PHASE_BUDGET_SECS: u64 = 900;
+
+/// Tighter wall-clock budget for the **docs** phase specifically, in seconds.
+///
+/// Docs is a PLANNING phase: three bounded-length documents (each now a single
+/// 4096-token generation + at most one short structural fix), an assessment
+/// consult, and a 2-critic cross-review. With the review rounds clamped to 1 and
+/// the prompts slimmed, the whole phase should finish in roughly 5-6 minutes —
+/// matching a bare base producing the same three docs. The generic 900s
+/// ([`PHASE_BUDGET_SECS`]) ceiling is sized for the BUILD phases (frontend /
+/// backend, which scaffold + compile real code) and is far too loose to catch a
+/// docs stall early. This caps docs at 480s (8 min) so a wedged base call surfaces
+/// as a degraded-but-moving phase minutes sooner instead of letting the planning
+/// stage silently burn 15 minutes. Override via `UMADEV_DOCS_BUDGET_SECS` (>0),
+/// then `UMADEV_PHASE_BUDGET_SECS`, then this default. Same fail-open clamp.
+const DOCS_BUDGET_SECS: u64 = 480;
 
 /// Default wall-clock budget for a whole AUTO run, in seconds. The `auto` tier
 /// drives past every gate unattended; without an upper bound a pathological run
@@ -104,6 +138,51 @@ fn advisory_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Drive an iterator of futures CONCURRENTLY on the current task and collect
+/// their outputs in input order (output `i` is future `i`'s result, regardless
+/// of which finished first).
+///
+/// This is the dependency-free analogue of `futures::future::join_all`: the
+/// agent crate deliberately avoids pulling in the `futures` crate (see the
+/// dependency-light contract), and `tokio::join!` needs a fixed arity, so a
+/// dynamic `Vec` of same-typed futures (the critic teams) gets this small
+/// hand-rolled concurrent driver instead. All futures share ONE task — they make
+/// progress whenever this future is polled, so two critic base calls overlap in
+/// wall-clock without spawning (which the borrowed `&self` futures can't do
+/// anyway, being non-`'static`). Cooperative: it polls every not-yet-ready
+/// future on each wake, so a waker from any child advances the whole set.
+async fn join_all_ordered<F>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output>
+where
+    F: std::future::Future,
+{
+    use std::task::Poll;
+    // Pin each future on the heap so it has a stable address across polls.
+    let mut pending: Vec<Option<std::pin::Pin<Box<F>>>> =
+        futures.into_iter().map(|f| Some(Box::pin(f))).collect();
+    let mut results: Vec<Option<F::Output>> = (0..pending.len()).map(|_| None).collect();
+    std::future::poll_fn(move |cx| {
+        let mut all_done = true;
+        for (slot, out) in pending.iter_mut().zip(results.iter_mut()) {
+            if let Some(fut) = slot {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready(v) => {
+                        *out = Some(v);
+                        *slot = None; // done — stop polling it
+                    }
+                    Poll::Pending => all_done = false,
+                }
+            }
+        }
+        if all_done {
+            // Every slot resolved — drain the results in order.
+            Poll::Ready(results.iter_mut().map(|o| o.take().unwrap()).collect())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 /// Resolve the per-phase wall-clock budget: `UMADEV_PHASE_BUDGET_SECS` when set
 /// to a positive integer, else [`PHASE_BUDGET_SECS`]. Same fail-open clamp as
 /// [`advisory_timeout`].
@@ -120,6 +199,34 @@ fn phase_budget() -> std::time::Duration {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(PHASE_BUDGET_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Resolve the **docs** phase wall-clock budget. Precedence (first positive wins,
+/// fail-open): the test override, `UMADEV_DOCS_BUDGET_SECS`, then
+/// `UMADEV_PHASE_BUDGET_SECS` (so a user who tightens the global ceiling tightens
+/// docs too), then [`DOCS_BUDGET_SECS`]. This is deliberately tighter than the
+/// generic [`phase_budget`] because docs is a bounded planning phase, not a
+/// code-building one — it should surface a stall in minutes, not quarter-hours.
+fn docs_phase_budget() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let ms = PHASE_BUDGET_MS_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    let secs = std::env::var("UMADEV_DOCS_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .or_else(|| {
+            std::env::var("UMADEV_PHASE_BUDGET_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|n| *n > 0)
+        })
+        .unwrap_or(DOCS_BUDGET_SECS);
     std::time::Duration::from_secs(secs)
 }
 
@@ -341,10 +448,16 @@ fn max_tokens_for_phase(phase: Phase) -> u32 {
         }
     }
     match phase {
-        // Docs produces PRD + architecture + UIUX — the longest artifacts.
-        // Backend also emits substantial code + integration notes.
-        Phase::Docs | Phase::Backend => 8192,
-        // Frontend/quality/delivery/spec/research — moderate.
+        // Backend emits substantial code + integration notes — keep the larger
+        // budget there.
+        Phase::Backend => 8192,
+        // Docs (PRD + architecture + UIUX) used to share Backend's 8192 cap, but
+        // the slimmed planning docs (core sections only) fit comfortably in 4096,
+        // and a smaller cap is a HARD speed lever: the base stops generating
+        // sooner, so each of the three docs returns faster (a doc's wall-clock is
+        // roughly proportional to the tokens it emits). 4096 is still ample for a
+        // complete PRD/architecture/UIUX once the prompt no longer demands a dozen
+        // padded sections. Frontend/quality/delivery/spec/research stay moderate.
         _ => 4096,
     }
 }
@@ -603,10 +716,19 @@ impl<R: Runtime> AgentRunner<R> {
     where
         F: std::future::Future<Output = T>,
     {
-        if let Ok(out) = tokio::time::timeout(phase_budget(), fut).await {
+        // Docs is a bounded PLANNING phase, so it gets the tighter
+        // [`docs_phase_budget`]; every other (code-building) phase keeps the
+        // generic [`phase_budget`]. This is what lets a docs stall surface in
+        // minutes without shrinking the budget the frontend/backend builds need.
+        let budget = if phase == Phase::Docs {
+            docs_phase_budget()
+        } else {
+            phase_budget()
+        };
+        if let Ok(out) = tokio::time::timeout(budget, fut).await {
             (Some(out), false)
         } else {
-            let mins = phase_budget().as_secs() / 60;
+            let mins = budget.as_secs() / 60;
             self.emit(EngineEvent::Note(format!(
                 "[warn] {} 阶段超出时间预算(约 {mins} 分钟)— 保留已生成的产物,标记为降级,\
                  继续推进下一步(顾问/评审为非阻塞,丢弃不影响硬门)。",
@@ -1521,27 +1643,38 @@ impl<R: Runtime> AgentRunner<R> {
         self.record_phase_timing(Phase::Docs, phase_start);
         let gate = docs.gate;
         completed.push(docs);
-        // Intelligent docs assessment — the shared brain reviews the foundation
-        // and surfaces its judgment so the user confirms WITH a real opinion.
+        // Intelligent docs assessment + role-critic cross-review. These are the
+        // ADVISORY layer of the docs phase (the deterministic coverage/contract
+        // floor already ran as the HARD gate when the docs were recorded), so
+        // they belong INSIDE the docs time budget too — otherwise the assessment
+        // consult + critic team could add their own minutes ON TOP of the
+        // already-bounded generation, re-opening the "docs stage runs long" stall
+        // from the advisory side. Wrapping the whole advisory block in the docs
+        // budget caps it: on overrun we keep whatever the docs already are
+        // (assessment/critic are non-blocking and discardable) and move to the
+        // gate. Fully fail-open.
         if use_runtime {
             let slug = self.options.effective_slug();
-            self.surface_docs_assessment(&slug).await;
-            // Role-critic TEAM cross-review (explicit, scaled to the task). The
-            // deterministic floor (coverage/contract in surface_docs_assessment)
-            // already ran as the HARD gate above; this adds the PM + architect
-            // cross-review opinions, records every verdict to the team ledger,
-            // and folds their union of blocking issues into the docs revision
-            // path ONCE (round-1, advisory) — never as loop control.
-            let blocking = self
-                .with_heartbeat_opts(
-                    "角色团队交叉评审文档",
-                    false,
-                    self.run_docs_critic_team(&slug),
-                )
+            let (_advisory_done, _timed_out) = self
+                .with_phase_budget(Phase::Docs, async {
+                    self.surface_docs_assessment(&slug).await;
+                    // Role-critic TEAM cross-review (explicit, scaled to the task,
+                    // run CONCURRENTLY): adds the PM + architect cross-review
+                    // opinions, records every verdict to the team ledger, and folds
+                    // their union of blocking issues into the docs revision path
+                    // ONCE (round-1, advisory) — never as loop control.
+                    let blocking = self
+                        .with_heartbeat_opts(
+                            "角色团队交叉评审文档(并行)",
+                            false,
+                            self.run_docs_critic_team(&slug),
+                        )
+                        .await;
+                    if !blocking.is_empty() {
+                        self.revise_docs_for_critic_blocking(&slug, &blocking).await;
+                    }
+                })
                 .await;
-            if !blocking.is_empty() {
-                self.revise_docs_for_critic_blocking(&slug, &blocking).await;
-            }
         }
         self.transition(Phase::DocsConfirm, gate.map_or("", Gate::id_str))?;
 
@@ -3173,22 +3306,24 @@ impl<R: Runtime> AgentRunner<R> {
         };
 
         self.emit(EngineEvent::Note(format!(
-            "[team] 角色团队交叉评审(只读):{} 名 critic 各从本职审一遍文档…",
+            "[team] 角色团队交叉评审(只读,并行):{} 名 critic 各从本职审一遍文档…",
             team.len()
         )));
+        // Run the critics CONCURRENTLY (each on its own isolated fork) instead of
+        // back-to-back. The serial loop made the docs gate pay N advisory base
+        // calls in series (each up to the advisory timeout) — for the standard
+        // 2-critic docs team that doubled the cross-review wall-clock for no
+        // benefit, since the critics are independent read-only judges. Each
+        // critic thinks on its OWN forked session (clean, no-resume, read-only) —
+        // never the main writer session; if the base can't fork, it falls back to
+        // a fresh consult on the main runtime but STILL only reads. Fail-open: a
+        // broken/empty critic yields an accepting empty verdict and never blocks.
+        // The verdicts come back as owned values, so the ledger writes + Notes are
+        // done sequentially AFTER the join — preserving deterministic team-order
+        // output and ledger ordering regardless of which fork finished first.
+        let verdicts = self.run_critics_concurrently(&team, arts).await;
         let mut blocking: Vec<String> = Vec::new();
-        for critic in &team {
-            // Each critic thinks on its OWN isolated forked session (clean,
-            // no-resume, read-only) — never the main writer session. If the base
-            // can't fork, the critic falls back to a fresh consult on the main
-            // runtime but STILL only reads (consult never writes). Either way the
-            // verdict is fail-open.
-            let fork = self.runtime.fork();
-            let consult: ForkedConsult<'_, R> = ForkedConsult {
-                runner: self,
-                fork: fork.as_deref(),
-            };
-            let verdict = critic.review(&consult, arts).await;
+        for verdict in verdicts {
             crate::critics::append_team_ledger(&self.options.project_root, "docs", 1, &verdict);
             let seat = verdict.role.clone();
             if verdict.accepts && verdict.blocking.is_empty() {
@@ -3207,6 +3342,39 @@ impl<R: Runtime> AgentRunner<R> {
             }
         }
         blocking
+    }
+
+    /// Run a critic team CONCURRENTLY, each critic on its own isolated read-only
+    /// fork, and return the verdicts in the SAME order as `team` (so downstream
+    /// ledger writes + Notes stay deterministic regardless of completion order).
+    ///
+    /// This is the shared concurrency primitive for the docs- and quality-stage
+    /// cross-review teams: independent read-only judges have no reason to run
+    /// back-to-back, and the serial loop was a pure wall-clock tax (N advisory
+    /// base calls in series). The forks are created up front so each future owns
+    /// its own session for the duration. Fully fail-open — each `review` is itself
+    /// fail-open (a broken/empty critic yields an accepting empty verdict), so the
+    /// concurrent driver never errors and never blocks. Kept generic over team
+    /// size (no fixed arity) so a future larger team parallelises automatically.
+    async fn run_critics_concurrently(
+        &self,
+        team: &[Box<dyn crate::critics::RoleCritic>],
+        arts: crate::critics::CriticArtifacts<'_>,
+    ) -> Vec<crate::critics::RoleVerdict> {
+        // Each critic owns its own fork for the whole call (created here so the
+        // borrow lives as long as the future). `fork()` is cheap (spawns a fresh
+        // CLI session lazily on first use); when the base can't fork it's `None`
+        // and the consult transparently falls back to the main read-only runtime.
+        let forks: Vec<Option<Box<dyn umadev_runtime::Runtime>>> =
+            team.iter().map(|_| self.runtime.fork()).collect();
+        let futures = team.iter().zip(forks.iter()).map(|(critic, fork)| {
+            let consult: ForkedConsult<'_, R> = ForkedConsult {
+                runner: self,
+                fork: fork.as_deref(),
+            };
+            async move { critic.review(&consult, arts).await }
+        });
+        join_all_ordered(futures).await
     }
 
     /// The DETERMINISTIC QA floor — the hard signal that runs BEFORE the QA
@@ -3758,11 +3926,19 @@ impl<R: Runtime> AgentRunner<R> {
         let req = &self.options.requirement;
         let research_excerpt = excerpt(research.unwrap_or(""), 1500);
         let project_cfg = crate::config::load_project_config(&self.options.project_root);
-        let max_reviews = project_cfg.pipeline.max_review_rounds;
+        // Clamp docs review→fix to ONE round (mirrors the research clamp). The
+        // config's `max_review_rounds` (default 3) over-budgets docs into up to
+        // 4 full-document regenerations PER doc; the slimmed prompts pass the
+        // structural reviewers on the first draft, so the extra rounds almost
+        // never change the output but dominate the wall-clock. DOWNWARD-only: a
+        // config asking for 0 reviews still gets 0.
+        let max_reviews = project_cfg
+            .pipeline
+            .max_review_rounds
+            .min(DOCS_MAX_REVIEW_ROUNDS);
 
         self.emit(EngineEvent::Note(
-            "[docs] Docs phase: generating PRD → Architecture → UI/UX (3 documents).              This may take 5-15 minutes with a worker backend."
-                .to_string(),
+            "[docs] Docs phase: generating PRD → Architecture → UI/UX (3 documents).".to_string(),
         ));
 
         // PRD: inject PM methodology → generate → review → fix

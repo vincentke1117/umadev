@@ -11,6 +11,8 @@
 //! - `UMADEV_CLAUDE_BIN`  — program name (default `claude`)
 //! - `UMADEV_CLAUDE_PRINT_FLAG` — print flag (default `--print`)
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -30,15 +32,30 @@ pub struct ClaudeCodeDriver {
     print_flag: String,
     timeout: Duration,
     /// When `true`, the next `complete` resumes the `claude` conversation
-    /// instead of starting cold. Set per-call by the TUI for chat turns 2+.
+    /// instead of starting cold. Set per-call by the TUI for chat turns 2+, and
+    /// by the run path so every phase after the first reuses ONE base session
+    /// (the base keeps its file-read / tool / reasoning history across phases
+    /// instead of cold-starting and re-reading everything each phase — the
+    /// dominant speed win over a fresh process per phase).
     continue_session: bool,
-    /// An explicit conversation id (UUID) the TUI pins for its chat session.
-    /// When set, turn 1 creates the session with `--session-id <uuid>` and
-    /// later turns resume it with `--resume <uuid>` — deterministic, so we
+    /// An explicit conversation id (UUID) the caller pins for its session.
+    /// When set, the FIRST call creates the session with `--session-id <uuid>`
+    /// and later calls resume it with `--resume <uuid>` — deterministic, so we
     /// never accidentally continue the user's *other* `claude` conversation
     /// in the same directory. When `None`, falls back to `--continue`
     /// ("most recent in this dir").
     session_id: Option<String>,
+    /// Whether to AUTO-promote a pinned-id session from create→resume across
+    /// calls on this same driver instance. The TUI manages its own create/resume
+    /// turn sequence explicitly, so it leaves this `None` and keeps the literal
+    /// `(session_id, continue_session)` matrix. The run path sets it to a fresh
+    /// `AtomicBool` so the FIRST `complete` creates the pinned session
+    /// (`--session-id <uuid>`) and every later call on the SAME driver resumes it
+    /// (`--resume <uuid>`) — a `--resume` against a not-yet-created session would
+    /// error, so the first call must create. `Arc` so the `&self` async methods
+    /// can flip it without `&mut self`; a fresh `fork()` gets `None` (its own
+    /// fresh session), never sharing this one.
+    session_started: Option<Arc<AtomicBool>>,
     /// The cwd the `claude` subprocess runs in (the pipeline project root).
     /// `None` → the launching process's cwd.
     workspace: Option<std::path::PathBuf>,
@@ -53,6 +70,7 @@ impl Default for ClaudeCodeDriver {
             timeout: crate::worker_timeout_from_env(),
             continue_session: false,
             session_id: None,
+            session_started: None,
             workspace: None,
         }
     }
@@ -89,6 +107,18 @@ impl ClaudeCodeDriver {
         self
     }
 
+    /// Turn on cross-call create→resume AUTO-promotion for a pinned-id session
+    /// (the run path's "reuse ONE base session across phases" mode). With this on
+    /// AND a pinned `session_id`, the first `complete` creates the session
+    /// (`--session-id`) and every later call on this instance resumes it
+    /// (`--resume`). Off (the default) keeps the literal session matrix the TUI
+    /// relies on. No-op without a pinned id. Builder form (mainly for tests).
+    #[must_use]
+    pub fn with_session_autoresume(mut self, on: bool) -> Self {
+        self.session_started = on.then(|| Arc::new(AtomicBool::new(false)));
+        self
+    }
+
     /// The full argument vector for a `complete` call, resolving the session
     /// strategy. Exposed for tests. The prompt is appended by the subprocess
     /// layer as the last positional argument.
@@ -109,7 +139,23 @@ impl ClaudeCodeDriver {
     #[must_use]
     pub fn call_args_with_format(&self, output_format: &str) -> Vec<String> {
         let mut args = self.base_args_with_format(output_format);
+        // AUTO-promote a pinned-id session from create→resume when the run path
+        // enabled it: the FIRST call must create the pinned id (`--session-id`),
+        // so a later `--resume` has a session to attach to. We compute the create
+        // vs resume choice from `session_started`; the flag is FLIPPED by the
+        // call sites (`complete` / `complete_streaming`) AFTER the subprocess
+        // launches, not here, so building the args twice (probe / retry) stays
+        // idempotent.
+        let auto_first_create = self
+            .session_started
+            .as_ref()
+            .is_some_and(|started| !started.load(Ordering::Relaxed));
         match (&self.session_id, self.continue_session) {
+            // Pinned id + auto-resume mode, first call: CREATE with our id.
+            (Some(id), true) if auto_first_create => {
+                args.push("--session-id".to_string());
+                args.push(id.clone());
+            }
             (Some(id), true) => {
                 args.push("--resume".to_string());
                 args.push(id.clone());
@@ -122,6 +168,15 @@ impl ClaudeCodeDriver {
             (None, false) => {}
         }
         args
+    }
+
+    /// Mark the pinned session as ESTABLISHED so subsequent `call_args` resume
+    /// instead of re-creating. Called by `complete` / `complete_streaming` once
+    /// a call has launched. No-op when auto-resume is off. Idempotent.
+    fn mark_session_started(&self) {
+        if let Some(started) = &self.session_started {
+            started.store(true, Ordering::Relaxed);
+        }
     }
 
     /// The argument vector preceding the prompt, with the output format made
@@ -215,6 +270,10 @@ impl Runtime for ClaudeCodeDriver {
         // the existing `extract_*` helpers parse it unchanged.
         let mut args = self.call_args_with_format("json");
         args.extend(model_args(&req.model));
+        // From here on, a pinned auto-resume session is ESTABLISHED — later calls
+        // resume it. Flip BEFORE the await so a concurrent next call resumes, and
+        // because the create flag was already baked into `args` above.
+        self.mark_session_started();
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
         let out = run_subprocess(SubprocessCall {
             program: &self.program,

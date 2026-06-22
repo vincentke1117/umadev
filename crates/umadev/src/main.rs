@@ -2076,6 +2076,36 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
     let _ = std::io::stderr().flush();
 }
 
+/// A fresh UUID-v4 session id for a run, so the driven base reuses ONE
+/// continuous session across the pipeline's serial phases (research → docs →
+/// spec → frontend → backend) instead of a fresh stateless `--print` process
+/// per phase that re-feeds the whole ~90KB context every time. This is the
+/// long-session model: the base keeps context (it remembers the PRD when
+/// writing code), like driving Claude Code directly, which is what makes it
+/// fast. Pure (nanos + per-process counter + pid, avalanched) — no `uuid` dep.
+fn new_run_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    let counter = u128::from(COUNTER.fetch_add(1, Ordering::Relaxed));
+    let pid = u128::from(std::process::id());
+    let mut x = nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (pid << 64);
+    x ^= x >> 47;
+    x = x.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    x ^= x >> 47;
+    let mut u = x.to_be_bytes();
+    u[6] = (u[6] & 0x0F) | 0x40; // version 4
+    u[8] = (u[8] & 0x3F) | 0x80; // RFC-4122 variant
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]
+    )
+}
+
 async fn cmd_run(args: RunArgs) -> Result<()> {
     // Reject an empty / whitespace-only requirement up front with a helpful
     // message, rather than running the whole pipeline on nothing.
@@ -2114,6 +2144,14 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         // relative to its cwd, which differs from the launching cwd whenever
         // `--project-root` points elsewhere.
         driver.set_workspace(project_root.clone());
+        // Long-session model: pin a fresh session id + enable continuation so the
+        // base reuses ONE session across this run's serial phases instead of a
+        // fresh, context-re-feeding `--print` process per phase. The first call
+        // creates the session; later phases resume it (the base remembers the PRD
+        // when it writes code). fail-open: a driver that can't pin a session just
+        // ignores these (no-op default), keeping the old per-call behavior.
+        driver.set_session_id(Some(new_run_session_id()));
+        driver.set_continue_session(true);
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
@@ -2229,6 +2267,14 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         let mut driver = umadev_host::driver_for(backend.id())
             .ok_or_else(|| anyhow::anyhow!("unknown backend `{}`", backend.id()))?;
         driver.set_workspace(project_root.clone());
+        // Long-session model: pin a fresh session id + enable continuation so the
+        // base reuses ONE session across this run's serial phases instead of a
+        // fresh, context-re-feeding `--print` process per phase. The first call
+        // creates the session; later phases resume it (the base remembers the PRD
+        // when it writes code). fail-open: a driver that can't pin a session just
+        // ignores these (no-op default), keeping the old per-call behavior.
+        driver.set_session_id(Some(new_run_session_id()));
+        driver.set_continue_session(true);
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
@@ -2375,6 +2421,14 @@ async fn cmd_redo(
         let mut driver = umadev_host::driver_for(backend.id())
             .ok_or_else(|| anyhow::anyhow!("no driver registered for `{}`", backend.id()))?;
         driver.set_workspace(project_root.clone());
+        // Long-session model: pin a fresh session id + enable continuation so the
+        // base reuses ONE session across this run's serial phases instead of a
+        // fresh, context-re-feeding `--print` process per phase. The first call
+        // creates the session; later phases resume it (the base remembers the PRD
+        // when it writes code). fail-open: a driver that can't pin a session just
+        // ignores these (no-op default), keeping the old per-call behavior.
+        driver.set_session_id(Some(new_run_session_id()));
+        driver.set_continue_session(true);
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
