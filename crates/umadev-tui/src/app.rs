@@ -5189,14 +5189,18 @@ impl App {
     }
 
     /// `true` when a phase is running but the base has gone quiet past the
-    /// stall threshold — no worker output for >3s AND no tool call mid-flight.
+    /// stall threshold — no worker output for >30s AND no tool call mid-flight.
     /// This is the HONEST "about to hang" signal: the UI paints the status red
-    /// so the user sees a truthful cue instead of a fake-smooth spinner. Returns
-    /// `false` whenever nothing is running, a tool call is in progress (a long
-    /// `npm install` is work, not a stall), or output arrived within 3s.
+    /// so the user sees a truthful cue instead of a fake-smooth spinner. The
+    /// threshold is deliberately generous (30s): a base legitimately thinks or
+    /// web-searches for tens of seconds without emitting a token, so a short
+    /// quiet spell must NOT read as stalled — red means "probably wrong", not
+    /// "still thinking". Returns `false` whenever nothing is running, a tool call
+    /// is in progress (a long `npm install` is work, not a stall), or output
+    /// arrived within 30s.
     #[must_use]
     pub fn is_stalled(&self) -> bool {
-        const STALL: std::time::Duration = std::time::Duration::from_secs(3);
+        const STALL: std::time::Duration = std::time::Duration::from_secs(30);
         // Stall only makes sense while something is ACTIVELY running: a phase is
         // in flight, a chat turn is "thinking", OR the run has STARTED but not
         // yet entered its first `Running` phase. That last case is the structural
@@ -5215,7 +5219,7 @@ impl App {
         match self.last_output_at {
             Some(t) => t.elapsed() >= STALL,
             // Nothing has arrived yet this turn: only call it a stall once the
-            // active block has been running > 3s (a just-started phase / a
+            // active block has been running > 30s (a just-started phase / a
             // just-launched run isn't stalled, it's spinning up). The pre-phase
             // window has no `phase_started_at`/`thinking_started`, so fall back to
             // the run's own start instant.
@@ -7825,18 +7829,24 @@ mod tests {
     }
 
     #[test]
-    fn stall_after_three_seconds_then_clears_on_output() {
-        // Honest stall signal: a running phase with no output for >3s reads as
-        // stalled (status painted red by the UI); any fresh output clears it.
+    fn stall_after_threshold_then_clears_on_output() {
+        // Honest stall signal: a running phase with no output past the 60s
+        // threshold reads as stalled (status painted red by the UI); any fresh
+        // output clears it. A short quiet spell (the base thinking) is NOT a stall.
         let mut a = fresh_app(Some("offline"));
         a.apply_engine(EngineEvent::PhaseStarted {
             phase: Phase::Research,
         });
         // Just started → not stalled (spin-up grace).
         assert!(!a.is_stalled(), "a just-started phase is not stalled");
-        // Backdate the last-output clock past the 3s threshold.
-        a.last_output_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(4));
-        assert!(a.is_stalled(), "no output for >3s must read as stalled");
+        // A 15s quiet spell is normal base thinking, NOT a stall.
+        a.last_output_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(15));
+        assert!(!a.is_stalled(), "a sub-30s quiet spell is not a stall");
+        // Backdate the last-output clock past the 30s threshold.
+        a.last_output_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(45));
+        assert!(a.is_stalled(), "no output for >30s must read as stalled");
         // A worker stream event is a sign of life → stall clears immediately.
         a.apply_engine(EngineEvent::WorkerStream {
             event: umadev_runtime::StreamEvent::Text {
@@ -7848,9 +7858,9 @@ mod tests {
 
     #[test]
     fn tool_call_in_flight_is_not_a_stall() {
-        // A long tool call (e.g. a 40s npm install) is WORK, not a stall — the
-        // red signal must stay suppressed while a ToolUse has no ToolResult yet,
-        // even past the 3s threshold; the ToolResult re-arms the stall clock.
+        // A long tool call (e.g. a multi-minute npm install) is WORK, not a stall
+        // — the red signal must stay suppressed while a ToolUse has no ToolResult
+        // yet, even past the 60s threshold; the ToolResult re-arms the stall clock.
         let mut a = fresh_app(Some("offline"));
         a.apply_engine(EngineEvent::PhaseStarted {
             phase: Phase::Backend,
@@ -7862,9 +7872,10 @@ mod tests {
             },
         });
         assert!(a.tool_in_progress, "ToolUse marks a tool in flight");
-        // Even with a stale clock, an in-flight tool is not a stall.
+        // Even with a clock well past the 60s threshold, an in-flight tool is not
+        // a stall (otherwise a long `npm install` would falsely flash red).
         a.last_output_at =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(10));
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(120));
         assert!(
             !a.is_stalled(),
             "an in-flight tool call must NOT read as stalled"
@@ -7888,7 +7899,7 @@ mod tests {
         let mut a = fresh_app(Some("offline"));
         a.apply_engine(EngineEvent::PhaseStarted { phase: Phase::Docs });
         a.last_output_at =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(30));
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(90));
         a.apply_engine(EngineEvent::GateOpened {
             gate: umadev_agent::gates::Gate::DocsConfirm,
         });
@@ -7907,7 +7918,7 @@ mod tests {
         // phase has begun yet (cold index build / intake / vector build). Here
         // `phase_started_at` is None and `thinking` is false — the old judge
         // would NEVER go red, so a silent freeze in this window read as smooth.
-        // The structural backstop must paint it red past 3s.
+        // The structural backstop must paint it red past 30s.
         let mut a = fresh_app(Some("offline"));
         a.apply_engine(EngineEvent::PipelineStarted {
             slug: "demo".into(),
@@ -7917,11 +7928,12 @@ mod tests {
         assert!(!a.thinking, "not a chat-thinking turn");
         // Just launched → not stalled (spin-up grace).
         assert!(!a.is_stalled(), "a just-launched run is not stalled");
-        // Backdate the run start past the 3s threshold (no output has arrived).
-        a.run_started_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(4));
+        // Backdate the run start past the 30s threshold (no output has arrived).
+        a.run_started_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(45));
         assert!(
             a.is_stalled(),
-            "a silent pre-phase 0/9 window past 3s MUST read as stalled"
+            "a silent pre-phase 0/9 window past 30s MUST read as stalled"
         );
     }
 
@@ -7939,7 +7951,7 @@ mod tests {
         });
         // Even with a very stale clock, a gate pause is not a stall.
         a.run_started_at =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(30));
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(90));
         assert!(
             !a.is_stalled(),
             "a gate pause in the pre-phase window must not read as stalled"
@@ -7949,7 +7961,7 @@ mod tests {
         done.run_started = true;
         done.aborted = true;
         done.run_started_at =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(30));
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(90));
         assert!(!done.is_stalled(), "an aborted run is not stalled");
     }
 
