@@ -670,7 +670,15 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
 /// can still assemble the final response. Each line is also passed to
 /// `on_line` for real-time parsing.
 ///
-/// Timeout and kill-on-drop behavior mirror [`run_subprocess`].
+/// **Timeout model (two-phase, "first-line grace").** The per-line idle
+/// watchdog (`idle_timeout`, default 120s, `UMADEV_IDLE_TIMEOUT_SECS`) measures
+/// line-to-line *silence*, so it is armed only AFTER the first stdout line. Before
+/// the first line the sole bound is the remaining time to the hard `call.timeout`
+/// deadline — a base whose first token is slow (e.g. plain-text `opencode run`,
+/// where the first line is the answer itself) is not wrongly killed mid-generation
+/// before it has emitted anything. The hard `call.timeout` ceiling always applies
+/// and the grace can never bypass it (a true hang with no output still trips
+/// `call.timeout`). Kill-on-drop behaviour mirrors [`run_subprocess`].
 #[allow(clippy::too_many_lines)] // single coherent subprocess operation
 pub(crate) async fn run_subprocess_streaming(
     call: SubprocessCall<'_>,
@@ -732,10 +740,10 @@ pub(crate) async fn run_subprocess_streaming(
     };
 
     // Stream stdout line by line.
-    // **Watchdog**: uses a per-line timeout (not the full call timeout) so a
-    // hung process (stream-json hang bug #53584) is detected faster. If no
-    // line arrives within `idle_timeout`, we kill + error so the caller can
-    // retry. The overall `call.timeout` is still the hard ceiling.
+    // **Watchdog**: once the stream is live, a per-line idle timeout (not the
+    // full call timeout) catches a mid-stream hang (stream-json hang bug #53584)
+    // fast — if no further line arrives within `idle_timeout`, we kill + error so
+    // the caller can retry. The overall `call.timeout` is always the hard ceiling.
     let idle_timeout = std::cmp::min(
         call.timeout,
         Duration::from_secs(
@@ -746,12 +754,24 @@ pub(crate) async fn run_subprocess_streaming(
         ),
     );
     let mut all_lines = Vec::new();
-    // Total-time hard ceiling: the per-line idle watchdog alone lets a
-    // steady-trickle stream (one line every < idle_timeout, forever) outlive
-    // `call.timeout`. Bound each wait by whichever is sooner — the idle timeout
-    // or the remaining time to the hard deadline (`started` is the spawn time).
+    // **First-line grace.** The idle watchdog measures line-to-line *silence*,
+    // which only makes sense once a line has been seen. Some bases (claude /
+    // codex with `stream-json` / `--json`) emit lifecycle lines (system/init,
+    // thread.started) almost immediately, so for them the watchdog arms within
+    // milliseconds and behaviour is unchanged. But a plain-text base (opencode
+    // `run`) emits NOTHING until the model produces its first token — the first
+    // stdout line is the answer itself. A slow first token (big prompt / slow
+    // model / rate-limit) could legitimately exceed `idle_timeout`, and killing
+    // there would wrongly fall the driver back to a fresh non-streaming
+    // `complete` and re-run the whole generation (doubling wall-clock). So
+    // BEFORE the first line we do NOT arm the idle sub-timeout: the only bound is
+    // the remaining time to the hard `call.timeout` deadline (real-hang backstop
+    // that the grace can never bypass). AFTER the first line, every subsequent
+    // wait is bounded by `idle_timeout` (still also capped by the hard ceiling),
+    // restoring the mid-stream-hang protection.
     if let Some(stdout) = child.stdout.take() {
         let mut reader = BufReader::new(stdout).lines();
+        let mut seen_first_line = false;
         loop {
             let remaining = call.timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -763,9 +783,18 @@ pub(crate) async fn run_subprocess_streaming(
                     call.timeout.as_secs()
                 ));
             }
-            let wait = idle_timeout.min(remaining);
+            // First-line grace: until the first line, the only deadline is the
+            // hard ceiling's remaining time. After it, the per-line idle timeout
+            // arms — still capped by `remaining` so a steady trickle can never
+            // outlive `call.timeout`.
+            let wait = if seen_first_line {
+                idle_timeout.min(remaining)
+            } else {
+                remaining
+            };
             match tokio::time::timeout(wait, reader.next_line()).await {
                 Ok(Ok(Some(line))) => {
+                    seen_first_line = true;
                     on_line(&line);
                     all_lines.push(line);
                 }
@@ -775,10 +804,24 @@ pub(crate) async fn run_subprocess_streaming(
                     let _ = child.wait().await;
                     return Err(format!("`{}` stdout read error: {e}", call.program));
                 }
+                Err(_) if !seen_first_line => {
+                    // The wait that elapsed was the hard-ceiling remaining time
+                    // (the idle sub-timeout is not armed before the first line),
+                    // so a timeout here means we hit `call.timeout` with no output
+                    // at all — a true hang, reported as the overall timeout.
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(format!(
+                        "`{}` timed out after {}s",
+                        call.program,
+                        call.timeout.as_secs()
+                    ));
+                }
                 Err(_) => {
-                    // **Idle timeout** — no output for `idle_timeout`. This is
-                    // the stream-json hang scenario (#53584). Kill + return a
-                    // distinguishable error so callers can retry.
+                    // **Idle timeout** — the stream went live, then no further
+                    // line for `idle_timeout` (the stream-json hang scenario,
+                    // #53584). Kill + return a distinguishable error so callers
+                    // can retry.
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                     let lines_so_far = all_lines.len();
@@ -1520,6 +1563,159 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "timeout did not fire promptly — read_to_end blocked the deadline"
+        );
+    }
+
+    // ---- run_subprocess_streaming: first-line grace watchdog ----
+
+    /// Async-safe lock serialising the streaming tests that mutate the
+    /// process-global `UMADEV_IDLE_TIMEOUT_SECS`. `ENV_LOCK` is a
+    /// `std::sync::Mutex` whose guard can't be held across an `.await`; these
+    /// tests `.await` the subprocess while the env must stay set, so they need a
+    /// `tokio::sync::Mutex` instead. Only these three tests touch this var, so
+    /// serialising them is sufficient.
+    static IDLE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Write an executable `#!/bin/sh` fake into `dir` and return its path. The
+    /// streaming watchdog tests drive this instead of a real base; gated unix-only
+    /// because Windows cannot exec a shell-shebang script (same constraint as the
+    /// per-driver streaming tests).
+    #[cfg(unix)]
+    fn write_sh_fake(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join(name);
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    // A slow FIRST token (long silence BEFORE any stdout line) must NOT trip the
+    // idle watchdog, as long as it stays under the hard `call.timeout`. This is
+    // the opencode regression: its first stdout line IS the answer, so a slow
+    // model would otherwise be idle-killed before producing anything and forced to
+    // re-run the whole generation. The fake sleeps past `idle_timeout` (1s here)
+    // with zero output, THEN prints the answer — the call must succeed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_first_line_grace_survives_slow_first_token() {
+        let _env = IDLE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Sleep 2s (> the 1s idle timeout) with no output, then emit the answer.
+        let script = write_sh_fake(
+            tmp.path(),
+            "slow-first",
+            "#!/bin/sh\ncat >/dev/null 2>&1\nsleep 2\nprintf 'the slow answer\\n'\n",
+        );
+        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+        let started = Instant::now();
+        let out = run_subprocess_streaming(
+            SubprocessCall {
+                program: script.to_str().unwrap(),
+                args: &[],
+                prompt: "",
+                channel: PromptChannel::Stdin,
+                // Hard ceiling comfortably above the 2s first-token latency.
+                timeout: Duration::from_secs(20),
+                workspace: tmp.path(),
+                env: &[],
+            },
+            &|_line: &str| {},
+        )
+        .await;
+        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
+        let out = out.expect("a slow first token under call.timeout must not be idle-killed");
+        assert!(out.stdout.contains("the slow answer"));
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "the test should have waited out the slow first token"
+        );
+    }
+
+    // Once the stream is LIVE (first line seen), a mid-stream silence longer than
+    // `idle_timeout` MUST trip the idle watchdog — the first-line grace only
+    // relaxes the *pre*-first-line wait, never the line-to-line one. The fake
+    // prints a first line immediately, then hangs; we expect the distinguishable
+    // "idle timeout" error well before the (large) hard ceiling.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_idle_kill_after_first_line_on_midstream_silence() {
+        let _env = IDLE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = write_sh_fake(
+            tmp.path(),
+            "first-then-hang",
+            "#!/bin/sh\ncat >/dev/null 2>&1\nprintf 'first line\\n'\nsleep 30\n",
+        );
+        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+        let started = Instant::now();
+        let err = run_subprocess_streaming(
+            SubprocessCall {
+                program: script.to_str().unwrap(),
+                args: &[],
+                prompt: "",
+                channel: PromptChannel::Stdin,
+                // Hard ceiling far above the 1s idle timeout so we KNOW the idle
+                // watchdog — not the ceiling — is what fired.
+                timeout: Duration::from_secs(30),
+                workspace: tmp.path(),
+                env: &[],
+            },
+            &|_line: &str| {},
+        )
+        .await
+        .unwrap_err();
+        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
+        assert!(
+            err.contains("idle timeout"),
+            "mid-stream silence after the first line must trip the idle watchdog, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "idle watchdog should fire ~1s after the first line, not wait for the ceiling"
+        );
+    }
+
+    // A true hang — NO output at all, runs past the hard `call.timeout` — must
+    // still be killed by the overall ceiling. The first-line grace removes the
+    // pre-first-line *idle* sub-timeout but can never bypass `call.timeout`; this
+    // is the real-hang backstop. The fake produces nothing and sleeps forever; we
+    // expect the overall-timeout error in ~1s.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_hard_ceiling_kills_silent_hang_before_first_line() {
+        let _env = IDLE_ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = write_sh_fake(
+            tmp.path(),
+            "silent-hang",
+            "#!/bin/sh\ncat >/dev/null 2>&1\nsleep 30\n",
+        );
+        // Idle timeout huge so it can't be what fires — only the 1s hard ceiling
+        // can stop a never-emitting child before the first line.
+        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "600");
+        let started = Instant::now();
+        let err = run_subprocess_streaming(
+            SubprocessCall {
+                program: script.to_str().unwrap(),
+                args: &[],
+                prompt: "",
+                channel: PromptChannel::Stdin,
+                timeout: Duration::from_secs(1),
+                workspace: tmp.path(),
+                env: &[],
+            },
+            &|_line: &str| {},
+        )
+        .await
+        .unwrap_err();
+        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
+        assert!(
+            err.contains("timed out"),
+            "a silent child past call.timeout must hit the hard ceiling, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the hard ceiling must fire promptly even before the first line"
         );
     }
 }
