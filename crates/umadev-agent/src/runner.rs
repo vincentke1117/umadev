@@ -285,6 +285,21 @@ fn worktree_unchanged(before: &str, after: &str) -> bool {
     norm(before) == norm(after)
 }
 
+/// Count the project's REAL source-code files (`.tsx/.ts/.rs/.py/…`, skipping
+/// `node_modules`/`output`/`.umadev`/build/vendor dirs) via the shared
+/// acceptance scanner. This is the **git-independent** ground truth for "did
+/// the run actually produce code" — unlike a `git status --porcelain` snapshot,
+/// it works in a NON-git workspace, which is exactly where the "empty run looked
+/// successful" failure was observed.
+///
+/// **fail-SAFE for the empty-output gate**: the scanner is itself fail-open
+/// (an unreadable dir yields fewer files, never a panic), so a hiccup tends
+/// toward "0 source files" → the gate leans to "no real code produced → fail",
+/// which protects the user from a disguised-success delivery. It never panics.
+fn source_file_count(project_root: &std::path::Path) -> usize {
+    crate::acceptance::source_files(project_root).len()
+}
+
 /// Whether the markdown section starting at byte `heading_pos` (the heading
 /// line for `heading`) has any non-empty body content before the next `##`
 /// heading. Catches "present but empty" sections a bare `## goal` would
@@ -920,6 +935,32 @@ impl<R: Runtime> AgentRunner<R> {
         });
         let outcomes = crate::verify::run_verify(workspace).await;
         if outcomes.is_empty() {
+            // A skipped verify normally reads as "neutral pass". But there is one
+            // case where a SKIP must become a FAIL: a runtime run whose plan was
+            // supposed to produce code (Frontend/Backend) ended a code phase with
+            // NO real source files on disk. "No manifest" there isn't a benign
+            // skip — it's the empty-run failure. Record a FAILED build row so
+            // `verify_results_check` turns it into a `failed` "Build & test
+            // results" check (→ critical failure) instead of a silent pass.
+            let plan = crate::planner::plan(&self.options.requirement);
+            let expects_code = Self::plan_produces_code(&plan);
+            if !self.runtime.is_offline()
+                && matches!(phase, Phase::Frontend | Phase::Backend)
+                && expects_code
+                && source_file_count(workspace) == 0
+            {
+                self.record_empty_source_verify_failure(phase);
+                self.emit(EngineEvent::VerifyFailed {
+                    phase,
+                    exit_code: -1,
+                    stderr: "未产出任何真实源码文件(计划包含前端/后端实现)".to_string(),
+                });
+                return VerifyOutcome {
+                    passed: false,
+                    skipped: false,
+                    failure_detail: "未产出任何真实源码文件(计划包含前端/后端实现)".to_string(),
+                };
+            }
             self.emit(EngineEvent::VerifySkipped {
                 phase,
                 reason: "no recognised project manifest".to_string(),
@@ -3893,6 +3934,72 @@ impl<R: Runtime> AgentRunner<R> {
         true
     }
 
+    /// Whether the (deterministic) plan for this run is SUPPOSED to produce real
+    /// code — i.e. it includes a Frontend or Backend phase. Docs-only / research
+    /// / plan-only tasks return `false`, so the zero-source hard gate never fires
+    /// on a task that legitimately ships no code (no false alarm).
+    fn plan_produces_code(plan: &crate::planner::PhasePlan) -> bool {
+        plan.includes(Phase::Frontend) || plan.includes(Phase::Backend)
+    }
+
+    /// Per-phase reality check for the *frontend/backend* implementation phases
+    /// that does NOT depend on git: did the number of real source files actually
+    /// grow across the worker body? The base claiming success (`base_reported`)
+    /// is not evidence anything was written. When the base reported success but
+    /// the real source-file count did not increase at all, flag the phase
+    /// **degraded** + warn — catching "only replied with text, never wrote to
+    /// disk" at the source, independent of whether the repo is a git repo.
+    ///
+    /// fail-SAFE: `before`/`after` come from [`source_file_count`] (fail-open,
+    /// never panics). We only degrade on a *provable* non-increase
+    /// (`after <= before`); the equal-count case (e.g. files overwritten in
+    /// place) is intentionally treated as "no new code" because the observed bug
+    /// is a run that produced ZERO files, where `before == after == 0`.
+    fn implementation_added_no_source(
+        &self,
+        phase: Phase,
+        base_reported: bool,
+        before: usize,
+        after: usize,
+    ) -> bool {
+        if !base_reported {
+            return false; // already degraded / offline → nothing to cross-check
+        }
+        if after > before {
+            return false; // real new source landed → genuine implementation
+        }
+        self.emit(EngineEvent::Note(format!(
+            "[warn] {}:底座报告了实现,但真实源码文件数未增加({before} → {after})—— \
+             按降级处理(疑似只回了文字、未落盘)。",
+            phase.id()
+        )));
+        true
+    }
+
+    /// Record a synthetic FAILED build/test verify row to
+    /// `.umadev/audit/verify.jsonl` so the quality gate's `verify_results_check`
+    /// turns it into a `failed` "Build & test results" check (→ critical
+    /// failure → gate BLOCKED). Used when verify is otherwise SKIPPED (no
+    /// manifest) yet the plan was supposed to produce code and produced none —
+    /// a skip must not read as a pass in that situation.
+    fn record_empty_source_verify_failure(&self, phase: Phase) {
+        let outcome = crate::verify::VerifyOutcome {
+            project_kind: crate::verify::ProjectKind::None,
+            step: "build".to_string(),
+            command: "umadev: real-source-present check".to_string(),
+            exit_code: -1,
+            duration_ms: 0,
+            stdout: String::new(),
+            stderr: "未产出任何真实源码文件 —— 计划包含前端/后端实现,但工作区无 \
+                     .ts/.tsx/.rs/.py/… 源码文件落盘。"
+                .to_string(),
+            passed: false,
+            skipped: false,
+        };
+        let _ =
+            crate::verify::record_verify_outcome(&self.options.project_root, phase.id(), &outcome);
+    }
+
     /// Read an APPROVED context doc (`output/{slug}-{name}.md`) that a build
     /// phase needs, and report whether it came back empty.
     ///
@@ -4199,6 +4306,11 @@ impl<R: Runtime> AgentRunner<R> {
             // BEFORE `run_frontend` writes its notes artifact, so the diff
             // reflects only what the worker itself wrote.
             let fe_before = git_worktree_snapshot(&self.options.project_root);
+            // Git-INDEPENDENT real-source baseline: count actual source files
+            // before the worker body so we can prove the phase wrote code even
+            // when the workspace is NOT a git repo (where the porcelain snapshot
+            // is `None` and the changed-files check fails open / skips).
+            let fe_src_before = source_file_count(&self.options.project_root);
             // #4: read the approved docs the base needs as CONTEXT here (not via
             // a silent `unwrap_or_default` inside the closure). An expected doc
             // that reads empty warns + marks the phase degraded, so a blind build
@@ -4250,6 +4362,21 @@ impl<R: Runtime> AgentRunner<R> {
                     base_reported,
                     fe_before.as_deref(),
                     fe_after.as_deref(),
+                ) {
+                    fe_degraded = true;
+                }
+            }
+            // Git-independent twin of the above: "said it built the UI but the
+            // real source-file count did not grow" → degrade. Catches the
+            // text-only / nothing-written case in a NON-git workspace, which the
+            // porcelain snapshot above misses.
+            if !fe_degraded {
+                let fe_src_after = source_file_count(&self.options.project_root);
+                if self.implementation_added_no_source(
+                    Phase::Frontend,
+                    base_reported,
+                    fe_src_before,
+                    fe_src_after,
                 ) {
                     fe_degraded = true;
                 }
@@ -4327,6 +4454,8 @@ impl<R: Runtime> AgentRunner<R> {
             // writes its notes artifact only after this block, so the `after`
             // snapshot reflects exactly what the worker wrote.
             let be_before = git_worktree_snapshot(&self.options.project_root);
+            // Git-INDEPENDENT real-source baseline (mirrors the frontend phase).
+            let be_src_before = source_file_count(&self.options.project_root);
             // #4: read the approved docs as context here; an expected doc that
             // reads empty warns + degrades (no silent blind build).
             let slug = self.options.effective_slug();
@@ -4377,6 +4506,18 @@ impl<R: Runtime> AgentRunner<R> {
                     be_degraded = true;
                 }
             }
+            // Git-independent twin: real source-file count did not grow → degrade.
+            if !be_degraded {
+                let be_src_after = source_file_count(&self.options.project_root);
+                if self.implementation_added_no_source(
+                    Phase::Backend,
+                    base_reported,
+                    be_src_before,
+                    be_src_after,
+                ) {
+                    be_degraded = true;
+                }
+            }
         }
         completed.push(self.record_phase_maybe_degraded(
             Phase::Backend,
@@ -4410,6 +4551,45 @@ impl<R: Runtime> AgentRunner<R> {
                 "[plan] 任务类型 {} 无后端实现 — 跳过后端构建校验、代码评审与接口验收。",
                 plan.kind.id()
             )));
+        }
+
+        // ── HARD GATE: zero real source code ⇒ the run did NOT deliver ──────
+        // The root failure this gate fixes: a run that produced ZERO lines of
+        // code still reached the quality gate (which scores DOCUMENT structure),
+        // scored ~93/100, and "delivered". The fix is unconditional and
+        // git-independent: if this plan was SUPPOSED to produce code (it
+        // includes Frontend or Backend) and the real-source scanner finds NO
+        // source files at all, the pipeline STOPS here — it never enters the
+        // quality gate or delivery. This is the only fail-SAFE gate in the
+        // engine: when the source scan is uncertain it leans toward "no output →
+        // fail" so the user is protected from a disguised-success delivery,
+        // rather than fail-open. Offline/template runs are exempt (`use_runtime`
+        // is false) — their pipeline is a deterministic demo, not a delivery.
+        if use_runtime
+            && Self::plan_produces_code(&plan)
+            && source_file_count(&self.options.project_root) == 0
+        {
+            // Belt: also leave a FAILED build-verify row so any later read of
+            // the audit trail (and the quality gate, were it ever reached) sees
+            // the empty-output failure, not a skipped/green verify.
+            self.record_empty_source_verify_failure(Phase::Backend);
+            self.emit(EngineEvent::Note(
+                "[fail] 未产出任何真实代码文件 —— 流水线停止,未交付。\
+                 计划包含前端/后端实现,但工作区没有任何 .ts/.tsx/.rs/.py/… 源码文件落盘。\
+                 请检查底座是否真的在写文件(而不是只回了文字),修好后用 /redo 重跑实现阶段。"
+                    .to_string(),
+            ));
+            self.record_run_history(Phase::Backend, false, 0);
+            self.warn_degraded_summary();
+            self.emit(EngineEvent::BlockCompleted {
+                final_phase: Phase::Backend,
+                paused_at: None,
+            });
+            return Ok(RunReport {
+                final_phase: Phase::Backend,
+                paused_at: None,
+                completed,
+            });
         }
 
         let phase_start = std::time::Instant::now();
@@ -6864,6 +7044,13 @@ error TS2304: Cannot find name 'Foo'
         runner.start().unwrap();
         runner.run_initial_block(true, None).await.unwrap();
         runner.continue_after_docs_confirm().await.unwrap();
+        // Drop a REAL source file so the zero-source hard gate doesn't fire — this
+        // test exercises the QUALITY-gate-blocked path (sub-threshold doc score),
+        // not the empty-run path. (FakeRuntime writes no files of its own.)
+        let _ = std::fs::write(
+            tmp.path().join("App.tsx"),
+            "export const App = () => null;\n",
+        );
         // The preview→delivery block re-runs the quality phase, which (with a
         // FakeRuntime that returns "stub") produces a SUB-THRESHOLD gate — so the
         // delivery-blocked note fires for real. We assert on the SHAPE of that
@@ -6909,6 +7096,12 @@ error TS2304: Cannot find name 'Foo'
         runner.start().unwrap();
         runner.run_initial_block(true, None).await.unwrap();
         runner.continue_after_docs_confirm().await.unwrap();
+        // Drop a REAL source file so the zero-source hard gate doesn't fire —
+        // this test targets the QUALITY-gate block, not the empty-run stop.
+        let _ = std::fs::write(
+            tmp.path().join("App.tsx"),
+            "export const App = () => null;\n",
+        );
         // Overwrite the quality gate with a failing one (passed:false, score
         // below threshold). This runs before continue_after_preview_confirm
         // reaches its quality check.
@@ -6928,6 +7121,77 @@ error TS2304: Cannot find name 'Foo'
                     .unwrap()
                     .filter_map(Result::ok)
                     .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("zip"))
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_source_run_hard_stops_at_backend_and_never_delivers() {
+        // Root failure this gate fixes: a worker run that wrote ZERO real source
+        // files still sailed through quality and delivered. Now a code-bearing
+        // plan with no source files HARD STOPS at Backend. Works in a NON-git
+        // temp dir (the original repro condition).
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let mut o = opts(tmp.path()); // "build a login page" -> Greenfield
+        o.backend = "claude-code".into(); // use_runtime = true
+        let sink = RecordingSink::new();
+        let runner = AgentRunner::new(FakeRuntime, o).with_event_sink(Arc::new(sink.clone()));
+        runner.start().unwrap();
+        runner.run_initial_block(true, None).await.unwrap();
+        runner.continue_after_docs_confirm().await.unwrap();
+        let r = runner.continue_after_preview_confirm().await.unwrap();
+        assert_eq!(
+            r.final_phase,
+            Phase::Backend,
+            "zero-source run must stop at Backend, not reach Quality/Delivery"
+        );
+        assert_eq!(r.paused_at, None);
+        let notes: Vec<String> = sink
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Note(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("[fail]") && n.contains("未产出任何真实代码文件")),
+            "must emit the loud empty-output [fail] note: {notes:?}"
+        );
+        assert!(
+            !tmp.path().join("output/demo-quality-gate.json").is_file(),
+            "quality gate must NOT have run for a zero-source run"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_source_run_passes_the_hard_gate_and_continues() {
+        // The gate must NOT punish a legitimate run: with real source on disk, a
+        // code-bearing plan proceeds past Backend (no false alarm).
+        let tmp = TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".into();
+        let runner = AgentRunner::new(FakeRuntime, o);
+        runner.start().unwrap();
+        runner.run_initial_block(true, None).await.unwrap();
+        runner.continue_after_docs_confirm().await.unwrap();
+        let _ = std::fs::write(
+            tmp.path().join("App.tsx"),
+            "export const App = () => null;\n",
+        );
+        let r = runner.continue_after_preview_confirm().await.unwrap();
+        assert_ne!(
+            r.final_phase,
+            Phase::Backend,
+            "a run with real source must not be stopped by the empty-output gate"
+        );
+        assert!(
+            matches!(r.final_phase, Phase::Quality | Phase::Delivery),
+            "real-source run continues into quality/delivery, got {:?}",
+            r.final_phase
         );
     }
 
@@ -7157,6 +7421,12 @@ error TS2304: Cannot find name 'Foo'
         use std::sync::Arc;
 
         let tmp = TempDir::new().unwrap();
+        // Real source present (so the empty-run guard doesn't turn the skip into a
+        // fail) but NO build manifest → verify legitimately skips.
+        let _ = std::fs::write(
+            tmp.path().join("App.tsx"),
+            "export const App = () => null;\n",
+        );
         let sink = RecordingSink::new();
         let runner =
             AgentRunner::new(FakeRuntime, opts(tmp.path())).with_event_sink(Arc::new(sink.clone()));

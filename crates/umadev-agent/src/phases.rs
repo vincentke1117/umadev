@@ -925,6 +925,56 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
         });
     }
 
+    // HARD GATE — real source code present. The single most important check
+    // against "an empty run scored 93/100 on document structure and shipped":
+    // when the plan for this requirement was SUPPOSED to produce code (it
+    // includes a Frontend or Backend phase) yet the real-source scanner finds
+    // ZERO source files in the workspace, this is a `failed` **artifact** check.
+    // Because `critical_failures` collects exactly `status == "failed" &&
+    // category == "artifact"`, this single failed row forces `passed = false`
+    // regardless of how high the document-structure score is. fail-SAFE: the
+    // scanner is fail-open (an unreadable dir yields fewer files, never a
+    // panic), so an uncertain scan leans toward "0 files → fail", protecting the
+    // user from a disguised-success delivery. A docs-only / research-only /
+    // plan-only task does NOT include Frontend/Backend, so this check is `passed`
+    // (no false alarm).
+    {
+        let plan = crate::planner::plan(&opts.requirement);
+        let expects_code = plan.includes(Phase::Frontend) || plan.includes(Phase::Backend);
+        let source_count = crate::acceptance::source_files(&opts.project_root).len();
+        let (status, score, details) = if !expects_code {
+            (
+                "passed",
+                100,
+                "Plan ships no code (docs/research/plan only) — source check N/A".to_string(),
+            )
+        } else if source_count == 0 {
+            (
+                "failed",
+                0,
+                "未产出任何真实源码文件 — 计划包含前端/后端实现,但工作区无 \
+                 .ts/.tsx/.rs/.py/… 源码文件落盘(疑似空跑/只回了文字)。"
+                    .to_string(),
+            )
+        } else {
+            (
+                "passed",
+                100,
+                format!("{source_count} real source file(s) present"),
+            )
+        };
+        checks.push(QualityCheck {
+            name: "Real source code present".to_string(),
+            category: "artifact".to_string(),
+            description: "Plan-bearing code phases must leave real source files on disk"
+                .to_string(),
+            status: status.to_string(),
+            score,
+            details,
+            weight: 3.0,
+        });
+    }
+
     // UD-EVID-001 — API audit
     let api_log = opts
         .project_root
@@ -3582,6 +3632,91 @@ mod tests {
         let report: QualityReport = serde_json::from_str(&json).unwrap();
         assert!(!report.passed);
         assert!(!report.critical_failures.is_empty());
+    }
+
+    #[test]
+    fn quality_blocks_when_code_plan_produced_zero_source() {
+        // The HARD quality item: a code-bearing plan (Greenfield "build a login
+        // system") with NO real source files on disk must produce a `failed`
+        // "Real source code present" artifact check → critical failure → gate
+        // BLOCKED, regardless of how complete the docs are.
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        // Generate full, well-structured docs so the doc-structure score is high
+        // — proving the BLOCK is driven by the missing source, not weak docs.
+        run_research(&o, None).unwrap();
+        run_docs(&o, &DocsContent::default()).unwrap();
+        run_spec(&o).unwrap();
+        let out = run_quality(&o).unwrap();
+        let json = fs::read_to_string(&out.artifacts[0]).unwrap();
+        let report: QualityReport = serde_json::from_str(&json).unwrap();
+        let src = report
+            .checks
+            .iter()
+            .find(|c| c.name == "Real source code present")
+            .expect("real-source check must exist");
+        assert_eq!(src.status, "failed", "zero source must fail: {src:?}");
+        assert_eq!(src.category, "artifact");
+        assert!(
+            report
+                .critical_failures
+                .iter()
+                .any(|f| f == "Real source code present"),
+            "missing source must be a critical failure: {:?}",
+            report.critical_failures
+        );
+        assert!(!report.passed, "gate must be BLOCKED with zero source");
+    }
+
+    #[test]
+    fn quality_real_source_check_passes_when_source_present() {
+        // With at least one real source file on disk, the "Real source code
+        // present" check passes and is NOT a critical failure.
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        fs::write(
+            tmp.path().join("App.tsx"),
+            "export const App = () => null;\n",
+        )
+        .unwrap();
+        let out = run_quality(&o).unwrap();
+        let json = fs::read_to_string(&out.artifacts[0]).unwrap();
+        let report: QualityReport = serde_json::from_str(&json).unwrap();
+        let src = report
+            .checks
+            .iter()
+            .find(|c| c.name == "Real source code present")
+            .expect("real-source check must exist");
+        assert_eq!(src.status, "passed", "source present must pass: {src:?}");
+        assert!(!report
+            .critical_failures
+            .iter()
+            .any(|f| f == "Real source code present"));
+    }
+
+    #[test]
+    fn quality_real_source_check_not_triggered_for_docs_only_plan() {
+        // A docs-only plan ships no code, so the zero-source check must NOT fire
+        // (no false alarm) even with an empty workspace.
+        let tmp = TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.requirement = "只做调研 写文档 research only".to_string();
+        let out = run_quality(&o).unwrap();
+        let json = fs::read_to_string(&out.artifacts[0]).unwrap();
+        let report: QualityReport = serde_json::from_str(&json).unwrap();
+        let src = report
+            .checks
+            .iter()
+            .find(|c| c.name == "Real source code present")
+            .expect("real-source check must exist");
+        assert_eq!(
+            src.status, "passed",
+            "docs-only plan must not trigger the source check: {src:?}"
+        );
+        assert!(!report
+            .critical_failures
+            .iter()
+            .any(|f| f == "Real source code present"));
     }
 
     #[test]
