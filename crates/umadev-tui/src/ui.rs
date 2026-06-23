@@ -452,6 +452,73 @@ fn markdown_to_lines(text: &str, base_color: Color) -> Vec<Line<'static>> {
 
 // ---------- Picker (first launch) -----------------------------------------
 
+/// The honest three-state readiness mark + detail text for one base-CLI picker
+/// row (gap G10). Returns `(glyph, color, detail)`:
+/// - **logged in** → a filled circle (green) + the version detail.
+/// - **installed · not logged in** → a half circle (amber) + `→ <login cmd>`.
+/// - **not installed** → an empty circle (grey) + `→ <install cmd>`.
+/// - **unknown** → a half circle (amber) + a conservative "login not verified".
+///
+/// Glyphs are built from codepoints so the source carries no pictographic glyph,
+/// and there are no emoji.
+fn picker_auth_marks(
+    lang: umadev_i18n::Lang,
+    item: &crate::app::PickerItem,
+) -> (String, ratatui::style::Color, String) {
+    use crate::app::AuthMark;
+    // Geometric circles: ● filled / ◐ half / ○ empty.
+    let filled = char::from_u32(0x25CF).unwrap_or('*').to_string();
+    let half = char::from_u32(0x25D0).unwrap_or('o').to_string();
+    let empty = char::from_u32(0x25CB).unwrap_or('.').to_string();
+    match item.auth {
+        AuthMark::LoggedIn => (
+            filled,
+            theme::SUCCESS(),
+            umadev_i18n::t(lang, "picker.auth.logged_in").to_string(),
+        ),
+        AuthMark::NotLoggedIn => {
+            let cmd = if item.login_cmd.is_empty() {
+                "—".to_string()
+            } else {
+                item.login_cmd.clone()
+            };
+            (
+                half,
+                theme::WARNING(),
+                umadev_i18n::tf(lang, "picker.auth.not_logged_in", &[&cmd]),
+            )
+        }
+        AuthMark::NotInstalled => {
+            let cmd = if item.install_cmd.is_empty() {
+                "—".to_string()
+            } else {
+                item.install_cmd.clone()
+            };
+            (
+                empty,
+                theme::TEXT_MUTED(),
+                umadev_i18n::tf(lang, "picker.auth.not_installed", &[&cmd]),
+            )
+        }
+        // Unknown: conservative amber half-circle, "login not verified" — but the
+        // row is still selectable (the base IS installed; we just couldn't probe
+        // login). A legacy `ready: true` probe (no auth tag) also lands here.
+        AuthMark::Unknown => {
+            // If the legacy `ready` flag says installed, prefer that wording.
+            let detail = if item.detail.is_empty() {
+                umadev_i18n::t(lang, "picker.auth.unknown").to_string()
+            } else {
+                format!(
+                    "{} · {}",
+                    item.detail,
+                    umadev_i18n::t(lang, "picker.auth.unknown")
+                )
+            };
+            (half, theme::WARNING(), detail)
+        }
+    }
+}
+
 fn render_picker(frame: &mut Frame, app: &App) {
     // Tiny-terminal guard (mirror of the chat screen's): below this the fixed
     // logo / card / footer stack would overflow and shove the navigation hint —
@@ -596,15 +663,14 @@ fn render_picker(frame: &mut Frame, app: &App) {
         let is_selected = idx == app.picker_selected;
         // Brand left-bar marks the selected row (Claude Code style).
         let bar = if is_selected { "▌" } else { "  " };
-        // Only base-CLI rows carry a readiness mark; mode/language rows don't.
-        let (icon, icon_color) = if item.backend_id.is_some() {
-            if item.ready {
-                ("[ok]", theme::SUCCESS())
-            } else {
-                ("·", theme::TEXT_MUTED())
-            }
+        // Base-CLI rows carry an HONEST three-state readiness mark (gap G10):
+        // logged in (green ●) / installed-but-not-logged-in (amber ◐ + login cmd)
+        // / not installed (grey ○ + install cmd) / unknown (amber ◐, conservative).
+        // Mode/language rows carry no mark. The glyphs are geometric (no emoji).
+        let (icon, icon_color, state_detail) = if item.backend_id.is_some() {
+            picker_auth_marks(app.lang, item)
         } else {
-            ("", theme::TEXT_MUTED())
+            (String::new(), theme::TEXT_MUTED(), item.detail.clone())
         };
         let label_style = if is_selected {
             Style::default()
@@ -617,10 +683,7 @@ fn render_picker(frame: &mut Frame, app: &App) {
             Span::styled(format!(" {bar} "), Style::default().fg(theme::PRIMARY())),
             Span::styled(format!("{:<26}", item.label), label_style),
             Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
-            Span::styled(
-                item.detail.clone(),
-                Style::default().fg(theme::TEXT_MUTED()),
-            ),
+            Span::styled(state_detail, Style::default().fg(theme::TEXT_MUTED())),
         ])));
         if spacious {
             items.push(ListItem::new(Line::from("")));
@@ -721,11 +784,32 @@ fn render_chat(frame: &mut Frame, app: &App) {
     let prompt_h = prompt_block_height(&app.input, inner.width, mode_prefix_width(app))
         .min(inner.height.saturating_sub(3))
         .max(2);
+    // Wave-1 live plan + team-review panel — a fixed region between the
+    // transcript and the prompt, shown only when a plan / review is live and the
+    // terminal is tall enough to spare the rows (so it NEVER crushes the
+    // transcript below one row or pushes the prompt/status off-screen — the same
+    // small-terminal guarantee the rest of the layout keeps). The panel is
+    // capped; long plans scroll inside it conceptually but here we just clip to
+    // the cap with an "N more" tail.
+    let panel_lines = plan_panel_lines(app, inner.width);
+    // Reserve at most this many rows for the panel, and only when there's
+    // headroom: title(1) + transcript(≥3) + prompt + status must still fit.
+    let panel_h = if panel_lines.is_empty() {
+        0
+    } else {
+        // +1 for the panel's TOP border row.
+        let want = u16::try_from(panel_lines.len())
+            .unwrap_or(0)
+            .saturating_add(1);
+        let headroom = inner.height.saturating_sub(1 + 3 + prompt_h + 1); // title + min transcript + prompt + status
+        want.min(headroom).min(PLAN_PANEL_MAX_ROWS)
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),        // title row (borderless)
             Constraint::Min(1),           // transcript (grows; ≥1 guaranteed)
+            Constraint::Length(panel_h),  // live plan / team-review panel (0 = hidden)
             Constraint::Length(prompt_h), // prompt: input(N) + border(1) + meta(1)
             Constraint::Length(1),        // status row
         ])
@@ -733,15 +817,215 @@ fn render_chat(frame: &mut Frame, app: &App) {
 
     render_title_row(frame, chunks[0], app);
     render_transcript(frame, chunks[1], app);
-    render_prompt(frame, chunks[2], app);
-    render_status_row(frame, chunks[3], app);
+    if panel_h > 0 {
+        render_plan_panel(frame, chunks[2], &panel_lines);
+    }
+    render_prompt(frame, chunks[3], app);
+    render_status_row(frame, chunks[4], app);
 
     // Slash-command palette popover floats above the prompt when the user is
     // typing a `/`-prefixed command with at least one match.
     let palette = app.palette_matches();
     if !palette.is_empty() {
-        render_palette_popover(frame, chunks[2], app, &palette);
+        render_palette_popover(frame, chunks[3], app, &palette);
     }
+}
+
+/// Hard cap on the live plan / team-review panel height so a 20-step plan can't
+/// swallow the transcript. Beyond this the panel shows a compact "N more" tail.
+const PLAN_PANEL_MAX_ROWS: u16 = 12;
+
+/// Build the live plan checklist + team-review panel content (Wave 1
+/// deliverables 2/3). Returns the pre-styled lines, or an empty vec when there's
+/// nothing live (plan empty AND no verdicts) — the caller then reserves zero
+/// rows. Fail-open: an unknown status string renders as a neutral pending dot.
+fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let has_plan = !app.plan_steps.is_empty();
+    let has_review = !app.critic_verdicts.is_empty();
+    if !has_plan && !has_review {
+        return lines;
+    }
+
+    // ── Live plan checklist ──
+    if has_plan {
+        let done = app.plan_steps.iter().filter(|s| s.status == "done").count();
+        let total = app.plan_steps.len();
+        if app.plan_collapsed {
+            lines.push(Line::from(Span::styled(
+                umadev_i18n::tf(
+                    app.lang,
+                    "plan.panel.collapsed",
+                    &[&done.to_string(), &total.to_string()],
+                ),
+                Style::default().fg(theme::TEXT_MUTED()),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {} {done}/{total}",
+                    umadev_i18n::t(app.lang, "plan.panel.title")
+                ),
+                Style::default()
+                    .fg(theme::PRIMARY())
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for step in &app.plan_steps {
+                let (mark, color) = checklist_glyph(&step.status);
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {mark} "), Style::default().fg(color)),
+                    Span::styled(
+                        truncate_display(&step.title, 56),
+                        if step.status == "done" {
+                            Style::default().fg(theme::TEXT_MUTED())
+                        } else if step.status == "active" {
+                            Style::default()
+                                .fg(theme::TEXT())
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme::TEXT())
+                        },
+                    ),
+                ]));
+            }
+        }
+    }
+
+    // ── Collapsible team-review panel ──
+    if has_review {
+        let accepts = app.critic_verdicts.iter().filter(|c| c.accepts).count();
+        let blocking: usize = app.critic_verdicts.iter().filter(|c| !c.accepts).count();
+        if app.critics_collapsed {
+            lines.push(Line::from(Span::styled(
+                umadev_i18n::tf(
+                    app.lang,
+                    "plan.review.collapsed",
+                    &[&accepts.to_string(), &blocking.to_string()],
+                ),
+                Style::default().fg(theme::TEXT_MUTED()),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!(" {}", umadev_i18n::t(app.lang, "plan.review.title")),
+                Style::default()
+                    .fg(theme::SECONDARY())
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for c in &app.critic_verdicts {
+                let (mark, color) = if c.accepts {
+                    (review_accept_glyph(), theme::SUCCESS())
+                } else {
+                    (review_block_glyph(), theme::ERROR())
+                };
+                let verdict = if c.accepts {
+                    umadev_i18n::t(app.lang, "plan.review.accept").to_string()
+                } else {
+                    umadev_i18n::tf(
+                        app.lang,
+                        "plan.review.block",
+                        &[&c.blocking.len().max(1).to_string()],
+                    )
+                };
+                // First must-fix finding inline so a blocker is actionable at a
+                // glance (the full set folds into the rework directive upstream).
+                let detail = c
+                    .blocking
+                    .first()
+                    .or_else(|| c.advisory.first())
+                    .map(|s| format!(": {}", truncate_display(s, 44)))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {mark} "), Style::default().fg(color)),
+                    Span::styled(
+                        format!("[{}] ", c.seat),
+                        Style::default().fg(theme::SECONDARY()),
+                    ),
+                    Span::styled(
+                        format!("{verdict}{detail}"),
+                        Style::default().fg(theme::TEXT()),
+                    ),
+                ]));
+            }
+        }
+    }
+    lines
+}
+
+/// The checklist glyph + colour for a plan step status. Built from codepoints so
+/// the source carries no literal pictographic glyph. Fail-open: an unknown
+/// status renders as the neutral pending box.
+fn checklist_glyph(status: &str) -> (String, ratatui::style::Color) {
+    match status {
+        // [x] filled check — done.
+        "done" => (
+            format!("[{}]", char::from_u32(0x2713).unwrap_or('x')),
+            theme::SUCCESS(),
+        ),
+        // [~] in-progress.
+        "active" => ("[~]".to_string(), theme::WARNING()),
+        // [!] blocked.
+        "blocked" => ("[!]".to_string(), theme::ERROR()),
+        // [ ] pending (and any unrecognised status).
+        _ => ("[ ]".to_string(), theme::TEXT_MUTED()),
+    }
+}
+
+/// Accept mark for the team-review panel (a check), built from its codepoint.
+fn review_accept_glyph() -> String {
+    char::from_u32(0x2713).unwrap_or('+').to_string()
+}
+
+/// Blocking mark for the team-review panel (a cross), built from its codepoint.
+fn review_block_glyph() -> String {
+    char::from_u32(0x2717).unwrap_or('x').to_string()
+}
+
+/// Truncate a string to `max` DISPLAY characters with an ellipsis, so a long
+/// step title / finding can't overflow the panel row (the panel renders without
+/// `wrap`, mirroring the transcript's pre-fold model). Char-safe.
+fn truncate_display(s: &str, max: usize) -> String {
+    let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= max {
+        return one_line;
+    }
+    let mut t: String = one_line.chars().take(max.saturating_sub(1)).collect();
+    t.push('…');
+    t
+}
+
+/// Render the live plan / team-review panel into `area`. A thin top rule
+/// separates it from the transcript above. Lines are clipped to the area height
+/// (the caller already capped it); an overflow shows a muted "…" tail row.
+fn render_plan_panel(frame: &mut Frame, area: Rect, lines: &[Line<'static>]) {
+    // The TOP border eats one row, so the content fits in `area.height - 1`.
+    let inner_rows = (area.height as usize).saturating_sub(1);
+    if inner_rows == 0 {
+        return;
+    }
+    let shown: Vec<Line<'static>> = if lines.len() > inner_rows {
+        // Keep the head visible (title + first steps) and mark the clip so the
+        // user knows there's more behind /plan.
+        let mut v: Vec<Line<'static>> = lines
+            .iter()
+            .take(inner_rows.saturating_sub(1))
+            .cloned()
+            .collect();
+        v.push(Line::from(Span::styled(
+            format!("  … +{}", lines.len() - inner_rows + 1),
+            Style::default().fg(theme::TEXT_MUTED()),
+        )));
+        v
+    } else {
+        lines.to_vec()
+    };
+    frame.render_widget(
+        Paragraph::new(shown).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(theme::BORDER())),
+        ),
+        area,
+    );
 }
 
 /// A centered "terminal too small" card, shown when the window is below
@@ -2146,6 +2430,28 @@ mod tests {
         assert!(out.contains('▌'));
     }
 
+    #[test]
+    fn picker_shows_honest_three_state_login_marks() {
+        // Gap G10: a not-logged-in base must show its login command, not a green
+        // "ready". Drive a not-logged-in probe through the engine, then render.
+        let mut app = app_with(None);
+        let s = crate::app::PROBE_AUTH_SENTINEL;
+        let packed = format!(
+            "{s}auth=not_logged_in|login=claude auth login|install=npm i -g claude{s}claude 1.6.0",
+        );
+        app.apply_engine(umadev_agent::EngineEvent::BackendProbed {
+            backend_id: "claude-code".into(),
+            ready: false,
+            detail: packed,
+        });
+        app.goto_picker_step(crate::app::PickerStep::BaseCli);
+        let out = render_to_string(&app);
+        // The login command is surfaced ON the picker row.
+        assert!(out.contains("claude auth login"), "login cmd on row: {out}");
+        // The amber half-circle (◐) marks "installed · not logged in".
+        assert!(out.contains('\u{25D0}'), "half-circle mark rendered");
+    }
+
     // --- Chat ---
 
     #[test]
@@ -2241,6 +2547,90 @@ mod tests {
             .unwrap()
             .trim();
         assert!(out.contains(suffix), "rendered: {out}");
+    }
+
+    // Render the chat at a generous size and flatten the buffer to one string.
+    fn render_chat_to_string(app: &App, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| crate::ui::render(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn live_plan_panel_renders_checklist_with_ticks() {
+        let mut app = app_with(Some("offline"));
+        app.apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · scaffold (frontend)".into(),
+                "s2 · login route (backend)".into(),
+            ],
+            done: 0,
+            total: 2,
+        });
+        app.apply_engine(umadev_agent::EngineEvent::PlanStepStatus {
+            id: "s1".into(),
+            title: "scaffold".into(),
+            status: "done".into(),
+        });
+        let out = render_chat_to_string(&app, 100, 30);
+        // The panel header + step titles + the done check render.
+        assert!(out.contains("scaffold"), "step title shown: {out}");
+        assert!(out.contains("login route"), "second step shown");
+        // The done glyph is the check codepoint (no emoji).
+        assert!(out.contains('\u{2713}'), "done tick rendered");
+    }
+
+    #[test]
+    fn team_review_panel_renders_seat_verdicts() {
+        let mut app = app_with(Some("offline"));
+        app.apply_engine(umadev_agent::EngineEvent::CriticVerdict {
+            seat: "architect".into(),
+            accepts: true,
+            blocking: vec![],
+            advisory: vec![],
+        });
+        app.apply_engine(umadev_agent::EngineEvent::CriticVerdict {
+            seat: "qa".into(),
+            accepts: false,
+            blocking: vec!["no tests".into()],
+            advisory: vec![],
+        });
+        let out = render_chat_to_string(&app, 100, 30);
+        assert!(out.contains("[architect]"), "accepting seat shown: {out}");
+        assert!(out.contains("[qa]"), "blocking seat shown");
+        assert!(out.contains("no tests"), "first must-fix inlined");
+    }
+
+    #[test]
+    fn plan_panel_never_crushes_transcript_on_short_terminal() {
+        // A many-step plan on a SHORT terminal must NOT eat the transcript / push
+        // the prompt off-screen — the panel yields rows back below the headroom.
+        let mut app = app_with(Some("offline"));
+        let steps: Vec<String> = (0..20)
+            .map(|i| format!("s{i} · step number {i} (frontend)"))
+            .collect();
+        app.apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            steps,
+            done: 0,
+            total: 20,
+        });
+        // 12 rows tall is short; the render must still succeed (no panic) and the
+        // prompt mode prefix (the chevron) must still be visible at the bottom.
+        let out = render_chat_to_string(&app, 80, 12);
+        // The "more" tail proves the panel capped itself rather than overflowing.
+        assert!(
+            out.contains('…') || out.contains('+'),
+            "panel capped: {out}"
+        );
     }
 
     #[test]

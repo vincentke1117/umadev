@@ -145,6 +145,39 @@ pub struct PhaseRow {
     pub status: PhaseStatus,
 }
 
+/// Honest first-run readiness of a base, surfaced in the picker (Wave 1
+/// deliverable 5 / gap G10). Three states the user can act on, plus an
+/// indeterminate `Unknown` that conservatively reads as "login may be required"
+/// — the picker NEVER shows a false green.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum AuthMark {
+    /// Installed AND confidently logged in — the only honest green "ready".
+    LoggedIn,
+    /// Installed but NOT logged in — show the base's login command, block commit.
+    NotLoggedIn,
+    /// Not installed — show the install command, block commit.
+    NotInstalled,
+    /// Could not determine login state (probe errored / timed out). Conservative:
+    /// reads as "login may be required", does NOT block commit (the base IS
+    /// installed; a false-block would be worse than an honest "may need login").
+    Unknown,
+}
+
+impl AuthMark {
+    /// Parse the structured tag `spawn_probe` prefixes onto the probe `detail`
+    /// (`auth=logged_in|not_logged_in|not_installed|unknown;…`). Fail-open: an
+    /// unrecognised / absent tag is [`Self::Unknown`] (never a false green).
+    #[must_use]
+    pub fn from_tag(s: &str) -> Self {
+        match s {
+            "logged_in" => Self::LoggedIn,
+            "not_logged_in" => Self::NotLoggedIn,
+            "not_installed" => Self::NotInstalled,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Availability of one host backend.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BackendInfo {
@@ -154,6 +187,15 @@ pub struct BackendInfo {
     pub ready: bool,
     /// Version string or failure reason.
     pub detail: String,
+    /// Honest auth/install state (gap G10) — drives the three-state picker mark
+    /// and the not-ready commit block. Defaults to [`AuthMark::Unknown`].
+    pub auth: AuthMark,
+    /// The base's login command (e.g. `claude auth login`), shown when
+    /// [`Self::auth`] is [`AuthMark::NotLoggedIn`]. Empty when none / unknown.
+    pub login_cmd: String,
+    /// The base's install command (e.g. `npm install -g …`), shown when
+    /// [`Self::auth`] is [`AuthMark::NotInstalled`]. Empty when none / unknown.
+    pub install_cmd: String,
 }
 
 /// Which group a picker item belongs to — drives the section headers in the
@@ -184,6 +226,44 @@ pub struct PickerItem {
     /// the UI language live and stays on the picker (it does not commit a
     /// backend or leave the picker).
     pub lang: Option<umadev_i18n::Lang>,
+    /// Honest auth state (gap G10) — drives the three-state readiness mark and
+    /// the not-ready commit block. [`AuthMark::Unknown`] until probed.
+    pub auth: AuthMark,
+    /// Login command shown on [`AuthMark::NotLoggedIn`] (empty when none).
+    pub login_cmd: String,
+    /// Install command shown on [`AuthMark::NotInstalled`] (empty when none).
+    pub install_cmd: String,
+}
+
+/// One step in the live, UmaDev-owned plan checklist (Wave 1 deliverable 2/3).
+/// Mirrors a `umadev_agent::plan_state::PlanStep` flattened to the cheap summary
+/// the TUI renders: an id (matches a `PlanStepStatus` event's `id`), a title, and
+/// a status string (`pending` / `active` / `done` / `blocked`). Kept as plain
+/// strings so the panel renders without re-importing the agent's typed plan.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PlanStepRow {
+    /// Stable step id — matches the leading id of a `PlanPosted` summary and the
+    /// `id` field of a `PlanStepStatus` transition.
+    pub id: String,
+    /// Human-readable step title (the checklist label).
+    pub title: String,
+    /// Current status id: `pending` / `active` / `done` / `blocked`. Any other
+    /// value renders as a neutral pending dot (fail-open).
+    pub status: String,
+}
+
+/// One reviewing seat's verdict in the collapsible team-review panel (Wave 1
+/// deliverable 3). Flattened from a `umadev_agent::critics::RoleVerdict`.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CriticRow {
+    /// The reviewing seat's role id (e.g. `architect`, `qa`).
+    pub seat: String,
+    /// Whether the seat accepts the artifacts as-is.
+    pub accepts: bool,
+    /// Must-fix findings (may be empty).
+    pub blocking: Vec<String>,
+    /// Nice-to-have notes (may be empty).
+    pub advisory: Vec<String>,
 }
 
 /// Source of a chat message — used to colour the role label.
@@ -534,6 +614,33 @@ pub struct App {
     /// few seconds — the status bar shows ONE live-updating reassurance instead.
     /// Never enters the scrollback history.
     pub transient_status: Option<String>,
+
+    /// **Live plan checklist** (Wave 1 deliverable 2/3) — the UmaDev-owned plan,
+    /// populated by [`EngineEvent::PlanPosted`] and updated in place by
+    /// [`EngineEvent::PlanStepStatus`]. Rendered as a ticking checklist panel
+    /// above the prompt (replacing the frozen 0/9 dot bar on the director path).
+    /// Empty when no plan is live. Fail-open: a status for an unknown id is
+    /// ignored rather than panicking.
+    pub plan_steps: Vec<PlanStepRow>,
+    /// `true` collapses the live plan checklist panel to a one-line summary
+    /// (toggled by `/plan` with no args). Default expanded.
+    pub plan_collapsed: bool,
+
+    /// **Team-review verdicts** (Wave 1 deliverable 3) — each reviewing seat's
+    /// structured verdict, pushed by [`EngineEvent::CriticVerdict`]. Rendered as
+    /// a collapsible team-review panel. Bounded to the latest review round (a
+    /// repeated seat id replaces its prior row so a re-review doesn't stack).
+    pub critic_verdicts: Vec<CriticRow>,
+    /// `true` collapses the team-review panel to a one-line accept/block tally.
+    /// Default expanded so the first review is visible.
+    pub critics_collapsed: bool,
+
+    /// The last routed intent (Wave 1 deliverable 1) — the class id the router
+    /// decided for the in-flight turn (`chat` / `build` / …). Drives the status
+    /// chip so the user sees fast-vs-deliberate at a glance. `None` until the
+    /// first route. Set deterministically (Tier-0) the instant a turn is
+    /// submitted, then refined by the async Tier-1 consult.
+    pub last_intent_class: Option<String>,
 }
 
 impl App {
@@ -631,6 +738,11 @@ impl App {
             last_output_at: None,
             tool_in_progress: false,
             transient_status: None,
+            plan_steps: Vec::new(),
+            plan_collapsed: false,
+            critic_verdicts: Vec::new(),
+            critics_collapsed: false,
+            last_intent_class: None,
         };
         app.load_history();
         if app.mode == AppMode::Chat {
@@ -1184,6 +1296,10 @@ impl App {
             "quick",
             "lightweight fast track for a trivial task (/quick <task>)",
         ),
+        (
+            "plan",
+            "show/steer the live plan (/plan skip|add|veto|up|down <id>)",
+        ),
         ("runs", "view run history and phase timing"),
         (
             "cancel",
@@ -1342,6 +1458,143 @@ impl App {
         }
     }
 
+    // ---- Wave-1 visible surface (intent card / live plan / team review) ----
+
+    /// Render the **intent pre-commitment card** ([`EngineEvent::IntentDecided`]):
+    /// a single, prominent UmaDev message telling the user what the router
+    /// decided BEFORE any work — class, depth, rough budget, and a one-line
+    /// reason ("this is a full product — I'll BUILD …" / "small change, on it").
+    /// Also records `last_intent_class` so the status chip can show fast-vs-
+    /// deliberate. Fail-open: unknown class/depth ids fall back to neutral text.
+    fn apply_intent_decided(
+        &mut self,
+        class: &str,
+        depth: &str,
+        team: &[String],
+        est_tool_calls: u32,
+        rationale: &str,
+    ) {
+        self.last_intent_class = Some(class.to_string());
+        // A localized headline per class, so the card reads like a director's
+        // pre-commitment rather than a debug dump.
+        let headline_key = match class {
+            "build" => "intent.build",
+            "debug" => "intent.debug",
+            "quick_edit" => "intent.quick_edit",
+            "explain" => "intent.explain",
+            _ => "intent.chat",
+        };
+        let depth_label = match depth {
+            "deep" => umadev_i18n::t(self.lang, "intent.depth.deep"),
+            "standard" => umadev_i18n::t(self.lang, "intent.depth.standard"),
+            _ => umadev_i18n::t(self.lang, "intent.depth.fast"),
+        };
+        let mut body = umadev_i18n::tf(self.lang, headline_key, &[depth_label]);
+        // Append the rough budget + (for deliberate turns) the convened team, so
+        // the user sees the expected cost + who's on it up front.
+        if est_tool_calls > 0 {
+            body.push_str(&umadev_i18n::tf(
+                self.lang,
+                "intent.budget",
+                &[&est_tool_calls.to_string()],
+            ));
+        }
+        if !team.is_empty() {
+            body.push_str(&umadev_i18n::tf(
+                self.lang,
+                "intent.team",
+                &[&team.join(", ")],
+            ));
+        }
+        // The router's own one-line rationale, kept verbatim as a second line so
+        // the *why* is visible (it is already localized at the source).
+        let rationale = rationale.trim();
+        if !rationale.is_empty() {
+            body.push('\n');
+            body.push_str(rationale);
+        }
+        self.push(ChatRole::UmaDev, body);
+    }
+
+    /// Initialise the **live plan checklist** ([`EngineEvent::PlanPosted`]) from
+    /// the freshly synthesised plan. Each `PlanPosted` summary is `id · title
+    /// (seat)`; we keep the id + title and start every step `pending`. The panel
+    /// (rendered above the prompt) then ticks off live via `PlanStepStatus`,
+    /// replacing the frozen 0/9 dot bar on the director path. A one-line "posted
+    /// N steps" memo also lands in the transcript so scrollback records it.
+    fn apply_plan_posted(&mut self, steps: &[String], _done: usize, total: usize) {
+        self.plan_steps = steps
+            .iter()
+            .enumerate()
+            .map(|(i, summary)| {
+                // `id · title (seat)` — split off the leading `id ·`; if the
+                // shape is unexpected, fall back to a positional id + the whole
+                // summary as the title (fail-open, never drops a step).
+                let (id, title) = split_plan_summary(summary, i);
+                PlanStepRow {
+                    id,
+                    title,
+                    status: "pending".to_string(),
+                }
+            })
+            .collect();
+        // A fresh plan un-collapses the panel so the first plan is always seen.
+        self.plan_collapsed = false;
+        if total > 0 {
+            self.push(
+                ChatRole::UmaDev,
+                umadev_i18n::tf(self.lang, "plan.posted", &[&total.to_string()]),
+            );
+        }
+    }
+
+    /// Tick one step in the live checklist ([`EngineEvent::PlanStepStatus`]).
+    /// Matches by id; if the id is unknown (a step the post didn't carry) it is
+    /// appended so the panel never silently loses a transition. Fail-open: an
+    /// unrecognised status string renders as a neutral pending dot.
+    fn apply_plan_step_status(&mut self, id: &str, title: &str, status: &str) {
+        if let Some(row) = self.plan_steps.iter_mut().find(|s| s.id == id) {
+            row.status = status.to_string();
+            if !title.trim().is_empty() {
+                row.title = title.to_string();
+            }
+        } else {
+            self.plan_steps.push(PlanStepRow {
+                id: id.to_string(),
+                title: if title.trim().is_empty() {
+                    id.to_string()
+                } else {
+                    title.to_string()
+                },
+                status: status.to_string(),
+            });
+        }
+    }
+
+    /// Record one reviewing seat's verdict for the **collapsible team-review
+    /// panel** ([`EngineEvent::CriticVerdict`]). A repeated seat id replaces its
+    /// prior row (a re-review updates in place, never stacks). Replaces the old
+    /// bland team `Note`.
+    fn apply_critic_verdict(
+        &mut self,
+        seat: String,
+        accepts: bool,
+        blocking: Vec<String>,
+        advisory: Vec<String>,
+    ) {
+        let row = CriticRow {
+            seat,
+            accepts,
+            blocking,
+            advisory,
+        };
+        if let Some(existing) = self.critic_verdicts.iter_mut().find(|c| c.seat == row.seat) {
+            *existing = row;
+        } else {
+            self.critic_verdicts.push(row);
+        }
+    }
+
     // ---- engine events ----------------------------------------------------
 
     /// Fold one engine event into the chat history + status bar.
@@ -1365,15 +1618,29 @@ impl App {
                     umadev_i18n::tf(self.lang, "run.started", &[&requirement]),
                 );
             }
-            // Wave-1 router / plan / critic events. Placeholder arms for now so the
-            // foundation (router.rs + plan_state.rs + director-loop emission) compiles
-            // and ships; W1-B replaces these with the real intent card, the live plan
-            // checklist (which retires the frozen 0/9 bar on the director path), and a
-            // collapsible team-review panel.
-            EngineEvent::IntentDecided { .. }
-            | EngineEvent::PlanPosted { .. }
-            | EngineEvent::PlanStepStatus { .. }
-            | EngineEvent::CriticVerdict { .. } => {}
+            // Wave-1 router / plan / critic events — the visible surface that makes
+            // "routes intelligently, owns a steerable plan, behaves like a director"
+            // actually appear on screen. Each arm is fail-open: a missing / odd field
+            // degrades to a sensible default, never panics.
+            EngineEvent::IntentDecided {
+                class,
+                depth,
+                team,
+                est_tool_calls,
+                rationale,
+            } => self.apply_intent_decided(&class, &depth, &team, est_tool_calls, &rationale),
+            EngineEvent::PlanPosted { steps, done, total } => {
+                self.apply_plan_posted(&steps, done, total);
+            }
+            EngineEvent::PlanStepStatus { id, title, status } => {
+                self.apply_plan_step_status(&id, &title, &status);
+            }
+            EngineEvent::CriticVerdict {
+                seat,
+                accepts,
+                blocking,
+                advisory,
+            } => self.apply_critic_verdict(seat, accepts, blocking, advisory),
             EngineEvent::PhaseStarted { phase } => {
                 self.set_phase(phase, PhaseStatus::Running);
                 self.phase_started_at = Some(std::time::Instant::now());
@@ -1575,15 +1842,27 @@ impl App {
                 ready,
                 detail,
             } => {
+                // The `BackendProbed` event only carries `{id, ready, detail}` (it
+                // lives in umadev-agent and we don't change it), so the honest auth
+                // state + the base's login/install commands ride along packed into
+                // `detail` by `spawn_probe`. Unpack here, fail-open to Unknown / no
+                // hint if the tag is absent (an external emitter, an older build).
+                let (auth, login_cmd, install_cmd, human) = parse_probe_detail(&detail);
                 // Update or append the probe row.
                 if let Some(existing) = self.backends.iter_mut().find(|b| b.id == backend_id) {
                     existing.ready = ready;
-                    existing.detail = detail.clone();
+                    existing.detail = human.clone();
+                    existing.auth = auth;
+                    existing.login_cmd = login_cmd.clone();
+                    existing.install_cmd = install_cmd.clone();
                 } else {
                     self.backends.push(BackendInfo {
                         id: backend_id.clone(),
                         ready,
-                        detail: detail.clone(),
+                        detail: human.clone(),
+                        auth,
+                        login_cmd: login_cmd.clone(),
+                        install_cmd: install_cmd.clone(),
                     });
                 }
                 // If we're still on the picker, refresh its labels.
@@ -2001,14 +2280,56 @@ impl App {
                     }
                     return Action::None;
                 }
-                // A base CLI must be installed/reachable before we commit to it.
-                if chosen.backend_id.is_some() && !chosen.ready {
-                    self.picker_notice = Some(umadev_i18n::tf(
-                        self.lang,
-                        "picker.unavailable",
-                        &[&chosen.label, &chosen.detail],
-                    ));
-                    return Action::None;
+                // A base CLI must be installed AND logged in before we commit to it
+                // (gap G10): an honest three-state block so the user never picks a
+                // base that fails mid-run. The matching command (login / install) is
+                // surfaced inline so the fix is one copy-paste away.
+                if chosen.backend_id.is_some() {
+                    match chosen.auth {
+                        AuthMark::NotInstalled => {
+                            let cmd = if chosen.install_cmd.is_empty() {
+                                chosen.detail.clone()
+                            } else {
+                                chosen.install_cmd.clone()
+                            };
+                            self.picker_notice = Some(umadev_i18n::tf(
+                                self.lang,
+                                "picker.block.not_installed",
+                                &[&chosen.label, &cmd],
+                            ));
+                            return Action::None;
+                        }
+                        AuthMark::NotLoggedIn => {
+                            let cmd = if chosen.login_cmd.is_empty() {
+                                chosen.detail.clone()
+                            } else {
+                                chosen.login_cmd.clone()
+                            };
+                            self.picker_notice = Some(umadev_i18n::tf(
+                                self.lang,
+                                "picker.block.not_logged_in",
+                                &[&chosen.label, &cmd],
+                            ));
+                            return Action::None;
+                        }
+                        // Unknown that hasn't even been confirmed installed (a base
+                        // not yet probed: `ready=false`, no auth signal) stays blocked
+                        // with the generic "unavailable" message — exactly the old
+                        // behaviour. A confirmed-installed base whose LOGIN we couldn't
+                        // verify (`ready=true` legacy, or an Unknown auth on an
+                        // installed base) is allowed through conservatively (the picker
+                        // footer already says login is unverified).
+                        AuthMark::Unknown if !chosen.ready => {
+                            self.picker_notice = Some(umadev_i18n::tf(
+                                self.lang,
+                                "picker.unavailable",
+                                &[&chosen.label, &chosen.detail],
+                            ));
+                            return Action::None;
+                        }
+                        // LoggedIn / installed-Unknown → commit.
+                        AuthMark::LoggedIn | AuthMark::Unknown => {}
+                    }
                 }
                 // Commit the chosen base CLI id and enter the chat.
                 self.commit_backend(chosen.backend_id.clone());
@@ -2651,6 +2972,12 @@ impl App {
         // run and fire at the wrong gate.
         self.queued_steer.clear();
         self.pending_steer = None;
+        // A new run owns a fresh plan + review panel — the previous run's
+        // checklist / verdicts must not bleed into it.
+        self.plan_steps.clear();
+        self.plan_collapsed = false;
+        self.critic_verdicts.clear();
+        self.critics_collapsed = false;
     }
 
     /// Reset run state after `/cancel` aborts the in-flight pipeline task, and
@@ -2739,6 +3066,11 @@ impl App {
                 self.history.clear();
                 self.conversation.clear();
                 self.transcript_scroll = 0;
+                // A cleared transcript also clears the live plan / review panel +
+                // the last-intent chip — nothing from the prior conversation lingers.
+                self.plan_steps.clear();
+                self.critic_verdicts.clear();
+                self.last_intent_class = None;
                 // A cleared transcript means the base should start a fresh
                 // session on the next turn, not resume the old one.
                 self.host_chat_session_active = false;
@@ -2903,6 +3235,7 @@ impl App {
             "template" => self.slash_template(rest),
             "run" => self.slash_run(rest),
             "quick" => self.slash_quick(rest),
+            "plan" => self.slash_plan(rest),
             "status" => {
                 self.open_status_overlay();
                 Action::None
@@ -3737,6 +4070,145 @@ impl App {
             umadev_i18n::tf(self.lang, "quick.starting", &[task]),
         );
         Action::StartQuick(task.to_string())
+    }
+
+    /// `/plan` — show and **steer** the live plan (Wave 1 deliverable 4).
+    ///
+    /// With no args: render the current checklist (or a hint when none is live).
+    /// `/plan collapse` toggles the panel. The steering subcommands
+    /// (`skip` / `veto` / `add` / `up` / `down`) fold a one-line directive into
+    /// the next turn over the SAME session via [`queued_steer`] — so a reorder /
+    /// skip / add / veto reaches the director without restarting the run. Plan
+    /// edits are advisory directives, not a hard mutation of the plan DAG (the
+    /// director owns the plan); the panel reflects them once the director re-posts.
+    /// Fail-open: an unknown subcommand falls back to showing usage.
+    fn slash_plan(&mut self, arg: &str) -> Action {
+        let arg = arg.trim();
+        // No args → show the plan (or a "no plan yet" hint) + a usage line.
+        if arg.is_empty() {
+            self.show_plan_status();
+            return Action::None;
+        }
+        let mut parts = arg.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let target = parts.next().unwrap_or("").trim();
+        match sub.as_str() {
+            "collapse" | "fold" | "toggle" => {
+                self.plan_collapsed = !self.plan_collapsed;
+                self.critics_collapsed = self.plan_collapsed;
+                Action::None
+            }
+            "show" | "status" | "list" => {
+                self.show_plan_status();
+                Action::None
+            }
+            "skip" | "veto" | "up" | "down" | "add" => self.steer_plan(&sub, target),
+            _ => {
+                // Unknown subcommand → show usage (never silently swallow).
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "plan.steer.usage"),
+                );
+                Action::None
+            }
+        }
+    }
+
+    /// Render the live plan + team review as a chat note (for `/plan` with no
+    /// args). Falls back to a friendly "no active plan" hint.
+    fn show_plan_status(&mut self) {
+        if self.plan_steps.is_empty() {
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, "plan.none"));
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "plan.steer.usage"),
+            );
+            return;
+        }
+        let (done, total) = (
+            self.plan_steps
+                .iter()
+                .filter(|s| s.status == "done")
+                .count(),
+            self.plan_steps.len(),
+        );
+        let mut body = format!(
+            "{} {done}/{total}\n",
+            umadev_i18n::t(self.lang, "plan.panel.title")
+        );
+        for step in &self.plan_steps {
+            let mark = match step.status.as_str() {
+                "done" => "[x]",
+                "active" => "[~]",
+                "blocked" => "[!]",
+                _ => "[ ]",
+            };
+            body.push_str(&format!("  {mark} {} · {}\n", step.id, step.title));
+        }
+        body.push_str(umadev_i18n::t(self.lang, "plan.steer.usage"));
+        self.push(ChatRole::UmaDev, body);
+    }
+
+    /// Fold a plan-steering edit (`skip` / `veto` / `add` / `up` / `down`) into
+    /// the next directive via [`queued_steer`], echoing a confirmation. The
+    /// `skip` / `veto` / `up` / `down` forms validate `target` against a live
+    /// step id; `add` takes free text. The edit applies at the next step boundary
+    /// (the same place a queued steer fires), so it shares the run's session.
+    fn steer_plan(&mut self, sub: &str, target: &str) -> Action {
+        // `add` is free text; the rest reference an existing step id.
+        if sub != "add" {
+            if target.is_empty() {
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "plan.steer.usage"),
+                );
+                return Action::None;
+            }
+            if !self.plan_steps.iter().any(|s| s.id == target) {
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::tf(self.lang, "plan.steer.unknown_step", &[target]),
+                );
+                return Action::None;
+            }
+        }
+        // Build the directive the director sees, and the user-facing confirmation.
+        let (directive, confirm) = match sub {
+            "skip" => (
+                format!("Plan steering: SKIP step `{target}` — do not perform it; proceed with the rest of the plan."),
+                umadev_i18n::tf(self.lang, "plan.steer.skip", &[target]),
+            ),
+            "veto" => (
+                format!("Plan steering: VETO step `{target}` — remove it from the plan entirely and do not perform it."),
+                umadev_i18n::tf(self.lang, "plan.steer.veto", &[target]),
+            ),
+            "up" => (
+                format!("Plan steering: REORDER step `{target}` EARLIER — do it before its current predecessors where dependencies allow."),
+                umadev_i18n::tf(self.lang, "plan.steer.move", &[target, "↑"]),
+            ),
+            "down" => (
+                format!("Plan steering: REORDER step `{target}` LATER — defer it after its current successors where dependencies allow."),
+                umadev_i18n::tf(self.lang, "plan.steer.move", &[target, "↓"]),
+            ),
+            // `add`
+            _ => (
+                format!("Plan steering: ADD a new step — {target}"),
+                umadev_i18n::tf(self.lang, "plan.steer.add", &[target]),
+            ),
+        };
+        // Fold into the next directive over the SAME session (the queued-steer
+        // mechanism), then confirm to the user.
+        self.queued_steer.push_back(directive);
+        self.push(ChatRole::UmaDev, confirm);
+        // If nothing is mid-run (no gap will come), tell the user the edit is
+        // parked and will apply at the next step boundary — never silently lost.
+        if !self.is_pipeline_active() {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "plan.steer.queued"),
+            );
+        }
+        Action::None
     }
 
     /// `/redo [phase]` — with NO argument, re-run the whole requirement from
@@ -5434,6 +5906,9 @@ fn step_items(
                 detail: l.code().to_string(),
                 group: PickerGroup::Language,
                 lang: Some(l),
+                auth: AuthMark::LoggedIn,
+                login_cmd: String::new(),
+                install_cmd: String::new(),
             })
             .collect(),
         // Step 2 - which logged-in base CLI (ready-state from the live probe).
@@ -5450,6 +5925,9 @@ fn step_items(
                     detail: probe.map_or_else(|| "detecting...".to_string(), |p| p.detail.clone()),
                     group: PickerGroup::HostCli,
                     lang: None,
+                    auth: probe.map_or(AuthMark::Unknown, |p| p.auth),
+                    login_cmd: probe.map(|p| p.login_cmd.clone()).unwrap_or_default(),
+                    install_cmd: probe.map(|p| p.install_cmd.clone()).unwrap_or_default(),
                 }
             })
             .collect(),
@@ -5622,12 +6100,76 @@ fn gate_card(
     out
 }
 
+/// Split a `PlanPosted` step summary (`id · title (seat)`) into `(id, title)`
+/// for the live checklist. The `(seat)` suffix is kept on the title (it reads
+/// as useful context — who owns the step). **Fail-open**: a summary that doesn't
+/// match the `id ·` shape yields a positional id (`s{index}`) and the whole
+/// string as the title, so a malformed summary never drops a step or panics.
+pub(crate) fn split_plan_summary(summary: &str, index: usize) -> (String, String) {
+    // The separator is the middle-dot `·` with surrounding spaces (see
+    // `Plan::step_summaries`). Split on the FIRST occurrence only.
+    if let Some((id, rest)) = summary.split_once(" · ") {
+        let id = id.trim();
+        if !id.is_empty() {
+            return (id.to_string(), rest.trim().to_string());
+        }
+    }
+    (format!("s{index}"), summary.trim().to_string())
+}
+
+/// Sentinel that prefixes the structured auth metadata `spawn_probe` packs onto
+/// the [`EngineEvent::BackendProbed`] `detail` (since that event can't grow new
+/// fields — it lives in umadev-agent, outside this crate). Shape:
+/// `\u{1}auth=<state>|login=<cmd>|install=<cmd>\u{1}<human detail>`.
+pub(crate) const PROBE_AUTH_SENTINEL: char = '\u{1}';
+
+/// Unpack the auth tag `spawn_probe` packed onto a probe `detail`. Returns
+/// `(auth_mark, login_cmd, install_cmd, human_detail)`. **Fail-open**: a `detail`
+/// with no sentinel (an external emitter, an older build) yields
+/// `(Unknown, "", "", detail)` — the human string is preserved verbatim and the
+/// picker simply shows the conservative "unknown" mark.
+pub(crate) fn parse_probe_detail(detail: &str) -> (AuthMark, String, String, String) {
+    let Some(rest) = detail.strip_prefix(PROBE_AUTH_SENTINEL) else {
+        return (
+            AuthMark::Unknown,
+            String::new(),
+            String::new(),
+            detail.to_string(),
+        );
+    };
+    let Some((meta, human)) = rest.split_once(PROBE_AUTH_SENTINEL) else {
+        // Malformed (no closing sentinel) — treat the whole thing as human text.
+        return (
+            AuthMark::Unknown,
+            String::new(),
+            String::new(),
+            rest.to_string(),
+        );
+    };
+    let mut auth = AuthMark::Unknown;
+    let mut login = String::new();
+    let mut install = String::new();
+    for field in meta.split('|') {
+        if let Some(v) = field.strip_prefix("auth=") {
+            auth = AuthMark::from_tag(v);
+        } else if let Some(v) = field.strip_prefix("login=") {
+            login = v.to_string();
+        } else if let Some(v) = field.strip_prefix("install=") {
+            install = v.to_string();
+        }
+    }
+    (auth, login, install, human.to_string())
+}
+
 fn refresh_picker_with_probes(items: &mut [PickerItem], probes: &[BackendInfo]) {
     for item in items.iter_mut() {
         if let Some(id) = item.backend_id.as_deref() {
             if let Some(p) = probes.iter().find(|p| p.id == id) {
                 item.ready = p.ready;
                 item.detail = p.detail.clone();
+                item.auth = p.auth;
+                item.login_cmd.clone_from(&p.login_cmd);
+                item.install_cmd.clone_from(&p.install_cmd);
             }
         }
     }
@@ -6337,6 +6879,309 @@ mod tests {
         app.picker_selected = idx;
         assert!(app.picker_items[idx].ready);
         let action = app.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::BackendChanged);
+        assert_eq!(app.mode, AppMode::Chat);
+        assert_eq!(app.backend_label, "claude-code");
+    }
+
+    // --- Wave 1: intent card / live plan / team review event rendering ---
+
+    #[test]
+    fn intent_decided_pushes_intent_card_and_records_class() {
+        let mut app = fresh_app(Some("offline"));
+        let before = app.history.len();
+        app.apply_engine(EngineEvent::IntentDecided {
+            class: "build".into(),
+            depth: "deep".into(),
+            team: vec!["architect".into(), "qa".into()],
+            est_tool_calls: 160,
+            rationale: "完整构建,进研发流程".into(),
+        });
+        // A prominent UmaDev card landed in the transcript…
+        assert!(app.history.len() > before);
+        let card = app
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == ChatRole::UmaDev)
+            .unwrap();
+        // …carrying the BUILD headline, the rough budget, the team, and the reason.
+        assert!(card.body.contains("160"), "shows the budget");
+        assert!(card.body.contains("architect"), "shows the team");
+        assert!(card.body.contains("研发流程"), "carries the rationale");
+        // …and the class is recorded so the status chip can show it.
+        assert_eq!(app.last_intent_class.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn intent_decided_unknown_class_falls_open_to_chat_headline() {
+        let mut app = fresh_app(Some("offline"));
+        // A bogus class id must not panic and must not show a budget/team line.
+        app.apply_engine(EngineEvent::IntentDecided {
+            class: "totally-unknown".into(),
+            depth: "weird".into(),
+            team: vec![],
+            est_tool_calls: 0,
+            rationale: String::new(),
+        });
+        assert_eq!(app.last_intent_class.as_deref(), Some("totally-unknown"));
+        // Still produced a card (the neutral chat headline), no crash.
+        assert!(app.history.iter().any(|m| m.role == ChatRole::UmaDev));
+    }
+
+    #[test]
+    fn plan_posted_then_step_status_drives_the_checklist() {
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · scaffold the app (frontend)".into(),
+                "s2 · login route (backend)".into(),
+                "s3 · login form (frontend)".into(),
+            ],
+            done: 0,
+            total: 3,
+        });
+        assert_eq!(app.plan_steps.len(), 3);
+        assert_eq!(app.plan_steps[0].id, "s1");
+        assert!(app.plan_steps[0].title.contains("scaffold"));
+        assert!(app.plan_steps.iter().all(|s| s.status == "pending"));
+        // A status transition ticks the matching step in place (not a new row).
+        app.apply_engine(EngineEvent::PlanStepStatus {
+            id: "s1".into(),
+            title: "scaffold the app".into(),
+            status: "done".into(),
+        });
+        assert_eq!(app.plan_steps.len(), 3, "no new row appended");
+        assert_eq!(app.plan_steps[0].status, "done");
+        // A status for an UNKNOWN id is appended, never dropped (fail-open).
+        app.apply_engine(EngineEvent::PlanStepStatus {
+            id: "s9".into(),
+            title: "extra".into(),
+            status: "active".into(),
+        });
+        assert_eq!(app.plan_steps.len(), 4);
+        assert_eq!(app.plan_steps[3].id, "s9");
+    }
+
+    #[test]
+    fn critic_verdict_records_and_replaces_per_seat() {
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "architect".into(),
+            accepts: true,
+            blocking: vec![],
+            advisory: vec!["consider a cache".into()],
+        });
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "qa".into(),
+            accepts: false,
+            blocking: vec!["no tests".into(), "no error handling".into()],
+            advisory: vec![],
+        });
+        assert_eq!(app.critic_verdicts.len(), 2);
+        // A re-review of the SAME seat replaces its row (does not stack).
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "qa".into(),
+            accepts: true,
+            blocking: vec![],
+            advisory: vec![],
+        });
+        assert_eq!(app.critic_verdicts.len(), 2, "seat replaced, not stacked");
+        let qa = app.critic_verdicts.iter().find(|c| c.seat == "qa").unwrap();
+        assert!(qa.accepts);
+    }
+
+    #[test]
+    fn split_plan_summary_fails_open_on_odd_shape() {
+        // Normal shape: `id · title (seat)`.
+        let (id, title) = split_plan_summary("s2 · build the API (backend)", 1);
+        assert_eq!(id, "s2");
+        assert_eq!(title, "build the API (backend)");
+        // No separator → positional id, whole string as title (never drops it).
+        let (id, title) = split_plan_summary("just a bare title", 4);
+        assert_eq!(id, "s4");
+        assert_eq!(title, "just a bare title");
+    }
+
+    #[test]
+    fn slash_plan_shows_usage_when_no_plan() {
+        let mut app = fresh_app(Some("offline"));
+        let action = app.try_slash_command("/plan").unwrap();
+        assert_eq!(action, Action::None);
+        // A "no active plan" hint + the usage line land (not silent).
+        let joined: String = app.history.iter().map(|m| m.body.clone()).collect();
+        assert!(joined.contains("/plan skip"), "usage shown: {joined}");
+    }
+
+    #[test]
+    fn slash_plan_skip_folds_into_queued_steer() {
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · scaffold (frontend)".into(),
+                "s2 · login route (backend)".into(),
+            ],
+            done: 0,
+            total: 2,
+        });
+        let action = app.try_slash_command("/plan skip s2").unwrap();
+        assert_eq!(action, Action::None);
+        // The skip directive is folded into the queued-steer queue (same-session
+        // delivery), and it references the skipped step id.
+        assert_eq!(app.queued_steer.len(), 1);
+        assert!(app.queued_steer[0].contains("s2"));
+        assert!(app.queued_steer[0].to_ascii_uppercase().contains("SKIP"));
+    }
+
+    #[test]
+    fn slash_plan_unknown_step_does_not_queue() {
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec!["s1 · only step (frontend)".into()],
+            done: 0,
+            total: 1,
+        });
+        let _ = app.try_slash_command("/plan veto s9").unwrap();
+        // No such step → nothing queued, an honest "no step" note instead.
+        assert!(app.queued_steer.is_empty());
+        let joined: String = app.history.iter().map(|m| m.body.clone()).collect();
+        assert!(joined.contains("s9"));
+    }
+
+    #[test]
+    fn slash_plan_add_takes_free_text() {
+        let mut app = fresh_app(Some("offline"));
+        let _ = app
+            .try_slash_command("/plan add write integration tests")
+            .unwrap();
+        assert_eq!(app.queued_steer.len(), 1);
+        assert!(app.queued_steer[0].contains("write integration tests"));
+        assert!(app.queued_steer[0].to_ascii_uppercase().contains("ADD"));
+    }
+
+    #[test]
+    fn slash_plan_collapse_toggles_panel() {
+        let mut app = fresh_app(Some("offline"));
+        assert!(!app.plan_collapsed);
+        let _ = app.try_slash_command("/plan collapse").unwrap();
+        assert!(app.plan_collapsed);
+        let _ = app.try_slash_command("/plan collapse").unwrap();
+        assert!(!app.plan_collapsed);
+    }
+
+    #[test]
+    fn new_run_clears_the_plan_and_review_panels() {
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec!["s1 · do a thing (frontend)".into()],
+            done: 0,
+            total: 1,
+        });
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "qa".into(),
+            accepts: false,
+            blocking: vec!["x".into()],
+            advisory: vec![],
+        });
+        assert!(!app.plan_steps.is_empty() && !app.critic_verdicts.is_empty());
+        app.reset_for_new_run();
+        assert!(app.plan_steps.is_empty(), "plan cleared for a fresh run");
+        assert!(app.critic_verdicts.is_empty(), "review cleared too");
+    }
+
+    // --- Wave 1: honest picker auth state (gap G10) ---
+
+    #[test]
+    fn parse_probe_detail_unpacks_packed_auth_metadata() {
+        // The packed shape spawn_probe emits.
+        let s = PROBE_AUTH_SENTINEL;
+        let packed = format!(
+            "{s}auth=not_logged_in|login=claude auth login|install=npm i -g x{s}claude 1.6.0",
+        );
+        let (auth, login, install, human) = parse_probe_detail(&packed);
+        assert_eq!(auth, AuthMark::NotLoggedIn);
+        assert_eq!(login, "claude auth login");
+        assert_eq!(install, "npm i -g x");
+        assert_eq!(human, "claude 1.6.0");
+        // Fail-open: a plain (untagged) detail keeps the human text, Unknown auth.
+        let (auth, login, _i, human) = parse_probe_detail("claude 1.6.0");
+        assert_eq!(auth, AuthMark::Unknown);
+        assert!(login.is_empty());
+        assert_eq!(human, "claude 1.6.0");
+    }
+
+    // Drive a probe through the engine, then select that base in the picker.
+    fn probe_and_select(app: &mut App, id: &str, auth: &str, login: &str, install: &str) {
+        let s = PROBE_AUTH_SENTINEL;
+        let detail = format!("{s}auth={auth}|login={login}|install={install}{s}{id} 1.0.0");
+        // `ready` mirrors spawn_probe: true only when logged in.
+        app.apply_engine(EngineEvent::BackendProbed {
+            backend_id: id.into(),
+            ready: auth == "logged_in",
+            detail,
+        });
+        app.goto_picker_step(PickerStep::BaseCli);
+        let idx = app
+            .picker_items
+            .iter()
+            .position(|i| i.backend_id.as_deref() == Some(id))
+            .unwrap();
+        app.picker_selected = idx;
+    }
+
+    #[test]
+    fn picker_blocks_commit_on_not_logged_in_with_login_cmd() {
+        let mut app = fresh_app(None);
+        probe_and_select(
+            &mut app,
+            "claude-code",
+            "not_logged_in",
+            "claude auth login",
+            "npm i -g claude",
+        );
+        let action = app.apply_key(KeyCode::Enter);
+        // Commit is BLOCKED — stays on the picker with the login command surfaced.
+        assert_eq!(action, Action::None);
+        assert_eq!(app.mode, AppMode::Picker);
+        let notice = app.picker_notice.as_deref().unwrap_or("");
+        assert!(
+            notice.contains("claude auth login"),
+            "login cmd shown: {notice}"
+        );
+    }
+
+    #[test]
+    fn picker_blocks_commit_on_not_installed_with_install_cmd() {
+        let mut app = fresh_app(None);
+        probe_and_select(
+            &mut app,
+            "codex",
+            "not_installed",
+            "codex login",
+            "npm install -g @openai/codex",
+        );
+        let action = app.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::None);
+        assert_eq!(app.mode, AppMode::Picker);
+        let notice = app.picker_notice.as_deref().unwrap_or("");
+        assert!(
+            notice.contains("npm install -g @openai/codex"),
+            "install cmd shown: {notice}"
+        );
+    }
+
+    #[test]
+    fn picker_commits_when_logged_in() {
+        let mut app = fresh_app(None);
+        probe_and_select(
+            &mut app,
+            "claude-code",
+            "logged_in",
+            "claude auth login",
+            "",
+        );
+        let action = app.apply_key(KeyCode::Enter);
+        // A logged-in base commits straight into chat.
         assert_eq!(action, Action::BackendChanged);
         assert_eq!(app.mode, AppMode::Chat);
         assert_eq!(app.backend_label, "claude-code");

@@ -1452,6 +1452,23 @@ fn fire_agentic(
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
     task: String,
 ) -> tokio::task::JoinHandle<()> {
+    // No pre-computed route → a non-deliberate free-text turn (the legacy
+    // behaviour, kept for callers like the queued-chat drain).
+    fire_agentic_routed(app, sink, route_tx, task, false)
+}
+
+/// Like [`fire_agentic`], but the caller has already routed the turn and decided
+/// whether it is a **director build** (a Build-class, deliberate-depth turn that
+/// must hold the single-writer run-lock + run the source-present hard-gate). This
+/// is what lets a plain chat message that says "build me an X" auto-promote into
+/// a real build instead of the old hardcoded `director_build: false`.
+fn fire_agentic_routed(
+    app: &mut App,
+    sink: &Arc<ChannelSink>,
+    route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    task: String,
+    director_build: bool,
+) -> tokio::task::JoinHandle<()> {
     let spec = app.brain_spec();
     let host_cli = matches!(spec, BrainSpec::HostCli(_));
     let continue_session = app.host_chat_session_active;
@@ -1474,9 +1491,12 @@ fn fire_agentic(
             session_id,
             fallback_model: app.effective_model(),
             project_root: app.project_root.clone(),
-            // A free-text turn is NOT a director build: no run-lock, no
-            // source-present hard-gate — just the lighter git-diff fact line.
-            director_build: false,
+            // Director-build is now ROUTED, not hardcoded: a Build-class
+            // deliberate turn takes the run-lock + the source-present hard-gate;
+            // a chat / explain / quick turn stays light (just the git-diff fact
+            // line). Fail-open: a routing failure leaves this `false` (today's
+            // behaviour).
+            director_build,
         },
         sink.clone(),
         route_tx.clone(),
@@ -1485,6 +1505,38 @@ fn fire_agentic(
         app.host_chat_session_active = true;
     }
     handle
+}
+
+/// Route ONE free-text turn at the default chat entry and surface the decision.
+///
+/// Runs the deterministic Tier-0 router ([`umadev_agent::router::route`] with no
+/// session — the floor + fallback that never blocks; a brain-assisted Tier-1
+/// consult would need a forkable `BaseSession`, which the lightweight agentic
+/// path does not hold, so the entry stays on the fast deterministic floor).
+/// Emits an [`EngineEvent::IntentDecided`] so the **intent pre-commitment card**
+/// appears immediately, records `last_intent_class`, and returns whether this
+/// turn should take the **deliberate director-build** path. **Fail-open:** any
+/// surprise resolves to "not a director build" — the existing agentic behaviour.
+async fn route_turn(app: &mut App, project_root: &std::path::Path, task: &str) -> bool {
+    let options = RunOptions {
+        project_root: project_root.to_path_buf(),
+        requirement: task.to_string(),
+        slug: app.slug.clone(),
+        model: app.effective_model(),
+        backend: app.backend.clone().unwrap_or_default(),
+        design_system: app.config.design_system.clone().unwrap_or_default(),
+        seed_template: app.config.seed_template.clone().unwrap_or_default(),
+        mode: app.effective_trust_mode(),
+        strict_coverage: umadev_agent::strict_coverage_from_env(),
+    };
+    // Tier-0 (session = None): deterministic, zero-latency, never errors.
+    let route = umadev_agent::router::route(None, &options, task).await;
+    // Surface the decision as the intent card (replaces the silent old default).
+    app.apply_engine(EngineEvent::intent_decided(&route));
+    // A Build-class, deliberate-depth turn is the director-build path: a chat
+    // that says "build me X" now auto-promotes here instead of the old
+    // hardcoded `director_build:false`.
+    route.class.mutates_workspace() && route.depth.is_deliberate()
 }
 
 /// After a TERMINAL chat route outcome (`Chat` / `Failed`), fire the next turn
@@ -1597,13 +1649,45 @@ fn toml_top_string(path: &std::path::Path, key: &str) -> Option<String> {
 fn spawn_probe(sink: Arc<ChannelSink>) {
     tokio::spawn(async move {
         for status in umadev_host::probe_all().await {
-            let (ready, detail) = match status.probe {
-                umadev_host::ProbeResult::Ready { version, .. } => (true, version),
-                umadev_host::ProbeResult::NotInstalled { program } => {
-                    (false, format!("`{program}` not on PATH"))
+            // The honest auth state (gap G10): a base can be installed yet not
+            // logged in, in which case the picker must NOT show a green "ready".
+            // `ready` now means installed AND confidently authenticated, so a
+            // not-logged-in base is correctly blocked at commit.
+            let auth_state = status.probe.auth_state();
+            let ready = auth_state.is_logged_in();
+            let (auth_tag, human) = match &status.probe {
+                umadev_host::ProbeResult::Ready { version, .. } => {
+                    let tag = match auth_state {
+                        umadev_host::AuthState::LoggedIn => "logged_in",
+                        umadev_host::AuthState::NotLoggedIn => "not_logged_in",
+                        umadev_host::AuthState::NotInstalled => "not_installed",
+                        umadev_host::AuthState::Unknown => "unknown",
+                    };
+                    (tag, version.clone())
                 }
-                umadev_host::ProbeResult::Unhealthy { detail } => (false, detail),
+                umadev_host::ProbeResult::NotInstalled { program } => {
+                    ("not_installed", format!("`{program}` not on PATH"))
+                }
+                umadev_host::ProbeResult::Unhealthy { detail } => ("unknown", detail.clone()),
             };
+            // The base's own login / install commands so the picker can tell the
+            // user EXACTLY what to run — read off the driver (fail-open to empty).
+            let (login_cmd, install_cmd) = umadev_host::driver_for(status.id)
+                .map(|d| {
+                    (
+                        d.login_hint().unwrap_or("").to_string(),
+                        d.install_hint().unwrap_or("").to_string(),
+                    )
+                })
+                .unwrap_or_default();
+            // Pack the structured auth metadata onto `detail` (the BackendProbed
+            // event can't grow fields — it lives in umadev-agent). The TUI
+            // unpacks via `parse_probe_detail`; `|` and the \u{1} sentinels never
+            // occur in a real version string / login command.
+            let detail = format!(
+                "{s}auth={auth_tag}|login={login_cmd}|install={install_cmd}{s}{human}",
+                s = '\u{1}',
+            );
             sink.emit(EngineEvent::BackendProbed {
                 backend_id: status.id.to_string(),
                 ready,
@@ -2181,16 +2265,25 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 ));
                             }
                             Action::Route(text) => {
-                                // Brain-driven by default: hand the message straight
-                                // to the tools-enabled base session and let the brain
-                                // decide for itself whether to just reply or to do
-                                // the work — no UmaDev-side chat/run classification,
-                                // no forced 9-phase pipeline. `/run` stays the
-                                // explicit entry to the full commercial pipeline.
-                                // (`submit_text` already recorded the user turn; we do
-                                // NOT pre-announce "inspecting repo" since the brain
-                                // may simply be replying to small talk.)
-                                run_task = Some(fire_agentic(app, &sink, &route_tx, text));
+                                // Wave-1 routing: classify the turn FIRST (the
+                                // intelligent router), so the default chat entry
+                                // shows an intent pre-commitment card and a plain
+                                // "build me X" auto-promotes into a deliberate
+                                // director build — instead of every free-text turn
+                                // silently taking the same light path with the old
+                                // hardcoded `director_build:false`. Fail-open: the
+                                // deterministic Tier-0 floor never errors; a chat /
+                                // explain / quick turn stays light. `/run` remains
+                                // the explicit forced-Deep entry to the full pipeline.
+                                let director_build =
+                                    route_turn(app, &opts.project_root, &text).await;
+                                run_task = Some(fire_agentic_routed(
+                                    app,
+                                    &sink,
+                                    &route_tx,
+                                    text,
+                                    director_build,
+                                ));
                             }
                             Action::Revise(text) => {
                                 // Re-run the block that PRODUCED the current
@@ -2621,6 +2714,52 @@ mod tests {
             Ok(RouteDecision::AgenticDone(text)) => assert_eq!(text, "no bug found"),
             other => panic!("expected AgenticDone, got {other:?}"),
         }
+    }
+
+    // Build an offline App for routing tests (no host CLI is reached; the Tier-0
+    // router runs purely on the message text + the planner heuristics).
+    fn routing_app() -> App {
+        App::new(
+            "demo",
+            crate::config::UserConfig {
+                backend: Some("offline".into()),
+                ..Default::default()
+            },
+            std::env::temp_dir().join("umadev-route-test-config.toml"),
+            std::env::temp_dir(),
+        )
+    }
+
+    #[tokio::test]
+    async fn router_promotes_build_request_to_deliberate() {
+        // "build me a login app" → a Build-class, deliberate-depth route →
+        // director-build = true (the auto-promotion the hardcoded false killed).
+        let mut app = routing_app();
+        let root = std::env::temp_dir();
+        let director_build =
+            route_turn(&mut app, &root, "build me a full login app with email auth").await;
+        assert!(
+            director_build,
+            "a clear build must take the deliberate path"
+        );
+        // The intent card landed AND recorded the class as build.
+        assert_eq!(app.last_intent_class.as_deref(), Some("build"));
+        assert!(
+            app.history
+                .iter()
+                .any(|m| matches!(m.role, crate::app::ChatRole::UmaDev)),
+            "an intent card was pushed"
+        );
+    }
+
+    #[tokio::test]
+    async fn router_keeps_greeting_as_light_chat() {
+        // A greeting must NOT take the deliberate director path.
+        let mut app = routing_app();
+        let root = std::env::temp_dir();
+        let director_build = route_turn(&mut app, &root, "你好，今天怎么样？").await;
+        assert!(!director_build, "a greeting stays a light chat turn");
+        assert_eq!(app.last_intent_class.as_deref(), Some("chat"));
     }
 
     #[tokio::test]

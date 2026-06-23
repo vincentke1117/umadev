@@ -98,6 +98,35 @@
 "run.phase_start" = "> phase {} 开始…"
 "run.artifact_written" = "  · [{}] 写入 {}"
 
+# Wave 1 — 意图预承诺卡(路由决定,动手前先告诉你)
+"intent.build" = "这是一次完整构建（{}）——进研发流程:计划 + 团队 + 质量门。"
+"intent.debug" = "这是一个排障任务（{}）——定位、修复、回归。"
+"intent.quick_edit" = "小修改（{}）——直接做 + 定向校验。"
+"intent.explain" = "讲解/答疑（{}）——只读理解,不动工作区。"
+"intent.chat" = "这是对话（{}）——直接回应,不进开发流程。"
+"intent.depth.fast" = "快速"
+"intent.depth.standard" = "标准"
+"intent.depth.deep" = "深度"
+"intent.budget" = " · 预估 ≤{} 次工具调用"
+"intent.team" = " · 团队:{}"
+
+# Wave 1 — 实时计划清单 + 团队评审面板
+"plan.posted" = "计划已就绪——{} 步。下方清单会实时勾选;用 /plan 调整。"
+"plan.panel.title" = "计划"
+"plan.panel.collapsed" = "计划 {}/{} — /plan 展开"
+"plan.none" = "暂无计划。完整构建或一次深思熟虑的任务会在这里生成计划。"
+"plan.review.title" = "团队评审"
+"plan.review.accept" = "通过"
+"plan.review.block" = "{} 个必改"
+"plan.review.collapsed" = "团队评审:{} 通过 · {} 拦截 — /plan 展开"
+"plan.steer.usage" = "/plan — 查看计划 · /plan skip <id> · /plan add <文本> · /plan veto <id> · /plan up <id> · /plan down <id> · /plan collapse"
+"plan.steer.skip" = "跳过步骤 `{}`——折进下一条指令。"
+"plan.steer.veto" = "否决步骤 `{}`——折进下一条指令。"
+"plan.steer.add" = "新增步骤:{}——折进下一条指令。"
+"plan.steer.move" = "调整步骤 `{}`（{}）——折进下一条指令。"
+"plan.steer.unknown_step" = "当前计划没有步骤 `{}`。"
+"plan.steer.queued" = "计划修改已排队,将在下一个步骤边界生效。"
+
 # 帮助
 "help.title" = "UmaDev 命令"
 "help.lang" = "/lang —— 切换界面语言（简体 / 繁體 / English）"
@@ -147,6 +176,13 @@
 
 # Picker / quit / gate confirmation / run lifecycle
 "picker.unavailable" = "{} 不可用:{} — 上下选其他,或先装好底座再来"
+# Wave 1 — 选择器诚实显示三态登录状态(缺口 G10)
+"picker.auth.logged_in" = "已登录"
+"picker.auth.not_logged_in" = "已安装 · 未登录 -> {}"
+"picker.auth.not_installed" = "未安装 -> {}"
+"picker.auth.unknown" = "已安装 · 登录未验证"
+"picker.block.not_logged_in" = "{} 已安装但未登录。先在终端运行 `{}`,再回来选。"
+"picker.block.not_installed" = "{} 未安装。先运行 `{}`,再重新打开 UmaDev。"
 "quit.confirm_running" = "再按一次 Esc 退出 UmaDev(workflow state 已保存,下次 `umadev` 自动续上)。"
 "gate.clarify_saved" = "[ok] 澄清回答已保存,开始联网调研…"
 "gate.clarify_recorded" = "已记录(继续回答,或输入 c 提交)"

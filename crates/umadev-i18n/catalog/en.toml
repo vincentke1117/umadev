@@ -98,6 +98,35 @@
 "run.phase_start" = "> phase {} starting…"
 "run.artifact_written" = "  · [{}] wrote {}"
 
+# Wave 1 — intent pre-commitment card (router decision shown before any work)
+"intent.build" = "This is a full build ({}) — I'll run the director flow: plan, team, quality gates."
+"intent.debug" = "This is a defect to diagnose and fix ({}) — I'll locate, fix, and regress it."
+"intent.quick_edit" = "Small, well-scoped change ({}) — on it directly with a targeted check."
+"intent.explain" = "A read-only explanation ({}) — I'll answer without touching the workspace."
+"intent.chat" = "This is a conversation ({}) — replying directly, no dev flow."
+"intent.depth.fast" = "fast"
+"intent.depth.standard" = "standard"
+"intent.depth.deep" = "deep"
+"intent.budget" = " · est. ≤{} tool calls"
+"intent.team" = " · team: {}"
+
+# Wave 1 — live plan checklist + team-review panel
+"plan.posted" = "Plan posted — {} steps. Track them in the checklist; steer with /plan."
+"plan.panel.title" = "Plan"
+"plan.panel.collapsed" = "Plan {}/{} — /plan to expand"
+"plan.none" = "No active plan. A build or a deliberate turn posts one here."
+"plan.review.title" = "Team review"
+"plan.review.accept" = "accepts"
+"plan.review.block" = "{} must-fix"
+"plan.review.collapsed" = "Team review: {} accept · {} blocking — /plan to expand"
+"plan.steer.usage" = "/plan — show plan · /plan skip <id> · /plan add <text> · /plan veto <id> · /plan up <id> · /plan down <id> · /plan collapse"
+"plan.steer.skip" = "Skipping step `{}` — folded into the next directive."
+"plan.steer.veto" = "Vetoing step `{}` — folded into the next directive."
+"plan.steer.add" = "Adding step: {} — folded into the next directive."
+"plan.steer.move" = "Reordering step `{}` ({}) — folded into the next directive."
+"plan.steer.unknown_step" = "No step `{}` in the current plan."
+"plan.steer.queued" = "Plan edit queued; it applies at the next step boundary."
+
 # Help
 "help.title" = "UmaDev commands"
 "help.lang" = "/lang — switch interface language (Simplified / Traditional / English)"
@@ -147,6 +176,13 @@
 
 # Picker / quit / gate confirmation / run lifecycle
 "picker.unavailable" = "{} unavailable: {} — pick another above, or install the base first and come back"
+# Wave 1 — honest three-state login readiness in the picker (gap G10)
+"picker.auth.logged_in" = "logged in"
+"picker.auth.not_logged_in" = "installed · not logged in -> {}"
+"picker.auth.not_installed" = "not installed -> {}"
+"picker.auth.unknown" = "installed · login not verified"
+"picker.block.not_logged_in" = "{} is installed but not logged in. Run `{}` in your terminal first, then come back."
+"picker.block.not_installed" = "{} is not installed. Run `{}` first, then re-open UmaDev."
 "quit.confirm_running" = "Press Esc again to quit UmaDev (workflow state is saved; the next `umadev` resumes automatically)."
 "gate.clarify_saved" = "[ok] Clarification answers saved, starting web research…"
 "gate.clarify_recorded" = "Recorded (keep answering, or type c to submit)"
