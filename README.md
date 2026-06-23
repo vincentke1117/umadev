@@ -4,14 +4,14 @@
 
 <img src="docs/assets/umadev-logo.png" alt="UmaDev" width="760">
 
-### 给 AI 编码底座套一条治理轨道
+### 一个 AI 项目总监，带领一支完整团队，把你的需求交付成可上线产品
 
-**从一句需求，到 PRD、架构、UI/UX、代码、质量门、交付包——底座写代码，UmaDev 管流程。**
+**产品 / 架构 / 设计 / 前后端 / 测试 / 安全 / 运维——像真实开发团队那样协作。底座是大脑，UmaDev 是带队交付的总监。**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.87%2B-orange)](https://www.rust-lang.org/)
 [![Spec](https://img.shields.io/badge/Spec-UMADEV__HOST__SPEC__V1-blue)](spec/UMADEV_HOST_SPEC_V1.md)
-[![Version](https://img.shields.io/badge/Version-1.0.0-success)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-1.0.7-success)](CHANGELOG.md)
 
 简体中文 | [繁體中文](README.zh-TW.md) | [English](README_EN.md)
 
@@ -22,22 +22,33 @@
 ## 目录
 
 - [简介](#简介) · [项目来源](#项目来源) · [它解决什么问题](#它解决什么问题)
-- [快速体验](#快速体验) · [一个完整例子](#一个完整例子) · [UmaDev 如何工作](#umadev-如何工作)
-- [运行模式](#运行模式) · [流水线设计](#流水线设计) · [质量门是什么](#质量门是什么)
+- [快速体验](#快速体验) · [一个完整例子](#一个完整例子) · [UmaDev 如何工作](#umadev-如何工作) · [团队怎么协作](#团队怎么协作)
+- [为什么可信](#为什么可信) · [运行模式](#运行模式) · [流水线设计](#流水线设计) · [质量门是什么](#质量门是什么)
 - [治理规则是什么](#治理规则是什么) · [知识库是什么](#知识库是什么) · [交付产物长什么样](#交付产物长什么样)
 - [**命令大全**](#命令大全) · [配置](#配置) · [Rust 架构](#rust-架构) · [开发](#开发)
 
 ## 简介
 
-UmaDev 是一个本地运行的确定性壳：它给你**已经登录的 AI 编码底座**（Claude Code / Codex / OpenCode）套上一条**治理轨道**，把"AI 写代码"约束成一个可检查、可恢复、可审计的交付流程。它不替代这些底座，也不卖模型 API——**脑子始终在底座**，UmaDev 只管流程、规则和证据。
+UmaDev 是一个本地运行的 **AI 项目总监 Agent**。它加载你**已经登录的 AI 编码底座**（Claude Code / Codex / OpenCode）的大脑——一个**常驻的持续会话**就是它的工作意识——然后像一位真正的项目总监那样，**带领一支完整团队**把你的一句需求交付成可上线产品。
 
-1. **把你的需求拆成完整交付流程**：先澄清，再调研，再写 PRD、架构、UI/UX，再实现前后端，最后跑质量门和交付。
-2. **驱动你已经登录的 AI 编码工具**：Claude Code / Codex / OpenCode 负责真实写代码，UmaDev 负责让它们按流程做事——一等支持恰好这三个底座；想覆盖更多模型，是把底座路由到第三方/本地模型，那是底座自己的事，不是 UmaDev 加新驱动。
-3. **把交付过程变成可检查、可恢复、可审计**：每个阶段有产物，每次工具调用有记录，最后有 quality gate、compliance mapping 和 proof pack。
+总监不亲自敲代码。它做三件事：**理解你**、**调度团队**、**把关交付**。底座是干活的工程师（思考、调研、设计、写代码、审查都是底座的认知）；UmaDev 是带队的总监 + 确定性工具层（编排阶段、设置确认门、实时治理、跑质量门、留下审计证据）。
 
-如果普通 AI 编码工具像一个很强的工程师，那么 UmaDev 更像围着它的一圈**流程与审稿岗位**——产品经理、架构师、UI/UX 审稿人、技术负责人、QA、交付经理的检查清单，而不是一个能取代工程师的全自动总监。最终判断和代码仍来自底座，UmaDev 负责让这个过程不跑偏、留下证据。
+它的团队是一组**可调度的角色席位**，而非写死的判断逻辑：
 
-> 定位与成熟度：UmaDev 仍处于**早期、治理优先**阶段，最适合在真实项目上验证它的流程与门禁。它把价值押在"轨道"上，而不是声称已经能无人值守地全自动交付。
+- **产品经理** 拆解需求、定范围与验收标准
+- **架构师** 定技术选型、分层分包、接口契约
+- **UI/UX 设计师** 定设计系统、令牌、信息架构，盯住"不像 AI 模板"
+- **前端 / 后端工程师** 真写代码（驱动底座连续用工具产出文件）
+- **测试 / QA** 真跑构建测试、查覆盖
+- **安全 / 红队** 扫漏洞、查攻击面、做 pre-PR 安全检查
+- **运维 / DevOps** 管构建、CI、运行时证据、上线
+- **总监** 在每道门汇总裁决、对照计划验收、拍板过或返工
+
+干活的角色串行写主会话；评审的角色各自 fork 出**只读分叉会话并行**审，把结构化裁决交回总监。角色之间**不互相聊天**——它们只通过共享的产物文件（黑板）和结构化裁决沟通，避免多 Agent 互聊放大幻觉。总监**确定性地**汇总：把阻断项折成一条返工指令注入主会话，让团队带上下文修，循环由确定性信号（覆盖 / 契约 / 验证 / 硬门）有界终止——不靠模型自评"够不够好"。
+
+它驱动的恰好是这三个一等底座；想覆盖更多模型，是把底座路由到第三方/本地模型，那是底座自己的事，UmaDev 不注入、不覆盖、不持有任何模型端点。
+
+> 持续会话是**默认**：整条流水线复用一个底座会话，上下文全程在线；过去"每阶段单发"的旧模型只作为底座会话起不来时的兜底。这让底座连续干活、真写代码，而不是九个"陌生人"各做一段、客套不动手。
 
 ## 项目来源
 
@@ -45,16 +56,16 @@ UmaDev 脱胎于原项目 [shangyankeji/super-dev](https://github.com/shangyanke
 
 早期的 `super-dev` 更像一个 **AI 编码治理工具**：它主要关注“AI 生成代码时不能写什么”，例如不要用 emoji 当图标、不要硬编码颜色、不要写不安全代码。
 
-现在的 UmaDev 在这之上扩成了一条完整的治理轨道：
+现在的 UmaDev 在这之上长成了一个带队交付的项目总监 Agent：
 
-- **从单点治理扩展到全流程治理**：不只检查代码，而是把从需求到交付的每个阶段都纳入流程和门禁。
-- **从零散脚本升级为规范驱动系统**：核心是 [UMADEV_HOST_SPEC_V1](spec/UMADEV_HOST_SPEC_V1.md)，所有实现都围绕规范。
+- **从单点治理扩展到全流程交付**：不只检查代码，而是把从需求到上线的每个阶段都交给对应角色，并加上门禁与验收。
+- **从零散脚本升级为规范驱动系统**：核心是 [UMADEV_HOST_SPEC_V1](spec/UMADEV_HOST_SPEC_V1.md)，所有实现都围绕规范（持续会话与团队模型见 §9.3–§9.4）。
 - **使用 Rust 重写**：单二进制、跨平台、启动快、依赖少、适合本地长期运行。
-- **从“拦截问题”扩展到“带着底座走完流程”**：Claude Code / Codex / OpenCode 是大脑和手，UmaDev 是包在外面的流程与治理轨道。
+- **从“拦截问题”升级为“带队走完交付”**：Claude Code / Codex / OpenCode 是大脑和手，UmaDev 是加载这颗大脑、调度整支团队、把关交付的总监。
 
 一句话概括这个演进：
 
-> `super-dev` 关注“AI 不要写烂代码”；`UmaDev` 关注“AI 如何交付一个完整、可上线、可审计的商业项目”。
+> `super-dev` 关注“AI 不要写烂代码”；`UmaDev` 关注“一个 AI 项目总监如何带领一支团队，把需求交付成可上线、可审计的商业产品”。
 
 ## 它解决什么问题
 
@@ -68,21 +79,19 @@ UmaDev 脱胎于原项目 [shangyankeji/super-dev](https://github.com/shangyanke
 - 代码能生成，但没有质量报告、没有证据链，不知道能不能交付。
 - 团队有自己的规范和知识库，但每次都要手动复制给 AI。
 
-UmaDev 的目标就是把这些问题系统化解决。
-
-它会强制 AI 走一条更像真实团队的流程：
+UmaDev 的目标就是把这些问题系统化解决——靠的不是更长的提示词，而是一支分工明确的团队，每个角色在该出手的节点出手：
 
 ```mermaid
 flowchart LR
-    A["一句需求"] --> B["澄清问题"]
-    B --> C["调研"]
-    C --> D["PRD / 架构 / UIUX"]
-    D --> E["执行计划"]
-    E --> F["前端实现"]
-    F --> G["预览确认"]
-    G --> H["后端实现"]
-    H --> I["质量门"]
-    I --> J["交付包"]
+    A["一句需求"] --> B["产品经理<br/>拆解 + 调研"]
+    B --> C["架构师 ‖ 设计师<br/>架构 + UIUX 并行"]
+    C --> D{"文档确认门<br/>团队并行评审 + 你拍板"}
+    D --> E["技术负责人<br/>Spec / 任务"]
+    E --> F["前端工程师<br/>照设计系统实现"]
+    F --> G{"预览确认门"}
+    G --> H["后端工程师<br/>照契约实现"]
+    H --> I["QA · 安全 · 运维<br/>质量门 / 红队"]
+    I --> J["交付包<br/>总监验收 + 证据"]
 ```
 
 ## 快速体验
@@ -258,32 +267,70 @@ flowchart TB
 
 更简单地说：
 
-- **TUI/CLI**：你和 UmaDev 交流的地方。
-- **Agent Runner**：决定现在该做哪个阶段、什么时候暂停、什么时候继续。
-- **Research（第 1 阶段）**：先让底座联网调研同类产品 / 竞品 / 趋势 / 真实评价，叠加本地知识库，产出 `research.md`——不是上来就写代码。
-- **Runtime / 底座**：把任务交给你登录的底座（Claude Code / Codex / OpenCode）——底座用它自己的登录和模型，既负责写真实代码，也负责联网调研竞品；UmaDev 不注入、不覆盖任何模型或 key。
-- **Governance/Quality**：检查 AI 写出来的东西是否符合规范。
-- **Knowledge**：把工程标准、设计系统、领域知识（本地 BM25 + 向量检索）注入给底座。
-- **Evidence**：把过程记录下来，最后打包交付。
+- **TUI/CLI**：你和总监对话的地方。一句"你好"、一个"审下这段代码"、一个完整需求，都进同一个会话，由底座判断该闲聊、做临时任务、还是开工跑流水线。
+- **总监（umadev-agent）**：决定现在该做哪个阶段、点名哪些角色、什么时候停下设门、什么时候汇总裁决推进或返工。
+- **持续会话 / 底座**：整条流水线复用你登录的底座（Claude Code / Codex / OpenCode）的一个会话——底座用它自己的登录和模型连续干活（调研、设计、真写代码、评审）；UmaDev 不注入、不覆盖任何模型或 key。
+- **治理 / 质量**：底座每写一个文件就实时拦截不合规内容；交付前再跑一遍质量门补扫。
+- **知识库**：把工程标准、设计系统、领域知识（本地 BM25 + 向量检索）注入给当前阶段的角色。
+- **证据**：把每次工具调用、每份裁决、每道门记录下来，最后打包成交付证明。
+
+## 团队怎么协作
+
+UmaDev 把"质量判断"建模成**一支团队**，而不是单趟检查。一个**确定性总监**主导全程；干活角色串行写，评审角色并行只读审；沟通只走"共享文件黑板 + 结构化裁决"。
+
+```mermaid
+flowchart TB
+    User["你<br/>需求 / 确认"] --> Director["总监<br/>确定性编排核 · 唯一决策者"]
+    Director -->|"send_turn · 观察事件 · 纠偏"| Main["主持续会话（底座大脑）"]
+    Main -->|"干活角色串行写"| Board["黑板<br/>output/*.md · 源码"]
+    Director -->|"fork() 只读分叉"| Critics["评审角色 ×N<br/>PM · 架构 · 设计 · QA · 安全 · 前端 · 后端 · 运维"]
+    Board -.->|"读黑板"| Critics
+    Critics -->|"RoleVerdict<br/>accepts · blocking · advisory · evidence"| Director
+    Floor["确定性地板<br/>覆盖 · 契约 · 验证 · 硬门"] --> Director
+    Director -->|"阻断项 → 一条返工指令"| Main
+    Director -->|"全过 → 过门推进"| Next["下一阶段"]
+```
+
+四条铁律保证这套团队既强又稳：
+
+- **单写者**：任一时刻只有主会话在写黑板；评审分叉只读，绝不并行写，因此并行安全。
+- **确定性控环**：循环继续还是终止，由确定性信号（gap-count、退出码、硬门）决定。底座和评审角色都是 **advisory**，永不驱动循环终止——避免模型"自我感觉良好"放行。
+- **fail-open**：评审角色够不到底座时，空裁决 = 通过，绝不阻塞；总监退回确定性地板决策。一个评审的 bug 永远不会卡住底座。
+- **有界返工**：阻断项折成返工指令注入主会话，带上下文修，再复审；gap-count + stall-counter 确定性收敛（默认最多几轮、无进展即停），残留进自学习库下次规避。
+
+团队规模随任务复杂度缩放：bugfix / 小重构不组队，确定性地板独立把关；完整需求才上全套角色。简单需求因此能走轻量路径——跳过调研和三文档、保留 Spec 与硬门，几分钟出代码。
+
+## 为什么可信
+
+总监带队听起来像把判断权交给模型——其实恰恰相反。UmaDev 的可信来自把"模型说了什么"和"硬信号是什么"严格分开：
+
+- **fail-open 治理**：底座每写一个文件，都实时拦截 emoji 当图标、硬编码颜色、AI 模板痕迹、无障碍缺失、前后端契约不符等。治理函数**永远 fail-open**——治理自身出 bug 时放行而非阻断，绝不让一个治理缺陷卡死底座。
+- **确定性控环**：底座和评审 critic 都是 **advisory**。真正决定"过门 / 返工 / 硬停"的是确定性信号：FR→任务覆盖、前后端契约对照、真跑 verify 的退出码、质量门阈值、以及**零代码硬门**（计划要产出代码却没有真实源码 = 判失败，绝不把空骨架伪装成"完成"）。
+- **不持有模型端点**：UmaDev 用你已登录的底座，不自带模型、不接第三方 API、不存你的 key。底座用谁的模型、什么思考强度，UmaDev 只读出来显示、绝不覆盖。
+- **审计证据**：每次工具调用、每份角色裁决、每道门的状态都落盘（`.umadev/audit/*`、`team-ledger.jsonl`）；交付时打包成 proof-pack + 成绩单 + 合规映射（SOC 2 / ISO 27001 / EU AI Act），可直接发给团队、客户或审计方。
+- **自我进化记忆**：踩坑自动识别→按技术栈指纹精准召回→复发触发更高层的纠正策略（反思）；相似教训沉淀成更稠密的"信念"，并做矛盾卫生；信任分级 + CJK 检索贯穿其中。越用越懂你的项目。
+- **三语**：zh-CN / zh-TW / en 全程覆盖用户可见文案，按系统语言检测、可随时切换。
 
 ## 运行模式
 
-### 模式 A：驱动本机 AI 编码 CLI
+### 模式 A：驱动本机 AI 编码 CLI（默认走持续会话）
 
-这是推荐模式。
+这是产品模式。整条流水线复用底座的**一个持续会话**，上下文全程在线；底座连续用工具干活。
 
-| Backend ID | 实际程序 | UmaDev 怎么调用 | 适合谁 |
+| Backend ID | 实际程序 | UmaDev 怎么驱动 | 适合谁 |
 |---|---|---|---|
-| `claude-code` | `claude` | `claude --print --output-format text` | 已经在用 Claude Code 的用户 |
-| `codex` | `codex` | `codex exec --sandbox workspace-write` | 已经在用 Codex CLI 的用户 |
-| `opencode` | `opencode` | `opencode run` | 已经在用 OpenCode 的用户 |
+| `claude-code` | `claude` | 持续会话（stream-json 双向流），跨阶段 `--resume` 续接 | 已经在用 Claude Code 的用户 |
+| `codex` | `codex` | 持续会话（`codex app-server`，同一 thread 续接） | 已经在用 Codex CLI 的用户 |
+| `opencode` | `opencode` | 持续会话（`opencode serve`，同一 session 续接） | 已经在用 OpenCode 的用户 |
 
 特点：
 
 - UmaDev 不需要你的模型 API key。
 - 继续使用你原来 CLI 的账号、订阅和配置。
 - 底座负责真实读写文件和运行命令。
-- UmaDev 负责流程、规则、质量门和证据链。
+- UmaDev 负责团队调度、流程、规则、质量门和证据链。
+
+> 单发兜底：底座的持续会话起不来时，自动回退到旧的"每阶段单发"路径（`claude --print` / `codex exec` / `opencode run`），保证不卡死；离线模式与显式 `UMADEV_CONTINUOUS=0` 也走单发。
 
 ### 底座自带模型 —— UmaDev 不接外部 API
 
@@ -340,20 +387,20 @@ output/<slug>-clarify.md
 
 > 小任务有轻量路径：9 阶段是面向"完整商业级交付"的主链，不是每个需求都得全程走完。用 `/kind`（全栈 / 仅前端 / 仅后端 / bugfix / 重构）声明任务类型后，UmaDev 会据此裁剪阶段——bugfix、小改动不会强行拉你走 PRD/架构/UIUX 全套。
 
-### 每个阶段会产出什么
+### 每个阶段由谁主导、产出什么
 
-| 阶段 | 你能理解成 | 主要文件 |
-|---|---|---|
-| `clarify` | 先把需求问清楚 | `output/<slug>-clarify.md`、`output/<slug>-clarify-answers.md` |
-| `research` | 联网调研竞品、领域、风险、设计趋势 | `output/<slug>-research.md` |
-| `docs` | 写三份核心文档 | `output/<slug>-prd.md`、`output/<slug>-architecture.md`、`output/<slug>-uiux.md` |
-| `docs_confirm` | 让你确认文档方向 | `.umadev/workflow-state.json` |
-| `spec` | 拆任务和执行计划 | `output/<slug>-execution-plan.md`、`.umadev/changes/<id>/tasks.md` |
-| `frontend` | 前端实现和预览说明 | `output/<slug>-frontend-notes.md` |
-| `preview_confirm` | 让你看前端效果 | TUI gate 状态 |
-| `backend` | 后端实现和集成说明 | `output/<slug>-backend-notes.md` |
-| `quality` | 独立质量检查 | `output/<slug>-quality-gate.json`、`output/<slug>-quality-gate.md` |
-| `delivery` | 最终交付 | `output/<slug>-delivery-notes.md`、`release/proof-pack-*.zip`、`release/scorecard-*.html` |
+| 阶段 | 主导角色 | 你能理解成 | 主要文件 |
+|---|---|---|---|
+| `clarify` | 产品经理 | 先把需求问清楚 | `output/<slug>-clarify.md`、`output/<slug>-clarify-answers.md` |
+| `research` | 产品经理 | 联网调研竞品、领域、风险、设计趋势 | `output/<slug>-research.md` |
+| `docs` | PM · 架构师 · 设计师 | 写三份核心文档（架构 ‖ UIUX 可并行） | `output/<slug>-prd.md`、`output/<slug>-architecture.md`、`output/<slug>-uiux.md` |
+| `docs_confirm` | 团队并行评审 + 你 | PM + 架构 + 设计 critic 各自只读审，连同你一起确认方向 | `.umadev/workflow-state.json`、`.umadev/team-ledger.jsonl` |
+| `spec` | 技术负责人 | 拆任务和执行计划（每任务回链 FR 编号） | `output/<slug>-execution-plan.md`、`.umadev/changes/<id>/tasks.md` |
+| `frontend` | 前端工程师 | 照设计系统/令牌实现前端 | `output/<slug>-frontend-notes.md` |
+| `preview_confirm` | 设计 + 前端 critic + 你 | 看前端效果、审实现质量 | TUI gate 状态、`.umadev/team-ledger.jsonl` |
+| `backend` | 后端工程师 | 照契约实现后端和集成 | `output/<slug>-backend-notes.md` |
+| `quality` | QA · 安全 · 后端 · 运维 critic | 真跑构建测试 + 红队 + 契约/覆盖/治理扫描 + 硬门 | `output/<slug>-quality-gate.json`、`output/<slug>-quality-gate.md` |
+| `delivery` | 运维 / 总监验收 | 对照计划验收、打包交付 | `output/<slug>-delivery-notes.md`、`release/proof-pack-*.zip`、`release/scorecard-*.html` |
 
 ## 质量门是什么
 
@@ -425,7 +472,7 @@ blocked_domains = ["internal-bad-proxy.corp"]
 
 ## 知识库是什么
 
-UmaDev 内置了 416 份 markdown 知识文件，不只是普通文档，而是给 AI 看的工程标准库。
+UmaDev 内置了 400+ 份 markdown 知识文件，不只是普通文档，而是给底座看的工程标准库。
 
 它覆盖：
 
@@ -694,9 +741,9 @@ UmaDev 是一个 10 crate Rust workspace。
 | `umadev` | 主程序 | CLI、TUI 入口、doctor、hook、CI、MCP/Skill/Knowledge 管理 |
 | `umadev-spec` | 规则说明书 | `UMADEV_HOST_SPEC_V1` 的 Rust 数据 |
 | `umadev-governance` | 质检和红线 | 112 条治理规则、审计、策略、合规映射 |
-| `umadev-agent` | 流程编排引擎 | 9 阶段 runner、gate、状态、质量门、交付包 |
-| `umadev-runtime` | 统一大脑接口 | Offline、HTTP runtime、Runtime trait |
-| `umadev-host` | 驱动外部 CLI | Claude Code、Codex、OpenCode 子进程驱动 |
+| `umadev-agent` | 总监引擎 | 9 阶段 runner、gate、质量门、角色 critic 团队、持续会话编排、验收/有界返工、信任分级、自我进化记忆 |
+| `umadev-runtime` | 统一大脑接口 | Runtime trait + 持续会话 `BaseSession` trait、Offline、能力契约 |
+| `umadev-host` | 驱动外部 CLI | Claude Code / Codex / OpenCode：持续会话驱动（`*_session.rs`）+ 单发兜底 |
 | `umadev-contract` | API 对账员 | OpenAPI 契约、前后端路径校验 |
 | `umadev-knowledge` | 知识检索 | BM25、chunk、tokenizer、可选 vector |
 | `umadev-tui` | 终端界面 | ratatui 聊天 UI、预览/部署命令 |

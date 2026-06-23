@@ -5,36 +5,75 @@ with code in this repository.
 
 ## What this project is
 
-UmaDev (1.0.0) is a Rust workspace that ships a **single binary**
-(`umadev`) acting as a coach + orchestrator for AI coding hosts. It
-embeds `UMADEV_HOST_SPEC_V1` (see `spec/`). It does **not** own a model
-endpoint — it is a deterministic Rust shell that drives someone else's
-brain and enforces a 9-phase commercial-delivery pipeline + governance
-on top of it.
+UmaDev is a Rust workspace that ships a **single binary** (`umadev`): a
+persistent **project-director Agent** that loads a base CLI's brain as one
+continuous session and leads a full delivery team — product manager,
+architect, UI/UX designer, frontend, backend, QA, security, DevOps, plus
+the director — to turn a requirement into a shippable product. It embeds
+`UMADEV_HOST_SPEC_V1` (see `spec/`). It does **not** own a model endpoint:
+the base does all the cognition (thinking, research, design, writing code,
+review); UmaDev is the deterministic shell that orchestrates phases,
+enforces gates and governance, and leaves the audit trail. See
+`docs/CONTINUOUS_SESSION_ARCHITECTURE.md` for the design narrative, and
+`spec/UMADEV_HOST_SPEC_V1.md` §9.3–§9.4 for the normative-prose mirror.
 
-The binary has two execution modes:
+**One continuous session = the Agent's working context.** A run opens a
+single base session and drives the *same* session through every phase, so
+the base keeps its accumulated context instead of being re-primed from
+cold each phase. The persistent session is the **default** (see
+`umadev_agent::continuous_enabled_from_env` and the `*_session.rs` drivers
+in `umadev-host`); the per-phase single-shot path (`claude --print` /
+`codex exec` / `opencode run`) is retained only as a **fail-open
+fallback** — reached when the session can't start, when the brain is the
+offline runtime, or on an explicit opt-out (`UMADEV_CONTINUOUS=0` /
+`UMADEV_LEGACY_RUN=1`).
+
+Chat, an ad-hoc task ("review this code" / "fix this bug"), and a full
+pipeline run are **not three code paths** — they are three ways the
+director steers the same session over the same memory. The base classifies
+which one each turn is; only workspace-mutating work takes the
+single-writer run lock and the full gate machinery.
+
+The binary has two backend modes:
 
 - **base-CLI** (the product) — `run --backend <id>` drives an
-  already-logged-in base CLI as a subprocess; **no API key of its own**, the
-  customer's existing base subscription/config IS the brain. Exactly **three**
-  first-class bases: `claude-code` (`claude --print`), `codex` (`codex exec`),
-  `opencode` (`opencode run`). See `umadev_host::BACKEND_IDS`. UmaDev injects
-  **NOTHING** into the base — whatever the base is already configured with
-  (official login OR the customer's own third-party / local-model routing) is
-  exactly what runs. UmaDev does not own, broker, or configure any model
-  endpoint; connecting a third-party/local model is the base's job, not ours.
-- **offline** (internal fallback only) — deterministic templates, no network
-  (demo / CI / no base reachable). NOT offered to the customer as a choice;
-  the first-run picker lists only the three bases.
+  already-logged-in base CLI; **no API key of its own**, the customer's
+  existing base subscription/config IS the brain. Exactly **three**
+  first-class bases: `claude-code`, `codex`, `opencode`. See
+  `umadev_host::BACKEND_IDS`. UmaDev injects **NOTHING** into the base —
+  whatever the base is already configured with (official login OR the
+  customer's own third-party / local-model routing) is exactly what runs.
+  UmaDev does not own, broker, or configure any model endpoint; connecting
+  a third-party/local model is the base's job, not ours.
+- **offline** (internal fallback only) — deterministic templates, no
+  network (demo / CI / no base reachable). NOT offered to the customer as a
+  choice; the first-run picker lists only the three bases.
 
-Just typing `umadev` (no subcommand) launches a Claude Code-style chat
-TUI over the same engine — first launch shows a base picker (language →
-pick a base) that writes `~/.umadev/config.toml`; later launches drop
-straight into the conversation. Slash commands (`/run` `/continue`
-`/revise` `/backend` `/status` `/help` `/clear` `/quit`) live inside the
-chat and mirror the hidden CLI subcommands.
+**The team is a roster of schedulable seats, not hand-coded heuristics.**
+Doing roles (frontend / backend engineer) drive the *main* session
+**serially** (single-writer); reviewing roles (`umadev_agent::critics` —
+PM, architect, designer, QA, security, frontend, backend, DevOps) each run
+on their **own read-only `fork()`ed session** and review **in parallel**,
+returning a structured `RoleVerdict { accepts, blocking, advisory,
+evidence }`. Roles communicate only through the shared **blackboard** (the
+`output/*.md` artifacts + source tree) and their verdicts — never by
+chatting to each other. The director aggregates **deterministically**: the
+deterministic floor (coverage / contract / verify / hard gates) governs
+loop control, critic opinions are advisory only, blocking findings fold
+into one rework directive injected back into the main session, and rework
+is **bounded** by a gap counter + stall counter (see
+`umadev_agent::acceptance` / `coverage`). The team scales with task
+complexity (`*_team_for_kind`): a bugfix convenes no team; a greenfield
+build convenes the full roster.
 
-3.0+ is a complete rebuild from a previous Python implementation; do not
+Just typing `umadev` (no subcommand) launches a chat TUI over the same
+engine — first launch shows a base picker (language → pick a base) that
+writes `~/.umadev/config.toml`; later launches drop straight into the
+conversation. Slash commands (`/run` `/continue` `/revise` `/status`
+`/help` `/clear` `/quit`, etc.) live inside the chat and mirror the hidden
+CLI subcommands.
+
+This is a complete rebuild from a previous Python implementation; do not
 look for `umadev/` or `pyproject.toml` — they are intentionally gone.
 
 ## Build & test

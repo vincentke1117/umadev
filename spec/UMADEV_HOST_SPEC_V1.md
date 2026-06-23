@@ -1,8 +1,8 @@
 # UmaDev Host Specification, Version 1 (UMADEV_HOST_SPEC_V1)
 
 > **Status:** Draft  
-> **Version:** 1.0.0-draft.3  
-> **Date:** 2026-06-22  
+> **Version:** 1.0.0-draft.4  
+> **Date:** 2026-06-23  
 > **Editor:** UmaDev maintainers (`<11964948@qq.com>`)  
 > **License:** MIT  
 
@@ -763,6 +763,103 @@ The reference implementation is one realization. Hosts MAY implement
 this spec independently; conformance is judged by the spec, not by use
 of the reference code.
 
+### 9.3 Continuous-session driving model
+
+The reference implementation drives a base CLI as **one long-lived,
+stateful session** for the lifetime of a run, not as a fresh single-shot
+subprocess per phase. This is a property of the *reference driver*, not a
+new normative clause: every clause in §3–§6 fires identically whether the
+phases are driven over a persistent session or over per-phase single
+shots. The phase chain (`UD-FLOW-001`), the confirmation gates
+(`UD-FLOW-002` / `UD-FLOW-003`), session continuity (`UD-FLOW-006`), and
+the evidence chain (§6) are all defined on the *order of phases and the
+artifacts they leave on disk* — never on the wire mechanism underneath.
+
+In the reference driver the model is this:
+
+- **One session = the directing Agent's working context.** A run opens a
+  single base session, hands it the `research` directive, and then drives
+  the *same* session through `docs`, `spec`, `frontend`, `backend`,
+  `quality`, and `delivery`. The base keeps the accumulated context across
+  phases instead of being re-primed from cold nine times. The confirmation
+  gates (`UD-FLOW-002` / `UD-FLOW-003`) are natural pause points: after a
+  turn completes the driver simply does not send the next directive until
+  the user approves — the session parks with its context intact and resumes
+  on confirmation.
+- **The base does all cognition; the reference shell does only tooling.**
+  Reasoning, research, design, writing code, and review are the base's
+  work, observed as a stream of tool-call and text events. The shell layer
+  is deterministic orchestration: advancing phases, staging gates,
+  enforcing governance at the tool-call boundary, writing the audit chain
+  (`UD-EVID-002`), applying the hard reversibility floor (`UD-FLOW-008`),
+  and running the role-critic team (`UD-FLOW-007`). A run's *truth* is the
+  set of tool calls and the files they leave on disk, not the prose the
+  base narrates — the "no chat-only completion" rule (`UD-ART-006`) is
+  enforced against the filesystem, and runtime evidence (`UD-EVID-006`)
+  proves the result actually boots.
+- **All intents share the session.** A casual question, an ad-hoc
+  read/inspect/small-fix task, and a full pipeline run are not three
+  separate code paths but three ways the directing Agent steers the *same*
+  session. The base classifies which one a turn is and the shell drives
+  accordingly; only work that mutates the workspace takes the single-writer
+  run lock and the full gate machinery, while chat and read-only review do
+  not.
+- **Single-shot is a fail-open fallback.** The per-phase single-shot path
+  (`claude --print` / `codex exec` / `opencode run`) is retained only as a
+  degradation route: when the base session cannot start, when the brain is
+  the offline runtime, or when an operator explicitly opts out. A driver
+  that cannot open a continuous session **MUST** degrade rather than wedge,
+  consistent with the fail-open posture required everywhere else in this
+  spec.
+
+### 9.4 The team-of-roles collaboration model
+
+The role-critic team required by `UD-FLOW-007` is realized in the
+reference implementation as a **full project team led by a directing
+Agent** — the everyday mental model is a project director who does not
+type code, but who decomposes the requirement, schedules a top-tier team
+(product manager, architect, UI/UX designer, frontend, backend, QA,
+security, DevOps), and signs off at each gate. Each seat is a *persona*
+that drives the borrowed base brain from that seat's point of view; none
+is a hand-coded heuristic. The team obeys the four hard invariants of
+`UD-FLOW-007` and is organized along two axes:
+
+- **Doing roles vs. reviewing roles.** Doing roles (the frontend and
+  backend engineers, the PM writing the spec) drive the *main* session
+  **serially**, because writers share one workspace and cannot be
+  parallelized without their implicit decisions colliding. Reviewing roles
+  (PM, architect, designer, QA, security, backend, frontend, DevOps
+  critics) each run on their **own read-only forked session** and therefore
+  review **in parallel** — they never write, so they never conflict.
+- **Communication is a shared blackboard plus structured verdicts, never
+  free-form chat.** Roles do not converse with each other (cross-talk
+  amplifies hallucination and never converges). They exchange exactly two
+  things: the shared blackboard — the artifact files of §5 and the source
+  tree on disk — which doing roles write and reviewing roles read; and the
+  structured verdict each reviewer returns to the director (overall accept
+  plus a list of blocking findings, advisory notes, and concrete
+  evidence). Every verdict is appended to a team ledger as audit-grade
+  evidence alongside the §6 chain.
+- **The director aggregates deterministically and drives bounded rework.**
+  At each gate the director collects the reviewers' verdicts together with
+  the deterministic floor — FR→task coverage, the frontend↔backend contract
+  check (`UD-CODE-003`), the governance scan, the verify/runtime result
+  (`UD-EVID-006`), and the always-on hard gates. Loop control is a pure
+  function of that deterministic floor: a non-deterministic critic opinion
+  is advisory and **MUST NOT** drive termination (`UD-FLOW-007`). Blocking
+  findings are folded into a single rework directive injected back into the
+  main session, the affected artifacts are revised in place
+  (`UD-ART-005` / `UD-FLOW-004`), and the gate is re-staged. Rework is
+  **bounded**: a gap counter plus a stall counter terminate the loop
+  deterministically rather than asking the base whether the result is "good
+  enough."
+- **The team scales with task complexity.** Trivial work (a bugfix or a
+  refactor) convenes no team — the deterministic floor stands alone. A
+  greenfield build convenes the full roster. This keeps the cost of the
+  cross-review proportional to the risk of the change, and matches the
+  lightweight path allowed for simple requirements (the spec profile of
+  §8.4 governs the time-boxed `seeai` variant).
+
 ## 10. Future work (V2 candidates)
 
 Items considered for the V2 promotion to `MUST`:
@@ -794,3 +891,4 @@ The clause-ID prefix space `UD-*` is reserved for this specification.
 | 1.0.0-draft.1 | 2026-05-20 | Initial draft. Layers L1–L4 codified from the in-repo governance core and integration manager. |
 | 1.0.0-draft.2 | 2026-05-22 | §7 host map narrowed to the three official SDK families; §9 rewritten for the Rust reference implementation (three execution modes, TUI). No normative clause changed. |
 | 1.0.0-draft.3 | 2026-06-22 | Promoted shipped capabilities to normative clauses: `UD-FLOW-007` (role-critic team), `UD-FLOW-008` (trust tiers + irreversibility floor), `UD-ART-007` (PR artifact), `UD-EVID-006/007/008` (runtime / deploy / review-report evidence). §9 crate table updated to the ten-crate workspace; manifest `declared_by` synced to `umadev@1.0.x`. |
+| 1.0.0-draft.4 | 2026-06-23 | Added §9.3 (continuous-session driving model) and §9.4 (team-of-roles collaboration model) describing how the reference implementation drives one long-lived base session per run and realizes `UD-FLOW-007` as a director-led team over a shared blackboard. **Non-normative**: no clause added, changed, or renumbered — both sections describe the reference driver and cite only existing clauses. |
