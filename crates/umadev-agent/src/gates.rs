@@ -92,7 +92,12 @@ pub fn classify_reply(reply: &str) -> GateOutcome {
 /// reply-classification home, so the TUI's public wrapper has ONE source of truth.
 #[must_use]
 pub fn claims_code_changes(text: &str) -> bool {
-    // English change verbs.
+    // English change verbs. Matched as substrings (`t.contains(k)`), so a root
+    // covers its inflections: `build` → building/built (kept explicit for clarity),
+    // `wrote` → rewrote, `set up` → "set up the route". The build-loop directive
+    // literally says "build it", so a base answering "I built …/wrote …/scaffolded
+    // …/wired up …" MUST register as a code claim — otherwise the honesty QC + the
+    // source-present hard-gate are skipped over a possibly-hallucinated "done".
     const EN: &[&str] = &[
         "refactor",
         "added",
@@ -108,6 +113,17 @@ pub fn claims_code_changes(text: &str) -> bool {
         "rewrote",
         "replaced",
         "inserted",
+        // The most common "I did the work" verbs — aligned with the /run
+        // directive's own "build it" wording (P1-3).
+        "build", // building / rebuilt / "I'll build" → also "built" (substring)
+        "built",
+        "wrote",
+        "wired",
+        "scaffolded",
+        "generated",
+        "coded",
+        "developed",
+        "set up",
     ];
     // Chinese change verbs (no case folding needed).
     const ZH: &[&str] = &[
@@ -151,6 +167,28 @@ mod tests {
             "Here's how I'd approach it conceptually — nothing touched."
         ));
         assert!(!claims_code_changes("这是我的思路，我先和你确认一下方案"));
+    }
+
+    #[test]
+    fn claims_code_changes_recognises_build_verbs() {
+        // P1-3: the /run directive says "build it", so the base's most common "done"
+        // phrasings ("I built …", "wrote …", "scaffolded …", "wired up …", "set up …")
+        // MUST count as a code claim, or the honesty QC + source-present hard-gate are
+        // skipped over a possibly-hallucinated build.
+        for claim in [
+            "I built the login page and wrote the tests. All done.",
+            "Built the app end to end.",
+            "Scaffolded the project and wired up the routes.",
+            "Generated the API client and coded the form handler.",
+            "Developed the dashboard and set up the auth flow.",
+            "I'll build it now and report back.",
+        ] {
+            assert!(claims_code_changes(claim), "should claim a build: {claim}");
+        }
+        // Still no false positive on a pure plan / discussion (no build verb).
+        assert!(!claims_code_changes(
+            "Let me first discuss the trade-offs of each option before touching anything."
+        ));
     }
 
     #[test]

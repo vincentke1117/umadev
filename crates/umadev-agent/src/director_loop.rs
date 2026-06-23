@@ -89,6 +89,7 @@
 //!    pipeline (`UMADEV_LEGACY_PIPELINE=1`) is untouched.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use umadev_runtime::{ApprovalDecision, BaseSession, SessionEvent, StreamEvent, TurnStatus};
 
@@ -105,6 +106,32 @@ use crate::trust::requires_confirmation;
 /// final say. Mirrors the proven bounded-rework shape (`continuous::MAX_REWORK_ROUNDS`)
 /// at the build level: small + decisive, not an open-ended grind.
 const MAX_QC_ROUNDS: usize = 3;
+
+/// Default idle watchdog window, in seconds, for the director loop's per-event
+/// wait. A base that hangs (stops emitting stdout but never exits) would
+/// otherwise leave [`drive_one_turn`] blocked on `next_event().await` FOREVER —
+/// no `TurnDone`, no settle, the TUI's `thinking` stuck and the queued input
+/// never drained. This is the regression the USB → continuous-session move
+/// introduced: the old single-shot `complete_streaming` path had exactly this
+/// watchdog (`umadev-host` keys the same env). 300s (5 min) is generous enough
+/// that a legitimately-long streaming compile/test turn survives as long as it
+/// emits ANY output (every event resets the timer), but a true hang settles.
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// The idle watchdog window for one `next_event().await`, from
+/// `UMADEV_IDLE_TIMEOUT_SECS` (the SAME env the single-shot host watchdog reads —
+/// `umadev_host`), falling back to [`DEFAULT_IDLE_TIMEOUT_SECS`]. A non-positive /
+/// unparseable value falls back to the default (fail-open: a bad env never
+/// disables the watchdog, which would re-introduce the permanent hang). Read once
+/// per turn at the app boundary, not per wait, so a mid-turn env flip can't race.
+fn idle_timeout() -> Duration {
+    let secs = std::env::var("UMADEV_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 /// How the director loop settled. Mirrors the caller's existing director outcome but
 /// lives in the agent crate so both the CLI and the TUI share ONE loop.
@@ -145,6 +172,21 @@ pub async fn drive_director_loop(
     events: &Arc<dyn EventSink>,
     first_directive: String,
 ) -> DirectorLoopOutcome {
+    // Read the idle watchdog window ONCE at the boundary (not per-wait), so a
+    // mid-run env flip can't race the in-flight turns. Threaded into every turn.
+    drive_director_loop_with_idle(session, options, events, first_directive, idle_timeout()).await
+}
+
+/// [`drive_director_loop`] with an explicit idle window — the env read is hoisted
+/// to the public wrapper so this core is deterministic (the test drives it with a
+/// tiny window, no process-env mutation / race).
+async fn drive_director_loop_with_idle(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    first_directive: String,
+    idle: Duration,
+) -> DirectorLoopOutcome {
     let mut next_directive = first_directive;
     let mut last_reply = String::new();
 
@@ -152,7 +194,7 @@ pub async fn drive_director_loop(
         // 1. Drive ONE end-to-end base turn (build, or fix-the-QC-findings). The
         //    base runs its own agentic tool loop (PM→…→QA internally) and writes
         //    real files under the run-lock the caller holds (single-writer).
-        let turn = match drive_one_turn(session, options, events, next_directive).await {
+        let turn = match drive_one_turn(session, options, events, next_directive, idle).await {
             Ok(t) => t,
             Err(reason) => return DirectorLoopOutcome::Failed(reason),
         };
@@ -211,16 +253,39 @@ async fn drive_one_turn(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     directive: String,
+    idle: Duration,
 ) -> Result<TurnResult, String> {
     if let Err(e) = session.send_turn(directive).await {
         return Err(format!("session send: {e}"));
     }
     let mut text = String::new();
     loop {
-        let Some(ev) = session.next_event().await else {
-            // `None` = the session ended (process dead / EOF). Per the BaseSession
-            // contract, treat as a failed turn — fail-open, no panic.
-            return Err("base session ended mid-turn".to_string());
+        // Idle watchdog (P1-2): a base that HANGS (stops emitting stdout but never
+        // exits) would leave `next_event()` blocked forever — no `TurnDone`, no
+        // settle, `thinking` stuck. So bound each wait by `idle`; ANY event resets
+        // it (a legitimately-long streaming compile/test turn stays alive as long
+        // as it emits output), but pure silence past the window settles the turn as
+        // a Failed outcome — fail-open, never a permanent wedge. The session driver
+        // is a pure relay by design (no internal timeout), so the watchdog lives
+        // here, the one place both the CLI and TUI director paths flow through.
+        let ev = match tokio::time::timeout(idle, session.next_event()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => {
+                // `None` = the session ended (process dead / EOF). Per the
+                // BaseSession contract, treat as a failed turn — fail-open, no panic.
+                return Err("base session ended mid-turn".to_string());
+            }
+            Err(_) => {
+                // No event within the idle window → the base is hung. Settle as a
+                // Failed outcome so the loop ends and `thinking` clears, rather than
+                // blocking forever. Best-effort interrupt to release the child.
+                let _ = session.interrupt().await;
+                return Err(format!(
+                    "base went idle — no output for {}s (possible hang); settled. \
+                     Set UMADEV_IDLE_TIMEOUT_SECS to adjust.",
+                    idle.as_secs()
+                ));
+            }
         };
         match ev {
             SessionEvent::TextDelta(delta) => {
@@ -378,6 +443,31 @@ async fn run_auto_qc(
         return QcReport { blocking };
     }
 
+    // CONTENT GOVERNANCE (P1-1): scan what the base actually wrote for the
+    // universal "always wrong" floor (emoji-as-icon, hardcoded colors, AI-slop,
+    // swallowed errors, …). For `claude-code` the real-time PreToolUse hook
+    // already screened every write, so this is skipped to avoid a double scan; for
+    // codex / opencode (no hook, `realtime_governance == false`) this is the ONLY
+    // content-governance pass — without it their `/run` writes were NEVER scanned.
+    // The scan is CONTEXT-AWARE (`governance_scan` derives a `ProjectContext`), so
+    // a clean static page is governed leniently (no false "missing CSP" on a page
+    // that serves none). It runs BEFORE the lean short-circuit so even the lean
+    // fast path keeps this moat — only the duplicate build + fork review are
+    // skipped for a lean goal, never the content floor. Fail-open: a clean / empty
+    // scan contributes nothing, an unreadable file is skipped.
+    if !crate::continuous::backend_has_realtime_governance(&options.backend) {
+        let violations = crate::continuous::governance_scan(options);
+        if !violations.is_empty() {
+            events.emit(EngineEvent::Note(format!(
+                "team · content governance flagged {} issue(s) in what the base wrote",
+                violations.len()
+            )));
+            for v in violations {
+                blocking.push(format!("[governance] {v}"));
+            }
+        }
+    }
+
     // LEAN TIER: for a small, clearly-lean goal (a todo/记账 single page, a bug fix,
     // a refactor — `planner::is_lean_build`) the heavy half of QC is pure overhead
     // over a base that already ran its own build inside its turn:
@@ -388,10 +478,13 @@ async fn run_auto_qc(
     //     handshakes + full judge round-trips) — which for these kinds is ALREADY
     //     an empty team (`quality_team_for_kind` → `Vec::new()`), so it can only
     //     ever return "no blocking" anyway.
-    // So for the lean tier we stop at the honesty hard floor: source present ⇒
-    // clean. The objective source-present floor still ran (above), governance still
-    // rode every write, and the heavyweight tiers below are untouched. This is the
-    // single change that brings a simple page close to "the base just did it".
+    // So for the lean tier we stop after the honesty hard floor + the content
+    // governance scan: source present + no governance violation ⇒ clean. The
+    // objective source-present floor AND the context-aware content governance both
+    // ran above (the latter is the moat — kept even on the lean path); only the
+    // duplicate build + fork review are skipped here. The heavyweight tiers below
+    // are untouched. This is the single change that brings a simple page close to
+    // "the base just did it" without dropping the content floor.
     // Fail-open + safe: `is_lean_build` only fires on a clearly-lean classification
     // (an unrecognised / real-product goal stays heavyweight), so a real product is
     // never under-checked by accident.
@@ -766,6 +859,96 @@ mod tests {
         );
     }
 
+    /// A session that HANGS: `send_turn` succeeds, but `next_event` never resolves
+    /// (it returns a future that stays `Pending` forever) — the real "base wrote
+    /// nothing and never exits" hang the idle watchdog must catch.
+    struct HangingSession;
+
+    #[async_trait::async_trait]
+    impl BaseSession for HangingSession {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Err(SessionError::ForkUnsupported("hang".into()))
+        }
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            // Never resolves — simulate a base that hangs holding the pipe open.
+            std::future::pending::<()>().await;
+            None
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_watchdog_settles_a_hung_base_as_failed() {
+        // P1-2: a base that hangs (no output, never exits) must NOT block the
+        // director loop forever — the idle watchdog settles it as a Failed outcome.
+        // Drive the deterministic core directly with a tiny window (no process-env
+        // mutation, so nothing to race), keeping the real wait at ~100ms.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let mut sess = HangingSession;
+        let o = opts(tmp.path());
+        let outcome = drive_director_loop_with_idle(
+            &mut sess,
+            &o,
+            &events,
+            "GO".to_string(),
+            Duration::from_millis(100),
+        )
+        .await;
+        if let DirectorLoopOutcome::Failed(reason) = outcome {
+            assert!(
+                reason.contains("idle"),
+                "a hung base settles as an idle Failed: {reason}"
+            );
+        } else {
+            panic!("expected a Failed (idle) outcome, got {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn idle_timeout_reads_env_and_falls_back_safely() {
+        let prior = std::env::var_os("UMADEV_IDLE_TIMEOUT_SECS");
+        // A valid positive value is honoured.
+        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "42");
+        assert_eq!(idle_timeout(), Duration::from_secs(42));
+        // A non-positive / garbage value falls back to the default (fail-open: a
+        // bad env never DISABLES the watchdog, which would re-open the hang).
+        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "0");
+        assert_eq!(
+            idle_timeout(),
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+        );
+        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "nonsense");
+        assert_eq!(
+            idle_timeout(),
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+        );
+        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
+        assert_eq!(
+            idle_timeout(),
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+        );
+        match prior {
+            Some(v) => std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS"),
+        }
+    }
+
     // ── Auto-QC units ─────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -779,6 +962,91 @@ mod tests {
         let o = opts(tmp.path());
         let qc = run_auto_qc(&mut sess, &o, &events).await;
         assert!(qc.is_clean(), "source present + nothing to fail → clean QC");
+    }
+
+    /// A codex-tier `RunOptions` — a non-claude backend (no real-time governance
+    /// hook), so the director auto-QC must run the content-governance catch-up.
+    fn codex_opts(root: &std::path::Path) -> RunOptions {
+        let mut o = opts(root);
+        o.backend = "codex".to_string();
+        o
+    }
+
+    #[tokio::test]
+    async fn auto_qc_governs_codex_writes_and_blocks_on_emoji_icon() {
+        // P1-1: codex / opencode have NO real-time hook, so the director QC pass is
+        // their ONLY content-governance gate. A file the base wrote using an emoji
+        // as a functional icon must surface as a `[governance]` blocking finding,
+        // which the loop folds into a fix directive.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A clean source so the source-present floor passes, plus a button that uses
+        // an emoji as its icon (a universal-floor violation, context-independent).
+        std::fs::write(
+            tmp.path().join("button.tsx"),
+            "export const Btn = () => <button>\u{1F680} Launch</button>;",
+        )
+        .unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = codex_opts(tmp.path());
+        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        assert!(
+            !qc.is_clean(),
+            "an emoji-as-icon write by codex must be governed: {:?}",
+            qc.blocking
+        );
+        assert!(
+            qc.blocking.iter().any(|b| b.starts_with("[governance]")),
+            "the finding is tagged [governance]: {:?}",
+            qc.blocking
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_qc_skips_governance_for_claude_realtime_hook() {
+        // claude-code installs a real-time PreToolUse hook that already screened
+        // every write, so the director QC must NOT re-scan (no double governance).
+        // The SAME emoji file that blocks codex is clean here because the catch-up
+        // is skipped for a real-time-governed base.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("button.tsx"),
+            "export const Btn = () => <button>\u{1F680} Launch</button>;",
+        )
+        .unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".to_string();
+        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        assert!(
+            qc.is_clean(),
+            "claude's real-time hook already governed; QC must not double-scan: {:?}",
+            qc.blocking
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_qc_governance_does_not_falsely_flag_a_clean_static_page() {
+        // Context-aware: a clean static frontend page (codex backend) must NOT be
+        // flagged for a missing server-surface rule (CSP / HSTS / structured log) —
+        // it serves none. A benign HTML page → clean QC even on the governed path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("index.html"),
+            "<!doctype html><html><body><h1>Hello</h1><p>A static page.</p></body></html>",
+        )
+        .unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let mut o = codex_opts(tmp.path());
+        o.requirement = "做一个简单的静态介绍页,纯前端".to_string();
+        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        assert!(
+            qc.is_clean(),
+            "a clean static page must not be falsely flagged: {:?}",
+            qc.blocking
+        );
     }
 
     #[tokio::test]

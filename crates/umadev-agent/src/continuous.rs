@@ -901,7 +901,7 @@ async fn governance_catchup(
 /// base writes ungoverned in real time and needs the post-hoc
 /// [`governance_catchup`]. Deterministic + host-free (matches the
 /// `realtime_governance` capability the host crate reports for these bases).
-fn backend_has_realtime_governance(backend: &str) -> bool {
+pub(crate) fn backend_has_realtime_governance(backend: &str) -> bool {
     backend.eq_ignore_ascii_case("claude-code")
 }
 
@@ -909,7 +909,7 @@ fn backend_has_realtime_governance(backend: &str) -> bool {
 /// list of `"<rel>: <reason> (<clause>)"` violation strings. Empty = clean. Pure
 /// and fail-open: an unreadable file is skipped, never a panic. Shared by the
 /// catch-up rework loop (which reads it twice) and the critic floor.
-fn governance_scan(options: &RunOptions) -> Vec<String> {
+pub(crate) fn governance_scan(options: &RunOptions) -> Vec<String> {
     let policy = umadev_governance::Policy::load(&options.project_root);
     let ctx = project_context_for(options);
     let mut out = Vec::new();
