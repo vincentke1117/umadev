@@ -2218,6 +2218,51 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
             // A "thinking" pulse carries no content — don't spam the log with it.
             umadev_runtime::StreamEvent::Thinking => {}
         },
+        // Wave-1 director surface on the CLI: route decision, owned plan, step
+        // progress, and team verdicts — so `umadev run` from a terminal also SEES
+        // the director think, plan, and review (the TUI renders these as cards).
+        EngineEvent::IntentDecided {
+            class,
+            depth,
+            team,
+            rationale,
+            ..
+        } => {
+            let who = if team.is_empty() {
+                String::new()
+            } else {
+                format!(" · team: {}", team.join(", "))
+            };
+            eprintln!("◆ intent: {class} ({depth}){who} — {rationale}");
+        }
+        EngineEvent::PlanPosted { steps, done, total } => {
+            eprintln!("◆ plan ({done}/{total}):");
+            for s in steps {
+                eprintln!("    [ ] {s}");
+            }
+        }
+        EngineEvent::PlanStepStatus { id, title, status } => {
+            let mark = match status.as_str() {
+                "done" => "✓",
+                "active" => "~",
+                "blocked" => "!",
+                _ => " ",
+            };
+            eprintln!("  [{mark}] {id} {title}");
+        }
+        EngineEvent::CriticVerdict {
+            seat,
+            accepts,
+            blocking,
+            ..
+        } => {
+            if *accepts {
+                eprintln!("  [{seat}] ✓ accepts");
+            } else {
+                let first = blocking.first().map_or("", String::as_str);
+                eprintln!("  [{seat}] ✗ {} must-fix: {first}", blocking.len());
+            }
+        }
         _ => {}
     }
     let _ = std::io::stderr().flush();
@@ -2480,6 +2525,14 @@ async fn drive_director_run(
     // orchestrates with its team however it judges fit (no fixed phase checklist).
     let directive = umadev_agent::experts::director_build_directive(&options.requirement);
 
+    // Wave 1: `/run` is an EXPLICIT build — route it (Tier-0 is enough; the intent
+    // is already known to be a build, so we skip the Tier-1 fork latency and pass
+    // `None`) so the director emits a visible intent card AND synthesizes the owned
+    // plan/checklist. The route classifies the kind + sizes the team; the plan loop
+    // makes the director legible instead of a silent mega-turn. Fail-open: routing
+    // is deterministic and never blocks.
+    let route = umadev_agent::router::route(None, options, &options.requirement).await;
+
     // USB model (no marker protocol): drive the goal through the director build
     // loop — the firmware (team identity + craft) is injected, the base's body
     // builds the goal end to end with its OWN tools (the team lives in its head),
@@ -2487,7 +2540,15 @@ async fn drive_director_run(
     // back as a bounded fix directive the base acts on. Every floor invariant
     // (single-writer, governance, advisory review, fail-open) is preserved inside
     // the loop; the objective source-present hard-gate runs HERE, unchanged.
-    let reply = match umadev_agent::drive_director_loop(session, options, events, directive).await {
+    let reply = match umadev_agent::drive_director_loop_routed(
+        session,
+        options,
+        events,
+        directive,
+        Some(&route),
+    )
+    .await
+    {
         DirectorLoopOutcome::Done { reply } => reply,
         // A session that died / a turn that failed is an honest hard stop (never
         // disguised as a build).

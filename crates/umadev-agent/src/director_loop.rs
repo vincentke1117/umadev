@@ -310,9 +310,12 @@ async fn synthesize_and_post_plan(
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
 ) -> Option<Plan> {
-    // Only a deliberate (plan-worthy) route warrants a plan — a fast chat / quick
-    // edit needs no DAG (and would just pay a fork round-trip for nothing).
-    if !route.depth.is_deliberate() {
+    // A plan is warranted whenever there's a BUILD to make visible — every Build
+    // route, even a lean single-page one, gets a (proportionally short) plan so the
+    // user SEES the director think, not just a deliberate/deep one. A fast chat /
+    // explain / quick-edit needs no DAG (and would just pay a fork round-trip for
+    // nothing).
+    if !(matches!(route.class, crate::router::RouteClass::Build) || route.depth.is_deliberate()) {
         return None;
     }
     let plan = plan_state::synthesize_plan(session, options, &options.requirement, route).await?;
