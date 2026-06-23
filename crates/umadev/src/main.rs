@@ -4556,7 +4556,12 @@ mod tests {
         use umadev_runtime::{SessionEvent, TurnStatus};
         let tmp = tempfile::TempDir::new().unwrap();
         let seeded = tmp.path().join("App.tsx");
-        std::fs::write(seeded, "export const App = () => null;\n").unwrap();
+        // Genuinely clean content (no emoji/color/craft violation) so the QC
+        // governance scan — which now runs for EVERY backend, claude included —
+        // returns empty and the build settles `Done` in one turn. A craft nit here
+        // would (correctly) trigger the fix loop, which this single-turn fake
+        // session can't satisfy.
+        std::fs::write(seeded, "export const APP_NAME = \"ledger\";\n").unwrap();
         let opts = director_test_opts(tmp.path());
         let sink: Arc<dyn umadev_agent::EventSink> =
             Arc::new(umadev_agent::RecordingSink::default());

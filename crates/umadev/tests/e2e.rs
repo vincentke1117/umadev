@@ -487,15 +487,30 @@ fn run_hook_pre_write(payload: &str, govern_root: Option<&Path>) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// `umadev hook pre-write` blocks emoji writes (UD-CODE-001) WHEN UmaDev is
-/// driving the run (the governance scope is set).
+/// `umadev hook pre-write` blocks the IRREVERSIBLE floor (a leaked secret,
+/// UD-SEC-003) WHEN UmaDev is driving the run — but defers craft nits (emoji) to
+/// the post-write QC scan so the base can produce the file at all.
 #[test]
-fn hook_pre_write_blocks_emoji() {
+fn hook_pre_write_blocks_the_irreversible_floor_but_defers_craft() {
     let tmp = TempDir::new().unwrap();
-    let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
-    let s = run_hook_pre_write(payload, Some(tmp.path()));
-    assert!(s.contains("deny"), "emoji must be denied: {s}");
-    assert!(s.contains("emoji"), "must cite emoji violation: {s}");
+    // A craft nit (emoji) is ALLOWED through — the QC scan repairs it; blocking
+    // the write here once left the base unable to recover (zero output).
+    let emoji = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
+    let s = run_hook_pre_write(emoji, Some(tmp.path()));
+    assert!(
+        s.contains("allow"),
+        "emoji craft nit must be deferred, not denied: {s}"
+    );
+    // A leaked secret is irreversible-if-written — it MUST be denied at the write.
+    let secret = format!(
+        r#"{{"tool_name":"Write","tool_input":{{"file_path":"src/cfg.ts","content":"const k=\"sk_live_4eC39H{}\";"}}}}"#,
+        "qLyjWDarjtT1zdp7dcABCDEFGH"
+    );
+    let s2 = run_hook_pre_write(&secret, Some(tmp.path()));
+    assert!(
+        s2.contains("deny"),
+        "a leaked secret must be denied at the write: {s2}"
+    );
 }
 
 /// Self-limit: with NO governance scope (the user is driving the base directly,

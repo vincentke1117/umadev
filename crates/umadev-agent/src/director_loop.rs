@@ -443,28 +443,30 @@ async fn run_auto_qc(
         return QcReport { blocking };
     }
 
-    // CONTENT GOVERNANCE (P1-1): scan what the base actually wrote for the
-    // universal "always wrong" floor (emoji-as-icon, hardcoded colors, AI-slop,
-    // swallowed errors, …). For `claude-code` the real-time PreToolUse hook
-    // already screened every write, so this is skipped to avoid a double scan; for
-    // codex / opencode (no hook, `realtime_governance == false`) this is the ONLY
-    // content-governance pass — without it their `/run` writes were NEVER scanned.
-    // The scan is CONTEXT-AWARE (`governance_scan` derives a `ProjectContext`), so
-    // a clean static page is governed leniently (no false "missing CSP" on a page
-    // that serves none). It runs BEFORE the lean short-circuit so even the lean
-    // fast path keeps this moat — only the duplicate build + fork review are
-    // skipped for a lean goal, never the content floor. Fail-open: a clean / empty
-    // scan contributes nothing, an unreadable file is skipped.
-    if !crate::continuous::backend_has_realtime_governance(&options.backend) {
-        let violations = crate::continuous::governance_scan(options);
-        if !violations.is_empty() {
-            events.emit(EngineEvent::Note(format!(
-                "team · content governance flagged {} issue(s) in what the base wrote",
-                violations.len()
-            )));
-            for v in violations {
-                blocking.push(format!("[governance] {v}"));
-            }
+    // CONTENT GOVERNANCE: scan what the base actually wrote for craft/quality
+    // violations (emoji-as-icon, hardcoded colors, missing a11y, AI-slop,
+    // swallowed errors, …). This is now the PRIMARY craft-enforcement pass for
+    // EVERY backend. The real-time PreToolUse hook (claude only) deliberately no
+    // longer blocks these — it screens just the irreversible-if-written floor
+    // (a leaked secret / sensitive path), so the base's body is never pinned
+    // mid-write for a fixable nit (which once left it producing ZERO output). The
+    // craft is instead caught HERE and repaired by the feedback loop: the base
+    // wrote the file, UmaDev reads it, folds violations into the fix directive,
+    // and the base edits. Runs for all backends (claude included now). It is
+    // CONTEXT-AWARE (`governance_scan` derives a `ProjectContext`), so a clean
+    // static page is governed leniently (no false "missing CSP" on a page that
+    // serves none). It runs BEFORE the lean short-circuit so even the lean fast
+    // path keeps this moat — only the duplicate build + fork review are skipped
+    // for a lean goal, never the craft floor. Fail-open: a clean / empty scan
+    // contributes nothing, an unreadable file is skipped.
+    let violations = crate::continuous::governance_scan(options);
+    if !violations.is_empty() {
+        events.emit(EngineEvent::Note(format!(
+            "team · content governance flagged {} issue(s) in what the base wrote",
+            violations.len()
+        )));
+        for v in violations {
+            blocking.push(format!("[governance] {v}"));
         }
     }
 
@@ -1003,11 +1005,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_qc_skips_governance_for_claude_realtime_hook() {
-        // claude-code installs a real-time PreToolUse hook that already screened
-        // every write, so the director QC must NOT re-scan (no double governance).
-        // The SAME emoji file that blocks codex is clean here because the catch-up
-        // is skipped for a real-time-governed base.
+    async fn auto_qc_governs_craft_for_claude_too() {
+        // The claude real-time hook no longer screens CRAFT (it now refuses only the
+        // irreversible-if-written floor — secrets/paths — so it never pins the
+        // base's hands for a fixable nit). So the QC content-governance scan is the
+        // craft moat for EVERY backend, claude included: the same emoji-as-icon file
+        // that codex's QC flags must be flagged here too, then repaired by the
+        // feedback loop.
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("button.tsx"),
@@ -1020,8 +1024,13 @@ mod tests {
         o.backend = "claude-code".to_string();
         let qc = run_auto_qc(&mut sess, &o, &events).await;
         assert!(
-            qc.is_clean(),
-            "claude's real-time hook already governed; QC must not double-scan: {:?}",
+            !qc.is_clean(),
+            "an emoji-as-icon write must be governed by QC even on claude: {:?}",
+            qc.blocking
+        );
+        assert!(
+            qc.blocking.iter().any(|b| b.starts_with("[governance]")),
+            "the finding is tagged [governance]: {:?}",
             qc.blocking
         );
     }

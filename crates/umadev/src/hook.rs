@@ -179,7 +179,21 @@ fn run_pre_write_scoped(
     // `ProjectContext::unknown()` (full strictness), and even under a static
     // context any file with its own server evidence is still governed normally.
     let project_ctx = load_project_context(file_path);
-    umadev_governance::scan_content_with_context(file_path, content, policy, project_ctx)
+    let decision =
+        umadev_governance::scan_content_with_context(file_path, content, policy, project_ctx);
+    // Governance is a SAFETY NET, not a gate on the base's hands. The product's
+    // architecture: UmaDev directs the base's body to do the work — it must not
+    // pin the base's hands mid-write for a fixable nit. Only the
+    // irreversible-if-written floor (a leaked secret/credential in committed
+    // source) blocks the WRITE here. Every craft/quality/security-config defect
+    // (a11y, emoji-icon, hardcoded color, missing CSP, injection, …) is allowed
+    // through and repaired by the post-write QC feedback loop instead — so a
+    // single a11y or emoji nit can never stop the base from creating the file at
+    // all (which previously left it unable to recover, producing ZERO output).
+    if decision.block && !umadev_governance::is_irreversible_write_floor(&decision.clause) {
+        return Decision::pass();
+    }
+    decision
 }
 
 /// Resolve the run's governance [`ProjectContext`] for the file being written.
@@ -578,19 +592,37 @@ mod tests {
     }
 
     #[test]
-    fn pre_write_blocks_emoji() {
-        let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
-        let d = pre_write(payload);
-        assert!(d.block);
-        assert_eq!(d.clause, "UD-CODE-001");
+    fn pre_write_allows_craft_violations_deferred_to_qc() {
+        // The write hook is a SAFETY NET, not a gate on the base's hands: a craft
+        // nit (emoji-as-icon UD-CODE-001, hardcoded color UD-CODE-002) is ALLOWED
+        // through so the base can produce the file at all — the post-write QC
+        // governance scan catches it and the base fixes it. (Blocking the write
+        // here once left the base unable to recover, producing ZERO output.)
+        let emoji = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
+        assert!(
+            !pre_write(emoji).block,
+            "emoji craft nit must not block the write"
+        );
+        let color = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Card.tsx","content":"color:#9333ea"}}"#;
+        assert!(
+            !pre_write(color).block,
+            "hardcoded color must not block the write"
+        );
     }
 
     #[test]
-    fn pre_write_blocks_color() {
-        let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Card.tsx","content":"color:#9333ea"}}"#;
-        let d = pre_write(payload);
-        assert!(d.block);
-        assert_eq!(d.clause, "UD-CODE-002");
+    fn pre_write_blocks_the_irreversible_floor() {
+        // The one thing the write hook DOES refuse: an irreversible-if-written
+        // violation — a secret/credential leaked into committed source (UD-SEC-003).
+        // Once on disk + in git it cannot be un-leaked, so it must be stopped before
+        // the write, not deferred to QC.
+        let secret = concat!(
+            r#"{"tool_name":"Write","tool_input":{"file_path":"src/cfg.ts","content":"const k = \"sk_live_4eC39H"#,
+            r#"qLyjWDarjtT1zdp7dcABCDEFGH\";"}}"#
+        );
+        let d = pre_write(secret);
+        assert!(d.block, "a leaked secret must block the write");
+        assert!(umadev_governance::is_irreversible_write_floor(&d.clause));
     }
 
     #[test]
@@ -615,10 +647,18 @@ mod tests {
 
     #[test]
     fn pre_write_uses_new_string_for_edit() {
-        let payload =
-            r#"{"tool_name":"Edit","tool_input":{"file_path":"src/Btn.tsx","new_string":"🚀"}}"#;
+        // Prove the Edit path scans `new_string` — use an irreversible-floor
+        // violation (a leaked secret) so it still blocks; a craft nit would now be
+        // allowed through and couldn't distinguish "scanned" from "ignored".
+        let payload = concat!(
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"src/Btn.tsx","new_string":"const k=\"sk_live_4eC39H"#,
+            r#"qLyjWDarjtT1zdp7dcABCDEFGH\";"}}"#
+        );
         let d = pre_write(payload);
-        assert!(d.block);
+        assert!(
+            d.block,
+            "Edit must scan new_string (secret here must block)"
+        );
     }
 
     #[test]
@@ -891,14 +931,28 @@ mod tests {
     }
 
     #[test]
-    fn strict_context_still_blocks_csp_on_index_html() {
-        // Same project but proven a NON-static (unknown->strict) context: the
-        // surface rule fires, proving the leniency is context-gated, not blanket.
-        let (_tmp, root) = project_with_context(false);
+    fn surface_rules_never_block_the_write_even_under_strict_context() {
+        // A surface/craft rule (CSP/clickjacking) is NOT irreversible-if-written:
+        // the write hook lets it through on ANY context (the post-write QC scan
+        // catches it). This is the architecture fix — the hook only refuses the
+        // irreversible floor, never pins the base's hands for a fixable nit.
+        let (_tmp, root) = project_with_context(false); // strict context
         let file = root.join("index.html");
         let d = pre_write_in(&write_payload(&file, &static_html()), &root);
-        assert!(d.block, "strict context must keep CSP/clickjacking on");
-        assert!(d.clause == "UD-ARCH-013" || d.clause == "UD-ARCH-046");
+        assert!(
+            !d.block,
+            "a surface rule must be deferred to QC, never block the write: {}",
+            d.reason
+        );
+    }
+
+    /// A leaked secret/credential — the irreversible-if-written floor — built at
+    /// runtime so this source file carries no contiguous key.
+    fn secret_content() -> String {
+        format!(
+            "const k = \"sk_live_4eC39H{}\";",
+            "qLyjWDarjtT1zdp7dcABCDEFGH"
+        )
     }
 
     #[test]
@@ -924,81 +978,65 @@ mod tests {
     }
 
     #[test]
-    fn server_evidence_file_still_triggers_under_static_context() {
-        // Even with a static-frontend project context on disk, a file that boots
-        // a server re-arms the surface rules (the per-file override from #13).
-        let (_tmp, root) = project_with_context(true);
-        let listen = format!("{}.{}(3000)", "app", "listen");
-        let server = format!("const app = express(); app.use(cors()); {listen};");
-        let d = pre_write_in(&write_payload(&root.join("server.ts"), &server), &root);
+    fn irreversible_floor_blocks_regardless_of_context() {
+        // The irreversible floor (a leaked secret) blocks the write under EVERY
+        // context resolution — proven static, missing file, malformed JSON, empty
+        // object — because a credential in committed source can never be un-leaked.
+        // This is the one safety guarantee the write hook still enforces.
+        let secret = secret_content();
+
+        // (a) proven static-frontend context
+        let (_t1, r1) = project_with_context(true);
         assert!(
-            d.block,
-            "a file with server evidence must be governed even under a static context"
+            pre_write_in(&write_payload(&r1.join("cfg.js"), &secret), &r1).block,
+            "secret must block under a static context"
         );
-    }
 
-    #[test]
-    fn missing_context_file_defaults_to_strict() {
-        // Project root exists (has a .umadev/) but NO governance-context.json --
-        // the hook must fall back to the conservative strict default and still
-        // fire the surface rule, never silently relax governance.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        std::fs::create_dir_all(root.join(".umadev")).unwrap();
-        let d = pre_write_in(
-            &write_payload(&root.join("index.html"), &static_html()),
-            &root,
-        );
+        // (b) project root with .umadev/ but NO context file → strict default
+        let t2 = tempfile::TempDir::new().unwrap();
+        let r2 = std::fs::canonicalize(t2.path()).unwrap();
+        std::fs::create_dir_all(r2.join(".umadev")).unwrap();
         assert!(
-            d.block,
-            "a missing context file must default to strict governance"
+            pre_write_in(&write_payload(&r2.join("cfg.js"), &secret), &r2).block,
+            "secret must block when the context file is missing"
         );
-    }
 
-    #[test]
-    fn malformed_context_file_defaults_to_strict() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let dir = root.join(".umadev");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("governance-context.json"), "{ not json").unwrap();
-        let d = pre_write_in(
-            &write_payload(&root.join("index.html"), &static_html()),
-            &root,
-        );
+        // (c) malformed context JSON → strict default
+        let t3 = tempfile::TempDir::new().unwrap();
+        let r3 = std::fs::canonicalize(t3.path()).unwrap();
+        std::fs::create_dir_all(r3.join(".umadev")).unwrap();
+        std::fs::write(r3.join(".umadev/governance-context.json"), "{ not json").unwrap();
         assert!(
-            d.block,
-            "malformed context JSON must default to strict governance"
+            pre_write_in(&write_payload(&r3.join("cfg.js"), &secret), &r3).block,
+            "secret must block when the context JSON is malformed"
+        );
+
+        // (d) empty `{}` context object → strict default
+        let t4 = tempfile::TempDir::new().unwrap();
+        let r4 = std::fs::canonicalize(t4.path()).unwrap();
+        std::fs::create_dir_all(r4.join(".umadev")).unwrap();
+        std::fs::write(r4.join(".umadev/governance-context.json"), "{}").unwrap();
+        assert!(
+            pre_write_in(&write_payload(&r4.join("cfg.js"), &secret), &r4).block,
+            "secret must block under an empty context object"
         );
     }
 
     #[test]
-    fn empty_context_object_defaults_to_strict() {
-        // `{}` (missing field) must deserialize to the strict default via the
-        // field's serde(default) -- never an accidental skip.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let dir = root.join(".umadev");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("governance-context.json"), "{}").unwrap();
-        let d = pre_write_in(
-            &write_payload(&root.join("index.html"), &static_html()),
-            &root,
-        );
-        assert!(d.block, "an empty context object must default to strict");
-    }
-
-    #[test]
-    fn floor_rules_block_under_static_context() {
-        // The always-wrong floor (emoji) is context-independent: even a proven
-        // static frontend cannot write an emoji into a source file.
+    fn craft_floor_is_deferred_to_qc_not_blocked_at_write() {
+        // The always-wrong CRAFT floor (emoji) is NOT irreversible: even though the
+        // scan still finds it, the write hook lets it through so the base can
+        // produce the file — the post-write QC governance scan repairs it. (This is
+        // the inverse of the old behavior, where emoji blocked the write.)
         let (_tmp, root) = project_with_context(true);
         let d = pre_write_in(
             &write_payload(&root.join("app.js"), "const x = '\u{1F680}';"),
             &root,
         );
-        assert!(d.block, "the emoji floor fires under any context");
-        assert_eq!(d.clause, "UD-CODE-001");
+        assert!(
+            !d.block,
+            "an emoji craft nit must be deferred to QC, not block the write"
+        );
     }
 
     #[test]

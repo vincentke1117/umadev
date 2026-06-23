@@ -439,6 +439,31 @@ fn is_server_surface_rule(check: fn(&str, &str) -> Decision) -> bool {
         .any(|f| std::ptr::fn_addr_eq(*f, check))
 }
 
+/// Whether a clause belongs to the **irreversible-if-written floor** — the only
+/// violations the real-time WRITE hook refuses outright.
+///
+/// The governing principle (the product's "USB" architecture): UmaDev borrows
+/// the base's brain to think and directs the base's *body* to do the work; it
+/// must NOT pin the base's hands mid-write for a fixable nit. A leaked
+/// secret/credential committed into source, a write into a sensitive path, or a
+/// destructive shell command is **irreversible** — those must be stopped before
+/// they happen. Every *other* governed defect (a11y, emoji-icon, hardcoded
+/// color, injection, security-config, craft) is **fixable after the file
+/// exists**, so the base is allowed to produce it and the post-write QC feedback
+/// loop repairs it. This is what keeps a single a11y/emoji nit from blocking the
+/// write entirely and leaving the base unable to recover (producing nothing).
+///
+/// `UD-SEC-001` sensitive path · `UD-SEC-002` dangerous bash · `UD-SEC-003`
+/// hardcoded secret · `UD-SEC-018` plaintext password · `UD-SEC-026` client
+/// secret leak.
+#[must_use]
+pub fn is_irreversible_write_floor(clause: &str) -> bool {
+    matches!(
+        clause,
+        "UD-SEC-001" | "UD-SEC-002" | "UD-SEC-003" | "UD-SEC-018" | "UD-SEC-026"
+    )
+}
+
 /// File extensions guarded by the emoji rule (UD-CODE-001).
 const EMOJI_GUARDED_EXTS: &[&str] = &[
     "tsx", "ts", "jsx", "js", "mjs", "cjs", "vue", "svelte", "astro", "html", "htm", "css", "scss",
