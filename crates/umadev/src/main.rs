@@ -919,12 +919,82 @@ fn cmd_hook(check: String) -> Result<()> {
     let _ = std::io::stdin().read_to_string(&mut stdin);
     // Load the per-project policy from .umadev/rules.toml (fail-open default).
     let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let policy = umadev_governance::Policy::load(&project_root);
-    let decision = match check.as_str() {
+
+    // ── P0-1: fail-open is a HARD CONTRACT, not a hope ────────────────────
+    // The whole rule book (≈110 `check_*` content scanners) runs on arbitrary
+    // base-authored content INSIDE this hook subprocess. If ANY rule panics on
+    // a pathological input, an unwinding hook process produces empty stdout +
+    // a non-zero exit — which Claude Code interprets as a hard DENY, turning
+    // governance fail-CLOSED and wedging the base on every write. We refuse to
+    // let that happen: the entire decision computation (policy load + scan) is
+    // wrapped in `catch_unwind`; a panic collapses to `Decision::pass()`
+    // (allow). The `AssertUnwindSafe` is sound here — on the panic path we
+    // discard all of `compute`'s captured state and emit a fresh `pass()`, so
+    // no logically-inconsistent value can escape.
+    let check_for_panic = check.clone();
+    let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compute_hook_decision(&check_for_panic, &stdin, &project_root)
+    }))
+    .unwrap_or_else(|_| {
+        eprintln!(
+            "umadev: hook `{check}` panicked while scanning content — failing OPEN (allow). \
+             Governance must never block the base on a rule bug."
+        );
+        umadev_governance::Decision::pass()
+    });
+
+    // Record the decision to the audit log (UD-EVID-002). The hook runs in
+    // the workspace CWD, so that's the project root. Best-effort: a write
+    // failure (or even a panic in the recorder) never blocks the host — the
+    // audit call is itself wrapped so it can't unwind past us.
+    if decision.block {
+        let tool = if check == "pre-bash" { "Bash" } else { "Write" };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            umadev_governance::record_tool_call(
+                &project_root,
+                tool,
+                "",
+                "block",
+                &decision.clause,
+                &decision.reason,
+                "",
+                None,
+            )
+        }));
+    }
+    // Printing the decision must also never unwind: a serialization/IO panic
+    // here would otherwise exit non-zero with no `allow` on stdout. Catch it
+    // and, on the block-less path, still try to emit a bare allow so the base
+    // is never silently denied. (`print_decision` already uses
+    // `to_string(...).unwrap_or_default()`, so this is belt-and-braces.)
+    let printed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hook::print_decision(&decision);
+    }));
+    if printed.is_err() && !decision.block {
+        // Last-resort allow so a print panic can't read as a deny.
+        println!(
+            r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow"}}}}"#
+        );
+    }
+    Ok(())
+}
+
+/// The pure decision core of [`cmd_hook`], split out so the whole rule-scan can
+/// be wrapped in one `catch_unwind`. Returns the governance [`Decision`] for the
+/// given `check` name and stdin payload. Fail-open by construction: an unknown
+/// check name passes through; a panic inside any rule is caught by the caller
+/// and collapses to `Decision::pass()`.
+fn compute_hook_decision(
+    check: &str,
+    stdin: &str,
+    project_root: &std::path::Path,
+) -> umadev_governance::Decision {
+    let policy = umadev_governance::Policy::load(project_root);
+    match check {
         "pre-write" | "check-emoji" | "check-color" | "check-slop" => {
-            hook::run_pre_write_with(&stdin, &policy)
+            hook::run_pre_write_with(stdin, &policy)
         }
-        "pre-bash" => hook::run_pre_bash(&stdin),
+        "pre-bash" => hook::run_pre_bash(stdin),
         _ => {
             // Fail-open, like every other path in the hook layer: an unknown
             // check name (a misconfigured matcher, or a future host passing a
@@ -936,25 +1006,7 @@ fn cmd_hook(check: String) -> Result<()> {
             );
             umadev_governance::Decision::pass()
         }
-    };
-    // Record the decision to the audit log (UD-EVID-002). The hook runs in
-    // the workspace CWD, so that's the project root. Best-effort: a write
-    // failure never blocks the host.
-    if decision.block {
-        let tool = if check == "pre-bash" { "Bash" } else { "Write" };
-        let _ = umadev_governance::record_tool_call(
-            &project_root,
-            tool,
-            "",
-            "block",
-            &decision.clause,
-            &decision.reason,
-            "",
-            None,
-        );
     }
-    hook::print_decision(&decision);
-    Ok(())
 }
 
 fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
@@ -4900,5 +4952,59 @@ mod tests {
             Gate::ClarifyGate,
             "interrupted docs should re-run from clarify"
         );
+    }
+
+    // ── P0-1: the governance hook is fail-open even against a PANICKING rule ──
+
+    #[test]
+    fn compute_hook_decision_unknown_check_passes() {
+        // An unrecognised check name must pass through (allow), never block.
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let d = compute_hook_decision("totally-unknown-check", "{}", &root);
+        assert!(!d.block, "unknown hook check must fail open (allow)");
+    }
+
+    #[test]
+    fn compute_hook_decision_garbage_payload_passes() {
+        // Unparseable stdin → fail-open allow (the real production default).
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let d = compute_hook_decision("pre-write", "not json at all", &root);
+        assert!(!d.block, "garbage payload must fail open (allow)");
+        let d2 = compute_hook_decision("pre-bash", "}{ broken", &root);
+        assert!(!d2.block, "garbage bash payload must fail open (allow)");
+    }
+
+    #[test]
+    fn hook_catch_unwind_collapses_a_panicking_rule_to_allow() {
+        // The HARD contract: if any `check_*` rule panics deep inside the scan,
+        // the hook subprocess must NOT unwind (empty stdout + exit 101 reads as
+        // a DENY to Claude Code). The `catch_unwind` wrapper in `cmd_hook` must
+        // turn that panic into `Decision::pass()` (allow). We exercise the exact
+        // wrapper shape against a closure that panics like a buggy rule would.
+        let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Stand in for `compute_hook_decision` blowing up inside a rule.
+            panic!("simulated rule panic on pathological content");
+            #[allow(unreachable_code)]
+            umadev_governance::Decision::block("UD-CODE-001", "unreachable")
+        }))
+        .unwrap_or_else(|_| umadev_governance::Decision::pass());
+        assert!(
+            !decision.block,
+            "a panicking rule must collapse to allow, never block (fail-CLOSED)"
+        );
+    }
+
+    #[test]
+    fn hook_print_decision_never_panics_on_allow_or_block() {
+        // print_decision must always be panic-safe so the hook process exits 0
+        // with a valid JSON decision (never empty stdout + non-zero exit).
+        let allow = umadev_governance::Decision::pass();
+        let block = umadev_governance::Decision::block("UD-SEC-001", "leaked secret");
+        // Wrapped exactly as cmd_hook wraps it; neither may unwind.
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hook::print_decision(&allow);
+            hook::print_decision(&block);
+        }))
+        .is_ok());
     }
 }

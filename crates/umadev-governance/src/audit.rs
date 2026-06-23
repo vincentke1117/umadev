@@ -219,8 +219,14 @@ fn append_jsonl(path: &Path, line: &str) -> std::io::Result<()> {
     // append (audit is fail-open).
     rotate_if_needed(path);
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")?;
+    // SINGLE write of `line + \n`. Each hook invocation is a SEPARATE process
+    // appending to the SAME JSONL concurrently; with `O_APPEND` one `write(2)`
+    // is atomic (the kernel seeks-to-end + writes under one lock), so a record
+    // and its terminating newline land together. Two `write_all` calls (line,
+    // then "\n") were two syscalls — a concurrent appender could interleave
+    // between them and split a record across the newline, producing a torn,
+    // unparseable JSONL row and a corrupt evidence chain.
+    f.write_all(format!("{line}\n").as_bytes())?;
     Ok(())
 }
 
@@ -446,6 +452,78 @@ mod tests {
         assert_eq!(r2.decision, "warn");
         let r3 = record_tool_call(tmp.path(), "Edit", "x", "Audit", "", "", "", Some(1)).unwrap();
         assert_eq!(r3.decision, "audit");
+    }
+
+    #[test]
+    fn concurrent_appends_never_tear_a_line() {
+        // P1-1: every hook invocation is a SEPARATE process appending to the
+        // SAME JSONL. Model that with many threads each appending its own
+        // record at once. The single `write_all(line + "\n")` under O_APPEND
+        // must keep every line whole — no record split across a newline. We
+        // assert each line round-trips as a valid record AND every record we
+        // wrote is present exactly once.
+        let _guard = ROTATE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("UMADEV_AUDIT_MAX_BYTES", "0"); // never rotate mid-test
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev/audit");
+        fs::create_dir_all(&dir).unwrap();
+        let live = std::sync::Arc::new(dir.join("tool-calls.jsonl"));
+
+        let writers = 16;
+        let per_writer = 40;
+        let mut handles = Vec::new();
+        for w in 0..writers {
+            let live = std::sync::Arc::clone(&live);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_writer {
+                    // A realistic record whose body contains no newline so the
+                    // ONLY newline in the file comes from our terminator.
+                    let rec = ToolCallRecord {
+                        ts: 1,
+                        ts_ms: 1,
+                        tool: "Write".to_string(),
+                        file: format!("w{w}-line-{i}.tsx"),
+                        decision: "allow".to_string(),
+                        clause: String::new(),
+                        reason: String::new(),
+                        session_id: String::new(),
+                    };
+                    let serialized = serde_json::to_string(&rec).unwrap();
+                    append_jsonl(&live, &serialized).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let body = fs::read_to_string(&*live).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            lines.len(),
+            writers * per_writer,
+            "every record must be its own intact line — no tears, no merges"
+        );
+        // Every line is independently parseable (a torn line would fail here).
+        for line in &lines {
+            serde_json::from_str::<ToolCallRecord>(line)
+                .unwrap_or_else(|e| panic!("torn/invalid JSONL line {line:?}: {e}"));
+        }
+        // Every unique record we wrote is present exactly once.
+        let mut files: Vec<String> = lines
+            .iter()
+            .map(|l| serde_json::from_str::<ToolCallRecord>(l).unwrap().file)
+            .collect();
+        files.sort();
+        files.dedup();
+        assert_eq!(
+            files.len(),
+            writers * per_writer,
+            "no record dropped or duplicated under concurrency"
+        );
+        std::env::remove_var("UMADEV_AUDIT_MAX_BYTES");
     }
 
     // NOTE: these mutate the process-global UMADEV_AUDIT_MAX_BYTES env

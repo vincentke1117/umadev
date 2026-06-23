@@ -203,16 +203,52 @@ pub fn list_checkpoints(project_root: &Path) -> Vec<Checkpoint> {
         .collect()
 }
 
+/// `true` when `id` names one of the checkpoints in `list` — the ONLY commits
+/// `restore_checkpoint` may reset to. Accepts an exact match or an unambiguous
+/// abbreviation in EITHER direction (the caller's `id` is a prefix of a listed
+/// short id, OR a listed short id is a prefix of a fuller `id` the caller pasted)
+/// so a user can pass the short handle we printed or a longer SHA. Rejects
+/// everything else — `HEAD~999`, arbitrary refs/branches, an unrelated SHA — so a
+/// stray handle can never `reset --hard` the work-tree to an unintended commit and
+/// silently discard files. An empty `id` matches nothing.
+fn id_is_known_checkpoint(id: &str, list: &[Checkpoint]) -> bool {
+    let id = id.trim();
+    if id.is_empty() {
+        return false;
+    }
+    list.iter().any(|c| {
+        let cid = c.id.as_str();
+        cid == id || cid.starts_with(id) || id.starts_with(cid)
+    })
+}
+
 /// Rewind the workspace files to checkpoint `id` (`git reset --hard`). The
 /// CURRENT state is auto-checkpointed first, so a rewind is itself undoable.
 /// Untracked / excluded paths (`node_modules`, …) are left untouched.
 ///
+/// `id` MUST name a checkpoint returned by [`list_checkpoints`]; it is validated
+/// against that set BEFORE any reset (P1-3). An arbitrary git ref (`HEAD~999`, a
+/// branch, an unrelated SHA) is refused rather than reset-to, so a malformed
+/// handle can never `reset --hard` the work-tree to an unintended commit and
+/// destroy uncommitted work.
+///
 /// # Errors
 /// Returns `Err` with a human message when no checkpoints exist, `git` is
-/// unavailable, or the id is unknown.
+/// unavailable, or the id is not a known checkpoint.
 pub fn restore_checkpoint(project_root: &Path, id: &str) -> Result<(), String> {
     if !has_checkpoints(project_root) {
         return Err("还没有任何检查点可回滚".to_string());
+    }
+    // P1-3: validate `id` against the known-checkpoint set BEFORE doing anything
+    // destructive. `git reset --hard <id>` accepts ANY revision (HEAD~999, a
+    // branch, a random SHA), so without this gate a bad handle would silently
+    // rewind the work-tree to an unintended commit and drop files. We only allow
+    // ids that `list_checkpoints` actually surfaced.
+    let known = list_checkpoints(project_root);
+    if !id_is_known_checkpoint(id, &known) {
+        return Err(format!(
+            "未知的检查点 id「{id}」—— 它不在可回滚的检查点列表中"
+        ));
     }
     // Make the rewind reversible AND keep forward checkpoints reachable: snapshot
     // the present, then anchor that snapshot (whose history includes every
@@ -320,5 +356,52 @@ mod tests {
     fn has_checkpoints_false_on_empty() {
         let tmp = tempfile::TempDir::new().expect("tmp");
         assert!(!has_checkpoints(tmp.path()));
+    }
+
+    #[test]
+    fn restore_rejects_unknown_id_without_resetting() {
+        // P1-3: an id that is NOT a known checkpoint must be refused BEFORE any
+        // `git reset --hard`, so a stray ref (HEAD~999, a random SHA) can never
+        // rewind the work-tree to an unintended commit and discard files.
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), "v1").unwrap();
+        let _c1 = create_checkpoint(root, "phase: frontend").expect("checkpoint");
+        // Mutate the live tree AFTER the checkpoint — this is the work an out-of-
+        // range reset would have destroyed.
+        std::fs::write(root.join("a.txt"), "v2-live-work").unwrap();
+
+        // An arbitrary ref that git WOULD accept for `reset --hard` but is not a
+        // known checkpoint → refused.
+        for bad in ["HEAD~999", "deadbeef", "main", "refs/heads/whatever", ""] {
+            let r = restore_checkpoint(root, bad);
+            assert!(r.is_err(), "unknown id {bad:?} must be refused");
+        }
+        // The live work is intact — no reset happened.
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "v2-live-work",
+            "a refused restore must not touch the work-tree"
+        );
+    }
+
+    #[test]
+    fn id_is_known_checkpoint_matches_prefixes_both_directions() {
+        let list = vec![Checkpoint {
+            id: "abc1234".to_string(),
+            label: "x".to_string(),
+            when: "t".to_string(),
+        }];
+        // Exact, listed-id-as-prefix-of-input (full SHA), input-as-prefix-of-id.
+        assert!(id_is_known_checkpoint("abc1234", &list));
+        assert!(id_is_known_checkpoint("abc1234def567", &list)); // fuller SHA
+        assert!(id_is_known_checkpoint("abc", &list)); // abbreviation
+                                                       // Unrelated / empty → rejected.
+        assert!(!id_is_known_checkpoint("zzz9999", &list));
+        assert!(!id_is_known_checkpoint("", &list));
+        assert!(!id_is_known_checkpoint("HEAD~5", &list));
     }
 }

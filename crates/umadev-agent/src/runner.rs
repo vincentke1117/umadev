@@ -183,6 +183,37 @@ where
     .await
 }
 
+/// Poll `fut` to completion, but if it PANICS while being polled, swallow the
+/// panic and yield `on_panic()` instead of letting the unwind propagate.
+///
+/// P1-2: the critic team runs many independent judge futures concurrently in ONE
+/// task via [`join_all_ordered`]. A panic in any one of them would otherwise
+/// unwind straight through the shared `poll_fn` and abort the WHOLE run —
+/// violating the invariant that a critic (advisory, read-only) can NEVER block or
+/// crash the base. Wrapping each critic future here turns "one buggy critic
+/// panicked" into "that one critic returned its fail-open empty verdict", exactly
+/// like every other critic failure mode (no brain / fork failed / unparseable
+/// reply). The `AssertUnwindSafe` is sound: on the panic path we discard the
+/// (now-poisoned) future entirely and substitute a freshly-built fallback, so no
+/// torn state escapes. Dependency-free — the agent crate avoids the `futures`
+/// crate's `catch_unwind` combinator on purpose (see the dependency-light
+/// contract), so this small adapter stands in for it.
+async fn catch_unwind_future<F, T>(fut: F, on_panic: impl Fn() -> T) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    use std::panic::AssertUnwindSafe;
+    use std::task::Poll;
+    let mut fut = Box::pin(fut);
+    std::future::poll_fn(move |cx| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+            Ok(poll) => poll,                  // normal progress / completion
+            Err(_) => Poll::Ready(on_panic()), // a poll panicked → fail open
+        }
+    })
+    .await
+}
+
 /// Resolve the per-phase wall-clock budget: `UMADEV_PHASE_BUDGET_SECS` when set
 /// to a positive integer, else [`PHASE_BUDGET_SECS`]. Same fail-open clamp as
 /// [`advisory_timeout`].
@@ -3620,7 +3651,18 @@ impl<R: Runtime> AgentRunner<R> {
                 runner: self,
                 fork: fork.as_deref(),
             };
-            async move { critic.review(&consult, arts).await }
+            // P1-2: isolate each critic's panic. The review is already fail-open
+            // for every *value* error (no brain / fork failed / unparseable JSON);
+            // `catch_unwind_future` extends that to a *panic* — a buggy critic
+            // collapses to its empty (accepting) verdict instead of unwinding
+            // through the shared concurrent driver and aborting the whole run.
+            let role = critic.role().to_string();
+            async move {
+                catch_unwind_future(critic.review(&consult, arts), || {
+                    crate::critics::RoleVerdict::empty(&role)
+                })
+                .await
+            }
         });
         join_all_ordered(futures).await
     }
@@ -9287,6 +9329,92 @@ error TS2304: Cannot find name 'Foo'
         assert!(
             saw_warn,
             "must emit the changed-files reality-check warn for a files-less claim"
+        );
+    }
+
+    // ── P1-2: a panicking critic must collapse to its empty verdict, never
+    //     unwind and abort the run ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn catch_unwind_future_returns_fallback_on_panic() {
+        // A future that panics while polled must yield the fallback, not unwind.
+        let out = catch_unwind_future(
+            async {
+                panic!("boom inside the future");
+                #[allow(unreachable_code)]
+                7_i32
+            },
+            || 42_i32,
+        )
+        .await;
+        assert_eq!(out, 42, "a panicking future must yield the fallback value");
+    }
+
+    #[tokio::test]
+    async fn catch_unwind_future_passes_through_a_clean_value() {
+        // No panic → the real value flows through unchanged.
+        let out = catch_unwind_future(async { 7_i32 }, || 42_i32).await;
+        assert_eq!(out, 7);
+    }
+
+    /// A critic whose `review` PANICS — models a buggy critic that blows up on
+    /// some pathological artifact. Without panic isolation it would unwind the
+    /// shared concurrent driver and abort the whole run.
+    struct PanickingCritic;
+
+    #[async_trait]
+    impl crate::critics::RoleCritic for PanickingCritic {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn role(&self) -> &str {
+            "panicking-critic"
+        }
+        async fn review(
+            &self,
+            _consult: &dyn crate::critics::CriticConsult,
+            _artifacts: crate::critics::CriticArtifacts<'_>,
+        ) -> crate::critics::RoleVerdict {
+            panic!("a critic panicked mid-review");
+        }
+    }
+
+    /// A trivial consult the panicking critic never reaches.
+    struct NoopConsult;
+
+    #[async_trait]
+    impl crate::critics::CriticConsult for NoopConsult {
+        async fn judge(
+            &self,
+            role: &str,
+            _system: &str,
+            _user: String,
+        ) -> crate::critics::RoleVerdict {
+            crate::critics::RoleVerdict::empty(role)
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_critic_yields_empty_accepting_verdict() {
+        use crate::critics::RoleCritic; // bring `review`/`role` into scope
+                                        // Wire the panicking critic exactly as `run_critics_concurrently` does:
+                                        // wrap its `review` future in `catch_unwind_future` with the role's
+                                        // empty verdict as the fallback. The panic must become an ACCEPTING
+                                        // empty verdict (invariant 1: an absent/broken critic never blocks).
+        let critic = PanickingCritic;
+        let consult = NoopConsult;
+        let arts = crate::critics::CriticArtifacts::default();
+        let role = critic.role().to_string();
+        let verdict = catch_unwind_future(critic.review(&consult, arts), || {
+            crate::critics::RoleVerdict::empty(&role)
+        })
+        .await;
+        assert!(
+            verdict.accepts,
+            "a panicking critic must fail OPEN (accept), never block the base"
+        );
+        assert_eq!(verdict.role, "panicking-critic");
+        assert!(
+            verdict.blocking.is_empty(),
+            "no blocking findings from a panic"
         );
     }
 }

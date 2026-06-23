@@ -80,7 +80,7 @@ enum AcquireIntent {
 }
 
 /// Parsed contents of a `run.lock` file: who claims to hold it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Owner {
     /// Process id of the holder (`0` if it could not be parsed).
     pid: u32,
@@ -159,7 +159,30 @@ impl RunLock {
                         hostname(),
                         now_secs()
                     );
-                    return Ok(RunLock { path, owned: true });
+                    // Flush + drop the handle so the read-back below sees our
+                    // bytes (and any clobber by a racing reclaimer).
+                    let _ = file.flush();
+                    drop(file);
+                    // ── P0-2: reclaim TOCTOU read-back self-check ─────────────
+                    // The reclaim path is remove-then-create, which is NOT atomic:
+                    // if A and B both saw the same stale dead-PID lock, both could
+                    // `remove_file` and both could win a `create_new` (B's remove
+                    // can delete A's just-created lock, then B re-creates). Our own
+                    // `create_new` succeeding is therefore NOT proof we are the sole
+                    // owner. So we READ THE LOCK BACK and confirm it still records
+                    // OUR pid+host. If a racing reclaimer clobbered it after us, the
+                    // read-back shows a foreign pid → we DROP ownership (`owned:
+                    // false`) and do NOT delete it (fail-open: never remove a lock
+                    // that now belongs to someone else). Last-writer keeps it; the
+                    // single-writer invariant holds because at most one identity can
+                    // survive the read-back as self. `create_new` already closed the
+                    // common race; the read-back closes the remove-then-create window.
+                    if holder_is_self(&path) {
+                        return Ok(RunLock { path, owned: true });
+                    }
+                    // Someone overwrote our lock between create and read-back.
+                    // Surrender ownership without deleting their lock.
+                    return Ok(RunLock { path, owned: false });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     // The lock is taken. Classify the holder into exactly three
@@ -264,29 +287,44 @@ fn is_stale(path: &Path) -> bool {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return true;
     };
-    // Corrupt / legacy-without-fields → fall back to age only.
+    // Corrupt / legacy-without-fields → no parseable owner at all, so there is
+    // no recorded `ts` heartbeat. Force the mtime fallback with a ts==0 owner.
     let Some(owner) = Owner::parse(&contents) else {
-        return older_than_stale(path);
+        return older_than_stale(&Owner::default(), path);
     };
 
     let same_host = !owner.host.is_empty() && owner.host == hostname();
     if same_host && owner.pid != 0 {
         // Primary path: probe the actual holder. Dead → stale; alive → live.
         return match pid_is_alive(owner.pid) {
-            Some(true) => false,            // a real run holds it
-            Some(false) => true,            // crashed/killed → reclaim
-            None => older_than_stale(path), // can't probe → conservative + age fallback
+            Some(true) => false, // a real run holds it
+            Some(false) => true, // crashed/killed → reclaim
+            // Can't probe → conservative + age fallback. Age from the OWNER's
+            // recorded `ts` (the lock's own heartbeat), NOT the file's mtime.
+            None => older_than_stale(&owner, path),
         };
     }
 
     // Different host (can't probe its process table) or no usable PID: the only
     // safe signal left is age.
-    older_than_stale(path)
+    older_than_stale(&owner, path)
 }
 
-/// `true` when the lock file's mtime is older than [`STALE_SECS`] (or can't be
-/// stat'd — an unstattable file can't be a live heartbeat).
-fn older_than_stale(path: &Path) -> bool {
+/// `true` when the lock is older than [`STALE_SECS`].
+///
+/// P0-5/P1-4: age is measured from the OWNER's recorded `ts` (UNIX seconds
+/// written into the lock at creation) against the current wall clock — NOT the
+/// file's mtime. mtime is unreliable across hosts and on NFS (clock skew, `noatime`
+/// /relatime quirks, a `touch`/rsync bumping it), and `Owner.ts` was already
+/// parsed but went unused. Only when the owner has no usable timestamp (`ts == 0`:
+/// a legacy/corrupt line) do we fall back to the file mtime as a last resort. An
+/// unstattable file on that fallback can't be a live heartbeat → treat as stale.
+fn older_than_stale(owner: &Owner, path: &Path) -> bool {
+    if owner.ts != 0 {
+        // now - ts > STALE_SECS  (saturating: a future-dated ts → age 0 → not stale).
+        return now_secs().saturating_sub(owner.ts) > STALE_SECS;
+    }
+    // No recorded heartbeat — last-resort mtime fallback.
     match std::fs::metadata(path).and_then(|m| m.modified()) {
         Ok(mtime) => mtime
             .elapsed()
@@ -657,6 +695,84 @@ mod tests {
         // Reordered / extra keys tolerated.
         let reordered = Owner::parse("ts=5 extra=x pid=7 host=h").expect("parses");
         assert_eq!((reordered.pid, reordered.host.as_str()), (7, "h"));
+    }
+
+    #[test]
+    fn staleness_uses_owner_ts_not_mtime() {
+        // P0-5/P1-4: a cross-host lock (can't probe its PID) whose recorded
+        // `ts` is ancient must be reclaimable EVEN THOUGH the file mtime is
+        // brand-new (we just wrote it). This proves age comes from owner.ts,
+        // not the file's mtime. Use a foreign host so the PID-probe branch is
+        // skipped and only the age path decides.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let ancient = now_secs().saturating_sub(STALE_SECS + 60);
+        write_lock(
+            root,
+            &format!("pid=12345 host=some-other-host ts={ancient}"),
+        );
+        let path = root.join(".umadev").join("run.lock");
+        assert!(
+            is_stale(&path),
+            "an ancient owner.ts must be stale despite a fresh file mtime"
+        );
+
+        // Inverse: a FRESH ts on a foreign host is NOT stale even if the file
+        // is touched/old — the owner heartbeat is recent.
+        let fresh = now_secs();
+        write_lock(root, &format!("pid=12345 host=some-other-host ts={fresh}"));
+        assert!(
+            !is_stale(&path),
+            "a fresh owner.ts must not be reclaimable on the age path"
+        );
+    }
+
+    #[test]
+    fn staleness_falls_back_to_mtime_when_ts_is_zero() {
+        // A legacy/corrupt owner with ts=0 has no heartbeat → mtime fallback.
+        // A freshly-written file is young, so it is NOT age-stale.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        write_lock(root, "pid=12345 host=some-other-host ts=0");
+        let path = root.join(".umadev").join("run.lock");
+        assert!(
+            !is_stale(&path),
+            "ts=0 + fresh mtime → not age-stale (mtime fallback)"
+        );
+    }
+
+    #[test]
+    fn reclaim_read_back_surrenders_when_lock_clobbered() {
+        // P0-2: prove the read-back self-check. Simulate a racing reclaimer
+        // that overwrote our just-created lock with a FOREIGN owner before we
+        // read it back. `holder_is_self` then returns false → we must surrender
+        // ownership (owned:false) and NOT delete the foreign lock.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let path = root.join(".umadev").join("run.lock");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A foreign owner already in the file (as if a racer clobbered us).
+        std::fs::write(&path, "pid=999999 host=racer ts=1\n").unwrap();
+        // The read-back self-check must classify this as NOT us.
+        assert!(
+            !holder_is_self(&path),
+            "a foreign-owner lock must not be attributed to us on read-back"
+        );
+        // And the foreign lock must remain untouched (fail-open: never delete
+        // someone else's lock on the surrender path).
+        assert!(path.exists(), "we must not delete a foreign lock");
+    }
+
+    #[test]
+    fn reclaim_read_back_confirms_self_on_clean_acquire() {
+        // The happy path: a clean acquire writes our identity and the read-back
+        // confirms it, so we own the lock end-to-end.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let lock = RunLock::acquire_for_run(root).expect("clean acquire");
+        assert!(lock.owned, "a clean acquire owns the lock after read-back");
+        let path = root.join(".umadev").join("run.lock");
+        assert!(holder_is_self(&path), "read-back confirms our identity");
     }
 
     #[test]
