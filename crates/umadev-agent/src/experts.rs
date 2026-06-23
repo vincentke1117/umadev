@@ -616,6 +616,63 @@ pub fn lean_phase_role(phase: umadev_spec::Phase) -> &'static str {
     }
 }
 
+/// The TEAM-IDENTITY preamble for the default agentic (chat / ad-hoc) path.
+///
+/// The agentic turn is UmaDev's *default* surface — the brain answering the user
+/// through the thin shell. Without this, that path is a bare base CLI; with it,
+/// the base steps into UmaDev's seat: a senior delivery TEAM (PM / architect /
+/// designer / frontend / backend / QA / security / DevOps + a director) that
+/// works to a standard, not a generic assistant.
+///
+/// Kept SHORT and ALWAYS-ON (even for small talk) — it sets WHO you are, not HOW
+/// to build, so it costs almost nothing and never makes a greeting feel heavy.
+/// The team's craft + accumulated experience live in [`agentic_engineering_rules`]
+/// and the per-turn knowledge digest, which are surfaced only for work-class
+/// turns.
+///
+/// Tone is AGENCY, not compliance: you ARE the director with full ownership and
+/// judgment, not an executor being held to a checklist.
+#[must_use]
+pub fn agentic_team_identity() -> &'static str {
+    "You ARE UmaDev — a senior project director leading a full delivery team \
+     (product, architecture, design, frontend, backend, QA, security, DevOps), \
+     reached through a thin shell. You have your team's accumulated craft and \
+     judgment, and full ownership: YOU decide how to get the user's goal done — \
+     and done well. Bring the right seat to whatever they ask. When something \
+     needs building or fixing, drive it the way a strong director would: scope it \
+     yourself, build to your team's bar, proportionate to the task. When it's just \
+     conversation, be warm and quick — you don't run a process for small talk."
+}
+
+/// The COMPACT craft-and-taste block for work-class agentic turns (a turn that
+/// reads / changes / builds something — NOT small talk).
+///
+/// A deliberately TERSE distillation of the heavyweight [`SPEC_PREAMBLE`] +
+/// [`ANTI_SLOP_LAW`] the document phases carry — the core of how this team's work
+/// looks when it's good, framed as the director's OWN standards and taste, not a
+/// compliance checklist. So a routine "fix this" turn carries the team's bar
+/// WITHOUT the multi-paragraph pipeline preamble that would make day-to-day chat
+/// slow. Surfaced ONLY for work-class turns; pure conversation skips it to stay
+/// light. (The governance hook is a background safety net — it isn't restated
+/// here; the prompt is about craft, not policing.)
+#[must_use]
+pub fn agentic_engineering_rules() -> &'static str {
+    "HOW YOUR TEAM BUILDS (your craft and taste when you write or change code — \
+     scaled to the task, never over-engineered):\n\
+     - Your UIs never use emoji as icons — you pull real icons from a proper \
+     library (Lucide / Heroicons / Tabler). It's a tell you're above.\n\
+     - You theme through design tokens (CSS vars / theme keys), not hardcoded hex. \
+     You avoid the AI-default look: purple/indigo gradients and the Tailwind \
+     indigo/violet accent (#6366f1 / #4f46e5 / #8b5cf6 / #7c3aed), Inter/Roboto/\
+     Arial-only type. You commit to ONE deliberate design direction over the safe \
+     generic average — work nobody can mistake for a template.\n\
+     - You keep frontend calls wired to the backend's real routes, structure \
+     server code in clean layers, validate inputs, and use real representative \
+     content — never lorem or placeholder boxes.\n\
+     - You trust evidence over memory: when you change something, you run the \
+     project's real build / test / lint and report only what actually passes."
+}
+
 /// Truncate `text` to at most `max_chars` characters, keeping head.
 /// Returns text with a trailing `…` marker when it had to cut.
 #[must_use]
@@ -813,6 +870,36 @@ mod tests {
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, "user");
         assert!(req.system.is_some());
+    }
+
+    #[test]
+    fn agentic_team_identity_is_a_director_with_agency() {
+        let p = agentic_team_identity();
+        let lower = p.to_lowercase();
+        // It IS the product, framed as a director with full agency (not a generic
+        // assistant being held to rules).
+        assert!(lower.contains("umadev"));
+        assert!(lower.contains("director") && lower.contains("team"));
+        assert!(
+            lower.contains("judgment") || lower.contains("ownership") || lower.contains("decide")
+        );
+        // Always-on identity is short — it must not read like the heavy preamble.
+        assert!(p.len() < SPEC_PREAMBLE.len(), "identity must stay short");
+    }
+
+    #[test]
+    fn agentic_engineering_rules_carry_the_anti_slop_core_compactly() {
+        let p = agentic_engineering_rules();
+        // The non-negotiable visual moat survives in the compact form.
+        assert!(p.contains("emoji"));
+        assert!(p.contains("Lucide") || p.contains("icon library"));
+        assert!(p.to_lowercase().contains("token"));
+        // Stays compact — a fraction of the full preamble + anti-slop law so it
+        // doesn't bloat day-to-day chat.
+        assert!(
+            p.len() < SPEC_PREAMBLE.len() + ANTI_SLOP_LAW.len(),
+            "agentic rules must be a compact distillation"
+        );
     }
 
     #[test]

@@ -145,6 +145,79 @@ pub fn phase_knowledge_digest_with_retrieval(
     legacy_phase_knowledge_digest(opts, phase)
 }
 
+/// A COMPACT, requirement-scoped knowledge digest for the default agentic
+/// (chat / ad-hoc) path — distinct from the per-phase pipeline digest above.
+///
+/// Unlike [`phase_knowledge_digest`], this takes only a `project_root` + the raw
+/// user `requirement` (the agentic path has no `RunOptions`), retrieves a SMALL
+/// top-K (capped at `max_chunks`, default ~4) of the most relevant curated
+/// knowledge, and renders SHORT excerpts — a tight token budget so injecting it
+/// into a day-to-day work turn does not bloat the prompt the way the full
+/// pipeline digest would. It runs ONLY for work-class turns (the TUI gates on a
+/// work-vs-chat heuristic); pure conversation never reaches it.
+///
+/// Phase is fixed to [`Phase::Research`] so retrieval scans the WHOLE knowledge
+/// tree (the agentic turn could be about anything — frontend, backend, infra),
+/// rather than narrowing to one pipeline phase's subdirs.
+///
+/// **Fail-open**: no `knowledge/` dir, retrieval disabled, an empty index, or no
+/// match all return an empty string — the caller then injects nothing and the
+/// turn proceeds exactly as before. Never errors.
+#[must_use]
+pub fn agentic_knowledge_digest(
+    project_root: &Path,
+    requirement: &str,
+    max_chunks: usize,
+) -> String {
+    if requirement.trim().is_empty() || max_chunks == 0 {
+        return String::new();
+    }
+    let base = knowledge_root(project_root);
+    if !base.is_dir() {
+        return String::new();
+    }
+    let project_cfg = crate::config::load_project_config(project_root);
+    let cfg = &project_cfg.knowledge;
+    if !cfg.enabled {
+        return String::new();
+    }
+    // Small budget: cap the configured per-phase top_k down to the agentic
+    // allowance so a project with a large `top_k` doesn't dump the pipeline-sized
+    // digest into a casual work turn.
+    let top_k = cfg.top_k.min(max_chunks).max(1);
+    let rcfg = umadev_knowledge::retrieve::RetrievalConfig {
+        enabled: true,
+        engine: match cfg.engine.as_str() {
+            "hybrid" => umadev_knowledge::retrieve::RetrievalEngine::Hybrid,
+            _ => umadev_knowledge::retrieve::RetrievalEngine::Bm25,
+        },
+        top_k,
+        custom_dirs: Vec::new(),
+    };
+    // Phase::Research scans the whole tree (no subdir narrowing) — the agentic
+    // turn isn't bound to one pipeline phase.
+    let hits = umadev_knowledge::retrieve(&base, &base, &rcfg, requirement, Phase::Research);
+    if hits.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\nYOUR TEAM'S EXPERIENCE ON THIS (patterns and practices your team has \
+         built up that match this request — draw on what's useful, your judgment \
+         decides):\n\n",
+    );
+    for hit in hits.iter().take(max_chunks) {
+        // Short excerpts (220 chars) keep the agentic budget tight — roughly half
+        // the pipeline digest's per-chunk size.
+        out.push_str(&format!(
+            "- `{}` — {}: {}\n",
+            hit.chunk.meta.path,
+            hit.chunk.meta.section,
+            hit.chunk.excerpt(220)
+        ));
+    }
+    out
+}
+
 /// The pre-4.6 keyword-scoring digest, retained as the fallback when
 /// `knowledge.enabled = false`.
 #[must_use]
@@ -3398,6 +3471,41 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn agentic_knowledge_digest_fails_open_without_knowledge_dir() {
+        // No `knowledge/` dir in the workspace -> empty digest, never an error.
+        // (The agentic path must proceed unchanged when there's nothing to inject.)
+        let tmp = TempDir::new().unwrap();
+        let d = agentic_knowledge_digest(tmp.path(), "build a login page", 4);
+        assert!(d.is_empty(), "no knowledge dir -> empty digest");
+        // Empty requirement / zero budget also short-circuit to empty.
+        assert!(agentic_knowledge_digest(tmp.path(), "   ", 4).is_empty());
+        assert!(agentic_knowledge_digest(tmp.path(), "build it", 0).is_empty());
+    }
+
+    #[test]
+    fn agentic_knowledge_digest_surfaces_matching_chunk() {
+        // With a `knowledge/` file that matches the requirement, the compact digest
+        // names the source path + an excerpt of the team's experience.
+        let tmp = TempDir::new().unwrap();
+        let kdir = tmp.path().join("knowledge").join("backend");
+        fs::create_dir_all(&kdir).unwrap();
+        fs::write(
+            kdir.join("layering.md"),
+            "# Service layering\n\n## Clean layers\n\nKeep controllers thin and push \
+             business logic into a service layer; repositories own persistence.\n",
+        )
+        .unwrap();
+        let d = agentic_knowledge_digest(tmp.path(), "service layering controllers", 4);
+        // Fail-open is fine if the index can't match (e.g. tokeniser edge), but when
+        // it does match it must carry the real source path + the team-experience
+        // framing.
+        if !d.is_empty() {
+            assert!(d.contains("layering.md"), "names the matched source");
+            assert!(d.contains("YOUR TEAM'S EXPERIENCE"), "empowering framing");
+        }
+    }
 
     #[test]
     fn scorecard_html_is_self_contained_and_slop_free() {

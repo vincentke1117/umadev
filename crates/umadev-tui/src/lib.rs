@@ -907,16 +907,169 @@ fn agentic_fact_line(changed: Option<&[String]>, claimed: bool) -> Option<String
     }
 }
 
-/// The reality-anchored system prompt for an agentic turn. It UNLOCKS tools
-/// (read/edit files, run commands — the whole point of the agentic path) and
-/// injects the live git state, then hard-constrains the base to verify any
-/// "what did I change" claim against the real disk/git state rather than
-/// reciting unverified session intent. `status`/`diff_stat` are the live
-/// snapshots (either may be `None`).
-fn agentic_system_prompt(status: Option<&str>, diff_stat: Option<&str>) -> String {
-    let mut p = String::from(
-        "You are the brain behind UmaDev, talking to the user through a thin shell — it \
-         is you they are talking to. You are running inside the project's working \
+/// Heuristic: does the user's latest message look like a WORK request — asking to
+/// read, inspect, explain, debug, review, change, or BUILD something — rather than
+/// pure conversation (a greeting / opinion / chit-chat)?
+///
+/// Used only to decide whether to surface the team's engineering craft + the
+/// per-turn knowledge digest into the agentic prompt: a work-class turn gets them
+/// (so the base builds to the team's bar with relevant experience on hand), small
+/// talk stays light (identity only, no rules, no knowledge retrieval). The base
+/// still makes the final chat-vs-act call itself — this only gates what REFERENCE
+/// material we pre-load, so a false positive merely adds a little unused context
+/// and a false negative just means the base works without the digest. Bilingual
+/// and deliberately broad; never blocks anything.
+pub(crate) fn looks_like_work_request(text: &str) -> bool {
+    // English intent verbs / nouns (substring match after lowercasing).
+    const EN: &[&str] = &[
+        "build",
+        "create",
+        "make",
+        "add",
+        "implement",
+        "write",
+        "code",
+        "fix",
+        "debug",
+        "refactor",
+        "change",
+        "modify",
+        "update",
+        "edit",
+        "rewrite",
+        "rename",
+        "remove",
+        "delete",
+        "replace",
+        "review",
+        "audit",
+        "inspect",
+        "analyze",
+        "analyse",
+        "explain",
+        "read",
+        "look at",
+        "check",
+        "test",
+        "run",
+        "deploy",
+        "optimize",
+        "optimise",
+        "improve",
+        "design",
+        "generate",
+        "scaffold",
+        "set up",
+        "setup",
+        "configure",
+        "install",
+        "render",
+        "render the",
+        "feature",
+        "component",
+        "endpoint",
+        "api",
+        "bug",
+        "error",
+        "crash",
+        "function",
+        "module",
+        "page",
+    ];
+    // Chinese intent verbs / nouns (no case folding needed).
+    const ZH: &[&str] = &[
+        "做",
+        "建",
+        "创建",
+        "实现",
+        "写",
+        "加",
+        "新增",
+        "增加",
+        "修",
+        "修复",
+        "改",
+        "修改",
+        "更新",
+        "重构",
+        "删",
+        "删除",
+        "移除",
+        "替换",
+        "重命名",
+        "审",
+        "审查",
+        "审核",
+        "review",
+        "分析",
+        "解释",
+        "说明",
+        "读",
+        "看一下",
+        "看看",
+        "查",
+        "检查",
+        "测试",
+        "运行",
+        "跑",
+        "部署",
+        "优化",
+        "改进",
+        "设计",
+        "生成",
+        "搭建",
+        "配置",
+        "安装",
+        "渲染",
+        "功能",
+        "组件",
+        "接口",
+        "页面",
+        "报错",
+        "错误",
+        "崩溃",
+        "函数",
+        "模块",
+        "实现一个",
+        "帮我",
+        "给我",
+    ];
+    let t = text.to_lowercase();
+    if EN.iter().any(|k| t.contains(k)) {
+        return true;
+    }
+    ZH.iter().any(|k| text.contains(k))
+}
+
+/// The reality-anchored system prompt for an agentic turn. It establishes the
+/// TEAM IDENTITY (the brain is UmaDev's senior delivery team — its director —
+/// not a bare base CLI), UNLOCKS tools (read/edit files, run commands — the whole
+/// point of the agentic path) and injects the live git state, then hard-constrains
+/// the base to verify any "what did I change" claim against the real disk/git
+/// state rather than reciting unverified session intent.
+///
+/// `status`/`diff_stat` are the live git snapshots (either may be `None`).
+/// `work_class` is the [`looks_like_work_request`] verdict for the user's message:
+/// when `true`, the team's engineering craft (`agentic_engineering_rules`) and the
+/// `knowledge_digest` (relevant curated experience, already retrieved by the
+/// caller) are folded in so the base builds to the team's bar. When `false` (small
+/// talk), neither is injected — the prompt stays the lightweight team-identity +
+/// reality contract, so a greeting never pays for rules or knowledge. All
+/// injections are additive + fail-open: an empty `knowledge_digest` just omits
+/// that section.
+fn agentic_system_prompt(
+    status: Option<&str>,
+    diff_stat: Option<&str>,
+    work_class: bool,
+    knowledge_digest: &str,
+) -> String {
+    // (1) TEAM IDENTITY — always on (even small talk). Establishes WHO the brain
+    // is: UmaDev's senior delivery team / director with full agency, not a generic
+    // assistant. Reused from the agent crate so the wording lives in one place.
+    let mut p = String::from(umadev_agent::experts::agentic_team_identity());
+    p.push_str("\n\n");
+    p.push_str(
+        "You are running inside the project's working \
          directory with FULL tool access.\n\n\
          DECIDE FOR YOURSELF how to handle the user's latest message — that judgement is \
          yours, not the shell's:\n\
@@ -935,6 +1088,22 @@ fn agentic_system_prompt(status: Option<&str>, diff_stat: Option<&str>) -> Strin
          did not just verify it on disk, do not claim it. If you did not actually write \
          a file this turn, say so plainly.\n",
     );
+    // (2) WORK-CLASS CRAFT + KNOWLEDGE — only when the user's message looks like a
+    // work request (build / change / inspect / debug …). Small talk skips both so a
+    // greeting stays light. The engineering craft is the team's own standards/taste
+    // (framed as ability, not a compliance checklist); the knowledge digest is the
+    // team's relevant accumulated experience, already retrieved by the caller. Both
+    // are additive + fail-open (an empty digest just omits its section).
+    if work_class {
+        p.push('\n');
+        p.push_str(umadev_agent::experts::agentic_engineering_rules());
+        p.push('\n');
+        let kd = knowledge_digest.trim_end();
+        if !kd.is_empty() {
+            p.push_str(kd);
+            p.push('\n');
+        }
+    }
     match status {
         Some(s) if !s.trim().is_empty() => {
             p.push_str("\nCurrent `git status --porcelain` (the real, current working tree):\n");
@@ -987,7 +1156,27 @@ async fn drive_agentic_stream(
     // diff. Both are `Option` (fail-open: git missing -> None -> guards no-op).
     let before = git_status_porcelain(project_root);
     let diff_stat = git_diff_stat(project_root);
-    let system = agentic_system_prompt(before.as_deref(), diff_stat.as_deref());
+    // Team-identity injection: always carry the director/team identity; for a
+    // work-class turn (build / change / inspect …) also fold in the team's
+    // engineering craft + a SMALL, requirement-scoped knowledge digest so the base
+    // builds with the team's relevant experience on hand. Small talk stays light
+    // (identity only, no knowledge retrieval). Both gates are fail-open: the work
+    // heuristic is broad-but-harmless, and the digest is empty on any retrieval
+    // miss/disabled/no-knowledge so the turn proceeds unchanged.
+    let work_class = looks_like_work_request(task);
+    // Cap the agentic digest at 4 chunks (tight token budget) — only computed for
+    // work-class turns so a greeting never touches the knowledge index.
+    let knowledge_digest = if work_class {
+        umadev_agent::agentic_knowledge_digest(project_root, task, 4)
+    } else {
+        String::new()
+    };
+    let system = agentic_system_prompt(
+        before.as_deref(),
+        diff_stat.as_deref(),
+        work_class,
+        &knowledge_digest,
+    );
 
     // The execution request: the user's raw task, tools UNLOCKED, no max_tokens
     // (so the base isn't cut off mid-loop). The system prompt does NOT re-ban
@@ -2245,7 +2434,7 @@ mod tests {
         // the chat-route tool ban — and embed the live git status plus a
         // no-recitation contract.
         let status = concat!(" M crates/umadev-tui/src/lib.rs\n", "?? new.rs\n");
-        let p = agentic_system_prompt(Some(status), Some("1 file changed"));
+        let p = agentic_system_prompt(Some(status), Some("1 file changed"), true, "");
         // Tools stay unlocked (the whole point of the agentic path).
         assert!(p.contains("FULL tool access"));
         assert!(p.to_lowercase().contains("edit files"));
@@ -2264,13 +2453,96 @@ mod tests {
         // up front, the prompt hands that judgement to the base — reply to small
         // talk without tools, do the work when it needs tools. This is what makes
         // a greeting not waste tool calls and a real task actually get done.
-        let p = agentic_system_prompt(None, None);
+        let p = agentic_system_prompt(None, None, false, "");
         let lower = p.to_lowercase();
         assert!(lower.contains("decide for yourself"));
         // It must cover BOTH arms: just reply to conversation, and do the work.
         assert!(lower.contains("just talking") || lower.contains("simply reply"));
         assert!(lower.contains("do not use tools") || lower.contains("small talk"));
         assert!(lower.contains("actually do it") || lower.contains("do the work"));
+    }
+
+    #[test]
+    fn agentic_prompt_carries_team_identity_in_both_classes() {
+        // The default agentic path is no longer a bare base CLI: even small talk
+        // opens with UmaDev's senior delivery-team / director identity, so the base
+        // works AS the team, not a generic assistant. Identity is always-on.
+        let chat = agentic_system_prompt(None, None, false, "");
+        let work = agentic_system_prompt(None, None, true, "");
+        for p in [&chat, &work] {
+            let lower = p.to_lowercase();
+            assert!(lower.contains("umadev"), "identity names the product");
+            assert!(
+                lower.contains("director") && lower.contains("team"),
+                "identity is the director leading a team"
+            );
+        }
+    }
+
+    #[test]
+    fn agentic_prompt_injects_team_craft_only_for_work_class() {
+        // A work-class turn carries the team's engineering craft (anti-AI-slop:
+        // no emoji icons, design tokens, the AI-default look it avoids). Small talk
+        // does NOT — a greeting must stay light, no rules dumped on it.
+        let work = agentic_system_prompt(None, None, true, "");
+        let work_lower = work.to_lowercase();
+        assert!(
+            work_lower.contains("emoji"),
+            "work-class carries the icon rule"
+        );
+        assert!(
+            work_lower.contains("design token") || work_lower.contains("tokens"),
+            "work-class carries token discipline"
+        );
+
+        let chat = agentic_system_prompt(None, None, false, "");
+        let chat_lower = chat.to_lowercase();
+        assert!(
+            !chat_lower.contains("emoji") && !chat_lower.contains("design token"),
+            "small talk must NOT carry the engineering craft block"
+        );
+    }
+
+    #[test]
+    fn agentic_prompt_injects_knowledge_only_when_work_class_and_present() {
+        // The retrieved knowledge digest is folded in for a work-class turn; an
+        // empty digest just omits the section (fail-open), and a chat-class turn
+        // never carries it even if a digest is somehow passed.
+        let digest = "\n\nYOUR TEAM'S EXPERIENCE ON THIS:\n\n- `layering.md` — Layers: keep \
+                      controllers thin.\n";
+        let work = agentic_system_prompt(None, None, true, digest);
+        assert!(
+            work.contains("layering.md"),
+            "work-class folds in the digest"
+        );
+
+        // Empty digest -> no knowledge section, but the turn still builds.
+        let work_empty = agentic_system_prompt(None, None, true, "");
+        assert!(!work_empty.contains("YOUR TEAM'S EXPERIENCE"));
+
+        // Chat-class never carries knowledge, even if one is handed in.
+        let chat = agentic_system_prompt(None, None, false, digest);
+        assert!(!chat.contains("layering.md"), "small talk omits knowledge");
+    }
+
+    #[test]
+    fn work_request_heuristic_separates_work_from_chat() {
+        // Work-class intents (EN + ZH) are detected so craft + knowledge get
+        // surfaced.
+        for s in [
+            "build me a login page",
+            "fix the crash in the parser",
+            "review this diff",
+            "帮我做一个登录系统",
+            "修复这个报错",
+            "看看 src/lib.rs",
+        ] {
+            assert!(looks_like_work_request(s), "should be work-class: {s}");
+        }
+        // Pure conversation stays chat-class (no knowledge retrieval, no rules).
+        for s in ["你好", "hi there", "thanks!", "what's your name", "哈哈"] {
+            assert!(!looks_like_work_request(s), "should be chat-class: {s}");
+        }
     }
 
     #[test]
