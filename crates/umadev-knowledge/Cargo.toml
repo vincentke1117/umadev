@@ -15,6 +15,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+# Dependency-light symbol scan for the repo-map (repomap.rs). `regex` is a
+# pure-Rust, workspace-pinned dep already used by the equally dep-light
+# `governance` / `contract` crates — adding it here introduces NO new
+# transitive deps, and deliberately avoids a heavy parser tree (no tree-sitter,
+# no language server, no ICU), per the workspace anti-rules.
+regex = { workspace = true }
 # Stable content hash for the corpus cache (truncated SHA-256). SHA-256 is
 # fixed by spec, so the cache survives Rust-stdlib hasher changes that would
 # otherwise invalidate the whole .umadev/kb-index/ between toolchain bumps.

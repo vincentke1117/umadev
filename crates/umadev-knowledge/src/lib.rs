@@ -64,6 +64,7 @@ pub mod index;
 /// `vector-local` feature; the npm package ships the model so it works offline.
 #[cfg(feature = "vector-local")]
 pub mod local_embed;
+pub mod repomap;
 pub mod retrieve;
 pub mod tokenizer;
 pub mod vector;
@@ -72,6 +73,10 @@ pub use chunker::{chunk_file, chunk_text, Chunk, ChunkMeta};
 pub use index::{
     bm25_search, build_index, build_vector_store_if_enabled, invalidate_cache, load_or_build_index,
     load_or_build_index_multi, Bm25Index, Posting,
+};
+pub use repomap::{
+    invalidate_cache as invalidate_repomap_cache, repo_map, symbol_index, FileSymbols, Symbol,
+    SymbolIndex, SymbolKind, REPOMAP_CACHE_DIR,
 };
 pub use retrieve::{
     corpus_dirs, retrieve, retrieve_for_phase, retrieve_for_phase_with_expansion,
