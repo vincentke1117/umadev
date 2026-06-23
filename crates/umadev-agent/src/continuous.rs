@@ -167,6 +167,14 @@ pub async fn run_block(
     let plan = crate::planner::plan(&options.requirement);
     let produces_code = plan.includes(Phase::Frontend) || plan.includes(Phase::Backend);
 
+    // Persist the project's governance context BEFORE any phase writes a file, so
+    // the out-of-process PreToolUse hook (which reads `.umadev/governance-context.
+    // json`) governs by it from the very first write — otherwise a clean static
+    // frontend gets nagged about server-only rules (CSP / structured logging /
+    // crypto-RNG) in real time. Re-derived + re-persisted per tool call too (see
+    // `govern_tool_call`) so a project that grows a backend mid-run re-arms strict.
+    persist_project_context(options);
+
     // The phases this block drives, tailored to the plan. A GATED plan
     // (`Greenfield` / `FrontendOnly` / `BackendOnly` / `DocsOnly`) keeps the
     // gate-anchored three-block split, intersected with the plan so a one-sided
@@ -435,6 +443,34 @@ async fn drive_phase(
 /// the deterministic floor that actually GUARDS the delivery is the governance
 /// hook (installed in `settings.json`) plus the post-hoc quality scan; here we
 /// observe + audit + advise, matching the design's "two governance paths".
+/// Derive the project's governance context from what the base has established
+/// (task kind + requirement signals + architecture doc + per-file server
+/// evidence). A clean static frontend → lenient (server-only rules N/A); ANY
+/// backend/auth signal → strict. Fail-open: errors inside the planner fall back
+/// to its own conservative default.
+fn project_context_for(options: &RunOptions) -> umadev_governance::ProjectContext {
+    crate::planner::derive_project_context(
+        &options.requirement,
+        &options.project_root,
+        &options.effective_slug(),
+    )
+}
+
+/// Write the derived context to `<root>/.umadev/governance-context.json` so the
+/// out-of-process PreToolUse hook reads the SAME context the in-process scans
+/// use. Best-effort / fail-open: a create/serialize/write error is swallowed
+/// (the hook then defaults to full strictness — conservative, never a false
+/// "clean"). Mirrors the agent runner's single-shot persistence.
+fn persist_project_context(options: &RunOptions) {
+    let ctx = project_context_for(options);
+    let dir = options.project_root.join(".umadev");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        if let Ok(json) = serde_json::to_string_pretty(&ctx) {
+            let _ = std::fs::write(dir.join("governance-context.json"), json);
+        }
+    }
+}
+
 fn govern_tool_call(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
@@ -443,7 +479,11 @@ fn govern_tool_call(
     name: &str,
     input: &serde_json::Value,
 ) {
-    let (target, decision) = evaluate_tool_call(policy, name, input);
+    // Keep the on-disk context fresh (a static project that just grew a server
+    // file re-arms strict) AND make this in-process scan context-aware.
+    persist_project_context(options);
+    let ctx = project_context_for(options);
+    let (target, decision) = evaluate_tool_call(policy, ctx, name, input);
 
     // TUI tool row — "正在写 src/App.tsx…". This is the SOURCE OF TRUTH for what
     // the base actually did.
@@ -481,6 +521,7 @@ fn govern_tool_call(
 /// split out so it can be unit-tested without an event sink.
 fn evaluate_tool_call(
     policy: &umadev_governance::Policy,
+    ctx: umadev_governance::ProjectContext,
     name: &str,
     input: &serde_json::Value,
 ) -> (String, umadev_governance::Decision) {
@@ -507,7 +548,7 @@ fn evaluate_tool_call(
             .or_else(|| input.get("new_string").and_then(serde_json::Value::as_str))
             .or_else(|| input.get("new_str").and_then(serde_json::Value::as_str))
             .unwrap_or_default();
-        let decision = umadev_governance::scan_content_with_policy(path, content, policy);
+        let decision = umadev_governance::scan_content_with_context(path, content, policy, ctx);
         return (path.to_string(), decision);
     }
     // Read / Grep / Glob / … — observe-only, never a write. Pass.
@@ -806,6 +847,7 @@ fn backend_has_realtime_governance(backend: &str) -> bool {
 /// catch-up rework loop (which reads it twice) and the critic floor.
 fn governance_scan(options: &RunOptions) -> Vec<String> {
     let policy = umadev_governance::Policy::load(&options.project_root);
+    let ctx = project_context_for(options);
     let mut out = Vec::new();
     for f in crate::acceptance::source_files(&options.project_root) {
         let Ok(content) = std::fs::read_to_string(&f) else {
@@ -816,7 +858,7 @@ fn governance_scan(options: &RunOptions) -> Vec<String> {
             .unwrap_or(&f)
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
-        let d = umadev_governance::scan_content_with_policy(&rel, &content, &policy);
+        let d = umadev_governance::scan_content_with_context(&rel, &content, &policy, ctx);
         if d.block {
             out.push(format!(
                 "{rel}: {} ({})",
@@ -2046,6 +2088,7 @@ mod tests {
         // rule (error-boundary / a11y) doesn't win precedence and mask it.
         let (target, decision) = evaluate_tool_call(
             &policy,
+            umadev_governance::ProjectContext::unknown(),
             "Write",
             &serde_json::json!({
                 "file_path": "output/demo-uiux.md",
@@ -2062,6 +2105,7 @@ mod tests {
         let policy = umadev_governance::Policy::default();
         let (cmd, decision) = evaluate_tool_call(
             &policy,
+            umadev_governance::ProjectContext::unknown(),
             "Bash",
             &serde_json::json!({ "command": "rm -rf /" }),
         );
@@ -2072,8 +2116,12 @@ mod tests {
     #[tokio::test]
     async fn read_tool_is_observe_only_and_passes() {
         let policy = umadev_governance::Policy::default();
-        let (_t, decision) =
-            evaluate_tool_call(&policy, "Read", &serde_json::json!({ "file_path": "a.rs" }));
+        let (_t, decision) = evaluate_tool_call(
+            &policy,
+            umadev_governance::ProjectContext::unknown(),
+            "Read",
+            &serde_json::json!({ "file_path": "a.rs" }),
+        );
         assert!(!decision.block);
     }
 
