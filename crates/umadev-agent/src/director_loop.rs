@@ -363,7 +363,9 @@ async fn run_auto_qc(
 
     // 1. Honesty hard floor (UmaDev's own read-only check): did real source actually
     //    land? A claimed build with zero source is the decisive blocking finding —
-    //    feed it back so the base's body actually writes the code.
+    //    feed it back so the base's body actually writes the code. This floor is
+    //    ALWAYS run, on EVERY tier — it is the non-negotiable "did anything get
+    //    built" reality check, the one invariant the lean tier must never drop.
     let src = director::verify(options, events, VerifyKind::SourcePresent).await;
     if src.available && !src.passed {
         blocking.push(format!(
@@ -373,6 +375,31 @@ async fn run_auto_qc(
         ));
         // No source means nothing to build/test or review — return now with the
         // decisive finding rather than reading over an empty tree.
+        return QcReport { blocking };
+    }
+
+    // LEAN TIER: for a small, clearly-lean goal (a todo/记账 single page, a bug fix,
+    // a refactor — `planner::is_lean_build`) the heavy half of QC is pure overhead
+    // over a base that already ran its own build inside its turn:
+    //   - the `BuildTest` read re-runs the project's FULL build/test (a SECOND
+    //     `npm install` + build — minutes), even though the base just ran it and
+    //     the fix directive asks it to run it again, and
+    //   - the fork review convenes a per-seat `fork()` team (independent base
+    //     handshakes + full judge round-trips) — which for these kinds is ALREADY
+    //     an empty team (`quality_team_for_kind` → `Vec::new()`), so it can only
+    //     ever return "no blocking" anyway.
+    // So for the lean tier we stop at the honesty hard floor: source present ⇒
+    // clean. The objective source-present floor still ran (above), governance still
+    // rode every write, and the heavyweight tiers below are untouched. This is the
+    // single change that brings a simple page close to "the base just did it".
+    // Fail-open + safe: `is_lean_build` only fires on a clearly-lean classification
+    // (an unrecognised / real-product goal stays heavyweight), so a real product is
+    // never under-checked by accident.
+    if crate::planner::is_lean_build(&options.requirement) {
+        events.emit(EngineEvent::Note(
+            "team · lean goal — source present, skipping the duplicate build + fork review"
+                .to_string(),
+        ));
         return QcReport { blocking };
     }
 
@@ -583,6 +610,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lean_clean_build_finishes_in_one_turn_without_review() {
+        // The headline speed case: a simple page that the base builds correctly the
+        // first time spends ZERO fix rounds AND skips the fork review entirely.
+        // Even though the session CAN fork and would raise a blocking verdict, the
+        // lean tier never convenes the review, so the loop settles in ONE base turn.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, _rec) = sink();
+        let reply = r#"{"accepts": false, "blocking": ["MUST NOT trigger a fix round"]}"#;
+        let turns = vec![text_turn(
+            "Created the single-page todo app — index.html, styles, the add/delete \
+             logic. Implemented it end to end. Done.",
+        )];
+        let mut sess = FakeSession::new(turns, true, reply);
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
+
+        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+        // EXACTLY one main directive — the opening build. The lean QC is clean (no
+        // review), so no fix directive is ever fed back.
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "a lean clean build finishes in one turn — no review-driven fix pass"
+        );
+    }
+
+    #[tokio::test]
     async fn qc_finds_no_source_and_feeds_a_fix_directive_back() {
         // The base CLAIMS a build but writes no source. UmaDev's hard-floor QC
         // catches it and feeds a fix directive back over the USB channel; the next
@@ -737,6 +794,53 @@ mod tests {
         assert!(
             qc.blocking.iter().any(|b| b.contains("source-present")),
             "the hard-floor finding is present: {:?}",
+            qc.blocking
+        );
+    }
+
+    /// A lean-tier `RunOptions` — a clearly-small requirement that
+    /// `planner::is_lean_build` classifies as lean (Light), so QC takes the
+    /// stripped-down path (source floor only, no duplicate build / fork review).
+    fn lean_opts(root: &std::path::Path) -> RunOptions {
+        let mut o = opts(root);
+        o.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
+        o
+    }
+
+    #[tokio::test]
+    async fn lean_goal_qc_stops_at_source_floor_and_skips_review() {
+        // A lean goal with real source on disk → QC is clean WITHOUT convening the
+        // fork review. The session here CAN fork and would return a BLOCKING verdict
+        // if the review ran; the lean tier must short-circuit BEFORE that, so the
+        // blocking finding never appears → clean.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, _rec) = sink();
+        let reply = r#"{"accepts": false, "blocking": ["a review nit that must NOT surface"]}"#;
+        let mut sess = FakeSession::new(vec![], true, reply);
+        let o = lean_opts(tmp.path());
+        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        assert!(
+            qc.is_clean(),
+            "a lean goal with source present is clean — the fork review is skipped: {:?}",
+            qc.blocking
+        );
+    }
+
+    #[tokio::test]
+    async fn lean_goal_qc_still_enforces_the_source_present_hard_floor() {
+        // The lean tier must NEVER drop the honesty hard floor: a lean goal that
+        // CLAIMED a build but wrote zero source is STILL caught (the one invariant
+        // the fast path keeps). Empty tree → the source-present blocking finding.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = lean_opts(tmp.path());
+        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        assert!(!qc.is_clean(), "a lean goal with no source still blocks");
+        assert!(
+            qc.blocking.iter().any(|b| b.contains("source-present")),
+            "the hard-floor finding fires on the lean tier too: {:?}",
             qc.blocking
         );
     }

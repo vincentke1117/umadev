@@ -125,6 +125,47 @@ impl TaskKind {
     pub fn is_light(self) -> bool {
         matches!(self, TaskKind::Light)
     }
+
+    /// Whether a director `/run` of this kind should take the **lean build tier**
+    /// — a short firmware directive + a stripped-down QC pass — instead of the
+    /// full commercial-grade framing + the duplicate build + the fork-review team.
+    ///
+    /// This is the single source of truth the director path consults so the
+    /// directive ([`crate::experts::director_build_directive`]) and the auto-QC
+    /// pass ([`crate::director_loop`]) stay in lockstep: BOTH go lean for exactly
+    /// the same kinds, never one without the other.
+    ///
+    /// The lean tier is the kinds whose review teams are ALREADY empty
+    /// ([`crate::critics::quality_team_for_kind`] returns `Vec::new()` for these):
+    /// [`TaskKind::Light`] (a trivial / explicitly-small build), [`TaskKind::Bugfix`],
+    /// and [`TaskKind::Refactor`]. Those are precisely the goals where a 12-minute
+    /// "commercial-grade build + a second `npm install` + an 8-seat fork review"
+    /// is pure overhead over a base that would just do it. Every heavyweight kind
+    /// (Greenfield / FrontendOnly / BackendOnly / DocsOnly) keeps the full firmware
+    /// + full QC — the research / docs / contract / review ARE the value there.
+    ///
+    /// Fail-open by construction: [`classify`] falls back to [`TaskKind::Greenfield`]
+    /// on anything unrecognised, so an ambiguous requirement gets the FULL path —
+    /// the lean tier is never reached by accident, only on a clearly-lean signal.
+    #[must_use]
+    pub fn is_lean_build(self) -> bool {
+        matches!(
+            self,
+            TaskKind::Light | TaskKind::Bugfix | TaskKind::Refactor
+        )
+    }
+}
+
+/// Whether a director `/run` on `requirement` should take the **lean build tier**.
+///
+/// A thin convenience over [`classify`] + [`TaskKind::is_lean_build`] so the two
+/// director call sites (the firmware directive and the auto-QC pass) classify a
+/// requirement identically from one entry point. Deterministic, no model call,
+/// fail-open to the FULL path (an unrecognised requirement classifies as
+/// [`TaskKind::Greenfield`], whose [`TaskKind::is_lean_build`] is `false`).
+#[must_use]
+pub fn is_lean_build(requirement: &str) -> bool {
+    classify(requirement).is_lean_build()
 }
 
 /// A tailored, ordered plan of phases for a specific requirement.
@@ -793,6 +834,61 @@ fn rationale_for(kind: TaskKind) -> String {
 mod tests {
     use super::*;
     use umadev_spec::Phase;
+
+    #[test]
+    fn lean_build_tier_matches_the_empty_review_kinds() {
+        // The lean build tier must be EXACTLY the kinds whose quality review team
+        // is already empty (`quality_team_for_kind` returns Vec::new()): Light /
+        // Bugfix / Refactor. Those are the goals where the heavy firmware + the
+        // duplicate build + the fork review are pure overhead. Every heavyweight
+        // kind keeps the FULL path.
+        assert!(TaskKind::Light.is_lean_build());
+        assert!(TaskKind::Bugfix.is_lean_build());
+        assert!(TaskKind::Refactor.is_lean_build());
+        assert!(!TaskKind::Greenfield.is_lean_build());
+        assert!(!TaskKind::FrontendOnly.is_lean_build());
+        assert!(!TaskKind::BackendOnly.is_lean_build());
+        assert!(!TaskKind::DocsOnly.is_lean_build());
+        // Cross-check one direction so the two never drift: EVERY lean-build kind
+        // has an already-empty quality review team (so the lean QC short-circuit
+        // can only ever skip a team that would have returned "no blocking" anyway —
+        // it changes wall-clock, never the verdict). The converse does NOT hold:
+        // `DocsOnly` also has an empty quality team (it produces no code to review)
+        // yet is NOT a lean *build* tier — it keeps the full docs firmware/process.
+        for k in [TaskKind::Light, TaskKind::Bugfix, TaskKind::Refactor] {
+            assert!(
+                crate::critics::quality_team_for_kind(k).is_empty(),
+                "a lean-build kind must already have an empty quality team: {k:?}"
+            );
+        }
+        // The heavyweight BUILD kinds (those that produce code) keep a non-empty
+        // quality team — the lean tier must never swallow one of these.
+        for k in [TaskKind::Greenfield, TaskKind::BackendOnly] {
+            assert!(
+                !k.is_lean_build() && !crate::critics::quality_team_for_kind(k).is_empty(),
+                "a heavyweight build kind keeps its review team: {k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_lean_build_requirement_classifies_and_fails_open_heavy() {
+        // An explicitly-small build is lean; a real product (and an unrecognised
+        // requirement, which falls back to Greenfield) is NOT lean — so a real
+        // product never reaches the lean fast path by accident.
+        assert!(is_lean_build("帮我改个文案")); // Light
+        assert!(is_lean_build("修复登录按钮点击没反应")); // Bugfix
+        assert!(is_lean_build("重构 app.rs 拆分模块")); // Refactor
+        assert!(is_lean_build("做一个简单的待办清单单页应用,纯前端")); // Light
+                                                                       // Heavyweight stays heavyweight (full firmware + full QC).
+        assert!(!is_lean_build("做一个记账应用")); // Greenfield (no smallness signal)
+        assert!(!is_lean_build("做一个带邮箱登录的 SaaS 数据分析仪表盘")); // Greenfield
+        assert!(!is_lean_build("做一个前端落地页")); // FrontendOnly
+        assert!(!is_lean_build("写一个后端接口")); // BackendOnly
+                                                   // Unrecognised / empty → Greenfield → NOT lean (fail-open to the full path).
+        assert!(!is_lean_build(""));
+        assert!(!is_lean_build("?!@#"));
+    }
 
     #[test]
     fn classifies_bugfix() {

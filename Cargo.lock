@@ -3104,6 +3104,7 @@ name = "umadev"
 version = "1.0.7"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "serde",
  "serde_json",

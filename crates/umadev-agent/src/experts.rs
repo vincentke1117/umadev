@@ -767,6 +767,40 @@ pub fn director_build_directive(requirement: &str) -> String {
     // use or ignore — NOT a fixed phase list it must walk. The planner is demoted
     // from "decides the route" to "a prior the director consults".
     let prior = crate::planner::advisory_prior(requirement);
+
+    // SCALE THE FIRMWARE TO THE GOAL'S SIZE. A simple, clearly-lean goal (a
+    // todo/记账 single page, a bug fix, a refactor — `TaskKind::is_lean_build`)
+    // must NOT be framed as a "COMPLETE, ship-quality, commercial-grade product
+    // build", or the base over-builds: a multi-file, PRD-grade scaffold for a page
+    // that wants three files. The heavy framing is the right bar for a real
+    // product (Greenfield / FrontendOnly / BackendOnly / DocsOnly), where the
+    // full team + process IS the value; for a lean goal it is pure over-build
+    // tax. Deterministic + fail-open: an unrecognised goal classifies as
+    // `Greenfield` (NOT lean) → the full framing, so nothing is under-built by
+    // accident. The honesty contract (real files on disk + the project's real
+    // build/test, report only what works) holds on BOTH tiers — only the SCOPE
+    // framing changes, never the floor.
+    if crate::planner::is_lean_build(requirement) {
+        return format!(
+            "## Your goal (build it right — proportionate to its size)\n\n\
+             {requirement}\n\n\
+             ---\n\
+             This is a small, well-scoped goal — NOT a full commercial product. \
+             You are the director: do it directly and do it well, but keep the \
+             solution strictly proportional to THIS scope. Make it correct, clean, \
+             and good enough — do NOT scaffold a large multi-module app, do NOT \
+             invent extra surfaces (auth / database / dashboards) the goal never \
+             asked for, and do NOT run a heavy PM → architect → docs process for a \
+             page-sized task. The fewest real files that do the job well.\n\
+             {prior}\n\
+             Your team's craft floor still holds: never emoji as icons (use a \
+             declared icon library — Lucide / Heroicons / Tabler), design-token \
+             colors only, real representative content (never placeholders). Ground \
+             every \"done\" claim in the real files on disk and the project's real \
+             build/test — report only what actually works."
+        );
+    }
+
     format!(
         "## Your goal (treat this as a COMPLETE, ship-quality product build)\n\n\
          {requirement}\n\n\
@@ -918,6 +952,45 @@ mod tests {
         assert!(lower.contains("no fixed phase") || lower.contains("no fixed-phase"));
         // The honesty contract (real files, real build, report only what works).
         assert!(lower.contains("real files") || lower.contains("on disk"));
+    }
+
+    #[test]
+    fn director_build_directive_scales_down_for_a_lean_goal() {
+        // A small, clearly-lean goal (Light) must NOT be framed as a COMPLETE,
+        // commercial-grade product build — that over-framing is what makes the base
+        // over-build a page-sized task. It gets the short "build it right,
+        // proportionate, do not over-engineer" framing instead.
+        let d = director_build_directive("帮我改个文案");
+        let lower = d.to_lowercase();
+        // The raw requirement is still carried verbatim.
+        assert!(d.contains("帮我改个文案"));
+        // It must NOT carry the heavy commercial-grade framing.
+        assert!(
+            !lower.contains("commercial-grade") && !lower.contains("complete, ship-quality"),
+            "a lean goal must not get the heavy product framing: {d}"
+        );
+        // It explicitly tells the base to keep it proportionate and NOT over-build.
+        assert!(lower.contains("proportional") || lower.contains("proportionate"));
+        assert!(
+            lower.contains("not a full commercial product") || lower.contains("do not scaffold")
+        );
+        // The craft floor + honesty contract still hold on the lean tier.
+        assert!(d.contains("emoji"));
+        assert!(d.contains("Lucide") || lower.contains("icon library"));
+        assert!(lower.contains("real files") || lower.contains("on disk"));
+    }
+
+    #[test]
+    fn director_build_directive_keeps_full_framing_for_a_real_product() {
+        // A heavyweight goal (a SaaS dashboard with login → Greenfield) keeps the
+        // FULL commercial-grade framing + the seat roster — the lean downgrade must
+        // never touch a real product.
+        let d = director_build_directive("做一个带邮箱登录的 SaaS 数据分析仪表盘,要能上线");
+        let lower = d.to_lowercase();
+        assert!(lower.contains("commercial-grade"));
+        assert!(lower.contains("complete") && lower.contains("product"));
+        // The full seat roster is named (the heavy path only).
+        assert!(lower.contains("architect") && lower.contains("devops"));
     }
 
     #[test]
