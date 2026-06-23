@@ -348,13 +348,17 @@ fn scan_code_block(
     lang: &str,
     lines: &[&str],
     policy: &umadev_governance::Policy,
+    ctx: umadev_governance::ProjectContext,
 ) -> Option<String> {
     let path = lang_to_path(lang)?;
     let content: String = lines.join("\n");
     // Honor the project's `.umadev/rules.toml` (disabled clauses / path
     // exclusions) exactly like the hook / CI / MCP paths do — the runner is
     // the MAIN generation path and must not be the one place that ignores it.
-    let decision = umadev_governance::scan_content_with_policy(&path, &content, policy);
+    // `ctx` lets a proven static-frontend run skip server/security-surface rules
+    // (CSP / structured-logging / HSTS / …) that have nothing to guard; the
+    // universal floor still fires. Conservative default keeps every rule on.
+    let decision = umadev_governance::scan_content_with_context(&path, &content, policy, ctx);
     if decision.block {
         Some(format!(
             "Governance {} violation in ```{lang} block: {}",
@@ -614,6 +618,22 @@ impl<R: Runtime> AgentRunner<R> {
     /// Runtime kind (for human-facing announcements).
     pub fn runtime_kind(&self) -> umadev_runtime::RuntimeKind {
         self.runtime.kind()
+    }
+
+    /// The governance [`ProjectContext`](umadev_governance::ProjectContext) for
+    /// this run — derived once from the requirement + architecture doc + produced
+    /// source via [`crate::planner::derive_project_context`]. A proven static,
+    /// frontend-only build returns the lenient context so the rule engine skips
+    /// server/security-surface rules that have nothing to guard; everything else
+    /// stays strict (the universal floor always applies). Recomputed per call
+    /// (cheap file probes) so a project that grows a backend mid-run flips back
+    /// to strict on the next phase — fail-open toward strict.
+    fn project_context(&self) -> umadev_governance::ProjectContext {
+        crate::planner::derive_project_context(
+            &self.options.requirement,
+            &self.options.project_root,
+            &self.options.effective_slug(),
+        )
     }
 
     /// Emit `event` to the attached sink (no-op for the null sink).
@@ -1911,6 +1931,7 @@ impl<R: Runtime> AgentRunner<R> {
             let gov_defects = Self::governance_defects(
                 &text,
                 &umadev_governance::Policy::load(&self.options.project_root),
+                self.project_context(),
             );
             if !gov_defects.is_empty() && attempt == 1 {
                 self.emit(EngineEvent::Note(format!(
@@ -2367,7 +2388,11 @@ impl<R: Runtime> AgentRunner<R> {
     /// host mechanism). For claude-code/codex the hook already catches file
     /// writes; this is the belt-and-suspenders that covers the doc-embedded
     /// code the HTTP path produces.
-    fn governance_defects(text: &str, policy: &umadev_governance::Policy) -> Vec<String> {
+    fn governance_defects(
+        text: &str,
+        policy: &umadev_governance::Policy,
+        ctx: umadev_governance::ProjectContext,
+    ) -> Vec<String> {
         let mut defects = Vec::new();
         // Walk fenced code blocks: ```lang\n...\n```.
         let mut lines = text.lines().peekable();
@@ -2379,7 +2404,7 @@ impl<R: Runtime> AgentRunner<R> {
             if trimmed.starts_with("```") {
                 if in_block {
                     // Close — scan the accumulated block.
-                    if let Some(d) = scan_code_block(&lang, &buf, policy) {
+                    if let Some(d) = scan_code_block(&lang, &buf, policy, ctx) {
                         defects.push(d);
                     }
                     in_block = false;
@@ -2400,7 +2425,7 @@ impl<R: Runtime> AgentRunner<R> {
         // common) would otherwise escape scanning entirely. Scan the trailing
         // buffer so emoji/secret in a truncated block is still caught.
         if in_block && !buf.is_empty() {
-            if let Some(d) = scan_code_block(&lang, &buf, policy) {
+            if let Some(d) = scan_code_block(&lang, &buf, policy, ctx) {
                 defects.push(d);
             }
         }
@@ -3599,6 +3624,7 @@ impl<R: Runtime> AgentRunner<R> {
     fn security_floor_findings(&self) -> Vec<String> {
         let mut out = Vec::new();
         let policy = umadev_governance::Policy::load(&self.options.project_root);
+        let ctx = self.project_context();
         for f in crate::acceptance::source_files(&self.options.project_root) {
             let Ok(content) = std::fs::read_to_string(&f) else {
                 continue;
@@ -3608,7 +3634,7 @@ impl<R: Runtime> AgentRunner<R> {
                 .unwrap_or(&f)
                 .to_string_lossy()
                 .replace(std::path::MAIN_SEPARATOR, "/");
-            let d = umadev_governance::scan_content_with_policy(&rel, &content, &policy);
+            let d = umadev_governance::scan_content_with_context(&rel, &content, &policy, ctx);
             if d.block {
                 out.push(format!(
                     "{rel}: {} ({})",
@@ -3991,6 +4017,7 @@ impl<R: Runtime> AgentRunner<R> {
             return; // claude already blocked these at write time
         }
         let policy = umadev_governance::Policy::load(&self.options.project_root);
+        let ctx = self.project_context();
         let scan = |files: Vec<std::path::PathBuf>| -> Vec<String> {
             let mut out = Vec::new();
             for f in &files {
@@ -4002,7 +4029,7 @@ impl<R: Runtime> AgentRunner<R> {
                     .unwrap_or(f)
                     .to_string_lossy()
                     .replace(std::path::MAIN_SEPARATOR, "/");
-                let d = umadev_governance::scan_content_with_policy(&rel, &content, &policy);
+                let d = umadev_governance::scan_content_with_context(&rel, &content, &policy, ctx);
                 if d.block {
                     out.push(format!(
                         "{rel}: {} ({})",
@@ -8642,6 +8669,7 @@ error TS2304: Cannot find name 'Foo'
         let defects = AgentRunner::<FakeRuntime>::governance_defects(
             doc,
             &umadev_governance::Policy::default(),
+            umadev_governance::ProjectContext::unknown(),
         );
         assert!(!defects.is_empty(), "should flag console.log");
         assert!(defects[0].contains("UD-ARCH-002"));
@@ -8653,6 +8681,7 @@ error TS2304: Cannot find name 'Foo'
         let defects = AgentRunner::<FakeRuntime>::governance_defects(
             doc,
             &umadev_governance::Policy::default(),
+            umadev_governance::ProjectContext::unknown(),
         );
         assert!(!defects.is_empty());
         assert!(defects[0].contains("UD-ARCH-001"));
@@ -8664,6 +8693,7 @@ error TS2304: Cannot find name 'Foo'
         let defects = AgentRunner::<FakeRuntime>::governance_defects(
             doc,
             &umadev_governance::Policy::default(),
+            umadev_governance::ProjectContext::unknown(),
         );
         assert!(defects.is_empty());
     }
@@ -8675,6 +8705,7 @@ error TS2304: Cannot find name 'Foo'
         let defects = AgentRunner::<FakeRuntime>::governance_defects(
             doc,
             &umadev_governance::Policy::default(),
+            umadev_governance::ProjectContext::unknown(),
         );
         assert!(defects.is_empty());
     }

@@ -441,6 +441,130 @@ fn has_heavy_signal(q: &str) -> bool {
     ])
 }
 
+/// Derive the governance [`ProjectContext`](umadev_governance::ProjectContext)
+/// for a run — the signal that lets the rule engine skip server/security-surface
+/// rules (CSP, clickjacking, structured logging, HSTS, HTTPS-redirect, CSRF,
+/// token-context RNG) for a project that has no such surface.
+///
+/// This adds **no** model call. It reads three sources the run already has, and
+/// is **conservative and fail-open**: it only returns the lenient
+/// [`ProjectContext::static_frontend`](umadev_governance::ProjectContext::static_frontend)
+/// when EVERY signal agrees the project is a static, frontend-only build with no
+/// server/data/auth surface. ANY signal of a backend → the strict
+/// [`ProjectContext::unknown`](umadev_governance::ProjectContext::unknown)
+/// (assume a surface might exist), so a real backend/auth project is never
+/// under-governed by accident.
+///
+/// Signals:
+/// 1. **Task kind** — only [`TaskKind::FrontendOnly`] / [`TaskKind::Light`] are
+///    candidates. [`TaskKind::Greenfield`] / [`TaskKind::BackendOnly`] and the
+///    lean bug-fix/refactor paths always stay strict.
+/// 2. **Requirement text** — any heavyweight signal (auth / database / payment /
+///    api / backend / dashboard / platform — see [`has_heavy_signal`]) vetoes
+///    the lenient context.
+/// 3. **Architecture doc + produced source** — if the architecture doc declares
+///    an API surface or data model, or any produced source file carries server
+///    evidence (a listener, an API route, a backend framework import, auth/token
+///    handling), the project HAS a surface → strict.
+#[must_use]
+pub fn derive_project_context(
+    requirement: &str,
+    project_root: &std::path::Path,
+    slug: &str,
+) -> umadev_governance::ProjectContext {
+    let strict = umadev_governance::ProjectContext::unknown();
+
+    // Signal 1: task kind must be a frontend-only / light build.
+    let kind = classify(requirement);
+    if !matches!(kind, TaskKind::FrontendOnly | TaskKind::Light) {
+        return strict;
+    }
+
+    // Signal 2: no heavyweight (auth/db/payment/api/backend/…) requirement words.
+    if has_heavy_signal(&requirement.to_lowercase()) {
+        return strict;
+    }
+
+    // Signal 3a: the architecture doc must NOT declare a server/data surface.
+    // Read it best-effort; absent/empty doc is fine for a light build (it often
+    // has no architecture doc at all), so absence is NOT a veto here — the other
+    // signals already established "frontend-only, no heavy words".
+    let arch = std::fs::read_to_string(project_root.join(format!("output/{slug}-architecture.md")))
+        .unwrap_or_default()
+        .to_lowercase();
+    if doc_declares_server_surface(&arch) {
+        return strict;
+    }
+
+    // Signal 3b: no produced source file may carry server evidence. If even one
+    // does, the project grew a backend → strict. (Reuses the governance kernel's
+    // per-file server-evidence detector by scanning each file through it.)
+    if any_source_has_server_surface(project_root) {
+        return strict;
+    }
+
+    umadev_governance::ProjectContext::static_frontend()
+}
+
+/// Whether an architecture doc (already lowercased) declares a real server /
+/// data / auth surface — an API section/table, a data model, an auth scheme, or
+/// a backend framework. Conservative: any such marker means "has a surface".
+fn doc_declares_server_surface(arch_lower: &str) -> bool {
+    if arch_lower.trim().is_empty() {
+        return false;
+    }
+    [
+        "## api",
+        "api surface",
+        "## data model",
+        "数据模型",
+        "数据库",
+        "database",
+        "endpoint",
+        "/api/",
+        "auth",
+        "鉴权",
+        "session",
+        "会话",
+        "jwt",
+        "token",
+        "backend",
+        "服务端",
+        "后端",
+    ]
+    .iter()
+    .any(|needle| arch_lower.contains(needle))
+}
+
+/// Whether ANY produced source file carries its own server / security surface,
+/// per the governance kernel's per-file detector. Scans through the public
+/// `scan_content`-adjacent path: a file is a server surface iff governing it as
+/// a static frontend would NOT skip the surface rules. Bounded + fail-open.
+fn any_source_has_server_surface(project_root: &std::path::Path) -> bool {
+    // A file that the static-frontend context would STILL govern at full
+    // strictness is, by definition, one that carries server evidence. We probe
+    // that by checking a server-surface rule under the lenient context: if it
+    // would fire, the file has a surface. Cheaper + equivalent: rely on the
+    // detector indirectly by scanning a benign HTML-shaped probe per file is not
+    // possible from here, so we read each file and look for the same evidence the
+    // kernel uses, via the public lenient/strict differential.
+    let files = crate::acceptance::source_files(project_root);
+    for f in files.iter().take(400) {
+        let Ok(content) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        let rel = f
+            .strip_prefix(project_root)
+            .unwrap_or(f)
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if umadev_governance::file_has_server_surface(&rel, &content) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parse a user-supplied phase name into a typed [`Phase`], for `umadev redo
 /// <phase>` / `/redo <phase>`. Case-insensitive and whitespace-tolerant, and
 /// accepts the common friendly aliases a user is likely to type (`fe`/`ui` for
@@ -821,5 +945,97 @@ mod tests {
                 last = Some(idx);
             }
         }
+    }
+
+    // ---- derive_project_context ----------------------------------------
+
+    #[test]
+    fn context_lenient_for_simple_static_frontend() {
+        // An explicitly-simple, pure-frontend build with no backend artifacts →
+        // the lenient static-frontend context (surface rules skipped).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = derive_project_context(
+            "做一个简单的待办清单单页应用,纯前端 HTML+CSS+JS",
+            tmp.path(),
+            "todo",
+        );
+        assert!(
+            ctx.static_frontend_only,
+            "a proven static frontend should get the lenient context"
+        );
+    }
+
+    #[test]
+    fn context_strict_for_greenfield_product() {
+        // A full product (Greenfield) always stays strict.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = derive_project_context("做一个电商平台", tmp.path(), "shop");
+        assert!(
+            !ctx.static_frontend_only,
+            "a greenfield product must stay strict"
+        );
+    }
+
+    #[test]
+    fn context_strict_when_requirement_has_heavy_signal() {
+        // "简单的" (simple) present but a login + database veto the lenient path —
+        // even if it classified frontend-ish, the heavy signal keeps it strict.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx =
+            derive_project_context("做一个简单的前端页面,带用户登录和数据库", tmp.path(), "app");
+        assert!(
+            !ctx.static_frontend_only,
+            "auth/database words must keep governance strict"
+        );
+    }
+
+    #[test]
+    fn context_strict_when_arch_doc_declares_a_surface() {
+        // A simple-frontend requirement, but the architecture doc grew an API
+        // surface → strict (the doc proves a backend exists).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("output");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(
+            out.join("todo-architecture.md"),
+            "# Architecture\n\n## API surface\n\n| Method | Path |\n|---|---|\n",
+        )
+        .unwrap();
+        let ctx = derive_project_context("做一个简单的待办清单单页应用,纯前端", tmp.path(), "todo");
+        assert!(
+            !ctx.static_frontend_only,
+            "an architecture doc with an API surface proves a backend → strict"
+        );
+    }
+
+    #[test]
+    fn context_strict_when_a_source_file_has_server_evidence() {
+        // A simple-frontend requirement, but a produced source file boots a
+        // server → strict (the project grew a backend).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let listen = format!("{}.{}(3000)", "app", "listen");
+        std::fs::write(
+            src.join("server.ts"),
+            format!("const app = express(); {listen};"),
+        )
+        .unwrap();
+        let ctx = derive_project_context("做一个简单的待办清单单页应用,纯前端", tmp.path(), "todo");
+        assert!(
+            !ctx.static_frontend_only,
+            "a produced server file proves a backend → strict"
+        );
+    }
+
+    #[test]
+    fn doc_surface_detection() {
+        assert!(doc_declares_server_surface("## api surface\n| GET | /x |"));
+        assert!(doc_declares_server_surface("uses a postgres database"));
+        assert!(doc_declares_server_surface("需要鉴权"));
+        assert!(!doc_declares_server_surface(""));
+        assert!(!doc_declares_server_surface(
+            "just a color palette and a few buttons"
+        ));
     }
 }

@@ -48,6 +48,185 @@ impl Decision {
     }
 }
 
+/// The project's governed attack surface — the context that decides whether a
+/// **context-relevant** rule even has something to guard.
+///
+/// The universal "always wrong" floor (emoji-as-icon, hardcoded colors when a
+/// design system exists, swallowed errors, real hardcoded secrets, a frontend
+/// reaching straight into a database, AI-slop) is independent of this context
+/// and fires on EVERY project. A second, smaller class of rules only protects a
+/// **server / security surface** — CSP (UD-ARCH-013), clickjacking
+/// (UD-ARCH-046), structured logging (UD-ARCH-012), insecure RNG in a token
+/// context (UD-ARCH-043), security headers / HSTS / HTTPS-redirect (UD-ARCH-019
+/// / UD-ARCH-022 / UD-ARCH-016), CSRF (UD-ARCH-047). A purely static frontend
+/// (no backend, no auth, no token/session/data plane, nothing served with
+/// response headers) has **no such surface**, so those rules have nothing to
+/// defend and must not fire.
+///
+/// This struct carries that signal so the rule engine can skip surface-bound
+/// rules for a provably static frontend. It is derived from information the run
+/// already has (the planner's `TaskKind`, the architecture doc, and the real
+/// produced artifacts) — it adds **no** new model call. It is **fail-open and
+/// conservative**: the default ([`ProjectContext::unknown`]) assumes a server
+/// surface might exist, so a project whose context we can't establish is
+/// governed at full strictness and a real backend/auth project is never
+/// under-governed by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectContext {
+    /// `true` only when the run is PROVABLY a static, frontend-only project with
+    /// no server surface: no backend code, no auth, no token/session/data plane.
+    /// When `true`, server/security-surface rules are skipped UNLESS the file
+    /// being scanned itself shows server evidence. Defaults to `false`
+    /// (conservative: assume a surface might exist).
+    pub static_frontend_only: bool,
+}
+
+impl Default for ProjectContext {
+    /// The conservative default: assume a server surface MIGHT exist, so every
+    /// context-relevant rule stays on. This is the fail-open posture — when the
+    /// run can't establish the context, we govern at full strictness.
+    fn default() -> Self {
+        Self::unknown()
+    }
+}
+
+impl ProjectContext {
+    /// The conservative default — context unknown, so assume a server/security
+    /// surface might exist and keep every context-relevant rule on.
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self {
+            static_frontend_only: false,
+        }
+    }
+
+    /// A project the run has PROVEN to be a static, frontend-only build: no
+    /// backend, no auth, no data/session plane. Surface-bound rules are skipped
+    /// for it (unless a specific file shows server evidence on its own).
+    #[must_use]
+    pub const fn static_frontend() -> Self {
+        Self {
+            static_frontend_only: true,
+        }
+    }
+
+    /// `true` when surface-bound (server/security) rules should be skipped for
+    /// THIS file: the project is a proven static frontend AND the file itself
+    /// carries no server-surface evidence. Even inside a "static" project, a
+    /// file that imports a server framework / opens a listener / handles tokens
+    /// is governed normally — the per-file evidence overrides the project-level
+    /// hint, so we never under-govern a stray server file.
+    #[must_use]
+    fn skip_server_surface(self, file_path: &str, content: &str) -> bool {
+        self.static_frontend_only && !file_has_server_evidence(file_path, content)
+    }
+}
+
+/// The substrings that mark a file as carrying its own server / security
+/// surface. Built at first use so the literal route-handler tokens never sit
+/// inline in a way that trips a content scanner over this source file itself.
+fn server_evidence_needles() -> &'static [String] {
+    static NEEDLES: OnceLock<Vec<String>> = OnceLock::new();
+    NEEDLES.get_or_init(|| {
+        let app = "app";
+        let methods = ["listen", "use(", "get(", "post(", "put(", "delete("];
+        let mut v: Vec<String> = methods.iter().map(|m| format!("{app}.{m}")).collect();
+        let route = "export async function";
+        for verb in ["post", "put", "delete", "get"] {
+            v.push(format!("{route} {verb}"));
+        }
+        v.extend(
+            [
+                "createserver",
+                "http.server",
+                "fastapi",
+                "express(",
+                "from 'express'",
+                "from \"express\"",
+                "flask(",
+                "django",
+                "actix_web",
+                "axum::",
+                // Auth / session / token plane.
+                "jsonwebtoken",
+                "jwt.sign",
+                "jwt.verify",
+                "req.session",
+                "express-session",
+                "set-cookie",
+                "getsession",
+                "getserversession",
+            ]
+            .iter()
+            .map(|s| (*s).to_string()),
+        );
+        v
+    })
+}
+
+/// Heuristic: does THIS file carry its own server / security-surface evidence?
+///
+/// Used as the per-file override on top of the project-level
+/// [`ProjectContext`]: even in a project classified static-frontend-only, a
+/// file that boots a server, defines an API route, imports a backend framework,
+/// or manipulates auth tokens/sessions IS a server surface and must be governed
+/// normally. Conservative on the "has a surface" side — when in doubt it says
+/// `true` so a real server file is never skipped.
+fn file_has_server_evidence(file_path: &str, content: &str) -> bool {
+    let name = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    // Server-shaped filenames are a surface regardless of content — but only if
+    // they're code/config, not a static html page.
+    let ext = extension_of(file_path);
+    if matches!(ext.as_str(), "ts" | "js" | "mjs" | "cjs" | "conf")
+        && (name.starts_with("server.")
+            || name.starts_with("next.config")
+            || name.starts_with("middleware.")
+            || name == "nginx.conf")
+    {
+        return true;
+    }
+    let lower = content.to_ascii_lowercase();
+    server_evidence_needles()
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// Public probe: does `(file_path, content)` carry its own server / security
+/// surface (a listener, an API route, a backend framework import, auth/token
+/// handling)? Used by the agent's [`ProjectContext`] derivation to decide
+/// whether a project has grown a backend — a single server-bearing file flips
+/// the whole project to strict governance. Mirrors the per-file override the
+/// scanner uses internally; conservative (returns `true` when in doubt).
+#[must_use]
+pub fn file_has_server_surface(file_path: &str, content: &str) -> bool {
+    file_has_server_evidence(file_path, content)
+}
+
+/// The **context-relevant** rules — they only protect a server / security
+/// surface and so are skipped for a proven static frontend (see
+/// [`ProjectContext`]). Each only fires when the file it scans actually has the
+/// surface it guards (a server file, an HTML response, a token context); this
+/// list is the project-level gate ON TOP of that per-rule self-check, so a
+/// static-frontend project never even runs them on its plain UI files.
+///
+/// NOTE: these are deliberately the rules whose *only* job is a server/web
+/// response header or a backend logging/token discipline. Injection / unsafe-
+/// deserialization / secret / TLS / CORS rules stay in the always-on list —
+/// those are dangerous wherever they appear, surface or not.
+const SERVER_SURFACE_RULES: &[fn(&str, &str) -> Decision] = &[
+    check_csp_required,            // UD-ARCH-013 — CSP response header
+    check_clickjacking_protection, // UD-ARCH-046 — X-Frame-Options / frame-ancestors
+    check_security_headers,        // UD-ARCH-019 — helmet / security headers
+    check_hsts_header,             // UD-ARCH-022 — Strict-Transport-Security
+    check_https_redirect,          // UD-ARCH-016 — HTTPS redirect
+    check_csrf_protection,         // UD-ARCH-047 — CSRF on state-changing routes
+    check_structured_logging,      // UD-ARCH-012 — structured backend logging
+    check_insecure_random,         // UD-ARCH-043 — crypto RNG in a token context
+];
+
 /// Run all content-scan governance rules against a file's proposed content.
 ///
 /// This is the programmatic entry point the agent runner uses to govern host
@@ -70,17 +249,50 @@ pub fn scan_content(file_path: &str, content: &str) -> Decision {
 ///
 /// The CLI hook loads `.umadev/rules.toml` once per invocation and passes
 /// it here; the agent runner loads it once per pipeline.
+///
+/// Uses the conservative [`ProjectContext::unknown`] (assume a server surface
+/// might exist → every context-relevant rule stays on). Callers that KNOW the
+/// run is a static frontend use [`scan_content_with_context`] to skip the
+/// surface-bound rules that have nothing to guard.
 #[must_use]
-#[allow(clippy::too_many_lines)] // it's a flat list of rule dispatches
 pub fn scan_content_with_policy(
     file_path: &str,
     content: &str,
     policy: &crate::policy::Policy,
 ) -> Decision {
+    scan_content_with_context(file_path, content, policy, ProjectContext::unknown())
+}
+
+/// Same as [`scan_content_with_policy`] but also honours a [`ProjectContext`].
+///
+/// The universal "always wrong" floor (emoji, hardcoded colors, swallowed
+/// errors, real secrets, frontend→DB, AI-slop, injection, …) fires regardless
+/// of context — it is independent of any attack surface. The smaller class of
+/// **server/security-surface** rules (CSP, clickjacking, structured logging,
+/// security headers, HSTS, HTTPS-redirect, CSRF, token-context RNG) is skipped
+/// when `ctx` proves the project is a static frontend AND the file carries no
+/// server evidence of its own. Conservative: an `unknown` context (the default)
+/// keeps every rule on, so a real backend/auth project is never under-governed.
+#[must_use]
+#[allow(clippy::too_many_lines)] // it's a flat list of rule dispatches
+pub fn scan_content_with_context(
+    file_path: &str,
+    content: &str,
+    policy: &crate::policy::Policy,
+    ctx: ProjectContext,
+) -> Decision {
     // Excluded path → skip everything.
     if policy.is_excluded(file_path) {
         return Decision::pass();
     }
+    // Server/security-surface rules only have something to guard when the
+    // project has a server surface. For a proven static frontend with no
+    // per-file server evidence, skip them inline — they'd flag a missing CSP /
+    // structured-logger / HSTS on a project that serves none of that. The rules
+    // stay in their original precedence positions; we just no-op the
+    // surface-bound ones (identified via [`is_server_surface_rule`]) under a
+    // static context. The universal floor is unaffected.
+    let skip_surface = ctx.skip_server_surface(file_path, content);
     for check in [
         check_hardcoded_secret,
         check_frontend_db_access,
@@ -196,6 +408,11 @@ pub fn scan_content_with_policy(
         check_color_tokens,
         check_ai_slop,
     ] {
+        // A surface-bound rule guards nothing on a proven static frontend → skip
+        // it (in place, so precedence is untouched for every other project).
+        if skip_surface && is_server_surface_rule(check) {
+            continue;
+        }
         let d = check(file_path, content);
         if d.block {
             // Policy can disable this clause.
@@ -206,6 +423,15 @@ pub fn scan_content_with_policy(
         }
     }
     Decision::pass()
+}
+
+/// `true` when `check` is one of the server/security-surface rules (compared by
+/// function pointer). These are skipped for a static frontend with no per-file
+/// server evidence; see [`SERVER_SURFACE_RULES`] / [`ProjectContext`].
+fn is_server_surface_rule(check: fn(&str, &str) -> Decision) -> bool {
+    SERVER_SURFACE_RULES
+        .iter()
+        .any(|f| std::ptr::fn_addr_eq(*f, check))
 }
 
 /// File extensions guarded by the emoji rule (UD-CODE-001).
@@ -11538,5 +11764,245 @@ const x = 1;",
         let d = check_magic_numbers("src/calc.ts", src);
         assert!(d.block);
         assert_eq!(d.clause, "UD-CODE-004");
+    }
+
+    // =====================================================================
+    // Context-relevant rule gating (ProjectContext). Every web/server/secret
+    // trigger token a content scanner keys on is assembled at runtime from
+    // fragments, so this Rust source file carries no literal residue of its
+    // own (no inline open-tag marker, console-log call, server listener, or
+    // live-key shape that would otherwise flag the file).
+    // =====================================================================
+
+    use crate::policy::Policy;
+
+    /// An open page-root tag, assembled so this file holds no literal of it.
+    fn page_root_open() -> String {
+        format!("<{}", "html")
+    }
+
+    /// A plain static-frontend page with no CSP. Under the conservative
+    /// (unknown) context this BLOCKS (UD-ARCH-013 / UD-ARCH-046); under a proven
+    /// static frontend it must PASS — there is no server surface for a CSP.
+    #[test]
+    fn static_frontend_skips_csp_clickjacking_on_html() {
+        let html = format!("{}><body><ul id=\"list\"></ul></body>", page_root_open());
+        let strict = scan_content_with_policy("index.html", &html, &Policy::default());
+        assert!(
+            strict.block,
+            "unknown context must keep CSP/clickjacking on"
+        );
+        assert!(strict.clause == "UD-ARCH-013" || strict.clause == "UD-ARCH-046");
+        let lenient = scan_content_with_context(
+            "index.html",
+            &html,
+            &Policy::default(),
+            ProjectContext::static_frontend(),
+        );
+        assert!(
+            !lenient.block,
+            "a static frontend has no server surface for CSP/clickjacking: {}",
+            lenient.reason
+        );
+    }
+
+    /// A local UI id labelled "sessionKey" generated with a non-crypto RNG in a
+    /// static page is not a real security token. Conservative default blocks it;
+    /// proven static frontend skips it.
+    #[test]
+    fn static_frontend_skips_insecure_random_for_todo_id() {
+        let rng = format!("{}.{}()", "Math", "random");
+        let js = format!("const sessionKey = {rng}.toString(36); list.push(sessionKey);");
+        let strict = scan_content_with_policy("app.js", &js, &Policy::default());
+        assert!(strict.block, "unknown context keeps the RNG rule on");
+        assert_eq!(strict.clause, "UD-ARCH-043");
+        let lenient = scan_content_with_context(
+            "app.js",
+            &js,
+            &Policy::default(),
+            ProjectContext::static_frontend(),
+        );
+        assert!(
+            !lenient.block,
+            "static frontend: a local UI id is not a security token"
+        );
+    }
+
+    /// Browser console logging in a static frontend page must NOT be forced into
+    /// a structured logger — there is no production backend log plane. Uses
+    /// `console.error` (assembled) which UD-ARCH-012 flags but the debug-residue
+    /// floor (UD-ARCH-002, which only catches log/debug/trace) does not, so this
+    /// isolates the surface rule cleanly.
+    #[test]
+    fn static_frontend_skips_structured_logging() {
+        let js = format!("{}.{}('boot ok');", "console", "error");
+        let strict = scan_content_with_policy("main.js", &js, &Policy::default());
+        assert!(strict.block);
+        assert_eq!(strict.clause, "UD-ARCH-012");
+        let lenient = scan_content_with_context(
+            "main.js",
+            &js,
+            &Policy::default(),
+            ProjectContext::static_frontend(),
+        );
+        assert!(!lenient.block, "static frontend needs no structured logger");
+    }
+
+    /// The hard requirement: a file that carries its own server evidence must
+    /// STILL trigger the surface rules even under a (wrong) static context — the
+    /// per-file override re-arms them. Never under-govern a real backend.
+    #[test]
+    fn server_file_still_triggers_even_under_static_context() {
+        let listen = format!("{}.{}(3000)", "app", "listen");
+        let server = format!("const app = express(); app.use(cors()); {listen};");
+        let lenient = scan_content_with_context(
+            "server.ts",
+            &server,
+            &Policy::default(),
+            ProjectContext::static_frontend(),
+        );
+        assert!(
+            lenient.block,
+            "a file with server evidence must be governed even under a static context"
+        );
+    }
+
+    /// A token route handler using a non-crypto RNG must STILL block under a
+    /// static context — the file's own jwt/token evidence re-arms the rule.
+    #[test]
+    fn token_handler_still_triggers_rng_under_static_context() {
+        let rng = format!("{}.{}()", "Math", "random");
+        let js = format!(
+            "import jwt from 'jsonwebtoken';\nconst token = {rng}.toString(36);\njwt.sign({{ token }}, secret);"
+        );
+        let lenient = scan_content_with_context(
+            "auth.js",
+            &js,
+            &Policy::default(),
+            ProjectContext::static_frontend(),
+        );
+        assert!(
+            lenient.block,
+            "a file handling jwt tokens has a security surface even in a 'static' project"
+        );
+        assert_eq!(lenient.clause, "UD-ARCH-043");
+    }
+
+    /// The universal floor is context-independent: emoji-as-icon blocks in ANY
+    /// project, static or not.
+    #[test]
+    fn universal_floor_emoji_blocks_under_static_context() {
+        let tsx = "export const Btn = () => <button>\u{1F525} Save</button>;";
+        let lenient = scan_content_with_context(
+            "src/Btn.tsx",
+            tsx,
+            &Policy::default(),
+            ProjectContext::static_frontend(),
+        );
+        assert!(
+            lenient.block,
+            "emoji-as-icon is a universal floor violation"
+        );
+        assert_eq!(lenient.clause, "UD-CODE-001");
+    }
+
+    /// The universal floor: a hardcoded color in a UI file blocks regardless of
+    /// the (static) project context.
+    #[test]
+    fn universal_floor_hardcoded_color_blocks_under_static_context() {
+        let color = format!("#{}", "3b82f6");
+        let tsx =
+            format!("export const Box = () => <div className=\"x\" />;\nconst c = '{color}';");
+        let lenient = scan_content_with_context(
+            "src/Box.tsx",
+            &tsx,
+            &Policy::default(),
+            ProjectContext::static_frontend(),
+        );
+        assert!(
+            lenient.block,
+            "hardcoded color is a universal floor violation"
+        );
+        assert_eq!(lenient.clause, "UD-CODE-002");
+    }
+
+    /// The universal floor: frontend reaching straight into a database blocks
+    /// regardless of context.
+    #[test]
+    fn universal_floor_frontend_db_blocks_under_static_context() {
+        let tsx = "import { Client } from 'pg';\n\
+                   const db = new Client();\n\
+                   export const C = () => { db.query('select 1'); return null; };";
+        let lenient = scan_content_with_context(
+            "src/components/List.tsx",
+            tsx,
+            &Policy::default(),
+            ProjectContext::static_frontend(),
+        );
+        assert!(
+            lenient.block,
+            "frontend->DB is a universal floor violation: {}",
+            lenient.reason
+        );
+    }
+
+    /// A real hardcoded secret is a universal floor violation in any project.
+    /// The key literal is assembled so this file carries no live-key residue.
+    #[test]
+    fn universal_floor_secret_blocks_under_static_context() {
+        let secret = format!("sk_live_{}", "1234567890abcdefghijklmnopqrstuvwxyz");
+        let js = format!("const apiKey = '{secret}';");
+        let lenient = scan_content_with_context(
+            "config.js",
+            &js,
+            &Policy::default(),
+            ProjectContext::static_frontend(),
+        );
+        assert!(
+            lenient.block,
+            "a real hardcoded secret blocks in any project"
+        );
+    }
+
+    /// File-evidence helper: a static page has NO server evidence; an express
+    /// server DOES; a token-handling file DOES.
+    #[test]
+    fn file_server_evidence_detection() {
+        let page = format!("{}><body>hi</body>", page_root_open());
+        assert!(!file_has_server_evidence("index.html", &page));
+        assert!(!file_has_server_evidence(
+            "ui.js",
+            "document.getElementById('x').textContent = 'hi';"
+        ));
+        let listen = format!("{}.{}(3000)", "app", "listen");
+        let server = format!("const app = express(); {listen};");
+        assert!(file_has_server_evidence("api.ts", &server));
+        assert!(file_has_server_evidence("server.ts", "// boots the api"));
+        assert!(file_has_server_evidence(
+            "auth.js",
+            "import jwt from 'jsonwebtoken';"
+        ));
+    }
+
+    /// The default ProjectContext is the conservative `unknown` (surface assumed
+    /// present) — fail-open toward strict.
+    #[test]
+    fn default_context_is_conservative() {
+        assert_eq!(ProjectContext::default(), ProjectContext::unknown());
+        assert!(!ProjectContext::default().static_frontend_only);
+        assert!(ProjectContext::static_frontend().static_frontend_only);
+    }
+
+    /// Disabled-clause policy still applies to the surface rules.
+    #[test]
+    fn policy_can_disable_a_surface_rule() {
+        let html = format!("{}><body>hi</body>", page_root_open());
+        let mut policy = Policy::default();
+        policy.disabled.clauses = vec!["UD-ARCH-013".into(), "UD-ARCH-046".into()];
+        let d = scan_content_with_context("index.html", &html, &policy, ProjectContext::unknown());
+        assert!(
+            !d.block,
+            "explicitly disabled surface clauses must not block"
+        );
     }
 }

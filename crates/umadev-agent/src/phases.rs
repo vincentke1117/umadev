@@ -1515,6 +1515,33 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
         });
     }
 
+    // Context-aware N/A: a proven static, frontend-only build has no server /
+    // data / API surface, so the backend-contract and ops checks below guard
+    // nothing. Mark them `n/a` (kept in the report for transparency but excluded
+    // from the score) instead of penalising a clean static page for "missing" a
+    // CSP / API contract / Dockerfile it correctly has no reason to ship. This
+    // does NOT lower the bar for APPLICABLE checks — a static page still must
+    // pass design-system / anti-slop / emoji / color / secret / build checks —
+    // and a backend/auth project keeps EVERY check live (conservative default).
+    // Only N/A a surface-bound check that is actually PENALISING the gate
+    // (status `failed`/`warning`) for lack of a backend. A surface check that
+    // already PASSES (e.g. "Auth coverage" with no endpoints → 100) is left
+    // live — N/A-ing a passing check would only strip a legitimate positive
+    // signal and could lower the mean. This keeps the rule strictly "don't
+    // penalise inapplicable checks", never "lower the bar for applicable ones".
+    let ctx = crate::planner::derive_project_context(&opts.requirement, &opts.project_root, &slug);
+    if ctx.static_frontend_only {
+        for c in &mut checks {
+            if SURFACE_BOUND_CHECKS.contains(&c.name.as_str()) && c.status != "passed" {
+                c.status = "n/a".to_string();
+                c.details = format!(
+                    "N/A — static frontend has no server/API/data surface to guard. ({})",
+                    c.details
+                );
+            }
+        }
+    }
+
     let total_score = avg_score(&checks);
     let weighted_score = weighted_avg(&checks);
     let mut critical_failures: Vec<String> = checks
@@ -1530,7 +1557,7 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
     }
     let recommendations = checks
         .iter()
-        .filter(|c| c.status != "passed")
+        .filter(|c| c.status != "passed" && !is_na(c))
         .map(|c| format!("Address `{}`: {}", c.name, c.details))
         .collect();
     let passed = total_score >= pass_threshold && critical_failures.is_empty();
@@ -1730,23 +1757,54 @@ fn security_scan_check(project_root: &Path) -> Option<QualityCheck> {
     })
 }
 
+/// Quality-gate checks whose ONLY purpose is to guard a server / data / API
+/// surface. For a proven static, frontend-only build (no backend, no auth, no
+/// data plane) these guard nothing, so [`run_quality`] marks them `n/a` and the
+/// scoring helpers below exclude them. They stay LIVE for every other project
+/// (the conservative default), so a real backend/auth build is scored on all of
+/// them. NOTE: this list deliberately excludes the universal floor — "No leaked
+/// secrets", "Anti-AI-slop check", "Design quality (code)", emoji/color block
+/// events, "Real source code present", "Build & test results" — those apply to
+/// EVERY project and are never marked N/A.
+const SURFACE_BOUND_CHECKS: &[&str] = &[
+    "OpenAPI contract",
+    "Frontend↔contract conformance",
+    "PRD routes↔contract coverage",
+    "Input validation coverage",
+    "Auth coverage",
+    "Pagination strategy",
+    "Error handling convention",
+    "PRD↔Architecture alignment",
+    "API URL consistency",
+    "Ops artifacts present",
+    "Security scan",
+];
+
+/// `true` when a check is N/A (it guards an absent attack surface). N/A checks
+/// are kept in the report for transparency but neither help nor hurt the score.
+fn is_na(c: &QualityCheck) -> bool {
+    c.status == "n/a"
+}
+
 fn avg_score(checks: &[QualityCheck]) -> i32 {
-    if checks.is_empty() {
+    let scored: Vec<&QualityCheck> = checks.iter().filter(|c| !is_na(c)).collect();
+    if scored.is_empty() {
         return 0;
     }
-    let sum: i32 = checks.iter().map(|c| c.score).sum();
-    sum / i32::try_from(checks.len()).unwrap_or(1)
+    let sum: i32 = scored.iter().map(|c| c.score).sum();
+    sum / i32::try_from(scored.len()).unwrap_or(1)
 }
 
 fn weighted_avg(checks: &[QualityCheck]) -> f32 {
-    if checks.is_empty() {
+    let scored: Vec<&QualityCheck> = checks.iter().filter(|c| !is_na(c)).collect();
+    if scored.is_empty() {
         return 0.0;
     }
-    let total_weight: f32 = checks.iter().map(|c| c.weight).sum();
+    let total_weight: f32 = scored.iter().map(|c| c.weight).sum();
     if total_weight <= 0.0 {
         return 0.0;
     }
-    let weighted: f32 = checks.iter().map(|c| c.score as f32 * c.weight).sum();
+    let weighted: f32 = scored.iter().map(|c| c.score as f32 * c.weight).sum();
     weighted / total_weight
 }
 
@@ -4568,6 +4626,125 @@ mod tests {
         assert!(
             via_notes_path.is_empty(),
             "scanning the notes file path (old bug) finds no source calls: {via_notes_path:?}"
+        );
+    }
+
+    // ---- context-aware N/A on the quality gate -------------------------
+
+    /// Build RunOptions for an explicitly-simple, pure static-frontend build.
+    fn static_frontend_opts(root: &Path) -> RunOptions {
+        let mut o = opts(root);
+        o.requirement = "做一个简单的待办清单单页应用,纯前端 HTML+CSS+JS".to_string();
+        o
+    }
+
+    #[test]
+    fn static_frontend_marks_backend_contract_checks_na() {
+        // A proven static-frontend run: the backend-contract + ops checks must be
+        // marked `n/a` (no server/API/data surface to guard) rather than scored
+        // low, so a clean static page isn't penalised for "missing" an API
+        // contract / Dockerfile it has no reason to ship.
+        let tmp = TempDir::new().unwrap();
+        let o = static_frontend_opts(tmp.path());
+        let out = run_quality(&o).unwrap();
+        let json = fs::read_to_string(&out.artifacts[0]).unwrap();
+        let report: QualityReport = serde_json::from_str(&json).unwrap();
+        // At least one surface-bound check that was PENALISING the static page
+        // (status failed/warning, no backend to satisfy it) is now N/A — the
+        // mechanism removes inapplicable penalties. Every N/A row must be a
+        // surface-bound check that was NOT passing (we never N/A the floor, and
+        // never N/A a passing check).
+        let na: Vec<&QualityCheck> = report.checks.iter().filter(|c| c.status == "n/a").collect();
+        assert!(
+            !na.is_empty(),
+            "a static frontend with no backend artifacts should N/A some surface checks"
+        );
+        for c in &na {
+            assert!(
+                SURFACE_BOUND_CHECKS.contains(&c.name.as_str()),
+                "only surface-bound checks may be N/A, got `{}`",
+                c.name
+            );
+        }
+        // A surface check that already PASSES (no endpoints → Auth 100) stays
+        // live — N/A only removes penalties, never positive signal.
+        if let Some(c) = report.checks.iter().find(|c| c.name == "Auth coverage") {
+            if c.score == 100 {
+                assert_ne!(c.status, "n/a", "a passing surface check stays live");
+            }
+        }
+        // The universal floor must STILL be live (not N/A) on a static frontend.
+        for name in ["No leaked secrets", "Anti-AI-slop check"] {
+            if let Some(c) = report.checks.iter().find(|c| c.name == name) {
+                assert_ne!(c.status, "n/a", "{name} is a universal floor — never N/A");
+            }
+        }
+    }
+
+    #[test]
+    fn na_checks_excluded_from_score() {
+        // N/A checks neither help nor hurt: a static-frontend run that has none of
+        // the backend artifacts should NOT be dragged down by the (now-N/A)
+        // contract/ops checks. We assert the scored set excludes every N/A row.
+        let tmp = TempDir::new().unwrap();
+        let o = static_frontend_opts(tmp.path());
+        let out = run_quality(&o).unwrap();
+        let json = fs::read_to_string(&out.artifacts[0]).unwrap();
+        let report: QualityReport = serde_json::from_str(&json).unwrap();
+        let scored: Vec<&QualityCheck> =
+            report.checks.iter().filter(|c| c.status != "n/a").collect();
+        let scored_mean = if scored.is_empty() {
+            0
+        } else {
+            scored.iter().map(|c| c.score).sum::<i32>() / i32::try_from(scored.len()).unwrap()
+        };
+        assert_eq!(
+            report.total_score, scored_mean,
+            "total_score must be the mean of the NON-N/A checks only"
+        );
+        // At least one check was actually marked N/A (the mechanism fired).
+        assert!(
+            report.checks.iter().any(|c| c.status == "n/a"),
+            "a static-frontend run should mark some surface-bound checks N/A"
+        );
+    }
+
+    #[test]
+    fn greenfield_keeps_all_checks_live() {
+        // The conservative default: a greenfield/login product (the default
+        // `opts` requirement is "build a login system") marks NOTHING N/A — every
+        // backend-contract + ops check stays live and scored.
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path()); // requirement = "build a login system" → strict
+        let out = run_quality(&o).unwrap();
+        let json = fs::read_to_string(&out.artifacts[0]).unwrap();
+        let report: QualityReport = serde_json::from_str(&json).unwrap();
+        assert!(
+            report.checks.iter().all(|c| c.status != "n/a"),
+            "a strict (backend) project must keep every check live, none N/A"
+        );
+    }
+
+    #[test]
+    fn static_frontend_scores_at_least_as_high_as_strict() {
+        // The headline behaviour: on the SAME clean-but-docs-light workspace, the
+        // static-frontend context scores at least as high as the strict context —
+        // because the contract/ops checks it can't satisfy are N/A, not failing.
+        let tmp_a = TempDir::new().unwrap();
+        let lenient = run_quality(&static_frontend_opts(tmp_a.path())).unwrap();
+        let report_l: QualityReport =
+            serde_json::from_str(&fs::read_to_string(&lenient.artifacts[0]).unwrap()).unwrap();
+
+        let tmp_b = TempDir::new().unwrap();
+        let strict = run_quality(&opts(tmp_b.path())).unwrap(); // "build a login system"
+        let report_s: QualityReport =
+            serde_json::from_str(&fs::read_to_string(&strict.artifacts[0]).unwrap()).unwrap();
+
+        assert!(
+            report_l.total_score >= report_s.total_score,
+            "static frontend ({}) should not score below strict ({}) on an equivalent empty workspace",
+            report_l.total_score,
+            report_s.total_score
         );
     }
 }
