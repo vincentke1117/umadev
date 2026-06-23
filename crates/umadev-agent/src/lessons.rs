@@ -1095,6 +1095,39 @@ fn write_raw_lessons(project_root: &Path, filename: &str, lessons: &[Lesson]) {
     let _ = fs::write(&path, buf);
 }
 
+/// Atomically write `body` to `path` via a unique temp file + rename, so a
+/// reader (or a concurrent writer in another process) never observes a torn /
+/// partially-written file. Used for the SHARED global learned dir, which is not
+/// covered by the per-project run lock. The temp name carries the process id and
+/// a high-resolution timestamp so two concurrent writers don't collide on the
+/// temp file itself. Best-effort cleanup of the temp on a rename failure.
+/// Returns the rename result so the caller can fail-open.
+fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("lesson"),
+        std::process::id(),
+        stamp,
+    ));
+    fs::write(&tmp, body)?;
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Rename can fail across some filesystems / on Windows if the target
+            // is momentarily locked; clean the temp so we don't litter.
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// Append lessons to a raw JSONL file. Fail-open (best-effort write).
 fn append_raw_lessons(project_root: &Path, filename: &str, lessons: &[Lesson]) {
     if lessons.is_empty() {
@@ -1631,6 +1664,19 @@ fn advice_content_hash(l: &Lesson) -> u64 {
     l.root_cause.trim().hash(&mut h);
     "\u{0}".hash(&mut h);
     l.fix.trim().hash(&mut h);
+    h.finish()
+}
+
+/// A stable 64-bit hash of an arbitrary string — the filename disambiguator for
+/// promoted global lessons (see [`promote_to_global`]). Uses the same fixed-key
+/// `DefaultHasher` as [`advice_content_hash`], so the SAME input hashes the same
+/// across processes/runs (a re-promotion lands on the same file) while distinct
+/// inputs that slugify identically get distinct files. Fail-open by nature:
+/// hashing never errors.
+fn stable_str_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
     h.finish()
 }
 
@@ -2317,15 +2363,33 @@ pub fn sediment_lessons_with_judge(project_root: &Path, judge: Option<ReconcileJ
     let learned_root = project_root.join(LEARNED_DIR);
     let _ = fs::create_dir_all(&learned_root);
     let mut written = 0usize;
-    let mut seq_by_domain: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
 
+    // Clear stale `lesson-*.md` orphans in every domain dir this run touches
+    // BEFORE re-writing. The old `lesson-<domain>-<seq>.md` numbering walked the
+    // dedup map in non-deterministic HashMap order, so the same lesson could land
+    // on a different seq each run, leaving orphaned files for lessons that were
+    // invalidated / re-titled — and those orphans kept being RETRIEVED. We now
+    // (a) wipe the prior auto-sediment files in each written domain and (b) name
+    // each file by a STABLE content hash of its `(domain, title)` key, so a
+    // re-sediment of the same lesson is idempotent (same file, updated in place)
+    // and a vanished lesson leaves no ghost. Mirrors the skill index discipline.
+    let mut cleaned: std::collections::HashSet<String> = std::collections::HashSet::new();
     for lesson in by_key.values() {
+        if cleaned.insert(lesson.domain.clone()) {
+            let domain_dir = learned_root.join(&lesson.domain);
+            let _ = fs::create_dir_all(&domain_dir);
+            clear_auto_sediment_files(&domain_dir);
+        }
+    }
+
+    for (key, lesson) in &by_key {
         let domain_dir = learned_root.join(&lesson.domain);
         let _ = fs::create_dir_all(&domain_dir);
-        let seq = seq_by_domain.entry(lesson.domain.clone()).or_insert(0);
-        *seq += 1;
-        let path = domain_dir.join(format!("lesson-{domain}-{seq}.md", domain = lesson.domain));
+        let path = domain_dir.join(format!(
+            "lesson-{domain}-{:016x}.md",
+            stable_str_hash(key),
+            domain = lesson.domain
+        ));
         let body = render_lesson_markdown(lesson);
         if fs::write(&path, body).is_ok() {
             written += 1;
@@ -2443,10 +2507,26 @@ fn promote_to_global(_project_root: &Path, lessons: &[Lesson]) -> usize {
         if let Some(lesson) = latest {
             let dir = global_dir.join(&lesson.domain);
             let _ = fs::create_dir_all(&dir);
+            // Disambiguate the filename with a stable hash of the FULL
+            // `domain::title` key. Slugifying alone is lossy — two genuinely
+            // different titles (different punctuation, different long tails that
+            // get clipped) can collapse to the same slug and silently OVERWRITE
+            // each other's global lesson. Appending the key hash keeps distinct
+            // lessons in distinct files, while a re-promotion of the SAME lesson
+            // (identical key) hashes the same → it updates in place, never
+            // duplicates. The hash is deterministic across processes (fixed-key
+            // SipHash), so cross-run promotions stay stable.
             let slug = key.replace("::", "-").replace(' ', "-");
-            let path = dir.join(format!("{slug}.md"));
+            let slug = truncate(&slug, 80);
+            let path = dir.join(format!("{slug}-{:016x}.md", stable_str_hash(key)));
             let body = render_lesson_markdown(lesson);
-            if fs::write(&path, body).is_ok() {
+            // The global learned dir is SHARED across every project + run on this
+            // machine, so a plain `fs::write` (truncate-then-write) could be
+            // observed torn if two processes promote the same lesson at once.
+            // Write atomically (temp + rename) so a concurrent promotion never
+            // leaves a partial global lesson file. Fail-open: a write error is a
+            // no-op (the lesson stays project-local).
+            if write_atomic(&path, &body).is_ok() {
                 promoted += 1;
             }
         }
@@ -2466,6 +2546,29 @@ pub fn list_sedimented_lessons(project_root: &Path) -> Vec<PathBuf> {
         collect_md_files(&global, &mut files);
     }
     files
+}
+
+/// Remove this run's-predecessor auto-sediment markdown files (`lesson-*.md`)
+/// from a single domain dir, so a re-sediment doesn't accumulate orphans for
+/// lessons that were invalidated / re-titled. Strictly scoped to the
+/// auto-sediment `lesson-` prefix — any hand-authored `.md` a user dropped in
+/// the learned tree is left untouched. Non-recursive (operates on one domain
+/// dir). Fail-open: a read/remove error is ignored.
+fn clear_auto_sediment_files(domain_dir: &Path) {
+    let Ok(rd) = fs::read_dir(domain_dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+        let is_md = p.extension().and_then(|s| s.to_str()) == Some("md");
+        if is_md && name.starts_with("lesson-") {
+            let _ = fs::remove_file(&p);
+        }
+    }
 }
 
 fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -2712,6 +2815,18 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
     let top = &hits[0];
     let top_sig = top.signature.clone();
     let recurring = top.pitfall_status() == PitfallStatus::Recurring;
+    // Is `top` the SAME root cause as the error we are explaining, or merely a
+    // family neighbour? `lessons_for_error` matches by full signature OR family
+    // (`category/family` prefix), so the chosen `top` can be a DIFFERENT
+    // discriminator within the same family — e.g. the error is
+    // `dependency/module-not-found/lodash` but the highest-ranked recurring hit
+    // is `…/react-router-dom`. The generic root_cause/fix below are templated
+    // per family and stay useful across discriminators, but the
+    // discriminator-SPECIFIC fields — the base-reflected `next_strategy` and the
+    // `failed_fixes` ledger — belong to THAT pitfall's exact root cause. Surfacing
+    // them for a different module is the "knowledge → noise" mis-injection. So we
+    // only emit those when `top` is an exact-signature match.
+    let exact_root_cause = top.signature == sig;
     let mut out = String::from("\n\n## 历史踩坑（同类错误你之前遇到过）\n");
     out.push_str(&format!(
         "- 已累计 {} 次；签名 `{}`\n  根因：{}\n  上次修法：{}\n",
@@ -2731,13 +2846,19 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
     if recurring {
         // Prefer the base-generated correction STRATEGY when reflection has
         // produced one — it says concretely "switch to THIS approach", which is
-        // far more actionable than the bare "换个根本不同方案" template line.
-        // Fall back to the template line only when no strategy exists yet.
-        let strategy = top
-            .efficacy
-            .as_ref()
-            .map(|e| e.next_strategy.trim())
-            .filter(|s| !s.is_empty());
+        // far more actionable than the bare "换个根本不同方案" template line. BUT a
+        // reflected strategy is root-cause-specific: only surface it (and the
+        // failed-fix ledger) when `top` is the exact same signature, never across
+        // a mere family match. A family-only match falls back to the generic
+        // template line so a different root cause never inherits another's fix.
+        let strategy = if exact_root_cause {
+            top.efficacy
+                .as_ref()
+                .map(|e| e.next_strategy.trim())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
         if let Some(strategy) = strategy {
             out.push_str(&format!(
                 "  [!] 上次已警示但仍复发——之前的修法不够彻底。改用这个不同的高层做法：\n    {}\n",
@@ -2750,13 +2871,25 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
         }
         // Name the specific fixes that were ALREADY tried and failed, so the
         // base is steered AWAY from re-running them, not just told "try
-        // harder". This is the structured "失败修法 + 换思路" guidance.
-        out.push_str(&render_failed_fixes(top));
+        // harder". This is the structured "失败修法 + 换思路" guidance — but only
+        // for an exact-signature match, since a family neighbour's failed fixes
+        // targeted a different root cause.
+        if exact_root_cause {
+            out.push_str(&render_failed_fixes(top));
+        }
     }
     // Snapshot the hit count NOW so that, if this exact pitfall recurs after the
     // fix attempt, `capture_dev_errors` can flag `recurred_after_warning` — the
-    // efficacy half of the closed loop.
-    record_pitfall_injections(project_root, std::slice::from_ref(&top_sig));
+    // efficacy half of the closed loop. This is the AT-FAILURE path. We only count
+    // it as a genuine fresh fix attempt (which RESETS the escalation flag) when
+    // `top` is the exact same root cause; a family-neighbour match surfaced only
+    // the generic summary, so it must not reset THAT different pitfall's "already
+    // warned, still recurring" flag.
+    record_pitfall_injections(
+        project_root,
+        std::slice::from_ref(&top_sig),
+        exact_root_cause,
+    );
     out
 }
 
@@ -2814,8 +2947,10 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
 
     // Efficacy bookkeeping: mark the dev-error pitfalls we just surfaced as
     // "injected" so a later capture can tell whether the warning actually
-    // prevented recurrence. Fail-open — purely advisory state.
-    record_pitfall_injections(project_root, &surfaced_signatures(&selected));
+    // prevented recurrence. Fail-open — purely advisory state. PASSIVE recall
+    // (`active_fix_attempt = false`): it must NOT clear an existing
+    // `recurred_after_warning` escalation flag (read-only on that bit).
+    record_pitfall_injections(project_root, &surfaced_signatures(&selected), false);
     // Snapshot the surfaced NON-pitfall / belief identities so the runner's next
     // verify pass/fail can feed THEIR trust (parity with the ranked API, since
     // the runner's `with_context` injects via THIS String path). Fail-open.
@@ -2843,7 +2978,10 @@ pub fn relevant_lessons_for_prompt_ranked(
     if selected.is_empty() {
         return Vec::new();
     }
-    record_pitfall_injections(project_root, &surfaced_signatures(&selected));
+    // PASSIVE recall (`active_fix_attempt = false`): preserve any existing
+    // `recurred_after_warning` escalation flag — surfacing for ranking is not a
+    // fresh fix attempt.
+    record_pitfall_injections(project_root, &surfaced_signatures(&selected), false);
     // Snapshot the NON-pitfall / belief identities too, so the runner can feed
     // the verify pass/fail back into THEIR trust (the dev-error path already
     // rides the signature reflux above). Fail-open: a write error is swallowed.
@@ -3092,9 +3230,21 @@ fn render_one_lesson(lesson: &Lesson) -> String {
 
 /// Mark dev-error pitfalls as surfaced-to-the-worker, snapshotting their hit
 /// count so a later [`capture_dev_errors`] can detect "recurred despite being
-/// warned". Resets any prior `recurred_after_warning` flag — each fresh warning
-/// gives the fix a clean chance to prove itself (self-healing). Fail-open.
-fn record_pitfall_injections(project_root: &Path, signatures: &[String]) {
+/// warned". Fail-open.
+///
+/// `active_fix_attempt` distinguishes the two surfacing modes, which matters for
+/// the `recurred_after_warning` escalation flag:
+/// - `true` — the AT-FAILURE injection from [`lessons_for_error`]: the worker is
+///   about to make a genuine fresh fix attempt, so resetting the flag gives the
+///   (possibly re-derived) fix a clean chance to prove itself (self-healing).
+/// - `false` — a PASSIVE prompt-assembly recall (`relevant_lessons_for_prompt`):
+///   the pitfall is merely shown as context, NOT re-attempted. Clearing the flag
+///   here would silently erase the "already warned, still recurring → escalate"
+///   signal just because the lesson scrolled past in a later prompt. So passive
+///   surfacing snapshots the baseline (bump `injected`, re-baseline
+///   `occ_at_injection` so a subsequent recurrence is still detected) but LEAVES
+///   `recurred_after_warning` untouched — read-only on the escalation bit.
+fn record_pitfall_injections(project_root: &Path, signatures: &[String], active_fix_attempt: bool) {
     if signatures.is_empty() {
         return;
     }
@@ -3117,7 +3267,11 @@ fn record_pitfall_injections(project_root: &Path, signatures: &[String]) {
             });
             eff.injected = eff.injected.saturating_add(1);
             eff.occ_at_injection = occ;
-            eff.recurred_after_warning = false;
+            // Only a genuine fresh fix attempt clears the escalation flag; a
+            // passive recall must not reset "already warned, still recurring".
+            if active_fix_attempt {
+                eff.recurred_after_warning = false;
+            }
             changed = true;
         }
     }
@@ -3673,21 +3827,238 @@ mod tests {
         assert_eq!(status(tmp.path()), Some(PitfallStatus::Recurring));
         assert_eq!(pitfall_efficacy_summary(tmp.path()).recurring, 1);
 
-        // 4. The next recall surfaces it LOUDLY (escalation annotation) and, by
-        //    re-warning, gives the fix a fresh chance (self-healing reset).
+        // 4. A PASSIVE recall surfaces it LOUDLY (escalation annotation) but must
+        //    NOT clear the escalation flag — merely showing a pitfall as prompt
+        //    context is not a fresh fix attempt, so "already warned, still
+        //    recurring" survives the surfacing (the item-#2 fix). It stays
+        //    Recurring, not silently demoted to Validated.
         let recall = relevant_lessons_for_prompt(tmp.path(), "无关需求二");
         assert!(
             recall.contains("⚠ 上次已警示"),
             "recurrence must escalate: {recall}"
         );
+        assert_eq!(
+            status(tmp.path()),
+            Some(PitfallStatus::Recurring),
+            "a passive recall must NOT reset the escalation flag"
+        );
 
-        // 5. Having now been warned twice and NOT recurred since, its fix is
-        //    Validated — the loop confirms it's beaten and damps it.
-        assert_eq!(status(tmp.path()), Some(PitfallStatus::Validated));
+        // 5. Self-healing routes through a GENUINE fix attempt: the at-failure
+        //    recall (`lessons_for_error`) gives the (re-derived) fix a clean
+        //    chance by resetting the escalation flag. Having now been warned and
+        //    NOT recurred since, the fix reads as Validated and is damped.
+        let _ = lessons_for_error(tmp.path(), &err[0]);
+        assert_eq!(
+            status(tmp.path()),
+            Some(PitfallStatus::Validated),
+            "an active fix attempt that doesn't recur validates the fix"
+        );
         let s = pitfall_efficacy_summary(tmp.path());
         assert_eq!(s.total, 1);
         assert_eq!(s.validated, 1);
         assert_eq!(s.recurring, 0);
+    }
+
+    #[test]
+    fn passive_recall_preserves_escalation_flag() {
+        // Item #2: a passive `relevant_lessons_for_prompt` recall must leave an
+        // existing `recurred_after_warning` flag intact (read-only on the
+        // escalation bit), whereas the OLD behaviour silently cleared it.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let recurring = Lesson {
+            kind: LessonKind::DevError,
+            domain: "dependency".into(),
+            title: "踩坑 [dependency/module-not-found/lodash]".into(),
+            body: String::new(),
+            fix: "npm install lodash".into(),
+            root_cause: "missing dependency".into(),
+            keywords: vec!["lodash".into()],
+            source_requirement: "r".into(),
+            first_seen: "2026-06-21T00:00:00Z".into(),
+            signature: "dependency/module-not-found/lodash".into(),
+            occurrences: 3,
+            context: vec!["lodash".into()],
+            efficacy: Some(PitfallEfficacy {
+                injected: 2,
+                occ_at_injection: 2,
+                recurred_after_warning: true,
+                proven_fix: false,
+                failed_fixes: vec!["npm install lodash".into()],
+                next_strategy: String::new(),
+            }),
+            invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
+        };
+        write_raw_lessons(root, DEV_ERRORS_FILE, std::slice::from_ref(&recurring));
+
+        // A purely passive surfacing (no failing error in hand).
+        let _ = relevant_lessons_for_prompt(root, "完全无关的需求");
+
+        let after = read_raw_lessons(root, DEV_ERRORS_FILE)
+            .into_iter()
+            .find(|l| l.signature == "dependency/module-not-found/lodash")
+            .and_then(|l| l.efficacy)
+            .expect("pitfall survives");
+        assert!(
+            after.recurred_after_warning,
+            "passive recall must NOT clear the escalation flag"
+        );
+        // But the baseline IS re-snapshotted so a later capture still detects a
+        // fresh recurrence (injected bumped, occ re-baselined to current hits).
+        assert!(
+            after.injected >= 3,
+            "passive recall still records the injection"
+        );
+    }
+
+    #[test]
+    fn family_match_does_not_inject_other_root_causes_strategy() {
+        // Item #1: `lessons_for_error` matches by signature OR family prefix. A
+        // reflected `next_strategy` is root-cause-specific, so a family-neighbour
+        // (same `dependency/module-not-found` family, DIFFERENT module) must not
+        // leak its strategy / failed-fix ledger into a different module's error.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let neighbour = Lesson {
+            kind: LessonKind::DevError,
+            domain: "dependency".into(),
+            title: "踩坑 [dependency/module-not-found/react-router-dom]".into(),
+            body: String::new(),
+            fix: "install react-router-dom".into(),
+            root_cause: "router dep missing".into(),
+            keywords: vec!["react-router-dom".into()],
+            source_requirement: "r".into(),
+            first_seen: "2026-06-21T00:00:00Z".into(),
+            signature: "dependency/module-not-found/react-router-dom".into(),
+            occurrences: 5,
+            context: vec!["react-router-dom".into()],
+            efficacy: Some(PitfallEfficacy {
+                injected: 2,
+                occ_at_injection: 2,
+                recurred_after_warning: true, // Recurring → would surface strategy
+                proven_fix: false,
+                failed_fixes: vec!["delete node_modules and reinstall".into()],
+                next_strategy: "Pin react-router-dom to v6 and migrate the data router APIs."
+                    .into(),
+            }),
+            invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
+        };
+        write_raw_lessons(root, DEV_ERRORS_FILE, std::slice::from_ref(&neighbour));
+
+        // A DIFFERENT module's error in the SAME family.
+        let recall = lessons_for_error(root, "Error: Cannot find module 'lodash'");
+        // The generic family summary (root cause / last fix) is still useful and
+        // surfaced — but the neighbour's module-specific strategy + failed-fix
+        // ledger must NOT appear (that would be cross-root-cause mis-injection).
+        assert!(
+            !recall.contains("Pin react-router-dom"),
+            "a family match must not inject another module's reflected strategy: {recall}"
+        );
+        assert!(
+            !recall.contains("delete node_modules and reinstall"),
+            "a family match must not inject another module's failed-fix ledger: {recall}"
+        );
+
+        // Sanity: an EXACT-signature match DOES surface its own strategy.
+        write_raw_lessons(
+            root,
+            DEV_ERRORS_FILE,
+            std::slice::from_ref(&Lesson {
+                title: "踩坑 [dependency/module-not-found/lodash]".into(),
+                fix: "install lodash".into(),
+                root_cause: "lodash missing".into(),
+                keywords: vec!["lodash".into()],
+                signature: "dependency/module-not-found/lodash".into(),
+                context: vec!["lodash".into()],
+                efficacy: Some(PitfallEfficacy {
+                    injected: 2,
+                    occ_at_injection: 2,
+                    recurred_after_warning: true,
+                    proven_fix: false,
+                    failed_fixes: vec![],
+                    next_strategy: "Add lodash to package.json and run a clean install.".into(),
+                }),
+                ..neighbour.clone()
+            }),
+        );
+        let exact = lessons_for_error(root, "Error: Cannot find module 'lodash'");
+        assert!(
+            exact.contains("Add lodash to package.json"),
+            "an exact-signature match still surfaces its own strategy: {exact}"
+        );
+    }
+
+    #[test]
+    fn global_promote_filename_disambiguates_colliding_slugs() {
+        // Item #4: two lessons whose `domain::title` slugify to the SAME string
+        // must NOT overwrite each other's promoted global file. The stable
+        // key-hash suffix keeps them distinct.
+        let a = "general::Build failed (case A)!!!";
+        let b = "general::Build failed (case A)???";
+        let slug_a = a.replace("::", "-").replace(' ', "-");
+        let slug_b = b.replace("::", "-").replace(' ', "-");
+        // The lossy slugs would collide were the hash not appended.
+        let name_a = format!("{}-{:016x}.md", truncate(&slug_a, 80), stable_str_hash(a));
+        let name_b = format!("{}-{:016x}.md", truncate(&slug_b, 80), stable_str_hash(b));
+        assert_ne!(
+            name_a, name_b,
+            "distinct keys must yield distinct filenames"
+        );
+        // And the SAME key is stable across calls (idempotent re-promotion).
+        assert_eq!(
+            stable_str_hash(a),
+            stable_str_hash(a),
+            "the key hash is deterministic"
+        );
+    }
+
+    #[test]
+    fn sediment_clears_stale_orphans_and_is_idempotent() {
+        // Item #4 (local path): re-sediment must not leave ghost `lesson-*.md`
+        // files for lessons that vanished, and re-running over the same ledger is
+        // idempotent (same files, no accumulation).
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        capture_quality_failures(
+            root,
+            &[check("API URL consistency", "failed", 30)],
+            "demo",
+            "博客 api",
+        );
+        let first = sediment_lessons(root);
+        assert_eq!(first, 1);
+        let api_dir = root.join(".umadev/learned/api");
+        let count_md = |d: &std::path::Path| {
+            std::fs::read_dir(d)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let after_first = count_md(&api_dir);
+
+        // Plant a stale orphan as if a previous run's non-deterministic seq left
+        // it behind, then re-sediment: the orphan must be swept, count unchanged.
+        std::fs::write(api_dir.join("lesson-api-stale.md"), "ghost").unwrap();
+        let second = sediment_lessons(root);
+        assert_eq!(second, 1, "re-sediment writes the same single lesson");
+        assert_eq!(
+            count_md(&api_dir),
+            after_first,
+            "stale orphan swept; no accumulation across runs"
+        );
+        assert!(
+            !api_dir.join("lesson-api-stale.md").is_file(),
+            "the planted orphan was cleared"
+        );
     }
 
     #[test]

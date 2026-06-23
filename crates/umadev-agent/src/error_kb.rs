@@ -47,38 +47,89 @@ pub struct ErrorInsight {
 /// Cheap pre-filter: does this text look like an error at all?
 ///
 /// Used by capture sites to skip benign tool output before paying for
-/// classification. Case-insensitive substring scan over common error markers
-/// across JS / TS / Rust / Python / shells.
+/// classification — and, crucially, before a string becomes a captured pitfall.
+/// A false positive here poisons the lessons KB with a junk "pitfall" mined from
+/// ordinary output, so the filter is split into two tiers to cut false positives
+/// WITHOUT dropping a real error:
+///
+/// - **STRONG markers** are unambiguous failure tokens (`error`, `panic`,
+///   `traceback`, `err!`, `eaddrinuse`, …). Any one of them means "error",
+///   full stop — even on a line that also reads "0 errors", because real build
+///   output like `build failed: 0 warnings` must still classify.
+/// - **WEAK markers** are tokens that legitimately appear in BENIGN output
+///   (`not found`, `missing`, `undefined`, `fail`, `denied`, `rejected`,
+///   `no such`). They only count as an error when the text is NOT clearly a
+///   success/benign line (see [`looks_benign`]) — so `0 missing`,
+///   `no undefined behavior`, `up to date` no longer mint a bogus pitfall.
+///
+/// Case-insensitive substring scan over common error markers across JS / TS /
+/// Rust / Python / shells.
 #[must_use]
 pub fn looks_like_error(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    const MARKERS: &[&str] = &[
+    // Unambiguous: presence ⇒ error, regardless of any benign-looking phrasing.
+    const STRONG_MARKERS: &[&str] = &[
         "error",
         "failed",
-        "fail",
         "panic",
         "exception",
         "traceback",
         "cannot find",
-        "not found",
         "not defined",
-        "undefined",
-        "unexpected",
         "is not a function",
-        "refused",
-        "denied",
-        "rejected",
         "err!",
         "err_",
         "eaddrinuse",
         "eacces",
         "econnrefused",
-        "no such",
         "assertion",
-        "missing",
+        "unexpected",
+        "refused",
         "✕",
     ];
-    MARKERS.iter().any(|m| lower.contains(m))
+    if STRONG_MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    // Ambiguous: these substrings show up in plenty of benign output, so they
+    // only count when the line isn't a clear success/benign report.
+    const WEAK_MARKERS: &[&str] = &[
+        "fail",
+        "not found",
+        "undefined",
+        "denied",
+        "rejected",
+        "no such",
+        "missing",
+    ];
+    if WEAK_MARKERS.iter().any(|m| lower.contains(m)) {
+        return !looks_benign(&lower);
+    }
+    false
+}
+
+/// Heuristic: does this lowercased text read as a SUCCESS / benign status line
+/// rather than a failure? Used to veto a WEAK marker in [`looks_like_error`] so
+/// ordinary output (a clean install, a passing test summary, a "0 missing"
+/// audit) doesn't get mined into a bogus pitfall.
+///
+/// Deliberately conservative: it only fires on phrasings that are
+/// overwhelmingly benign, and it never overrides a STRONG marker (that check
+/// runs first), so a real error is never suppressed.
+fn looks_benign(lower: &str) -> bool {
+    // Deliberately PRECISE phrasings (zero-count / up-to-date / explicit "no X"),
+    // not loose success words like a bare "passed" — those co-occur with real
+    // failures (`1 failed, 11 passed`) and would wrongly veto a genuine error.
+    const BENIGN: &[&str] = &[
+        "0 missing",
+        "no missing",
+        "0 vulnerabilities",
+        "no vulnerabilities",
+        "up to date",
+        "up-to-date",
+        "no undefined",
+        "nothing to commit",
+    ];
+    BENIGN.iter().any(|m| lower.contains(m))
 }
 
 /// Classify a raw error string into a reusable [`ErrorInsight`].
@@ -683,6 +734,37 @@ mod tests {
         assert!(looks_like_error("npm ERR! code ERESOLVE"));
         assert!(!looks_like_error("Compiled successfully in 1.2s"));
         assert!(!looks_like_error("Listening on http://localhost:3000"));
+    }
+
+    #[test]
+    fn looks_like_error_does_not_false_positive_on_benign_weak_markers() {
+        // A WEAK marker inside an explicitly-benign (zero-count / up-to-date /
+        // "no X") line must NOT mint a pitfall (the item-#6 false-positive
+        // tightening). Each line below carries an ambiguous token that the OLD
+        // unconditional scan would have flagged as an error.
+        assert!(!looks_like_error("audit complete: 0 missing, up to date")); // "missing"
+        assert!(!looks_like_error("no undefined behavior in this module")); // "undefined"
+        assert!(!looks_like_error("dependencies up-to-date, 0 missing")); // "missing"
+                                                                          // A line with NO marker at all is still benign.
+        assert!(!looks_like_error("found 0 vulnerabilities"));
+        assert!(!looks_like_error("Everything up-to-date"));
+        assert!(!looks_like_error("nothing to commit, working tree clean"));
+    }
+
+    #[test]
+    fn looks_like_error_still_catches_real_errors_with_weak_or_strong_markers() {
+        // STRONG markers win even when a benign-looking phrase co-occurs.
+        assert!(looks_like_error("build failed: 0 warnings, 1 error"));
+        assert!(looks_like_error("Test Suites: 1 failed, 11 passed"));
+        // WEAK marker in a genuinely failing line (no benign veto) still fires.
+        assert!(looks_like_error(
+            "Cannot find module 'react' — not found in node_modules"
+        ));
+        assert!(looks_like_error(
+            "ENOENT: no such file or directory, open 'config.json'"
+        ));
+        assert!(looks_like_error("ReferenceError: foo is not defined"));
+        assert!(looks_like_error("EACCES: permission denied, mkdir '/usr'"));
     }
 
     #[test]
