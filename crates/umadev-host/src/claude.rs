@@ -21,8 +21,8 @@ use umadev_runtime::{
 };
 
 use crate::{
-    default_workspace, merge_prompt, model_args, run_subprocess, run_subprocess_streaming,
-    HostDriver, ProbeResult, PromptChannel, SubprocessCall,
+    default_workspace, govern_root_env, merge_prompt, model_args, run_subprocess,
+    run_subprocess_streaming, HostDriver, ProbeResult, PromptChannel, SubprocessCall,
 };
 
 /// Drives the `claude` CLI as a subprocess.
@@ -275,6 +275,10 @@ impl Runtime for ClaudeCodeDriver {
         // because the create flag was already baked into `args` above.
         self.mark_session_started();
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
+        // Mark "UmaDev is driving" + the governed root for the PreToolUse hook,
+        // so the hook governs THIS run's writes while leaving the user's other
+        // claude usage untouched (see `govern_root_env` / `umadev::hook`).
+        let govern_env = govern_root_env(&ws);
         let out = run_subprocess(SubprocessCall {
             program: &self.program,
             args: &args,
@@ -282,7 +286,7 @@ impl Runtime for ClaudeCodeDriver {
             channel: PromptChannel::Arg,
             workspace: &ws,
             timeout: self.timeout,
-            env: &[],
+            env: &govern_env,
         })
         .await
         .map_err(crate::map_subprocess_error)?;
@@ -344,6 +348,10 @@ impl Runtime for ClaudeCodeDriver {
         let timeout = self.timeout;
         let program = self.program.clone();
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
+        // Scope the PreToolUse governance hook to THIS run's workspace (see
+        // `govern_root_env`): the hook governs the run UmaDev drives, not the
+        // user's own claude sessions.
+        let govern_env = govern_root_env(&ws);
 
         // Accumulate the raw stream so a mid-stream failure can salvage whatever
         // the base already produced instead of cold-restarting a whole new run.
@@ -356,7 +364,7 @@ impl Runtime for ClaudeCodeDriver {
                 channel: PromptChannel::Arg,
                 workspace: &ws,
                 timeout,
-                env: &[],
+                env: &govern_env,
             },
             &|line: &str| {
                 if let Ok(mut b) = stream_buf.lock() {

@@ -64,6 +64,30 @@ pub use codex_session::CodexSession;
 pub use opencode::OpenCodeDriver;
 pub use opencode_session::OpenCodeSession;
 
+/// The env var UmaDev sets on a base subprocess to mark "UmaDev is driving this
+/// run/session" — its value is the project root being governed.
+///
+/// The base (claude) inherits this var and passes it to the `PreToolUse`
+/// governance hook it spawns. The hook governs **only** when this var is set, and
+/// only files under its value (see `umadev::hook`). So a base UmaDev itself
+/// drives is governed, while a base the user runs directly (plain claude /
+/// spec-kit / any other project) sees the var UNSET and is completely
+/// unaffected. This is how UmaDev's governance stays scoped to its own runs
+/// instead of leaking into the user's whole environment.
+pub const GOVERN_ROOT_ENV: &str = "UMADEV_GOVERN_ROOT";
+
+/// Build the `[(key, value)]` env entry that scopes the governance hook to
+/// `workspace`. Spawn the base with this so the `PreToolUse` hook can tell it is
+/// UmaDev driving and which root to govern. Returns a single-element vec so it
+/// composes with any existing provider env the caller already passes.
+#[must_use]
+pub fn govern_root_env(workspace: &std::path::Path) -> Vec<(String, String)> {
+    vec![(
+        GOVERN_ROOT_ENV.to_string(),
+        workspace.to_string_lossy().into_owned(),
+    )]
+}
+
 /// Outcome of probing a host CLI for availability.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ProbeResult {
@@ -378,10 +402,11 @@ async fn drain_and_wait(
 }
 
 /// Apply extra env overrides to a child command before spawn (an empty value
-/// removes the inherited var). Always called with an EMPTY slice today — UmaDev
-/// injects nothing into the base; the child inherits the user's full environment
-/// so the base self-authenticates with its own login / API. Kept as a generic
-/// (currently unused) hook.
+/// removes the inherited var). UmaDev injects no *model/auth* env into the base —
+/// the child inherits the user's full environment so the base self-authenticates
+/// with its own login / API. The one thing UmaDev DOES set on a base it drives is
+/// [`GOVERN_ROOT_ENV`] (via [`govern_root_env`]), the signal that scopes the
+/// `PreToolUse` governance hook to this run.
 fn apply_provider_env(cmd: &mut Command, env: &[(String, String)]) {
     for (key, value) in env {
         if value.is_empty() {
@@ -1534,6 +1559,38 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.stdout, "hello-from-test");
+    }
+
+    #[test]
+    fn govern_root_env_carries_the_workspace_under_the_marker() {
+        let env = govern_root_env(std::path::Path::new("/projects/app"));
+        assert_eq!(
+            env,
+            vec![(GOVERN_ROOT_ENV.to_string(), "/projects/app".to_string())]
+        );
+    }
+
+    // `printenv` exists on macOS/Linux; the env propagation it proves is the
+    // same on Windows (`Command::env`), exercised via `govern_root_env` above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_subprocess_propagates_govern_root_env_to_child() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = govern_root_env(tmp.path());
+        let out = run_subprocess(SubprocessCall {
+            program: "printenv",
+            args: &[GOVERN_ROOT_ENV.to_string()],
+            prompt: "",
+            channel: PromptChannel::Arg,
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(5),
+            env: &env,
+        })
+        .await
+        .unwrap();
+        // The base subprocess sees UMADEV_GOVERN_ROOT = the workspace, so the
+        // PreToolUse hook it spawns will govern (scoped to this root).
+        assert_eq!(out.stdout.trim(), tmp.path().to_string_lossy());
     }
 
     #[tokio::test]

@@ -961,17 +961,31 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
     let root = project_root.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
     match host.as_str() {
         "claude-code" => {
-            let path = hook::install_claude_hook(&root)?;
-            println!("[ok] Installed UmaDev PreToolUse hook for Claude Code.");
-            println!("  → {}", path.display());
-            println!();
-            println!("Every Write/Edit tool call will now be checked for:");
-            println!("  • emoji-as-functional-icons (UD-CODE-001)");
-            println!("  • hardcoded color literals   (UD-CODE-002)");
-            println!("  • AI-slop / placeholders     (UD-CODE-002)");
-            println!("  • sensitive-path writes      (UD-SEC-001) — .git/.env/.ssh bypass-immune");
-            println!();
-            println!("To remove: umadev uninstall --host claude-code");
+            if let Some(path) = hook::install_claude_hook(&root)? {
+                println!("[ok] Installed UmaDev PreToolUse hook for Claude Code.");
+                println!("  → {}", path.display());
+                println!();
+                println!("Every Write/Edit tool call will now be checked for:");
+                println!("  • emoji-as-functional-icons (UD-CODE-001)");
+                println!("  • hardcoded color literals   (UD-CODE-002)");
+                println!("  • AI-slop / placeholders     (UD-CODE-002)");
+                println!(
+                    "  • sensitive-path writes      (UD-SEC-001) — .git/.env/.ssh bypass-immune"
+                );
+                println!();
+                println!("To remove: umadev uninstall --host claude-code");
+            } else {
+                // Refused to install into the GLOBAL ~/.claude — that would
+                // govern every other project/tool, exactly the over-reach we
+                // avoid. The user should install from inside a project dir.
+                println!(
+                    "[skip] Not installing the UmaDev hook into the global ~/.claude — it would"
+                );
+                println!(
+                    "       govern ALL your projects and tools. Run `umadev install` from inside"
+                );
+                println!("       a specific project directory instead.");
+            }
         }
         "pre-commit" => {
             let path = install_pre_commit_hook(&root)?;
@@ -2449,7 +2463,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                 // ungoverned in real time. Claude Code is the only base with a
                 // PreToolUse hook surface.
                 if backend.id() == "claude-code" {
-                    if let Ok(p) = hook::install_claude_hook(&project_root) {
+                    if let Ok(Some(p)) = hook::install_claude_hook(&project_root) {
                         eprintln!(
                             "  [governance] real-time PreToolUse hook active ({})",
                             p.display()
@@ -2682,7 +2696,7 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
             umadev_host::ProbeResult::Ready { version } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
                 if backend.id() == "claude-code" {
-                    if let Ok(p) = hook::install_claude_hook(&project_root) {
+                    if let Ok(Some(p)) = hook::install_claude_hook(&project_root) {
                         eprintln!(
                             "  [governance] real-time PreToolUse hook active ({})",
                             p.display()
@@ -2836,7 +2850,7 @@ async fn cmd_redo(
             umadev_host::ProbeResult::Ready { version } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
                 if backend.id() == "claude-code" {
-                    if let Ok(p) = hook::install_claude_hook(&project_root) {
+                    if let Ok(Some(p)) = hook::install_claude_hook(&project_root) {
                         eprintln!(
                             "  [governance] real-time PreToolUse hook active ({})",
                             p.display()
@@ -3118,7 +3132,7 @@ async fn drive_gate_block(
                 // ungoverned in real time. Claude Code is the only base with a
                 // PreToolUse hook surface.
                 if backend.id() == "claude-code" {
-                    if let Ok(p) = hook::install_claude_hook(project_root) {
+                    if let Ok(Some(p)) = hook::install_claude_hook(project_root) {
                         eprintln!(
                             "  [governance] real-time PreToolUse hook active ({})",
                             p.display()

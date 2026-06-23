@@ -1359,10 +1359,12 @@ impl<R: Runtime> AgentRunner<R> {
         write_workflow_state(&self.options.project_root, &state)?;
         // Drop a coach prompt so the host knows what to do on first turn.
         let _ = write_coach_prompt(&self.options, Phase::Research);
-        // UD-META-001: ensure the workspace declares its spec conformance.
-        // Best-effort — a user-customised umadev.yaml is left untouched.
-        let _ = crate::manifest::SpecManifest::new(self.options.effective_slug())
-            .write_to(&self.options.project_root, false);
+        // NOTE: a `run` (or any everyday use) must NOT drop `umadev.yaml` into the
+        // user's project root. UmaDev is a polite agent — its per-run state lives
+        // under `.umadev/` (gitignored, written above), and it leaves no marker in
+        // the project root. `umadev.yaml` (the UD-META-001 conformance manifest) is
+        // created ONLY when the user EXPLICITLY runs `umadev init` (or the `/init`
+        // slash command). Run/TUI no longer auto-writes it.
         // Brownfield baseline detected → announce the incremental-change mode so
         // the user knows this run edits the existing repo (driven by the
         // `.umadev/adopt.json` marker), with real-code retrieval feeding the
@@ -6755,6 +6757,25 @@ error TS2304: Cannot find name 'Foo'
         let runner = AgentRunner::new(FakeRuntime, opts(tmp.path()));
         let state = runner.start().unwrap();
         assert_eq!(state.phase, "research");
+    }
+
+    #[test]
+    fn start_does_not_drop_umadev_yaml_in_project_root() {
+        // A run keeps the user's project root clean: per-run state goes under
+        // `.umadev/` (gitignored), and `umadev.yaml` is created ONLY by an
+        // explicit `umadev init`, never by a run. UmaDev leaves no marker behind.
+        let tmp = TempDir::new().unwrap();
+        let runner = AgentRunner::new(FakeRuntime, opts(tmp.path()));
+        runner.start().unwrap();
+        assert!(
+            !tmp.path().join("umadev.yaml").exists(),
+            "run/start() must NOT create umadev.yaml in the project root"
+        );
+        // The run DOES still record its state under `.umadev/` (gitignored).
+        assert!(
+            tmp.path().join(".umadev/workflow-state.json").is_file(),
+            "run state must live under .umadev/"
+        );
     }
 
     #[tokio::test]

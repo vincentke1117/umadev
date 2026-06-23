@@ -127,6 +127,13 @@ impl ClaudeSession {
         cmd.args(&lead);
         cmd.args(args);
         cmd.current_dir(workspace);
+        // Mark "UmaDev is driving" + the governed root for the PreToolUse hook
+        // (see `crate::GOVERN_ROOT_ENV`). The base inherits this var and passes
+        // it to the hook subprocess it spawns, so the hook governs THIS session's
+        // writes while leaving the user's own claude sessions completely
+        // untouched. Set on every spawned `claude` (main + read-only fork) so the
+        // governance scope is consistent across the session's process tree.
+        cmd.env(crate::GOVERN_ROOT_ENV, workspace);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -837,6 +844,42 @@ mod tests {
             &SessionEvent::TurnDone {
                 status: TurnStatus::Completed
             }
+        );
+        let _ = s.end().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_spawn_sets_govern_root_env_to_workspace() {
+        // The spawned base must inherit UMADEV_GOVERN_ROOT = the session
+        // workspace, so the PreToolUse hook it spawns governs THIS run (and only
+        // this run). The fake claude emits the env value back as a text delta;
+        // the test asserts the session relays the workspace path.
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            "#!/bin/sh\nread _line\n\
+             printf '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}}\\n' \"$UMADEV_GOVERN_ROOT\"\n\
+             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}'\n\
+             cat >/dev/null\n",
+        );
+        let mut s =
+            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "sid-env", true)
+                .await
+                .expect("start");
+        s.send_turn("go".to_string()).await.expect("send");
+        let mut text = String::new();
+        while let Some(ev) = s.next_event().await {
+            match ev {
+                SessionEvent::TextDelta(t) => text.push_str(&t),
+                SessionEvent::TurnDone { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            text.trim(),
+            tmp.to_string_lossy(),
+            "the base must see UMADEV_GOVERN_ROOT = the session workspace"
         );
         let _ = s.end().await;
     }

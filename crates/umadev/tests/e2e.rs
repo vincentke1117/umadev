@@ -459,18 +459,24 @@ fn spec_clauses_subcommand_lists_every_clause() {
     assert!(stdout.contains("Phase chain:"));
 }
 
-/// `umadev hook pre-write` blocks emoji writes (UD-CODE-001).
-#[test]
-fn hook_pre_write_blocks_emoji() {
-    let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
+/// Run `umadev hook pre-write` against `payload`, optionally marking the run as
+/// UmaDev-driven by setting `UMADEV_GOVERN_ROOT` to `govern_root` (and running
+/// the child there so a relative payload path resolves under the root). Returns
+/// the hook's stdout (the permission-decision JSON).
+fn run_hook_pre_write(payload: &str, govern_root: Option<&Path>) -> String {
     use std::io::Write;
-    let mut child = Command::new(bin())
-        .args(["hook", "pre-write"])
+    let mut cmd = Command::new(bin());
+    cmd.args(["hook", "pre-write"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn");
+        .stderr(std::process::Stdio::piped());
+    if let Some(root) = govern_root {
+        cmd.env("UMADEV_GOVERN_ROOT", root).current_dir(root);
+    } else {
+        // Scrub any inherited marker so the "not driving" case is hermetic.
+        cmd.env_remove("UMADEV_GOVERN_ROOT");
+    }
+    let mut child = cmd.spawn().expect("spawn");
     child
         .stdin
         .take()
@@ -478,31 +484,39 @@ fn hook_pre_write_blocks_emoji() {
         .write_all(payload.as_bytes())
         .unwrap();
     let out = child.wait_with_output().expect("wait");
-    let s = String::from_utf8_lossy(&out.stdout);
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// `umadev hook pre-write` blocks emoji writes (UD-CODE-001) WHEN UmaDev is
+/// driving the run (the governance scope is set).
+#[test]
+fn hook_pre_write_blocks_emoji() {
+    let tmp = TempDir::new().unwrap();
+    let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
+    let s = run_hook_pre_write(payload, Some(tmp.path()));
     assert!(s.contains("deny"), "emoji must be denied: {s}");
     assert!(s.contains("emoji"), "must cite emoji violation: {s}");
 }
 
-/// `umadev hook pre-write` allows clean code.
+/// Self-limit: with NO governance scope (the user is driving the base directly,
+/// e.g. plain claude / spec-kit), the hook passes EVERYTHING — UmaDev does not
+/// touch the user's other tools/projects.
+#[test]
+fn hook_pre_write_passes_when_not_driving() {
+    let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
+    let s = run_hook_pre_write(payload, None);
+    assert!(
+        s.contains("allow"),
+        "not-driving → UmaDev must not interfere, even with an emoji: {s}"
+    );
+}
+
+/// `umadev hook pre-write` allows clean code (when driving).
 #[test]
 fn hook_pre_write_allows_clean() {
+    let tmp = TempDir::new().unwrap();
     let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>Search</button>"}}"#;
-    let mut child = Command::new(bin())
-        .args(["hook", "pre-write"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn");
-    use std::io::Write;
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(payload.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("wait");
-    let s = String::from_utf8_lossy(&out.stdout);
+    let s = run_hook_pre_write(payload, Some(tmp.path()));
     assert!(s.contains("allow"), "clean code must be allowed: {s}");
 }
 

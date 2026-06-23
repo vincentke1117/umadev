@@ -36,6 +36,72 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use umadev_governance::{check_dangerous_bash, check_sensitive_path, Decision, ProjectContext};
 
+/// The env var UmaDev sets on a base subprocess when (and only when) it is
+/// itself driving a run/session — its value is the project root being governed.
+///
+/// The PreToolUse hook subprocess is spawned by the base (claude), inherits the
+/// base's environment, and the base inherited it from UmaDev's spawn. So a set
+/// `UMADEV_GOVERN_ROOT` is the hook's proof that "UmaDev is driving this write";
+/// when it is **absent**, the user is driving the base directly (plain `claude`,
+/// spec-kit, any other project) and UmaDev MUST NOT interfere at all — the hook
+/// passes everything, including the bypass-immune safety floor. UmaDev is a
+/// polite agent: it governs only its own runs, never the user's other tools.
+const GOVERN_ROOT_ENV: &str = "UMADEV_GOVERN_ROOT";
+
+/// The governance scope: `None` when UmaDev is NOT driving (hook passes
+/// everything), or `Some(root)` when it is (govern only files under `root`).
+///
+/// Reads [`GOVERN_ROOT_ENV`]. An empty value is treated as unset (fail-open).
+fn govern_root() -> Option<PathBuf> {
+    std::env::var_os(GOVERN_ROOT_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Is `file_path` inside the governed `root`? Resolves a relative path against
+/// the process CWD so it works regardless of how the host passes the path. A
+/// non-existent target (this is a PRE-write hook) is handled lexically — we do
+/// NOT touch the filesystem. Fail-open: when we cannot decide (e.g. no CWD for a
+/// relative path), we treat it as IN-scope so a real UmaDev write is still
+/// governed; the env gate already proved UmaDev is driving.
+fn path_under_root(file_path: &str, root: &Path) -> bool {
+    if file_path.is_empty() {
+        return true; // no target → let the content rules run (CWD is the root)
+    }
+    let p = Path::new(file_path);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(p)
+    } else {
+        return true; // can't resolve → don't relax governance
+    };
+    // Lexical containment via normalized prefix match. Canonicalizing the root
+    // (if it exists on disk) absorbs a symlinked /var → /private/var so the
+    // comparison still matches; the target itself may not exist yet, so it is
+    // only lexically normalized.
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let abs = lexically_normalize(&abs);
+    abs.starts_with(&root)
+}
+
+/// Collapse `.`/`..` components lexically WITHOUT hitting the filesystem (the
+/// target of a pre-write hook may not exist). Pure path arithmetic.
+fn lexically_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Read the PreToolUse payload from stdin, run the governance rules, and
 /// print the decision JSON. Returns the raw decision for testing.
 pub fn run_pre_write(stdin: &str) -> Decision {
@@ -45,6 +111,29 @@ pub fn run_pre_write(stdin: &str) -> Decision {
 /// Same as [`run_pre_write`] but with an explicit policy (loaded from
 /// `.umadev/rules.toml` by the caller).
 pub fn run_pre_write_with(stdin: &str, policy: &umadev_governance::Policy) -> Decision {
+    run_pre_write_scoped(stdin, policy, govern_root().as_deref())
+}
+
+/// The write-hook core with the governance scope passed EXPLICITLY (instead of
+/// read from the process env). `scope`:
+/// - `None` → UmaDev is NOT driving (env unset). Pass EVERYTHING, including the
+///   bypass-immune safety floor, so the user's plain claude / spec-kit / other
+///   projects are completely unaffected.
+/// - `Some(root)` → UmaDev is driving; govern only files under `root`.
+///
+/// Split out so the env read happens once at the edge and the logic is testable
+/// without mutating the process-global `UMADEV_GOVERN_ROOT`.
+fn run_pre_write_scoped(
+    stdin: &str,
+    policy: &umadev_governance::Policy,
+    scope: Option<&Path>,
+) -> Decision {
+    // Self-limit: govern ONLY when UmaDev is itself driving this run/session
+    // (it set `UMADEV_GOVERN_ROOT` on the base subprocess). Absent → the user is
+    // driving the base directly; UmaDev passes EVERYTHING.
+    let Some(root) = scope else {
+        return Decision::pass();
+    };
     let payload: PreToolUsePayload = match serde_json::from_str(stdin) {
         Ok(p) => p,
         Err(_) => return Decision::pass(), // fail-open on unparseable input
@@ -58,6 +147,13 @@ pub fn run_pre_write_with(stdin: &str, policy: &umadev_governance::Policy) -> De
         return Decision::pass();
     }
     let file_path = payload.tool_input.file_path.as_deref().unwrap_or("");
+    // Scope to the governed root: a write to a file OUTSIDE the UmaDev project
+    // (e.g. the base touching something in a sibling dir or the user's home)
+    // is none of UmaDev's business — pass it. Only files under the run's root
+    // are governed.
+    if !path_under_root(file_path, root) {
+        return Decision::pass();
+    }
     let content = payload.tool_input.content.as_deref().unwrap_or("");
     // For Edit, the new content may be in `new_string` rather than `content`.
     let content = if content.is_empty() {
@@ -161,6 +257,20 @@ fn ancestor_with_umadev(dir: &Path) -> Option<PathBuf> {
 /// This is the second arm of the real-time interception layer: UD-SEC-001
 /// guards *what the host writes*, UD-SEC-002 guards *what the host runs*.
 pub fn run_pre_bash(stdin: &str) -> Decision {
+    run_pre_bash_scoped(stdin, govern_root().is_some())
+}
+
+/// The bash-hook core with the "UmaDev is driving" decision passed EXPLICITLY.
+/// `driving` is `false` when [`GOVERN_ROOT_ENV`] is unset → pass everything (the
+/// user's own shell commands in plain claude / other tools are untouched).
+/// Split out so it is testable without mutating the process-global env.
+fn run_pre_bash_scoped(stdin: &str, driving: bool) -> Decision {
+    // Same self-limit as the write hook: only guard commands when UmaDev is
+    // itself driving the run. Not driving → UmaDev does not touch the user's
+    // shell commands at all.
+    if !driving {
+        return Decision::pass();
+    }
     let payload: PreToolUsePayload = match serde_json::from_str(stdin) {
         Ok(p) => p,
         Err(_) => return Decision::pass(), // fail-open on unparseable input
@@ -234,9 +344,49 @@ struct ToolInput {
     script: Option<String>,
 }
 
-/// Install the PreToolUse hook into `.claude/settings.json` (workspace-level).
-/// Idempotent — if the hook is already registered, does nothing.
-pub fn install_claude_hook(project_root: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+/// The cross-platform home directory (`HOME`, then `USERPROFILE` on Windows).
+/// `None` when neither is set (the install guard then can't prove a home match,
+/// so it proceeds — fail-open).
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Would installing into `project_root/.claude` land in the GLOBAL `~/.claude`?
+/// True when `project_root` is (or resolves to) the user's home directory.
+///
+/// This is the guard against UmaDev's most invasive bug: if the hook is written
+/// into `~/.claude/settings.json`, Claude Code merges it GLOBALLY and the user's
+/// every project/tool (plain claude, spec-kit, anything) gets the hook. We refuse
+/// to install there. Cross-platform via [`home_dir`]; canonicalized on both sides
+/// so a symlinked home still matches. Fail-open: if home can't be resolved, we
+/// can't prove a match, so we DON'T block the install (the runtime self-limit in
+/// the hook itself is the second line of defence).
+fn is_home_claude(project_root: &Path) -> bool {
+    let Some(home) = home_dir() else {
+        return false;
+    };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(project_root) == canon(&home)
+}
+
+/// Install the PreToolUse hook into `<project_root>/.claude/settings.json`
+/// (workspace-level). Idempotent — if the hook is already registered, does
+/// nothing. Returns the settings path on install, or `None` when the install was
+/// deliberately SKIPPED because `project_root` is the user's home directory
+/// (writing there would register the hook GLOBALLY and pollute every other
+/// project/tool — see [`is_home_claude`]). Skipping is fail-open: no error, just
+/// no global install.
+pub fn install_claude_hook(
+    project_root: &std::path::Path,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    // Never install into the global `~/.claude` — that would govern the user's
+    // whole environment (every other project + tool), exactly the over-reach we
+    // are fixing. A project-level install (any non-home dir) is fine.
+    if is_home_claude(project_root) {
+        return Ok(None);
+    }
     let claude_dir = project_root.join(".claude");
     std::fs::create_dir_all(&claude_dir)?;
     let settings_path = claude_dir.join("settings.json");
@@ -262,14 +412,14 @@ pub fn install_claude_hook(project_root: &std::path::Path) -> std::io::Result<st
         settings = serde_json::json!({});
     }
     let Some(obj) = settings.as_object_mut() else {
-        return Ok(settings_path);
+        return Ok(Some(settings_path));
     };
     let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
     if !hooks.is_object() {
         *hooks = serde_json::json!({});
     }
     let Some(hooks_obj) = hooks.as_object_mut() else {
-        return Ok(settings_path);
+        return Ok(Some(settings_path));
     };
     let pre_use = hooks_obj
         .entry("PreToolUse")
@@ -278,7 +428,7 @@ pub fn install_claude_hook(project_root: &std::path::Path) -> std::io::Result<st
         *pre_use = serde_json::json!([]);
     }
     let Some(matchers) = pre_use.as_array_mut() else {
-        return Ok(settings_path);
+        return Ok(Some(settings_path));
     };
 
     // Self-healing install: first REMOVE any existing UmaDev matcher
@@ -314,7 +464,7 @@ pub fn install_claude_hook(project_root: &std::path::Path) -> std::io::Result<st
 
     let json = serde_json::to_string_pretty(&settings)?;
     std::fs::write(&settings_path, json + "\n")?;
-    Ok(settings_path)
+    Ok(Some(settings_path))
 }
 
 /// Remove the UmaDev hook from `.claude/settings.json`. Idempotent.
@@ -362,10 +512,75 @@ pub fn uninstall_claude_hook(project_root: &std::path::Path) -> std::io::Result<
 mod tests {
     use super::*;
 
+    /// A governing scope rooted at the process CWD — used by the simple-payload
+    /// tests whose `file_path` is RELATIVE (it resolves under the CWD, so it is
+    /// in-scope). Mirrors a real UmaDev run rooted at the project the hook is
+    /// driving, without mutating the process-global `UMADEV_GOVERN_ROOT`.
+    fn cwd_scope() -> PathBuf {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    /// Run the write hook AS IF UmaDev is driving a run rooted at the CWD.
+    fn pre_write(payload: &str) -> Decision {
+        let cwd = cwd_scope();
+        run_pre_write_scoped(payload, &umadev_governance::Policy::default(), Some(&cwd))
+    }
+
+    /// Run the write hook scoped to an explicit `root` (used by the context
+    /// tests whose payloads carry absolute temp paths).
+    fn pre_write_in(payload: &str, root: &Path) -> Decision {
+        run_pre_write_scoped(payload, &umadev_governance::Policy::default(), Some(root))
+    }
+
+    /// Run the bash hook AS IF UmaDev is driving a run (scope present).
+    fn pre_bash(payload: &str) -> Decision {
+        run_pre_bash_scoped(payload, true)
+    }
+
+    // --- self-limiting: UmaDev only governs ITS OWN runs ------------------
+
+    #[test]
+    fn pre_write_passes_everything_when_not_driving() {
+        // No governance scope (env unset) → the user is driving the base
+        // directly (plain claude / spec-kit / another project). UmaDev passes
+        // EVERYTHING, including content that would otherwise block.
+        let emoji = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
+        assert!(!run_pre_write_scoped(emoji, &umadev_governance::Policy::default(), None).block);
+        // Even the bypass-immune safety floor (UD-SEC-001) passes — UmaDev must
+        // not touch the user's other tools at all.
+        let secret =
+            r#"{"tool_name":"Write","tool_input":{"file_path":".env","content":"SECRET=x"}}"#;
+        assert!(!run_pre_write_scoped(secret, &umadev_governance::Policy::default(), None).block);
+        // The public entry point reads the (unset, in this test process) env and
+        // also passes — proving the production default is fail-open.
+        assert!(!run_pre_write(emoji).block);
+    }
+
+    #[test]
+    fn pre_write_passes_files_outside_the_governed_root() {
+        // UmaDev IS driving (scope set) but the base writes a file OUTSIDE the
+        // run's root (a sibling project / the user's home) → none of UmaDev's
+        // business, so it passes even though the content would block.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let outside = std::env::temp_dir().join("umadev-outside-emoji.tsx");
+        let payload = write_payload(&outside, "<button>🔍</button>");
+        assert!(!pre_write_in(&payload, &root).block);
+    }
+
+    #[test]
+    fn pre_bash_passes_everything_when_not_driving() {
+        // Not driving → the user's own shell commands are untouched, even a
+        // dangerous one (UmaDev is not their general-purpose shell guard).
+        let payload = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#;
+        assert!(!run_pre_bash_scoped(payload, false).block);
+        assert!(!run_pre_bash(payload).block); // public entry, env unset → pass
+    }
+
     #[test]
     fn pre_write_blocks_emoji() {
         let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
-        let d = run_pre_write(payload);
+        let d = pre_write(payload);
         assert!(d.block);
         assert_eq!(d.clause, "UD-CODE-001");
     }
@@ -373,7 +588,7 @@ mod tests {
     #[test]
     fn pre_write_blocks_color() {
         let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Card.tsx","content":"color:#9333ea"}}"#;
-        let d = run_pre_write(payload);
+        let d = pre_write(payload);
         assert!(d.block);
         assert_eq!(d.clause, "UD-CODE-002");
     }
@@ -381,20 +596,20 @@ mod tests {
     #[test]
     fn pre_write_allows_clean_code() {
         let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>Search</button>"}}"#;
-        let d = run_pre_write(payload);
+        let d = pre_write(payload);
         assert!(!d.block);
     }
 
     #[test]
     fn pre_write_fails_open_on_garbage() {
-        let d = run_pre_write("not json at all");
+        let d = pre_write("not json at all");
         assert!(!d.block);
     }
 
     #[test]
     fn pre_write_ignores_non_write_tools() {
         let payload = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
-        let d = run_pre_write(payload);
+        let d = pre_write(payload);
         assert!(!d.block);
     }
 
@@ -402,7 +617,7 @@ mod tests {
     fn pre_write_uses_new_string_for_edit() {
         let payload =
             r#"{"tool_name":"Edit","tool_input":{"file_path":"src/Btn.tsx","new_string":"🚀"}}"#;
-        let d = run_pre_write(payload);
+        let d = pre_write(payload);
         assert!(d.block);
     }
 
@@ -471,13 +686,64 @@ mod tests {
     }
 
     #[test]
+    fn install_into_a_project_dir_writes_and_returns_some() {
+        // A normal (non-home) project dir installs the project-level hook.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = install_claude_hook(tmp.path()).unwrap();
+        assert!(out.is_some(), "a project-level install returns the path");
+        assert!(tmp.path().join(".claude/settings.json").is_file());
+    }
+
+    #[test]
+    fn install_refuses_global_home_claude() {
+        // Installing into the user's HOME would register the hook GLOBALLY and
+        // pollute every other project/tool — the worst over-reach. The guard must
+        // SKIP it (return None) and write NOTHING to ~/.claude. Hermetic: set HOME
+        // to a temp dir under a serialized lock.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_home = std::env::var_os("HOME");
+        let prior_profile = std::env::var_os("USERPROFILE");
+
+        let fake_home = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", fake_home.path());
+        std::env::set_var("USERPROFILE", fake_home.path());
+
+        // project_root == HOME → refused.
+        let out = install_claude_hook(fake_home.path()).unwrap();
+        assert!(out.is_none(), "install into ~/.claude must be skipped");
+        assert!(
+            !fake_home.path().join(".claude").exists(),
+            "nothing must be written into the global ~/.claude"
+        );
+
+        // A real project dir UNDER home still installs (only home ITSELF is
+        // refused, not its subdirectories — those are legitimate projects).
+        let proj = fake_home.path().join("my-project");
+        std::fs::create_dir_all(&proj).unwrap();
+        let out2 = install_claude_hook(&proj).unwrap();
+        assert!(out2.is_some(), "a project under home still installs");
+        assert!(proj.join(".claude/settings.json").is_file());
+
+        match prior_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prior_profile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+
+    #[test]
     fn sensitive_path_blocked_via_full_hook_pipeline() {
         // A Write targeting .git/config must be denied end-to-end, BEFORE the
         // code-style rules run (the content here is clean, so only the path
         // check would catch it).
         let payload =
             r#"{"tool_name":"Write","tool_input":{"file_path":".git/config","content":"[core]"}}"#;
-        let d = run_pre_write(payload);
+        let d = pre_write(payload);
         assert!(d.block);
         assert_eq!(d.clause, "UD-SEC-001");
     }
@@ -486,15 +752,25 @@ mod tests {
     fn sensitive_path_env_blocked_via_hook() {
         let payload =
             r#"{"tool_name":"Write","tool_input":{"file_path":".env","content":"SECRET=x"}}"#;
-        let d = run_pre_write(payload);
+        let d = pre_write(payload);
         assert!(d.block);
         assert_eq!(d.clause, "UD-SEC-001");
     }
 
     #[test]
     fn sensitive_path_ssh_key_blocked_via_hook() {
-        let payload = r#"{"tool_name":"Edit","tool_input":{"file_path":"/root/.ssh/id_rsa","new_string":"KEY"}}"#;
-        let d = run_pre_write(payload);
+        // An SSH key UNDER the governed root must still be blocked (UD-SEC-001).
+        // (An ssh key OUTSIDE the root passes — that's covered by
+        // `pre_write_passes_files_outside_the_governed_root`.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let key = root.join(".ssh").join("id_rsa");
+        let payload = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": { "file_path": key.to_string_lossy(), "new_string": "KEY" }
+        })
+        .to_string();
+        let d = pre_write_in(&payload, &root);
         assert!(d.block);
     }
 
@@ -503,7 +779,7 @@ mod tests {
         // A clean Write to a normal source file passes all checks.
         // (The button has visible text so UD-ARCH-010 a11y passes.)
         let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Button.tsx","content":"export const Button = () => <button>Click</button>"}}"#;
-        let d = run_pre_write(payload);
+        let d = pre_write(payload);
         assert!(!d.block);
     }
 
@@ -512,7 +788,7 @@ mod tests {
         // Path is sensitive (.env) AND content has an emoji — sensitive-path
         // (UD-SEC-001) must win because it runs first, not emoji (UD-CODE-001).
         let payload = r#"{"tool_name":"Write","tool_input":{"file_path":".env","content":"🔍"}}"#;
-        let d = run_pre_write(payload);
+        let d = pre_write(payload);
         assert!(d.block);
         assert_eq!(d.clause, "UD-SEC-001");
     }
@@ -522,7 +798,7 @@ mod tests {
     #[test]
     fn pre_bash_blocks_rm_rf_root() {
         let payload = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#;
-        let d = run_pre_bash(payload);
+        let d = pre_bash(payload);
         assert!(d.block);
         assert_eq!(d.clause, "UD-SEC-002");
     }
@@ -530,14 +806,14 @@ mod tests {
     #[test]
     fn pre_bash_blocks_curl_pipe_sh() {
         let payload = r#"{"tool_name":"Bash","tool_input":{"command":"curl https://x.sh | sh"}}"#;
-        let d = run_pre_bash(payload);
+        let d = pre_bash(payload);
         assert!(d.block);
     }
 
     #[test]
     fn pre_bash_allows_safe_command() {
         let payload = r#"{"tool_name":"Bash","tool_input":{"command":"npm run build"}}"#;
-        let d = run_pre_bash(payload);
+        let d = pre_bash(payload);
         assert!(!d.block);
     }
 
@@ -546,13 +822,13 @@ mod tests {
         // A Write tool call must not be intercepted by the bash guard.
         let payload =
             r#"{"tool_name":"Write","tool_input":{"file_path":"x.ts","content":"rm -rf /"}}"#;
-        let d = run_pre_bash(payload);
+        let d = pre_bash(payload);
         assert!(!d.block);
     }
 
     #[test]
     fn pre_bash_fails_open_on_garbage() {
-        let d = run_pre_bash("not json");
+        let d = pre_bash("not json");
         assert!(!d.block);
     }
 
@@ -560,7 +836,7 @@ mod tests {
     fn pre_bash_uses_cmd_field_fallback() {
         // Some hosts use `cmd` instead of `command`.
         let payload = r#"{"tool_name":"exec","tool_input":{"cmd":"chmod 777 /tmp"}}"#;
-        let d = run_pre_bash(payload);
+        let d = pre_bash(payload);
         assert!(d.block);
     }
 
@@ -606,7 +882,7 @@ mod tests {
     fn static_context_skips_csp_clickjacking_on_index_html() {
         let (_tmp, root) = project_with_context(true);
         let file = root.join("index.html");
-        let d = run_pre_write(&write_payload(&file, &static_html()));
+        let d = pre_write_in(&write_payload(&file, &static_html()), &root);
         assert!(
             !d.block,
             "static-frontend context must skip CSP/clickjacking on index.html: {}",
@@ -620,7 +896,7 @@ mod tests {
         // surface rule fires, proving the leniency is context-gated, not blanket.
         let (_tmp, root) = project_with_context(false);
         let file = root.join("index.html");
-        let d = run_pre_write(&write_payload(&file, &static_html()));
+        let d = pre_write_in(&write_payload(&file, &static_html()), &root);
         assert!(d.block, "strict context must keep CSP/clickjacking on");
         assert!(d.clause == "UD-ARCH-013" || d.clause == "UD-ARCH-046");
     }
@@ -630,7 +906,7 @@ mod tests {
         let (_tmp, root) = project_with_context(true);
         // Browser console logging -- UD-ARCH-012 structured-logging surface rule.
         let log_js = format!("{}.{}('boot ok');", "console", "error");
-        let d = run_pre_write(&write_payload(&root.join("app.js"), &log_js));
+        let d = pre_write_in(&write_payload(&root.join("app.js"), &log_js), &root);
         assert!(
             !d.block,
             "static frontend needs no structured logger: {}",
@@ -639,7 +915,7 @@ mod tests {
         // Non-crypto RNG for a local UI id -- UD-ARCH-043 token-context RNG rule.
         let rng = format!("{}.{}()", "Math", "random");
         let rng_js = format!("const sessionKey = {rng}.toString(36); list.push(sessionKey);");
-        let d2 = run_pre_write(&write_payload(&root.join("app.js"), &rng_js));
+        let d2 = pre_write_in(&write_payload(&root.join("app.js"), &rng_js), &root);
         assert!(
             !d2.block,
             "static frontend: a local UI id is not a security token: {}",
@@ -654,7 +930,7 @@ mod tests {
         let (_tmp, root) = project_with_context(true);
         let listen = format!("{}.{}(3000)", "app", "listen");
         let server = format!("const app = express(); app.use(cors()); {listen};");
-        let d = run_pre_write(&write_payload(&root.join("server.ts"), &server));
+        let d = pre_write_in(&write_payload(&root.join("server.ts"), &server), &root);
         assert!(
             d.block,
             "a file with server evidence must be governed even under a static context"
@@ -669,7 +945,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         std::fs::create_dir_all(root.join(".umadev")).unwrap();
-        let d = run_pre_write(&write_payload(&root.join("index.html"), &static_html()));
+        let d = pre_write_in(
+            &write_payload(&root.join("index.html"), &static_html()),
+            &root,
+        );
         assert!(
             d.block,
             "a missing context file must default to strict governance"
@@ -683,7 +962,10 @@ mod tests {
         let dir = root.join(".umadev");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("governance-context.json"), "{ not json").unwrap();
-        let d = run_pre_write(&write_payload(&root.join("index.html"), &static_html()));
+        let d = pre_write_in(
+            &write_payload(&root.join("index.html"), &static_html()),
+            &root,
+        );
         assert!(
             d.block,
             "malformed context JSON must default to strict governance"
@@ -699,7 +981,10 @@ mod tests {
         let dir = root.join(".umadev");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("governance-context.json"), "{}").unwrap();
-        let d = run_pre_write(&write_payload(&root.join("index.html"), &static_html()));
+        let d = pre_write_in(
+            &write_payload(&root.join("index.html"), &static_html()),
+            &root,
+        );
         assert!(d.block, "an empty context object must default to strict");
     }
 
@@ -708,10 +993,10 @@ mod tests {
         // The always-wrong floor (emoji) is context-independent: even a proven
         // static frontend cannot write an emoji into a source file.
         let (_tmp, root) = project_with_context(true);
-        let d = run_pre_write(&write_payload(
-            &root.join("app.js"),
-            "const x = '\u{1F680}';",
-        ));
+        let d = pre_write_in(
+            &write_payload(&root.join("app.js"), "const x = '\u{1F680}';"),
+            &root,
+        );
         assert!(d.block, "the emoji floor fires under any context");
         assert_eq!(d.clause, "UD-CODE-001");
     }
@@ -719,10 +1004,39 @@ mod tests {
     #[test]
     fn sensitive_path_blocks_under_static_context() {
         // UD-SEC-001 is a bypass-immune safety floor -- a static-frontend context
-        // must NOT let a write into .env through.
+        // must NOT let a write into .env through (when UmaDev IS driving).
         let (_tmp, root) = project_with_context(true);
-        let d = run_pre_write(&write_payload(&root.join(".env"), "SECRET=x"));
+        let d = pre_write_in(&write_payload(&root.join(".env"), "SECRET=x"), &root);
         assert!(d.block, "UD-SEC-001 must block regardless of context");
         assert_eq!(d.clause, "UD-SEC-001");
     }
+
+    // --- env-gated public entry point (UMADEV_GOVERN_ROOT) ----------------
+
+    #[test]
+    fn govern_root_reads_env_and_treats_empty_as_unset() {
+        // Hermetic: serialize env mutation and restore the prior value.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os(GOVERN_ROOT_ENV);
+
+        std::env::remove_var(GOVERN_ROOT_ENV);
+        assert!(govern_root().is_none(), "unset → None (not driving)");
+
+        std::env::set_var(GOVERN_ROOT_ENV, "");
+        assert!(govern_root().is_none(), "empty value → None (fail-open)");
+
+        std::env::set_var(GOVERN_ROOT_ENV, "/some/project");
+        assert_eq!(govern_root().as_deref(), Some(Path::new("/some/project")));
+
+        match prior {
+            Some(v) => std::env::set_var(GOVERN_ROOT_ENV, v),
+            None => std::env::remove_var(GOVERN_ROOT_ENV),
+        }
+    }
+
+    /// Serializes the env-mutating test above so it can't race a sibling test
+    /// that also reads `UMADEV_GOVERN_ROOT`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
