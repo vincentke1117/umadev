@@ -295,23 +295,6 @@ pub async fn route(
 /// to a class + depth, and size a team. Always complete, always safe — this is what
 /// the router returns when there's no brain or the brain consult fails.
 fn tier0(requirement: &str) -> RoutePlan {
-    // Greeting / self-inquiry / capability question → Chat, BEFORE the work-verb
-    // floor can over-promote it. "你能帮我做什么?" contains 帮我/做 (work verbs) but
-    // is small talk with no deliverable — without this guard it became a full
-    // Build, convening a 7-seat team for a "hello". A real build phrased as a
-    // question ("帮我做一个待办应用") carries a deliverable and is NOT caught.
-    if looks_like_smalltalk(requirement) {
-        return RoutePlan {
-            class: RouteClass::Chat,
-            kind: TaskKind::Light,
-            depth: Depth::Fast,
-            team: Vec::new(),
-            scope: Vec::new(),
-            needs_clarify: None,
-            est_budget: Budget::for_route(RouteClass::Chat, Depth::Fast),
-            confidence: 0.9,
-        };
-    }
     let kind = classify(requirement);
     let is_work = looks_like_work_request(requirement);
 
@@ -567,103 +550,7 @@ pub fn looks_like_work_request(text: &str) -> bool {
     ZH.iter().any(|k| text.contains(k))
 }
 
-/// Whether the turn is a greeting / self-inquiry / capability question — small
-/// talk that must route to [`RouteClass::Chat`] even though it may contain a work
-/// verb in the interrogative ("你能**帮我做**什么?" = *what can you help me do*,
-/// NOT "帮我做 X"). The guard fires ONLY when there is **no concrete deliverable
-/// noun** — "帮我做一个待办**应用**" carries a deliverable and stays a real build.
-/// Deterministic; the brain (Tier-1) refines an ambiguous middle.
-fn looks_like_smalltalk(text: &str) -> bool {
-    let t = text.trim().to_lowercase();
-    // A concrete deliverable noun ⇒ it's a real request, never small talk.
-    const DELIVERABLE: &[&str] = &[
-        "应用",
-        "程序",
-        "页面",
-        "系统",
-        "网站",
-        "仪表盘",
-        "面板",
-        "落地页",
-        "博客",
-        "商城",
-        "后台",
-        "组件",
-        "接口",
-        "表单",
-        "网页",
-        "小程序",
-        "插件",
-        "工具",
-        "脚本",
-        "游戏",
-        "app",
-        "dashboard",
-        "page",
-        "site",
-        "website",
-        "landing",
-        "login",
-        "api",
-        "feature",
-        "component",
-        "form",
-        "tool",
-        "script",
-        "game",
-        "blog",
-        "store",
-    ];
-    if DELIVERABLE.iter().any(|n| t.contains(n)) {
-        return false;
-    }
-    // Greeting / self-inquiry / capability question with no deliverable.
-    const SMALL: &[&str] = &[
-        "你好",
-        "您好",
-        "嗨",
-        "哈喽",
-        "在吗",
-        "在不在",
-        "你是谁",
-        "你叫什么",
-        "你能做什么",
-        "你能帮我做什么",
-        "你能帮我做点什么",
-        "你能帮我干什么",
-        "你会做什么",
-        "你会什么",
-        "能做些什么",
-        "能做什么",
-        "能干什么",
-        "能干嘛",
-        "做什么呢",
-        "怎么用你",
-        "你怎么用",
-        "如何使用",
-        "怎么开始",
-        "你是什么",
-        "介绍一下你",
-        "自我介绍",
-        "你能干嘛",
-        "你好呀",
-        "who are you",
-        "what can you do",
-        "what do you do",
-        "how do you work",
-        "what are you",
-        "introduce yourself",
-        "how does this work",
-        "how to use you",
-    ];
-    if SMALL.iter().any(|k| t.contains(k)) {
-        return true;
-    }
-    // A bare greeting token at the very start of a short turn (e.g. "hi", "hello").
-    const HELLO: &[&str] = &["hello", "hi ", "hey ", "yo ", "早上好", "晚上好"];
-    let short = t.chars().count() <= 24;
-    short && (t == "hi" || t == "hey" || t == "yo" || HELLO.iter().any(|k| t.starts_with(k)))
-}
+
 
 /// Cheap deterministic path hints — pull obvious file-ish tokens out of the
 /// requirement (anything with a path separator or a known source extension). These
@@ -734,33 +621,121 @@ struct BrainRoute {
 /// fork → judge-turn → parse path, same fail-open contract. Returns `None` on any
 /// failure (no fork / offline / timeout / unparseable), which the caller treats as
 /// "use the Tier-0 floor".
+/// The intent-triage instruction the borrowed brain answers — shared by the
+/// fork-based [`consult_route`] and the one-shot [`route_via_brain`].
+const ROUTER_TRIAGE_SYSTEM: &str =
+    "You are a senior engineering director triaging ONE incoming request before \
+     any work starts. Decide how to handle it. Be decisive and terse. \
+     `class`: chat (small talk / a greeting / a question about you) | explain (read-only \
+     Q&A about code) | quick_edit (a small, well-scoped change to existing text/code) | \
+     debug (diagnose+fix a defect) | build (create a real feature/product). A greeting or \
+     a 'what can you do' question is chat, NOT build, even if it mentions building. \
+     `kind`: greenfield | frontend_only | backend_only | bugfix | refactor | docs_only | \
+     light. `complexity`: simple | medium | complex. Only set `clarify_question` when the \
+     request is genuinely ambiguous in a way you could NOT resolve by reading the code — \
+     never ask what you can discover yourself. JSON shape: \
+     {\"class\":\"…\",\"kind\":\"…\",\"complexity\":\"simple|medium|complex\",\
+     \"needs\":[\"…\"],\"scope\":[\"file/dir\",…],\"risks\":[\"…\"],\
+     \"clarify_question\":\"\",\"clarify_options\":[],\"confidence\":0.0}";
+
 async fn consult_route(
     session: &mut dyn BaseSession,
     _options: &RunOptions,
     requirement: &str,
 ) -> Option<BrainRoute> {
-    let system = "You are a senior engineering director triaging ONE incoming request before \
-         any work starts. Decide how to handle it. Be decisive and terse. \
-         `class`: chat (small talk) | explain (read-only Q&A about code) | quick_edit (a \
-         small, well-scoped change) | debug (diagnose+fix a defect) | build (a real \
-         feature/product). `kind`: greenfield | frontend_only | backend_only | bugfix | \
-         refactor | docs_only | light. `complexity`: simple | medium | complex. Only set \
-         `clarify_question` when the request is genuinely ambiguous in a way you could NOT \
-         resolve by reading the code — never ask what you can discover yourself. JSON shape: \
-         {\"class\":\"…\",\"kind\":\"…\",\"complexity\":\"simple|medium|complex\",\
-         \"needs\":[\"…\"],\"scope\":[\"file/dir\",…],\"risks\":[\"…\"],\
-         \"clarify_question\":\"\",\"clarify_options\":[],\"confidence\":0.0}";
     let user = format!("Request:\n{requirement}");
 
     // Fork a read-only session (bounded handshake) and run one strict-JSON judge
     // turn over it — reusing the exact ForkConsult mechanism the critic team uses.
     let fork = crate::continuous::fork_with_timeout(session).await;
     let consult = crate::continuous::ForkConsult::new(fork);
-    let json_text = consult.judge_json("router", system, user).await;
+    let json_text = consult
+        .judge_json("router", ROUTER_TRIAGE_SYSTEM, user)
+        .await;
     consult.end().await;
 
     let text = json_text?;
     serde_json::from_str::<BrainRoute>(&text).ok()
+}
+
+/// Route a turn by asking the **borrowed brain** to classify the intent — a single
+/// stateless one-shot consult (`claude --print` and equivalents), no fork, no
+/// session lifecycle. This is the router for the chat surface: UmaDev depends on
+/// the base ecosystem, so the base's own model is the judge of "chat vs. a small
+/// edit vs. a real build" — far better than any keyword table. There is
+/// intentionally **no deterministic keyword classifier** in this path: if the
+/// brain is unreachable the product cannot run anyway, and a failed / garbage
+/// consult degrades to the lightest path ([`RouteClass::Chat`]) so the turn still
+/// reaches the base (which will surface any real connectivity error itself).
+///
+/// `runtime` is a freshly-built brain (`build_brain`) the caller owns; this fn does
+/// not mutate the workspace and opens no session.
+pub async fn route_via_brain(
+    runtime: &dyn umadev_runtime::Runtime,
+    requirement: &str,
+) -> RoutePlan {
+    match consult_brain_oneshot(runtime, requirement).await {
+        Some(brain) => brain_to_route(&brain),
+        // Simplest possible degradation (NOT a keyword fallback): treat it as a
+        // chat turn and pass it straight to the base.
+        None => brain_unavailable_chat_route(),
+    }
+}
+
+/// One stateless `complete()` triage call on the borrowed brain. `None` on offline
+/// / empty input / a call error / unparseable JSON.
+async fn consult_brain_oneshot(
+    runtime: &dyn umadev_runtime::Runtime,
+    requirement: &str,
+) -> Option<BrainRoute> {
+    if runtime.is_offline() || requirement.trim().is_empty() {
+        return None;
+    }
+    let prompt = crate::experts::Prompt {
+        system: ROUTER_TRIAGE_SYSTEM.to_string(),
+        user: format!("Request:\n{requirement}"),
+    };
+    let resp = runtime.complete(prompt.into_request(String::new(), 400)).await.ok()?;
+    let json = crate::continuous::extract_json_object(&resp.text)?;
+    serde_json::from_str::<BrainRoute>(&json).ok()
+}
+
+/// Map the brain's triage verdict into an owned [`RoutePlan`] — the brain is
+/// **authoritative** here (no escalate-only flooring): it decides the class, the
+/// depth (from complexity), the kind, and the implied team. An unparseable field
+/// falls back to the lightest sensible value.
+fn brain_to_route(brain: &BrainRoute) -> RoutePlan {
+    let class = parse_class(&brain.class).unwrap_or(RouteClass::Chat);
+    let depth = parse_depth(&brain.complexity).unwrap_or(Depth::Fast);
+    let kind = parse_kind(&brain.kind).unwrap_or(TaskKind::Light);
+    let team = reconcile_team(&[], kind, class, depth, &brain.needs);
+    let scope = union_scope(&[], &brain.scope);
+    let needs_clarify = build_clarify(brain);
+    RoutePlan {
+        class,
+        kind,
+        depth,
+        team,
+        scope,
+        needs_clarify,
+        est_budget: Budget::for_route(class, depth),
+        confidence: brain.confidence.clamp(0.0, 1.0),
+    }
+}
+
+/// The lightest route — used only when the brain can't be reached (no keyword
+/// guessing): the turn is treated as chat and handed to the base as-is.
+fn brain_unavailable_chat_route() -> RoutePlan {
+    RoutePlan {
+        class: RouteClass::Chat,
+        kind: TaskKind::Light,
+        depth: Depth::Fast,
+        team: Vec::new(),
+        scope: Vec::new(),
+        needs_clarify: None,
+        est_budget: Budget::for_route(RouteClass::Chat, Depth::Fast),
+        confidence: 0.3,
+    }
 }
 
 /// Reconcile the brain's opinion with the deterministic Tier-0 floor under ONE
@@ -941,6 +916,73 @@ fn parse_kind(s: &str) -> Option<TaskKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use umadev_runtime::{
+        CompletionRequest, CompletionResponse, Runtime, RuntimeError, RuntimeKind, Usage,
+    };
+
+    /// A one-shot brain that always returns the given triage JSON — exercises
+    /// `route_via_brain` (the chat surface's brain-driven router).
+    struct TriageBrain(&'static str);
+    #[async_trait]
+    impl Runtime for TriageBrain {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Anthropic
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, RuntimeError> {
+            Ok(CompletionResponse {
+                text: self.0.to_string(),
+                id: "t".into(),
+                model: "t".into(),
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn brain_classifies_a_greeting_as_chat_not_build() {
+        // The brain — not a keyword table — judges intent. A greeting is chat.
+        let brain = TriageBrain(
+            "{\"class\":\"chat\",\"kind\":\"light\",\"complexity\":\"simple\",\"confidence\":0.95}",
+        );
+        let p = route_via_brain(&brain, "你好,你是谁?能帮我做什么?").await;
+        assert_eq!(p.class, RouteClass::Chat);
+        assert!(p.team.is_empty());
+    }
+
+    #[tokio::test]
+    async fn brain_classifies_a_real_build_as_build_with_team() {
+        let brain = TriageBrain(
+            "```json\n{\"class\":\"build\",\"kind\":\"greenfield\",\"complexity\":\"complex\",\
+             \"needs\":[\"frontend\",\"backend\"],\"confidence\":0.9}\n```",
+        );
+        let p = route_via_brain(&brain, "做一个带登录的 SaaS 仪表盘").await;
+        assert_eq!(p.class, RouteClass::Build);
+        assert_eq!(p.depth, Depth::Deep);
+        assert!(!p.team.is_empty(), "a complex build convenes a team");
+    }
+
+    #[tokio::test]
+    async fn brain_classifies_a_tweak_as_quick_edit() {
+        let brain = TriageBrain(
+            "{\"class\":\"quick_edit\",\"kind\":\"light\",\"complexity\":\"simple\",\"confidence\":0.8}",
+        );
+        let p = route_via_brain(&brain, "把标题改成 Welcome").await;
+        assert_eq!(p.class, RouteClass::QuickEdit);
+    }
+
+    #[tokio::test]
+    async fn brain_unavailable_degrades_to_chat_not_a_keyword_guess() {
+        // Offline / unreachable brain → the lightest path (Chat), NOT a keyword
+        // classifier. We depend on the base ecosystem; there is no deterministic
+        // fallback classifier on this path by design.
+        let offline = umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic);
+        let p = route_via_brain(&offline, "做一个待办应用").await;
+        assert_eq!(p.class, RouteClass::Chat, "no brain → pass-through chat");
+    }
 
     fn opts() -> RunOptions {
         RunOptions {
@@ -991,31 +1033,7 @@ mod tests {
         assert_eq!(p.class, RouteClass::Debug);
     }
 
-    #[tokio::test]
-    async fn greeting_and_self_inquiry_stay_chat_not_build() {
-        // The real-machine walkthrough caught "你好,你是谁?能帮我做什么?" (a greeting +
-        // capability question) convening a 7-seat BUILD team. Small talk with a work
-        // verb in the interrogative must route to Chat.
-        for q in [
-            "你好,你是谁?能帮我做什么?",
-            "你好呀",
-            "你能做什么",
-            "hi there",
-            "what can you do for me?",
-            "介绍一下你自己",
-        ] {
-            let p = route(None, &opts(), q).await;
-            assert_eq!(p.class, RouteClass::Chat, "{q} must be Chat");
-            assert!(p.team.is_empty(), "{q} convenes no team");
-        }
-        // …but a deliverable phrased as a question is STILL a build.
-        let p = route(None, &opts(), "你能帮我做一个待办应用吗?").await;
-        assert_eq!(
-            p.class,
-            RouteClass::Build,
-            "a deliverable question is a build"
-        );
-    }
+
 
     #[tokio::test]
     async fn small_create_request_is_a_build_not_a_quick_edit() {
@@ -1155,3 +1173,4 @@ mod tests {
         assert!(!looks_like_work_request("nice, thanks"));
     }
 }
+
