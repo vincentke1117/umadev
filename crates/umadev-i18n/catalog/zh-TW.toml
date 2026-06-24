@@ -155,7 +155,7 @@
 "report.write_failed" = "[warn] 無法寫入報告: {}"
 
 # 歡迎語（冷啟動第一屏）
-"greeting.main" = "UmaDev — 把一句話需求,變成可上線的商業產品。\n你不用寫一行程式碼:我驅動你登入的 AI 工人,按 研究 -> 設計 -> 開發 -> 預覽 -> 上線 幫你交付,並自動套用商業級設計系統、留下品質與稽核證據。\n目前工人:{}"
+"greeting.main" = "UmaDev — 把一句話需求,變成可上線的商業產品。\n你不用寫一行程式碼:我驅動你登入的 AI 底座,按 研究 -> 設計 -> 開發 -> 預覽 -> 上線 幫你交付,並自動套用商業級設計系統、留下品質與稽核證據。\n目前底座:{}"
 "greeting.examples" = "直接輸入你想做什麼,例如(也可以照抄一條):\n\n  · 做一個帶 Email 登入的 SaaS 數據分析儀表板\n  · 做一個待辦清單應用,支援分組和提醒\n  · 做一個部落格系統,支援 Markdown 寫作\n  · 做一個產品登陸頁,要能上架的那種\n\n接下來:回答幾個釐清問題 -> 審核三份設計文件(c 通過)-> /preview 看效果 -> /deploy 上線。\n更多:/help 全部指令 · /design 換設計風格（預設已自動選）· /config 目前設定"
 
 # Provider preset labels (vendor menu in the external-API wizard)
@@ -250,7 +250,7 @@
 "common.none" = "(無)"
 
 # /backend and /model
-"backend.switched" = "已切換工人到 `{}` — 下一個 run 起用此 backend。"
+"backend.switched" = "已切換底座到 `{}` — 下一個 run 起用此 backend。"
 "backend.busy_no_switch" = "目前底座上有執行進行中 —— 請先 /cancel 再切換底座,以免執行與其會話錯配。"
 "model.base_default" = "(底座預設)"
 "model.menu.claude" = "  Claude(別名或完整 id 均可):\n    · /model opus —— 最強  · /model sonnet —— 均衡(預設)  · /model haiku —— 最快\n    · 完整 id 如 claude-opus-4-8 / claude-sonnet-4-6"
