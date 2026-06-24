@@ -9,7 +9,7 @@
 //! Later milestones swap the deterministic phase bodies for LLM-driven
 //! ones without changing this orchestration.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -569,6 +569,47 @@ pub fn strict_coverage_from_env() -> bool {
     std::env::var("UMADEV_STRICT_COVERAGE").as_deref() == Ok("1")
 }
 
+/// **Git-as-trust setup for a workspace-mutating run** (Wave 6 deliverable 2) —
+/// the shared, sink-free core called both by the runner block methods and by the
+/// TUI's director loop, so EVERY fresh write-run is isolated regardless of path.
+///
+/// Two extremely-conservative, fully fail-open safety moves, run once at the
+/// start of a write-run (before any phase writes):
+///
+/// 1. **Branch isolation** — derive a sibling `umadev/<slug>` branch from the
+///    current HEAD and switch to it, so the run never edits the user's default /
+///    working branch in place. We **never auto-merge, push, touch a remote, or
+///    delete anything**; a non-git dir / dirty tree / any error skips isolation
+///    and the run proceeds in the working tree exactly as it always did.
+/// 2. **Run baseline** — snapshot the pre-run workspace into the SHADOW repo
+///    (`.umadev/checkpoints.git`, decoupled from the user's `.git`) so `rollback`
+///    can undo the entire run later.
+///
+/// Idempotent across the blocks of one run: a continue/resume block already on
+/// `umadev/<slug>` re-enters cleanly, and the baseline is taken only when none
+/// exists yet (a continue block must not reset the rollback target to mid-run
+/// state). Returns `Some((branch, from))` ONLY when this call freshly created an
+/// isolation branch (so the caller emits a single advisory note); every other
+/// outcome — re-entered, skipped, error — returns `None` and stays silent.
+#[must_use]
+pub fn setup_run_isolation(project_root: &Path, slug: &str) -> Option<(String, String)> {
+    let announce = match crate::pr::ensure_isolation_branch(project_root, slug) {
+        crate::pr::BranchIsolation::Isolated {
+            branch,
+            from,
+            created: true,
+        } => Some((branch, from)),
+        // Re-entered an existing isolation branch, or skipped (not a repo / dirty
+        // / error): the run proceeds exactly as before, no note.
+        _ => None,
+    };
+    // Run baseline for `rollback`, only once per run. Best-effort, fail-open.
+    if crate::checkpoint::run_baseline(project_root).is_none() {
+        let _ = crate::checkpoint::create_run_baseline(project_root, slug);
+    }
+    announce
+}
+
 impl RunOptions {
     /// Resolve the effective slug — derives from workspace dir name
     /// when empty.
@@ -649,6 +690,44 @@ impl<R: Runtime> AgentRunner<R> {
     /// Runtime kind (for human-facing announcements).
     pub fn runtime_kind(&self) -> umadev_runtime::RuntimeKind {
         self.runtime.kind()
+    }
+
+    /// **Git-as-trust setup for a workspace-mutating run** (Wave 6 deliverable 2).
+    ///
+    /// Called once at the very start of a fresh run, after the run lock is held
+    /// but before any phase writes. Two extremely-conservative, fully fail-open
+    /// safety moves so the user can trust the run with their code:
+    ///
+    /// 1. **Branch isolation** — derive a sibling `umadev/<slug>` branch from the
+    ///    current HEAD and switch to it, so the run never edits the user's
+    ///    default / working branch in place. We **never auto-merge, push, touch a
+    ///    remote, or delete anything**; a non-git dir / dirty tree / any error
+    ///    simply skips isolation and the run proceeds in the working tree exactly
+    ///    as it always did. The user reviews + merges the branch themselves.
+    /// 2. **Run baseline** — snapshot the pre-run workspace into the SHADOW repo
+    ///    (`.umadev/checkpoints.git`, decoupled from the user's `.git`), so
+    ///    `rollback` can undo the entire run later. Best-effort.
+    ///
+    /// Idempotent across the blocks of one run: a continue/resume block already
+    /// sitting on `umadev/<slug>` re-enters cleanly and does NOT take a second
+    /// baseline (a fresh baseline is only taken when none exists yet). Every step
+    /// is best-effort and emits at most a single advisory note; a failure NEVER
+    /// blocks or errors the run — this is the most irreversible-leaning piece, so
+    /// it leans hard toward "do nothing" over "risk the user's work".
+    ///
+    /// Safe to call at the start of EVERY workspace-mutating block (initial /
+    /// continue / light / continuous): the shared [`setup_run_isolation`] helper
+    /// is idempotent, so a continue block on the existing isolation branch is a
+    /// no-op and never re-baselines.
+    fn setup_run_isolation(&self) {
+        if let Some((branch, from)) =
+            setup_run_isolation(&self.options.project_root, &self.options.effective_slug())
+        {
+            self.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "trust.branch_isolated",
+                &[&branch, &from],
+            )));
+        }
     }
 
     /// The governance [`ProjectContext`](umadev_governance::ProjectContext) for
@@ -1450,6 +1529,9 @@ impl<R: Runtime> AgentRunner<R> {
             return self.run_initial_block(use_runtime, None).await;
         }
         let _run_lock = crate::run_lock::RunLock::acquire_for_run(&self.options.project_root)?;
+        // Git-as-trust: isolate onto `umadev/<slug>` + snapshot the run baseline
+        // (fail-open; idempotent — see `setup_run_isolation`).
+        self.setup_run_isolation();
         self.emit(EngineEvent::PipelineStarted {
             slug: self.options.effective_slug(),
             requirement: self.options.requirement.clone(),
@@ -1596,6 +1678,13 @@ impl<R: Runtime> AgentRunner<R> {
         start_after: Phase,
     ) -> std::io::Result<crate::continuous::RunOutcome> {
         let _run_lock = crate::run_lock::RunLock::acquire_for_run(&self.options.project_root)?;
+        // Git-as-trust: isolate + baseline on the FRESH block of a continuous run
+        // (Research). Continue blocks (Spec/Backend) are already on the isolation
+        // branch, so the helper is a no-op there — but we only call it on the
+        // fresh block to avoid even the idempotent probe cost mid-run.
+        if start_after == Phase::Research {
+            self.setup_run_isolation();
+        }
         Ok(crate::continuous::run_block(session, &self.options, &self.events, start_after).await)
     }
 
@@ -1615,6 +1704,9 @@ impl<R: Runtime> AgentRunner<R> {
         // residue and is reclaimed, not treated as a `WouldBlock` queue signal —
         // otherwise the first real block would self-abort at `0/9`.
         let _run_lock = crate::run_lock::RunLock::acquire_for_run(&self.options.project_root)?;
+        // Git-as-trust: derive `umadev/<slug>` + baseline before any write
+        // (fail-open; idempotent if a prior block already isolated).
+        self.setup_run_isolation();
         let mut completed = Vec::new();
         let project_cfg = crate::config::load_project_config(&self.options.project_root);
         let max_reviews = project_cfg.pipeline.max_review_rounds;
@@ -5109,6 +5201,9 @@ impl<R: Runtime> AgentRunner<R> {
     /// run is leaner, not invisible. `use_runtime` forces the worker on/off.
     pub async fn run_light(&self, use_runtime: bool) -> std::io::Result<RunReport> {
         let _run_lock = crate::run_lock::RunLock::acquire_for_run(&self.options.project_root)?;
+        // Git-as-trust: a `/quick` run still mutates the workspace → isolate +
+        // baseline (fail-open; idempotent).
+        self.setup_run_isolation();
         let plan = crate::planner::plan_light(&self.options.requirement);
         let mut completed = Vec::new();
 

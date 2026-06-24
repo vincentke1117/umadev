@@ -1,8 +1,8 @@
 # UmaDev Host Specification, Version 1 (UMADEV_HOST_SPEC_V1)
 
 > **Status:** Draft  
-> **Version:** 1.0.0-draft.4  
-> **Date:** 2026-06-23  
+> **Version:** 1.0.0-draft.5  
+> **Date:** 2026-06-24  
 > **Editor:** UmaDev maintainers (`<11964948@qq.com>`)  
 > **License:** MIT  
 
@@ -220,6 +220,19 @@ profile (§8.4).
 
 The host **MUST** persist the active phase to `.umadev/workflow-state.json`
 in a format containing at least the keys `phase` and `active_gate`.
+
+**Scope of this clause.** `UD-FLOW-001` governs the *full commercial
+delivery build* — the `standard` profile of §8.4. It is the contract for
+**how a heavyweight greenfield product is delivered**: when a host commits
+to that play, it MUST run these phases in this order and honor the gates.
+It does **not** require that *every* user turn be a nine-phase walk. A
+casual question, a read-only review, a one-line edit, or a bugfix is not a
+commercial delivery build and is **out of this clause's scope** (see the
+team-scaling rule in §9.4 and the lightweight `seeai` profile in §8.4). The
+reference implementation reaches the phase chain by **routing** a turn to
+the deliberate path and synthesizing a plan whose deepest form *is* this
+chain (§9.5) — the chain is the deep play the directing Agent selects for a
+full build, not a funnel every message is forced through.
 
 ### 4.2 Docs confirmation gate (`UD-FLOW-002`)
 
@@ -727,7 +740,7 @@ workspace is ten crates:
 | `umadev` | The binary — clap CLI + the `tui` subcommand |
 | `umadev-spec` | This specification as Rust data (clauses, phases, gates) |
 | `umadev-governance` | Every enforceable rule in §3 / §6 — fail-open |
-| `umadev-agent` | 9-phase pipeline runner, gate semantics, role-critic team, trust tiers, runtime/deploy/review evidence |
+| `umadev-agent` | The director engine — intent router + owned plan DAG + step scheduling + firmware injection, with the full commercial phase chain as its deepest play; gate semantics, role-critic team, trust tiers, runtime/deploy/review evidence |
 | `umadev-runtime` | Runtime trait + OfflineRuntime + RuntimeKind (the host drivers impl Runtime; UmaDev owns no HTTP/model endpoint) |
 | `umadev-host` | Drives a logged-in `claude` / `codex` / `opencode` CLI as a subprocess |
 | `umadev-knowledge` | Structured BM25 + CJK retrieval over the curated `knowledge/` corpus |
@@ -737,9 +750,11 @@ workspace is ten crates:
 
 ### 9.1 Execution modes
 
-The reference implementation runs the §4 phase chain with one of two
-interchangeable backends — the choice does **not** affect which clauses
-fire, only where the generative work happens:
+The reference implementation drives a turn through the director-driven
+runtime of §9.5 — routing it, and for a full commercial build expanding the
+plan into the §4 phase chain — with one of two interchangeable backends. The
+choice does **not** affect which clauses fire, only where the generative
+work happens:
 
 | Mode | Selector | Needs an API key |
 |---|---|---|
@@ -860,6 +875,66 @@ is a hand-coded heuristic. The team obeys the four hard invariants of
   lightweight path allowed for simple requirements (the spec profile of
   §8.4 governs the time-boxed `seeai` variant).
 
+### 9.5 Director-driven turn model — route, plan, schedule, deliver
+
+This section describes the **canonical shape of the reference
+implementation's runtime**. It is **non-normative**: it adds no clause and
+changes no clause. It documents *how* the reference driver decides, for any
+given turn, whether and how deeply to engage the §4 flow contract — and it
+reconciles the everyday product behaviour with the phase chain of
+`UD-FLOW-001`.
+
+The mental model is **firmware over a borrowed brain**. UmaDev owns no
+model and does not re-implement the base's agentic loop. It borrows the
+base brain to **think** (route, plan, judge) and directs the base body to
+**work** (write code, run, fix), driving the base deterministically against
+**typed artifacts UmaDev owns**. Every brain consult is fail-open to a
+deterministic floor and never blocks the host. A turn flows through up to
+five layers:
+
+- **L0 — Firmware injection (every path).** Before any base turn, the
+  reference driver composes a curated, token-budgeted system prompt —
+  identity + engineering craft / anti-AI-slop taste + just-in-time
+  knowledge digest + learned-pitfall recall + a repo-map slice of the
+  user's existing code — and injects it through each base's *own* native
+  system-prompt surface. The base executes; UmaDev declares policy. This is
+  the layer that makes a UmaDev turn behave like a senior delivery team
+  rather than a bare base; governance (§3 / §6) remains the silent floor
+  under it.
+- **L1 — Intent router.** The directing Agent classifies the turn into a
+  typed route — its class (chat / explain / quick-edit / debug / build), its
+  task kind, the depth warranted, and the team to convene — using a
+  deterministic tier as the floor and an optional cheap forked brain consult
+  to refine it (the brain may escalate depth, never silently de-scope below
+  the safe deterministic floor). The route is **surfaced to the user** so
+  the decision is legible ("small change, on it" vs "full build, entering
+  the delivery flow"), and the user can override it.
+- **L2 — Owned plan + scheduling.** For a deliberate build the driver asks
+  the brain for a strict plan it **parses and owns** as a dependency DAG of
+  steps, each with a mechanical acceptance check; the plan is persisted, and
+  rendered as a live, steerable checklist. Scheduling obeys the
+  single-writer / map-reduce-manage doctrine of §9.4: doing-roles drive the
+  main session serially under the run lock; reviewing critics run on
+  parallel read-only forked sessions (`UD-FLOW-007`).
+- **L3–L5 — Drive, verify, learn.** The driver walks the plan step by step,
+  verifying each step against its acceptance on the deterministic floor
+  (coverage / contract / verify / hard gate), self-correcting blocking
+  findings with a typed, evidence-bearing rework directive, and exiting
+  cleanly when stuck rather than spinning. Delivery artifacts (§5) and the
+  proof pack (§6) are produced once the floor is clean, and the run's
+  episodes feed the self-evolving memory.
+
+**Relation to `UD-FLOW-001`.** The §4 phase chain is the **deepest play the
+directing Agent selects** — its plan for a full commercial greenfield build
+*expands into* `research → docs → docs_confirm → spec → frontend →
+preview_confirm → backend → quality → delivery`, with the gates of §4.2 /
+§4.3 honored exactly. The chain is therefore canonical for that build, but
+it is reached *by routing and planning*, not imposed on every turn: a chat
+turn never enters it, a quick edit takes the fast path, and a bugfix
+convenes no team (§9.4). This is the same scoping `UD-FLOW-001` now states
+in §4.1. The `standard` profile of §8.4 *is* the full chain; the `seeai`
+profile is its time-boxed variant; both remain plays the router can select.
+
 ## 10. Future work (V2 candidates)
 
 Items considered for the V2 promotion to `MUST`:
@@ -892,3 +967,4 @@ The clause-ID prefix space `UD-*` is reserved for this specification.
 | 1.0.0-draft.2 | 2026-05-22 | §7 host map narrowed to the three official SDK families; §9 rewritten for the Rust reference implementation (three execution modes, TUI). No normative clause changed. |
 | 1.0.0-draft.3 | 2026-06-22 | Promoted shipped capabilities to normative clauses: `UD-FLOW-007` (role-critic team), `UD-FLOW-008` (trust tiers + irreversibility floor), `UD-ART-007` (PR artifact), `UD-EVID-006/007/008` (runtime / deploy / review-report evidence). §9 crate table updated to the ten-crate workspace; manifest `declared_by` synced to `umadev@1.0.x`. |
 | 1.0.0-draft.4 | 2026-06-23 | Added §9.3 (continuous-session driving model) and §9.4 (team-of-roles collaboration model) describing how the reference implementation drives one long-lived base session per run and realizes `UD-FLOW-007` as a director-led team over a shared blackboard. **Non-normative**: no clause added, changed, or renumbered — both sections describe the reference driver and cite only existing clauses. |
+| 1.0.0-draft.5 | 2026-06-24 | Added §9.5 (director-driven turn model: route → plan → schedule → deliver) describing how the reference implementation decides whether/how deeply to engage the flow contract per turn, and clarified the **scope** of `UD-FLOW-001` in §4.1: the phase chain is the `standard`-profile *full commercial build* — the deepest play the directing Agent routes to and its plan expands into — not a funnel every turn is forced through. Reconciles the everyday director/router/plan product behaviour with the normative chain. **Non-normative**: no clause added, changed, renumbered, or weakened — `UD-FLOW-001` stays a MUST for the build it governs; §9.5 and the §4.1 scoping paragraph cite only existing clauses. |

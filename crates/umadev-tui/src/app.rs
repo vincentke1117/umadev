@@ -630,6 +630,15 @@ pub struct App {
     /// stall — the base IS working — so the red signal is suppressed while this
     /// is set even past the 3s threshold.
     pub tool_in_progress: bool,
+    /// **Adaptive stall threshold** (Wave 6) — `true` while the in-flight tool
+    /// call is a known *legitimately-long* operation (a dependency install or a
+    /// full build/compile: `npm install`, `cargo build`, `pip install`, …). These
+    /// routinely run for minutes with no intervening output, so the stall clock
+    /// uses a much longer threshold while this is set — the red "about to hang"
+    /// cue must not false-fire during a legitimate `npm install`. Set on the
+    /// matching `ToolUse`, cleared on its `ToolResult` (alongside
+    /// [`Self::tool_in_progress`]).
+    pub long_op_in_progress: bool,
 
     /// **Transient heartbeat status** — a single in-place line for the
     /// long-phase heartbeat's periodic "still working (mm:ss)" beats. Set by
@@ -768,6 +777,7 @@ impl App {
             stream_text_active: false,
             last_output_at: None,
             tool_in_progress: false,
+            long_op_in_progress: false,
             transient_status: None,
             plan_steps: Vec::new(),
             plan_collapsed: false,
@@ -1159,6 +1169,7 @@ impl App {
         // The run is over — any worker-stall animation must stop.
         self.thinking = false;
         self.tool_in_progress = false;
+        self.long_op_in_progress = false;
         self.last_output_at = None;
         // No live phase → no heartbeat reassurance should remain.
         self.transient_status = None;
@@ -2262,6 +2273,12 @@ impl App {
                                                          // is WORK, not a stall, so suppress the red signal until
                                                          // its result returns.
                         self.tool_in_progress = true;
+                        // Adaptive stall threshold: a dependency install / full
+                        // build legitimately runs for minutes with no output, so
+                        // widen the stall window while one is in flight (only a
+                        // `Bash`/`run` tool can be one). Cleared on its result.
+                        self.long_op_in_progress =
+                            matches!(name.as_str(), "Bash") && is_long_running_command(&detail);
                         let icon = match name.as_str() {
                             "Read" | "NotebookEdit" => "[read]",
                             "Write" | "Edit" => "[write]",
@@ -2306,6 +2323,7 @@ impl App {
                         // The in-flight tool call returned → no longer "working
                         // on a tool"; the stall clock applies normally again.
                         self.tool_in_progress = false;
+                        self.long_op_in_progress = false;
                         let mark = if ok { "[ok]" } else { "[fail]" };
                         let preview: String = summary.chars().take(100).collect();
                         if !preview.trim().is_empty() {
@@ -6043,7 +6061,21 @@ impl App {
     /// within 60s.
     #[must_use]
     pub fn is_stalled(&self) -> bool {
+        // Adaptive threshold (Wave 6): the normal "about to hang" window is a
+        // generous 60s, but a known long operation (a dependency install / full
+        // build, flagged by `long_op_in_progress`) legitimately runs for minutes
+        // with no output — using the 60s window there would paint a false red
+        // mid-`npm install`. So widen the window to 5 min while one is in flight.
+        // (In practice `tool_in_progress` already suppresses the red cue during a
+        // tool call, so this is the belt-and-braces case where a long op's own
+        // tool boundary has passed but the work it kicked off is still settling.)
         const STALL: std::time::Duration = std::time::Duration::from_secs(60);
+        const STALL_LONG_OP: std::time::Duration = std::time::Duration::from_secs(300);
+        let stall = if self.long_op_in_progress {
+            STALL_LONG_OP
+        } else {
+            STALL
+        };
         // Stall only makes sense while something is ACTIVELY running: a phase is
         // in flight, a chat turn is "thinking", OR the run has STARTED but not
         // yet entered its first `Running` phase. That last case is the structural
@@ -6060,17 +6092,17 @@ impl App {
             return false;
         }
         match self.last_output_at {
-            Some(t) => t.elapsed() >= STALL,
+            Some(t) => t.elapsed() >= stall,
             // Nothing has arrived yet this turn: only call it a stall once the
-            // active block has been running > 60s (a just-started phase / a
-            // just-launched run isn't stalled, it's spinning up). The pre-phase
-            // window has no `phase_started_at`/`thinking_started`, so fall back to
-            // the run's own start instant.
+            // active block has been running past the threshold (a just-started
+            // phase / a just-launched run isn't stalled, it's spinning up). The
+            // pre-phase window has no `phase_started_at`/`thinking_started`, so
+            // fall back to the run's own start instant.
             None => self
                 .phase_started_at
                 .or(self.thinking_started)
                 .or(self.run_started_at)
-                .is_some_and(|t| t.elapsed() >= STALL),
+                .is_some_and(|t| t.elapsed() >= stall),
         }
     }
 
@@ -6128,6 +6160,50 @@ pub(crate) struct ChatSession {
 /// in `chrono` — the TUI crate stays dependency-light. Derived from the Unix
 /// epoch via a plain civil-date conversion (days-from-epoch → Y/M/D). Used only
 /// for human-facing ordering/labels, so a leap-second-level imprecision is fine.
+/// Whether a `Bash` command detail looks like a legitimately-long operation
+/// (dependency install / full build / image pull) that runs for minutes with no
+/// output — so the stall watchdog should widen its window instead of flashing red
+/// on honest work. Substring match on the command text; conservative (false → the
+/// normal 60s threshold still applies).
+fn is_long_running_command(detail: &str) -> bool {
+    const LONG: &[&str] = &[
+        "npm install",
+        "npm ci",
+        "npm run build",
+        "yarn install",
+        "yarn build",
+        "pnpm install",
+        "pnpm build",
+        "pip install",
+        "poetry install",
+        "cargo build",
+        "cargo test",
+        "cargo check",
+        "go build",
+        "go mod download",
+        "go test",
+        "mvn ",
+        "gradle",
+        "./gradlew",
+        "make ",
+        "cmake",
+        "docker build",
+        "docker pull",
+        "docker compose",
+        "bundle install",
+        "composer install",
+        "vite build",
+        "webpack",
+        "next build",
+        "tsc ",
+        "apt-get install",
+        "brew install",
+        "playwright install",
+    ];
+    let d = detail.to_ascii_lowercase();
+    LONG.iter().any(|p| d.contains(p))
+}
+
 fn now_iso8601() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

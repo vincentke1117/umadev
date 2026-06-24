@@ -2,6 +2,26 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] — 顶级真 Agent 化：智能路由 + 可视计划 + 团队调度 + 固件 + 代码库理解 + 记忆（Wave 1–6）
+
+把"持续会话总监"从一个**对外承诺、内部却停在裸底座 + 事后质检**的状态，落地成**用户真能看见、能操控、能信任**的顶级总监 Agent。核心发现（见 [`docs/PRODUCT_VISION_AND_ROADMAP.md`](docs/PRODUCT_VISION_AND_ROADMAP.md)，权威产品态）：智能其实**早已存在于代码树**，但被困在 env-gated 旧流水线、降级成非约束提示、或是死代码（`director::summon`）——发布工作是**把已有资产接到用户真正走的路径上 + 让总监可见**，加三个新自有原语，而非从零发明。
+
+### 新增（Wave 1–6）
+
+- **W1 — 它会想、会拆计划、还给你看**：新增三个自有原语。**智能路由**（`umadev-agent/src/router.rs`）把每条非斜杠输入分流成 `RoutePlan{class,kind,depth,team,scope,…}`（确定性 Tier-0 地板 + 可选 fork 出的只读结构化 JSON 借脑判断，借脑只能升级深度、绝不悄悄降到安全地板以下），结果以**意图卡**显示（"小改动，这就做" vs "完整产品，进研发流程"），`/run` 强制完整、`/quick` 强制快路径可覆盖。**自有可视计划**（`plan_state.rs`）把目标拆成总监自己解析并持有的依赖 DAG（落 `.umadev/plan.json`），渲染成**实时勾选清单**（退役"卡在 0/9"的冻结相位条），`/plan skip|add|veto|up|down <id>` 步级调度。新增 4 个引擎事件 `IntentDecided` / `PlanPosted` / `PlanStepStatus` / `CriticVerdict` 并在 TUI + CLI 渲染。首启选择器**说真话**：三态认证探测（已登录 / 装了没登录→登录命令 / 没装→安装命令），未登录的底座不再假绿、阻止提交。
+- **W2 — 真带团队 + 真固件**：新增 `context::compose_firmware`——一个分层、token 预算的系统提示构建器，在**每条路径**注入身份 + 反 AI 模板心法 + JIT 知识摘要 + 按技术栈指纹召回的踩坑（过去只在 `runner.rs` 触发），经 `session_for`→各底座原生系统提示面注入（claude `--append-system-prompt`；codex/opencode 作首条指令前缀，诚实标注）。计划被 **`director::summon` 真驱动**（不只是显示）：可调度的 Build 步串行 summon、Review 步 fork 团队并行审；团队规模在**每条路径**按 `RoutePlan.team` 缩放（不再 `/run`-only）。用量 + 审计（`record_tool_call`）+ 踩坑捕获/召回接进默认 `director_loop`——`/lessons`、`/usage`、审计在发布路径上对**三家底座**都真了。
+- **W3 — 它懂你的代码库**：新增 `umadev-knowledge/src/repomap.rs`——依赖极轻的逐语言正则符号扫描（JS/TS/Py/Rust/Go/Java/Kotlin/C#/PHP/Swift/Dart/Ruby，函数/类/接口/枚举/导出 + file:line），按度中心性近似排名、按 `RoutePlan.scope` 个性化，渲染成 token 预算的符号轮廓，mtime 缓存到 `.umadev/repomap-cache`，**零新增传递依赖**（纯 Rust regex，守住依赖极简反规则）。这片 repo-map 切片经 `compose_firmware` 在每条干活路径（含 "explain this code"）注入底座；greenfield/空仓→空→零开销。增量 verify：底座自己刚跑过且报告干净的构建/测试，`run_auto_qc` 信任它、不再重复跑一遍。
+- **W4 — 它交付证明、也自验**：`director::finalize`（从 `phases.rs` 抬出）在质检通过后产出 PRD/架构/UIUX/成绩单/proof-pack，**按深度裁剪**（轻量页面不塞 proof-pack）。验收地板（覆盖 FR→step + 验收 task→API + 契约校验）提升到默认 deliberate 路径，不再 legacy-only；bugfix 要求复现测试红→绿 + 回归保持绿。自纠错**被诊断**：每个阻断项分类型（build/contract/coverage/behavior/craft）+ disposition（Investigate/FixAdjacent/NoteAndContinue/Escalate）+ `error_kb` 配方 + 召回踩坑折进带证据的修复指令；卡死检测器（同一指纹 N 次）干净退出为 `Blocked{reason,evidence}` 而非空转。自有基线 SAST（`rules` 引擎的 `sast_scan_file`：注入 / 缺鉴权 / 硬编码密钥启发式）让安全扫描免工具出结果。
+- **W5 — 它记得住、你能和它对话**：UmaDev 每轮把自己**有界的对话**（6k token 预算）发给底座（`--resume` 退化为双保险，不再是唯一记忆）；**持久化 + 续接**每项目对话到 `.umadev/chat/<id>.json`（原子写），`/sessions` 列、`/resume <id>` 续、`/compact` 按 token 预算总结折叠（替代 FIFO-16 截断）。chat ↔ `/run` **共享记忆**：一次 build 结束后会话交回 chat，"你为什么这么建？" 续在同一会话。跨会话目标续接：启动时若 `.umadev/plan.json` 有未完成计划，问"继续目标 X（第 N/M 步）？"。离线 chat 不再静默——上下文感知兜底回声 + 指向连接底座。
+- **W6 — 可信、清晰、一致**（本轮文档批次）：文档/规范/README 三方对齐到当前真实产品——确立 director/USB 模型 + Router/Plan/Scheduling 为 canonical，把 9 阶段强制链降级为"总监为完整商业级 build 选择的最深一招"。
+
+### 文档
+
+- **README.md** 重写"UmaDev 如何工作 / 团队怎么协作 / 流水线设计"：以真实流程为主线——智能路由（意图卡）→ 可视计划（实时清单）→ 注入固件 + 代码库理解 → 逐步调度团队 + 每步验收 → 交付证明 → 记忆；9 阶段降级为"最深一招"。新增"大概要多久 · 命令怎么发现"一节（时间量级表 + 命令可发现性）。命令表补齐 `/quick` / `/plan` / `/sessions` / `/resume` / `/compact`。诚实标注已实现 vs 路线图。
+- **spec/UMADEV_HOST_SPEC_V1.md**（draft.5）：新增 §9.5（director 驱动的轮次模型：route → plan → schedule → deliver）+ 在 §4.1 厘清 `UD-FLOW-001` **作用域**——9 阶段链是 `standard` profile 的**完整商业级 build**（总监路由到、计划展开成的最深一招），不是每条输入的固定漏斗。**非规范变更**：未新增/修改/重排/弱化任何条款，`UD-FLOW-001` 对它治理的那次 build 仍是 MUST；与 CLAUSES 锁步测试保持绿（14/14）。
+- **docs/** 理顺权威关系：`AGENT_WIELDS_BASE_ARCHITECTURE.md` 标注**被 VISION supersede**（保留为 director/USB 模型的概念起源，其四波迁移路线已落地）；`CONTINUOUS_SESSION_ARCHITECTURE.md` 标注会话机制仍现行、但 router/plan/调度叠加在其上、9 阶段应读作"最深一招"；`ARCHITECTURE.md` / `USER_GUIDE.md` 更新定位指向 VISION 为权威。
+- **CLAUDE.md** "What this project is" 与 crate 表对齐真 Agent（router/plan_state/context/director/repomap/finalize），不再说"9-phase runner is core"；9 阶段标注为"最深一招"。
+
 ## [Unreleased] — 持续会话总监 + 完整团队架构（驱动模型大版本变更）
 
 UmaDev 的底座驱动模型从"每阶段单发"重构为"一个持续存在的项目总监 Agent，带领一支完整团队交付"。这是产品叙事与运行时行为的一次大版本对齐。

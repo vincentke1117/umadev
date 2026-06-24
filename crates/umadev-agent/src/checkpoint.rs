@@ -272,6 +272,69 @@ pub fn restore_checkpoint(project_root: &Path, id: &str) -> Result<(), String> {
     }
 }
 
+// =====================================================================
+// Run-level rollback — "undo the whole run" over the SHADOW repo
+// (Wave 6 deliverable 2: real-git rollback, decoupled from the user's .git)
+// =====================================================================
+
+/// The label prefix that marks a **run baseline** checkpoint — the snapshot of
+/// the workspace taken the instant a workspace-mutating run begins, BEFORE the
+/// base writes anything. `rollback` rewinds to the newest of these, so the user
+/// can undo an entire run's worth of edits in one move.
+///
+/// Kept distinct from ordinary per-phase checkpoints (which use a `phase: …` /
+/// freeform label) so [`run_baseline`] can find it deterministically.
+pub const RUN_BASELINE_PREFIX: &str = "run-baseline: ";
+
+/// Take a **run-baseline** checkpoint — the pre-run snapshot `rollback` rewinds
+/// to. Call this once at the very start of a workspace-mutating run, before any
+/// phase writes. It is a normal shadow-repo checkpoint with a recognisable
+/// label, so it composes with the existing per-phase rewind points and never
+/// touches the user's own `.git`. Fail-open: `None` when `git` is unavailable.
+///
+/// `slug` only flavours the label; the baseline is identified by its prefix.
+#[must_use]
+pub fn create_run_baseline(project_root: &Path, slug: &str) -> Option<String> {
+    let label = format!("{RUN_BASELINE_PREFIX}{slug}");
+    create_checkpoint(project_root, &label)
+}
+
+/// The newest run-baseline checkpoint, if one exists — the target `rollback`
+/// rewinds to. Newest-first scan of [`list_checkpoints`] for the baseline
+/// prefix. `None` when no run has recorded a baseline yet.
+#[must_use]
+pub fn run_baseline(project_root: &Path) -> Option<Checkpoint> {
+    list_checkpoints(project_root)
+        .into_iter()
+        .find(|c| c.label.starts_with(RUN_BASELINE_PREFIX))
+}
+
+/// Roll the workspace back to the most recent **run baseline** — a true,
+/// reversible "undo this whole run". This is the user-facing `rollback`:
+///
+/// - Rewinds tracked files to the pre-run snapshot via the SHADOW repo (so the
+///   user's own `.git` history is never rewritten — only the working-tree files
+///   the run wrote are reverted).
+/// - Is itself undoable: [`restore_checkpoint`] auto-snapshots the present and
+///   anchors forward checkpoints under a `umadev-saved-*` ref first, so a
+///   rollback can be rolled forward again.
+/// - Leaves untracked/excluded paths (`node_modules`, the user's `.git`, the
+///   isolation branch pointer) untouched.
+///
+/// Fail-open by contract: when no run baseline exists (no run has started, or
+/// `git` is unavailable) it returns an actionable `Err` string and changes
+/// nothing — it NEVER deletes a remote, force-pushes, or rewrites user commits.
+///
+/// # Errors
+/// Returns `Err` with a human message when there is no recorded baseline to
+/// roll back to, or the underlying restore fails.
+pub fn rollback_run(project_root: &Path) -> Result<Checkpoint, String> {
+    let baseline = run_baseline(project_root)
+        .ok_or_else(|| "还没有可回滚的运行基线(本工作区尚未开始过会改动文件的运行)".to_string())?;
+    restore_checkpoint(project_root, &baseline.id)?;
+    Ok(baseline)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +448,86 @@ mod tests {
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "v2-live-work",
             "a refused restore must not touch the work-tree"
+        );
+    }
+
+    #[test]
+    fn rollback_run_rewinds_whole_run_to_baseline() {
+        // Wave 6: `rollback` = real-git undo of the entire run, over the shadow
+        // repo (the user's own `.git` is never touched).
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        // Pre-run state.
+        std::fs::write(root.join("src.rs"), "original").unwrap();
+        // Run start → baseline snapshot.
+        let baseline = create_run_baseline(root, "demo").expect("baseline");
+        assert!(run_baseline(root).is_some(), "baseline is findable");
+        // The run writes a couple of phases' worth of edits.
+        std::fs::write(root.join("src.rs"), "rewritten by the run").unwrap();
+        std::fs::write(root.join("new_file.rs"), "added by the run").unwrap();
+        let _ = create_phase_checkpoint(root, "phase: frontend");
+        std::fs::write(root.join("another.rs"), "more run output").unwrap();
+        let _ = create_phase_checkpoint(root, "phase: backend");
+        // Roll the WHOLE run back.
+        let rolled = rollback_run(root).expect("rollback to baseline");
+        assert!(
+            rolled.id == baseline
+                || baseline.starts_with(&rolled.id)
+                || rolled.id.starts_with(&baseline)
+        );
+        // Pre-run file restored, run-added files gone.
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).unwrap(),
+            "original"
+        );
+        assert!(!root.join("new_file.rs").exists(), "run-added file removed");
+        assert!(!root.join("another.rs").exists(), "run-added file removed");
+        // The rollback is itself undoable: forward checkpoints survive under a
+        // saved ref (so list still shows the run's work).
+        let after = list_checkpoints(root);
+        assert!(
+            after.iter().any(|c| c.label == "phase: backend"),
+            "forward run checkpoints survive the rollback (it stays reversible)"
+        );
+    }
+
+    #[test]
+    fn rollback_run_without_baseline_errors_and_changes_nothing() {
+        // Fail-open: no baseline → an actionable error, never a destructive op.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), "untouched").unwrap();
+        let r = rollback_run(root);
+        assert!(r.is_err(), "no baseline → Err, not a silent reset");
+        // The working tree was not touched.
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "untouched"
+        );
+    }
+
+    #[test]
+    fn run_baseline_picks_newest_and_ignores_phase_checkpoints() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        std::fs::write(root.join("f.txt"), "1").unwrap();
+        let _ = create_run_baseline(root, "first-run");
+        std::fs::write(root.join("f.txt"), "2").unwrap();
+        let _ = create_phase_checkpoint(root, "phase: spec");
+        std::fs::write(root.join("f.txt"), "3").unwrap();
+        let second = create_run_baseline(root, "second-run").expect("second baseline");
+        // The newest baseline is the rollback target, not the phase checkpoint.
+        let target = run_baseline(root).expect("a baseline exists");
+        assert!(target.label.starts_with(RUN_BASELINE_PREFIX));
+        assert!(target.label.contains("second-run"));
+        assert!(
+            second.starts_with(&target.id) || target.id.starts_with(&second) || second == target.id
         );
     }
 

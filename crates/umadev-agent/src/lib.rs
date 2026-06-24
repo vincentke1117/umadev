@@ -73,6 +73,9 @@ pub use adopt::{
     is_adopted, load_project_source_index, read_adopt_marker, run_adopt, AdoptReport,
     DetectedCommand,
 };
+pub use checkpoint::{
+    create_run_baseline, rollback_run, run_baseline, Checkpoint, RUN_BASELINE_PREFIX,
+};
 pub use context::{compose_firmware, project_context, FIRMWARE_BUDGET};
 pub use continuous::{
     continuous_enabled_from_env, legacy_pipeline_from_env, run_block as run_continuous_block,
@@ -117,8 +120,9 @@ pub use planner::{
     TaskKind,
 };
 pub use pr::{
-    assess_readiness, feature_branch_name, latest_proof_pack, manual_steps, plan_branches,
-    pr_body_rel_path, proof_pack_summary, render_pr_body, PrPlan, PrReadiness, ReadinessCheck,
+    assess_readiness, ensure_isolation_branch, feature_branch_name, is_isolation_branch,
+    latest_proof_pack, manual_steps, plan_branches, pr_body_rel_path, proof_pack_summary,
+    render_pr_body, BranchIsolation, PrPlan, PrReadiness, ReadinessCheck,
 };
 pub use review::{
     build_review_report, render_review_md, review_report_rel_path, scan_ci_weakening,
@@ -127,7 +131,9 @@ pub use review::{
 pub use router::{
     looks_like_work_request, route, Budget, ClarifyQuestion, Depth, RouteClass, RoutePlan,
 };
-pub use runner::{strict_coverage_from_env, AgentRunner, RunOptions, RunReport};
+pub use runner::{
+    setup_run_isolation, strict_coverage_from_env, AgentRunner, RunOptions, RunReport,
+};
 pub use runtime_proof::{
     run_runtime_proof, runtime_proof_rel_path, write_runtime_proof, E2eResult, RouteProbe,
     RuntimeProof, RuntimeStatus,
@@ -145,7 +151,8 @@ pub use state::{
     unfinished_plan_summary, write_workflow_state, ReadState, WorkflowState,
 };
 pub use trust::{
-    requires_confirmation, reversibility_class, GateTrust, Reversibility, TrustLedger, TrustMode,
-    TrustSuggestion,
+    capability_class, capability_requires_confirmation, requires_confirmation, reversibility_class,
+    Capability, CapabilityPolicy, CircuitBreaker, GateTrust, Reversibility, TrustLedger, TrustMode,
+    TrustSuggestion, CIRCUIT_THRESHOLD, CIRCUIT_WINDOW_SECS,
 };
 pub use verify::{detect_project, run_verify, ProjectKind, VerifyOutcome};

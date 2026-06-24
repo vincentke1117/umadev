@@ -1,7 +1,21 @@
 # UmaDev = an Agent that wields the base — director orchestrates a team
 
-> Target-state architecture + phased migration. This supersedes the
-> fixed-pipeline framing in `CONTINUOUS_SESSION_ARCHITECTURE.md`. The core model
+> **⚠️ Superseded by [`PRODUCT_VISION_AND_ROADMAP.md`](PRODUCT_VISION_AND_ROADMAP.md)
+> — read that first; it is the authoritative product spec.** This file is
+> retained as the **conceptual origin** of the director/USB model: it correctly
+> establishes the identity (a third-party Agent with agency that wields the base
+> like a sword / USB firmware) and the "no fixed chain — the director improvises
+> a team" doctrine, which are still true. But its concrete *roadmap* — the
+> four-wave migration in §5 (one engine → director tools → demote planner →
+> retire legacy) — has **already shipped and is superseded** by the VISION
+> document's L0–L5 architecture and Wave 1–6 plan. The Router (`router.rs`),
+> the owned visible Plan (`plan_state.rs`), `compose_firmware` (`context.rs`),
+> the repo-map (`umadev-knowledge::repomap`), the `summon`-driven step
+> scheduling and `finalize` delivery, and the persistent conversation layer —
+> all the primitives this file gestured at — now exist on the live path. For
+> the current architecture, gap analysis, and roadmap, use the VISION document.
+
+> Target-state architecture + phased migration (historical). The core model
 > here is **NOT a pipeline**. It is a **director Agent that improvises a team**.
 
 > **Simplification update (current):** the clean mental model is **USB / smart

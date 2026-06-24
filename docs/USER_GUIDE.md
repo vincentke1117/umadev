@@ -1,10 +1,13 @@
 # UmaDev User Guide
 
+> Authoritative product spec: [`PRODUCT_VISION_AND_ROADMAP.md`](PRODUCT_VISION_AND_ROADMAP.md).
+> This guide is the user-facing walkthrough; where they differ, VISION wins.
+
 ## What is UmaDev?
 
-UmaDev is a **governance rail around the AI coding base you already use**. It drives your already-logged-in base CLI — exactly three are first-class: **Claude Code, Codex, OpenCode** — through a 9-phase commercial delivery pipeline, keeping the base's output on track against real company standards. (Want a different model? That is the base's job — route it to a third-party / local model in the base's own config; UmaDev does not add new drivers for that.)
+UmaDev is a **project-director Agent that wraps the AI coding base you already use** — it is *firmware over a borrowed brain*. It drives your already-logged-in base CLI — exactly three are first-class: **Claude Code, Codex, OpenCode** — to **route** your request, show you a **plan**, inject its team **firmware** (engineering craft + anti-AI-slop taste + your project's knowledge + a map of your existing code), **schedule a team** step by step with a deterministic acceptance floor, and hand back a **proof-pack**. (Want a different model? That is the base's job — route it to a third-party / local model in the base's own config; UmaDev does not add new drivers for that.)
 
-UmaDev itself does NOT write code, and it is **not a fully autonomous director that replaces the engineer**. The brain stays in the base; UmaDev tells the base WHAT to produce at each phase, checks the result, and leaves an evidence trail. It is still early-stage and governance-first — best validated on real projects.
+UmaDev itself does NOT write code: the brain stays in the base; UmaDev decides WHAT to produce and HOW deeply to engage, checks the result against a floor that can say no, and leaves an evidence trail. It owns **no model endpoint** and does not re-implement the base's agentic loop. Governance (no emoji icons, no hardcoded colors, no AI-template slop, contract alignment) is the **silent safety net under** the director, not the whole product. Best validated on real projects.
 
 ## Quick Start
 
@@ -22,7 +25,9 @@ umadev
 
 On first launch, pick your base (one of the three AI coding CLIs you've already logged into: Claude Code, Codex, or OpenCode). Then type your requirement and press Enter.
 
-## The 9-Phase Pipeline
+## The 9-Phase Pipeline (the deep play, not every turn)
+
+This chain is the **deepest play the director routes to** for a full commercial greenfield build — not a funnel every message walks. A greeting stays chat, a one-line edit takes the fast path, a bugfix convenes no team; only a full product requirement expands the plan into this chain. (See the intent router in "What is UmaDev?" above, and spec §4.1 / §9.5.)
 
 ```
 research → docs → ⏸ docs_confirm → spec → frontend → ⏸ preview_confirm → backend → quality → delivery

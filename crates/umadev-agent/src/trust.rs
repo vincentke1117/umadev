@@ -272,6 +272,306 @@ pub fn requires_confirmation(mode: TrustMode, command: &str, target_path: &str) 
 }
 
 // ---------------------------------------------------------------------------
+// Graduated, per-capability trust (Wave 6 deliverable 1)
+// ---------------------------------------------------------------------------
+
+/// The *kind* of thing a candidate action does, independent of how reversible it
+/// is. Where [`Reversibility`] answers "could this lose the user's work?", a
+/// [`Capability`] answers "what class of power does this exercise?" — so trust
+/// can be granted **per capability** (read freely, edit under light guard, run
+/// shell only with confirmation, reach the network only via an allowlist)
+/// instead of one all-or-nothing autonomy switch.
+///
+/// This sits *above* the always-on irreversible floor: the floor
+/// ([`requires_confirmation`]) still escalates any irreversible action in EVERY
+/// tier, and the capability policy can only ever ADD a confirmation on top — it
+/// never weakens the floor.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum Capability {
+    /// Read-only inspection (read a file, list a dir, grep, view git status).
+    /// The cheapest, always-safe capability — auto in every tier.
+    Read,
+    /// Mutate a file inside the workspace (write / edit / create). Reversible
+    /// (the checkpoint + branch isolation back it), but it changes the project —
+    /// guarded by default.
+    Write,
+    /// Run a shell command that is neither a pure read nor a known network /
+    /// destructive verb. Side effects are real but local — confirm by default.
+    Shell,
+    /// Reach the network (push / pull / fetch / clone / curl / install). Effects
+    /// leave the machine — only an allowlisted host runs without confirmation.
+    Network,
+}
+
+impl Capability {
+    /// i18n key for the human label of this capability + its default posture.
+    #[must_use]
+    pub const fn label_key(self) -> &'static str {
+        match self {
+            Self::Read => "trust.cap.read",
+            Self::Write => "trust.cap.write",
+            Self::Shell => "trust.cap.shell",
+            Self::Network => "trust.cap.network",
+        }
+    }
+}
+
+/// Classify a candidate action into the capability it exercises. Pure +
+/// deterministic, mirrors [`reversibility_class`]'s token approach. Order:
+/// network verbs win over a bare shell command; an empty command with only a
+/// target path is a write (a file is being produced); an empty action is a read.
+#[must_use]
+pub fn capability_class(command: &str, target_path: &str) -> Capability {
+    let cmd = command.to_ascii_lowercase();
+    if !cmd.is_empty() {
+        if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) {
+            return Capability::Network;
+        }
+        // A pure read verb stays Read; everything else that runs is Shell.
+        if is_read_only_command(&cmd) {
+            return Capability::Read;
+        }
+        return Capability::Shell;
+    }
+    // No command — a bare target path means a file write/edit is proposed.
+    if target_path.trim().is_empty() {
+        Capability::Read
+    } else {
+        Capability::Write
+    }
+}
+
+/// Read-only shell verbs whose presence keeps an action at [`Capability::Read`].
+/// Whitespace-bounded so `cat` doesn't match `category`.
+fn is_read_only_command(cmd: &str) -> bool {
+    const READ_VERBS: &[&str] = &[
+        "cat ",
+        "ls ",
+        "ls\n",
+        "grep ",
+        "rg ",
+        "find ",
+        "head ",
+        "tail ",
+        "less ",
+        "git status",
+        "git log",
+        "git diff",
+        "git show",
+        "pwd",
+        "echo ",
+        "which ",
+        "stat ",
+    ];
+    let c = cmd.trim_start();
+    READ_VERBS.iter().any(|v| c == v.trim() || c.starts_with(v))
+}
+
+/// Per-capability autonomy posture: may an action of this capability run without
+/// a confirmation? Configurable on top of the [`TrustMode`] ladder; the default
+/// for each tier is the commercial-grade posture (read auto / write guarded /
+/// shell confirm / network allowlist).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityPolicy {
+    /// `true` → reads auto-run (always true in practice; here for symmetry).
+    #[serde(default = "yes")]
+    pub read_auto: bool,
+    /// `true` → in-project writes auto-run (guarded run still lets the base edit
+    /// files mid-turn; this only governs an *explicit confirmation overlay*, not
+    /// the per-tool floor). Default `true` so a guarded run isn't stop-the-world.
+    #[serde(default = "yes")]
+    pub write_auto: bool,
+    /// `true` → arbitrary shell commands auto-run. Default `false`: shell is
+    /// confirmed unless the tier auto-approves (auto) or the user opts in.
+    #[serde(default)]
+    pub shell_auto: bool,
+    /// Allowlisted network hosts/prefixes that may be reached without a
+    /// confirmation (e.g. `registry.npmjs.org`, `github.com`). A network action
+    /// whose target matches one of these is treated as auto; everything else off
+    /// the list is confirmed. Empty by default (network always confirmed).
+    #[serde(default)]
+    pub network_allowlist: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for CapabilityPolicy {
+    fn default() -> Self {
+        Self {
+            read_auto: true,
+            write_auto: true,
+            shell_auto: false,
+            network_allowlist: Vec::new(),
+        }
+    }
+}
+
+impl CapabilityPolicy {
+    /// The policy implied by a [`TrustMode`] tier, before any user override:
+    /// - `Auto` → everything auto (the tier already auto-approves gates; the
+    ///   irreversible floor in [`requires_confirmation`] still applies on top).
+    /// - `Guarded` → read+write auto, shell confirmed, network allowlist-only
+    ///   (the commercial-grade default).
+    /// - `Plan` → read auto only; nothing executes (write/shell/network all
+    ///   confirmed), matching plan mode's read-only promise.
+    #[must_use]
+    pub fn for_mode(mode: TrustMode) -> Self {
+        match mode {
+            TrustMode::Auto => Self {
+                read_auto: true,
+                write_auto: true,
+                shell_auto: true,
+                network_allowlist: vec!["*".to_string()], // any host, in auto
+            },
+            TrustMode::Guarded => Self::default(),
+            TrustMode::Plan => Self {
+                read_auto: true,
+                write_auto: false,
+                shell_auto: false,
+                network_allowlist: Vec::new(),
+            },
+        }
+    }
+
+    /// Whether an action of `capability` (with `target` for the network case)
+    /// may run WITHOUT an explicit capability confirmation under this policy.
+    /// This is the graduated layer; it is consulted ONLY for actions the
+    /// irreversible floor did not already escalate.
+    #[must_use]
+    pub fn auto_allows(&self, capability: Capability, target: &str) -> bool {
+        match capability {
+            Capability::Read => self.read_auto,
+            Capability::Write => self.write_auto,
+            Capability::Shell => self.shell_auto,
+            Capability::Network => self.network_allows(target),
+        }
+    }
+
+    /// `true` when `target` matches the network allowlist (`*` = any). A match is
+    /// a case-insensitive substring test against each allowlist entry.
+    #[must_use]
+    pub fn network_allows(&self, target: &str) -> bool {
+        let t = target.to_ascii_lowercase();
+        self.network_allowlist.iter().any(|h| {
+            let h = h.trim();
+            h == "*" || (!h.is_empty() && t.contains(&h.to_ascii_lowercase()))
+        })
+    }
+}
+
+/// The full graduated-trust decision for a candidate action: does it need a
+/// confirmation, and why? Combines the always-on irreversible floor with the
+/// per-capability policy. The floor wins (an irreversible action is always
+/// escalated); otherwise the policy decides.
+///
+/// This is **purely additive** over [`requires_confirmation`]: when an action is
+/// reversible, the floor says "no confirmation", and this only *adds* one if the
+/// capability policy withholds auto-approval (e.g. an un-allowlisted network
+/// fetch, or shell under guarded). It never *removes* a floor escalation.
+#[must_use]
+pub fn capability_requires_confirmation(
+    policy: &CapabilityPolicy,
+    command: &str,
+    target_path: &str,
+) -> bool {
+    // 1) Irreversible floor first — mode-independent, never skippable.
+    if reversibility_class(command, target_path).always_escalates() {
+        return true;
+    }
+    // 2) Graduated capability policy on top.
+    let cap = capability_class(command, target_path);
+    let target = if matches!(cap, Capability::Network) {
+        command
+    } else {
+        target_path
+    };
+    !policy.auto_allows(cap, target)
+}
+
+// ---------------------------------------------------------------------------
+// Circuit breaker — pause on a burst of failures (Wave 6 deliverable 1)
+// ---------------------------------------------------------------------------
+
+/// How many failures inside the rolling window trip the breaker. Chosen so a
+/// couple of ordinary retryable hiccups don't pause the run, but a genuine
+/// failure loop (the base flailing on the same broken step) stops fast.
+pub const CIRCUIT_THRESHOLD: u32 = 5;
+
+/// The rolling window, in seconds, over which failures are counted. A failure
+/// older than this no longer contributes — so a slow trickle of unrelated
+/// failures across a long run never trips the breaker; only a *burst* does.
+pub const CIRCUIT_WINDOW_SECS: u64 = 120;
+
+/// A deterministic, dependency-free circuit breaker over recent failures. The
+/// caller records each failure with a monotonic timestamp (seconds); when
+/// [`CIRCUIT_THRESHOLD`] failures fall inside the trailing [`CIRCUIT_WINDOW_SECS`]
+/// window, [`Self::is_open`] trips and the run should PAUSE and ask the user
+/// rather than keep burning effort in a loop.
+///
+/// Fail-open by design: it only *adds* a pause; it never silently kills a run,
+/// and a success record clears the recent failures so a recovered run resumes
+/// normally. The caller owns the clock (so tests are deterministic).
+#[derive(Debug, Clone, Default)]
+pub struct CircuitBreaker {
+    /// Timestamps (monotonic seconds) of recent failures, oldest first.
+    failures: Vec<u64>,
+    /// Latches once the breaker has tripped, so the caller surfaces the pause
+    /// exactly once until it is explicitly reset.
+    tripped: bool,
+}
+
+impl CircuitBreaker {
+    /// A fresh breaker with no recorded failures.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a failure at time `now_secs`. Prunes failures older than the
+    /// window, appends this one, and returns `true` if this failure trips the
+    /// breaker (crosses the threshold inside the window) for the FIRST time.
+    pub fn record_failure(&mut self, now_secs: u64) -> bool {
+        let cutoff = now_secs.saturating_sub(CIRCUIT_WINDOW_SECS);
+        self.failures.retain(|&t| t >= cutoff);
+        self.failures.push(now_secs);
+        if self.failures.len() as u32 >= CIRCUIT_THRESHOLD && !self.tripped {
+            self.tripped = true;
+            return true;
+        }
+        false
+    }
+
+    /// Record a success at `now_secs` — clears the recent-failure streak and
+    /// re-arms the breaker (a recovered run should not stay latched). Failures
+    /// outside the window are irrelevant, so we simply drop everything.
+    pub fn record_success(&mut self) {
+        self.failures.clear();
+        self.tripped = false;
+    }
+
+    /// `true` once the breaker has tripped (a failure burst is in progress).
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.tripped
+    }
+
+    /// Failures currently inside the window at `now_secs` (for the pause message).
+    #[must_use]
+    pub fn recent_failures(&self, now_secs: u64) -> u32 {
+        let cutoff = now_secs.saturating_sub(CIRCUIT_WINDOW_SECS);
+        self.failures.iter().filter(|&&t| t >= cutoff).count() as u32
+    }
+
+    /// Manually re-arm the breaker (e.g. after the user reviews and continues).
+    pub fn reset(&mut self) {
+        self.failures.clear();
+        self.tripped = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Collaborative trust tracking — .umadev/trust.json
 // ---------------------------------------------------------------------------
 
@@ -549,5 +849,144 @@ mod tests {
         // Corrupt file must NOT error — yields a fresh ledger.
         let led = TrustLedger::load(tmp.path());
         assert!(led.gates.is_empty());
+    }
+
+    // ---- graduated per-capability trust (Wave 6) -------------------------
+
+    #[test]
+    fn capability_classifies_by_power_class() {
+        assert_eq!(capability_class("", "src/main.rs"), Capability::Write);
+        assert_eq!(capability_class("", ""), Capability::Read);
+        assert_eq!(capability_class("cat src/a.rs", ""), Capability::Read);
+        assert_eq!(capability_class("git status", ""), Capability::Read);
+        assert_eq!(capability_class("npm run build", ""), Capability::Shell);
+        assert_eq!(capability_class("cargo test", ""), Capability::Shell);
+        assert_eq!(
+            capability_class("git push origin main", ""),
+            Capability::Network
+        );
+        assert_eq!(
+            capability_class("curl https://x.com", ""),
+            Capability::Network
+        );
+    }
+
+    #[test]
+    fn capability_policy_defaults_are_commercial_grade() {
+        // Guarded default: read+write auto, shell confirmed, network allowlist-only.
+        let g = CapabilityPolicy::for_mode(TrustMode::Guarded);
+        assert!(g.auto_allows(Capability::Read, ""));
+        assert!(g.auto_allows(Capability::Write, "src/x.rs"));
+        assert!(!g.auto_allows(Capability::Shell, ""));
+        assert!(!g.auto_allows(Capability::Network, "github.com"));
+        // Plan: read only, nothing else auto.
+        let p = CapabilityPolicy::for_mode(TrustMode::Plan);
+        assert!(p.auto_allows(Capability::Read, ""));
+        assert!(!p.auto_allows(Capability::Write, "x"));
+        assert!(!p.auto_allows(Capability::Shell, ""));
+        // Auto: everything auto (the floor still applies separately).
+        let a = CapabilityPolicy::for_mode(TrustMode::Auto);
+        assert!(a.auto_allows(Capability::Shell, ""));
+        assert!(a.auto_allows(Capability::Network, "anything.example"));
+    }
+
+    #[test]
+    fn network_allowlist_gates_only_listed_hosts() {
+        let mut pol = CapabilityPolicy::for_mode(TrustMode::Guarded);
+        pol.network_allowlist = vec!["registry.npmjs.org".into(), "github.com".into()];
+        assert!(pol.network_allows("https://registry.npmjs.org/lodash"));
+        assert!(pol.network_allows("git@github.com:me/repo"));
+        assert!(!pol.network_allows("https://evil.example.com"));
+    }
+
+    #[test]
+    fn graduated_confirmation_keeps_irreversible_floor_then_adds_policy() {
+        // The irreversible floor ALWAYS wins, in any policy: a destructive verb
+        // and a .git write are confirmed even when shell/write are auto.
+        let auto = CapabilityPolicy::for_mode(TrustMode::Auto);
+        assert!(capability_requires_confirmation(&auto, "rm -rf build", ""));
+        assert!(capability_requires_confirmation(&auto, "", ".git/config"));
+        assert!(capability_requires_confirmation(&auto, "git push", ""));
+        // On TOP of the floor, the policy adds confirmations for withheld
+        // capabilities: under guarded, a plain shell command is confirmed even
+        // though it is reversible (the floor alone would not escalate it).
+        let guarded = CapabilityPolicy::for_mode(TrustMode::Guarded);
+        assert!(
+            capability_requires_confirmation(&guarded, "npm run build", ""),
+            "guarded confirms shell"
+        );
+        // …but a reversible in-project write stays auto (never stop-the-world).
+        assert!(!capability_requires_confirmation(
+            &guarded,
+            "",
+            "src/app.tsx"
+        ));
+        assert!(!capability_requires_confirmation(
+            &guarded,
+            "cat src/a.rs",
+            ""
+        ));
+        // The legacy per-tool floor is unchanged for reversible writes.
+        assert!(!requires_confirmation(
+            TrustMode::Guarded,
+            "",
+            "src/app.tsx"
+        ));
+    }
+
+    // ---- circuit breaker (Wave 6) ----------------------------------------
+
+    #[test]
+    fn circuit_trips_on_failure_burst_within_window() {
+        let mut cb = CircuitBreaker::new();
+        // Below threshold inside the window → not open.
+        for i in 0..(CIRCUIT_THRESHOLD - 1) {
+            assert!(!cb.record_failure(u64::from(i)), "below threshold");
+        }
+        assert!(!cb.is_open());
+        // The threshold-th failure trips it ONCE.
+        assert!(
+            cb.record_failure(u64::from(CIRCUIT_THRESHOLD)),
+            "trips here"
+        );
+        assert!(cb.is_open());
+        assert_eq!(
+            cb.recent_failures(u64::from(CIRCUIT_THRESHOLD)),
+            CIRCUIT_THRESHOLD
+        );
+        // A further failure does not re-trip (latched, no double-fire).
+        assert!(!cb.record_failure(u64::from(CIRCUIT_THRESHOLD + 1)));
+    }
+
+    #[test]
+    fn circuit_ignores_failures_outside_window() {
+        let mut cb = CircuitBreaker::new();
+        // Spread failures so each is older than the window relative to the next:
+        // only the last falls inside the window → never trips.
+        for i in 0..CIRCUIT_THRESHOLD {
+            let t = u64::from(i) * (CIRCUIT_WINDOW_SECS + 10);
+            assert!(!cb.record_failure(t), "stale failures don't accumulate");
+        }
+        assert!(!cb.is_open(), "a slow trickle must not trip the breaker");
+    }
+
+    #[test]
+    fn circuit_success_clears_and_rearms() {
+        let mut cb = CircuitBreaker::new();
+        for i in 0..CIRCUIT_THRESHOLD {
+            cb.record_failure(u64::from(i));
+        }
+        assert!(cb.is_open());
+        // A success clears the streak and re-arms.
+        cb.record_success();
+        assert!(!cb.is_open());
+        assert_eq!(cb.recent_failures(100), 0);
+        // It can trip again on a fresh burst.
+        for i in 0..CIRCUIT_THRESHOLD {
+            cb.record_failure(200 + u64::from(i));
+        }
+        assert!(cb.is_open());
+        cb.reset();
+        assert!(!cb.is_open());
     }
 }

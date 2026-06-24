@@ -654,6 +654,19 @@ fn spawn_director_loop(
             }
         };
 
+        // Git-as-trust (Wave 6): isolate this director build onto `umadev/<slug>`
+        // and snapshot the run baseline before the base writes anything — never on
+        // the user's default/working branch, never auto-merged/pushed. Fail-open:
+        // a non-git dir / dirty tree / any error just runs in the working tree.
+        if let Some((branch, from)) =
+            umadev_agent::setup_run_isolation(&root, &options.effective_slug())
+        {
+            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "trust.branch_isolated",
+                &[&branch, &from],
+            )));
+        }
+
         // Wave 2 (firmware): compose UmaDev's identity + craft + JIT knowledge +
         // pitfall memory once (the `/run` route is deterministic, no session needed)
         // so claude can take it NATIVELY as a system prompt via `session_for`'s
@@ -866,6 +879,22 @@ fn spawn_agentic(
         } else {
             None
         };
+        // Git-as-trust (Wave 6): a director build mutates the workspace → isolate
+        // onto `umadev/<slug>` + baseline before any write (only for the
+        // workspace-mutating director path; a normal free-text turn takes no lock
+        // and is not isolated). Fail-open; idempotent.
+        if director_build {
+            let slug = project_root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("project");
+            if let Some((branch, from)) = umadev_agent::setup_run_isolation(&project_root, slug) {
+                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                    "trust.branch_isolated",
+                    &[&branch, &from],
+                )));
+            }
+        }
         // Resume the SAME chat session the conversation already uses, so the
         // agentic turn sees the prior dialogue (and leaves its work in the same
         // session for follow-up chat). Mirrors `spawn_route`'s resume wiring.

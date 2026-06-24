@@ -338,6 +338,165 @@ pub fn latest_proof_pack(project_root: &Path) -> Option<(std::path::PathBuf, u64
 }
 
 // =====================================================================
+// Branch isolation — git as the trust substrate (Wave 6 deliverable 2)
+// =====================================================================
+
+/// The outcome of trying to move a workspace-mutating run onto its own derived
+/// `umadev/<slug>` branch BEFORE the base writes anything.
+///
+/// This is the safety primitive behind "commercial-grade = the user can trust
+/// it": a run never edits the user's `main`/default branch or their currently
+/// checked-out working branch in place — it derives a sibling branch from the
+/// current `HEAD` and works there, so the user reviews + merges on their own
+/// terms. We **never auto-merge, never push, never touch a remote, never delete
+/// anything**. Every step is fail-open: a non-git directory, an unavailable
+/// `git`, a dirty tree we won't clobber, or any probe error → [`Self::Skipped`]
+/// (the run proceeds exactly as it does today, in the working tree).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchIsolation {
+    /// We are now on a derived `umadev/<slug>` branch (created fresh from the
+    /// prior HEAD, or already checked out from a previous run). Carries the
+    /// branch name and the branch we derived FROM, for the audit note.
+    Isolated {
+        /// The `umadev/<slug>` branch the run now operates on.
+        branch: String,
+        /// The branch we derived from (the user's prior HEAD), for the note.
+        from: String,
+        /// `true` when this call created the branch; `false` when we merely
+        /// re-entered a branch a prior run already created.
+        created: bool,
+    },
+    /// Isolation was deliberately skipped — fail-open. The run proceeds in the
+    /// working tree exactly as before. Carries a short machine-ish reason
+    /// (`not-a-repo` / `git-unavailable` / `dirty-tree` / `detached` / `error`)
+    /// for the audit note; never an error the host has to handle.
+    Skipped(&'static str),
+}
+
+impl BranchIsolation {
+    /// `true` when the run is now on its own derived branch.
+    #[must_use]
+    pub fn is_isolated(&self) -> bool {
+        matches!(self, Self::Isolated { .. })
+    }
+
+    /// The branch the run operates on, or empty when skipped.
+    #[must_use]
+    pub fn branch(&self) -> &str {
+        match self {
+            Self::Isolated { branch, .. } => branch,
+            Self::Skipped(_) => "",
+        }
+    }
+}
+
+/// Whether `branch` is one of UmaDev's derived isolation branches. Used so a
+/// second block of the SAME run (continue / resume) that is already sitting on
+/// `umadev/<slug>` is recognised and left alone rather than deriving a branch
+/// off a branch.
+#[must_use]
+pub fn is_isolation_branch(branch: &str) -> bool {
+    branch.starts_with("umadev/")
+}
+
+/// Move a workspace-mutating run onto its own derived `umadev/<slug>` branch,
+/// fail-open and **extremely conservative** (this is the one irreversible-ish
+/// piece, so it never does anything the user can't trivially undo):
+///
+/// 1. Not a git repo / `git` unavailable → [`BranchIsolation::Skipped`] — run
+///    in the working tree exactly as today.
+/// 2. Already on a `umadev/<slug>` branch → stay there ([`BranchIsolation::Isolated`]
+///    with `created: false`); a later block of the same run re-enters cleanly.
+/// 3. On the user's default / working branch with a CLEAN-enough tree → create
+///    (or fast-forward-checkout) `umadev/<slug>` **from the current HEAD** and
+///    switch to it. We do NOT commit, push, merge, or touch any remote — we only
+///    move the local branch pointer so subsequent writes land off the user's
+///    branch. The user's prior branch is untouched and still points where it did.
+/// 4. A DIRTY working tree on the user's branch → we will NOT risk carrying or
+///    losing their uncommitted edits across a branch switch, so we **skip**
+///    (`dirty-tree`) and run in place. Safer to not isolate than to disturb
+///    pending user work.
+///
+/// `git switch -c` / `git checkout -b` are pointer moves on the SAME work-tree
+/// content (the new branch starts at the current commit), so no file is deleted
+/// and the user's other branch keeps its commits. We never use `-f`/`--force`.
+#[must_use]
+pub fn ensure_isolation_branch(project_root: &Path, slug: &str) -> BranchIsolation {
+    if !git_is_repo(project_root) {
+        return BranchIsolation::Skipped("not-a-repo");
+    }
+    let current = git_current_branch(project_root);
+    // Detached HEAD (empty) → no branch to derive a name-stable sibling from
+    // safely; stay put rather than create a branch off a detached state.
+    if current.is_empty() {
+        return BranchIsolation::Skipped("detached");
+    }
+    // Already isolated (a continue/resume block of the same run) → nothing to do.
+    if is_isolation_branch(&current) {
+        return BranchIsolation::Isolated {
+            branch: current.clone(),
+            from: current,
+            created: false,
+        };
+    }
+    let target = feature_branch_name(slug);
+    // If that exact branch already exists (a prior run's branch), just switch to
+    // it — never recreate / force. `git switch` with no `-c` only succeeds on an
+    // existing branch and refuses if the switch would clobber local changes, so
+    // it is inherently safe.
+    if git_branch_exists(project_root, &target) {
+        if run_git(project_root, &["switch", &target]).is_some()
+            || run_git(project_root, &["checkout", &target]).is_some()
+        {
+            return BranchIsolation::Isolated {
+                branch: target,
+                from: current,
+                created: false,
+            };
+        }
+        // Couldn't switch (dirty tree / git refused) → fail-open, stay in place.
+        return BranchIsolation::Skipped("dirty-tree");
+    }
+    // A dirty tree + a real branch switch risks the user's uncommitted edits.
+    // Be conservative: do not isolate, run in place. (A clean tree carries
+    // nothing across, so `switch -c` is a pure pointer move.)
+    if git_has_changes(project_root) {
+        return BranchIsolation::Skipped("dirty-tree");
+    }
+    // Create the sibling branch FROM the current HEAD and switch to it. Try the
+    // modern `switch -c` first, fall back to `checkout -b` for older git. No
+    // `-f`/`--force`: a refusal means we leave the user where they were.
+    let created = run_git(project_root, &["switch", "-c", &target]).is_some()
+        || run_git(project_root, &["checkout", "-b", &target]).is_some();
+    if created {
+        BranchIsolation::Isolated {
+            branch: target,
+            from: current,
+            created: true,
+        }
+    } else {
+        BranchIsolation::Skipped("error")
+    }
+}
+
+/// `true` iff a local branch named `branch` already exists. Fail-open: a probe
+/// error reads as "does not exist" so we attempt a fresh create rather than a
+/// switch (and the create itself fails open).
+fn git_branch_exists(project_root: &Path, branch: &str) -> bool {
+    run_git(
+        project_root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .map(|s| !s.trim().is_empty())
+    .unwrap_or(false)
+}
+
+// =====================================================================
 // git / gh helpers — each fail-open
 // =====================================================================
 
@@ -580,5 +739,151 @@ mod tests {
     #[test]
     fn body_rel_path_is_stable() {
         assert_eq!(pr_body_rel_path("app"), "output/app-pr-body.md");
+    }
+
+    // ---- branch isolation (Wave 6) ---------------------------------------
+
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Init a real git repo with one commit on `main`, returning the temp dir.
+    fn init_repo(default: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+        };
+        run(&["init", "-q", "-b", default]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        fs::write(root.join("seed.txt"), "v1").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "seed"]);
+        tmp
+    }
+
+    #[test]
+    fn isolation_skipped_on_non_repo() {
+        // Fail-open: a plain dir is not a git repo → never error, just skip so the
+        // run proceeds in the working tree exactly as today.
+        let tmp = TempDir::new().unwrap();
+        let iso = ensure_isolation_branch(tmp.path(), "my-app");
+        assert_eq!(iso, BranchIsolation::Skipped("not-a-repo"));
+        assert!(!iso.is_isolated());
+        assert!(iso.branch().is_empty());
+    }
+
+    #[test]
+    fn isolation_creates_umadev_branch_from_default_and_never_touches_it() {
+        if !git_available() {
+            return;
+        }
+        let tmp = init_repo("main");
+        let root = tmp.path();
+        // On `main`, clean tree → derive `umadev/<slug>` from HEAD and switch.
+        let iso = ensure_isolation_branch(root, "my-app");
+        assert!(iso.is_isolated(), "clean repo on default must isolate");
+        assert_eq!(iso.branch(), "umadev/my-app");
+        match &iso {
+            BranchIsolation::Isolated { from, created, .. } => {
+                assert_eq!(from, "main");
+                assert!(created, "first isolation creates the branch");
+            }
+            BranchIsolation::Skipped(_) => panic!("expected isolation"),
+        }
+        // We are NOW on the isolation branch, never on `main`.
+        assert_eq!(git_current_branch(root), "umadev/my-app");
+        // `main` still exists and still points at the original seed commit — the
+        // user's default branch was NOT mutated, merged into, or deleted.
+        assert!(git_branch_exists(root, "main"), "default branch untouched");
+    }
+
+    #[test]
+    fn isolation_is_idempotent_when_already_on_umadev_branch() {
+        if !git_available() {
+            return;
+        }
+        let tmp = init_repo("main");
+        let root = tmp.path();
+        let first = ensure_isolation_branch(root, "task");
+        assert!(matches!(
+            first,
+            BranchIsolation::Isolated { created: true, .. }
+        ));
+        // A second block of the same run is already on umadev/task → stay put,
+        // created:false (never derive a branch off a branch).
+        let second = ensure_isolation_branch(root, "task");
+        assert_eq!(
+            second,
+            BranchIsolation::Isolated {
+                branch: "umadev/task".to_string(),
+                from: "umadev/task".to_string(),
+                created: false,
+            }
+        );
+    }
+
+    #[test]
+    fn isolation_reuses_existing_branch_without_recreating() {
+        if !git_available() {
+            return;
+        }
+        let tmp = init_repo("main");
+        let root = tmp.path();
+        // First run creates umadev/x and we hop back to main to simulate a later run.
+        let _ = ensure_isolation_branch(root, "x");
+        Command::new("git")
+            .args(["switch", "main"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert_eq!(git_current_branch(root), "main");
+        // Second run with the same slug must SWITCH to the existing branch, not
+        // recreate it (created:false), and never force.
+        let again = ensure_isolation_branch(root, "x");
+        assert_eq!(
+            again,
+            BranchIsolation::Isolated {
+                branch: "umadev/x".to_string(),
+                from: "main".to_string(),
+                created: false,
+            }
+        );
+        assert_eq!(git_current_branch(root), "umadev/x");
+    }
+
+    #[test]
+    fn isolation_skips_dirty_tree_to_protect_uncommitted_work() {
+        if !git_available() {
+            return;
+        }
+        let tmp = init_repo("main");
+        let root = tmp.path();
+        // Uncommitted edit on main → we must NOT risk carrying/losing it across a
+        // branch switch. Conservative: skip, run in place.
+        fs::write(root.join("seed.txt"), "uncommitted change").unwrap();
+        let iso = ensure_isolation_branch(root, "app");
+        assert_eq!(iso, BranchIsolation::Skipped("dirty-tree"));
+        // Still on main, edit intact — nothing disturbed.
+        assert_eq!(git_current_branch(root), "main");
+        assert_eq!(
+            fs::read_to_string(root.join("seed.txt")).unwrap(),
+            "uncommitted change"
+        );
+    }
+
+    #[test]
+    fn is_isolation_branch_recognises_prefix() {
+        assert!(is_isolation_branch("umadev/my-app"));
+        assert!(!is_isolation_branch("main"));
+        assert!(!is_isolation_branch("feature/umadev-thing"));
     }
 }
