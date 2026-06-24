@@ -542,7 +542,24 @@ fn git_current_branch(project_root: &Path) -> String {
 /// untracked) — i.e. there is something to commit into the PR.
 fn git_has_changes(project_root: &Path) -> bool {
     run_git(project_root, &["status", "--porcelain"])
-        .map(|s| !s.trim().is_empty())
+        .map(|s| {
+            s.lines().any(|line| {
+                // Porcelain line: "XY <path>" (2 status chars + space, then path;
+                // a rename is "XY old -> new"). IGNORE UmaDev's OWN artifact dirs
+                // (`.umadev/`, `output/`): a run-lock / governance-context / plan we
+                // just wrote is NOT the user's uncommitted work, and must not make
+                // the tree read as "dirty" and skip branch isolation (the run lock
+                // under `.umadev/` is written before isolation runs). We only care
+                // whether the USER has uncommitted edits.
+                let path = line.get(3..).unwrap_or("").trim().trim_matches('"');
+                let path = path.rsplit(" -> ").next().unwrap_or(path);
+                !path.is_empty()
+                    && !path.starts_with(".umadev/")
+                    && !path.starts_with(".umadev\\")
+                    && !path.starts_with("output/")
+                    && !path.starts_with("output\\")
+            })
+        })
         .unwrap_or(false)
 }
 
