@@ -2525,10 +2525,18 @@ fn render_title_row(frame: &mut Frame, area: Rect, app: &App) {
         format!(" {} ", app.status),
         Style::default().fg(phase_color),
     );
+    // The base lives here in the top bar (identity + context), so the bottom row
+    // doesn't have to repeat "project · base".
+    let base = Span::styled(
+        format!(" {} ", app.backend.as_deref().unwrap_or("offline")),
+        Style::default().fg(theme::TEXT_MUTED()),
+    );
     let line = Line::from(vec![
         title,
         Span::styled("·", Style::default().fg(theme::BORDER())),
         slug,
+        Span::styled("·", Style::default().fg(theme::BORDER())),
+        base,
         Span::styled("·", Style::default().fg(theme::BORDER())),
         phase,
     ]);
@@ -3096,6 +3104,18 @@ impl RenderedRow {
     }
 }
 
+/// Compact human token count: `452` → `452`, `1500` → `1.5K`, `452000` → `452K`,
+/// `1_500_000` → `1.5M`. Keeps the waiting indicator readable for a long session.
+#[allow(clippy::cast_precision_loss)] // token counts never approach f64's 2^52 mantissa
+fn fmt_token_count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=9_999 => format!("{:.1}K", n as f64 / 1_000.0),
+        10_000..=999_999 => format!("{}K", n / 1_000),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // Cap the retained scrollback so a marathon session can't grow the per-frame
     // fold unbounded. Counted in **visual rows AFTER folding** (not logical lines
@@ -3276,36 +3296,36 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             umadev_i18n::t(app.lang, "status.esc_cancel")
         };
-        // A rough token estimate (chars/4) so a long reply reads as PROGRESSING,
-        // not just elapsed — shown once output starts streaming.
-        let toks = app.stream_chars / 4;
-        let tok_part = if toks > 0 {
-            format!(" · ~{toks} tok")
+        // Cumulative REAL token consumption (read from the usage ledger), not a
+        // per-turn character guess — shows true total spend (e.g. `≈452K tok`).
+        let tok_part = if app.session_tokens > 0 {
+            format!(" · ≈{} tok", fmt_token_count(app.session_tokens))
         } else {
             String::new()
         };
-        let elapsed = if secs > 0 || app.interrupt_armed() {
-            format!("  ({secs}s{tok_part} · {esc_hint})")
-        } else {
-            String::new()
-        };
+        let elapsed = format!("  ({secs}s{tok_part} · {esc_hint})");
         rendered.push(RenderedRow::plain(Line::from(""), 0));
         let mut think_spans = vec![Span::styled(
             format!("{} ", app.spinner()),
             Style::default().fg(theme::ACCENT()),
         )];
         // The "thinking" word shimmers — a bright band sweeps across it so a long
-        // wait reads as alive (and freezes flat when animations are off).
+        // wait reads as alive. It keeps moving even on a stall (a frozen shimmer
+        // reads as "crashed", the opposite of the intent); only animations-off
+        // stills it.
         let thinking_word = umadev_i18n::t(app.lang, "status.thinking");
         think_spans.extend(shimmer_spans(
             thinking_word,
             app.tick,
             theme::ACCENT(),
             theme::TEXT(),
-            app.animations && !app.is_stalled(),
+            app.animations,
         ));
         think_spans.push(Span::styled(elapsed, Style::default().fg(theme::TEXT_MUTED())));
         rendered.push(RenderedRow::plain(Line::from(think_spans), 2));
+        // A trailing blank row lifts the indicator one line up off the input box
+        // (it was sitting jammed right against the prompt).
+        rendered.push(RenderedRow::plain(Line::from(""), 0));
     }
     // Pre-fold every logical line to the CURRENT width into the exact visual
     // rows it occupies, then render WITHOUT `Paragraph::wrap`. This is the
@@ -4203,19 +4223,15 @@ fn render_palette_popover(
 /// Bottom status row — directory on the left, phase/status on the right,
 /// both muted, separated by flexible whitespace. No box.
 fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
-    let dir_name = app
-        .project_root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("~");
-    let backend_label = app.backend.as_deref().unwrap_or("offline");
     let phase_info = if app.thinking {
-        // Animated so a sent message never looks frozen while the base replies.
-        format!(
-            "{} {}",
-            app.spinner(),
-            umadev_i18n::t(app.lang, "status.thinking")
-        )
+        // The bottom-right shows what the BASE is doing right now — the live tool it
+        // is running (read / edit / a command), else a compact elapsed timer — so it
+        // COMPLEMENTS the "正在思考" indicator above the input instead of repeating
+        // it. Animated so a sent message never looks frozen while the base replies.
+        match &app.stream_tool_batch {
+            Some((tool, _)) => format!("{} {tool}", app.spinner()),
+            None => format!("{} {}s", app.spinner(), app.thinking_elapsed_secs()),
+        }
     } else if app.aborted {
         // Dedicated terminal branch — an aborted round reads as `[aborted]` here
         // DIRECTLY, instead of leaning on `app.status` carrying the right text.
@@ -4244,80 +4260,27 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         umadev_i18n::t(app.lang, "status.ready").to_string()
     };
-    // Clamp the dir name to a display-width budget so a long workspace name can
-    // never push the `· backend · /help` chrome (or the right-aligned phase) off
-    // the row. The fixed chrome around the dir is `" " + " · " + " {backend} " +
-    // " · " + " /help "` = 1 + (1+2) + disp(backend)+2 + (1+2) + 7. We reserve at
-    // least 12 cols for the phase on the right, then give the dir whatever's left
-    // (floor 6 so it stays legible). Truncated names get a `…` so the cut is
-    // visible rather than silently swallowing characters.
-    let fixed_chrome = 1 + 1 + disp_width(backend_label) + 2 + 1 + 7;
-    let dir_budget = usize::from(area.width)
-        .saturating_sub(fixed_chrome)
-        .saturating_sub(12)
-        .max(6);
-    let dir_shown = if disp_width(dir_name) > dir_budget {
-        // Keep room for the ellipsis inside the budget.
-        format!(
-            "{}…",
-            truncate_to_width(dir_name, dir_budget.saturating_sub(1))
-        )
-    } else {
-        dir_name.to_string()
-    };
-    let left = Line::from(vec![
-        Span::styled(
-            format!(" {dir_shown} "),
-            Style::default().fg(theme::TEXT_MUTED()),
-        ),
-        Span::styled("·", Style::default().fg(theme::BORDER())),
-        Span::styled(
-            format!(" {backend_label} "),
-            Style::default().fg(theme::TEXT_MUTED()),
-        ),
-        Span::styled("·", Style::default().fg(theme::BORDER())),
-        Span::styled(" /help ", Style::default().fg(theme::TEXT_MUTED())),
-    ]);
-    let mut right_spans: Vec<Span<'static>> = Vec::new();
-    // Right-align by DISPLAY width, not byte length — a CJK glyph is 3 bytes but
-    // occupies 2 columns, so `.len()` over-counts ~3x and used to saturate the
-    // pad to 0 (status text glued to the left) under a Chinese locale. The left
-    // chrome is `" {dir} " · " {backend} " · " /help "`: each padded label adds
-    // its display width + 2 spaces, plus 1+1 for the two `·` and 7 for ` /help `.
-    // Uses the (possibly clamped) `dir_shown`, so the pad math matches what's drawn.
-    let left_width = disp_width(&dir_shown) + 2 + 1 + disp_width(backend_label) + 2 + 1 + 7;
-    // On a narrow terminal the phase string itself can be wider than the space
-    // left after the chrome — clip it (by display width) so it never wraps or
-    // overruns the row. Keep a trailing column for the ` ` we append below.
-    let avail_right = usize::from(area.width)
-        .saturating_sub(left_width)
-        .saturating_sub(1);
-    let phase_info = if disp_width(&phase_info) > avail_right {
-        truncate_to_width(&phase_info, avail_right)
+    // The bottom row is the LIVE state line ONLY — what's happening right now.
+    // The project + base now live in the top title bar, so we no longer repeat
+    // "{dir} · {backend} · /help" here (that duplicate chrome was the complaint).
+    // Clip to the row width (CJK-safe) so a long activity never wraps/overruns.
+    let avail = usize::from(area.width).saturating_sub(1);
+    let phase_info = if disp_width(&phase_info) > avail {
+        truncate_to_width(&phase_info, avail)
     } else {
         phase_info
     };
-    // Pad with spaces to right-align the (possibly clipped) phase status.
-    let phase_width = disp_width(&phase_info) + 1; // + the trailing space we add
-    let pad = usize::from(area.width)
-        .saturating_sub(left_width)
-        .saturating_sub(phase_width);
-    for _ in 0..pad {
-        right_spans.push(Span::raw(" "));
-    }
     // Stall → red (honest "about to hang"); otherwise the normal info color.
     let info_color = if app.is_stalled() {
         theme::ERROR()
     } else {
         theme::INFO()
     };
-    right_spans.push(Span::styled(
-        format!("{phase_info} "),
+    let line = Line::from(vec![Span::styled(
+        format!(" {phase_info}"),
         Style::default().fg(info_color),
-    ));
-    let mut all = left.spans;
-    all.extend(right_spans);
-    frame.render_widget(Paragraph::new(Line::from(all)), area);
+    )]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 // ---------- Help overlay (both modes) -------------------------------------
@@ -5750,8 +5713,13 @@ mod tests {
         let mut app = app_with(Some("offline"));
         app.insert_str_at_cursor("a\nb\nc\nd\ne\nf\ng\nh");
         let out = render_chat_at(&app, 50, 12);
-        // The bottom status row (directory breadcrumb + /help) is still drawn.
-        assert!(out.contains("/help"), "status row clipped: {out}");
+        // The bottom status row (now the live state line) is still drawn on screen.
+        // Match the status text's FIRST glyph: the flattened buffer separates wide
+        // CJK glyphs with their skip-cell space, so the full multi-char word won't
+        // appear contiguous, but its leading glyph reliably does.
+        let ready = umadev_i18n::t(app.lang, "status.ready").to_string();
+        let marker = ready.chars().next().unwrap().to_string();
+        assert!(out.contains(&marker), "status row clipped: {out}");
     }
 
     #[test]
@@ -5863,37 +5831,22 @@ mod tests {
     }
 
     #[test]
-    fn status_row_right_aligns_cjk_without_overflow_or_collision() {
-        // A Chinese phase string (`正在思考`, 8 display cols but 12 bytes) used to
-        // over-count via `.len()`, saturate the pad to 0, and glue the status to
-        // the left chrome. With display-width padding it sits flush RIGHT instead.
+    fn status_row_renders_cjk_status_left_aligned_without_overflow() {
+        // The bottom row is now the live state line ONLY (the dir·base·/help chrome
+        // moved to the top title bar). A Chinese status (`就绪`, 4 display cols / 6
+        // bytes) must render LEFT-aligned and never overrun the row width.
         let mut app = app_with(Some("offline"));
         app.lang = umadev_i18n::Lang::ZhCn;
-        app.thinking = true; // → phase_info = "<spinner> 正在思考"
         let width = 80u16;
         let cells = render_status_cells(&app, width);
-        // The buffer is exactly `width` cells (a wide glyph + its skip cell) — so
-        // by construction nothing overran. Assert the phase is RIGHT-aligned:
-        // its first glyph starts in the right portion of the row, well past the
-        // left chrome (which used to be where it got glued under the byte-len bug).
-        let phase_col = col_of(&cells, "正").expect("CJK phase glyph renders");
-        let help_col = col_of(&cells, "h").expect("/help chrome renders"); // ` /help `
-        assert!(
-            phase_col > help_col + 10,
-            "phase not right-aligned (phase col {phase_col} vs help col {help_col})"
-        );
-        // The last glyph of the phase (`考`, 2 cols wide) ends near the right
-        // edge — its right edge (start col + 2 wide cells) is within one trailing
-        // space of the boundary. Anything larger means the pad over-shrank again.
-        let last_col = cells
-            .iter()
-            .rposition(|s| s.contains('考'))
-            .expect("last CJK glyph renders");
-        let glyph_right_edge = last_col + 2; // wide glyph occupies last_col + skip cell
-        assert!(
-            (width as usize) - glyph_right_edge <= 2,
-            "phase not flush-right: last glyph ends at {glyph_right_edge}, width {width}"
-        );
+        // No overflow: render_status_cells yields exactly `width` cells by build.
+        assert_eq!(cells.len(), width as usize);
+        // Idle → the localized "ready" status renders near the LEFT (a leading
+        // space, then the text), not pushed to the right by chrome that's now gone.
+        let ready = umadev_i18n::t(app.lang, "status.ready").to_string();
+        let first = ready.chars().next().unwrap().to_string();
+        let col = col_of(&cells, &first).expect("CJK status glyph renders");
+        assert!(col < 4, "status should be left-aligned now (col {col})");
     }
 
     #[test]

@@ -1111,10 +1111,11 @@ pub struct App {
     /// within a short window actually cancels. `None` = not armed.
     pub interrupt_armed_at: Option<std::time::Instant>,
 
-    /// Streamed characters in the CURRENT turn — surfaced as a `~N tok` estimate on
-    /// the waiting indicator so a long reply reads as PROGRESSING, not just elapsed.
-    /// Reset at each turn start.
-    pub stream_chars: usize,
+    /// Cumulative REAL token usage for the session (input+output), read from the
+    /// usage ledger (`usage_report()`), surfaced on the waiting indicator as a
+    /// running total (e.g. `≈452K tok`). Cached + refreshed on a throttle in
+    /// `tick()` so the indicator shows true consumption, not a per-turn char guess.
+    pub session_tokens: u64,
 
     /// One-line status shown in the top bar.
     pub status: String,
@@ -1340,7 +1341,7 @@ impl App {
             project_root,
             pending_quit_confirm: false,
             interrupt_armed_at: None,
-            stream_chars: 0,
+            session_tokens: 0,
             status: String::new(),
             tick: 0,
             animations: animations_enabled_default(),
@@ -2635,7 +2636,6 @@ impl App {
                 // A fresh block clears any prior aborted terminal state — this
                 // run is live again.
                 self.aborted = false;
-                self.stream_chars = 0; // fresh run → reset the progress counter on every turn-start path
                 self.run_started_at = Some(std::time::Instant::now());
                 self.push(
                     ChatRole::UmaDev,
@@ -3083,9 +3083,6 @@ impl App {
                         // unbounded (the markdown renderer's fail-open still applies).
                         const SEGMENT_BYTES_MAX: usize = 24_000;
                         self.stream_tool_batch = None;
-                        // Progress signal: a long reply reads as MOVING (a ~N tok
-                        // estimate on the indicator), not just elapsed seconds.
-                        self.stream_chars = self.stream_chars.saturating_add(delta.chars().count());
                         // Decide WHERE the delta goes WITHOUT holding a mutable borrow
                         // across `self.push`: append to the live Host segment if it
                         // still has room, else roll over to a new one. Fence-safe: a
@@ -3823,7 +3820,6 @@ impl App {
             // from an earlier phase and flash red immediately).
             self.last_output_at = None;
             self.tool_in_progress = false;
-            self.stream_chars = 0; // fresh turn → reset the progress counter
             self.refresh_status();
             Action::Route(text)
         } else if !self.run_started {
@@ -3839,7 +3835,6 @@ impl App {
             // Fresh chat turn → fresh stall clock (see above).
             self.last_output_at = None;
             self.tool_in_progress = false;
-            self.stream_chars = 0; // fresh turn → reset the progress counter
             self.refresh_status();
             Action::Route(text)
         } else {
@@ -7139,6 +7134,13 @@ impl App {
     /// so the spinner glyph actually rotates while a phase is running.
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        // Refresh the REAL cumulative token total off the usage ledger on a throttle
+        // (~once at startup, then every ~2s). It's a file read — far too costly
+        // per-frame, fine here — so the waiting indicator shows true consumption
+        // instead of a per-turn character guess.
+        if self.tick == 1 || self.tick.is_multiple_of(25) {
+            self.session_tokens = umadev_agent::runner::usage_report().total_tokens;
+        }
         self.refresh_status();
     }
 
@@ -7150,12 +7152,13 @@ impl App {
         //
         // - Animations off / non-TTY → a single static glyph (`⋯`), so the UI
         //   never strobes for accessibility or in a piped render.
-        // - Stalled → FREEZE on a fixed frame (the status surface paints it the
-        //   warning color via `is_stalled()`): a stall means "probably wedged", so
-        //   the spinner must STOP moving (a fake-smooth spin would lie that work
-        //   is flowing) while the content stays put.
-        // - Otherwise → advance one braille frame per ~80ms tick.
-        spinner_frame(self.tick, self.animations, self.is_stalled())
+        // - Otherwise → advance one braille frame per ~80ms tick, ALWAYS while
+        //   work is in flight. We deliberately do NOT freeze on a stall: a frozen
+        //   spinner reads as "crashed", the opposite of the intended signal — the
+        //   base is still working, just not emitting output yet. The "taking long"
+        //   cue stays on the COLOR + the "still working (mm:ss)" heartbeat text,
+        //   not on stopping the spin.
+        spinner_frame(self.tick, self.animations, false)
     }
 
     /// Animated glyph for the IN-PROGRESS phase circle in the progress bar.
