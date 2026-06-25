@@ -3276,8 +3276,16 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             umadev_i18n::t(app.lang, "status.esc_cancel")
         };
+        // A rough token estimate (chars/4) so a long reply reads as PROGRESSING,
+        // not just elapsed — shown once output starts streaming.
+        let toks = app.stream_chars / 4;
+        let tok_part = if toks > 0 {
+            format!(" · ~{toks} tok")
+        } else {
+            String::new()
+        };
         let elapsed = if secs > 0 || app.interrupt_armed() {
-            format!("  ({secs}s · {esc_hint})")
+            format!("  ({secs}s{tok_part} · {esc_hint})")
         } else {
             String::new()
         };
