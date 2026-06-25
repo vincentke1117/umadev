@@ -3313,9 +3313,20 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         // wait reads as alive. It keeps moving even on a stall (a frozen shimmer
         // reads as "crashed", the opposite of the intent); only animations-off
         // stills it.
-        let thinking_word = umadev_i18n::t(app.lang, "status.thinking");
+        // The verb reflects WHAT the base is doing RIGHT NOW — thinking, or the live
+        // tool's action (reading / editing / running / searching / fetching) — so the
+        // indicator changes through the turn instead of sitting on a static
+        // "正在思考". Reverts to thinking the moment the tool's ToolResult lands.
+        let verb: String = if app.tool_in_progress {
+            match &app.stream_tool_batch {
+                Some((tool, _)) => format!("{}…", tool_activity_verb(tool, app.lang)),
+                None => format!("{}…", umadev_i18n::t(app.lang, "status.using_tool")),
+            }
+        } else {
+            umadev_i18n::t(app.lang, "status.thinking").to_string()
+        };
         think_spans.extend(shimmer_spans(
-            thinking_word,
+            &verb,
             app.tick,
             theme::ACCENT(),
             theme::TEXT(),
@@ -3717,6 +3728,22 @@ fn prefold_line(
 /// across the word over time, driven by the spinner `tick`, the rest in `base`.
 /// When `animated` is false (animations off / non-TTY) the word renders flat in
 /// `base` bold — no per-char strobe. The whole word is always bold.
+/// Map a base tool name to the live activity verb on the waiting indicator, so the
+/// status reflects WHAT the base is doing — reading / editing / running / searching
+/// / fetching — instead of a static "thinking" the whole turn. Unknown tools fall
+/// back to a generic "{using} {tool}" so a new tool still reads sensibly.
+fn tool_activity_verb(tool: &str, lang: umadev_i18n::Lang) -> String {
+    let key = match tool {
+        "Read" | "NotebookRead" => "status.act.reading",
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => "status.act.editing",
+        "Bash" | "BashOutput" | "KillBash" => "status.act.running",
+        "Grep" | "Glob" | "LS" => "status.act.searching",
+        "WebFetch" | "WebSearch" => "status.act.fetching",
+        _ => return format!("{} {tool}", umadev_i18n::t(lang, "status.using_tool")),
+    };
+    umadev_i18n::t(lang, key).to_string()
+}
+
 fn shimmer_spans(word: &str, tick: u8, base: Color, bright: Color, animated: bool) -> Vec<Span<'static>> {
     let chars: Vec<char> = word.chars().collect();
     if !animated || chars.is_empty() {
@@ -4228,16 +4255,11 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
         // is running (read / edit / a command), else a compact elapsed timer — so it
         // COMPLEMENTS the "正在思考" indicator above the input instead of repeating
         // it. Animated so a sent message never looks frozen while the base replies.
-        // Show the live tool ONLY while it's actually running (`tool_in_progress`,
-        // cleared the moment its ToolResult lands) — `stream_tool_batch` alone
-        // lingers after the tool finishes (it's the transcript-collapse label), so
-        // using it left a stale "⠦ Read" sitting in the corner after the read was
-        // long done. No tool running → nothing here (the "正在思考" indicator above
-        // the input already conveys aliveness).
-        match (app.tool_in_progress, &app.stream_tool_batch) {
-            (true, Some((tool, _))) => format!("{} {tool}", app.spinner()),
-            _ => String::new(),
-        }
+        // The live activity (thinking / reading / editing / running …) is now ON
+        // the indicator above the input, so the bottom status row stays EMPTY during
+        // a normal turn — no duplicate, no lingering tool name. Run states below
+        // (aborted / gate / finished) still render here.
+        String::new()
     } else if app.aborted {
         // Dedicated terminal branch — an aborted round reads as `[aborted]` here
         // DIRECTLY, instead of leaning on `app.status` carrying the right text.
