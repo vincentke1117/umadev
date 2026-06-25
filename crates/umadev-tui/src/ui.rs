@@ -459,6 +459,34 @@ fn role_span(text: impl Into<String>, role: SynRole, modifier: Modifier) -> Span
     )
 }
 
+/// The single left-gutter width (display columns) for every transcript turn —
+/// the role spine glyph (`▎`) + one space. Every speaker (You / Host / UmaDev /
+/// System) hangs its wrapped body and aligns its continuation rows under this
+/// same gutter, so the vertical skeleton is one width, not the old per-role
+/// patchwork (You=1 / Host=2 / System=2 / Gate=2). Continuation rows are
+/// indented by exactly this many columns (see [`prefold_line`]'s `spine` arg).
+const GUTTER_W: usize = 2;
+
+/// The role-spine glyph (`▎`, U+258E "left one-quarter block"), built from its
+/// codepoint so the source carries no literal pictographic glyph (same policy
+/// as [`assistant_marker`]). It is exactly one display column; followed by one
+/// space it forms the [`GUTTER_W`]-wide left gutter under which a turn's body
+/// and every wrapped continuation row align.
+fn spine_glyph() -> char {
+    char::from_u32(0x258E).unwrap_or('|')
+}
+
+/// The colored role-spine span for the FIRST row of a turn: `▎ ` (glyph + space,
+/// [`GUTTER_W`] columns) tinted by [`theme::role_bar`]. Continuation rows get
+/// the same spine re-painted by [`prefold_line`] when it folds the line, so a
+/// multi-line reply reads as one unbroken vertical bar in the speaker's color.
+fn role_spine_span(role: ChatRole) -> Span<'static> {
+    let mut s = String::with_capacity(2);
+    s.push(spine_glyph());
+    s.push(' ');
+    Span::styled(s, Style::default().fg(theme::role_bar(role)))
+}
+
 // ─── Markdown → styled Lines ──────────────────────────────────────────────
 // A pulldown-cmark event stream compiled into ratatui `Line`/`Span`s. Replaces
 // the old per-line `strip_prefix` renderer (no tables, no nested lists, no
@@ -612,6 +640,13 @@ struct MdState {
     table: Option<TableBuf>,
     /// `true` while inside a table cell so inline events route into the cell.
     in_table_cell: bool,
+    /// The open link's destination URL + the inline-span index where its text
+    /// began, so `End(Link)` can append a `(url)` suffix when the visible text
+    /// differs from the target (a terminal can't click, so the URL must be shown).
+    link: Option<(String, usize)>,
+    /// `Some(checked)` after a `TaskListMarker` so the item's flushed marker
+    /// renders a `☑`/`☐` checkbox instead of a bullet.
+    pending_task: Option<bool>,
 }
 
 /// A table accumulated cell-by-cell as pulldown-cmark walks it.
@@ -651,15 +686,26 @@ impl MdState {
             let indent = depth.saturating_mul(2);
             prefix.push(Span::raw(" ".repeat(indent + 1)));
             if self.pending_item_marker {
-                let marker = match self.lists.last() {
-                    Some(ListKind::Ordered(idx)) => ordered_marker(depth, *idx),
-                    _ => "•".to_string(),
-                };
-                prefix.push(role_span(
-                    format!("{marker} "),
-                    SynRole::ListMarker,
-                    Modifier::empty(),
-                ));
+                if let Some(checked) = self.pending_task.take() {
+                    // Task-list checkbox replaces the bullet (a checked box reads as
+                    // "done", an empty one as "todo").
+                    let (glyph, role) = if checked {
+                        ("\u{2611} ", SynRole::ListMarker)
+                    } else {
+                        ("\u{2610} ", SynRole::Muted)
+                    };
+                    prefix.push(role_span(glyph.to_string(), role, Modifier::empty()));
+                } else {
+                    let marker = match self.lists.last() {
+                        Some(ListKind::Ordered(idx)) => ordered_marker(depth, *idx),
+                        _ => "•".to_string(),
+                    };
+                    prefix.push(role_span(
+                        format!("{marker} "),
+                        SynRole::ListMarker,
+                        Modifier::empty(),
+                    ));
+                }
             } else {
                 // Continuation line under a list item: align under the text.
                 let marker_w = match self.lists.last() {
@@ -944,6 +990,7 @@ fn markdown_compile(text: &str) -> Vec<Line<'static>> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
     let parser = Parser::new_ext(text, options);
 
     let mut state = MdState {
@@ -955,6 +1002,8 @@ fn markdown_compile(text: &str) -> Vec<Line<'static>> {
         blockquote: 0,
         table: None,
         in_table_cell: false,
+        link: None,
+        pending_task: None,
     };
     // Fenced-code context: the language tag (for the tokenizer) + the buffered
     // lines, so the whole block is highlighted and boxed together.
@@ -1093,15 +1142,49 @@ fn markdown_compile(text: &str) -> Vec<Line<'static>> {
                 modifier: Modifier::CROSSED_OUT,
                 role: None,
             }),
-            Event::Start(Tag::Link { .. }) => state.inline.stack.push(StyleFrame {
-                modifier: Modifier::UNDERLINED,
-                role: Some(SynRole::Link),
-            }),
-            // Closing any inline-style tag pops one frame off the style stack.
-            Event::End(
-                TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link,
-            ) => {
+            Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) => {
+                // Remember the target + where the link text starts, so `End` can
+                // surface the URL (a terminal can't make text clickable, so the
+                // destination must be shown when it differs from the visible text).
+                state.link = Some((dest_url.to_string(), state.inline.spans.len()));
+                state.inline.stack.push(StyleFrame {
+                    modifier: Modifier::UNDERLINED,
+                    role: Some(SynRole::Link),
+                });
+            }
+            // Closing an inline-style tag pops one frame off the style stack.
+            Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough) => {
                 state.inline.stack.pop();
+            }
+            Event::End(TagEnd::Link | TagEnd::Image) => {
+                state.inline.stack.pop();
+                if let Some((url, start)) = state.link.take() {
+                    if !url.is_empty() {
+                        let text: String = state
+                            .inline
+                            .spans
+                            .get(start..)
+                            .map(|ss| ss.iter().map(|sp| sp.content.as_ref()).collect())
+                            .unwrap_or_default();
+                        let t = text.trim();
+                        if t.is_empty() {
+                            // No visible text → show the URL itself as the link.
+                            state.inline.push_text(&url, Some(SynRole::Link));
+                        } else if t != url {
+                            // Visible text differs from the target → append a dim (url).
+                            state.inline.spans.push(role_span(
+                                format!(" ({url})"),
+                                SynRole::Muted,
+                                Modifier::empty(),
+                            ));
+                        }
+                    }
+                }
+            }
+            Event::TaskListMarker(checked) => {
+                // A `- [ ]` / `- [x]` item: render a checkbox glyph in place of the
+                // bullet when this item's marker is flushed.
+                state.pending_task = Some(checked);
             }
             // ── Leaf inline content ──
             Event::Text(t) => {
@@ -2689,10 +2772,14 @@ fn diff_content_spans(
 /// height is stable across pending→done (the glyph swaps in place, no reflow).
 fn render_tool_row(
     tool: &ToolCall,
-    rendered: &mut Vec<(Line<'static>, usize)>,
+    rendered: &mut Vec<RenderedRow>,
     lang: umadev_i18n::Lang,
     spinner: char,
 ) {
+    // A tool call is a Host artifact, so every row it emits carries the Host
+    // spine — the vertical skeleton stays unbroken across a turn's prose +
+    // tool rows + diff cards.
+    let spine = theme::role_bar(ChatRole::Host);
     let (glyph, glyph_color) = tool_status_glyph(tool.status, spinner);
     let mut head: Vec<Span<'static>> = Vec::with_capacity(4);
     head.push(Span::styled(
@@ -2711,7 +2798,7 @@ fn render_tool_row(
             Style::default().fg(theme::TEXT_MUTED()),
         ));
     }
-    rendered.push((Line::from(head), 2));
+    rendered.push(RenderedRow::spined(Line::from(head), GUTTER_W, spine));
 
     // The result gutter. A failed / running call always shows it; a finished OK
     // call shows it only when not collapsed. Long results fold to head-N + a
@@ -2737,7 +2824,7 @@ fn render_tool_row(
     };
     for (i, line) in shown.iter().enumerate() {
         let prefix = if i == 0 { gutter.clone() } else { "   ".into() };
-        rendered.push((
+        rendered.push(RenderedRow::spined(
             Line::from(vec![
                 Span::styled(prefix, Style::default().fg(theme::TEXT_MUTED())),
                 Span::styled(
@@ -2746,11 +2833,12 @@ fn render_tool_row(
                 ),
             ]),
             3,
+            spine,
         ));
     }
     if show_collapsed && foldable {
         let hidden = lines.len().saturating_sub(head_n);
-        rendered.push((fold_summary_line(hidden, lang), 3));
+        rendered.push(RenderedRow::spined(fold_summary_line(hidden, lang), 3, spine));
     }
 }
 
@@ -2785,15 +2873,70 @@ fn fold_general_text(body: &str, lang: umadev_i18n::Lang) -> String {
     head
 }
 
-/// The assistant bullet glyph (a filled circle, the Claude-Code
-/// `AssistantTextMessage` marker), built from its codepoint so the source
-/// carries no literal pictographic glyph. Followed by one space, it forms the
-/// two-column left gutter under which a wrapped body aligns.
-fn assistant_bullet() -> String {
+/// The first-row marker for an assistant turn, distinguishing the SEAT: the
+/// UmaDev director's own voice vs the borrowed base (Host). Returns a
+/// [`GUTTER_W`]-wide glyph-plus-space string and its color, so the two read as
+/// different speakers, not one undifferentiated "AI."
+///
+/// - **Seat color** — `UmaDev` is the brand accent (cyan); `Host` is the
+///   success/teammate color (green) — matching [`theme::role_bar`], so the
+///   marker and the spine bar below it agree.
+/// - **Glyph** — platform-aware: macOS terminals render the heavier record
+///   circle `⏺` (U+23FA) crisply, elsewhere the plain filled circle `●`
+///   (U+25CF). Built from the codepoint so the source carries no literal
+///   pictographic glyph. Fail-open: an unmappable codepoint degrades to `*`.
+///
+/// Any non-assistant role passed here falls back to the Host marker (the
+/// callers only ever pass `Host` / `UmaDev`).
+fn assistant_marker(role: ChatRole) -> (String, Color) {
+    let cp = if cfg!(target_os = "macos") {
+        0x23FA // ⏺ heavy record circle — crisp on macOS terminals
+    } else {
+        0x25CF // ● plain filled circle — widest terminal support
+    };
     let mut s = String::with_capacity(2);
-    s.push(char::from_u32(0x25CF).unwrap_or('*'));
+    s.push(char::from_u32(cp).unwrap_or('*'));
     s.push(' ');
-    s
+    let color = match role {
+        ChatRole::UmaDev => theme::ACCENT(),
+        _ => theme::SUCCESS(),
+    };
+    (s, color)
+}
+
+/// One logical transcript line plus the layout hints the per-width fold needs:
+/// the hanging-indent width, an optional role-spine color (repainted down every
+/// wrapped continuation row), and an optional full-row background fill (the
+/// user-message bubble tint). Kept as a small struct rather than a 4-tuple so
+/// the fold call stays readable and clippy's `type_complexity` lint is happy.
+struct RenderedRow {
+    line: Line<'static>,
+    hang: usize,
+    spine: Option<Color>,
+    fill_bg: Option<Color>,
+}
+
+impl RenderedRow {
+    /// A plain row: no spine, no fill (welcome art, blank gaps, the thinking
+    /// indicator). `hang` still controls wrapped-continuation indentation.
+    fn plain(line: Line<'static>, hang: usize) -> Self {
+        Self {
+            line,
+            hang,
+            spine: None,
+            fill_bg: None,
+        }
+    }
+
+    /// A spined row: a role bar repainted down every wrapped continuation row.
+    fn spined(line: Line<'static>, hang: usize, spine: Color) -> Self {
+        Self {
+            line,
+            hang,
+            spine: Some(spine),
+            fill_bg: None,
+        }
+    }
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
@@ -2814,58 +2957,89 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // of reflowing flush-left. Welcome-banner art keeps a zero hang (it never
     // wraps at a sane width). A hang of 2 matches the two-column bullet gutter and
     // the gate bar; a hang of 1 matches the user-row leading space.
-    let mut rendered: Vec<(Line<'static>, usize)> = welcome_lines(app)
+    // Each entry is a `RenderedRow`: the logical line + its hang width + an
+    // optional role-spine color (repainted down every wrapped continuation row
+    // so a multi-line turn reads as one vertical bar in the speaker's color) +
+    // an optional full-row bg fill (the user bubble tint). Welcome art is plain
+    // (it isn't a turn).
+    let mut rendered: Vec<RenderedRow> = welcome_lines(app)
         .into_iter()
-        .map(|l| (l, 0usize))
+        .map(|l| RenderedRow::plain(l, 0))
         .collect();
     for (msg_idx, msg) in app.history.iter().enumerate() {
         // Top gap before each message for breathing room (Claude Code: marginTop=1).
         if msg_idx > 0 {
-            rendered.push((Line::from(""), 0));
+            rendered.push(RenderedRow::plain(Line::from(""), 0));
         }
 
         if msg.role == ChatRole::Gate {
             let body = msg.body();
+            let bar = theme::role_bar(ChatRole::Gate);
             let mut block: Vec<Line<'static>> = Vec::new();
-            render_gate_block(&body, theme::WARNING(), &mut block);
-            rendered.extend(block.into_iter().map(|l| (l, 2usize)));
+            render_gate_block(&body, bar, &mut block);
+            // Gate keeps its own per-line `▎` prefix on the FIRST row; the spine
+            // color carries that bar down any wrapped continuation row too.
+            rendered.extend(
+                block
+                    .into_iter()
+                    .map(|l| RenderedRow::spined(l, GUTTER_W, bar)),
+            );
             continue;
         }
 
         // A structured tool row renders the same regardless of (Host) role: a
         // single status line + a folded result gutter. Handled before the
         // role-text match so its body never falls through to the prose path.
+        // Tool rows belong to the Host flow, so they carry the Host spine — the
+        // vertical skeleton stays unbroken across a turn's prose + tool rows.
         if let MessageBody::Tool(tool) = &msg.kind {
             render_tool_row(tool, &mut rendered, app.lang, app.spinner());
             continue;
         }
         // A structured diff card (P1) — a Write/Edit rendered as a real diff.
         // Handled here for the same reason: it has its own renderer, never the
-        // prose path.
+        // prose path. A diff card is a Host artifact → Host spine on every row.
         if let MessageBody::Diff(d) = &msg.kind {
-            rendered.extend(diff_to_lines(d, app.lang, area.width as usize));
+            let bar = theme::role_bar(ChatRole::Host);
+            rendered.extend(
+                diff_to_lines(d, app.lang, area.width as usize)
+                    .into_iter()
+                    .map(|(l, hang)| RenderedRow::spined(l, hang.max(GUTTER_W), bar)),
+            );
             continue;
         }
 
         let body = msg.body();
+        let spine = theme::role_bar(msg.role);
         match msg.role {
-            // **User messages** — full-width tinted background bar (Claude Code:
-            // userMessageBackground = rgb(55,55,55)), no leading dot.
+            // **User messages** — full-width tinted background bubble (Claude
+            // Code: userMessageBackground) behind a role-spine bar. The leading
+            // `▎ ` spine replaces the old single leading space, so the gutter is
+            // the unified `GUTTER_W` like every other speaker, and `fill_bg`
+            // makes the fold right-pad each row so the tint reads as one solid
+            // block instead of stopping ragged at the text.
             ChatRole::You => {
                 for line in body.lines() {
-                    rendered.push((
-                        Line::from(Span::styled(
-                            format!(" {line}"),
+                    let spans = vec![
+                        role_spine_span(ChatRole::You),
+                        Span::styled(
+                            line.to_string(),
                             Style::default().fg(theme::TEXT()).bg(theme::USER_MSG_BG()),
-                        )),
-                        1,
-                    ));
+                        ),
+                    ];
+                    rendered.push(RenderedRow {
+                        line: Line::from(spans),
+                        hang: GUTTER_W,
+                        spine: Some(spine),
+                        fill_bg: Some(theme::USER_MSG_BG()),
+                    });
                 }
             }
-            // **Assistant/Host messages** — leading bullet + plain text on the
-            // terminal background (Claude Code: AssistantTextMessage). The
-            // two-column bullet gutter is also the hang width, so a long paragraph
-            // that wraps lines up under the text, not under the bullet.
+            // **Assistant/Host messages** — role spine + leading bullet + plain
+            // text on the terminal background (Claude Code: AssistantTextMessage).
+            // The unified `GUTTER_W` gutter is also the hang width, so a long
+            // paragraph that wraps lines up under the text, not under the bullet,
+            // and the spine carries down every wrapped row.
             //
             // **P6 long-output fold**: a collapsed long body is truncated to a
             // head-N preview + a `… N more lines` summary (Ctrl+R expands).
@@ -2896,30 +3070,33 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     markdown_to_lines(&folded, theme::TEXT())
                 };
+                // The first row leads with the role spine; the marker (bullet)
+                // distinguishes the SEAT — UmaDev's own director voice vs the
+                // borrowed base (Host). Continuation rows hang under `GUTTER_W`
+                // and the spine repaints there.
                 for (i, bl) in body_lines.into_iter().enumerate() {
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     if i == 0 {
-                        spans.push(Span::styled(
-                            assistant_bullet(),
-                            Style::default().fg(theme::ACCENT()),
-                        ));
+                        let (marker, marker_color) = assistant_marker(msg.role);
+                        spans.push(Span::styled(marker, Style::default().fg(marker_color)));
                     } else {
-                        spans.push(Span::raw("  "));
+                        // Continuation: the spine glyph fills col 0; pad to gutter.
+                        spans.push(role_spine_span(msg.role));
                     }
                     spans.extend(bl.spans);
-                    rendered.push((Line::from(spans), 2));
+                    rendered.push(RenderedRow::spined(Line::from(spans), GUTTER_W, spine));
                 }
             }
-            // **System messages** — dim/muted, no bullet.
+            // **System messages** — dim/muted text behind a role-spine bar. The
+            // old `  ` two-space prefix becomes the `▎ ` spine so System shares
+            // the unified gutter and gets a vertical bar like every other turn.
             ChatRole::System => {
                 for line in body.lines() {
-                    rendered.push((
-                        Line::from(Span::styled(
-                            format!("  {line}"),
-                            Style::default().fg(theme::TEXT_MUTED()),
-                        )),
-                        2,
-                    ));
+                    let spans = vec![
+                        role_spine_span(ChatRole::System),
+                        Span::styled(line.to_string(), Style::default().fg(theme::TEXT_MUTED())),
+                    ];
+                    rendered.push(RenderedRow::spined(Line::from(spans), GUTTER_W, spine));
                 }
             }
             ChatRole::Gate => unreachable!(),
@@ -2939,8 +3116,8 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             String::new()
         };
-        rendered.push((Line::from(""), 0));
-        rendered.push((
+        rendered.push(RenderedRow::plain(Line::from(""), 0));
+        rendered.push(RenderedRow::plain(
             Line::from(vec![
                 Span::styled(
                     format!("{} ", app.spinner()),
@@ -2970,7 +3147,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let w = usize::from(area.width).max(1);
     let mut folded: Vec<Line<'static>> = rendered
         .into_iter()
-        .flat_map(|(line, hang)| prefold_line(&line, w, hang))
+        .flat_map(|row| prefold_line_filled(&row.line, w, row.hang, row.spine, row.fill_bg))
         .collect();
     // Bound the retained scrollback by VISUAL rows (post-fold), keeping the most
     // recent `MAX_RENDER_ROWS`. Doing it here — not on logical lines up top —
@@ -3049,10 +3226,23 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
 /// Gate messages render as a single bordered warning panel — a compact,
 /// unmissable "pause and decide" card with a yellow left bar. Replaces the
 /// old full-width ASCII box-drawing art that read as amateur.
+///
+/// Every row (title / body / hint) now leads with the `▎ ` spine in `bar`'s
+/// color — the same unified [`GUTTER_W`] gutter every other speaker uses — so
+/// the gate reads as one continuous bar, not a `▎` title over `  `-indented
+/// body. The caller threads `bar` as the spine color so wrapped continuation
+/// rows repaint the bar too.
 fn render_gate_block(body: &str, bar: Color, rendered: &mut Vec<Line<'static>>) {
     let lang = umadev_i18n::current();
+    // The `▎ ` spine prefix, built from the shared glyph (no literal pictograph).
+    let spine = || -> Span<'static> {
+        let mut s = String::with_capacity(2);
+        s.push(spine_glyph());
+        s.push(' ');
+        Span::styled(s, Style::default().fg(bar))
+    };
     let title = Line::from(vec![
-        Span::styled("▎ ", Style::default().fg(bar)),
+        spine(),
         Span::styled(
             umadev_i18n::t(lang, "tui.gate_block.title"),
             Style::default()
@@ -3063,12 +3253,12 @@ fn render_gate_block(body: &str, bar: Color, rendered: &mut Vec<Line<'static>>) 
     rendered.push(title);
     for line in body.lines() {
         rendered.push(Line::from(vec![
-            Span::styled("  ", Style::default().fg(bar)),
+            spine(),
             Span::styled(line.to_string(), Style::default().fg(theme::TEXT())),
         ]));
     }
     rendered.push(Line::from(vec![
-        Span::styled("  ", Style::default().fg(bar)),
+        spine(),
         Span::styled(
             umadev_i18n::t(lang, "tui.gate_block.hint"),
             Style::default().fg(theme::TEXT_MUTED()),
@@ -3289,8 +3479,42 @@ fn strip_control_chars(s: &str) -> std::borrow::Cow<'_, str> {
 /// [`disp_width`]) are never split across a fold, so no half-character ever
 /// lands in a cell.
 ///
+/// `spine`, when `Some(color)`, repaints the FIRST column of each continuation
+/// row's hanging indent as the role-spine glyph (`▎`) in that color (the
+/// remaining `hang - 1` columns stay padding spaces), so a multi-line turn
+/// reads as one unbroken vertical bar in the speaker's color — the first row's
+/// spine is already in its prefix span; this carries it down the wrapped rows.
+/// `None` keeps the legacy plain-space indent. Fail-open: a `hang` of 0 means
+/// no spine is drawn (there's no gutter column to paint).
+///
 /// Always returns at least one row. Fail-open: a zero `width` is treated as 1.
-fn prefold_line(line: &Line<'static>, width: usize, hang: usize) -> Vec<Line<'static>> {
+///
+/// This is the no-fill convenience wrapper used by the fold-invariant unit
+/// tests; the render path calls [`prefold_line_filled`] directly so it can pass
+/// the user-bubble `fill_bg`.
+#[cfg(test)]
+fn prefold_line(
+    line: &Line<'static>,
+    width: usize,
+    hang: usize,
+    spine: Option<Color>,
+) -> Vec<Line<'static>> {
+    prefold_line_filled(line, width, hang, spine, None)
+}
+
+/// Like [`prefold_line`], but when `fill_bg` is `Some(color)` every emitted
+/// visual row is right-padded with bg-tinted spaces to exactly `width` display
+/// columns — so a tinted row (a user message) reads as one solid full-width
+/// bubble instead of a tint that stops at the text and leaves a ragged right
+/// edge. CJK-safe: padding is measured by display columns. Fail-open: `None`
+/// pads nothing and behaves exactly like the old fold.
+fn prefold_line_filled(
+    line: &Line<'static>,
+    width: usize,
+    hang: usize,
+    spine: Option<Color>,
+    fill_bg: Option<Color>,
+) -> Vec<Line<'static>> {
     let w = width.max(1);
     let hang = hang.min(w.saturating_sub(1)); // never indent past the usable width
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -3301,14 +3525,40 @@ fn prefold_line(line: &Line<'static>, width: usize, hang: usize) -> Vec<Line<'st
     let mut col = 0usize;
     let mut started_continuation = false;
 
+    // Right-pad one finished row to `w` columns with bg-tinted spaces, then push
+    // it. When `fill_bg` is None this just pushes the row unchanged.
+    let push_padded = |out: &mut Vec<Line<'static>>, mut row: Vec<Span<'static>>, filled: usize| {
+        if let Some(bg) = fill_bg {
+            if filled < w {
+                row.push(Span::styled(
+                    " ".repeat(w - filled),
+                    Style::default().bg(bg),
+                ));
+            }
+        }
+        out.push(Line::from(row));
+    };
+
     // Emit the accumulated row and start a fresh continuation row (with hang).
+    // When a `spine` color is set the indent's first column is the role-spine
+    // glyph; the rest is padding. CJK-safe: the glyph is one display column and
+    // the pad is plain spaces, so the total indent is exactly `hang` columns.
     macro_rules! flush_row {
         () => {{
-            out.push(Line::from(std::mem::take(&mut cur)));
+            push_padded(&mut out, std::mem::take(&mut cur), col);
             col = 0;
             started_continuation = true;
             if hang > 0 {
-                cur.push(Span::styled(" ".repeat(hang), Style::default()));
+                if let Some(bar) = spine {
+                    let mut g = String::with_capacity(2);
+                    g.push(spine_glyph());
+                    cur.push(Span::styled(g, Style::default().fg(bar)));
+                    if hang > 1 {
+                        cur.push(Span::styled(" ".repeat(hang - 1), Style::default()));
+                    }
+                } else {
+                    cur.push(Span::styled(" ".repeat(hang), Style::default()));
+                }
                 col = hang;
             }
         }};
@@ -3337,7 +3587,7 @@ fn prefold_line(line: &Line<'static>, width: usize, hang: usize) -> Vec<Line<'st
             cur.push(Span::styled(buf, style));
         }
     }
-    out.push(Line::from(cur));
+    push_padded(&mut out, cur, col);
     out
 }
 
@@ -4255,6 +4505,45 @@ mod tests {
                 && s.style.add_modifier.contains(Modifier::BOLD)
         });
         assert!(heading, "H1 'Title' is heading-colored + bold: {lines:?}");
+    }
+
+    #[test]
+    fn markdown_link_surfaces_the_destination_url() {
+        // A terminal can't make text clickable, so the URL must be shown when the
+        // visible text differs from the target.
+        let lines = markdown_to_lines("see [the docs](https://example.com/x)", Color::White);
+        let txt = md_text(&lines);
+        assert!(txt.contains("the docs"), "link text kept: {txt}");
+        assert!(
+            txt.contains("(https://example.com/x)"),
+            "destination URL surfaced: {txt}"
+        );
+        // A bare link (text == url) is NOT duplicated.
+        let bare = md_text(&markdown_to_lines("<https://example.com>", Color::White));
+        assert_eq!(
+            bare.matches("https://example.com").count(),
+            1,
+            "bare URL shown once, not duplicated: {bare}"
+        );
+    }
+
+    #[test]
+    fn markdown_task_list_renders_checkboxes() {
+        let md = "- [x] done\n- [ ] todo";
+        let txt = md_text(&markdown_to_lines(md, Color::White));
+        assert!(txt.contains("\u{2611}"), "checked box for a done item: {txt}");
+        assert!(txt.contains("\u{2610}"), "empty box for a todo item: {txt}");
+        // The checkbox replaces the bullet — no stray '•' on a task item.
+        assert!(!txt.contains('\u{2022}'), "no bullet on task items: {txt}");
+    }
+
+    #[test]
+    fn markdown_image_surfaces_its_href() {
+        let txt = md_text(&markdown_to_lines("![logo](https://x.test/a.png)", Color::White));
+        assert!(
+            txt.contains("https://x.test/a.png"),
+            "image href surfaced (not dropped): {txt}"
+        );
     }
 
     #[test]
@@ -5316,14 +5605,14 @@ mod tests {
         // This is what the old div_ceil estimate got wrong relative to ratatui's
         // own wrap. ASCII case: 25 cols of text at width 10 → 3 rows.
         let line = Line::from(Span::raw("a".repeat(25)));
-        let rows = prefold_line(&line, 10, 0);
+        let rows = prefold_line(&line, 10, 0, None);
         assert_eq!(rows.len(), 3, "25 cols / 10 = 3 rows");
         for r in &rows {
             assert!(line_width(r) <= 10, "no folded row exceeds the width");
         }
         // A short line is one row, unchanged.
         let short = Line::from(Span::raw("hi"));
-        assert_eq!(prefold_line(&short, 10, 0).len(), 1);
+        assert_eq!(prefold_line(&short, 10, 0, None).len(), 1);
     }
 
     #[test]
@@ -5332,7 +5621,7 @@ mod tests {
         // 2 glyphs (4 cols; a 3rd would need 6 > 5) → 3 rows. Critically, no row
         // is wider than 5 and no glyph is split across the fold.
         let line = Line::from(Span::raw("正在思考问题".to_string())); // 6 wide glyphs
-        let rows = prefold_line(&line, 5, 0);
+        let rows = prefold_line(&line, 5, 0, None);
         assert_eq!(rows.len(), 3, "6 wide glyphs at width 5 → 3 rows of 2");
         for r in &rows {
             assert!(line_width(r) <= 5, "a folded CJK row never exceeds width");
@@ -5359,7 +5648,7 @@ mod tests {
         // A 2-col hang means every continuation row starts with 2 spaces, so a
         // wrapped assistant paragraph aligns under the bullet's text column.
         let line = Line::from(Span::raw("a".repeat(20)));
-        let rows = prefold_line(&line, 10, 2);
+        let rows = prefold_line(&line, 10, 2, None);
         assert!(rows.len() >= 2, "20 cols at width 10 wraps");
         // Row 0 has no leading hang; every later row starts with the 2-space hang.
         let first: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
@@ -5371,6 +5660,260 @@ mod tests {
             let s: String = r.spans.iter().map(|sp| sp.content.as_ref()).collect();
             assert!(s.starts_with("  "), "continuation row not hung: {s:?}");
             assert!(line_width(r) <= 10, "hang row still respects width");
+        }
+    }
+
+    #[test]
+    fn prefold_spine_repaints_the_gutter_glyph_on_every_continuation_row() {
+        // With a spine color set, each wrapped continuation row's hanging indent
+        // leads with the role-spine glyph (`▎`) — so a multi-line turn shows one
+        // unbroken vertical bar — and the indent is still exactly `hang` cols.
+        let glyph = spine_glyph();
+        let bar = theme::role_bar(ChatRole::Host);
+        let line = Line::from(Span::raw("a".repeat(20)));
+        let rows = prefold_line(&line, 10, GUTTER_W, Some(bar));
+        assert!(rows.len() >= 2, "20 cols at width 10 wraps");
+        // Row 0 keeps the caller's own prefix (here: none) — no injected spine.
+        let first: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!first.starts_with(glyph), "row 0 spine comes from the caller");
+        for r in &rows[1..] {
+            let joined: String = r.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                joined.starts_with(glyph),
+                "continuation row leads with the spine glyph: {joined:?}"
+            );
+            // The spine glyph span carries the bar color; the pad does not.
+            assert_eq!(
+                r.spans[0].style.fg,
+                Some(bar),
+                "spine glyph is painted in the role color"
+            );
+            // Indent is still exactly GUTTER_W columns (glyph=1 + pad=1).
+            assert!(line_width(r) <= 10, "spine row still respects width");
+            let indent_cols: usize = joined
+                .chars()
+                .take_while(|&c| c == glyph || c == ' ')
+                .map(char_width)
+                .sum();
+            assert_eq!(indent_cols, GUTTER_W, "indent stays the unified gutter width");
+        }
+        // A `None` spine keeps the legacy plain-space indent (no glyph).
+        let plain = prefold_line(&line, 10, GUTTER_W, None);
+        let cont: String = plain[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!cont.starts_with(glyph), "no spine glyph when color is None");
+    }
+
+    // ── Transcript visual skeleton (role spine / full-width bubble / seat
+    //    markers / unified gutter) ────────────────────────────────────────
+
+    /// One rendered transcript row, captured at the cell level so a test can
+    /// assert the spine glyph, the per-cell background (the user bubble tint),
+    /// and the row text without re-deriving the wrap.
+    struct CellRow {
+        /// Full row text (one entry per buffer cell, row-major).
+        text: String,
+        /// Per-cell background color, index-aligned with `text`'s cells.
+        bgs: Vec<Option<Color>>,
+    }
+
+    /// Render the chat to a cell grid and return its non-blank rows.
+    fn transcript_cell_rows(app: &App, w: u16, h: u16) -> Vec<CellRow> {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        let mut rows = Vec::new();
+        for y in 0..buf.area().height {
+            let mut text = String::new();
+            let mut bgs: Vec<Option<Color>> = Vec::new();
+            for x in 0..buf.area().width {
+                text.push_str(buf[(x, y)].symbol());
+                bgs.push(Some(buf[(x, y)].bg));
+            }
+            if text.trim().is_empty() {
+                continue;
+            }
+            rows.push(CellRow { text, bgs });
+        }
+        rows
+    }
+
+    fn push_msg(app: &mut App, role: ChatRole, text: &str) {
+        app.history.push_back(crate::app::ChatMessage {
+            role,
+            kind: MessageBody::Text(text.to_string()),
+            collapsed: false,
+        });
+    }
+
+    #[test]
+    fn every_turn_row_carries_a_role_spine_including_continuation() {
+        // HARD REQ 1: every visual row of a turn (first AND wrapped continuation)
+        // carries the role spine glyph `▎`. A long assistant line wraps and every
+        // wrapped row must still show the spine. The transcript is inset from the
+        // buffer edge, so we scan each row's text for the glyph rather than
+        // assuming column 0.
+        let glyph = spine_glyph();
+        let mut app = app_with(Some("offline"));
+        app.history.clear(); // drop the auto-resumed greeting so only ours render
+        push_msg(&mut app, ChatRole::You, "hi there");
+        push_msg(
+            &mut app,
+            ChatRole::UmaDev,
+            "this is a fairly long director reply that absolutely has to wrap \
+             across several rows because it keeps going well past any \
+             reasonable single line width at this terminal size",
+        );
+        push_msg(&mut app, ChatRole::System, "config saved to disk");
+        let rows = transcript_cell_rows(&app, 50, 30);
+        // The wrapped director reply contributes several rows; its continuation
+        // rows must each carry the spine glyph. Match by content fragments.
+        let cont_with_spine = rows
+            .iter()
+            .filter(|r| {
+                (r.text.contains("absolutely")
+                    || r.text.contains("several")
+                    || r.text.contains("reasonable")
+                    || r.text.contains("terminal"))
+                    && r.text.contains(glyph)
+            })
+            .count();
+        assert!(
+            cont_with_spine >= 2,
+            "wrapped reply continuation rows carry the spine"
+        );
+        // The user row carries the spine glyph (no longer a bare leading space).
+        let user_row = rows
+            .iter()
+            .find(|r| r.text.contains("hi there"))
+            .expect("user row present");
+        assert!(
+            user_row.text.contains(glyph),
+            "user row carries the spine: {:?}",
+            user_row.text
+        );
+        // The system row carries the spine glyph too.
+        let sys_row = rows
+            .iter()
+            .find(|r| r.text.contains("config saved"))
+            .expect("system row present");
+        assert!(
+            sys_row.text.contains(glyph),
+            "system row carries the spine: {:?}",
+            sys_row.text
+        );
+    }
+
+    #[test]
+    fn user_message_is_a_full_width_background_bubble() {
+        // HARD REQ 2: the user-message tint reads as one solid block to the FULL
+        // transcript width, not just the text width (the old ragged-right bug).
+        let mut app = app_with(Some("offline"));
+        app.history.clear();
+        push_msg(&mut app, ChatRole::You, "short");
+        let w = 50u16;
+        let rows = transcript_cell_rows(&app, w, 20);
+        let user_row = rows
+            .iter()
+            .find(|r| r.text.contains("short"))
+            .expect("user row present");
+        let bg = theme::USER_MSG_BG();
+        // The tint must extend WELL past the 5-char word — to (near) the right
+        // edge of the transcript. We count the user-bg cells and require them to
+        // span most of the row, proving it's a block bubble.
+        let tinted = user_row.bgs.iter().filter(|c| **c == Some(bg)).count();
+        assert!(
+            tinted >= usize::from(w) / 2,
+            "user tint fills the row, not just the word: {tinted} of {w}"
+        );
+        // And specifically: cells well to the RIGHT of the word still carry the
+        // tint (the ragged-right regression would leave them on the default bg).
+        let tinted_far_right = user_row
+            .bgs
+            .iter()
+            .rev()
+            .take(8)
+            .filter(|c| **c == Some(bg))
+            .count();
+        assert!(
+            tinted_far_right >= 4,
+            "the tint reaches the right side of the bubble: {:?}",
+            user_row.text
+        );
+    }
+
+    #[test]
+    fn host_and_umadev_seats_use_distinct_markers() {
+        // HARD REQ 3: the borrowed base (Host) and the UmaDev director read as
+        // different seats — same glyph family, different seat COLOR.
+        let (host_marker, host_color) = assistant_marker(ChatRole::Host);
+        let (uma_marker, uma_color) = assistant_marker(ChatRole::UmaDev);
+        assert_eq!(host_marker, uma_marker, "same glyph family, both filled circles");
+        assert_ne!(host_color, uma_color, "Host vs UmaDev are different seat colors");
+        assert_eq!(uma_color, theme::ACCENT(), "UmaDev director = brand accent");
+        assert_eq!(host_color, theme::SUCCESS(), "Host base = teammate success");
+        // And the spine bar colors also differ (You/Host/UmaDev/System/Gate).
+        assert_ne!(
+            theme::role_bar(ChatRole::Host),
+            theme::role_bar(ChatRole::UmaDev),
+            "Host and UmaDev spines are different colors"
+        );
+    }
+
+    #[test]
+    fn unified_gutter_aligns_user_assistant_system_continuation() {
+        // HARD REQ 4: every speaker hangs its body under the SAME unified gutter,
+        // so a wrapped paragraph's continuation rows all align — i.e. the spine
+        // glyph sits at one identical screen column across every spine-led row of
+        // EVERY speaker (Host prose, System line). That single column is the
+        // unified-gutter invariant; the marker on row 0 also occupies that column.
+        let glyph = spine_glyph();
+        let mut app = app_with(Some("offline"));
+        app.history.clear();
+        push_msg(
+            &mut app,
+            ChatRole::Host,
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu \
+             nu xi omicron pi rho sigma tau upsilon phi chi psi omega extra words",
+        );
+        push_msg(
+            &mut app,
+            ChatRole::System,
+            "system status one two three four five six seven eight nine ten \
+             eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen",
+        );
+        let rows = transcript_cell_rows(&app, 50, 40);
+        // The screen column of the spine glyph (char index == column for the
+        // ASCII content used here) must be identical on every spine-led row.
+        let mut cols: Vec<usize> = Vec::new();
+        for r in &rows {
+            if let Some(idx) = r.text.chars().position(|c| c == glyph) {
+                cols.push(idx);
+            }
+        }
+        assert!(
+            cols.len() >= 4,
+            "both wrapped messages contribute several spine-led rows: {cols:?}"
+        );
+        let first = cols[0];
+        assert!(
+            cols.iter().all(|&c| c == first),
+            "every spine-led row aligns its bar at the same gutter column: {cols:?}"
+        );
+        // And the content begins exactly GUTTER_W columns past the bar's column:
+        // the gutter is the bar glyph (1 col) + one pad space.
+        for r in &rows {
+            let chars: Vec<char> = r.text.chars().collect();
+            if chars.get(first) != Some(&glyph) {
+                continue;
+            }
+            // The cell right after the bar is the single pad space of the gutter.
+            assert_eq!(
+                chars.get(first + 1),
+                Some(&' '),
+                "the bar is followed by exactly one pad space (GUTTER_W=2): {:?}",
+                r.text
+            );
         }
     }
 

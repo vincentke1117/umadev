@@ -1753,6 +1753,20 @@ impl App {
                         // metric in (e.g. `(3 matches)`), never the raw dump.
                         t.result = read_only_metric(lang, &t.name, &preview);
                         batch = Some((t.name.clone(), t.count));
+                    } else if let Some(metric) = read_only_metric(lang, &t.name, &preview) {
+                        // A read-only tool (Grep/Glob) gets a clean metric line
+                        // (`3 matches`) instead of its raw output dump.
+                        t.result = Some(metric);
+                    } else if ok
+                        && matches!(
+                            t.name.as_str(),
+                            "Read" | "NotebookRead" | "LS" | "Glob" | "Grep" | "WebFetch"
+                        )
+                    {
+                        // A successful read: the tool row already names the target
+                        // (the arg), so the raw file/content dump is pure noise —
+                        // suppress it, matching the clean reference look.
+                        t.result = None;
                     } else {
                         t.result = if preview.trim().is_empty() {
                             None
