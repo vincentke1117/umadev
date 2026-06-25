@@ -530,6 +530,8 @@
 "tui.fold.expand_hint" = "Ctrl+R expand"
 # Folded diff-card header: file (+added −removed) · expand hint
 "tui.diff.collapsed" = "{} (+{} −{}) · {} to expand"
+# Truncation tail when an expanded diff exceeds the per-card line cap
+"tui.diff.truncated" = "… {} more lines (open the file to view)"
 # Prompt meta-row hints
 "tui.hint.palette" = "↑↓ choose · Tab autocomplete · Enter run"
 "tui.hint.gate_tag" = "[gate] gate `{}`"

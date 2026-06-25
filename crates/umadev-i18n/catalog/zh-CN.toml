@@ -530,6 +530,8 @@
 "tui.fold.expand_hint" = "Ctrl+R 展开"
 # 折叠的 diff 卡头部:文件 (+增 −删) · 展开提示
 "tui.diff.collapsed" = "{} (+{} −{}) · {} 展开"
+# 展开的 diff 渲染到行数上限后的截断尾巴(打开文件查看完整改动)
+"tui.diff.truncated" = "… 还有 {} 行(打开文件查看)"
 # 输入框下方提示行
 "tui.hint.palette" = "↑↓ 选择 · Tab 补全 · Enter 执行"
 "tui.hint.gate_tag" = "[gate] 闸门 `{}`"

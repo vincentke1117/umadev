@@ -470,6 +470,7 @@ mod tests {
             "tui.fold.collapsed",
             "tui.fold.expand_hint",
             "tui.diff.collapsed",
+            "tui.diff.truncated",
             "tui.help.edit.expand",
         ];
         let cats = catalogs();

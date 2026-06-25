@@ -373,6 +373,15 @@ pub struct DiffLine {
     pub line_no: Option<u32>,
     /// Raw line content (no leading +/-/space).
     pub text: String,
+    /// Word-level changed regions WITHIN this `+`/`-` line, as **byte** ranges
+    /// `(start, end)` into [`text`](Self::text) (already sorted, non-overlapping,
+    /// on char boundaries). Populated by pairing each deletion run with the
+    /// following insertion run and word-diffing the two sides
+    /// ([`FileDiff::from_tool_edit`]). When **empty** the renderer falls back to
+    /// whole-line emphasis (an unpaired line, a near-total rewrite that tripped
+    /// the change-ratio threshold, or a context row) — so an empty vec is the
+    /// safe default and the fail-open path.
+    pub changed: Vec<(usize, usize)>,
 }
 
 /// A contiguous block of changed + surrounding-context lines (one `@@` hunk),
@@ -455,6 +464,7 @@ impl FileDiff {
                         tag: ' ',
                         line_no: Some(new_no),
                         text,
+                        changed: Vec::new(),
                     });
                 }
                 ChangeTag::Delete => {
@@ -464,6 +474,7 @@ impl FileDiff {
                         tag: '-',
                         line_no: Some(old_no),
                         text,
+                        changed: Vec::new(),
                     });
                 }
                 ChangeTag::Insert => {
@@ -473,8 +484,53 @@ impl FileDiff {
                         tag: '+',
                         line_no: Some(new_no),
                         text,
+                        changed: Vec::new(),
                     });
                 }
+            }
+        }
+
+        // Word-level pass: pair each maximal run of consecutive `-` lines with
+        // the run of `+` lines that immediately follows it, line-up the two runs
+        // by position, and for each `(del_line, ins_line)` pair compute the
+        // changed byte ranges on BOTH sides (`similar::TextDiff::from_words`).
+        // The result is stored on `DiffLine.changed`, so the renderer can
+        // emphasise only the changed words and syntax-highlight the rest. Lines
+        // with no pair (a pure add / pure delete, or the ragged tail of an
+        // uneven run) keep `changed == []` → whole-line emphasis fallback. Fully
+        // local + fail-open: any anomaly leaves `changed` empty.
+        {
+            let mut i = 0;
+            while i < flat.len() {
+                if flat[i].tag != '-' {
+                    i += 1;
+                    continue;
+                }
+                // Maximal '-' run [i, del_end), then the immediately-following
+                // '+' run [del_end, ins_end).
+                let del_start = i;
+                let mut del_end = i;
+                while del_end < flat.len() && flat[del_end].tag == '-' {
+                    del_end += 1;
+                }
+                let ins_start = del_end;
+                let mut ins_end = ins_start;
+                while ins_end < flat.len() && flat[ins_end].tag == '+' {
+                    ins_end += 1;
+                }
+                // Pair the two runs position-by-position (the common prefix
+                // length); a ragged tail on either side stays whole-line.
+                let pairs = (del_end - del_start).min(ins_end - ins_start);
+                for k in 0..pairs {
+                    let (del_text, ins_text) =
+                        (flat[del_start + k].text.clone(), flat[ins_start + k].text.clone());
+                    let (del_ranges, ins_ranges) = word_diff_ranges(&del_text, &ins_text);
+                    flat[del_start + k].changed = del_ranges;
+                    flat[ins_start + k].changed = ins_ranges;
+                }
+                // Advance past whichever run(s) we consumed; if there was no
+                // following '+' run, still step past the '-' run.
+                i = ins_end.max(del_end);
             }
         }
 
@@ -539,6 +595,98 @@ impl FileDiff {
     pub fn total_rows(&self) -> usize {
         self.hunks.iter().map(|h| h.lines.len()).sum()
     }
+}
+
+/// Changed **byte** ranges `(start, end)` within one line — the word-level diff
+/// signal carried on [`DiffLine::changed`] and returned by [`word_diff_ranges`].
+/// Sorted, non-overlapping, on char boundaries. A named alias keeps the paired
+/// `(del, ins)` return type readable (and satisfies clippy's `type_complexity`).
+type WordRanges = Vec<(usize, usize)>;
+
+/// Above this change ratio a paired line is treated as a near-total rewrite:
+/// the word-level ranges are discarded (returned empty) so the renderer falls
+/// back to whole-line emphasis instead of confetti-highlighting almost every
+/// token. `changed_len / total_len` is measured in **bytes** on the longer side
+/// of the pair. `0.4` matches the task's noise-avoidance threshold.
+pub(crate) const DIFF_WORD_REWRITE_RATIO: f32 = 0.4;
+
+/// Word-level diff of a `(deleted_line, inserted_line)` pair.
+///
+/// Returns `(del_ranges, ins_ranges)` — the changed **byte** ranges on each
+/// side (sorted, non-overlapping, char-boundary-aligned, into the respective
+/// input string), suitable for slicing the line into "unchanged" vs "changed"
+/// spans. Uses `similar::TextDiff::from_words`, walking the change stream with a
+/// running byte cursor per side: a `Delete` advances + records on the old side,
+/// an `Insert` on the new side, an `Equal` advances both.
+///
+/// **Threshold fallback:** if the changed bytes exceed
+/// [`DIFF_WORD_REWRITE_RATIO`] of the longer side, BOTH range vectors come back
+/// empty (the caller then whole-line-highlights — a near-rewrite has no useful
+/// word signal). Two identical lines also yield `([], [])`.
+///
+/// **Fail-open + CJK-safe:** ranges are exact byte offsets accumulated from the
+/// word slices `similar` returns (themselves cut on grapheme/word boundaries),
+/// so they never split a UTF-8 sequence; the renderer width-measures the slices
+/// with `unicode-width`. Pure data, never panics.
+#[must_use]
+fn word_diff_ranges(del: &str, ins: &str) -> (WordRanges, WordRanges) {
+    use similar::{ChangeTag, TextDiff};
+
+    if del == ins {
+        return (Vec::new(), Vec::new());
+    }
+
+    let diff = TextDiff::from_words(del, ins);
+    let mut del_ranges: WordRanges = Vec::new();
+    let mut ins_ranges: WordRanges = Vec::new();
+    let (mut del_cur, mut ins_cur) = (0usize, 0usize);
+    let (mut del_changed, mut ins_changed) = (0usize, 0usize);
+
+    for change in diff.iter_all_changes() {
+        let len = change.value().len();
+        match change.tag() {
+            ChangeTag::Equal => {
+                del_cur += len;
+                ins_cur += len;
+            }
+            ChangeTag::Delete => {
+                push_range(&mut del_ranges, del_cur, del_cur + len);
+                del_cur += len;
+                del_changed += len;
+            }
+            ChangeTag::Insert => {
+                push_range(&mut ins_ranges, ins_cur, ins_cur + len);
+                ins_cur += len;
+                ins_changed += len;
+            }
+        }
+    }
+
+    // Near-total rewrite → drop the word signal, whole-line highlight instead.
+    let longer = del.len().max(ins.len()).max(1);
+    let changed = del_changed.max(ins_changed);
+    #[allow(clippy::cast_precision_loss)]
+    if (changed as f32) / (longer as f32) > DIFF_WORD_REWRITE_RATIO {
+        return (Vec::new(), Vec::new());
+    }
+
+    (del_ranges, ins_ranges)
+}
+
+/// Append `[start, end)` to `ranges`, coalescing with the previous range when
+/// they touch/overlap (so adjacent changed words render as one contiguous
+/// emphasis span instead of many). Empty ranges are ignored.
+fn push_range(ranges: &mut WordRanges, start: usize, end: usize) {
+    if end <= start {
+        return;
+    }
+    if let Some(last) = ranges.last_mut() {
+        if start <= last.1 {
+            last.1 = last.1.max(end);
+            return;
+        }
+    }
+    ranges.push((start, end));
 }
 
 /// The payload of one chat row — free text (rendered via the shared
@@ -11570,6 +11718,82 @@ mod tests {
             panic!("Diff card");
         };
         assert!(!d.collapsed, "Ctrl+R expands the folded diff");
+    }
+
+    #[test]
+    fn word_diff_marks_only_the_changed_token_on_each_side() {
+        // `const oldName = compute(input);` → `const newName = compute(input);`
+        // — only `oldName`/`newName` should carry a `changed` byte range; the
+        // surrounding tokens stay unchanged (empty around them). The rename is a
+        // small fraction of the line, well under the 0.4 rewrite threshold.
+        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
+            path: "x.ts".into(),
+            before: "const oldName = compute(input);\n".into(),
+            after: "const newName = compute(input);\n".into(),
+        });
+        let lines: Vec<&DiffLine> = d.hunks.iter().flat_map(|h| h.lines.iter()).collect();
+        let del = lines.iter().find(|l| l.tag == '-').expect("a - line");
+        let ins = lines.iter().find(|l| l.tag == '+').expect("a + line");
+        // Each side has exactly one changed region, and it covers the renamed
+        // identifier — not the whole line.
+        assert_eq!(del.changed.len(), 1, "one changed region on the - line");
+        assert_eq!(ins.changed.len(), 1, "one changed region on the + line");
+        let (ds, de) = del.changed[0];
+        let (is, ie) = ins.changed[0];
+        assert_eq!(&del.text[ds..de], "oldName", "the deleted word is marked");
+        assert_eq!(&ins.text[is..ie], "newName", "the inserted word is marked");
+        // The unchanged prefix `let ` and suffix ` = 1;` are NOT inside a range.
+        assert!(ds >= "let ".len(), "the leading `let ` stays unchanged");
+    }
+
+    #[test]
+    fn word_diff_falls_back_to_whole_line_on_a_near_total_rewrite() {
+        // A line replaced wholesale (almost no shared tokens) trips the 0.4
+        // rewrite ratio → both `changed` vecs come back empty so the renderer
+        // whole-line-highlights instead of confetti.
+        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
+            path: "x.rs".into(),
+            before: "alpha beta gamma delta\n".into(),
+            after: "one two three four five\n".into(),
+        });
+        let lines: Vec<&DiffLine> = d.hunks.iter().flat_map(|h| h.lines.iter()).collect();
+        for l in lines.iter().filter(|l| l.tag != ' ') {
+            assert!(
+                l.changed.is_empty(),
+                "a near-total rewrite drops the word signal: {:?}",
+                l.changed
+            );
+        }
+    }
+
+    #[test]
+    fn word_diff_is_cjk_byte_safe() {
+        // A single CJK token changed inside an otherwise-equal line: the byte
+        // ranges must land on char boundaries (slicing must not panic) and cover
+        // exactly the changed CJK run.
+        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
+            path: "x.md".into(),
+            before: "前缀 旧值 后缀\n".into(),
+            after: "前缀 新值 后缀\n".into(),
+        });
+        let lines: Vec<&DiffLine> = d.hunks.iter().flat_map(|h| h.lines.iter()).collect();
+        let del = lines.iter().find(|l| l.tag == '-').expect("a - line");
+        let ins = lines.iter().find(|l| l.tag == '+').expect("a + line");
+        // Every range must be on a char boundary (no panic when sliced).
+        for l in [del, ins] {
+            for &(s, e) in &l.changed {
+                assert!(l.text.is_char_boundary(s) && l.text.is_char_boundary(e));
+                let _ = &l.text[s..e]; // would panic if mis-aligned
+            }
+        }
+        assert!(
+            del.changed.iter().any(|&(s, e)| del.text[s..e].contains('旧')),
+            "the changed CJK token is marked on the - side"
+        );
+        assert!(
+            ins.changed.iter().any(|&(s, e)| ins.text[s..e].contains('新')),
+            "the changed CJK token is marked on the + side"
+        );
     }
 
     #[test]

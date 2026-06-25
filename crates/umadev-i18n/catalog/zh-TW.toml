@@ -530,6 +530,8 @@
 "tui.fold.expand_hint" = "Ctrl+R 展開"
 # 摺疊的 diff 卡片標頭:檔案 (+增 −刪) · 展開提示
 "tui.diff.collapsed" = "{} (+{} −{}) · {} 展開"
+# 展開的 diff 渲染到行數上限後的截斷尾巴(開啟檔案檢視完整變更)
+"tui.diff.truncated" = "… 還有 {} 行(開啟檔案檢視)"
 # 輸入框下方提示列
 "tui.hint.palette" = "↑↓ 選擇 · Tab 補全 · Enter 執行"
 "tui.hint.gate_tag" = "[gate] 閘門 `{}`"

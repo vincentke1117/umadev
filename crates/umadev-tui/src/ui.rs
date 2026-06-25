@@ -212,6 +212,43 @@ mod theme {
         dark: rgb(0xf8, 0x71, 0x71),  // red-400 — diff -
         light: rgb(0xb9, 0x1c, 0x1c), // red-700
     };
+    // ── Word-level diff emphasis (the actually-changed tokens within a line) ──
+    // Brighter than the base add/del fg so the changed word pops against the
+    // surrounding (normally syntax-highlighted) unchanged text — Claude-Code's
+    // word-diff read. Drawn from the same green/red ramp, one step toward white.
+    const DIFF_ADD_WORD_P: Pair = Pair {
+        dark: rgb(0x86, 0xef, 0xac),  // green-300 — changed token on a + line
+        light: rgb(0x16, 0x65, 0x34), // green-800 (deeper for white-bg contrast)
+    };
+    const DIFF_DEL_WORD_P: Pair = Pair {
+        dark: rgb(0xfc, 0xa5, 0xa5),  // red-300 — changed token on a - line
+        light: rgb(0x99, 0x1b, 0x1b), // red-800
+    };
+    /// Full-width row-background tint for a `+` diff line. Pre-mixed RGB: a LOW
+    /// blend of ANSI-green into the active panel background (dark uses a low
+    /// alpha so the tint is barely-there; light uses an even lower alpha so it
+    /// never washes out black text). NEVER a naked `Color::Green` — the value is
+    /// resolved here so a theme swap re-skins the whole card.
+    pub fn DIFF_ADD_BG() -> Color {
+        if IS_LIGHT.load(Ordering::Relaxed) {
+            // green mixed ~10% into the light panel bg (#eef2f7).
+            Color::Rgb(0xdc, 0xf0, 0xe2)
+        } else {
+            // green mixed ~16% into the dark panel bg (#1e2030).
+            Color::Rgb(0x1c, 0x2e, 0x2a)
+        }
+    }
+    /// Full-width row-background tint for a `-` diff line — the red counterpart
+    /// of [`DIFF_ADD_BG`], same low-alpha pre-mix policy. Never a naked color.
+    pub fn DIFF_DEL_BG() -> Color {
+        if IS_LIGHT.load(Ordering::Relaxed) {
+            // red mixed ~10% into the light panel bg.
+            Color::Rgb(0xf2, 0xdf, 0xe1)
+        } else {
+            // red mixed ~16% into the dark panel bg.
+            Color::Rgb(0x30, 0x22, 0x29)
+        }
+    }
     /// Subtle background tint for fenced code blocks — distinct from the prose
     /// background without shouting. Sits between BG_PANEL and BG_ELEMENT.
     pub fn CODE_BG() -> Color {
@@ -260,6 +297,11 @@ mod theme {
         DiffAdd,
         /// Diff removed line (`- …`).
         DiffDel,
+        /// The actually-changed token(s) on a `+` line (word-level emphasis) —
+        /// brighter than `DiffAdd` so the new word pops against unchanged text.
+        DiffAddWord,
+        /// The actually-changed token(s) on a `-` line (word-level emphasis).
+        DiffDelWord,
     }
 
     /// The single source of truth mapping a [`SynRole`] to a runtime-resolved
@@ -282,6 +324,8 @@ mod theme {
             SynRole::ListMarker => pick(&INFO_P),
             SynRole::DiffAdd => pick(&DIFF_ADD_P),
             SynRole::DiffDel => pick(&DIFF_DEL_P),
+            SynRole::DiffAddWord => pick(&DIFF_ADD_WORD_P),
+            SynRole::DiffDelWord => pick(&DIFF_DEL_WORD_P),
         }
     }
 
@@ -2372,7 +2416,11 @@ fn lang_hint_from_path(path: &str) -> Option<String> {
 /// **Fail-open:** pure formatting over already-built data; never panics. CJK
 /// content is width-measured (`disp_width`) so a wide glyph never miscounts the
 /// gutter.
-fn diff_to_lines(d: &FileDiff, lang: umadev_i18n::Lang) -> Vec<(Line<'static>, usize)> {
+fn diff_to_lines(
+    d: &FileDiff,
+    lang: umadev_i18n::Lang,
+    width: usize,
+) -> Vec<(Line<'static>, usize)> {
     let mut out: Vec<(Line<'static>, usize)> = Vec::new();
 
     // ── Folded: just the header with the expand hint ──────────────────────
@@ -2419,7 +2467,14 @@ fn diff_to_lines(d: &FileDiff, lang: umadev_i18n::Lang) -> Vec<(Line<'static>, u
 
     let lang_hint = lang_hint_from_path(&d.path);
     let last_hunk = d.hunks.len().saturating_sub(1);
-    for (hi, hunk) in d.hunks.iter().enumerate() {
+    // Per-card hard cap on rendered CONTENT rows when expanded: a pathological
+    // single hunk (e.g. a 2000-line rewrite that slipped under the fold
+    // threshold via context grouping) still can't flood the transcript. After
+    // the cap, a muted `… N more lines (open the file)` tail closes the body.
+    // Counts only +/-/context rows (not the dashed frames / hunk separators).
+    let mut content_rows = 0usize;
+    let mut truncated_remaining = 0usize;
+    'hunks: for (hi, hunk) in d.hunks.iter().enumerate() {
         // A thin separator between non-adjacent hunks (a dim "⋮" under the gutter).
         if hi > 0 {
             out.push((
@@ -2431,7 +2486,15 @@ fn diff_to_lines(d: &FileDiff, lang: umadev_i18n::Lang) -> Vec<(Line<'static>, u
                 2,
             ));
         }
-        for dl in &hunk.lines {
+        for (li, dl) in hunk.lines.iter().enumerate() {
+            if content_rows >= DIFF_EXPANDED_ROW_CAP {
+                // Everything not yet rendered, across THIS and the remaining
+                // hunks, folds into the tail count.
+                truncated_remaining = (hunk.lines.len() - li)
+                    + d.hunks[hi + 1..].iter().map(|h| h.lines.len()).sum::<usize>();
+                break 'hunks;
+            }
+            content_rows += 1;
             // Fixed-width left gutter (no left frame char — dashed top/bottom
             // only): marker + right-aligned line number + a space, width =
             // digits(max_line_no)+3 (marker + space-after-number + trailing
@@ -2439,30 +2502,46 @@ fn diff_to_lines(d: &FileDiff, lang: umadev_i18n::Lang) -> Vec<(Line<'static>, u
             let num = dl
                 .line_no
                 .map_or_else(|| " ".repeat(num_w), |n| format!("{n:>num_w$}"));
+            // Row background tint: a low-alpha green/red fill behind a +/- line
+            // (pre-mixed in the theme — never a naked Color), padded full-width
+            // below; a context row stays on the terminal background.
+            let row_bg = match dl.tag {
+                '+' => Some(theme::DIFF_ADD_BG()),
+                '-' => Some(theme::DIFF_DEL_BG()),
+                _ => None,
+            };
             let marker_role = match dl.tag {
                 '+' => SynRole::DiffAdd,
                 '-' => SynRole::DiffDel,
                 _ => SynRole::Muted,
             };
             let mut spans: Vec<Span<'static>> = Vec::new();
-            spans.push(role_span(
+            // Gutter span — carries the row bg too so the tint starts at column 0.
+            let mut gutter = role_span(
                 format!("{} {} ", dl.tag, num),
                 marker_role,
                 Modifier::empty(),
-            ));
-            // Content: syntax-highlight context/added lines per the file
-            // extension; a deletion is rendered uniformly in the delete color
-            // (the read is "this is gone", no need to re-color its tokens). An
-            // empty line still emits a (blank) row so line numbers stay
-            // continuous.
-            if dl.tag == '-' {
-                spans.push(role_span(
-                    dl.text.clone(),
-                    SynRole::DiffDel,
-                    Modifier::empty(),
-                ));
-            } else {
-                spans.extend(highlight_code_line(&dl.text, lang_hint.as_deref()));
+            );
+            if let Some(bg) = row_bg {
+                gutter.style = gutter.style.bg(bg);
+            }
+            spans.push(gutter);
+            // Content: word-level when the line carries changed ranges (the
+            // changed tokens pop in the brighter DiffAddWord/DiffDelWord role,
+            // the rest is normally syntax-highlighted — so a deletion is no
+            // longer one flat block of red). With no ranges it falls back to the
+            // whole-line treatment (+ = syntax-highlight, − = uniform del color).
+            spans.extend(diff_content_spans(dl, lang_hint.as_deref(), row_bg));
+            // Pad the row to the full card width with a bg-filled tail so the
+            // tint spans edge-to-edge (Claude-Code full-row diff background).
+            if let Some(bg) = row_bg {
+                let used: usize = spans.iter().map(|s| disp_width(&s.content)).sum();
+                if used < width {
+                    spans.push(Span::styled(
+                        " ".repeat(width - used),
+                        Style::default().bg(bg),
+                    ));
+                }
             }
             out.push((Line::from(spans), 2));
         }
@@ -2474,6 +2553,23 @@ fn diff_to_lines(d: &FileDiff, lang: umadev_i18n::Lang) -> Vec<(Line<'static>, u
             ));
         }
     }
+    // Truncation tail: when the expanded body hit the row cap, a muted line
+    // tells the user how many rows were elided (open the file to see the rest).
+    if truncated_remaining > 0 {
+        let tail = umadev_i18n::tf(
+            lang,
+            "tui.diff.truncated",
+            &[&truncated_remaining.to_string()],
+        );
+        out.push((
+            Line::from(role_span(tail, SynRole::Muted, Modifier::empty())),
+            2,
+        ));
+        out.push((
+            Line::from(role_span("┄┄┄┄┄┄┄┄┄┄", SynRole::Muted, Modifier::empty())),
+            2,
+        ));
+    }
     // An empty diff (no hunks) still closes its frame so it never looks broken.
     if d.hunks.is_empty() {
         out.push((
@@ -2482,6 +2578,106 @@ fn diff_to_lines(d: &FileDiff, lang: umadev_i18n::Lang) -> Vec<(Line<'static>, u
         ));
     }
     out
+}
+
+/// Hard cap on rendered content rows for an EXPANDED diff card — past this a
+/// muted `… N more lines` tail closes the body so one pathological hunk can't
+/// flood the transcript (the fold threshold handles the common big diff; this
+/// is the safety net for a hunk that grouped under it).
+pub(crate) const DIFF_EXPANDED_ROW_CAP: usize = 200;
+
+/// Build the styled content spans for ONE diff line, honouring its word-level
+/// `changed` ranges.
+///
+/// - **Changed segment** (inside a `[start,end)` range): emphasised in the
+///   brighter [`SynRole::DiffAddWord`] / [`SynRole::DiffDelWord`] role so the
+///   actually-edited token pops.
+/// - **Unchanged segment** (between ranges): on a `+`/context line it is run
+///   through the normal syntax highlighter ([`highlight_code_line`]); on a `-`
+///   line it stays in the muted base delete color (it's gone — no need to fully
+///   re-syntax it, but it's NOT confetti-red either).
+/// - **No ranges** (`changed` empty → unpaired line / rewrite-threshold
+///   fallback / context row): the whole line falls back to the prior behaviour
+///   (`+`/context = syntax-highlight, `−` = uniform delete color).
+///
+/// `row_bg`, when set, is layered behind every emitted span so the tint is
+/// continuous under both changed and unchanged text. **CJK/UTF-8 safe:** the
+/// ranges are byte offsets on char boundaries (built from `similar`'s word
+/// slices); each segment is sliced on those boundaries, so a wide glyph is
+/// never split. **Fail-open:** a malformed range (out of bounds / not on a char
+/// boundary / mis-ordered) makes the whole line fall back to the no-range path.
+fn diff_content_spans(
+    dl: &crate::app::DiffLine,
+    lang_hint: Option<&str>,
+    row_bg: Option<Color>,
+) -> Vec<Span<'static>> {
+    let with_bg = |mut spans: Vec<Span<'static>>| -> Vec<Span<'static>> {
+        if let Some(bg) = row_bg {
+            for s in &mut spans {
+                s.style = s.style.bg(bg);
+            }
+        }
+        spans
+    };
+
+    // Whole-line fallback: no word ranges, OR any range is unusable.
+    let ranges_ok = !dl.changed.is_empty()
+        && dl.changed.iter().all(|&(s, e)| {
+            s < e && e <= dl.text.len() && dl.text.is_char_boundary(s) && dl.text.is_char_boundary(e)
+        })
+        // Strictly increasing, non-overlapping (push_range guarantees this, but
+        // we re-check so a corrupt vec can never panic the slicer below).
+        && dl
+            .changed
+            .windows(2)
+            .all(|w| w[0].1 <= w[1].0);
+    if !ranges_ok {
+        let base = if dl.tag == '-' {
+            vec![role_span(dl.text.clone(), SynRole::DiffDel, Modifier::empty())]
+        } else {
+            highlight_code_line(&dl.text, lang_hint)
+        };
+        return with_bg(base);
+    }
+
+    let word_role = if dl.tag == '-' {
+        SynRole::DiffDelWord
+    } else {
+        SynRole::DiffAddWord
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize;
+    for &(s, e) in &dl.changed {
+        // Unchanged segment before this changed range.
+        if s > cursor {
+            let seg = &dl.text[cursor..s];
+            if dl.tag == '-' {
+                // A deletion's unchanged text stays in the base delete color
+                // (muted), so only the changed token is emphasised — not the
+                // whole line re-coloured.
+                spans.push(role_span(seg.to_string(), SynRole::DiffDel, Modifier::empty()));
+            } else {
+                spans.extend(highlight_code_line(seg, lang_hint));
+            }
+        }
+        // The changed segment itself — emphasised, bold for extra contrast.
+        spans.push(role_span(
+            dl.text[s..e].to_string(),
+            word_role,
+            Modifier::BOLD,
+        ));
+        cursor = e;
+    }
+    // Trailing unchanged tail.
+    if cursor < dl.text.len() {
+        let seg = &dl.text[cursor..];
+        if dl.tag == '-' {
+            spans.push(role_span(seg.to_string(), SynRole::DiffDel, Modifier::empty()));
+        } else {
+            spans.extend(highlight_code_line(seg, lang_hint));
+        }
+    }
+    with_bg(spans)
 }
 
 /// Render one structured tool call as a single status line plus (when present
@@ -2647,7 +2843,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         // Handled here for the same reason: it has its own renderer, never the
         // prose path.
         if let MessageBody::Diff(d) = &msg.kind {
-            rendered.extend(diff_to_lines(d, app.lang));
+            rendered.extend(diff_to_lines(d, app.lang, area.width as usize));
             continue;
         }
 
@@ -5236,7 +5432,7 @@ mod tests {
             before: "let x = 1;\nlet y = 2;\n".into(),
             after: "let x = 1;\nlet y = 3;\n".into(),
         });
-        let lines = diff_to_lines(&d, umadev_i18n::Lang::En);
+        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, 80);
         // Header carries the path + the +N −M metric in add/del colors.
         let header: String = lines[0]
             .0
@@ -5277,6 +5473,175 @@ mod tests {
     }
 
     #[test]
+    fn word_diff_renders_only_the_changed_token_in_the_word_role() {
+        use crate::app::FileDiff;
+        // `const oldName = compute(input);` → `const newName = compute(input);`
+        // The rename is a small fraction (under the 0.4 fallback), so only the
+        // `oldName`/`newName` token should paint in the bright DiffAddWord /
+        // DiffDelWord role; the surrounding code keeps its NORMAL syntax colors
+        // (on the + line) / the muted delete color (on the − line), NOT the
+        // word-emphasis color.
+        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
+            path: "x.ts".into(),
+            before: "const oldName = compute(input);\n".into(),
+            after: "const newName = compute(input);\n".into(),
+        });
+        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, 80);
+        let add_word = theme::syn_color(SynRole::DiffAddWord);
+        let del_word = theme::syn_color(SynRole::DiffDelWord);
+
+        // Collect, per +/− row, the text painted in the WORD-emphasis role.
+        let mut add_emph = String::new();
+        let mut del_emph = String::new();
+        for (line, _) in &lines {
+            let Some(first) = line.spans.first() else {
+                continue;
+            };
+            let g = first.content.as_ref();
+            let is_add = g.starts_with('+');
+            let is_del = g.starts_with('-');
+            if !is_add && !is_del {
+                continue;
+            }
+            for s in line.spans.iter().skip(1) {
+                if is_add && s.style.fg == Some(add_word) {
+                    add_emph.push_str(&s.content);
+                } else if is_del && s.style.fg == Some(del_word) {
+                    del_emph.push_str(&s.content);
+                }
+            }
+        }
+        assert_eq!(add_emph, "newName", "only the renamed token is emphasised (+)");
+        assert_eq!(del_emph, "oldName", "only the renamed token is emphasised (−)");
+    }
+
+    #[test]
+    fn deletion_line_unchanged_tokens_are_not_all_one_red_block() {
+        use crate::app::FileDiff;
+        // A small change inside a longer line: the − line's UNCHANGED tokens must
+        // NOT all be painted in the bright word-del color — only the changed
+        // token is. (Pre-fix the whole − line was one flat block.)
+        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
+            path: "x.rs".into(),
+            before: "let total = sum_all(items, 1);\n".into(),
+            after: "let total = sum_all(items, 2);\n".into(),
+        });
+        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, 80);
+        let del_word = theme::syn_color(SynRole::DiffDelWord);
+        // Find the − row and count how many of its content chars are in the
+        // word-emphasis color — it must be a small minority (just the `1`).
+        for (line, _) in &lines {
+            let Some(first) = line.spans.first() else {
+                continue;
+            };
+            if !first.content.as_ref().starts_with('-') {
+                continue;
+            }
+            let mut emph = 0usize;
+            let mut total = 0usize;
+            for s in line.spans.iter().skip(1) {
+                let n = s.content.chars().filter(|c| !c.is_whitespace()).count();
+                total += n;
+                if s.style.fg == Some(del_word) {
+                    emph += n;
+                }
+            }
+            // The emphasised portion is a small minority — the bulk of the line
+            // (the unchanged `let total = sum_all(items, …)`) is NOT word-red.
+            assert!(
+                total > emph * 3,
+                "the changed token is a small minority of the − line; the rest \
+                 is not one red block (emph={emph}, total={total})"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_rows_carry_a_full_width_background_tint() {
+        use crate::app::FileDiff;
+        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
+            path: "x.rs".into(),
+            before: "let y = 2;\n".into(),
+            after: "let y = 3;\n".into(),
+        });
+        let width = 40usize;
+        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, width);
+        let add_bg = theme::DIFF_ADD_BG();
+        let del_bg = theme::DIFF_DEL_BG();
+        let mut saw_full_add = false;
+        let mut saw_full_del = false;
+        for (line, _) in &lines {
+            let Some(first) = line.spans.first() else {
+                continue;
+            };
+            let g = first.content.as_ref();
+            let (is_add, is_del) = (g.starts_with('+'), g.starts_with('-'));
+            if !is_add && !is_del {
+                continue;
+            }
+            // Every span on the row carries the row bg, and the painted width
+            // (sum of display widths) reaches the full card width.
+            let want = if is_add { add_bg } else { del_bg };
+            let painted: usize = line.spans.iter().map(|s| disp_width(&s.content)).sum();
+            let all_bg = line.spans.iter().all(|s| s.style.bg == Some(want));
+            assert!(all_bg, "every span on a +/- row carries the row bg");
+            assert_eq!(painted, width, "the row is padded to the full card width");
+            if is_add {
+                saw_full_add = true;
+            } else {
+                saw_full_del = true;
+            }
+        }
+        assert!(saw_full_add && saw_full_del, "both +/- rows got a full-width tint");
+    }
+
+    #[test]
+    fn expanded_diff_truncates_with_a_muted_tail() {
+        use crate::app::{FileDiff, DiffHunk, DiffLine};
+        // Build (by hand) an EXPANDED card whose single hunk exceeds the row cap,
+        // so the renderer must stop and emit a `… N more lines` tail. (Building
+        // it directly avoids relying on the fold heuristics.)
+        let n = super::DIFF_EXPANDED_ROW_CAP + 25;
+        let lines: Vec<DiffLine> = (0..n)
+            .map(|i| DiffLine {
+                tag: '+',
+                line_no: Some(u32::try_from(i).unwrap_or(0) + 1),
+                text: format!("row {i}"),
+                changed: Vec::new(),
+            })
+            .collect();
+        let d = FileDiff {
+            path: "big.rs".into(),
+            added: u32::try_from(n).unwrap_or(0),
+            removed: 0,
+            hunks: vec![DiffHunk { lines }],
+            collapsed: false, // explicitly expanded
+        };
+        let out = diff_to_lines(&d, umadev_i18n::Lang::En, 80);
+        let joined: String = out
+            .iter()
+            .flat_map(|(l, _)| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        // Exactly the cap's worth of `+` content rows render, then the tail.
+        let plus_rows = out
+            .iter()
+            .filter(|(l, _)| {
+                l.spans
+                    .first()
+                    .is_some_and(|s| s.content.as_ref().starts_with('+'))
+            })
+            .count();
+        assert_eq!(plus_rows, super::DIFF_EXPANDED_ROW_CAP, "renders up to the cap");
+        // The muted tail names the elided remainder (25 rows).
+        assert!(joined.contains("25"), "tail names the remaining rows: {joined:?}");
+        assert!(
+            joined.contains("more lines") || joined.contains('行'),
+            "tail is the truncation message: {joined:?}"
+        );
+    }
+
+    #[test]
     fn collapsed_diff_card_renders_only_the_header_with_expand_hint() {
         use crate::app::FileDiff;
         // A big diff defaults collapsed → just the header + the Ctrl+R hint.
@@ -5291,7 +5656,7 @@ mod tests {
             after,
         });
         assert!(d.collapsed);
-        let lines = diff_to_lines(&d, umadev_i18n::Lang::En);
+        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, 80);
         assert_eq!(lines.len(), 1, "folded card is a single header row");
         let text: String = lines[0]
             .0
