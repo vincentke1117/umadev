@@ -2006,6 +2006,13 @@ async fn drive_agentic_stream(
     };
     match brain.complete_streaming(request, &on_event).await {
         Ok(resp) => {
+            // (0) Surface the base's REAL token usage for this turn so the UI's live
+            // session total reflects true consumption (the base's own numbers), not
+            // an estimate or the all-time ledger.
+            sink.emit(EngineEvent::TurnUsage {
+                input_tokens: resp.usage.input_tokens,
+                output_tokens: resp.usage.output_tokens,
+            });
             // (2) Post-turn fact check — snapshot git AGAIN and diff against the
             // pre-turn snapshot to get the files THIS turn actually changed on
             // disk. Fail-open: if either snapshot is missing (non-git / git
@@ -3162,15 +3169,14 @@ fn setup_terminal() -> Result<Term> {
     // IME commits, which most terminals deliver as a paste) arrive as one
     // atomic `Event::Paste` instead of a scrambled stream of `Char` events.
     stdout.execute(EnableBracketedPaste).map_err(fail)?;
-    // Mouse capture is ON by default so the WHEEL scrolls the transcript — the
-    // thing users reach for first. (We're on the alternate screen, which has no
-    // native terminal scrollback, so without capture the wheel did nothing at all
-    // — "scroll up shows nothing".) To select + copy text, hold Shift (or Option
-    // on macOS) for the terminal's native click-drag, or run `/mouse` to turn
-    // capture OFF. The transcript also scrolls via the keyboard (PageUp/PageDown,
-    // Home/End, Shift+↑/↓, Ctrl+Alt+U/D). Teardown + the panic hook
-    // DisableMouseCapture so the terminal is never left in mouse-reporting mode.
-    stdout.execute(EnableMouseCapture).map_err(fail)?;
+    // Mouse capture is OFF by default so the terminal's native click-drag text
+    // SELECTION + copy keep working — the more essential need for a coding tool.
+    // The transcript scrolls via the keyboard (PageUp/PageDown, Home/End,
+    // Shift+↑/↓, Ctrl+Alt+U/D); `/mouse` opts INTO wheel-scroll (which then takes
+    // over selection). (We're on the alternate screen, which has no native
+    // scrollback, so the wheel can't both scroll AND leave selection intact here —
+    // claude-code gets both only by rendering on the MAIN screen, not the alt
+    // screen.) Teardown + the panic hook DisableMouseCapture regardless.
     // Show the terminal cursor so the user sees a blinking caret in the
     // input box (positioned via frame.set_cursor_position in render_prompt).
     stdout.execute(crossterm::cursor::Show).map_err(fail)?;

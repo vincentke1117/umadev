@@ -1300,7 +1300,7 @@ async fn drive_one_turn(
                 // + whatever streamed before the cut) — record the estimate so `/usage`
                 // is honest about cost on a failed turn, not just a clean one. No
                 // `TurnDone` arrived → no real usage available, so estimate (F3).
-                record_turn_usage(options, None, est_tokens);
+                record_turn_usage(options, events, None, est_tokens);
                 return Err("base session ended mid-turn".to_string());
             }
             IdleEvent::IdleTimedOut => {
@@ -1309,7 +1309,7 @@ async fn drive_one_turn(
                 // blocking forever (the interrupt was already issued, bounded).
                 // LOW #2: record the tokens spent up to the hang (fail-open). The
                 // turn hung with no `TurnDone` → estimate (no real usage). F3.
-                record_turn_usage(options, None, est_tokens);
+                record_turn_usage(options, events, None, est_tokens);
                 return Err(idle_reason(idle));
             }
         };
@@ -1371,7 +1371,7 @@ async fn drive_one_turn(
                     // LOW #2: a turn that dies on the approval round-trip still spent
                     // its tokens — record the estimate (fail-open) before bailing. No
                     // `TurnDone` yet → estimate (F3).
-                    record_turn_usage(options, None, est_tokens);
+                    record_turn_usage(options, events, None, est_tokens);
                     return Err(format!("session respond: {e}"));
                 }
             }
@@ -1383,7 +1383,7 @@ async fn drive_one_turn(
                     // Wave 2 deliverable 4: record usage + distil pitfalls on the
                     // DEFAULT loop, for every base. Both fail-open. F3: prefer the
                     // base's REAL reported usage, fall back to the chars/4 estimate.
-                    record_turn_usage(options, usage, est_tokens);
+                    record_turn_usage(options, events, usage, est_tokens);
                     capture_turn_pitfalls(options, events, &pitfalls);
                     return Ok(TurnResult { text });
                 }
@@ -1392,11 +1392,11 @@ async fn drive_one_turn(
                 // reflects the real cost of a turn that didn't finish clean. F3: a
                 // Failed/Interrupted `TurnDone` may still carry real usage — use it.
                 TurnStatus::Interrupted => {
-                    record_turn_usage(options, usage, est_tokens);
+                    record_turn_usage(options, events, usage, est_tokens);
                     return Err("director turn interrupted".to_string());
                 }
                 TurnStatus::Failed(reason) => {
-                    record_turn_usage(options, usage, est_tokens);
+                    record_turn_usage(options, events, usage, est_tokens);
                     return Err(reason);
                 }
             },
@@ -1446,7 +1446,22 @@ pub(crate) fn real_or_estimated_tokens(usage: Option<Usage>, est_tokens: u64) ->
 /// is real on the default loop for all three bases — preferring the base's REAL
 /// reported usage and falling back to the `chars/4` estimate (F3). Fail-open: a
 /// zero count / a write error is a no-op. Mirrors [`crate::runner::record_usage`].
-fn record_turn_usage(options: &RunOptions, usage: Option<Usage>, est_tokens: u64) {
+fn record_turn_usage(
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    usage: Option<Usage>,
+    est_tokens: u64,
+) {
+    // Surface the base's REAL reported usage to the live UI session total — only
+    // the real path (an estimate is not the base's own number, so we don't inflate
+    // the live count with it). The ledger row below still records the estimate
+    // fallback so `/usage` stays honest.
+    if let Some(u) = &usage {
+        events.emit(EngineEvent::TurnUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        });
+    }
     record_estimated_usage(
         &options.backend,
         real_or_estimated_tokens(usage, est_tokens),

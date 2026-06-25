@@ -111,6 +111,16 @@ pub enum EngineEvent {
     },
     /// A human-readable progress note (free-form).
     Note(String),
+    /// Real per-turn token usage as REPORTED BY THE BASE (input + output), emitted
+    /// once per completed base turn (a chat reply or a build step). The UI sums
+    /// these into a live session total — true consumption, not an estimate. Zero
+    /// when the base reports nothing for the turn.
+    TurnUsage {
+        /// Tokens consumed from the request this turn.
+        input_tokens: u32,
+        /// Tokens produced in the response this turn.
+        output_tokens: u32,
+    },
     /// A **transient, in-place status line** — NOT a transcript entry. Used by
     /// the long-phase heartbeat for its periodic "still working (mm:ss)" beats:
     /// a UI overwrites a single status field with `Some(text)` and clears it on

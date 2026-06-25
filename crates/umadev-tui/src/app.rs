@@ -1111,10 +1111,10 @@ pub struct App {
     /// within a short window actually cancels. `None` = not armed.
     pub interrupt_armed_at: Option<std::time::Instant>,
 
-    /// Cumulative REAL token usage for the session (input+output), read from the
-    /// usage ledger (`usage_report()`), surfaced on the waiting indicator as a
-    /// running total (e.g. `≈452K tok`). Cached + refreshed on a throttle in
-    /// `tick()` so the indicator shows true consumption, not a per-turn char guess.
+    /// REAL token usage for THIS session (input+output), accumulated from the
+    /// base's own per-turn reports (`EngineEvent::TurnUsage`, F3) — true
+    /// consumption, the base's numbers, NOT an estimate or the all-time ledger.
+    /// Starts at 0 each launch and grows per turn; shown on the waiting indicator.
     pub session_tokens: u64,
 
     /// One-line status shown in the top bar.
@@ -1304,7 +1304,7 @@ impl App {
             input_text_cols: std::cell::Cell::new(0),
             // OFF by default so native click-drag text selection / copy keeps
             // working; `/mouse` opts into wheel-scroll (and takes over selection).
-            mouse_scroll: true,
+            mouse_scroll: false,
             conversation: Vec::new(),
             host_chat_session_active: false,
             chat_session_id: None,
@@ -2999,6 +2999,17 @@ impl App {
                 if !appended {
                     self.push(ChatRole::Host, trimmed);
                 }
+            }
+            EngineEvent::TurnUsage {
+                input_tokens,
+                output_tokens,
+            } => {
+                // Accumulate the base's REAL reported per-turn usage into the live
+                // session total shown on the waiting indicator — true consumption
+                // (the base's own numbers), accruing across this session's turns.
+                self.session_tokens = self
+                    .session_tokens
+                    .saturating_add(u64::from(input_tokens) + u64::from(output_tokens));
             }
             EngineEvent::Note(note) => {
                 // A TERMINAL-ABORT note (a block that returned `Err` → produced
@@ -7134,13 +7145,6 @@ impl App {
     /// so the spinner glyph actually rotates while a phase is running.
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
-        // Refresh the REAL cumulative token total off the usage ledger on a throttle
-        // (~once at startup, then every ~2s). It's a file read — far too costly
-        // per-frame, fine here — so the waiting indicator shows true consumption
-        // instead of a per-turn character guess.
-        if self.tick == 1 || self.tick.is_multiple_of(25) {
-            self.session_tokens = umadev_agent::runner::usage_report().total_tokens;
-        }
         self.refresh_status();
     }
 
@@ -8325,25 +8329,25 @@ mod tests {
     fn slash_mouse_emits_set_capture_action_and_uses_i18n() {
         let mut app = fresh_app(Some("offline"));
         assert!(
-            app.mouse_scroll,
-            "wheel scroll defaults ON (the alt screen has no native scrollback, so the wheel must drive the app)"
+            !app.mouse_scroll,
+            "wheel scroll defaults OFF (native click-drag copy stays usable)"
         );
-        // First toggle turns it OFF → emits SetMouseCapture(false) so the event
-        // loop issues the real DisableMouseCapture (native click-drag selection).
+        // Turning ON must emit SetMouseCapture(true) so the event loop issues the
+        // real EnableMouseCapture, not just flip a bool.
         let action = app.slash_toggle_mouse();
-        assert_eq!(action, Action::SetMouseCapture(false));
-        assert!(!app.mouse_scroll);
+        assert_eq!(action, Action::SetMouseCapture(true));
+        assert!(app.mouse_scroll);
         // The pushed status line must be the i18n string, not a raw literal.
         let last = app.history.back().expect("a status line was pushed");
         assert_eq!(
             last.body(),
-            umadev_i18n::t(app.lang, "slash.mouse_off"),
+            umadev_i18n::t(app.lang, "slash.mouse_on"),
             "/mouse status text must come from the i18n catalog"
         );
-        // Toggling back ON emits SetMouseCapture(true).
+        // Toggling back OFF emits SetMouseCapture(false).
         let action = app.slash_toggle_mouse();
-        assert_eq!(action, Action::SetMouseCapture(true));
-        assert!(app.mouse_scroll);
+        assert_eq!(action, Action::SetMouseCapture(false));
+        assert!(!app.mouse_scroll);
     }
 
     #[test]
@@ -8365,12 +8369,12 @@ mod tests {
     #[test]
     fn slash_mouse_toggles_wheel_scroll_flag() {
         let mut app = fresh_app(Some("offline"));
-        assert!(app.mouse_scroll, "wheel scroll defaults ON");
+        assert!(!app.mouse_scroll, "wheel scroll defaults off");
         for c in "/mouse".chars() {
             let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
         }
         let _ = app.apply_key(crossterm::event::KeyCode::Enter);
-        assert!(!app.mouse_scroll, "/mouse turns the wheel binding off (back to native selection)");
+        assert!(app.mouse_scroll, "/mouse turns the wheel binding on");
     }
 
     #[test]

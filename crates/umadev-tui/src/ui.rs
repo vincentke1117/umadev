@@ -3299,7 +3299,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         // Cumulative REAL token consumption (read from the usage ledger), not a
         // per-turn character guess — shows true total spend (e.g. `≈452K tok`).
         let tok_part = if app.session_tokens > 0 {
-            format!(" · ≈{} tok", fmt_token_count(app.session_tokens))
+            format!(" · ≈{} token", fmt_token_count(app.session_tokens))
         } else {
             String::new()
         };
@@ -4230,7 +4230,9 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
         // it. Animated so a sent message never looks frozen while the base replies.
         match &app.stream_tool_batch {
             Some((tool, _)) => format!("{} {tool}", app.spinner()),
-            None => format!("{} {}s", app.spinner(), app.thinking_elapsed_secs()),
+            // No tool running → show nothing here (the "正在思考" indicator above the
+            // input already conveys aliveness + elapsed; a corner timer was redundant).
+            None => String::new(),
         }
     } else if app.aborted {
         // Dedicated terminal branch — an aborted round reads as `[aborted]` here
