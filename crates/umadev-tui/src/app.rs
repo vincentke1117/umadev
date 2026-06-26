@@ -1455,18 +1455,12 @@ impl App {
     /// `--model`, so the base is driven on exactly its own model.
     #[must_use]
     pub fn effective_model(&self) -> String {
-        if let Some(m) = self.config.model.as_deref() {
-            if !m.trim().is_empty() {
-                return m.to_string();
-            }
-        }
-        if let Some(b) = self.backend.as_deref() {
-            if !b.is_empty() && b != "offline" {
-                if let Some(m) = crate::detect_base_model(b, &self.project_root) {
-                    return m;
-                }
-            }
-        }
+        // UmaDev manages NO model: it forwards nothing to the base, so the base
+        // ALWAYS runs whatever it is configured / logged in with (an official
+        // subscription OR a third-party / local-model routing the user set up in
+        // the base itself) — UmaDev just calls it. Returning empty makes every
+        // session start omit the `model` field; `detect_base_model` is still used
+        // purely to SHOW the user which model their base runs (never to impose one).
         String::new()
     }
 
@@ -2439,7 +2433,6 @@ impl App {
             "offline",
             "fall back to offline templates (demo / CI, not a real base)",
         ),
-        ("model", "set the model id (e.g. /model claude-opus-4-7)"),
         ("lang", "switch UI language: /lang [zh-CN|zh-TW|en]"),
         (
             "setup",
@@ -4912,107 +4905,14 @@ impl App {
         Action::BackendChanged
     }
 
-    fn slash_model(&mut self, arg: &str) -> Action {
-        if arg.is_empty() {
-            let current = self
-                .config
-                .model
-                .clone()
-                .unwrap_or_else(|| umadev_i18n::t(self.lang, "model.base_default").to_string());
-            // Per-base menu — the valid ids differ by base, so a generic list
-            // would just invite typos that fail on the next run.
-            let menu = match self.backend.as_deref() {
-                Some("claude-code") => umadev_i18n::t(self.lang, "model.menu.claude"),
-                Some("codex") => umadev_i18n::t(self.lang, "model.menu.codex"),
-                Some("opencode") => umadev_i18n::t(self.lang, "model.menu.opencode"),
-                _ => umadev_i18n::t(self.lang, "model.menu.external"),
-            };
-            self.push(
-                ChatRole::System,
-                umadev_i18n::tf(self.lang, "model.current", &[&current, menu]),
-            );
-            // Surface per-phase tiers so a configured split is visible (and the
-            // feature is discoverable for those who haven't set it).
-            let plan = self.config.model_plan.as_deref();
-            let build = self.config.model_build.as_deref();
-            if plan.is_some() || build.is_some() {
-                let default = umadev_i18n::t(self.lang, "model.tiers_default");
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::tf(
-                        self.lang,
-                        "model.tiers_current",
-                        &[plan.unwrap_or(default), build.unwrap_or(default)],
-                    ),
-                );
-            } else {
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::t(self.lang, "model.tiers_hint").to_string(),
-                );
-            }
-            return Action::None;
-        }
-        // Per-phase model TIERS: `/model plan <m>` / `/model build <m>` (or
-        // `... off` to clear). Plan with a cheaper/faster model, write code with
-        // a stronger one — the per-phase model assignment top agents converged on.
-        let mut parts = arg.splitn(2, char::is_whitespace);
-        let head = parts.next().unwrap_or("");
-        if head == "plan" || head == "build" {
-            // apply_model_tiers mutates process-global env (set_var); a running
-            // worker reads that same env on another thread. Refuse mid-run so we
-            // never race a concurrent env read (a data race in edition 2021).
-            if self.is_pipeline_active() {
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::t(self.lang, "model.tiers_busy").to_string(),
-                );
-                return Action::None;
-            }
-            let value = parts.next().unwrap_or("").trim();
-            let cleared = value.is_empty() || value.eq_ignore_ascii_case("off");
-            let slot = if head == "plan" {
-                &mut self.config.model_plan
-            } else {
-                &mut self.config.model_build
-            };
-            *slot = if cleared {
-                None
-            } else {
-                Some(value.to_string())
-            };
-            self.config.apply_model_tiers();
-            // Don't claim the change persisted if the write failed — the next
-            // launch would silently revert. Surface the reason as a System note.
-            if let Err(e) = crate::config::save_to(&self.config, &self.config_path) {
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::tf(self.lang, "config.save_failed_note", &[&e.to_string()]),
-                );
-            }
-            let default = umadev_i18n::t(self.lang, "model.tiers_default_paren");
-            let plan = self.config.model_plan.as_deref().unwrap_or(default);
-            let build = self.config.model_build.as_deref().unwrap_or(default);
-            self.push(
-                ChatRole::System,
-                umadev_i18n::tf(self.lang, "model.tiers_updated", &[plan, build]),
-            );
-            return Action::None;
-        }
-        self.config.model = Some(arg.to_string());
-        if let Err(e) = crate::config::save_to(&self.config, &self.config_path) {
-            self.push(
-                ChatRole::System,
-                umadev_i18n::tf(
-                    self.lang,
-                    "config.write_failed",
-                    &[&self.config_path.display().to_string(), &e.to_string()],
-                ),
-            );
-        }
+    fn slash_model(&mut self, _arg: &str) -> Action {
+        // UmaDev does NOT manage the model. It forwards nothing to the base,
+        // which runs whatever it is configured / logged in with — so switching
+        // the model here would have no effect. Tell the user where the model
+        // actually lives (the base) instead of pretending to change it.
         self.push(
             ChatRole::System,
-            umadev_i18n::tf(self.lang, "model.switched", &[arg]),
+            umadev_i18n::t(self.lang, "model.unmanaged").to_string(),
         );
         Action::None
     }
@@ -5894,7 +5794,6 @@ impl App {
         body.push_str("\n## How to change\n\n");
         body.push_str("  /claude /codex /opencode      switch base CLI (or /offline)\n");
         body.push_str("  /manual  /auto                review mode: pause vs autonomous\n");
-        body.push_str("  /model <id>                   override the base's model\n");
         body.push_str("  /design <name>                switch design system\n");
         body.push_str("  /template <name>              switch seed template\n");
         body.push_str("  /run <slug> <req>             set slug + requirement\n");
@@ -10236,22 +10135,24 @@ mod tests {
     }
 
     #[test]
-    fn slash_model_without_arg_prints_usage() {
+    fn slash_model_explains_the_base_owns_the_model() {
         let mut a = fresh_app(Some("offline"));
         for c in "/model".chars() {
             let _ = a.apply_key(KeyCode::Char(c));
         }
         let _ = a.apply_key(KeyCode::Enter);
+        // /model no longer switches anything — it explains the base owns the model
+        // (the message names the bases, lang-agnostic check).
         assert!(a
             .history
             .iter()
-            .any(|m| m.body().contains("切换:/model") && m.body().contains("当前 model")));
-        // config.model still None.
+            .any(|m| m.body().contains("codex") && m.body().contains("opencode")));
+        // It never touches config.model.
         assert!(a.config.model.is_none());
     }
 
     #[test]
-    fn slash_model_with_arg_saves_to_config() {
+    fn slash_model_with_arg_does_not_set_a_model() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let cfg = UserConfig {
@@ -10269,10 +10170,11 @@ mod tests {
             let _ = app.apply_key(KeyCode::Char(c));
         }
         let _ = app.apply_key(KeyCode::Enter);
-        assert_eq!(app.config.model.as_deref(), Some("claude-opus-4-7"));
-        // Persisted.
+        // UmaDev no longer manages the model: `/model <arg>` does NOT set or persist
+        // a model — the base owns it. So config.model stays None, on disk too.
+        assert_eq!(app.config.model, None);
         let loaded = crate::config::load_from(&cfg_path);
-        assert_eq!(loaded.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(loaded.model, None);
     }
     // ---- backend / brain-spec selection ----
 
