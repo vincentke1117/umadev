@@ -6520,6 +6520,13 @@
   filter: grayscale(0%) opacity(1);
 }
 
+.partnerLogoContainer img {
+  width: 85% !important;
+  height: auto !important;
+  max-height: 56px !important;
+  object-fit: contain !important;
+}
+
 .partnerTextContainer {
   display: flex;
   flex-direction: column;
@@ -6579,7 +6586,7 @@
     border-radius: 16px;
   }
   .partnerLogoContainer {
-    height: 54px;
+    height: 60px;
     width: 100%;
     margin-bottom: 12px;
     display: flex;
