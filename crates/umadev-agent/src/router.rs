@@ -649,6 +649,13 @@ const ROUTER_TRIAGE_SYSTEM: &str =
      Q&A about code) | quick_edit (a small, well-scoped change to existing text/code) | \
      debug (diagnose+fix a defect) | build (create a real feature/product). A greeting or \
      a 'what can you do' question is chat, NOT build, even if it mentions building. \
+     Conversely, a request to implement a WHOLE project / product / app — especially \
+     one that points at a requirements / spec / PRD / 需求 / design document (e.g. \
+     'build what's in docs/spec.md', '实现 docs 里的需求', 'do this project') — is \
+     `build` with `kind:greenfield`, NEVER `quick_edit`, even if phrased tersely or as \
+     just a file path: delivering a product from a spec is real, multi-part work. \
+     Reserve `quick_edit` for a SMALL, single-surface change to something that already \
+     exists. \
      `kind`: greenfield | frontend_only | backend_only | bugfix | refactor | docs_only | \
      light. `complexity`: simple | medium | complex. Only set `clarify_question` when the \
      request is genuinely ambiguous in a way you could NOT resolve by reading the code — \
