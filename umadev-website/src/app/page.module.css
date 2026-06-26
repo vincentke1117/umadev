@@ -6328,3 +6328,145 @@
 .wechatButton:hover {
   color: #ffffff;
 }
+
+.partnersSection {
+  padding: 80px 32px;
+  background: rgba(10, 11, 14, 0.3);
+  border-top: 1px solid rgba(86, 90, 129, 0.15);
+  border-bottom: 1px solid rgba(86, 90, 129, 0.15);
+  position: relative;
+  overflow: hidden;
+}
+
+.partnersContainer {
+  max-width: 1200px;
+  margin: 0 auto;
+  text-align: center;
+  position: relative;
+  z-index: 2;
+}
+
+.partnersEyebrow {
+  display: block;
+  font-family: var(--font-mono), monospace;
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--cyan);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  margin-bottom: 16px;
+}
+
+.partnersTitle {
+  font-family: var(--font-space), sans-serif;
+  font-size: clamp(24px, 3.5vw, 36px);
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 48px;
+  line-height: 1.25;
+  background: linear-gradient(135deg, #ffffff 30%, rgba(255, 255, 255, 0.7));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.partnersGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 24px;
+  justify-content: center;
+}
+
+.partnerCard {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 24px;
+  background: rgba(26, 27, 31, 0.55);
+  border: 1px solid rgba(1, 203, 241, 0.08);
+  border-radius: 16px;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  text-decoration: none;
+  transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1), 
+              border-color 0.22s ease, 
+              box-shadow 0.22s ease;
+  overflow: hidden;
+}
+
+.partnerCard:hover {
+  transform: translateY(-4px) scale(1.01);
+  border-color: rgba(1, 203, 241, 0.42);
+  box-shadow: 0 12px 32px rgba(1, 203, 241, 0.12),
+              inset 0 0 12px rgba(1, 203, 241, 0.05);
+}
+
+.partnerCard:hover .partnerGlow {
+  opacity: 1;
+}
+
+.partnerGlow {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle 120px at 50% 50%, rgba(1, 203, 241, 0.06), transparent 70%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+}
+
+.partnerLogoWrapper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+  transition: transform 0.3s ease;
+}
+
+.partnerCard:hover .partnerLogoWrapper {
+  transform: scale(1.08) rotate(2deg);
+}
+
+.partnerInfo {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+}
+
+.partnerName {
+  font-family: var(--font-space), sans-serif;
+  font-size: 17px;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 4px;
+  transition: color 0.2s ease;
+}
+
+.partnerCard:hover .partnerName {
+  color: var(--cyan);
+}
+
+.partnerRole {
+  font-size: 13px;
+  color: #9ba7ba;
+  line-height: 1.4;
+}
+
+@media (max-width: 768px) {
+  .partnersSection {
+    padding: 60px 20px;
+  }
+  .partnersGrid {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+  .partnerCard {
+    padding: 20px;
+  }
+}

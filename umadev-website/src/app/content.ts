@@ -205,6 +205,18 @@ export const i18n = {
       { type: "file", text: "→ release/proof-pack-booking-20260620.zip" },
       { type: "done", text: "✓ 交付完成 · 证据链已归档于 .umadev/audit" },
     ],
+    partners: {
+      eyebrow: "合作与支持社区",
+      title: "携手各大开发者与 AI 社区，推动可治理编码交付",
+      list: [
+        { name: "RustCC 社区", role: "Rust 中文社区合作支持", logoName: "rustcc", url: "https://rustcc.cn" },
+        { name: "OpenCode 联盟", role: "底座生态共建伙伴", logoName: "opencode", url: "#" },
+        { name: "Codex 俱乐部", role: "工作流开发合作", logoName: "codex", url: "#" },
+        { name: "AI Agent 先锋汇", role: "智能体流水线研究共建", logoName: "agent", url: "#" },
+        { name: "Next.js 中文站", role: "前端工程化标准倡议", logoName: "nextjs", url: "#" },
+        { name: "开发者工坊", role: "本地沙盒安全技术合作", logoName: "workshop", url: "#" }
+      ]
+    },
   },
   en: {
     nav: { product: "Home", docs: "Docs", gallery: "Gallery", changelog: "Changelog" },
@@ -402,6 +414,18 @@ export const i18n = {
       { type: "file", text: "→ release/proof-pack-booking-20260620.zip" },
       { type: "done", text: "✓ Delivered · evidence chain archived in .umadev/audit" },
     ],
+    partners: {
+      eyebrow: "PARTNERS & COMMUNITIES",
+      title: "Empowering Governable AI Coding with Tech Communities",
+      list: [
+        { name: "RustCC", role: "Rust Chinese Community Support", logoName: "rustcc", url: "https://rustcc.cn" },
+        { name: "OpenCode Alliance", role: "Base Ecosystem Integration", logoName: "opencode", url: "#" },
+        { name: "Codex Club", role: "Workflow Optimization", logoName: "codex", url: "#" },
+        { name: "AI Agent Pioneer Hub", role: "Agent Pipeline R&D Partner", logoName: "agent", url: "#" },
+        { name: "Next.js Community", role: "Frontend Engineering Standards", logoName: "nextjs", url: "#" },
+        { name: "Dev Workshop", role: "Local Sandbox Security R&D", logoName: "workshop", url: "#" }
+      ]
+    },
   },
 } as const;
 
