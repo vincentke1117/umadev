@@ -19,6 +19,16 @@
 
 ---
 
+<div align="center">
+
+**官方微信群** — 扫码加入,获取更新 · 反馈问题 · 和其他用户交流
+
+<img src="docs/assets/wechat-qr.png" alt="官方微信群二维码" width="200">
+
+</div>
+
+---
+
 ## 目录
 
 - [简介](#简介) · [项目来源](#项目来源) · [它解决什么问题](#它解决什么问题)
@@ -825,9 +835,3 @@ cargo fmt --all
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。
-
-## 官方微信群
-
-扫码加入官方交流群,获取更新、反馈问题、和其他用户交流:
-
-<img src="docs/assets/wechat-qr.png" alt="官方微信群二维码" width="240">

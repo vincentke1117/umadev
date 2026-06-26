@@ -669,7 +669,7 @@ export default function Home() {
             GitHub
           </a>
           <button
-            className={styles.githubButton}
+            className={`${styles.githubButton} ${styles.wechatButton}`}
             type="button"
             onClick={() => setWechatOpen(true)}
           >

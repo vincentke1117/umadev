@@ -6319,3 +6319,12 @@
   from { opacity: 0; }
   to { opacity: 1; }
 }
+
+/* The 微信群 nav button is a <button>, which (unlike the GitHub <a>) does NOT
+   inherit the nav's light text color — set it explicitly so it's not UA-black. */
+.wechatButton {
+  color: #e8f6fb;
+}
+.wechatButton:hover {
+  color: #ffffff;
+}
