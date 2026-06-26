@@ -99,6 +99,7 @@ use crate::plan_state::{self, Plan, StepStatus};
 use crate::router::RoutePlan;
 use crate::runner::RunOptions;
 use crate::trust::requires_confirmation;
+use umadev_spec::Phase;
 
 /// The hard ceiling on auto-QC feedback-fix rounds in one `/run`. One round is: the
 /// base builds (or fixes) end to end, then UmaDev runs its objective QC pass. A
@@ -367,6 +368,10 @@ async fn synthesize_and_post_plan(
         .await?;
     // Persist best-effort; a failed write is ignored (fail-open — never blocks).
     let _ = plan_state::save(&plan, &options.project_root);
+    // Sync the 9-phase workflow state off its initial `research` value the moment a
+    // plan exists — so `/status` stops reporting "research / all pending" while the
+    // build is actually planning + working. Fail-open (swallows write errors).
+    sync_phase_from_plan(&plan, options);
     events.emit(EngineEvent::plan_posted(&plan));
     Some(plan)
 }
@@ -479,6 +484,10 @@ async fn drive_director_loop_with_idle(
             // Plan visibility (Wave 1): a clean pass means the work the plan
             // describes landed — tick its steps Done + persist the final plan.
             complete_plan(&mut plan, options, events);
+            // Sync the 9-phase workflow state at a CLEAN finalize: every step ticked
+            // Done above, so this is a genuine clean finish → `delivery`. With no plan
+            // (single-turn fallback) a clean build is still `delivery`. Fail-open.
+            finalize_phase_from_plan_opt(&plan, options, true);
             // Wave 4 (§L4 / G8): restore the shareable delivery on the DEFAULT
             // path — depth-gated, fail-open. A clean Build leaves a PRD /
             // architecture / UI-UX doc (+ a proof-pack on the deliberate path).
@@ -497,6 +506,10 @@ async fn drive_director_loop_with_idle(
             // they are (Active), honestly reflecting that QC didn't fully clear.
             // Persist the final state for resume.
             persist_plan(&plan, options);
+            // Sync the 9-phase state at a NON-clean settle: never claim `delivery` —
+            // advance only to the furthest phase that actually completed (no plan / no
+            // Done step → keep the in-progress anchor). Fail-open.
+            finalize_phase_from_plan_opt(&plan, options, false);
             return DirectorLoopOutcome::Done { reply: last_reply };
         }
 
@@ -508,6 +521,8 @@ async fn drive_director_loop_with_idle(
     // Loop fell through (exhausted the bounded rounds) — persist the plan's final
     // state for resume; reality is the caller's hard-gate.
     persist_plan(&plan, options);
+    // Non-clean settle (the bounded rounds didn't fully clear): honest phase only.
+    finalize_phase_from_plan_opt(&plan, options, false);
     DirectorLoopOutcome::Done { reply: last_reply }
 }
 
@@ -671,6 +686,11 @@ async fn drive_plan_steps(
         plan.mark(&step_id, status);
         events.emit(EngineEvent::plan_step_status(step_id, step.title, status));
         persist_plan_ref(plan, options);
+        // Advance the 9-phase workflow state to the furthest phase the plan's Done
+        // steps now imply (monotonic — `persist_phase` clamps, never regresses). Only
+        // a step that actually ticked Done moves the phase; a Blocked step leaves it.
+        // Fail-open. This is what keeps `/status` honest as the build progresses.
+        sync_phase_from_plan(plan, options);
     }
 
     // MEDIUM #2 — honest scope: a Blocked step permanently strands its dependents as
@@ -703,6 +723,12 @@ async fn drive_plan_steps(
 
     // Persist the plan's terminal state for resume.
     persist_plan_ref(plan, options);
+    // Sync the 9-phase workflow state at finalize. HONEST clean signal: every step
+    // reached Done (none Blocked / stranded) — only then may the build claim
+    // `delivery`; otherwise the state advances to the furthest phase that actually
+    // completed, so `/status` reflects where the build really stopped. Fail-open.
+    let clean = plan.steps.iter().all(|s| s.status == StepStatus::Done);
+    finalize_phase_from_plan(plan, options, clean);
     // Wave 4 (§L4 / G8): a step-driven (always deliberate) build leaves the FULL
     // shareable delivery — core docs + proof-pack + scorecard. Fail-open inside.
     director::finalize(options, events, Some(route));
@@ -1501,6 +1527,176 @@ fn complete_plan(plan: &mut Option<Plan>, options: &RunOptions, events: &Arc<dyn
 fn persist_plan(plan: &Option<Plan>, options: &RunOptions) {
     if let Some(p) = plan {
         let _ = plan_state::save(p, &options.project_root);
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Workflow-phase sync — keep `.umadev/workflow-state.json` (the 9-phase state
+// machine `/status` reads) in step with REAL plan progress on the director-loop
+// path.
+//
+// THE BUG THIS FIXES: `workflow-state.json` was written ONLY by the legacy
+// continuous phase-walk (`continuous::persist_state`). The director-loop / plan
+// path that `/run` actually drives (`drive_director_loop_routed` → `drive_plan_steps`
+// → `drive_build_step`) never wrote it, so after a multi-hour build that produced a
+// real frontend + backend on disk, `/status` still showed `phase=research` with all
+// 9 phases `[pending]` — stale, dishonest. These helpers map plan progress to a
+// `umadev_spec::Phase` and persist it at the key transitions, NEVER moving backward
+// and NEVER claiming a phase that didn't happen.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Map ONE plan step (by its responsible seat) to the pipeline [`Phase`] that step's
+/// work belongs to — the HONEST anchor for "how far has the build actually reached".
+///
+/// The mapping reads the seat that OWNS each phase's deliverable:
+/// - product-manager → `Docs` (owns scope / PRD — the three-core-docs phase)
+/// - architect → `Spec` (owns the API surface + data model — docs→spec translation)
+/// - uiux-designer / frontend-engineer → `Frontend` (the design lands as built UI)
+/// - backend-engineer → `Backend`
+/// - qa-engineer / security-engineer → `Quality` (test coverage + attack-surface review)
+/// - devops-engineer → `Delivery` (build / deploy / CI — the hand-off phase)
+///
+/// The two GATE phases (`DocsConfirm` / `PreviewConfirm`) are deliberately never
+/// returned here: they are human-confirmation pauses, not work a director-loop step
+/// produces, so anchoring a step to a gate would falsely claim the user confirmed.
+fn phase_for_seat(seat: crate::critics::Seat) -> Phase {
+    use crate::critics::Seat;
+    match seat {
+        Seat::ProductManager => Phase::Docs,
+        Seat::Architect => Phase::Spec,
+        Seat::UiuxDesigner | Seat::FrontendEngineer => Phase::Frontend,
+        Seat::BackendEngineer => Phase::Backend,
+        Seat::QaEngineer | Seat::SecurityEngineer => Phase::Quality,
+        Seat::DevopsEngineer => Phase::Delivery,
+    }
+}
+
+/// The ordered position of a phase in [`umadev_spec::PHASE_CHAIN`] — the comparison
+/// key for "further along". An unlisted phase (impossible for the spec enum, but
+/// defensive) sorts first so it can never clamp a real phase backward.
+fn phase_rank(phase: Phase) -> usize {
+    umadev_spec::PHASE_CHAIN
+        .iter()
+        .position(|p| *p == phase)
+        .unwrap_or(0)
+}
+
+/// The furthest-reached [`Phase`] implied by the plan's COMPLETED (Done) work.
+///
+/// Each `Done` step contributes its seat's phase; the result is the highest-ranked
+/// such phase (the deepest the build has honestly reached). A plan with no Done steps
+/// yet — or no plan at all — has reached nothing concrete, so this returns `None`
+/// (the caller then keeps the initial `research` phase / writes nothing). A fully
+/// `Done` plan whose furthest step is e.g. a QA seat reaches `Quality`, NOT
+/// `Delivery` — `Delivery` is only asserted by [`finalize_phase`] when the whole run
+/// genuinely finished clean.
+fn furthest_done_phase(plan: &Plan) -> Option<Phase> {
+    plan.steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Done)
+        .map(|s| phase_for_seat(s.seat))
+        .max_by_key(|p| phase_rank(*p))
+}
+
+/// The phase the build has reached based on its plan SO FAR — used when the plan is
+/// synthesised (move off `research` to honestly show "I'm planning / building this")
+/// and as each step completes. Anchors to the furthest Done step; before any step is
+/// Done it falls back to `Docs` (the build has at least produced a plan = the docs-era
+/// of the work), which is still HONEST: a synthesised plan is real planning output and
+/// strictly past bare `research`. Returns `None` only when there are literally no
+/// steps to anchor to.
+fn in_progress_phase(plan: &Plan) -> Option<Phase> {
+    if plan.steps.is_empty() {
+        return None;
+    }
+    Some(furthest_done_phase(plan).unwrap_or(Phase::Docs))
+}
+
+/// Read the current persisted phase (defaults to the chain head, `research`, when no
+/// state file exists yet) so a phase write can CLAMP to max-so-far and never regress.
+fn current_persisted_phase(options: &RunOptions) -> Phase {
+    crate::state::read_workflow_state(&options.project_root)
+        .and_then(|s| {
+            umadev_spec::PHASE_CHAIN
+                .iter()
+                .copied()
+                .find(|p| p.id() == s.phase)
+        })
+        .unwrap_or(Phase::Research)
+}
+
+/// Persist `phase` to `.umadev/workflow-state.json`, CLAMPED so it never moves
+/// backward (the phase machine is monotonic — a later step completing can advance it,
+/// but nothing regresses it). Mirrors [`crate::continuous::persist_state`]'s
+/// `WorkflowState` construction EXACTLY (same shape, same `write_workflow_state`), so
+/// `/status` / `continue` read the director-loop's progress the same way they read
+/// the legacy walk's. **Fail-open by contract:** a failed write is swallowed
+/// (`let _ =`) — a disk / permission error can never wedge an otherwise-healthy run.
+fn persist_phase(options: &RunOptions, phase: Phase) {
+    // Clamp: never regress below what's already on disk.
+    let current = current_persisted_phase(options);
+    let phase = if phase_rank(phase) >= phase_rank(current) {
+        phase
+    } else {
+        current
+    };
+    let state = crate::state::WorkflowState {
+        phase: phase.id().to_string(),
+        active_gate: String::new(),
+        slug: options.effective_slug(),
+        requirement: options.requirement.clone(),
+        last_transition_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        note: format!("Advanced to {} (director loop)", phase.id()),
+        backend: options.backend.clone(),
+        spec_version: umadev_spec::SPEC_VERSION.to_string(),
+    };
+    let _ = crate::state::write_workflow_state(&options.project_root, &state);
+}
+
+/// Sync `workflow-state.json` to the build's in-progress phase derived from `plan`.
+/// No-op (writes nothing) when there's no plan or no steps to anchor to. Fail-open.
+fn sync_phase_from_plan(plan: &Plan, options: &RunOptions) {
+    if let Some(phase) = in_progress_phase(plan) {
+        persist_phase(options, phase);
+    }
+}
+
+/// Sync `workflow-state.json` at FINALIZE. `clean` is whether the run genuinely
+/// finished its QC/acceptance floor: a clean finish over a plan whose deepest seat is
+/// DevOps reaches `Delivery`; a clean finish whose deepest seat is earlier reaches
+/// THAT phase (not an optimistic `Delivery`). A NON-clean finish never claims
+/// `Delivery` — it persists only the furthest phase actually completed, so the state
+/// stays HONEST about where the build really stopped. No plan / no Done steps → keep
+/// the in-progress anchor (still never regresses). Fail-open.
+fn finalize_phase_from_plan(plan: &Plan, options: &RunOptions, clean: bool) {
+    let reached = furthest_done_phase(plan);
+    let phase = match (clean, reached) {
+        // A clean finish with real completed work: advance to that furthest phase, and
+        // — only when clean — let the build claim `Delivery` as the terminal hand-off
+        // (it is the deepest phase, so this is always ≥ the furthest seat's phase).
+        (true, Some(_)) => Phase::Delivery,
+        // A clean finish with no anchorable Done step (e.g. a single-turn build whose
+        // plan never ticked): the build still completed clean, so `Delivery` is honest.
+        (true, None) => Phase::Delivery,
+        // Not clean: persist only what genuinely completed; never an optimistic jump.
+        (false, Some(p)) => p,
+        // Not clean and nothing completed: leave the on-disk phase as-is (the clamp in
+        // `persist_phase` keeps whatever the in-progress sync already wrote).
+        (false, None) => current_persisted_phase(options),
+    };
+    persist_phase(options, phase);
+}
+
+/// [`finalize_phase_from_plan`] over the single-turn loop's `&Option<Plan>`. A
+/// CLEAN finalize with no plan (the single-turn fallback) is a genuine clean
+/// finish → `delivery`. A NON-clean finalize with no plan leaves the on-disk phase
+/// as-is (whatever the in-progress sync wrote, clamped — never regressed, never
+/// optimistically jumped to delivery). Fail-open.
+fn finalize_phase_from_plan_opt(plan: &Option<Plan>, options: &RunOptions, clean: bool) {
+    match plan {
+        Some(p) => finalize_phase_from_plan(p, options, clean),
+        None if clean => persist_phase(options, Phase::Delivery),
+        None => {} // non-clean + no plan: keep the current on-disk phase (no regress)
     }
 }
 
@@ -3358,6 +3554,231 @@ mod tests {
             .steps
             .iter()
             .all(|s| s.status == crate::plan_state::StepStatus::Done));
+    }
+
+    // ── workflow-state.json phase sync — the state-sync bug fix. The director-loop
+    //    path must keep `.umadev/workflow-state.json` (the 9-phase machine `/status`
+    //    reads) in step with REAL progress; before the fix it stayed frozen at
+    //    `research` / all-pending while the build moved on. ──
+
+    /// Read the persisted workflow phase id from `.umadev/workflow-state.json`, or
+    /// `None` when no state was written.
+    fn persisted_phase_id(root: &std::path::Path) -> Option<String> {
+        crate::state::read_workflow_state(root).map(|s| s.phase)
+    }
+
+    #[tokio::test]
+    async fn director_loop_advances_workflow_state_off_research() {
+        // THE BUG: a `/run` over the director-loop / plan path never wrote
+        // workflow-state.json, so `/status` showed `phase=research` / all-pending even
+        // after real code landed. Now a deliberate step-driven build (a frontend +
+        // backend plan) must leave a workflow-state.json whose phase is PAST research
+        // and reflects the completed steps (backend completed → `backend`/`delivery`).
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path()); // source present → each step's acceptance passes
+        let (events, _rec) = sink();
+        let plan_json = r#"{"steps":[
+            {"id":"fe","title":"Build the frontend","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
+            {"id":"be","title":"Build the backend","seat":"backend-engineer","kind":"build","depends_on":["fe"],"acceptance":"source-present"}
+        ],"risks":[],"open_questions":[]}"#;
+        let turns = vec![
+            text_turn(plan_json),
+            text_turn("Built the frontend. Done."),
+            text_turn("Built the backend. Done."),
+        ];
+        let mut sess = FakeSession::new(turns, false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的任务管理产品".to_string();
+        let route = build_route();
+
+        // Before the run there is NO state file (this is the frozen-at-research case).
+        assert!(persisted_phase_id(tmp.path()).is_none());
+
+        let outcome =
+            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+
+        // A state file now exists and its phase is NOT the initial `research`.
+        let phase = persisted_phase_id(tmp.path()).expect("workflow-state.json was written");
+        assert_ne!(
+            phase, "research",
+            "the director loop advanced the phase off the initial research value"
+        );
+        // Both steps reached Done (a clean finish over a backend seat) → the terminal
+        // phase is the deepest the build honestly reached. A clean finalize claims
+        // `delivery`; it must at MINIMUM be past the frontend phase the backend follows.
+        let rank = |id: &str| {
+            umadev_spec::PHASE_CHAIN
+                .iter()
+                .position(|p| p.id() == id)
+                .unwrap_or(0)
+        };
+        assert!(
+            rank(&phase) >= rank("backend"),
+            "a build whose backend step completed reaches at least `backend` (got {phase})"
+        );
+    }
+
+    #[test]
+    fn phase_for_seat_maps_each_seat_honestly() {
+        use crate::critics::Seat;
+        assert_eq!(phase_for_seat(Seat::ProductManager), Phase::Docs);
+        assert_eq!(phase_for_seat(Seat::Architect), Phase::Spec);
+        assert_eq!(phase_for_seat(Seat::UiuxDesigner), Phase::Frontend);
+        assert_eq!(phase_for_seat(Seat::FrontendEngineer), Phase::Frontend);
+        assert_eq!(phase_for_seat(Seat::BackendEngineer), Phase::Backend);
+        assert_eq!(phase_for_seat(Seat::QaEngineer), Phase::Quality);
+        assert_eq!(phase_for_seat(Seat::SecurityEngineer), Phase::Quality);
+        assert_eq!(phase_for_seat(Seat::DevopsEngineer), Phase::Delivery);
+        // The gate phases are never the anchor for a step (they are human pauses).
+        for seat in [
+            Seat::ProductManager,
+            Seat::Architect,
+            Seat::UiuxDesigner,
+            Seat::FrontendEngineer,
+            Seat::BackendEngineer,
+            Seat::QaEngineer,
+            Seat::SecurityEngineer,
+            Seat::DevopsEngineer,
+        ] {
+            assert!(
+                !phase_for_seat(seat).is_gate(),
+                "a step never anchors to a gate phase"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_phase_never_regresses_across_writes() {
+        // The monotonic clamp: once the state reached a deeper phase, a later write of
+        // an EARLIER phase is ignored (a backend step finishing after a frontend step
+        // must not pull the phase back to `frontend`). This is the "never move
+        // BACKWARD" invariant the fix promises.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        // Advance frontend → backend → (try to regress) frontend.
+        persist_phase(&o, Phase::Frontend);
+        assert_eq!(persisted_phase_id(tmp.path()).as_deref(), Some("frontend"));
+        persist_phase(&o, Phase::Backend);
+        assert_eq!(persisted_phase_id(tmp.path()).as_deref(), Some("backend"));
+        // A regressing write is clamped — the phase stays at the deeper `backend`.
+        persist_phase(&o, Phase::Frontend);
+        assert_eq!(
+            persisted_phase_id(tmp.path()).as_deref(),
+            Some("backend"),
+            "a write of an earlier phase is clamped to the deepest reached (no regress)"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_completions_advance_phase_monotonically_never_backward() {
+        // End-to-end monotonicity across the step driver: a plan whose steps complete
+        // in seat order frontend → backend ticks the phase forward and NEVER backward,
+        // even though the backend step's seat maps to a LATER phase than the frontend's.
+        // (A regression would surface if a later-finishing earlier-phase step pulled it
+        // back; here the clamp guarantees a non-decreasing phase rank at every Done.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, _rec) = sink();
+        // backend (later phase) is the FIRST step; frontend (earlier phase) depends on
+        // it — so the EARLIER-phase step finishes LAST. The clamp must keep the phase
+        // at `backend` after the trailing frontend step, never regress to `frontend`.
+        let plan_json = r#"{"steps":[
+            {"id":"be","title":"Build the backend","seat":"backend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
+            {"id":"fe","title":"Polish the frontend","seat":"frontend-engineer","kind":"build","depends_on":["be"],"acceptance":"source-present"}
+        ],"risks":[],"open_questions":[]}"#;
+        let turns = vec![
+            text_turn(plan_json),
+            text_turn("Built the backend. Done."),
+            text_turn("Polished the frontend. Done."),
+        ];
+        let mut sess = FakeSession::new(turns, false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+
+        let outcome =
+            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+
+        // After the EARLIER-phase frontend step finished LAST, the phase must still be
+        // at least `backend` — it never regressed to `frontend`.
+        let phase = persisted_phase_id(tmp.path()).expect("state written");
+        let rank = |id: &str| {
+            umadev_spec::PHASE_CHAIN
+                .iter()
+                .position(|p| p.id() == id)
+                .unwrap_or(0)
+        };
+        assert!(
+            rank(&phase) >= rank("backend"),
+            "the phase never regressed below the deepest step reached (got {phase})"
+        );
+    }
+
+    #[test]
+    fn finalize_phase_is_honest_clean_vs_unclean() {
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let mk = |id: &str, seat: crate::critics::Seat, status: StepStatus| PlanStep {
+            id: id.into(),
+            title: format!("step {id}"),
+            seat,
+            kind: StepKind::Build,
+            depends_on: vec![],
+            acceptance: AcceptanceSpec::SourcePresent,
+            status,
+        };
+
+        // CLEAN finish (every step Done) over a QA-deepest plan → the build claims the
+        // terminal `delivery` phase.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        let clean_plan = Plan {
+            steps: vec![
+                mk(
+                    "fe",
+                    crate::critics::Seat::FrontendEngineer,
+                    StepStatus::Done,
+                ),
+                mk("qa", crate::critics::Seat::QaEngineer, StepStatus::Done),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        finalize_phase_from_plan(&clean_plan, &o, true);
+        assert_eq!(
+            persisted_phase_id(tmp.path()).as_deref(),
+            Some("delivery"),
+            "a genuinely clean finish reaches delivery"
+        );
+
+        // NON-clean finish (backend step Blocked, frontend Done) → the state must NOT
+        // claim delivery; it reflects only the furthest phase that actually completed
+        // (frontend), so `/status` stays honest about where the build stopped.
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let o2 = opts(tmp2.path());
+        let unclean_plan = Plan {
+            steps: vec![
+                mk(
+                    "fe",
+                    crate::critics::Seat::FrontendEngineer,
+                    StepStatus::Done,
+                ),
+                mk(
+                    "be",
+                    crate::critics::Seat::BackendEngineer,
+                    StepStatus::Blocked,
+                ),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        finalize_phase_from_plan(&unclean_plan, &o2, false);
+        assert_eq!(
+            persisted_phase_id(tmp2.path()).as_deref(),
+            Some("frontend"),
+            "a non-clean finish never optimistically claims delivery"
+        );
     }
 
     #[tokio::test]

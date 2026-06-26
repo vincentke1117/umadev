@@ -75,8 +75,16 @@ impl Selection {
 /// `area` is the transcript rectangle as `(left, top, width, height)`;
 /// `first_visible_row` is the index into the cached rows of the row currently
 /// painted at `area.top` (the renderer's `hidden_above - user_offset`);
-/// `rows` is the cached plain-text rows (used only to clamp the column to the
-/// resolved row's char length).
+/// `rows` is the cached LOGICAL plain-text rows (used to clamp the column to the
+/// resolved row's char length); `gutters` is the per-row leading-gutter display
+/// width that was stripped from each cached row (the role-spine / hang-indent
+/// decoration painted on screen but absent from the logical text), in lockstep
+/// with `rows`.
+///
+/// The returned column is a char index into the LOGICAL row text: a click in the
+/// painted gutter (the `▎` bar / indent) resolves to logical column 0, and a
+/// click past the gutter is offset back by it — so the screen column and the
+/// stored content stay in register even though the gutter isn't cached.
 ///
 /// Returns `None` when the point is OUTSIDE the transcript area (so the caller
 /// can clear the selection), or when there are no cached rows. The resolved
@@ -90,6 +98,7 @@ pub fn screen_to_content(
     area: (u16, u16, u16, u16),
     first_visible_row: usize,
     rows: &[String],
+    gutters: &[usize],
 ) -> Option<Point> {
     let (left, top, width, height) = area;
     if width == 0 || height == 0 || rows.is_empty() {
@@ -110,8 +119,13 @@ pub fn screen_to_content(
         .saturating_add(row_off)
         .min(rows.len() - 1);
     let col_off = usize::from(screen_col - left);
+    // Subtract the painted gutter so the screen column maps onto the LOGICAL text
+    // (a click inside the gutter clamps to logical column 0). Fail-open: a missing
+    // gutter entry is treated as 0.
+    let gutter = gutters.get(content_row).copied().unwrap_or(0);
+    let logical_off = col_off.saturating_sub(gutter);
     let row_len = rows[content_row].chars().count();
-    let content_col = col_off.min(row_len);
+    let content_col = logical_off.min(row_len);
     Some((content_row, content_col))
 }
 
@@ -249,12 +263,12 @@ mod tests {
         let area = (2u16, 5u16, 20u16, 10u16);
         // Click at screen (col=4, row=6): row_off=1 → content_row 1; col_off=2.
         assert_eq!(
-            screen_to_content(4, 6, area, 0, &rows),
+            screen_to_content(4, 6, area, 0, &rows, &[]),
             Some((1, 2)),
             "screen (4,6) maps to content row 1, col 2"
         );
         // Top-left corner of the area maps to (first_visible_row, 0).
-        assert_eq!(screen_to_content(2, 5, area, 0, &rows), Some((0, 0)));
+        assert_eq!(screen_to_content(2, 5, area, 0, &rows, &[]), Some((0, 0)));
     }
 
     #[test]
@@ -262,8 +276,8 @@ mod tests {
         let rows: Vec<String> = (0..10).map(|i| format!("line{i}")).collect();
         let area = (0u16, 0u16, 10u16, 4u16);
         // first_visible_row = 6 (scrolled): screen row 0 → content row 6.
-        assert_eq!(screen_to_content(0, 0, area, 6, &rows), Some((6, 0)));
-        assert_eq!(screen_to_content(3, 2, area, 6, &rows), Some((8, 3)));
+        assert_eq!(screen_to_content(0, 0, area, 6, &rows, &[]), Some((6, 0)));
+        assert_eq!(screen_to_content(3, 2, area, 6, &rows, &[]), Some((8, 3)));
     }
 
     #[test]
@@ -271,7 +285,7 @@ mod tests {
         let rows = vec!["hi".to_string()];
         let area = (0u16, 0u16, 40u16, 4u16);
         // col 30 is far past "hi" (len 2) → clamps to 2 (end of the row).
-        assert_eq!(screen_to_content(30, 0, area, 0, &rows), Some((0, 2)));
+        assert_eq!(screen_to_content(30, 0, area, 0, &rows, &[]), Some((0, 2)));
     }
 
     #[test]
@@ -279,7 +293,7 @@ mod tests {
         let rows = vec!["a".to_string(), "b".to_string()];
         let area = (0u16, 0u16, 10u16, 10u16);
         // screen row 7 is past the last content row (1) → clamps to row 1.
-        assert_eq!(screen_to_content(0, 7, area, 0, &rows), Some((1, 0)));
+        assert_eq!(screen_to_content(0, 7, area, 0, &rows, &[]), Some((1, 0)));
     }
 
     #[test]
@@ -287,18 +301,22 @@ mod tests {
         let rows = vec!["x".to_string()];
         let area = (5u16, 5u16, 10u16, 10u16);
         assert_eq!(
-            screen_to_content(4, 6, area, 0, &rows),
+            screen_to_content(4, 6, area, 0, &rows, &[]),
             None,
             "left of area"
         );
-        assert_eq!(screen_to_content(6, 4, area, 0, &rows), None, "above area");
         assert_eq!(
-            screen_to_content(15, 6, area, 0, &rows),
+            screen_to_content(6, 4, area, 0, &rows, &[]),
+            None,
+            "above area"
+        );
+        assert_eq!(
+            screen_to_content(15, 6, area, 0, &rows, &[]),
             None,
             "right of area (col == left+width)"
         );
         assert_eq!(
-            screen_to_content(6, 15, area, 0, &rows),
+            screen_to_content(6, 15, area, 0, &rows, &[]),
             None,
             "below area (row == top+height)"
         );
@@ -307,9 +325,35 @@ mod tests {
     #[test]
     fn screen_to_content_empty_rows_is_none() {
         assert_eq!(
-            screen_to_content(0, 0, (0, 0, 10, 10), 0, &[]),
+            screen_to_content(0, 0, (0, 0, 10, 10), 0, &[], &[]),
             None,
             "no cached rows → nothing to select"
+        );
+    }
+
+    #[test]
+    fn screen_to_content_subtracts_the_painted_gutter() {
+        // The cached row is the LOGICAL text "hello" but on screen it is painted
+        // behind a 2-col role-spine gutter (`▎ `). A click at screen col 2 (the
+        // first content cell) must map to logical col 0, and col 4 to logical 2.
+        let rows = vec!["hello".to_string()];
+        let gutters = vec![2usize];
+        let area = (0u16, 0u16, 20u16, 4u16);
+        assert_eq!(
+            screen_to_content(2, 0, area, 0, &rows, &gutters),
+            Some((0, 0)),
+            "click on the first painted content cell → logical col 0"
+        );
+        assert_eq!(
+            screen_to_content(4, 0, area, 0, &rows, &gutters),
+            Some((0, 2)),
+            "screen col 4 (gutter 2 + 2) → logical col 2"
+        );
+        // A click INSIDE the gutter clamps to logical col 0 (never negative).
+        assert_eq!(
+            screen_to_content(0, 0, area, 0, &rows, &gutters),
+            Some((0, 0)),
+            "click in the gutter → logical col 0"
         );
     }
 
