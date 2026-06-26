@@ -182,7 +182,7 @@ function downloadTo(url, dest, withBar, label) {
             const now = Date.now();
             const pct = Math.floor((got / total) * 100);
             // Redraw on each new percent OR every ~250ms — keeps the live speed
-            // ticking even while a single percent of a 224MB file streams in.
+            // ticking even while a single percent of a large file streams in.
             if (pct !== lastPct || now - lastDraw > 250) {
               lastPct = pct;
               lastDraw = now;
@@ -213,11 +213,11 @@ function downloadTo(url, dest, withBar, label) {
     req.setTimeout(120000, () => req.destroy(new Error('timeout')));
   });
 }
-// Ordered list of base URLs to try for the release assets. An explicit override
-// (UMADEV_MODEL_BASE_URL) wins; otherwise zh-CN / China-timezone users get GitHub
-// PROXY MIRRORS first (github.com's release CDN is frequently slow or blocked in
-// mainland China), and everyone else gets github.com first — with the others as
-// fallback either way, so a blocked github.com or a down mirror still recovers.
+// Ordered list of base URLs to try for the model files. An explicit override
+// (UMADEV_MODEL_BASE_URL) wins; otherwise EVERYONE pulls the SAME upstream f32 from
+// HuggingFace (international) / hf-mirror.com (China), region-ordered, with the
+// GitHub fp16 release as a last-resort fallback — so the download is consistent in
+// size everywhere and the model is always reachable.
 function releaseBases(version) {
   if (process.env.UMADEV_MODEL_BASE_URL) {
     return [process.env.UMADEV_MODEL_BASE_URL.replace(/\/+$/, '')];
@@ -242,9 +242,13 @@ function releaseBases(version) {
   } catch (_) {
     /* default to international order */
   }
-  // China: hf-mirror first (fast + reliable in CN), then GitHub proxies + direct.
-  // International: GitHub Release first (smaller fp16), then HuggingFace + mirror.
-  return cn ? [hfMirror, ...ghProxies, gh, hf] : [gh, hf, hfMirror, ...ghProxies];
+  // Unified on the upstream f32 model from HuggingFace (international) + its China
+  // mirror hf-mirror.com, so BOTH regions download the SAME ~448MB f32 — consistent
+  // everywhere (no more "some get 200MB, some 400MB"). China: hf-mirror first (fast
+  // in CN); international: huggingface.co first. The GitHub Release fp16 (~224MB) +
+  // proxies stay only as a LAST-RESORT fallback if both HF endpoints are down (the
+  // candle loader casts either precision to f32, so a fallback still loads).
+  return cn ? [hfMirror, hf, gh, ...ghProxies] : [hf, hfMirror, gh, ...ghProxies];
 }
 // Try each base for `name` in order; resolve on first success, throw the last
 // error if all fail. A China mirror can cover a blocked github.com (or vice
@@ -301,7 +305,7 @@ async function ensureModel() {
 }
 
 // Subcommands that do NOT drive the agent runtime — they never retrieve
-// knowledge, so they must not trigger the one-time ~224MB vector-model download.
+// knowledge, so they must not trigger the one-time vector-model download.
 // Without this, `umadev update` (and `--version` / `--help` / `doctor` / …) would
 // appear to hang on a machine that doesn't have the model yet, while it streams
 // in — which reads as "the update command broke". The model is fetched lazily on
