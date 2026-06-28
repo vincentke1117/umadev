@@ -911,7 +911,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                         <div className={styles.partnerGlow} />
                         <div className={styles.partnerLogoContainer}>
                           <Image
-                            src={asset(`/assets/partners/${partner.logoName}.png?v=3`)}
+                            src={asset(`/assets/partners/${partner.logoName}.png?v=4`)}
                             alt={partner.name}
                             width={180}
                             height={80}
