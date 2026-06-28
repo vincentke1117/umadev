@@ -228,6 +228,7 @@
 "picker.block.not_logged_in" = "{} is installed but not logged in. Run `{}` in your terminal first, then come back."
 "picker.block.not_installed" = "{} is not installed. Run `{}` first, then re-open UmaDev."
 "quit.confirm_running" = "Press Esc again to quit UmaDev (workflow state is saved; the next `umadev` resumes automatically)."
+"quit.use_command" = "Ctrl+C no longer quits (so a copy reflex can't drop the session); use /quit or /exit to exit — workflow state is saved and resumes next time."
 "gate.clarify_saved" = "[ok] Clarification answers saved, starting web research…"
 "gate.clarify_recorded" = "Recorded (keep answering, or type c to submit)"
 "gate.clarify_write_failed" = "[warn] Could not save that answer ({}) — it was NOT recorded; please retype it."

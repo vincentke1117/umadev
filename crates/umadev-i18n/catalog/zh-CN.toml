@@ -228,6 +228,7 @@
 "picker.block.not_logged_in" = "{} 已安装但未登录。先在终端运行 `{}`,再回来选。"
 "picker.block.not_installed" = "{} 未安装。先运行 `{}`,再重新打开 UmaDev。"
 "quit.confirm_running" = "再按一次 Esc 退出 UmaDev(workflow state 已保存,下次 `umadev` 自动续上)。"
+"quit.use_command" = "Ctrl+C 已不再退出(防止复制误触);要退出请用 /quit 或 /exit —— workflow state 会保存,下次自动续上。"
 "gate.clarify_saved" = "[ok] 澄清回答已保存,开始联网调研…"
 "gate.clarify_recorded" = "已记录(继续回答,或输入 c 提交)"
 "gate.clarify_write_failed" = "[warn] 该回答未能写入({}),未被记录,请重新输入。"

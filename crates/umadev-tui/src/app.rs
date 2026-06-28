@@ -4146,12 +4146,18 @@ impl App {
                     self.refresh_status();
                     return Action::None;
                 }
-                // Idle: clear a non-empty input; on empty input behave like Esc
-                // (quit-confirm).
+                // Idle: Ctrl+C clears a half-typed input but NEVER quits the app —
+                // it's universal muscle-memory for COPY, so an accidental Ctrl+C must
+                // not drop the session (user-reported). Quit deliberately with /quit
+                // (or /exit), Ctrl+D, or a double-Esc.
                 if self.input.is_empty() {
-                    return self.chat_key(KeyCode::Esc, crossterm::event::KeyModifiers::NONE);
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::t(self.lang, "quit.use_command"),
+                    );
+                } else {
+                    self.clear_input();
                 }
-                self.clear_input();
                 Action::None
             }
             KeyCode::Char('d') if ctrl && self.input.is_empty() => {
@@ -13199,16 +13205,23 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_on_empty_idle_input_arms_quit_confirm() {
-        // Regression guard for the idle path: with nothing running and an empty
-        // box, Ctrl-C still falls through to the Esc (quit-confirm) semantics.
+    fn ctrl_c_on_empty_idle_input_never_quits() {
+        // Ctrl+C is universal muscle-memory for COPY, so on an idle EMPTY box it must
+        // NOT quit and must NOT even arm a quit-confirm — it only hints to use /quit.
+        // (Quitting stays deliberate: /quit, /q, /exit, Ctrl+D, or a double-Esc.)
         let mut a = fresh_app(Some("offline"));
         let action =
             a.apply_key_with_mods(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL);
         assert_eq!(action, Action::None);
         assert!(
-            a.pending_quit_confirm,
-            "idle empty Ctrl-C arms quit confirm"
+            !a.pending_quit_confirm,
+            "idle empty Ctrl-C does NOT arm a quit confirm"
+        );
+        assert!(!a.should_quit, "idle empty Ctrl-C does NOT quit the app");
+        assert_eq!(
+            a.history.back().expect("a hint was pushed").body(),
+            umadev_i18n::t(a.lang, "quit.use_command"),
+            "idle empty Ctrl-C hints to use /quit"
         );
     }
 
