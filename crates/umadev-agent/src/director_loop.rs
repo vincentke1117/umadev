@@ -88,6 +88,7 @@
 //! 6. **Reversible.** This loop is the DEFAULT `/run` path; the legacy fixed
 //!    pipeline (`UMADEV_LEGACY_PIPELINE=1`) is untouched.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -400,6 +401,131 @@ pub async fn drive_director_loop_routed(
         deadline,
     )
     .await
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Cross-session RESUME — re-attach to a persisted director-loop run.
+//
+// A `/run` persists its owned plan (`.umadev/plan.json`, each step's status) +
+// the 9-phase workflow state "for resume". When the user closes the TUI mid-build
+// and reopens it, there is NO in-memory gate and NO live base subprocess — the old
+// session is gone. But the plan + the on-disk artifacts ARE the continuity: a FRESH
+// session can re-attach to the persisted plan, skip the already-`Done` steps, and
+// drive only what's left. These helpers + [`drive_director_loop_resume`] make that
+// reattachment possible. Every path is fail-open: a corrupt / absent / fully-done
+// plan simply yields "nothing to resume" and the caller falls back to a fresh run.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Whether `plan` still has work left to drive — at least one step that is NOT
+/// terminal (`Done` / `Blocked`). A fully `Done`/`Blocked` plan has nothing to
+/// resume.
+fn plan_has_incomplete_step(plan: &Plan) -> bool {
+    plan.steps
+        .iter()
+        .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::Active))
+}
+
+/// Reset any `Active` step back to `Pending` so a resume re-drives the step that was
+/// interrupted mid-flight. The scheduler only surfaces `Pending` steps via
+/// [`Plan::ready_steps`], so a step persisted as `Active` (the TUI closed while it
+/// ran) would otherwise be stranded — never re-driven, never finished. The old
+/// subprocess is gone; the fresh session must re-run it from a clean state. `Done`
+/// steps are left exactly as persisted (they are never re-driven), and `Blocked`
+/// steps stay an honest gap. Returns the count reset (0 = nothing was Active).
+fn reset_active_to_pending(plan: &mut Plan) -> usize {
+    let mut reset = 0;
+    for s in &mut plan.steps {
+        if s.status == StepStatus::Active {
+            s.status = StepStatus::Pending;
+            reset += 1;
+        }
+    }
+    reset
+}
+
+/// Load the persisted plan for a RESUME, returning it ONLY when it is genuinely
+/// resumable: it parses AND has at least one incomplete (`Pending`/`Active`) step.
+/// Any `Active` step is reset to `Pending` (the interrupted step must re-drive on the
+/// fresh session — see [`reset_active_to_pending`]). Fail-open: an absent / corrupt /
+/// fully-terminal plan → `None`.
+fn load_resumable_plan(root: &Path) -> Option<Plan> {
+    let mut plan = plan_state::load(root)?;
+    if !plan_has_incomplete_step(&plan) {
+        return None; // every step Done/Blocked → nothing left to resume
+    }
+    reset_active_to_pending(&mut plan);
+    Some(plan)
+}
+
+/// Whether `root` holds a director-loop run that can be RESUMED on a fresh session:
+/// either a persisted `.umadev/plan.json` with an incomplete step, OR a
+/// `.umadev/workflow-state.json` parked at a gate / in a non-terminal phase. Pure,
+/// read-only, fail-open — a missing/corrupt plan or state is simply "not resumable"
+/// (never a panic). The TUI uses this so `/continue` on a fresh session re-attaches
+/// to the previous run instead of telling the user to restart the whole pipeline.
+#[must_use]
+pub fn has_resumable_run(root: &Path) -> bool {
+    // A persisted plan with remaining work is the strongest resume signal.
+    if load_resumable_plan(root).is_some() {
+        return true;
+    }
+    // Else a workflow state parked at a gate, or short of the terminal `delivery`
+    // phase, is also resumable (a run that produced state but no plan — e.g. the
+    // legacy walk, or a build interrupted before the plan was synthesised).
+    if let Some(state) = crate::state::read_workflow_state(root) {
+        if !state.active_gate.trim().is_empty() {
+            return true;
+        }
+        if state.phase != Phase::Delivery.id() {
+            return true;
+        }
+    }
+    false
+}
+
+/// **Cross-session resume** — re-attach to a persisted director-loop run on a FRESH
+/// base session instead of synthesising a new plan.
+///
+/// Loads `.umadev/plan.json`; when a RESUMABLE plan exists (≥1 incomplete step) it
+/// re-emits [`EngineEvent::IntentDecided`] + [`EngineEvent::PlanPosted`] so the TUI
+/// re-renders the checklist with the already-`Done` steps checked, then drives ONLY
+/// the remaining steps via [`drive_plan_steps`] — which walks [`Plan::ready_steps`],
+/// so a `Done` step is never ready and is never re-run. The base session is fresh
+/// (the old subprocess is gone): the persisted plan + the on-disk artifacts ARE the
+/// continuity, exactly as a `/run` opens a new session.
+///
+/// Returns `Some(outcome)` when a resume actually ran, or `None` when there was
+/// nothing resumable (absent / corrupt / fully-terminal plan) OR the first remaining
+/// step could not drive on the fresh session — in BOTH cases the caller falls back to
+/// a fresh [`drive_director_loop_routed`], so a resume never loses the build.
+/// Fail-open by contract: never panics, never wedges.
+pub async fn drive_director_loop_resume(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    route: &RoutePlan,
+) -> Option<DirectorLoopOutcome> {
+    let mut plan = load_resumable_plan(&options.project_root)?;
+
+    // Surface the routing decision (the same visible intent card a fresh run shows).
+    events.emit(EngineEvent::intent_decided(route));
+    // Re-render the checklist so the user SEES the already-Done steps checked and the
+    // remaining ones pending — the visible proof the run resumed, not restarted.
+    events.emit(EngineEvent::plan_posted(&plan));
+    let (done, total) = plan.progress();
+    events.emit(EngineEvent::Note(umadev_i18n::tlf(
+        "continue.resuming_plan",
+        &[&done.to_string(), &total.to_string()],
+    )));
+
+    // One shared clock for the resumed build (same as a fresh routed run).
+    let deadline = std::time::Instant::now() + run_budget();
+    let idle = idle_timeout();
+    // Drive ONLY the remaining steps. `drive_plan_steps` schedules by readiness, so
+    // the already-Done steps are skipped and only the Pending ones drive; it persists
+    // the plan + finalizes exactly as a fresh deliberate build does. A first-step
+    // drive failure returns `None` (the caller fails open to a fresh run).
+    drive_plan_steps(session, options, events, route, &mut plan, idle, deadline).await
 }
 
 /// Synthesise the owned plan, persist it best-effort, and emit [`EngineEvent::PlanPosted`].
@@ -4845,5 +4971,192 @@ mod tests {
             prefix.is_empty(),
             "an empty project recalls no knowledge/lessons → empty prefix: {prefix:?}"
         );
+    }
+
+    // ── Cross-session RESUME (`/continue` on a fresh session) ──
+
+    /// Build a [`crate::plan_state::PlanStep`] for the resume tests.
+    fn resume_step(
+        id: &str,
+        title: &str,
+        deps: &[&str],
+        status: crate::plan_state::StepStatus,
+    ) -> crate::plan_state::PlanStep {
+        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind};
+        PlanStep {
+            id: id.into(),
+            title: title.into(),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            status,
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_drives_only_the_remaining_steps_not_the_done_ones() {
+        // The resume entry loads a persisted plan with some Done + some Pending steps
+        // and drives ONLY the remaining ones — the already-Done step is never re-run.
+        use crate::plan_state::{Plan, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Source on disk so the remaining Build step's source-present acceptance passes
+        // (it ticks Done, not Blocked) — the resume must COMPLETE the remaining work.
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+
+        // Persist a plan: `alpha` already DONE, `beta` PENDING (depends on alpha). A
+        // resume must skip `alpha` entirely and drive only `beta`.
+        let persisted = Plan {
+            steps: vec![
+                resume_step("alpha", "ALPHA scaffold the project", &[], StepStatus::Done),
+                resume_step(
+                    "beta",
+                    "BETA build the remaining feature",
+                    &["alpha"],
+                    StepStatus::Pending,
+                ),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        plan_state::save(&persisted, tmp.path()).expect("persist the plan");
+
+        let mut sess = FakeSession::new(vec![text_turn("Built BETA. Done.")], false, "");
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+
+        let outcome = drive_director_loop_resume(&mut sess, &o, &events, &route).await;
+        assert!(
+            matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
+            "a resumable plan drives to a Done outcome"
+        );
+
+        // ONLY the remaining step drove — no directive ever mentioned the Done one.
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.iter()
+                .any(|d| d.contains("BETA build the remaining feature")),
+            "the remaining (Pending) step was driven: {sent:?}"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|d| d.contains("ALPHA scaffold the project")),
+            "the already-Done step was NOT re-driven: {sent:?}"
+        );
+
+        // The persisted plan now has both steps Done (alpha preserved, beta completed).
+        let after = plan_state::load(tmp.path()).expect("the plan is still on disk");
+        let by = |id: &str| after.steps.iter().find(|s| s.id == id).unwrap().status;
+        assert_eq!(
+            by("alpha"),
+            StepStatus::Done,
+            "the prior Done step stays Done"
+        );
+        assert_eq!(
+            by("beta"),
+            StepStatus::Done,
+            "the remaining step is completed"
+        );
+
+        // The checklist was re-rendered (PlanPosted) so the TUI shows the resume.
+        assert!(
+            rec.count(|e| matches!(e, EngineEvent::PlanPosted { .. })) >= 1,
+            "the checklist is re-rendered on resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_is_none_when_no_resumable_plan_exists() {
+        // Fail-open: an absent plan → the resume entry returns None so the caller falls
+        // back to a fresh run (never a crash, never a phantom resume).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+        let outcome = drive_director_loop_resume(&mut sess, &o, &events, &route).await;
+        assert!(
+            outcome.is_none(),
+            "no persisted plan → no resume (caller fails open to a fresh run)"
+        );
+    }
+
+    #[test]
+    fn has_resumable_run_detects_incomplete_done_and_absent() {
+        // `has_resumable_run` is true for an incomplete persisted plan and false for a
+        // fully-Done / absent one (no workflow-state written in these temp dirs).
+        use crate::plan_state::{Plan, StepStatus};
+
+        // (a) Absent plan + absent state → not resumable.
+        let absent = tempfile::TempDir::new().unwrap();
+        assert!(
+            !has_resumable_run(absent.path()),
+            "no plan / no state → not resumable"
+        );
+
+        // (b) A persisted plan with a Pending step → resumable.
+        let incomplete = tempfile::TempDir::new().unwrap();
+        let p = Plan {
+            steps: vec![
+                resume_step("a", "a", &[], StepStatus::Done),
+                resume_step("b", "b", &["a"], StepStatus::Pending),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        plan_state::save(&p, incomplete.path()).unwrap();
+        assert!(
+            has_resumable_run(incomplete.path()),
+            "an incomplete persisted plan is resumable"
+        );
+
+        // (c) A persisted plan with EVERY step Done (+ no state) → not resumable.
+        let done = tempfile::TempDir::new().unwrap();
+        let p = Plan {
+            steps: vec![
+                resume_step("a", "a", &[], StepStatus::Done),
+                resume_step("b", "b", &["a"], StepStatus::Done),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        plan_state::save(&p, done.path()).unwrap();
+        assert!(
+            !has_resumable_run(done.path()),
+            "a fully-Done plan with no state is not resumable"
+        );
+    }
+
+    #[test]
+    fn load_resumable_plan_resets_an_interrupted_active_step_to_pending() {
+        // A step persisted as Active (the TUI closed mid-step) must be reset to Pending
+        // on load so `ready_steps` surfaces it again — otherwise the interrupted step is
+        // stranded (never re-driven). Done steps are preserved.
+        use crate::plan_state::{Plan, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = Plan {
+            steps: vec![
+                resume_step("a", "a", &[], StepStatus::Done),
+                resume_step("b", "b", &[], StepStatus::Active),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        plan_state::save(&p, tmp.path()).unwrap();
+        let loaded =
+            load_resumable_plan(tmp.path()).expect("an Active step makes the plan resumable");
+        let by = |id: &str| loaded.steps.iter().find(|s| s.id == id).unwrap().status;
+        assert_eq!(by("a"), StepStatus::Done, "the Done step is preserved");
+        assert_eq!(
+            by("b"),
+            StepStatus::Pending,
+            "the interrupted Active step is reset to Pending for a clean re-drive"
+        );
+        let ready: Vec<String> = loaded.ready_steps().iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ready, vec!["b"], "the reset step is ready again");
     }
 }

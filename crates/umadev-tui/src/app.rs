@@ -104,6 +104,13 @@ pub enum Action {
     /// full system (design / team / knowledge / evolution); the only difference is
     /// the goal-mode flag the event loop forwards into the director loop.
     StartGoal(String),
+    /// `/continue` on a FRESH session (no in-memory gate) with a persisted,
+    /// resumable director-loop run on disk — re-attach to the saved plan and drive
+    /// only the remaining steps instead of restarting the whole pipeline. Carries
+    /// the requirement (read back from `.umadev/workflow-state.json` when the
+    /// in-memory one is empty). Rides the SAME director-build path as
+    /// [`Self::StartRun`], only with the loop's resume entry selected.
+    ResumeRun(String),
     /// `/quick <task>` — run the lightweight fast track (spec-lite -> implement
     /// -> quality, no gates) for a trivial change instead of the full pipeline.
     StartQuick(String),
@@ -4845,6 +4852,22 @@ impl App {
                     );
                     self.record_trust_pass(gate.id_str());
                     Action::Continue(gate)
+                } else if !self.run_started
+                    && !self.finished
+                    && umadev_agent::has_resumable_run(&self.project_root)
+                {
+                    // Fresh session (no in-memory gate, no in-flight run) but the
+                    // previous `/run` left a resumable director-loop run on disk —
+                    // RE-ATTACH to the saved plan and drive only the remaining steps
+                    // rather than telling the user to restart the whole pipeline. The
+                    // requirement is read back from `.umadev/workflow-state.json` when
+                    // the in-memory one is empty (a reopened TUI has none).
+                    let req = self.resume_run_requirement();
+                    self.push(
+                        ChatRole::UmaDev,
+                        umadev_i18n::t(self.lang, "continue.resuming"),
+                    );
+                    Action::ResumeRun(req)
                 } else {
                     let hint = if self.run_started && !self.finished {
                         umadev_i18n::t(self.lang, "continue.running")
@@ -5457,6 +5480,32 @@ impl App {
         }
         names.sort();
         names
+    }
+
+    /// Resolve the requirement (and slug) for a `/continue` cross-session resume.
+    ///
+    /// A reopened TUI has an empty in-memory `requirement` / `slug`, so this reads
+    /// them back from the persisted `.umadev/workflow-state.json` the previous `/run`
+    /// left. The persisted slug is adopted (so branch isolation + the run baseline
+    /// stay on the SAME `umadev/<slug>` branch as the original run); the persisted
+    /// requirement is returned for the resumed build's firmware / lessons context.
+    /// Fail-open: a missing / empty persisted field keeps the in-memory value, so a
+    /// resume is never blocked by an unreadable state file.
+    fn resume_run_requirement(&mut self) -> String {
+        let state = umadev_agent::read_workflow_state(&self.project_root);
+        if let Some(s) = &state {
+            if self.slug.is_empty() && !s.slug.trim().is_empty() {
+                self.slug = s.slug.clone();
+            }
+        }
+        let persisted = state
+            .map(|s| s.requirement.trim().to_string())
+            .unwrap_or_default();
+        if persisted.is_empty() {
+            self.requirement.clone()
+        } else {
+            persisted
+        }
     }
 
     fn slash_run(&mut self, arg: &str) -> Action {
@@ -9998,6 +10047,60 @@ mod tests {
             .history
             .iter()
             .any(|m| m.body().contains("还没启动流水线") || m.body().contains("没有打开的 gate")));
+    }
+
+    #[test]
+    fn slash_continue_with_a_resumable_plan_resumes_instead_of_hinting() {
+        // /continue on a FRESH session (no in-memory gate) with a persisted, resumable
+        // director-loop run on disk must RE-ATTACH (Action::ResumeRun + a resuming
+        // note), not show the "no pipeline started" restart hint.
+        let mut app = fresh_app(Some("claude-code"));
+        // Persist a plan with one Pending step + a workflow-state carrying the
+        // requirement — exactly what an interrupted /run leaves behind.
+        let plan = umadev_agent::Plan {
+            steps: vec![umadev_agent::PlanStep {
+                id: "a".into(),
+                title: "build the login page".into(),
+                seat: umadev_agent::Seat::FrontendEngineer,
+                kind: umadev_agent::StepKind::Build,
+                depends_on: vec![],
+                acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
+                status: umadev_agent::StepStatus::Pending,
+            }],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+        state.slug = "demo".into();
+        state.requirement = "做一个登录页".into();
+        state.backend = "claude-code".into();
+        umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
+
+        let before = app.history.len();
+        let action = app
+            .try_slash_command("/continue")
+            .expect("/continue is a slash command");
+        assert_eq!(
+            action,
+            Action::ResumeRun("做一个登录页".to_string()),
+            "a resumable run resumes with the persisted requirement"
+        );
+        // The trilingual resuming note was surfaced (not the restart hint).
+        assert!(
+            app.history
+                .iter()
+                .skip(before)
+                .any(|m| m.body().contains("续跑")),
+            "the resuming note is shown"
+        );
+        assert!(
+            !app.history
+                .iter()
+                .skip(before)
+                .any(|m| m.body().contains("还没启动流水线")),
+            "the restart hint is NOT shown"
+        );
     }
 
     #[test]

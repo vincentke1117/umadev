@@ -828,6 +828,7 @@ fn spawn_continuous_block(
 /// transcript (no prior chat to inherit) and is unchanged. The session hand-back to
 /// chat is driven by the caller's `app.director_run_in_flight` + the terminal
 /// `RouteDecision::AgenticDone`, identical for both origins.
+#[allow(clippy::too_many_arguments)]
 fn spawn_director_loop(
     options: RunOptions,
     sink: Arc<ChannelSink>,
@@ -836,6 +837,7 @@ fn spawn_director_loop(
     conversation: Vec<Message>,
     route_override: Option<RoutePlan>,
     goal_mode: bool,
+    resume: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_director_loop(
         options,
@@ -845,6 +847,7 @@ fn spawn_director_loop(
         conversation,
         route_override,
         goal_mode,
+        resume,
     ))
 }
 
@@ -857,6 +860,7 @@ fn spawn_director_loop(
 /// — not a second copy). The `/run` entry + the queued-chat drain keep calling the
 /// spawning wrapper. The body is byte-for-byte the original; only the outer
 /// `tokio::spawn(async move { … })` moved up into the wrapper.
+#[allow(clippy::too_many_arguments)]
 async fn run_director_loop(
     options: RunOptions,
     sink: Arc<ChannelSink>,
@@ -865,6 +869,7 @@ async fn run_director_loop(
     conversation: Vec<Message>,
     route_override: Option<RoutePlan>,
     goal_mode: bool,
+    resume: bool,
 ) {
     {
         let backend = options.backend.clone();
@@ -1011,14 +1016,38 @@ async fn run_director_loop(
         // why the flagship plan/schedule/finalize/acceptance machinery was DEAD on the
         // TUI `/run`. Fail-open: an unparseable/empty plan inside the routed entry just
         // degrades to the single-turn loop, so this never loses a build.
-        let outcome = umadev_agent::drive_director_loop_routed(
-            session.as_mut(),
-            &options,
-            &sink_dyn,
-            directive,
-            Some(&route),
-        )
-        .await;
+        // Cross-session RESUME (`/continue` on a fresh session): try to re-attach to
+        // the persisted plan and drive ONLY the remaining steps. `drive_director_loop_resume`
+        // returns `None` when there is nothing resumable (absent / corrupt / fully-done
+        // plan) OR the first remaining step can't drive on this fresh session — in both
+        // cases we fail open to a fresh routed run, so a resume never loses the build.
+        // A non-resume `/run` / `/goal` skips straight to the fresh routed run.
+        let outcome = {
+            let resumed = if resume {
+                umadev_agent::drive_director_loop_resume(
+                    session.as_mut(),
+                    &options,
+                    &sink_dyn,
+                    &route,
+                )
+                .await
+            } else {
+                None
+            };
+            match resumed {
+                Some(o) => o,
+                None => {
+                    umadev_agent::drive_director_loop_routed(
+                        session.as_mut(),
+                        &options,
+                        &sink_dyn,
+                        directive,
+                        Some(&route),
+                    )
+                    .await
+                }
+            }
+        };
         // Always end the session (release the process / server).
         let _ = session.end().await;
 
@@ -3898,7 +3927,21 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         app.cancel_run();
                                     }
                                 }
-                                Action::StartRun(req) | Action::StartGoal(req) => {
+                                action @ (Action::StartRun(_)
+                                | Action::StartGoal(_)
+                                | Action::ResumeRun(_)) => {
+                                    // `/run`, `/goal <objective>`, and a `/continue`
+                                    // cross-session RESUME all ride this one director-build
+                                    // path. `ResumeRun` differs only in that the loop
+                                    // re-attaches to the persisted plan instead of
+                                    // synthesising a fresh one — captured here as `resume`.
+                                    let resume = matches!(action, Action::ResumeRun(_));
+                                    let (Action::StartRun(req)
+                                    | Action::StartGoal(req)
+                                    | Action::ResumeRun(req)) = action
+                                    else {
+                                        unreachable!()
+                                    };
                                     // `/goal <objective>` and `/run` BOTH ride this one
                                     // director-build path (the orchestration that owns the
                                     // plan / team / firmware / finalize). Both opt into goal
@@ -3972,6 +4015,9 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                             // `/goal` (and `/run`) → persistent-goal framing,
                                             // gated by capability + opt-out inside the loop.
                                             goal_mode,
+                                            // `/continue` resume → re-attach to the persisted
+                                            // plan; `/run` + `/goal` → a fresh run (false).
+                                            resume,
                                         ));
                                     } else {
                                         // LEGACY (opt-in) or offline / non-host: drive the
@@ -6241,7 +6287,17 @@ mod tests {
 
         // Drive the director loop body directly (no spawn): the session start fails
         // open AFTER the baseline write, so the loop returns cleanly.
-        run_director_loop(options, sink, route_tx, false, Vec::new(), None, false).await;
+        run_director_loop(
+            options,
+            sink,
+            route_tx,
+            false,
+            Vec::new(),
+            None,
+            false,
+            false,
+        )
+        .await;
 
         // The baseline is on disk and carries the run's identity — exactly what the
         // CLI surfaces read.
