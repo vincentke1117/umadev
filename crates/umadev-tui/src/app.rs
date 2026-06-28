@@ -371,6 +371,94 @@ pub struct ToolCall {
     pub collapsed: bool,
 }
 
+/// One UI command-palette section. Help groups render in this declared order,
+/// and every [`SlashCommand`] names exactly one group, so the help overlay can
+/// be GENERATED from [`App::COMMANDS`] alone — there are no hand-curated help
+/// rows left to drift out of sync with the palette / dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdGroup {
+    /// Pick / switch the worker (base CLI) that supplies the brain.
+    Worker,
+    /// Drive the delivery pipeline and its gates.
+    Pipeline,
+    /// Take the finished work live.
+    Ship,
+    /// Read-only inspection of state, artifacts, and history.
+    Inspect,
+    /// UI / onboarding settings (language, animations, redraw, …).
+    System,
+    /// Conversation lifecycle and exit.
+    Session,
+}
+
+impl CmdGroup {
+    /// All groups in help-overlay render order.
+    pub const ALL: &'static [CmdGroup] = &[
+        CmdGroup::Worker,
+        CmdGroup::Pipeline,
+        CmdGroup::Ship,
+        CmdGroup::Inspect,
+        CmdGroup::System,
+        CmdGroup::Session,
+    ];
+
+    /// i18n key for this group's help-overlay heading.
+    #[must_use]
+    pub fn title_key(self) -> &'static str {
+        match self {
+            CmdGroup::Worker => "tui.help.group.worker",
+            CmdGroup::Pipeline => "tui.help.group.pipeline",
+            CmdGroup::Ship => "tui.help.group.ship",
+            CmdGroup::Inspect => "tui.help.group.inspect",
+            CmdGroup::System => "tui.help.group.system",
+            CmdGroup::Session => "tui.help.group.session",
+        }
+    }
+}
+
+/// One slash command — the SINGLE source of truth shared by the palette
+/// autocomplete ([`App::palette_matches`]), the help overlay
+/// (`render_help_overlay`), and the dispatch resolver ([`App::resolve_command`]
+/// → `try_slash_command`).
+///
+/// Before this registry, those three surfaces were three hand-kept tables that
+/// had already drifted: `/model` was dispatchable yet absent from the palette;
+/// roughly a dozen verbs never appeared in help; many aliases (`q`/`exit`,
+/// `?`/`commands`, `abort`, `snapshot`, …) lived only in the dispatch `match`. A
+/// parity test (`commands_and_dispatch_are_in_lockstep`) now locks the registry
+/// against the dispatcher so the surfaces can never diverge again.
+#[derive(Debug, Clone, Copy)]
+pub struct SlashCommand {
+    /// Canonical verb (typed after `/`, no slash). Also the dispatch-arm key.
+    pub name: &'static str,
+    /// Alternative spellings that resolve to `name` (e.g. `q`/`exit` → `quit`).
+    pub aliases: &'static [&'static str],
+    /// Argument hint shown as dim ghost text in the palette / help (`<id>`,
+    /// `[slug]`). `None` for a verb that takes no arguments.
+    pub arg_hint: Option<&'static str>,
+    /// Which help-overlay section this command renders under.
+    pub group: CmdGroup,
+    /// i18n key for the one-line description shared by the palette and help.
+    pub desc_key: &'static str,
+    /// Hidden from the palette + help (still dispatchable). None today; kept so a
+    /// future internal verb can be wired without advertising it.
+    pub hidden: bool,
+}
+
+/// One palette autocomplete row: the verb, its localized description, and an
+/// optional argument hint rendered as dim ghost text. Built per-keystroke by
+/// [`App::palette_matches`] from [`App::COMMANDS`] (+ the dynamic per-backend
+/// verbs) for the active language.
+#[derive(Debug, Clone)]
+pub struct PaletteEntry {
+    /// The verb to insert on autocomplete (no leading slash).
+    pub verb: &'static str,
+    /// Localized one-line description (already resolved for the active language).
+    pub desc: &'static str,
+    /// Optional dim ghost-text argument hint.
+    pub arg_hint: Option<&'static str>,
+}
+
 /// One rendered line of a diff card. The `tag` is the gutter marker; `line_no`
 /// is the (1-based) line number in the AFTER file for an add/context line, or in
 /// the BEFORE file for a deletion — whichever the row belongs to (so the number
@@ -1253,6 +1341,13 @@ pub struct App {
     /// probe, and flipped live by `/animations`. Fail-open: an unreadable setting
     /// or probe defaults to animated (today's behaviour).
     pub animations: bool,
+    /// Global "expand everything" toggle (Ctrl+O). When `true`, EVERY collapsible
+    /// renderer (tool results, diff cards, long replies) shows its full body at
+    /// once — not just the most-recent row (which Ctrl+R folds). Flipping it back
+    /// to `false` re-hides all of them to their per-row default. The single
+    /// reveal-all gesture, so older collapsed output is never stranded with no
+    /// way to expand it. Defaults to `false` (collapsed).
+    pub verbose: bool,
     /// `true` when the user asked to quit.
     pub should_quit: bool,
 
@@ -1488,6 +1583,7 @@ impl App {
             status: String::new(),
             tick: 0,
             animations: animations_enabled_default(),
+            verbose: false,
             should_quit: false,
             run_started_at: None,
             phase_started_at: None,
@@ -1954,11 +2050,12 @@ impl App {
         }
     }
 
-    /// Toggle the fold state of the most recent collapsible row (P6 — Ctrl+R).
-    /// Walks from newest to oldest and flips the `collapsed` flag of the first
-    /// row long enough to be foldable (a long Host/UmaDev text body, or a
-    /// finished tool row whose result is long). No-op (fail-open) when nothing
-    /// in view is long enough to fold.
+    /// Toggle the fold state of the most recent collapsible row (Ctrl+R — the
+    /// secondary "fold just the latest" gesture; the global reveal-all is Ctrl+O
+    /// / [`verbose`](Self::verbose)). Walks from newest to oldest and flips the
+    /// `collapsed` flag of the first row long enough to be foldable (a long
+    /// Host/UmaDev text body, or a finished tool row whose result is long). No-op
+    /// (fail-open) when nothing in view is long enough to fold.
     fn toggle_last_collapsible(&mut self) {
         if let Some(msg) = self
             .history
@@ -2640,121 +2737,374 @@ impl App {
 
     // ---- slash command palette ------------------------------------------
 
-    /// Verbs the palette popover suggests, in display order. (verb, hint)
-    pub const SLASH_VERBS: &'static [(&'static str, &'static str)] = &[
-        ("claude", "switch worker to Claude Code CLI"),
-        ("codex", "switch worker to Codex CLI"),
-        ("opencode", "switch worker to OpenCode CLI"),
-        (
+    /// The ONE command registry. The palette autocomplete, the help overlay,
+    /// and the dispatch resolver all read this single table (see [`SlashCommand`]
+    /// for the anti-drift rationale + the parity test that locks it). Listed in
+    /// help-render order within each [`CmdGroup`]. Descriptions are i18n keys so
+    /// the palette + help are localized from one string per command.
+    pub const COMMANDS: &'static [SlashCommand] = &[
+        // ── Worker / brain ────────────────────────────────────────────────
+        Self::cmd(
+            "claude",
+            &["claude-code"],
+            None,
+            CmdGroup::Worker,
+            "tui.cmd.claude",
+        ),
+        Self::cmd("codex", &[], None, CmdGroup::Worker, "tui.cmd.codex"),
+        Self::cmd("opencode", &[], None, CmdGroup::Worker, "tui.cmd.opencode"),
+        Self::cmd(
             "offline",
-            "fall back to offline templates (demo / CI, not a real base)",
+            &[],
+            None,
+            CmdGroup::Worker,
+            "tui.help.worker.offline",
         ),
-        ("lang", "switch UI language: /lang [zh-CN|zh-TW|en]"),
-        (
-            "setup",
-            "re-open the first-run guide (language + base picker)",
+        Self::cmd(
+            "model",
+            &[],
+            Some("<id>"),
+            CmdGroup::Worker,
+            "tui.help.worker.model",
         ),
-        (
-            "guide",
-            "back to the first-run guide / onboarding (alias of /setup)",
+        // ── Pipeline & gates ──────────────────────────────────────────────
+        Self::cmd(
+            "run",
+            &[],
+            Some("[slug] <req>"),
+            CmdGroup::Pipeline,
+            "tui.help.pipe.run",
         ),
-        ("preview", "start the dev server + open the browser"),
-        ("stop-preview", "stop the running preview dev server"),
-        ("deploy", "run the recorded deploy command to go live"),
-        (
-            "pr",
-            "open a GitHub PR with the review report + proof-pack as the body",
-        ),
-        ("usage", "show your worker-call usage statistics"),
-        ("animations", "toggle spinner animation on/off"),
-        ("bug", "collect diagnostics to report a bug"),
-        (
-            "design",
-            "pick a design system (e.g. /design modern-minimal)",
-        ),
-        (
-            "template",
-            "pick a seed template (e.g. /template dashboard)",
-        ),
-        ("run", "start a new run (/run [slug] <requirement>)"),
-        (
+        Self::cmd(
             "goal",
-            "set a goal — keep the base working until it's met (/goal <objective>)",
+            &[],
+            Some("<objective>"),
+            CmdGroup::Pipeline,
+            "tui.cmd.goal",
         ),
-        (
+        Self::cmd(
             "quick",
-            "lightweight fast track for a trivial task (/quick <task>)",
+            &[],
+            Some("<task>"),
+            CmdGroup::Pipeline,
+            "tui.help.pipe.quick",
         ),
-        (
+        Self::cmd(
             "plan",
-            "show/steer the live plan (/plan skip|add|veto|up|down <id>)",
+            &[],
+            Some("skip|add|veto|up|down <id>"),
+            CmdGroup::Pipeline,
+            "tui.cmd.plan",
         ),
-        ("runs", "view run history and phase timing"),
-        (
-            "cancel",
-            "stop the running pipeline and return to the prompt",
+        Self::cmd(
+            "continue",
+            &[],
+            None,
+            CmdGroup::Pipeline,
+            "tui.help.pipe.continue",
         ),
-        (
+        Self::cmd(
+            "revise",
+            &[],
+            Some("<txt>"),
+            CmdGroup::Pipeline,
+            "tui.help.pipe.revise",
+        ),
+        Self::cmd(
             "redo",
-            "re-run the whole requirement, or one phase (/redo [phase])",
+            &[],
+            Some("[phase]"),
+            CmdGroup::Pipeline,
+            "tui.help.pipe.redo",
         ),
-        (
+        Self::cmd(
+            "rewind",
+            &["rollback-files"],
+            Some("[id]"),
+            CmdGroup::Pipeline,
+            "tui.help.pipe.rewind",
+        ),
+        Self::cmd(
             "checkpoint",
-            "snapshot workspace files (/checkpoint [label])",
+            &["snapshot"],
+            Some("[label]"),
+            CmdGroup::Pipeline,
+            "tui.cmd.checkpoint",
         ),
-        ("rewind", "list/rewind file checkpoints (/rewind [id])"),
-        ("config", "show all current configuration"),
-        ("init", "write umadev.yaml manifest"),
-        (
-            "adopt",
-            "adopt an EXISTING project (detect stack, index source, derive contract)",
+        Self::cmd(
+            "cancel",
+            &["abort"],
+            None,
+            CmdGroup::Pipeline,
+            "tui.cmd.cancel",
         ),
-        ("continue", "approve the active gate"),
-        ("revise", "stay at gate, request changes"),
-        ("manual", "review each checkpoint before continuing"),
-        ("auto", "auto-approve checkpoints (autonomous)"),
-        ("mode", "trust tier: /mode plan|guarded|auto"),
-        ("status", "show detailed pipeline status"),
-        ("export", "export the latest proof-pack"),
-        ("knowledge", "list knowledge + design files"),
-        ("pitfalls", "show the self-learning pitfalls knowledge base"),
-        (
-            "lessons",
-            "show what UmaDev has learned (pitfalls + proven patterns)",
+        Self::cmd("init", &[], None, CmdGroup::Pipeline, "tui.help.pipe.init"),
+        Self::cmd("adopt", &[], None, CmdGroup::Pipeline, "tui.cmd.adopt"),
+        Self::cmd(
+            "manual",
+            &[],
+            None,
+            CmdGroup::Pipeline,
+            "tui.help.pipe.manual",
         ),
-        ("mcp", "manage MCP servers (/mcp list)"),
-        ("skill", "manage skill packages (/skill list)"),
-        ("spec", "show the UMADEV_HOST_SPEC_V1 spec"),
-        ("verify", "show workspace conformance"),
-        ("doctor", "self-test"),
-        ("diff", "show an artifact (default: PRD)"),
-        ("history", "show the conversation history"),
-        ("sessions", "list saved chats you can /resume"),
-        ("resume", "reopen a saved chat (/resume <id>)"),
-        ("compact", "summarize-and-fold the chat to free up context"),
-        ("changelog", "show CHANGELOG.md"),
-        ("version", "show umadev / spec / worker versions"),
-        ("help", "show all keybindings"),
-        (
-            "mouse",
-            "toggle mouse-wheel scrolling (off = native text selection)",
+        Self::cmd("auto", &[], None, CmdGroup::Pipeline, "tui.help.pipe.auto"),
+        Self::cmd(
+            "mode",
+            &[],
+            Some("plan|guarded|auto"),
+            CmdGroup::Pipeline,
+            "tui.cmd.mode",
         ),
-        (
+        Self::cmd(
+            "diff",
+            &[],
+            Some("[artifact]"),
+            CmdGroup::Pipeline,
+            "tui.help.pipe.diff",
+        ),
+        // ── Ship it ───────────────────────────────────────────────────────
+        Self::cmd(
+            "preview",
+            &[],
+            None,
+            CmdGroup::Ship,
+            "tui.help.ship.preview",
+        ),
+        Self::cmd(
+            "stop-preview",
+            &[],
+            None,
+            CmdGroup::Ship,
+            "tui.help.ship.stop_preview",
+        ),
+        Self::cmd("deploy", &[], None, CmdGroup::Ship, "tui.help.ship.deploy"),
+        Self::cmd(
+            "pr",
+            &[],
+            Some("[create]"),
+            CmdGroup::Ship,
+            "tui.help.ship.pr",
+        ),
+        Self::cmd("export", &[], None, CmdGroup::Ship, "tui.help.ship.export"),
+        // ── Design & inspect ──────────────────────────────────────────────
+        Self::cmd(
+            "design",
+            &[],
+            Some("<name>"),
+            CmdGroup::Inspect,
+            "tui.help.inspect.design",
+        ),
+        Self::cmd(
+            "template",
+            &[],
+            Some("<name>"),
+            CmdGroup::Inspect,
+            "tui.help.inspect.template",
+        ),
+        Self::cmd(
+            "status",
+            &[],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.status",
+        ),
+        Self::cmd(
+            "pitfalls",
+            &["踩坑"],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.pitfalls",
+        ),
+        Self::cmd("lessons", &[], None, CmdGroup::Inspect, "tui.cmd.lessons"),
+        Self::cmd(
+            "runs",
+            &["history-runs"],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.runs",
+        ),
+        Self::cmd(
+            "knowledge",
+            &[],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.knowledge",
+        ),
+        Self::cmd("mcp", &[], None, CmdGroup::Inspect, "tui.help.inspect.mcp"),
+        Self::cmd(
+            "skill",
+            &[],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.skill",
+        ),
+        Self::cmd(
+            "usage",
+            &[],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.usage",
+        ),
+        Self::cmd(
+            "spec",
+            &[],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.spec",
+        ),
+        Self::cmd(
+            "verify",
+            &[],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.verify",
+        ),
+        Self::cmd(
+            "config",
+            &[],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.config",
+        ),
+        Self::cmd(
+            "doctor",
+            &[],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.doctor",
+        ),
+        Self::cmd(
+            "history",
+            &[],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.history",
+        ),
+        Self::cmd(
+            "sessions",
+            &[],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.sessions",
+        ),
+        Self::cmd(
+            "resume",
+            &[],
+            Some("<id>"),
+            CmdGroup::Inspect,
+            "tui.help.inspect.resume",
+        ),
+        Self::cmd(
+            "version",
+            &[],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.version",
+        ),
+        Self::cmd(
+            "changelog",
+            &[],
+            None,
+            CmdGroup::Inspect,
+            "tui.help.inspect.changelog",
+        ),
+        Self::cmd("bug", &[], None, CmdGroup::Inspect, "tui.help.inspect.bug"),
+        // ── UI & settings ─────────────────────────────────────────────────
+        Self::cmd(
+            "lang",
+            &["language", "语言", "語言"],
+            Some("[zh-CN|zh-TW|en]"),
+            CmdGroup::System,
+            "tui.cmd.lang",
+        ),
+        Self::cmd(
+            "setup",
+            &["reconfigure", "配置", "設定"],
+            None,
+            CmdGroup::System,
+            "tui.cmd.setup",
+        ),
+        Self::cmd("guide", &[], None, CmdGroup::System, "tui.cmd.guide"),
+        Self::cmd(
+            "animations",
+            &[],
+            None,
+            CmdGroup::System,
+            "tui.cmd.animations",
+        ),
+        Self::cmd("mouse", &[], None, CmdGroup::System, "tui.cmd.mouse"),
+        Self::cmd(
             "redraw",
-            "force a full repaint (clear stale / garbled cells)",
+            &["repaint"],
+            None,
+            CmdGroup::System,
+            "tui.cmd.redraw",
         ),
-        ("clear", "clear chat history"),
-        ("quit", "exit"),
+        // ── Session & exit ────────────────────────────────────────────────
+        Self::cmd(
+            "compact",
+            &[],
+            None,
+            CmdGroup::Session,
+            "tui.help.edit.compact",
+        ),
+        Self::cmd("clear", &[], None, CmdGroup::Session, "tui.help.edit.clear"),
+        Self::cmd(
+            "help",
+            &["?", "commands"],
+            None,
+            CmdGroup::Session,
+            "tui.help.edit.help",
+        ),
+        Self::cmd(
+            "quit",
+            &["q", "exit"],
+            None,
+            CmdGroup::Session,
+            "tui.help.edit.quit",
+        ),
     ];
+
+    /// Const constructor for a [`SlashCommand`] registry row — keeps each
+    /// [`COMMANDS`](Self::COMMANDS) entry a single readable line. Every command
+    /// is visible (`hidden: false`); the field exists for future internal verbs.
+    const fn cmd(
+        name: &'static str,
+        aliases: &'static [&'static str],
+        arg_hint: Option<&'static str>,
+        group: CmdGroup,
+        desc_key: &'static str,
+    ) -> SlashCommand {
+        SlashCommand {
+            name,
+            aliases,
+            arg_hint,
+            group,
+            desc_key,
+            hidden: false,
+        }
+    }
+
+    /// Resolve a typed verb (after `/`, lowercased for ASCII) to its registry
+    /// entry by canonical name OR any alias. `None` for an unknown verb (e.g. a
+    /// dynamic per-backend id like `goose`, handled by the dispatch fallback).
+    #[must_use]
+    pub fn resolve_command(verb: &str) -> Option<&'static SlashCommand> {
+        Self::COMMANDS
+            .iter()
+            .find(|c| c.name == verb || c.aliases.contains(&verb))
+    }
 
     /// Match the verbs prefixed by what comes after `/` in the current
     /// input. Empty input or non-slash input → empty list.
     ///
-    /// Combines the static [`SLASH_VERBS`] with the dynamic per-backend
-    /// verbs (so typing `/go` suggests `/goose`, typing `/am` suggests
-    /// `/claude`, `/codex`, etc.) — kept in sync with `BACKEND_IDS`.
+    /// Combines the registry [`COMMANDS`](Self::COMMANDS) with the dynamic
+    /// per-backend verbs (so typing `/go` suggests `/goose`, typing `/am`
+    /// suggests `/claude`, `/codex`, etc.) — kept in sync with `BACKEND_IDS`.
+    /// Descriptions are localized for the active language; hidden commands are
+    /// never suggested.
     #[must_use]
-    pub fn palette_matches(&self) -> Vec<(&'static str, &'static str)> {
+    pub fn palette_matches(&self) -> Vec<PaletteEntry> {
         if !self.input.starts_with('/') {
             return Vec::new();
         }
@@ -2774,22 +3124,30 @@ impl App {
         let hit = |verb: &str| {
             verb.starts_with(typed.as_str()) || (fuzzy && is_subsequence(&typed, verb))
         };
-        let mut out: Vec<(&'static str, &'static str)> = Self::SLASH_VERBS
+        let mut out: Vec<PaletteEntry> = Self::COMMANDS
             .iter()
-            .filter(|(verb, _)| hit(verb))
-            .copied()
+            .filter(|c| !c.hidden && hit(c.name))
+            .map(|c| PaletteEntry {
+                verb: c.name,
+                desc: umadev_i18n::t(self.lang, c.desc_key),
+                arg_hint: c.arg_hint,
+            })
             .collect();
-        // Skip ids already covered by the static list (the three first-class
+        // Skip ids already covered by the registry (the three first-class
         // base CLIs) to avoid duplicate palette rows.
-        let known: std::collections::HashSet<&str> = out.iter().map(|(v, _)| *v).collect();
+        let known: std::collections::HashSet<&str> = out.iter().map(|p| p.verb).collect();
         for (id, hint) in backend_palette_verbs() {
             if !known.contains(id) && hit(id) {
-                out.push((id, hint));
+                out.push(PaletteEntry {
+                    verb: id,
+                    desc: hint,
+                    arg_hint: None,
+                });
             }
         }
         // Prefix matches before looser subsequence matches (stable sort preserves
         // the canonical verb order within each tier).
-        out.sort_by_key(|(v, _)| !v.starts_with(typed.as_str()));
+        out.sort_by_key(|p| !p.verb.starts_with(typed.as_str()));
         out
     }
 
@@ -2811,7 +3169,7 @@ impl App {
             return;
         }
         let selected = self.palette_selected.min(matches.len() - 1);
-        let verb = matches[selected].0;
+        let verb = matches[selected].verb;
         self.input = format!("/{verb} ");
         self.input_cursor = self.input_len();
         self.palette_selected = 0;
@@ -4079,11 +4437,11 @@ impl App {
                     let matches = self.palette_matches();
                     if !matches.is_empty() {
                         let typed = self.input[1..].to_ascii_lowercase();
-                        let is_exact = matches.iter().any(|(v, _)| *v == typed)
+                        let is_exact = matches.iter().any(|p| p.verb == typed)
                             || umadev_host::driver_for(&typed).is_some();
                         if !is_exact {
                             let sel = self.palette_selected.min(matches.len() - 1);
-                            self.input = format!("/{}", matches[sel].0);
+                            self.input = format!("/{}", matches[sel].verb);
                             self.input_cursor = self.input_len();
                         }
                     }
@@ -4202,9 +4560,20 @@ impl App {
                 self.should_quit = true;
                 Action::Quit
             }
+            // Ctrl+O: the GLOBAL "expand everything" toggle (Claude-Code
+            // convention). Flips `verbose` so EVERY collapsed tool result / diff
+            // card / long reply reveals (or re-hides) at once — the single reveal
+            // gesture that reaches OLDER folded rows, which Ctrl+R cannot (it only
+            // toggles the most-recent one). The render reads `verbose`, so the
+            // next frame shows the change.
+            KeyCode::Char('o') if ctrl => {
+                self.verbose = !self.verbose;
+                Action::None
+            }
             // Ctrl+R toggles the fold of the most recent collapsible row (a long
-            // Host/UmaDev text wall, or a finished tool row's result) — the P6
-            // "expand the 998-line wall" lever. No-op when nothing is foldable.
+            // Host/UmaDev text wall, or a finished tool row's result) — the
+            // "fold just the latest" lever, secondary to the global Ctrl+O. No-op
+            // when nothing is foldable.
             KeyCode::Char('r') if ctrl => {
                 self.toggle_last_collapsible();
                 Action::None
@@ -4769,13 +5138,23 @@ impl App {
         let verb = parts.next().unwrap_or("").to_ascii_lowercase();
         let rest = parts.next().unwrap_or("").trim();
         self.push(ChatRole::You, raw.to_string());
-        let action = match verb.as_str() {
-            "help" | "?" | "commands" => {
+        // Resolve aliases CENTRALLY against the registry first, so the dispatch
+        // arms below only ever key on canonical names (e.g. `/q`, `/exit` →
+        // `quit`; `/abort` → `cancel`; `/语言` → `lang`). An unknown verb (a
+        // dynamic per-backend id, or a typo) passes through unchanged to the `_`
+        // fallback. The `commands_and_dispatch_are_in_lockstep` test parses the
+        // arm literals between the COMMAND-DISPATCH sentinels and locks them
+        // against [`COMMANDS`](Self::COMMANDS) so no arm can drift from the
+        // registry that the palette + help also read.
+        let canonical = Self::resolve_command(&verb).map_or(verb.as_str(), |c| c.name);
+        // COMMAND-DISPATCH-START
+        let action = match canonical {
+            "help" => {
                 self.show_help = true;
                 self.help_scroll = 0;
                 Action::None
             }
-            "quit" | "q" | "exit" => {
+            "quit" => {
                 self.should_quit = true;
                 Action::Quit
             }
@@ -4813,7 +5192,7 @@ impl App {
                 );
                 Action::None
             }
-            "claude" | "claude-code" => self.slash_backend(Some("claude-code")),
+            "claude" => self.slash_backend(Some("claude-code")),
             "codex" => self.slash_backend(Some("codex")),
             "opencode" => self.slash_backend(Some("opencode")),
             "offline" => self.slash_backend(None),
@@ -4946,7 +5325,7 @@ impl App {
                 self.open_diff_overlay(rest);
                 Action::None
             }
-            "runs" | "history-runs" => {
+            "runs" => {
                 self.open_runs_overlay();
                 Action::None
             }
@@ -4962,8 +5341,8 @@ impl App {
             "auto" => self.slash_set_review_mode(true),
             "mode" => self.slash_mode(rest),
             "model" => self.slash_model(rest),
-            "lang" | "language" | "语言" | "語言" => self.slash_lang(rest),
-            "setup" | "reconfigure" | "guide" | "配置" | "設定" => self.slash_setup(),
+            "lang" => self.slash_lang(rest),
+            "setup" | "guide" => self.slash_setup(),
             "preview" => self.slash_preview(),
             "stop-preview" => self.slash_stop_preview(),
             "deploy" => self.slash_deploy(rest),
@@ -4982,7 +5361,7 @@ impl App {
             "usage" => self.slash_usage(),
             "animations" => self.slash_toggle_animations(),
             "mouse" => self.slash_toggle_mouse(),
-            "redraw" | "repaint" => {
+            "redraw" => {
                 // Force a full repaint to recover from any accumulated render
                 // desync (stale cells / bled long lines). The event loop owns the
                 // terminal and performs the actual `terminal.clear()`.
@@ -5008,7 +5387,7 @@ impl App {
                 self.open_knowledge_overlay();
                 Action::None
             }
-            "pitfalls" | "踩坑" => {
+            "pitfalls" => {
                 let body = umadev_agent::pitfall_overview(&self.project_root);
                 self.overlay = Some(Overlay::from_body(
                     umadev_i18n::t(self.lang, "pitfalls.overlay_title"),
@@ -5046,7 +5425,7 @@ impl App {
                 self.push(ChatRole::System, output);
                 Action::None
             }
-            "cancel" | "abort" => {
+            "cancel" => {
                 // P1-H: `/cancel` must also abort an in-flight AGENTIC round (the
                 // base inspecting/editing the repo outside the full pipeline).
                 // `agentic_in_flight` is true but `is_pipeline_active()` is false in
@@ -5065,8 +5444,8 @@ impl App {
                 }
             }
             "redo" => self.slash_redo(rest),
-            "checkpoint" | "snapshot" => self.slash_checkpoint(rest),
-            "rewind" | "rollback-files" => self.slash_rewind(rest),
+            "checkpoint" => self.slash_checkpoint(rest),
+            "rewind" => self.slash_rewind(rest),
             "config" => {
                 self.open_config_overlay();
                 Action::None
@@ -5079,6 +5458,7 @@ impl App {
                 self.open_changelog_overlay();
                 Action::None
             }
+            // COMMAND-DISPATCH-END
             _ => {
                 // Dynamic backend verbs: only a verb that resolves to a REAL
                 // registered driver switches the worker. (Never special-case a
@@ -5109,8 +5489,8 @@ impl App {
             return None;
         }
         // Prefix match first — handles `/c` → `claude` and `/rev` → `revise`.
-        if let Some((verb, _)) = Self::SLASH_VERBS.iter().find(|(v, _)| v.starts_with(typed)) {
-            return Some(verb);
+        if let Some(c) = Self::COMMANDS.iter().find(|c| c.name.starts_with(typed)) {
+            return Some(c.name);
         }
         // Also consider the dynamic backend verbs (goose, amp, junie, …).
         if let Some((verb, _)) = backend_palette_verbs()
@@ -5119,12 +5499,12 @@ impl App {
         {
             return Some(verb);
         }
-        // Otherwise Levenshtein ≤ 2 against known verbs (static + dynamic).
+        // Otherwise Levenshtein ≤ 2 against known verbs (registry + dynamic).
         let typed_lower = typed.to_ascii_lowercase();
         let (mut best, mut best_dist) = (None, usize::MAX);
-        let all_verbs = Self::SLASH_VERBS
+        let all_verbs = Self::COMMANDS
             .iter()
-            .map(|(v, _)| *v)
+            .map(|c| c.name)
             .chain(backend_palette_verbs().iter().map(|(v, _)| *v));
         for verb in all_verbs {
             let d = lev(&typed_lower, verb);
@@ -10239,7 +10619,125 @@ mod tests {
     #[test]
     fn goal_is_a_registered_slash_verb() {
         // The `/goal` verb is in the palette so completion + help surface it.
-        assert!(App::SLASH_VERBS.iter().any(|(v, _)| *v == "goal"));
+        assert!(App::COMMANDS.iter().any(|c| c.name == "goal"));
+    }
+
+    /// Parse the canonical verbs from the dispatch `match` arms by reading THIS
+    /// source between the `COMMAND-DISPATCH-START/END` sentinels. An arm head is
+    /// a line that (after trimming) starts with a string literal and contains
+    /// `=>`; its `|`-separated quoted literals are the verbs it handles. The `_`
+    /// fallback sits past the END sentinel, so dynamic per-backend ids are
+    /// excluded. This reads the REAL dispatcher, so it can't drift from it.
+    fn dispatch_arm_verbs() -> Vec<String> {
+        let src = include_str!("app.rs");
+        let start = src
+            .find("// COMMAND-DISPATCH-START")
+            .expect("dispatch start sentinel present");
+        let end = src
+            .find("// COMMAND-DISPATCH-END")
+            .expect("dispatch end sentinel present");
+        assert!(end > start, "END sentinel follows START");
+        let mut verbs = Vec::new();
+        for line in src[start..end].lines() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('"') {
+                continue;
+            }
+            let Some(arrow) = trimmed.find("=>") else {
+                continue;
+            };
+            for part in trimmed[..arrow].split('|') {
+                let part = part.trim();
+                if let Some(inner) = part.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                    verbs.push(inner.to_string());
+                }
+            }
+        }
+        verbs
+    }
+
+    #[test]
+    fn commands_and_dispatch_are_in_lockstep() {
+        // The ONE-registry invariant (UX maturity Fix A): the palette, the help
+        // overlay, and the dispatcher all read `App::COMMANDS`. This test locks
+        // the registry against the actual dispatch arms so the three surfaces can
+        // never drift again (the historical bugs: `/model` dispatchable yet not
+        // in the palette; a dozen verbs missing from help; aliases only in
+        // dispatch). Mirrors how a mature TUI locks its built-in command names.
+        let dispatch = dispatch_arm_verbs();
+        assert!(
+            dispatch.len() >= 40,
+            "parsed the dispatch arms (got {}): {dispatch:?}",
+            dispatch.len()
+        );
+
+        // (1) Every non-hidden registry command has a dispatch arm on its
+        //     canonical name — the palette/help can't advertise an unwired verb.
+        for c in App::COMMANDS {
+            if c.hidden {
+                continue;
+            }
+            assert!(
+                dispatch.iter().any(|v| v == c.name),
+                "/{} is in COMMANDS but has no dispatch arm",
+                c.name
+            );
+            // Each alias resolves CENTRALLY back to its command (aliases live only
+            // in the registry now), so a typed alias always reaches the handler.
+            for alias in c.aliases {
+                let resolved = App::resolve_command(alias);
+                assert!(
+                    resolved.is_some_and(|r| r.name == c.name),
+                    "alias /{alias} of /{} does not resolve to it",
+                    c.name
+                );
+            }
+        }
+
+        // (2) Every dispatch arm is a registered command name — a hand-added
+        //     `match` arm that forgot the registry fails right here.
+        for verb in &dispatch {
+            assert!(
+                App::COMMANDS.iter().any(|c| c.name == verb),
+                "dispatch arm \"{verb}\" is not a registered COMMANDS name"
+            );
+        }
+
+        // (3) Names + aliases are globally unique, so resolution is unambiguous.
+        let mut seen = std::collections::HashSet::new();
+        for c in App::COMMANDS {
+            assert!(seen.insert(c.name), "duplicate command name /{}", c.name);
+            for alias in c.aliases {
+                assert!(
+                    seen.insert(*alias),
+                    "alias /{alias} collides with another verb"
+                );
+            }
+            // Every description key must be present in the catalog (resolves to a
+            // real string, not the key echoed back) so no palette/help row is blank.
+            assert_ne!(
+                umadev_i18n::t(umadev_i18n::Lang::En, c.desc_key),
+                c.desc_key,
+                "/{} desc_key {} is missing from the i18n catalog",
+                c.name,
+                c.desc_key
+            );
+        }
+    }
+
+    #[test]
+    fn model_verb_is_registered_and_dispatchable() {
+        // The exact historical drift the registry kills: `/model` was dispatched
+        // + in help yet absent from the palette. Now it is one registry row that
+        // all three surfaces read.
+        assert!(
+            App::COMMANDS.iter().any(|c| c.name == "model"),
+            "/model is in the registry (so the palette suggests it)"
+        );
+        assert!(
+            dispatch_arm_verbs().iter().any(|v| v == "model"),
+            "/model has a dispatch arm"
+        );
     }
 
     #[test]
@@ -11586,7 +12084,7 @@ mod tests {
         for c in "/dpl".chars() {
             let _ = a.apply_key(KeyCode::Char(c));
         }
-        let verbs: Vec<&str> = a.palette_matches().iter().map(|(v, _)| *v).collect();
+        let verbs: Vec<&str> = a.palette_matches().iter().map(|p| p.verb).collect();
         assert!(
             verbs.contains(&"deploy"),
             "fuzzy /dpl → deploy, got: {verbs:?}"
@@ -11615,7 +12113,7 @@ mod tests {
         }
         let matches = a.palette_matches();
         // /claude /clear → 2 matches.
-        let verbs: Vec<&str> = matches.iter().map(|(v, _)| *v).collect();
+        let verbs: Vec<&str> = matches.iter().map(|p| p.verb).collect();
         assert!(verbs.contains(&"claude"));
         assert!(verbs.contains(&"clear"));
     }
@@ -13058,6 +13556,22 @@ mod tests {
         // No foldable row → history unchanged (fail-open).
         assert_eq!(a.history.len(), before.history.len());
         assert!(!a.history.back().unwrap().collapsed);
+    }
+
+    #[test]
+    fn ctrl_o_toggles_the_global_verbose_flag() {
+        // UX maturity Fix B: a single global key flips `verbose`, which every
+        // collapsible renderer reads so ALL collapsed output reveals/hides at
+        // once — not just the most-recent row that Ctrl+R reaches.
+        let mut a = fresh_app(Some("offline"));
+        assert!(
+            !a.verbose,
+            "verbose defaults off (everything at its per-row state)"
+        );
+        let _ = a.apply_key_with_mods(KeyCode::Char('o'), crossterm::event::KeyModifiers::CONTROL);
+        assert!(a.verbose, "Ctrl+O turns the global expand-all on");
+        let _ = a.apply_key_with_mods(KeyCode::Char('o'), crossterm::event::KeyModifiers::CONTROL);
+        assert!(!a.verbose, "Ctrl+O toggles it back off");
     }
 
     // ---- backward-compat: plain Text rows ---------------------------------

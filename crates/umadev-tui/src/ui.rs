@@ -358,7 +358,9 @@ mod theme {
 }
 use ratatui::Frame;
 
-use crate::app::{App, AppMode, ChatRole, FileDiff, MessageBody, ToolCall, ToolStatus};
+use crate::app::{
+    App, AppMode, ChatRole, CmdGroup, FileDiff, MessageBody, PaletteEntry, ToolCall, ToolStatus,
+};
 
 /// Set the terminal's light/dark classification, probed once at launch
 /// (OSC 11 + COLORFGBG) before raw mode. Re-exported from [`theme`].
@@ -2733,11 +2735,14 @@ fn diff_to_lines(
     d: &FileDiff,
     lang: umadev_i18n::Lang,
     width: usize,
+    verbose: bool,
 ) -> Vec<(Line<'static>, usize)> {
     let mut out: Vec<(Line<'static>, usize)> = Vec::new();
 
     // ── Folded: just the header with the expand hint ──────────────────────
-    if d.collapsed {
+    // The global `verbose` toggle (Ctrl+O) force-expands EVERY diff at once, so
+    // an older folded card is never stranded with no reveal gesture.
+    if d.collapsed && !verbose {
         let hint = umadev_i18n::t(lang, "tui.fold.expand_hint");
         let text = umadev_i18n::tf(
             lang,
@@ -3020,6 +3025,7 @@ fn render_tool_row(
     rendered: &mut Vec<RenderedRow>,
     lang: umadev_i18n::Lang,
     spinner: char,
+    verbose: bool,
 ) {
     // A tool call is a Host artifact, so every row it emits carries the Host
     // spine — the vertical skeleton stays unbroken across a turn's prose +
@@ -3052,8 +3058,10 @@ fn render_tool_row(
         return;
     };
     // A failed call is force-expanded so the error is never hidden, regardless
-    // of the stored `collapsed` flag.
-    let show_collapsed = tool.collapsed && tool.status != ToolStatus::Fail;
+    // of the stored `collapsed` flag. The global `verbose` toggle (Ctrl+O) also
+    // force-expands EVERY tool result at once — including older rows that Ctrl+R
+    // (latest-only) can't reach.
+    let show_collapsed = tool.collapsed && tool.status != ToolStatus::Fail && !verbose;
     let head_n = if tool.name == "Bash" {
         crate::app::FOLD_HEAD_SHELL
     } else {
@@ -3259,7 +3267,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         // Tool rows belong to the Host flow, so they carry the Host spine — the
         // vertical skeleton stays unbroken across a turn's prose + tool rows.
         if let MessageBody::Tool(tool) = &msg.kind {
-            render_tool_row(tool, &mut rendered, app.lang, app.spinner());
+            render_tool_row(tool, &mut rendered, app.lang, app.spinner(), app.verbose);
             continue;
         }
         // A structured diff card (P1) — a Write/Edit rendered as a real diff.
@@ -3268,7 +3276,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         if let MessageBody::Diff(d) = &msg.kind {
             let bar = theme::role_bar(ChatRole::Host);
             rendered.extend(
-                diff_to_lines(d, app.lang, area.width as usize)
+                diff_to_lines(d, app.lang, area.width as usize, app.verbose)
                     .into_iter()
                     .map(|(l, hang)| RenderedRow::spined(l, hang.max(GUTTER_W), bar)),
             );
@@ -3310,7 +3318,12 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             // **P6 long-output fold**: a collapsed long body is truncated to a
             // head-N preview + a `… N more lines` summary (Ctrl+R expands).
             ChatRole::Host | ChatRole::UmaDev => {
-                let folded = if msg.collapsed && crate::app::message_is_collapsible(msg) {
+                // The global `verbose` toggle (Ctrl+O) force-expands every long
+                // reply at once, so an older folded wall always has a reveal
+                // gesture (Ctrl+R only reaches the most-recent row).
+                let eff_collapsed =
+                    msg.collapsed && !app.verbose && crate::app::message_is_collapsible(msg);
+                let folded = if eff_collapsed {
                     fold_general_text(&body, app.lang)
                 } else {
                     body.into_owned()
@@ -3325,7 +3338,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                     && msg_idx + 1 == app.history.len()
                     && matches!(msg.role, ChatRole::Host)
                     && matches!(msg.kind, MessageBody::Text(_))
-                    && !(msg.collapsed && crate::app::message_is_collapsible(msg));
+                    && !eff_collapsed;
                 let body_lines = if is_live_stream {
                     // Fail-open: a borrow conflict (re-entrant render) falls back
                     // to a plain whole-body render.
@@ -4469,7 +4482,7 @@ fn render_palette_popover(
     frame: &mut Frame,
     input_area: Rect,
     app: &App,
-    matches: &[(&'static str, &'static str)],
+    matches: &[PaletteEntry],
 ) {
     let total = matches.len();
     if total == 0 {
@@ -4513,7 +4526,7 @@ fn render_palette_popover(
     let items: Vec<ListItem> = matches[win_start..win_end]
         .iter()
         .enumerate()
-        .map(|(i, (verb, hint))| {
+        .map(|(i, entry)| {
             let idx = win_start + i;
             let arrow = if idx == selected { "›" } else { " " };
             let row_style = if idx == selected {
@@ -4523,14 +4536,26 @@ fn render_palette_popover(
             } else {
                 Style::default().fg(theme::TEXT())
             };
-            ListItem::new(Line::from(vec![
+            // `/verb [arg-hint]` then the localized description. The arg hint is
+            // dim ghost text right after the verb (autocomplete convention) so a
+            // command's expected argument is visible before you commit to it.
+            let mut spans = vec![
                 Span::styled(format!(" {arrow} "), row_style),
-                Span::styled(format!("/{verb:<12}"), row_style),
-                Span::styled(
-                    (*hint).to_string(),
-                    Style::default().fg(theme::TEXT_MUTED()),
-                ),
-            ]))
+                Span::styled(format!("/{}", entry.verb), row_style),
+            ];
+            if let Some(hint) = entry.arg_hint {
+                spans.push(Span::styled(
+                    format!(" {hint}"),
+                    Style::default()
+                        .fg(theme::TEXT_MUTED())
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("  {}", entry.desc),
+                Style::default().fg(theme::TEXT_MUTED()),
+            ));
+            ListItem::new(Line::from(spans))
         })
         .collect();
     // Title carries the position + total so the user KNOWS there are more
@@ -4651,135 +4676,48 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
             );
         }
         AppMode::Chat => {
-            // Worker group derived from the REAL driver registry — never list a
-            // backend that isn't wired. (The old hard-coded list advertised
-            // /gemini /qwen /kimi etc. which don't exist and error on use.)
-            let mut worker_owned: Vec<(String, String)> = umadev_host::BACKEND_IDS
-                .iter()
-                .map(|id| {
-                    let display = umadev_host::driver_for(id)
-                        .map_or_else(|| (*id).to_string(), |d| d.display_name().to_string());
-                    (format!("/{id}"), display)
-                })
-                .collect();
-            worker_owned.push((
-                "/offline".to_string(),
-                umadev_i18n::t(lang, "tui.help.worker.offline").to_string(),
-            ));
-            worker_owned.push((
-                "/model <id>".to_string(),
-                umadev_i18n::t(lang, "tui.help.worker.model").to_string(),
-            ));
-            let worker_rows: Vec<(&str, &str)> = worker_owned
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            push_help_group(
-                &mut items,
-                umadev_i18n::t(lang, "tui.help.group.worker"),
-                &worker_rows,
-            );
-            push_help_group(
-                &mut items,
-                umadev_i18n::t(lang, "tui.help.group.pipeline"),
-                &[
-                    ("Enter", umadev_i18n::t(lang, "tui.help.pipe.enter")),
-                    (
-                        "/continue or c",
-                        umadev_i18n::t(lang, "tui.help.pipe.continue"),
-                    ),
-                    (
-                        "/revise <txt>",
-                        umadev_i18n::t(lang, "tui.help.pipe.revise"),
-                    ),
-                    ("/manual", umadev_i18n::t(lang, "tui.help.pipe.manual")),
-                    ("/auto", umadev_i18n::t(lang, "tui.help.pipe.auto")),
-                    (
-                        "/diff [artifact]",
-                        umadev_i18n::t(lang, "tui.help.pipe.diff"),
-                    ),
-                    (
-                        "/run [slug] <req>",
-                        umadev_i18n::t(lang, "tui.help.pipe.run"),
-                    ),
-                    ("/quick <task>", umadev_i18n::t(lang, "tui.help.pipe.quick")),
-                    ("/redo [phase]", umadev_i18n::t(lang, "tui.help.pipe.redo")),
-                    ("/rewind [id]", umadev_i18n::t(lang, "tui.help.pipe.rewind")),
-                    ("/init", umadev_i18n::t(lang, "tui.help.pipe.init")),
-                ],
-            );
-            push_help_group(
-                &mut items,
-                umadev_i18n::t(lang, "tui.help.group.ship"),
-                &[
-                    ("/preview", umadev_i18n::t(lang, "tui.help.ship.preview")),
-                    (
-                        "/stop-preview",
-                        umadev_i18n::t(lang, "tui.help.ship.stop_preview"),
-                    ),
-                    ("/deploy", umadev_i18n::t(lang, "tui.help.ship.deploy")),
-                    ("/pr", umadev_i18n::t(lang, "tui.help.ship.pr")),
-                    ("/export", umadev_i18n::t(lang, "tui.help.ship.export")),
-                ],
-            );
-            push_help_group(
-                &mut items,
-                umadev_i18n::t(lang, "tui.help.group.inspect"),
-                &[
-                    (
-                        "/design <name>",
-                        umadev_i18n::t(lang, "tui.help.inspect.design"),
-                    ),
-                    (
-                        "/template <name>",
-                        umadev_i18n::t(lang, "tui.help.inspect.template"),
-                    ),
-                    ("/status", umadev_i18n::t(lang, "tui.help.inspect.status")),
-                    (
-                        "/pitfalls",
-                        umadev_i18n::t(lang, "tui.help.inspect.pitfalls"),
-                    ),
-                    ("/runs", umadev_i18n::t(lang, "tui.help.inspect.runs")),
-                    (
-                        "/knowledge",
-                        umadev_i18n::t(lang, "tui.help.inspect.knowledge"),
-                    ),
-                    ("/mcp", umadev_i18n::t(lang, "tui.help.inspect.mcp")),
-                    ("/skill", umadev_i18n::t(lang, "tui.help.inspect.skill")),
-                    ("/usage", umadev_i18n::t(lang, "tui.help.inspect.usage")),
-                    ("/spec", umadev_i18n::t(lang, "tui.help.inspect.spec")),
-                    ("/verify", umadev_i18n::t(lang, "tui.help.inspect.verify")),
-                    ("/config", umadev_i18n::t(lang, "tui.help.inspect.config")),
-                    ("/doctor", umadev_i18n::t(lang, "tui.help.inspect.doctor")),
-                    ("/history", umadev_i18n::t(lang, "tui.help.inspect.history")),
-                    (
-                        "/sessions",
-                        umadev_i18n::t(lang, "tui.help.inspect.sessions"),
-                    ),
-                    (
-                        "/resume <id>",
-                        umadev_i18n::t(lang, "tui.help.inspect.resume"),
-                    ),
-                    ("/version", umadev_i18n::t(lang, "tui.help.inspect.version")),
-                    (
-                        "/changelog",
-                        umadev_i18n::t(lang, "tui.help.inspect.changelog"),
-                    ),
-                    ("/bug", umadev_i18n::t(lang, "tui.help.inspect.bug")),
-                ],
-            );
+            // GENERATED from the one command registry (`App::COMMANDS`), grouped
+            // on `CmdGroup` in declared order. The palette + dispatcher read the
+            // SAME table, and a parity test locks the registry against the
+            // dispatcher — so help can no longer drift (the old hand-curated rows
+            // had already lost `/model`, `/goal`, a dozen others, and every
+            // alias). Each row is `/verb [arg-hint]` + the shared localized desc.
+            for group in CmdGroup::ALL {
+                let rows: Vec<(String, &str)> = App::COMMANDS
+                    .iter()
+                    .filter(|c| !c.hidden && c.group == *group)
+                    .map(|c| {
+                        let key = match c.arg_hint {
+                            Some(hint) => format!("/{} {hint}", c.name),
+                            None => format!("/{}", c.name),
+                        };
+                        (key, umadev_i18n::t(lang, c.desc_key))
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                let row_refs: Vec<(&str, &str)> =
+                    rows.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+                push_help_group(
+                    &mut items,
+                    umadev_i18n::t(lang, group.title_key()),
+                    &row_refs,
+                );
+            }
+            // Keyboard shortcuts are KEYS, not slash commands, so they stay
+            // hand-listed (the registry only owns `/`-verbs). Ctrl+O is the
+            // global reveal-all; Ctrl+R folds just the latest row.
             push_help_group(
                 &mut items,
                 umadev_i18n::t(lang, "tui.help.group.editing"),
                 &[
+                    ("Enter", umadev_i18n::t(lang, "tui.help.pipe.enter")),
                     ("Shift+Enter", umadev_i18n::t(lang, "tui.help.edit.newline")),
                     ("↑ / ↓", umadev_i18n::t(lang, "tui.help.edit.recall")),
                     ("Tab", umadev_i18n::t(lang, "tui.help.edit.autocomplete")),
+                    ("Ctrl+O", umadev_i18n::t(lang, "tui.help.key.expand_all")),
                     ("Ctrl+R", umadev_i18n::t(lang, "tui.help.edit.expand")),
-                    ("/compact", umadev_i18n::t(lang, "tui.help.edit.compact")),
-                    ("/clear", umadev_i18n::t(lang, "tui.help.edit.clear")),
-                    ("/help or /?", umadev_i18n::t(lang, "tui.help.edit.help")),
-                    ("/quit or q", umadev_i18n::t(lang, "tui.help.edit.quit")),
                     ("F1", umadev_i18n::t(lang, "tui.help.edit.toggle")),
                     ("Esc", umadev_i18n::t(lang, "tui.help.edit.esc")),
                 ],
@@ -5790,8 +5728,10 @@ mod tests {
         app.lang = umadev_i18n::Lang::En;
         let _ = app.apply_key(KeyCode::F(1));
         // Render at a terminal tall enough that the full overlay fits (so all
-        // groups are visible without scrolling).
-        let backend = TestBackend::new(120, 90);
+        // groups are visible without scrolling). The registry-generated help is
+        // now complete (every command + every group), so it needs more height
+        // than the old hand-curated subset did.
+        let backend = TestBackend::new(120, 130);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| crate::ui::render(f, &app)).unwrap();
         let buf = term.backend().buffer();
@@ -6935,7 +6875,7 @@ mod tests {
             before: "let x = 1;\nlet y = 2;\n".into(),
             after: "let x = 1;\nlet y = 3;\n".into(),
         });
-        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, 80);
+        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, 80, false);
         // Header carries the path + the +N −M metric in add/del colors.
         let header: String = lines[0]
             .0
@@ -6989,7 +6929,7 @@ mod tests {
             before: "const oldName = compute(input);\n".into(),
             after: "const newName = compute(input);\n".into(),
         });
-        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, 80);
+        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, 80, false);
         let add_word = theme::syn_color(SynRole::DiffAddWord);
         let del_word = theme::syn_color(SynRole::DiffDelWord);
 
@@ -7035,7 +6975,7 @@ mod tests {
             before: "let total = sum_all(items, 1);\n".into(),
             after: "let total = sum_all(items, 2);\n".into(),
         });
-        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, 80);
+        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, 80, false);
         let del_word = theme::syn_color(SynRole::DiffDelWord);
         // Find the − row and count how many of its content chars are in the
         // word-emphasis color — it must be a small minority (just the `1`).
@@ -7074,7 +7014,7 @@ mod tests {
             after: "let y = 3;\n".into(),
         });
         let width = 40usize;
-        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, width);
+        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, width, false);
         let add_bg = theme::DIFF_ADD_BG();
         let del_bg = theme::DIFF_DEL_BG();
         let mut saw_full_add = false;
@@ -7129,7 +7069,7 @@ mod tests {
             hunks: vec![DiffHunk { lines }],
             collapsed: false, // explicitly expanded
         };
-        let out = diff_to_lines(&d, umadev_i18n::Lang::En, 80);
+        let out = diff_to_lines(&d, umadev_i18n::Lang::En, 80, false);
         let joined: String = out
             .iter()
             .flat_map(|(l, _)| l.spans.iter())
@@ -7175,7 +7115,7 @@ mod tests {
             after,
         });
         assert!(d.collapsed);
-        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, 80);
+        let lines = diff_to_lines(&d, umadev_i18n::Lang::En, 80, false);
         assert_eq!(lines.len(), 1, "folded card is a single header row");
         let text: String = lines[0]
             .0
@@ -7185,6 +7125,110 @@ mod tests {
             .collect();
         assert!(text.contains("big.rs"));
         assert!(text.contains("expand"), "shows the expand hint: {text}");
+    }
+
+    // ---- Fix B: ONE global "expand everything" toggle (Ctrl+O / verbose) ----
+
+    #[test]
+    fn global_verbose_force_expands_a_collapsed_diff() {
+        use crate::app::FileDiff;
+        use std::fmt::Write as _;
+        let mut after = String::new();
+        for i in 0..40 {
+            let _ = writeln!(after, "row{i}");
+        }
+        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
+            path: "big.rs".into(),
+            before: String::new(),
+            after,
+        });
+        assert!(d.collapsed, "a big diff defaults collapsed");
+        // verbose=false → its per-row state: folded to a single header row.
+        assert_eq!(diff_to_lines(&d, umadev_i18n::Lang::En, 80, false).len(), 1);
+        // verbose=true (Ctrl+O) → force-expanded regardless of the collapsed flag.
+        let expanded = diff_to_lines(&d, umadev_i18n::Lang::En, 80, true);
+        assert!(
+            expanded.len() > 1,
+            "global verbose reveals the folded diff body"
+        );
+    }
+
+    #[test]
+    fn global_verbose_force_expands_a_collapsed_tool() {
+        let result: String = (0..30)
+            .map(|i| format!("tool-line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tool = ToolCall {
+            name: "Read".into(),
+            arg: "big.txt".into(),
+            status: ToolStatus::Ok,
+            result: Some(result),
+            merged: false,
+            count: 1,
+            collapsed: true,
+        };
+        let joined = |verbose: bool| -> String {
+            let mut rows = Vec::new();
+            render_tool_row(&tool, &mut rows, umadev_i18n::Lang::En, ' ', verbose);
+            rows.iter()
+                .flat_map(|r| r.line.spans.iter())
+                .map(|s| s.content.as_ref().to_string())
+                .collect()
+        };
+        let folded = joined(false);
+        assert!(
+            !folded.contains("tool-line-29"),
+            "a collapsed OK tool hides its tail by default: {folded}"
+        );
+        let revealed = joined(true);
+        assert!(
+            revealed.contains("tool-line-29"),
+            "global verbose reveals the full tool result: {revealed}"
+        );
+    }
+
+    #[test]
+    fn global_verbose_reveals_a_non_latest_collapsed_tool() {
+        // The reported bug: only the MOST-RECENT collapsed row had a reveal
+        // gesture (Ctrl+R). A single Ctrl+O / `verbose` flip must reveal an OLDER
+        // collapsed row too. Push an older tool (alpha) then a newer one (beta);
+        // alpha is the non-latest row.
+        use crate::app::{ChatMessage, MessageBody};
+        let tool_msg = |marker: &str| ChatMessage {
+            role: ChatRole::Host,
+            kind: MessageBody::Tool(ToolCall {
+                name: "Read".into(),
+                arg: format!("{marker}.txt"),
+                status: ToolStatus::Ok,
+                result: Some(
+                    (0..30)
+                        .map(|i| format!("{marker}-line-{i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                merged: false,
+                count: 1,
+                collapsed: true,
+            }),
+            collapsed: false,
+        };
+        let mut app = app_with(Some("offline"));
+        app.history.push_back(tool_msg("alpha")); // older / non-latest
+        app.history.push_back(tool_msg("beta")); // latest
+
+        let out_collapsed = render_chat_at(&app, 100, 80);
+        assert!(
+            !out_collapsed.contains("alpha-line-29"),
+            "older tool stays folded by default: {out_collapsed}"
+        );
+
+        app.verbose = true;
+        let out_verbose = render_chat_at(&app, 100, 80);
+        assert!(
+            out_verbose.contains("alpha-line-29"),
+            "Ctrl+O reveals the OLDER (non-latest) collapsed tool: {out_verbose}"
+        );
     }
 
     #[test]

@@ -548,10 +548,10 @@
 "tui.tool.batch" = "读取 {} 个文件"
 "tui.tool.matches" = "{} 处匹配"
 # 长输出折叠:折叠摘要行 + 每条消息的展开提示
-"tui.fold.collapsed" = "… 还有 {} 行 · {} 展开"
-"tui.fold.expand_hint" = "Ctrl+R 展开"
+"tui.fold.collapsed" = "… 还有 {} 行 · {}"
+"tui.fold.expand_hint" = "Ctrl+O 展开全部"
 # 折叠的 diff 卡头部:文件 (+增 −删) · 展开提示
-"tui.diff.collapsed" = "{} (+{} −{}) · {} 展开"
+"tui.diff.collapsed" = "{} (+{} −{}) · {}"
 # 展开的 diff 渲染到行数上限后的截断尾巴(打开文件查看完整改动)
 "tui.diff.truncated" = "… 还有 {} 行(打开文件查看)"
 # 输入框下方提示行
@@ -582,7 +582,9 @@
 "tui.help.group.pipeline" = "流水线与闸门"
 "tui.help.group.ship" = "交付上线"
 "tui.help.group.inspect" = "设计与检视"
-"tui.help.group.editing" = "编辑与退出"
+"tui.help.group.system" = "界面与设置"
+"tui.help.group.session" = "会话与退出"
+"tui.help.group.editing" = "快捷键"
 # 帮助浮层 —— 选择器导航行
 "tui.help.nav.move" = "在底座列表中移动"
 "tui.help.nav.confirm" = "确认 —— 写入 ~/.umadev/config.toml"
@@ -634,12 +636,32 @@
 "tui.help.edit.recall" = "调取输入历史"
 "tui.help.edit.autocomplete" = "从斜杠面板补全"
 "tui.help.edit.compact" = "压缩并折叠对话以释放上下文"
-"tui.help.edit.expand" = "展开 / 折叠最近的长回复或工具输出"
+"tui.help.edit.expand" = "折叠 / 展开最近一条长回复或工具输出"
+"tui.help.key.expand_all" = "一次展开 / 收起所有折叠输出"
 "tui.help.edit.clear" = "清空对话历史(配置保留)"
 "tui.help.edit.help" = "本浮层"
 "tui.help.edit.quit" = "退出"
 "tui.help.edit.toggle" = "切换本浮层"
 "tui.help.edit.esc" = "关闭浮层 / 退出"
+# 帮助浮层 + 命令面板共享的斜杠命令描述(单一来源)。
+# 多数命令复用上面的 tui.help.* 文案;以下覆盖此前只有英文面板提示(或没有提示)、
+# 现在归注册表统一管理的命令。
+"tui.cmd.claude" = "把底座切换到 Claude Code"
+"tui.cmd.codex" = "把底座切换到 Codex"
+"tui.cmd.opencode" = "把底座切换到 OpenCode"
+"tui.cmd.goal" = "设定目标 — 让底座持续工作直到达成"
+"tui.cmd.plan" = "查看 / 调度实时计划"
+"tui.cmd.checkpoint" = "快照工作区文件"
+"tui.cmd.cancel" = "停止正在运行的流水线 / 智能体回合"
+"tui.cmd.adopt" = "接管现有项目(识别技术栈、索引源码、反推契约)"
+"tui.cmd.mode" = "信任档位:plan / guarded / auto"
+"tui.cmd.lessons" = "UmaDev 学到的经验(踩坑 + 验证过的范式)"
+"tui.cmd.lang" = "切换界面语言"
+"tui.cmd.setup" = "重新打开首次运行向导(语言 + 底座选择)"
+"tui.cmd.guide" = "回到上手向导(/setup 的别名)"
+"tui.cmd.animations" = "开 / 关加载动画"
+"tui.cmd.mouse" = "开 / 关鼠标滚轮滚动(关 = 原生文本选择)"
+"tui.cmd.redraw" = "强制整屏重绘(清除残留 / 乱码单元格)"
 # 事件流渲染(app.rs apply_engine)
 "event.phase_done" = "[ok] {}"
 "event.verify_started" = "[verify] 校验 [{}] 运行中:{}"

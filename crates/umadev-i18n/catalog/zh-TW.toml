@@ -548,10 +548,10 @@
 "tui.tool.batch" = "讀取 {} 個檔案"
 "tui.tool.matches" = "{} 處符合"
 # 長輸出摺疊:摺疊摘要列 + 每則訊息的展開提示
-"tui.fold.collapsed" = "… 還有 {} 行 · {} 展開"
-"tui.fold.expand_hint" = "Ctrl+R 展開"
+"tui.fold.collapsed" = "… 還有 {} 行 · {}"
+"tui.fold.expand_hint" = "Ctrl+O 展開全部"
 # 摺疊的 diff 卡片標頭:檔案 (+增 −刪) · 展開提示
-"tui.diff.collapsed" = "{} (+{} −{}) · {} 展開"
+"tui.diff.collapsed" = "{} (+{} −{}) · {}"
 # 展開的 diff 渲染到行數上限後的截斷尾巴(開啟檔案檢視完整變更)
 "tui.diff.truncated" = "… 還有 {} 行(開啟檔案檢視)"
 # 輸入框下方提示列
@@ -582,7 +582,9 @@
 "tui.help.group.pipeline" = "流水線與閘門"
 "tui.help.group.ship" = "交付上線"
 "tui.help.group.inspect" = "設計與檢視"
-"tui.help.group.editing" = "編輯與退出"
+"tui.help.group.system" = "介面與設定"
+"tui.help.group.session" = "會話與退出"
+"tui.help.group.editing" = "快捷鍵"
 # 說明浮層 —— 選擇器導覽列
 "tui.help.nav.move" = "在底座清單中移動"
 "tui.help.nav.confirm" = "確認 —— 寫入 ~/.umadev/config.toml"
@@ -634,12 +636,32 @@
 "tui.help.edit.recall" = "調取輸入歷史"
 "tui.help.edit.autocomplete" = "從斜線面板補全"
 "tui.help.edit.compact" = "壓縮並摺疊對話以釋放上下文"
-"tui.help.edit.expand" = "展開 / 摺疊最近的長回覆或工具輸出"
+"tui.help.edit.expand" = "摺疊 / 展開最近一條長回覆或工具輸出"
+"tui.help.key.expand_all" = "一次展開 / 收起所有摺疊輸出"
 "tui.help.edit.clear" = "清空對話歷史(設定保留)"
 "tui.help.edit.help" = "本浮層"
 "tui.help.edit.quit" = "退出"
 "tui.help.edit.toggle" = "切換本浮層"
 "tui.help.edit.esc" = "關閉浮層 / 退出"
+# 說明浮層 + 命令面板共用的斜線命令描述(單一來源)。
+# 多數命令沿用上面的 tui.help.* 文案;以下涵蓋此前只有英文面板提示(或沒有提示)、
+# 現在改由註冊表統一管理的命令。
+"tui.cmd.claude" = "把底座切換到 Claude Code"
+"tui.cmd.codex" = "把底座切換到 Codex"
+"tui.cmd.opencode" = "把底座切換到 OpenCode"
+"tui.cmd.goal" = "設定目標 — 讓底座持續工作直到達成"
+"tui.cmd.plan" = "檢視 / 調度即時計畫"
+"tui.cmd.checkpoint" = "快照工作區檔案"
+"tui.cmd.cancel" = "停止正在執行的流水線 / 智慧體回合"
+"tui.cmd.adopt" = "接管既有專案(辨識技術棧、索引原始碼、反推契約)"
+"tui.cmd.mode" = "信任檔位:plan / guarded / auto"
+"tui.cmd.lessons" = "UmaDev 學到的經驗(踩坑 + 驗證過的範式)"
+"tui.cmd.lang" = "切換介面語言"
+"tui.cmd.setup" = "重新開啟首次執行精靈(語言 + 底座選擇)"
+"tui.cmd.guide" = "回到上手精靈(/setup 的別名)"
+"tui.cmd.animations" = "開 / 關載入動畫"
+"tui.cmd.mouse" = "開 / 關滑鼠滾輪捲動(關 = 原生文字選取)"
+"tui.cmd.redraw" = "強制整螢幕重繪(清除殘留 / 亂碼儲存格)"
 # 事件流渲染(app.rs apply_engine)
 "event.phase_done" = "[ok] {}"
 "event.verify_started" = "[verify] 校驗 [{}] 執行中:{}"

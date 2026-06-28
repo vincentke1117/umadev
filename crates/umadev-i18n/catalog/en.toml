@@ -547,11 +547,13 @@
 # Tool-call rows: merged read/grep batch headline + grep metric
 "tui.tool.batch" = "inspected {} files"
 "tui.tool.matches" = "{} matches"
-# Long-output folding: collapsed-summary line + the per-message expand hint
-"tui.fold.collapsed" = "… {} more lines · {} to expand"
-"tui.fold.expand_hint" = "Ctrl+R expand"
+# Long-output folding: collapsed-summary line + the per-message expand hint.
+# The hint names the GLOBAL reveal-all key (Ctrl+O) so a folded row that is not
+# the most recent (which Ctrl+R toggles) still advertises a working gesture.
+"tui.fold.collapsed" = "… {} more lines · {}"
+"tui.fold.expand_hint" = "Ctrl+O expand all"
 # Folded diff-card header: file (+added −removed) · expand hint
-"tui.diff.collapsed" = "{} (+{} −{}) · {} to expand"
+"tui.diff.collapsed" = "{} (+{} −{}) · {}"
 # Truncation tail when an expanded diff exceeds the per-card line cap
 "tui.diff.truncated" = "… {} more lines (open the file to view)"
 # Prompt meta-row hints
@@ -582,7 +584,9 @@
 "tui.help.group.pipeline" = "Pipeline & gates"
 "tui.help.group.ship" = "Ship it"
 "tui.help.group.inspect" = "Design & inspect"
-"tui.help.group.editing" = "Editing & exit"
+"tui.help.group.system" = "UI & settings"
+"tui.help.group.session" = "Session & exit"
+"tui.help.group.editing" = "Keys"
 # Help overlay — picker navigation rows
 "tui.help.nav.move" = "navigate the worker list"
 "tui.help.nav.confirm" = "confirm — saves to ~/.umadev/config.toml"
@@ -634,12 +638,32 @@
 "tui.help.edit.recall" = "recall input history"
 "tui.help.edit.autocomplete" = "autocomplete from slash palette"
 "tui.help.edit.compact" = "summarize-and-fold the chat to free up context"
-"tui.help.edit.expand" = "expand / collapse the latest long reply or tool output"
+"tui.help.edit.expand" = "fold / unfold the latest long reply or tool output"
+"tui.help.key.expand_all" = "reveal / hide ALL collapsed output at once"
 "tui.help.edit.clear" = "clear chat history (config stays)"
 "tui.help.edit.help" = "this overlay"
 "tui.help.edit.quit" = "exit"
 "tui.help.edit.toggle" = "toggle this overlay"
 "tui.help.edit.esc" = "close overlay / quit"
+# Slash-command descriptions that the help overlay + palette share (one source).
+# Most commands reuse the tui.help.* strings above; these cover the verbs that
+# previously had only an English palette hint (or none) and are now registry-owned.
+"tui.cmd.claude" = "switch the worker to Claude Code"
+"tui.cmd.codex" = "switch the worker to Codex"
+"tui.cmd.opencode" = "switch the worker to OpenCode"
+"tui.cmd.goal" = "set a goal — keep the worker going until it's met"
+"tui.cmd.plan" = "show / steer the live plan"
+"tui.cmd.checkpoint" = "snapshot workspace files"
+"tui.cmd.cancel" = "stop the running pipeline / agentic round"
+"tui.cmd.adopt" = "adopt an existing project (detect stack, index source, derive contract)"
+"tui.cmd.mode" = "trust tier: plan / guarded / auto"
+"tui.cmd.lessons" = "what UmaDev has learned (pitfalls + proven patterns)"
+"tui.cmd.lang" = "switch UI language"
+"tui.cmd.setup" = "re-open the first-run guide (language + base picker)"
+"tui.cmd.guide" = "back to the onboarding guide (alias of /setup)"
+"tui.cmd.animations" = "toggle spinner animation on / off"
+"tui.cmd.mouse" = "toggle mouse-wheel scrolling (off = native text selection)"
+"tui.cmd.redraw" = "force a full repaint (clear stale / garbled cells)"
 # Event-stream render (app.rs apply_engine)
 "event.phase_done" = "[ok] {}"
 "event.verify_started" = "[verify] verify [{}] running: {}"
