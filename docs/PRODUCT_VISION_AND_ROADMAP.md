@@ -2,8 +2,19 @@
 
 > **Status:** authoritative. This document supersedes scattered direction notes and
 > the aspirational `AGENT_WIELDS_BASE_ARCHITECTURE.md` migration-wave language.
-> It defines the target "real director Agent," an honest gap analysis against the
-> current code, and an executable, impact-ordered roadmap to launch.
+> It defines the target — a **whole AI development team** (a product manager,
+> architect, UI/UX designer, frontend, backend, QA, security, and DevOps — eight
+> specialists, coordinated by a director seat) — an honest gap analysis against the
+> current code, and an executable, impact-ordered roadmap to launch. The headline
+> repositioning (team as the product, the director demoted to the team's
+> coordinator) is captured in [`DEV_TEAM_AGENT_VISION.md`](DEV_TEAM_AGENT_VISION.md);
+> the layered architecture below is how that team is wired.
+>
+> **The product is the team, not the director.** A solo developer or a small team
+> instantly gets a full, disciplined development team — eight role specialists that
+> plan, build, review, and sign off like a real team. The "director" is the
+> coordinator seat (it routes, owns the visible plan, schedules the team, enforces
+> the gates, leaves the audit trail); it is the glue, not the star.
 >
 > **Non-negotiable identity:** UmaDev is **firmware over a borrowed brain**. It owns
 > **no model**, brokers **no endpoint**, and does **not** re-implement the base's
@@ -17,9 +28,9 @@
 
 ## 0. The one-sentence problem
 
-The product the README/spec **describe** (a director that routes, plans, decomposes,
-schedules a team, delivers a proof-pack, and learns) is **not the product that ships
-by default**. The default path (`drive_director_loop`) is *one base build turn + ≤3
+The product the README/spec **describe** (a whole development team — driven by a
+coordinator that routes, plans, decomposes, schedules the team, delivers a proof-pack,
+and learns) is **not the product that ships by default**. The default path (`drive_director_loop`) is *one base build turn + ≤3
 rounds of read-only QC*, fed by a *static* directive, with **no routing, no visible
 plan, no team scheduling, no learned-memory injection, and no codebase-context
 engine**. All of that intelligence exists in the tree but is either stranded in the
@@ -30,11 +41,12 @@ visible event surface) — not greenfield invention.
 
 ---
 
-## 1. Target Architecture — the "real director Agent"
+## 1. Target Architecture — how the development team is wired
 
-UmaDev is one engine with five layers. The base brain is consulted at **explicit
-decision points** to produce **typed artifacts UmaDev owns**; UmaDev then drives the
-base body deterministically against those artifacts. Everything is **fail-open**: any
+UmaDev is one engine with five layers — the machinery that turns the eight-role team
+into a running system, with the director seat as its coordinator. The base brain is
+consulted at **explicit decision points** to produce **typed artifacts UmaDev owns**;
+UmaDev then drives the base body deterministically against those artifacts. Everything is **fail-open**: any
 brain consult that fails or returns garbage falls back to a deterministic floor and
 never blocks the host.
 
@@ -336,8 +348,9 @@ craft + anti-AI-slop taste + your project's knowledge + learned pitfalls*, verif
 against a *deterministic acceptance floor* that can say no, and hands back a *proof-pack
 + scorecard*. The bare base is a brilliant generalist with no taste floor, no plan you
 can steer, no team, no memory of your project, and no honesty gate. UmaDev keeps the
-base's brain and subscription (no second bill, no second login) and adds the **director
-layer the base lacks** — and it works across **all three** bases identically.
+base's brain and subscription (no second bill, no second login) and adds the **whole
+development-team layer the base lacks** (eight role specialists + a coordinator) — and
+it works across **all three** bases identically.
 
 **vs Cursor:** Cursor's moat is its IDE + apply pipeline + index. UmaDev is **CLI/terminal-
 native, base-agnostic, and governance-first** — it brings the multi-seat review,

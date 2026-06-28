@@ -4,7 +4,7 @@
 
 <img src="docs/assets/umadev-logo-en.png" alt="umadev" width="760">
 
-### A project-director agent for the coding CLI you already use.
+### A whole AI development team for the coding CLI you already use.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.87%2B-orange)](https://www.rust-lang.org/)
@@ -19,9 +19,9 @@ English | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
 
 umadev is a single command-line tool that drives an AI coding CLI you already have — Claude Code, Codex, or OpenCode — as one continuous session. It owns no model of its own: the model your base is connected to is the brain.
 
-You describe what you want in plain language, and umadev drives the base to build it: it plans the work, writes the code, convenes a review team — product, architecture, design, frontend, backend, QA, security — runs quality and governance checks, and hands back runnable code plus a delivery proof. It sizes itself to the task: a small edit stays a small edit; a full project gets the full pipeline.
+What you get is **a whole AI development team**. Eight specialists — product manager, architect, UI/UX designer, frontend engineer, backend engineer, QA, security, and DevOps — plan, build, review, and sign off the way a real team does, borrowing your already-logged-in base as their shared brain. You describe what you want in plain language, and the team turns it into runnable, shippable, auditable software: it researches, writes the PRD, architecture, and UI/UX, builds the frontend and backend, runs the quality and governance checks, and hands back the code plus a delivery proof. It sizes itself to the task — a small edit stays a small edit; a full project convenes the full roster.
 
-The central idea is that umadev works like a real software delivery team. It leads a roster of roles — product manager, architect, UI/UX designer, frontend, backend, QA, security, DevOps, and the director — that plan, build, review, and sign off the way a real team does. The director doesn't type code directly; the base (the AI coding CLI) is the engineer that does the work. The roles coordinate only through shared artifact files and structured verdicts — they never chat to each other.
+A ninth seat — the **coordinator** (the team's technical lead) — is the glue, not the headline: it routes the request, owns a visible plan, schedules the team, enforces the gates, and leaves the audit trail. It doesn't type code itself; the base (the AI coding CLI) is the engineer that does the work. The roles coordinate only through shared artifact files and structured verdicts — they never chat to each other.
 
 It's a single Rust binary. npm is just the delivery shell.
 
@@ -35,7 +35,7 @@ It's a single Rust binary. npm is just the delivery shell.
 - [What Problem It Solves](#what-problem-it-solves)
 - [Features](#features)
 - [How It Works](#how-it-works)
-- [The Review Team](#the-review-team)
+- [The Team](#the-team)
 - [Why You Can Trust the Output](#why-you-can-trust-the-output)
 - [Runtime Modes](#runtime-modes)
 - [The Full Delivery Flow](#the-full-delivery-flow)
@@ -137,7 +137,7 @@ umadev will:
 3. **Research.** When the base has web access, search competing booking apps — features, pricing, design trends, real user reviews — and merge that with built-in knowledge about booking systems, admin CRUD, permissions, and form validation. Everything lands in `output/<slug>-research.md`.
 4. **Draft three core documents.** PRD (roles, scope, EARS acceptance criteria), architecture (data model, APIs, auth, deployment), UI/UX (design direction, tokens, typography, component states, icon library). Pause for your review.
 5. **Build an execution plan.** A dependency plan (`plan.json`) rendered as a live checklist. Each task links back to its FR id.
-6. **Implement the frontend.** The director schedules each task, the base writes the code, each file is governance-checked as it lands.
+6. **Implement the frontend.** The coordinator schedules each task, the base writes the code, each file is governance-checked as it lands.
 7. **Pause for preview.** You see the running app before backend work starts.
 8. **Implement the backend and integration.**
 9. **Run the full quality gate.** Build, test, lint, contract check, runtime probe, governance scan.
@@ -153,12 +153,12 @@ umadev evolved from the original [shangyankeji/super-dev](https://github.com/sha
 
 Early `super-dev` was closer to an AI coding governance tool. It focused on what AI-generated code must not contain: emoji icons, hardcoded colors, unsafe patterns.
 
-umadev has grown that into a full project-director agent:
+umadev has grown that into a whole AI development team wrapped around the base CLI:
 
 - **From single-point governance to whole-pipeline governance.** It no longer only checks code; every phase from requirement to delivery is brought under the process and its gates.
 - **From loose scripts to a spec-driven system.** The source of truth is [UMADEV_HOST_SPEC_V1](spec/UMADEV_HOST_SPEC_V1.md), 25 clauses, ~112 governance rules.
 - **Rewritten in Rust.** One binary, fast startup, low dependency surface, cross-platform distribution.
-- **From blocking bad output to driving the base through the process.** Claude Code / Codex / OpenCode are the brain and hands; umadev is the director and governance rail wrapped around them.
+- **From blocking bad output to driving the base through the process.** Claude Code / Codex / OpenCode are the brain and hands; umadev is the development team — and the governance rail — wrapped around them.
 
 > `super-dev` asked: "how do we stop AI from writing bad code?" umadev asks: "how do we make AI deliver a complete, shippable, auditable project — the way a real software team would?"
 
@@ -196,8 +196,8 @@ flowchart LR
 ## Features
 
 - **Drives a base you already use.** Claude Code, Codex, or OpenCode, run as one continuous session so the base keeps its context across a whole build instead of starting cold each step. No API key of its own.
-- **Works like a real dev team.** The director convenes a roster of nine named roles — product manager, architect, UI/UX designer, frontend engineer, backend engineer, QA, security, DevOps, and the director itself — that plan, implement, review, and sign off the way a real team does.
-- **Plans the work and shows it.** A build becomes a dependency plan (`.umadev/plan.json`) rendered as a live checklist you can steer with `/plan`. Steps are driven step by step; the director owns the plan, not the base.
+- **A whole dev team, not one assistant.** Eight specialists — product manager, architect, UI/UX designer, frontend engineer, backend engineer, QA, security, and DevOps — each own a deliverable (PRD, API contract, design system, the build, tests + runtime-proof, security audit, deploy-proof) and plan, implement, review, and sign off the way a real team does. A coordinator schedules them, owns the plan, and enforces the gates.
+- **Plans the work and shows it.** A build becomes a dependency plan (`.umadev/plan.json`) rendered as a live checklist you can steer with `/plan`. Steps are driven step by step; the coordinator owns the plan, not the base.
 - **A build in chat is a real build.** A build typed in the chat UI earns the same planning, team scheduling, governance, and delivery proof as `umadev run`. There is no weaker chat path.
 - **Ships a delivery proof.** PRD, architecture, and UI/UX docs, a scorecard, and a proof pack — scaled to the task, so a one-page change doesn't get an enterprise dossier.
 - **Carries engineering standards into the base — with a fully-local dual-channel RAG.** 418 curated knowledge files (commercial-grade engineering standards, design rules) plus a map of your existing code are compiled into the binary and retrieved on every working turn by a two-channel hybrid engine: pure-Rust BM25 + a local vector model (`multilingual-e5-small`, f16, via candle) fused with RRF, HyDE query expansion on top. No API key, no network, millisecond recall over your own standards and business docs. Zero config.
@@ -250,13 +250,25 @@ The firmware is pre-loaded once at launch, so the first reply doesn't pay the 30
 
 ---
 
-## The Review Team
+## The Team
 
-umadev convenes a nine-seat review roster. Each role is a real job function, not a label.
+umadev convenes a nine-seat team — eight specialists plus a coordinator — and each role is a real job function with a real deliverable, not a label. Each role owns something concrete on the shared blackboard:
+
+| Role | What it owns (deliverable on the shared blackboard) |
+|---|---|
+| Product manager | Scope, user stories, EARS acceptance criteria — `*-prd.md` |
+| Architect | Layering, data model, API contract — `*-architecture.md` + `openapi.*` |
+| UI/UX designer | Design system: tokens, typography, component states, page skeleton — `*-uiux.md` |
+| Frontend engineer | Components and pages that import the tokens and call the contract URLs |
+| Backend engineer | Data model, endpoints, and business logic aligned to the contract |
+| QA engineer | Tests + a runtime probe — `runtime-proof.json` |
+| Security engineer | Threat model + SAST scan: auth, injection, secrets |
+| DevOps | Build, CI, and deploy evidence — `deploy-proof.json` |
+| Coordinator (technical lead) | Routes intent, owns the plan, schedules the team, enforces each gate, keeps the audit trail |
 
 ```mermaid
 flowchart TB
-    Director["Director<br/>owns plan · drives main session · aggregates verdicts"]
+    Director["Coordinator<br/>owns plan · drives main session · aggregates verdicts"]
 
     subgraph Writing ["Writing roles — main session, serial (single-writer)"]
         FE["Frontend engineer"]
@@ -283,11 +295,11 @@ flowchart TB
     Verdicts --> Director
 ```
 
-How the team works:
+How the team ships without stepping on itself:
 
-- **Writing roles** drive the main session serially. Only one writer touches source at a time.
+- **Doer roles** drive the main session serially to produce their deliverable. Only one writer touches source at a time (single-writer).
 - **Reviewing roles** each run on their own read-only forked session, in parallel, and return a `RoleVerdict` — `accepts`, `blocking` findings with evidence, and `advisory` notes.
-- **The director aggregates deterministically.** The deterministic floor governs loop control; critic opinions are advisory only. Blocking findings are folded into one rework directive injected back into the main session, along with the evidence.
+- **The coordinator aggregates deterministically.** The deterministic floor governs loop control; critic opinions are advisory only. Blocking findings are folded into one rework directive injected back into the main session, along with the evidence.
 - **Roles never chat to each other.** The shared blackboard is the output artifact files and the source tree. The only communication channel between roles is the verdict.
 - **The team scales with the task.** A bugfix convenes no team. A greenfield build convenes the full roster. Complexity determines the seats.
 
@@ -341,7 +353,7 @@ Offline mode (`/offline`) makes no model calls and no network requests. It is an
 
 ## The Full Delivery Flow
 
-For a heavyweight greenfield build, the director can expand the plan into the full nine-phase chain. This is the most complete delivery path — not a funnel every message is forced through.
+For a heavyweight greenfield build, the coordinator can expand the plan into the full nine-phase chain. This is the most complete delivery path — not a funnel every message is forced through.
 
 ```mermaid
 flowchart LR
