@@ -123,9 +123,24 @@ pub fn screen_to_content(
     // (a click inside the gutter clamps to logical column 0). Fail-open: a missing
     // gutter entry is treated as 0.
     let gutter = gutters.get(content_row).copied().unwrap_or(0);
-    let logical_off = col_off.saturating_sub(gutter);
-    let row_len = rows[content_row].chars().count();
-    let content_col = logical_off.min(row_len);
+    let display_off = col_off.saturating_sub(gutter);
+    // `display_off` counts terminal CELLS into the logical text; map it to a CHAR
+    // INDEX honoring double-width (CJK / wide) glyphs. Without this a click on a
+    // line containing wide chars selects too far to the RIGHT — the screen column
+    // is up to ~2x the char index — so the highlight and the copied text drift
+    // past where the mouse points (the reported "选左边选中右边" offset). Walk the
+    // row accumulating each char's display width and stop at the char whose cell
+    // span holds the cursor.
+    let mut acc = 0usize;
+    let mut content_col = 0usize;
+    for ch in rows[content_row].chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if acc.saturating_add(w) > display_off {
+            break;
+        }
+        acc = acc.saturating_add(w);
+        content_col += 1;
+    }
     Some((content_row, content_col))
 }
 
@@ -354,6 +369,37 @@ mod tests {
             screen_to_content(0, 0, area, 0, &rows, &gutters),
             Some((0, 0)),
             "click in the gutter → logical col 0"
+        );
+    }
+
+    #[test]
+    fn screen_to_content_maps_wide_cjk_columns_to_char_index() {
+        // A row of 4 CJK glyphs, each 2 cells wide, no gutter. The screen COLUMN
+        // is up to 2x the char index, so the old "display col == char index" code
+        // selected too far right (the reported 选左边选中右边 offset). The mapping
+        // must walk display widths back to a char index.
+        let rows = vec!["你好世界".to_string()];
+        let gutters = vec![0usize];
+        let area = (0u16, 0u16, 40u16, 10u16);
+        assert_eq!(
+            screen_to_content(0, 0, area, 0, &rows, &gutters),
+            Some((0, 0)),
+            "display col 0 → char 0"
+        );
+        assert_eq!(
+            screen_to_content(2, 0, area, 0, &rows, &gutters),
+            Some((0, 1)),
+            "display col 2 (one wide glyph in) → char 1, not char 2"
+        );
+        assert_eq!(
+            screen_to_content(4, 0, area, 0, &rows, &gutters),
+            Some((0, 2)),
+            "display col 4 (two wide glyphs in) → char 2, not char 4"
+        );
+        assert_eq!(
+            screen_to_content(20, 0, area, 0, &rows, &gutters),
+            Some((0, 4)),
+            "a click past the text clamps to the row's char length"
         );
     }
 
