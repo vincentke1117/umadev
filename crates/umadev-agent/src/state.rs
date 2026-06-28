@@ -39,6 +39,15 @@ pub struct WorkflowState {
     /// against the same worker the original `run` used.
     #[serde(default)]
     pub backend: String,
+    /// The base's OWN persisted conversation id (claude's pinned `--session-id`,
+    /// codex's `thread.id`), captured at run-open. This is the load-bearing
+    /// pointer for **full-context cross-session resume**: a later `/continue`
+    /// re-opens the SAME base conversation (`--resume` / `thread/resume`) so the
+    /// build picks up with the base's accumulated reasoning instead of a cold
+    /// brain that "forgot the task". `None` when the base exposes no resumable id
+    /// (e.g. offline / opencode). Near-zero extra storage — a ~36-byte UUID.
+    #[serde(default)]
+    pub base_session_id: Option<String>,
     /// Spec version the agent is conformant against.
     pub spec_version: String,
 }
@@ -55,6 +64,7 @@ impl WorkflowState {
             last_transition_at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             note: String::new(),
             backend: String::new(),
+            base_session_id: None,
             spec_version: umadev_spec::SPEC_VERSION.to_string(),
         }
     }
@@ -346,6 +356,42 @@ mod tests {
         write_workflow_state(tmp.path(), &s).unwrap();
         let back = read_workflow_state(tmp.path()).unwrap();
         assert_eq!(back.backend, "claude-code");
+    }
+
+    #[test]
+    fn base_session_id_roundtrips_and_defaults_for_legacy() {
+        // The base session id is persisted on run-open and read back verbatim — the
+        // pointer a `/continue` resumes the base conversation with (P0 piece #1).
+        let tmp = TempDir::new().unwrap();
+        let mut s = WorkflowState::new(Phase::Frontend);
+        s.base_session_id = Some("c0ffee00-1234-4abc-8def-0123456789ab".to_string());
+        write_workflow_state(tmp.path(), &s).unwrap();
+        let back = read_workflow_state(tmp.path()).unwrap();
+        assert_eq!(
+            back.base_session_id.as_deref(),
+            Some("c0ffee00-1234-4abc-8def-0123456789ab"),
+            "the base session id round-trips so resume can issue --resume"
+        );
+
+        // A legacy state written before the field existed must still read (defaults
+        // to None — no resumable id, the caller degrades to a fresh session).
+        let dir = tmp.path().join(".umadev");
+        let legacy = r#"{
+            "phase": "frontend",
+            "active_gate": "",
+            "slug": "old",
+            "requirement": "do thing",
+            "last_transition_at": "2026-01-01T00:00:00Z",
+            "note": "",
+            "backend": "claude-code",
+            "spec_version": "UMADEV_HOST_SPEC_V1"
+        }"#;
+        std::fs::write(dir.join("workflow-state.json"), legacy).unwrap();
+        let legacy_state = read_workflow_state(tmp.path()).expect("legacy state must read");
+        assert_eq!(
+            legacy_state.base_session_id, None,
+            "missing field defaults to None"
+        );
     }
 
     #[test]

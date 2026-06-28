@@ -921,7 +921,19 @@ async fn run_director_loop(
         // before the base writes anything) so the baseline reflects this run. Fail-open
         // by contract: a disk/permission error is swallowed (`let _ =`) — a state-write
         // bug must NEVER block an otherwise-healthy build.
-        let baseline = {
+        // P0 (full-context resume): before overwriting the baseline, read any base
+        // session id the PRIOR run persisted — only on a `/continue` (resume), so a
+        // fresh `/run` never inherits a stale pointer. This is the id a `--resume` /
+        // `thread/resume` re-attaches the base's OWN transcript with. Fail-open: a
+        // missing / empty id just means "nothing to resume" (a fresh session below).
+        let prior_base_session_id = if resume {
+            umadev_agent::read_workflow_state(&root)
+                .and_then(|s| s.base_session_id)
+                .filter(|id| !id.trim().is_empty())
+        } else {
+            None
+        };
+        let mut baseline = {
             // `WorkflowState::new` fills `last_transition_at` (now) + `spec_version`;
             // override the run-specific carry-through fields the CLI's `start` sets.
             let mut s = umadev_agent::WorkflowState::new(umadev_spec::Phase::Research);
@@ -929,6 +941,10 @@ async fn run_director_loop(
             s.requirement.clone_from(&options.requirement);
             s.backend.clone_from(&backend);
             s.note = format!("Started director build (TUI) with {backend}");
+            // Preserve the prior resume pointer across the baseline write so the
+            // resume id survives (the LIVE id is re-persisted right after the session
+            // opens, so a fresh-fallback updates it to the new conversation).
+            s.base_session_id = prior_base_session_id.clone();
             s
         };
         let _ = umadev_agent::write_workflow_state(&root, &baseline);
@@ -949,15 +965,19 @@ async fn run_director_loop(
         let firmware = umadev_agent::compose_firmware(&root, &route, &options.requirement).await;
         let firmware = (!firmware.trim().is_empty()).then_some(firmware);
 
-        // Open the director's live base session. Fail-open: a session that can't
-        // open emits the honest terminal abort + a terminal Failed (the user can
-        // retry, or opt into the legacy pipeline with `UMADEV_LEGACY_PIPELINE=1`).
-        let mut session = match umadev_host::session_for(
+        // Open the director's live base session. On a `/continue` with a persisted
+        // base session id this RESUMES the base's OWN conversation (full context for
+        // free); on any resume failure — or a plain `/run` — it opens a fresh one.
+        // Fail-open: a session that can't open at all emits the honest terminal abort
+        // + a terminal Failed (the user can retry, or opt into the legacy pipeline
+        // with `UMADEV_LEGACY_PIPELINE=1`).
+        let mut session = match open_director_session(
             &backend,
             &root,
             &model,
             autonomous,
             firmware.as_deref(),
+            prior_base_session_id.as_deref(),
         )
         .await
         {
@@ -974,6 +994,20 @@ async fn run_director_loop(
                 return;
             }
         };
+
+        // P0 (full-context resume): persist the LIVE base session id so a later
+        // `/continue` can resume THIS conversation. On a successful claude/codex
+        // resume the id is unchanged (idempotent); on a fresh-fallback it captures
+        // the NEW conversation's id (so a resume that degraded still leaves a fresh,
+        // resumable pointer). Fail-open: a base with no resumable id (opencode /
+        // offline) or a write error just leaves the baseline as-is.
+        if let Some(id) = session.session_id() {
+            let id = id.to_string();
+            if !id.trim().is_empty() && baseline.base_session_id.as_deref() != Some(id.as_str()) {
+                baseline.base_session_id = Some(id);
+                let _ = umadev_agent::write_workflow_state(&root, &baseline);
+            }
+        }
 
         // Frame the goal for the director (the firmware framing), then drive the
         // build loop: the base builds end to end, UmaDev runs its honesty/QC read.
@@ -1082,6 +1116,38 @@ async fn run_director_loop(
             }
         }
     }
+}
+
+/// Open the director's base session, RESUMING the persisted base conversation when
+/// one exists (full-context cross-session resume) and degrading **fail-open** to a
+/// fresh session on any resume failure.
+///
+/// When `resume_session_id` is `Some(id)` (a `/continue` with a base session id the
+/// prior run persisted), this first tries [`umadev_host::session_for_resume`] —
+/// claude `--resume <id>` (writable main line, no fork) / codex `thread/resume`
+/// (workspace-write) — so the base re-supplies its OWN transcript and the build picks
+/// up with full context. On ANY error (no persisted id, the base rejects the resume,
+/// opencode's per-run server is gone) it degrades to a fresh
+/// [`umadev_host::session_for`], exactly as a brand-new `/run` opens one. A resume
+/// that errors silently becomes a fresh run — never a crash, never a hang.
+async fn open_director_session(
+    backend: &str,
+    root: &std::path::Path,
+    model: &str,
+    autonomous: bool,
+    firmware: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Result<Box<dyn umadev_runtime::BaseSession>, umadev_runtime::SessionError> {
+    if let Some(id) = resume_session_id.filter(|s| !s.trim().is_empty()) {
+        // Fail-open: a successful resume returns immediately; ANY resume error falls
+        // through to a fresh session below (degrade, never block).
+        if let Ok(s) =
+            umadev_host::session_for_resume(backend, root, model, autonomous, firmware, id).await
+        {
+            return Ok(s);
+        }
+    }
+    umadev_host::session_for(backend, root, model, autonomous, firmware).await
 }
 
 /// Marker prefixed onto the terminal-abort note emitted by [`spawn_block`] when

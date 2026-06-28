@@ -971,6 +971,28 @@ struct StepOutcome {
     made_progress: bool,
 }
 
+/// The overall-goal preamble prepended to every plan-step directive — the directive
+/// half of full-context cross-session resume. It restates the ORIGINAL requirement
+/// so the base knows the product it is building, not just an isolated step title.
+///
+/// On a real base-session resume (`--resume` / `thread/resume`) the base already
+/// re-supplies its own transcript, so this is belt-and-suspenders; when the resume
+/// degraded to a fresh session (no persisted id / a resume error), this preamble is
+/// the LOAD-BEARING context that stops the brain "forgetting the task" and acting on
+/// a bare step title. Fail-open: an empty requirement yields an empty frame (the
+/// directive is byte-for-byte the old step-title form).
+fn step_goal_frame(options: &RunOptions) -> String {
+    let req = options.requirement.trim();
+    if req.is_empty() {
+        return String::new();
+    }
+    format!(
+        "## Overall goal (the product being delivered)\n{req}\n\n\
+         You are continuing the delivery plan for that goal; complete the current \
+         step below in service of it.\n\n## Current step\n"
+    )
+}
+
 /// Drive ONE Build step: `summon` the step's seat serially on the main session with
 /// a focused directive (recalled pitfalls injected), then verify against the step's
 /// `acceptance` on the deterministic floor. A failing acceptance folds its evidence
@@ -994,7 +1016,18 @@ async fn drive_build_step(
     // runs / a miss, so the directive is unchanged then.
     let pitfalls =
         crate::lessons::relevant_lessons_for_prompt(&options.project_root, &options.requirement);
-    let mut instruction = format!("{} — {}", step.title, route_focus_line(route));
+    // PREPEND the ORIGINAL requirement (the directive half of full-context resume):
+    // a per-step directive must restate the overall goal so the base — even a FRESH
+    // brain on a cross-session resume that could not re-attach the base transcript —
+    // builds the right product instead of acting on a bare step title and "forgetting
+    // the task". On a real base-session resume this is belt-and-suspenders; without
+    // one it is the load-bearing context. Fail-open: an empty requirement → no frame.
+    let mut instruction = format!(
+        "{}{} — {}",
+        step_goal_frame(options),
+        step.title,
+        route_focus_line(route)
+    );
     if !pitfalls.trim().is_empty() {
         instruction.push_str("\n\n## Known pitfalls to avoid (from past runs)\n");
         instruction.push_str(pitfalls.trim());
@@ -1073,11 +1106,13 @@ async fn drive_build_step(
             break;
         }
         // Fold this step's failing acceptance into the NEXT re-drive's directive so
-        // the same seat fixes the cause with raw evidence, in the same session.
+        // the same seat fixes the cause with raw evidence, in the same session. The
+        // overall-goal frame is re-prepended so a fix turn keeps the product context.
         instruction = format!(
-            "{} — {}\n\n## This step did not pass its acceptance check yet — fix the cause\n{}\n\
+            "{}{} — {}\n\n## This step did not pass its acceptance check yet — fix the cause\n{}\n\
              Edit the real files, run any build/test you need, and make this step's \
              acceptance ({}) actually pass.",
+            step_goal_frame(options),
             step.title,
             route_focus_line(route),
             verdict.evidence_line(),
@@ -1849,8 +1884,21 @@ fn current_persisted_phase(options: &RunOptions) -> Phase {
 /// the legacy walk's. **Fail-open by contract:** a failed write is swallowed
 /// (`let _ =`) — a disk / permission error can never wedge an otherwise-healthy run.
 fn persist_phase(options: &RunOptions, phase: Phase) {
+    // Read the existing state ONCE so we can both clamp the phase AND carry the
+    // base session id forward (a phase-transition write must NEVER erase the
+    // cross-session resume pointer the run-open path captured — otherwise a
+    // `/continue` mid-build would read None and cold-prime a fresh brain).
+    let current_state = crate::state::read_workflow_state(&options.project_root);
+    let current = current_state
+        .as_ref()
+        .and_then(|s| {
+            umadev_spec::PHASE_CHAIN
+                .iter()
+                .copied()
+                .find(|p| p.id() == s.phase)
+        })
+        .unwrap_or(Phase::Research);
     // Clamp: never regress below what's already on disk.
-    let current = current_persisted_phase(options);
     let phase = if phase_rank(phase) >= phase_rank(current) {
         phase
     } else {
@@ -1864,6 +1912,8 @@ fn persist_phase(options: &RunOptions, phase: Phase) {
         last_transition_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         note: format!("Advanced to {} (director loop)", phase.id()),
         backend: options.backend.clone(),
+        // Preserve the resume pointer across every phase transition of THIS run.
+        base_session_id: current_state.and_then(|s| s.base_session_id),
         spec_version: umadev_spec::SPEC_VERSION.to_string(),
     };
     let _ = crate::state::write_workflow_state(&options.project_root, &state);
@@ -5104,6 +5154,15 @@ mod tests {
                 .iter()
                 .any(|d| d.contains("ALPHA scaffold the project")),
             "the already-Done step was NOT re-driven: {sent:?}"
+        );
+        // Piece #3: the step directive RESTATES the original requirement (the goal
+        // frame), so the base knows the overall product even on a fresh-session
+        // resume — not just the bare step title.
+        assert!(
+            sent.iter()
+                .any(|d| d.contains("做一个完整的产品") && d.contains("Overall goal")),
+            "the resumed step directive restates the original goal, not just the step \
+             title: {sent:?}"
         );
 
         // The persisted plan now has both steps Done (alpha preserved, beta completed).

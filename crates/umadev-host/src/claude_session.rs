@@ -120,6 +120,35 @@ impl ClaudeSession {
         .await
     }
 
+    /// **Cross-session resume** — re-open the WRITABLE main line of an existing
+    /// claude conversation (`session_id`) instead of minting a fresh one. The base
+    /// re-supplies its OWN persisted transcript (`~/.claude/projects/…/<id>.jsonl`),
+    /// so a `/continue` after the TUI closed mid-build gets full context for free —
+    /// no re-priming a cold brain that "forgot the task". Uses
+    /// [`resume_session_args`] (`--resume <id>` WITHOUT `--fork-session`, so it is
+    /// the writable main line, not a read-only critic branch). The struct keeps the
+    /// SAME `session_id`, so a later [`session_id`](BaseSession::session_id) re-persist
+    /// is idempotent.
+    ///
+    /// `UMADEV_CLAUDE_BIN` override honored. Fail-open by contract: a spawn failure
+    /// surfaces as [`SessionError::Start`] — the caller degrades to a fresh
+    /// [`start`](Self::start), never blocks.
+    pub async fn resume(
+        workspace: &Path,
+        append_system: Option<&str>,
+        session_id: &str,
+        autonomous: bool,
+    ) -> Result<Self, SessionError> {
+        let program = std::env::var("UMADEV_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+        Self::spawn_with_args(
+            &program,
+            workspace,
+            &resume_session_args(session_id, append_system, autonomous),
+            session_id,
+        )
+        .await
+    }
+
     /// Spawn a `claude` child with an explicit argument vector and wire up the
     /// stdin / stdout-reader / stderr-drain plumbing. Shared by the main-session
     /// start and the read-only [`fork`](BaseSession::fork) start so both paths
@@ -288,6 +317,13 @@ impl BaseSession for ClaudeSession {
         // base exited, `Ok(None)` = still alive.
         self.child.try_lock().ok()?.try_wait().ok().flatten()
     }
+
+    fn session_id(&self) -> Option<&str> {
+        // The pinned conversation id — the pointer a later `/continue` resumes
+        // via [`ClaudeSession::resume`] (`--resume <id>`), restoring claude's OWN
+        // accumulated transcript for full-context cross-session resume.
+        Some(&self.session_id)
+    }
 }
 
 /// Reader task: parse stdout NDJSON → events forever. On EOF (the base process
@@ -376,6 +412,45 @@ fn claude_permission_mode(autonomous: bool) -> String {
             "default".to_string()
         }
     })
+}
+
+/// The argument vector for a WRITABLE cross-session resume: re-open `session_id`
+/// with `--resume <id>` and **NO** `--fork-session` (this IS the main writable
+/// line, not a read-only critic branch) and **NO** fresh `--session-id` (we are
+/// continuing the existing conversation, not pinning a new one). All the other
+/// stream-json + permission + allowed-tools flags mirror [`session_args`] exactly,
+/// so a resumed session writes files identically to a fresh one — it just inherits
+/// the base's accumulated transcript. Exposed for tests.
+#[must_use]
+pub fn resume_session_args(
+    session_id: &str,
+    append_system: Option<&str>,
+    autonomous: bool,
+) -> Vec<String> {
+    let permission_mode = claude_permission_mode(autonomous);
+    let mut args = vec![
+        "--print".to_string(),
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--include-partial-messages".to_string(),
+        "--verbose".to_string(),
+        // Re-open the existing conversation on its WRITABLE main line. No
+        // `--fork-session` (that branches read-only), no new `--session-id` (that
+        // mints a fresh one) — `--resume <id>` alone resumes + continues writing it.
+        "--resume".to_string(),
+        session_id.to_string(),
+        "--permission-mode".to_string(),
+        permission_mode,
+        "--allowedTools".to_string(),
+        "Read,Edit,Write,Bash".to_string(),
+    ];
+    if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
+        args.push("--append-system-prompt".to_string());
+        args.push(sys.to_string());
+    }
+    args
 }
 
 /// The argument vector for a READ-ONLY critic fork: resume `main_session_id` and
@@ -724,6 +799,49 @@ mod tests {
             .position(|a| a == "--permission-mode")
             .unwrap();
         assert_eq!(overridden[o_idx + 1], "plan", "env override wins");
+
+        match prior {
+            Some(v) => std::env::set_var("UMADEV_CLAUDE_PERMISSION_MODE", v),
+            None => std::env::remove_var("UMADEV_CLAUDE_PERMISSION_MODE"),
+        }
+    }
+
+    #[test]
+    fn resume_session_args_writable_main_line_no_fork() {
+        // A WRITABLE cross-session resume re-opens the existing conversation with
+        // `--resume <id>` and must NOT branch it (`--fork-session`) nor mint a fresh
+        // `--session-id`. The write toolset + stream-json flags match a fresh start,
+        // so the resumed session writes files identically — it just inherits context.
+        let prior = std::env::var_os("UMADEV_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("UMADEV_CLAUDE_PERMISSION_MODE");
+
+        let args = resume_session_args("sid-resume", Some("be terse"), true);
+        // Resumes the SAME conversation id.
+        let r = args
+            .iter()
+            .position(|a| a == "--resume")
+            .expect("--resume present");
+        assert_eq!(args[r + 1], "sid-resume");
+        // NOT a read-only fork, and NOT a fresh pinned id.
+        assert!(
+            !args.contains(&"--fork-session".to_string()),
+            "a writable resume must not branch read-only"
+        );
+        assert!(
+            !args.contains(&"--session-id".to_string()),
+            "a writable resume continues the existing id, never mints a new one"
+        );
+        // Writable toolset (Write/Edit), NOT the read-only fork allowlist.
+        let tools = args.iter().position(|a| a == "--allowedTools").unwrap();
+        assert_eq!(args[tools + 1], "Read,Edit,Write,Bash");
+        // Permission mode tracks autonomy exactly like a fresh start.
+        let perm = args.iter().position(|a| a == "--permission-mode").unwrap();
+        assert_eq!(args[perm + 1], "acceptEdits", "autonomous → acceptEdits");
+        // Streams partial messages so a resumed reply renders token-by-token.
+        assert!(args.iter().any(|a| a == "--include-partial-messages"));
+        // Firmware still injects natively on resume.
+        assert!(args.contains(&"--append-system-prompt".to_string()));
+        assert!(args.contains(&"be terse".to_string()));
 
         match prior {
             Some(v) => std::env::set_var("UMADEV_CLAUDE_PERMISSION_MODE", v),

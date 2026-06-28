@@ -282,6 +282,85 @@ impl CodexSession {
         Ok(session)
     }
 
+    /// **Cross-session resume** — open a fresh `codex app-server` and RESUME the
+    /// existing `thread_id` WRITABLE (`thread/resume` with a workspace-write
+    /// sandbox), so a `/continue` after the TUI closed mid-build re-opens the SAME
+    /// thread with its OWN accumulated context instead of cold-priming a new one.
+    /// The opposite of [`start_fork`](Self::start_fork) (which resumes read-only for
+    /// a critic). `UMADEV_CODEX_BIN` override honored.
+    ///
+    /// Fail-open by contract: a spawn / handshake / resume failure surfaces as
+    /// [`SessionError::Start`] — the caller degrades to a fresh [`start`](Self::start),
+    /// never blocks.
+    pub async fn resume(
+        workspace: &Path,
+        model: &str,
+        thread_id: &str,
+        autonomous: bool,
+    ) -> Result<Self, SessionError> {
+        Self::start_resume(
+            &codex_program(),
+            workspace,
+            model,
+            thread_id,
+            autonomous,
+            handshake_timeout(),
+        )
+        .await
+    }
+
+    /// Open a fresh app-server and resume `thread_id` WRITABLE (the testable core
+    /// of [`resume`](Self::resume); mirrors [`start_fork`](Self::start_fork) but with
+    /// the writable resume handshake).
+    async fn start_resume(
+        program: &str,
+        workspace: &Path,
+        model: &str,
+        thread_id: &str,
+        autonomous: bool,
+        handshake_budget: Duration,
+    ) -> Result<Self, SessionError> {
+        let mut child = spawn_app_server(program, workspace)?;
+        let stdin = take_pipe(child.stdin.take(), "stdin")?;
+        let stdout = take_pipe(child.stdout.take(), "stdout")?;
+        let stderr_tail = StderrTail::new();
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(drain_stderr_into(stderr, stderr_tail.clone()));
+        }
+        let stdin = Arc::new(Mutex::new(stdin));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let approvals: ApprovalMap = Arc::new(Mutex::new(HashMap::new()));
+        let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let latest_usage: LatestUsage = Arc::new(Mutex::new(None));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        tokio::spawn(reader_loop(
+            stdout,
+            Arc::clone(&pending),
+            Arc::clone(&approvals),
+            Arc::clone(&turn_id),
+            latest_usage,
+            event_tx,
+        ));
+        let session = Self {
+            stdin,
+            events: event_rx,
+            pending,
+            approvals,
+            next_id: AtomicI64::new(1),
+            thread_id: thread_id.to_string(),
+            turn_id,
+            program: program.to_string(),
+            workspace: workspace.to_path_buf(),
+            model: model.to_string(),
+            child: std::sync::Mutex::new(child),
+            stderr: stderr_tail,
+        };
+        session
+            .resume_handshake(thread_id, autonomous, handshake_budget)
+            .await?;
+        Ok(session)
+    }
+
     /// Start a READ-ONLY critic fork: a fresh, independent `codex app-server`
     /// that RESUMES the main thread (`fork_thread_id`) in a read-only sandbox.
     ///
@@ -361,6 +440,36 @@ impl CodexSession {
                 "codex handshake timed out — check codex login/config".to_string(),
             )),
         }
+    }
+
+    /// Run `initialize → initialized → thread/resume` for a WRITABLE cross-session
+    /// resume (workspace-write sandbox + the autonomy-tiered approval policy), so the
+    /// resumed thread keeps writing with its accumulated context.
+    async fn resume_handshake(
+        &self,
+        thread_id: &str,
+        autonomous: bool,
+        budget: Duration,
+    ) -> Result<(), SessionError> {
+        self.request_bounded(
+            "initialize",
+            &initialize_params(),
+            budget,
+            "codex resume initialize",
+        )
+        .await?;
+        self.notify("initialized", json!({}))
+            .await
+            .map_err(|e| SessionError::Start(format!("codex resume initialized: {e}")))?;
+        // Resume the existing thread WRITABLE on this fresh server.
+        self.request_bounded(
+            "thread/resume",
+            &thread_resume_params_writable(thread_id, &self.workspace, &self.model, autonomous),
+            budget,
+            "codex thread/resume (writable)",
+        )
+        .await?;
+        Ok(())
     }
 
     /// Run `initialize → initialized → thread/resume` for a read-only fork.
@@ -569,6 +678,33 @@ fn thread_resume_params(thread_id: &str, workspace: &Path, model: &str) -> Value
         "approvalPolicy": "never",
         // Kebab-case (see `thread_start_params`): `readOnly` → `read-only`.
         "sandbox": "read-only",
+    });
+    if let Some(m) = codex_model(model) {
+        params["model"] = json!(m);
+    }
+    params
+}
+
+/// Build the `thread/resume` params for a WRITABLE cross-session resume: re-open
+/// `thread_id` with `sandbox:"workspace-write"` + the autonomy-tiered
+/// `approvalPolicy` (mirroring [`thread_start_params`]), so the resumed thread can
+/// keep WRITING the workspace with its OWN accumulated context — the opposite of
+/// the read-only critic [`thread_resume_params`]. The model is forwarded only when
+/// codex-native.
+fn thread_resume_params_writable(
+    thread_id: &str,
+    workspace: &Path,
+    model: &str,
+    autonomous: bool,
+) -> Value {
+    let approval_policy = if autonomous { "never" } else { "on-request" };
+    let mut params = json!({
+        "threadId": thread_id,
+        "cwd": workspace.to_string_lossy(),
+        "approvalPolicy": approval_policy,
+        // Kebab-case (see `thread_start_params`): writable so the resumed thread
+        // can continue building, not just review.
+        "sandbox": "workspace-write",
     });
     if let Some(m) = codex_model(model) {
         params["model"] = json!(m);
@@ -1328,6 +1464,14 @@ impl BaseSession for CodexSession {
         // None. `Ok(Some)` = the base process exited, `Ok(None)` = still alive.
         self.child.try_lock().ok()?.try_wait().ok().flatten()
     }
+
+    fn session_id(&self) -> Option<&str> {
+        // codex's `thread.id` is the resumable pointer: a later `/continue`
+        // re-opens THIS thread WRITABLE via [`CodexSession::resume`]
+        // (`thread/resume` with a workspace-write sandbox), restoring the thread's
+        // accumulated context. Empty (handshake not completed) → None (fail-open).
+        (!self.thread_id.is_empty()).then_some(self.thread_id.as_str())
+    }
 }
 
 /// Build the `turn/start` params (one text input on the live thread).
@@ -1418,6 +1562,32 @@ mod tests {
         // A non-codex model is dropped (account default), same as thread/start.
         let p2 = thread_resume_params("thr_main", Path::new("/tmp/p"), "claude-sonnet-4-6");
         assert!(p2.get("model").is_none());
+    }
+
+    #[test]
+    fn thread_resume_params_writable_is_workspace_write() {
+        // A cross-session resume re-opens the thread WRITABLE: workspace-write
+        // sandbox + the autonomy-tiered approval policy, so it can keep building
+        // (the opposite of the read-only critic resume above).
+        let auto =
+            thread_resume_params_writable("thr_main", Path::new("/tmp/p"), "gpt-5-codex", true);
+        assert_eq!(auto["threadId"], "thr_main");
+        assert_eq!(auto["sandbox"], "workspace-write");
+        assert_eq!(
+            auto["approvalPolicy"], "never",
+            "autonomous → never-approve"
+        );
+        assert_eq!(auto["model"], "gpt-5-codex");
+        // Guarded tier → on-request (the server raises requestApproval at gates).
+        let gated = thread_resume_params_writable(
+            "thr_main",
+            Path::new("/tmp/p"),
+            "claude-sonnet-4-6",
+            false,
+        );
+        assert_eq!(gated["approvalPolicy"], "on-request");
+        assert_eq!(gated["sandbox"], "workspace-write");
+        assert!(gated.get("model").is_none(), "non-codex model dropped");
     }
 
     #[test]

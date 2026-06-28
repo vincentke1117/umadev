@@ -685,6 +685,22 @@ pub trait BaseSession: Send {
     fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
         None
     }
+
+    /// The base's OWN persisted conversation id, if this session has one — the
+    /// load-bearing pointer for **full-context cross-session resume**. Every
+    /// first-class base persists its transcript under this id (claude's pinned
+    /// `--session-id`, codex's `thread.id`, opencode's server-side `ses_…`), so
+    /// persisting just this id lets a later `/continue` re-open the SAME base
+    /// conversation via `--resume` / `thread/resume` instead of cold-priming a
+    /// fresh brain that "forgot the task." Near-zero extra storage: a ~36-byte id.
+    ///
+    /// **Fail-open:** the default returns `None`; a session that cannot expose a
+    /// resumable id (or hasn't captured one yet) simply yields `None`, and the
+    /// caller degrades to a fresh session — a resume is best-effort, never
+    /// required.
+    fn session_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[cfg(test)]

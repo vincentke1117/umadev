@@ -1464,6 +1464,10 @@ impl<R: Runtime> AgentRunner<R> {
                 self.options.requirement
             ),
             backend: self.options.backend.clone(),
+            // The legacy single-shot pipeline captures no base session id (each
+            // phase is its own process); cross-session resume targets the
+            // continuous director-loop path. None → a `/continue` degrades to fresh.
+            base_session_id: None,
             spec_version: SPEC_VERSION.to_string(),
         };
         write_workflow_state(&self.options.project_root, &state)?;
@@ -5165,6 +5169,7 @@ impl<R: Runtime> AgentRunner<R> {
             last_transition_at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             note: "Pipeline complete.".to_string(),
             backend: self.options.backend.clone(),
+            base_session_id: None,
             spec_version: SPEC_VERSION.to_string(),
         };
         write_workflow_state(&self.options.project_root, &done)?;
@@ -5333,6 +5338,7 @@ impl<R: Runtime> AgentRunner<R> {
             last_transition_at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             note: "Light pipeline complete.".to_string(),
             backend: self.options.backend.clone(),
+            base_session_id: None,
             spec_version: SPEC_VERSION.to_string(),
         };
         write_workflow_state(&self.options.project_root, &done)?;
@@ -5750,6 +5756,11 @@ impl<R: Runtime> AgentRunner<R> {
     }
 
     fn transition(&self, next: Phase, active_gate: &str) -> std::io::Result<()> {
+        // Carry any captured resume pointer forward across legacy transitions too,
+        // so a phase write never erases it (defensive — the legacy path itself
+        // captures none, but a mixed-mode workspace must not lose the id).
+        let prior_base_session_id = crate::state::read_workflow_state(&self.options.project_root)
+            .and_then(|s| s.base_session_id);
         let state = WorkflowState {
             phase: next.id().to_string(),
             active_gate: active_gate.to_string(),
@@ -5762,6 +5773,7 @@ impl<R: Runtime> AgentRunner<R> {
                 self.worker_label()
             ),
             backend: self.options.backend.clone(),
+            base_session_id: prior_base_session_id,
             spec_version: SPEC_VERSION.to_string(),
         };
         write_workflow_state(&self.options.project_root, &state)?;

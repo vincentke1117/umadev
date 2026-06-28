@@ -163,6 +163,10 @@ pub enum RunOutcome {
 /// continuous driver returns a [`RunOutcome`], not a `Result`, so we degrade to
 /// "best-effort persisted" rather than aborting an otherwise-healthy run.
 fn persist_state(options: &RunOptions, phase: Phase, active_gate: &str) {
+    // Carry the base session id (if any) forward across transitions so a
+    // phase-transition write never erases a cross-session resume pointer.
+    let prior_base_session_id =
+        crate::state::read_workflow_state(&options.project_root).and_then(|s| s.base_session_id);
     let state = WorkflowState {
         phase: phase.id().to_string(),
         active_gate: active_gate.to_string(),
@@ -171,6 +175,7 @@ fn persist_state(options: &RunOptions, phase: Phase, active_gate: &str) {
         last_transition_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         note: format!("Advanced to {} (continuous session)", phase.id()),
         backend: options.backend.clone(),
+        base_session_id: prior_base_session_id,
         spec_version: umadev_spec::SPEC_VERSION.to_string(),
     };
     let _ = write_workflow_state(&options.project_root, &state);

@@ -1482,6 +1482,65 @@ pub async fn session_for(
     }
 }
 
+/// Open a base session by **resuming** an existing base conversation
+/// (`resume_session_id`) instead of minting a fresh one — the WRITABLE
+/// cross-session resume that powers full-context `/continue`. The base
+/// re-supplies its OWN persisted transcript, so a build interrupted mid-way picks
+/// up with full context (near-zero extra storage: the resume id is a ~36-byte
+/// pointer UmaDev persisted at run-open).
+///
+/// Per base:
+/// - **claude-code** → [`ClaudeSession::resume`] (`--resume <id>`, no
+///   `--fork-session`): the writable main line of the pinned conversation.
+/// - **codex** → [`CodexSession::resume`] (`thread/resume` with a workspace-write
+///   sandbox): re-open the thread WRITABLE with its accumulated context.
+/// - **opencode** → **not resumable cross-process**: the per-run `opencode serve`
+///   child dies when UmaDev closes (and the session is deleted on `end`), so a
+///   fresh process has no live server to re-point at. Returns
+///   [`SessionError::Start`] so the caller degrades to a fresh session (the
+///   roadmap's "server gone → degrade" path).
+///
+/// # Errors
+/// Returns [`umadev_runtime::SessionError`] when the id is unknown, the base
+/// rejects the resume, or the backend has no cross-process resume (opencode).
+/// **Fail-open by contract:** the error is the caller's signal to degrade to a
+/// fresh [`session_for`], never a panic — a resume that errors silently becomes a
+/// fresh run.
+pub async fn session_for_resume(
+    backend_id: &str,
+    workspace: &std::path::Path,
+    model: &str,
+    autonomous: bool,
+    append_system: Option<&str>,
+    resume_session_id: &str,
+) -> Result<Box<dyn umadev_runtime::BaseSession>, umadev_runtime::SessionError> {
+    let append_system = append_system.filter(|s| !s.trim().is_empty());
+    let resume_id = resume_session_id.trim();
+    if resume_id.is_empty() {
+        return Err(umadev_runtime::SessionError::Start(
+            "no base session id to resume".to_string(),
+        ));
+    }
+    match backend_id {
+        "claude-code" => {
+            let s = ClaudeSession::resume(workspace, append_system, resume_id, autonomous).await?;
+            Ok(Box::new(s))
+        }
+        "codex" => {
+            let s = CodexSession::resume(workspace, model, resume_id, autonomous).await?;
+            Ok(Box::new(s))
+        }
+        "opencode" => Err(umadev_runtime::SessionError::Start(
+            "opencode has no cross-process session resume (the per-run server is \
+             gone); degrade to a fresh session"
+                .to_string(),
+        )),
+        other => Err(umadev_runtime::SessionError::Start(format!(
+            "unknown backend id for session resume: {other}"
+        ))),
+    }
+}
+
 /// All backend ids `driver_for` accepts. UmaDev drives exactly three host
 /// CLI bases: Claude Code, Codex, and `OpenCode`.
 pub const BACKEND_IDS: &[&str] = &["claude-code", "codex", "opencode"];
@@ -1602,6 +1661,30 @@ mod tests {
                 "unknown backend must error deterministically (firmware={fw:?})"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn session_for_resume_degrades_deterministically() {
+        // Cross-session resume must fail DETERMINISTICALLY (no base process spawned)
+        // so the caller's fail-open path to a fresh `session_for` is always reachable:
+        // an empty resume id, opencode (no cross-process server), and an unknown
+        // backend all error without touching a subprocess.
+        let ws = std::env::temp_dir();
+        // Empty / whitespace id → error before any spawn, for every backend.
+        for backend in ["claude-code", "codex", "opencode"] {
+            let r = session_for_resume(backend, &ws, "", false, None, "   ").await;
+            assert!(
+                matches!(r, Err(umadev_runtime::SessionError::Start(_))),
+                "empty resume id must degrade ({backend})"
+            );
+        }
+        // opencode has no cross-process resume → always an honest Start error
+        // (degrade to fresh), even with a plausible-looking id.
+        let r = session_for_resume("opencode", &ws, "", false, None, "ses_abc123").await;
+        assert!(matches!(r, Err(umadev_runtime::SessionError::Start(_))));
+        // Unknown backend → deterministic error too.
+        let r = session_for_resume("not-a-real-backend", &ws, "", false, None, "sid").await;
+        assert!(matches!(r, Err(umadev_runtime::SessionError::Start(_))));
     }
 
     #[test]
