@@ -7,6 +7,7 @@ const basePath = isGithubPages && !customDomain ? `/${githubPagesRepo}` : "";
 
 const nextConfig: NextConfig = {
   output: isGithubPages ? "export" : undefined,
+  trailingSlash: true,
   basePath,
   assetPrefix: basePath ? `${basePath}/` : undefined,
   images: {

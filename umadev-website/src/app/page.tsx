@@ -291,9 +291,9 @@ const partnerColors: Record<string, { glow: string; border: string }> = {
   xinze: { glow: "rgba(255, 105, 180, 0.18)", border: "#ff69b4" },
 };
 
-export default function Home() {
+export default function Home({ initialView }: { initialView?: View } = {}) {
   const [lang, setLang] = useState<Lang>("zh");
-  const [view, setView] = useState<View>("home");
+  const [view, setView] = useState<View>(initialView ?? "home");
   const [wechatOpen, setWechatOpen] = useState(false);
 
   // Auto language detection based on browser locale
@@ -317,6 +317,33 @@ export default function Home() {
   useEffect(() => {
     localStorage.setItem("umadev_lang", lang);
   }, [lang]);
+
+  // Sync initial view from URL pathname and handle browser back/forward buttons
+  useEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect */
+    if (typeof window !== "undefined") {
+      const pathToView = (path: string): View => {
+        const cleanPath = path.replace(process.env.NEXT_PUBLIC_BASE_PATH ?? "", "").replace(/\/$/, "");
+        if (cleanPath === "/docs" || cleanPath === "docs") return "docs";
+        if (cleanPath === "/gallery" || cleanPath === "gallery") return "gallery";
+        if (cleanPath === "/changelog" || cleanPath === "changelog") return "changelog";
+        if (cleanPath === "/contributors" || cleanPath === "contributors") return "contributors";
+        return "home";
+      };
+
+      const currentView = pathToView(window.location.pathname);
+      if (!initialView && currentView !== view) {
+        setView(currentView);
+      }
+      
+      const handlePopState = () => {
+        setView(pathToView(window.location.pathname));
+      };
+      window.addEventListener("popstate", handlePopState);
+      return () => window.removeEventListener("popstate", handlePopState);
+    }
+    /* eslint-enable react-hooks/set-state-in-effect */
+  }, [initialView, view]);
 
   const [stageIndex, setStageIndex] = useState(0);
   const [mode, setMode] = useState("claude-code");
@@ -595,6 +622,13 @@ export default function Home() {
 
   function go(nextView: View) {
     setView(nextView);
+    if (typeof window !== "undefined") {
+      const base = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+      const targetPath = nextView === "home" ? `${base}/` : `${base}/${nextView}/`;
+      if (window.location.pathname !== targetPath) {
+        window.history.pushState(null, "", targetPath);
+      }
+    }
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
