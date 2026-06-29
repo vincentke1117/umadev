@@ -7,8 +7,8 @@
 > specialists, coordinated by a director seat) — an honest gap analysis against the
 > current code, and an executable, impact-ordered roadmap to launch. The headline
 > repositioning (team as the product, the director demoted to the team's
-> coordinator) is captured in [`DEV_TEAM_AGENT_VISION.md`](DEV_TEAM_AGENT_VISION.md);
-> the layered architecture below is how that team is wired.
+> coordinator) frames this whole document; the layered architecture below is how
+> that team is wired.
 >
 > **The product is the team, not the director.** A solo developer or a small team
 > instantly gets a full, disciplined development team — eight role specialists that
