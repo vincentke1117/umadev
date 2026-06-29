@@ -4298,13 +4298,20 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // `folded_wraps` is split in lockstep so the soft-wrap flags stay aligned with
     // the rows that survive (the new first row's flag is harmless — extraction
     // never reads a leading continuation).
-    if folded.len() > MAX_RENDER_ROWS {
-        let cut = folded.len() - MAX_RENDER_ROWS;
+    let cut = folded.len().saturating_sub(MAX_RENDER_ROWS);
+    if cut > 0 {
         folded = folded.split_off(cut);
         if folded_wraps.len() >= cut {
             folded_wraps = folded_wraps.split_off(cut);
         }
     }
+    // Re-base offsets for the selection / search highlights: the stored rows
+    // index the PREVIOUS frame's trimmed window, so a change in `cut` shifts where
+    // the same content now lives. `replace` swaps in this frame's `cut` and hands
+    // back last frame's, so `rebase_content_row` can shift by the delta below
+    // (paint-only — `render` holds `&App`, so the stored selection is left for the
+    // next mouse event to re-anchor against the freshly published rows).
+    let prev_cut = app.transcript_cut.replace(cut);
     let total = folded.len();
     // The scroll-hint title (added below when content overflows) is a `Block` title
     // row that `Block::inner` STEALS off the top — so whenever it's shown the real
@@ -4404,16 +4411,33 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // un-highlighted (never a panic).
     if let Some(sel) = app.selection {
         if !sel.is_empty() {
-            apply_selection_highlight(&mut folded, &sel, &app.transcript_gutters.borrow());
+            // Re-base a LOCAL copy of the selection onto this frame's window (a
+            // no-op when `cut == prev_cut`, the normal case). Skip painting only
+            // when BOTH endpoints scrolled off the top of the retained window.
+            let a = rebase_content_row(sel.anchor.0, prev_cut, cut);
+            let c = rebase_content_row(sel.cursor.0, prev_cut, cut);
+            if a.is_some() || c.is_some() {
+                let mut sel = sel;
+                sel.anchor.0 = a.unwrap_or(0);
+                sel.cursor.0 = c.unwrap_or(0);
+                apply_selection_highlight(&mut folded, &sel, &app.transcript_gutters.borrow());
+            }
         }
     }
 
     // Feature B — paint the in-transcript search matches over the same folded
     // rows. The matches were computed against `transcript_rows` (their indices
-    // ARE these visual-row coords), so the spans land exactly where the text is.
+    // ARE these visual-row coords), so the spans land exactly where the text is —
+    // re-based by the `cut` delta so a marathon-session front-trim can't offset them.
     if let Some(search) = &app.search {
         if !search.matches.is_empty() {
-            apply_search_highlight(&mut folded, search, &app.transcript_gutters.borrow());
+            apply_search_highlight(
+                &mut folded,
+                search,
+                &app.transcript_gutters.borrow(),
+                prev_cut,
+                cut,
+            );
         }
     }
 
@@ -5086,11 +5110,18 @@ fn apply_search_highlight(
     folded: &mut [Line<'static>],
     search: &crate::app::SearchState,
     gutters: &[usize],
+    prev_cut: usize,
+    cut: usize,
 ) {
     let other_bg = theme::SELECTION_BG();
     let cur_bg = theme::MATCH_CUR_BG();
     for (i, m) in search.matches.iter().enumerate() {
-        let shift = gutters.get(m.row).copied().unwrap_or(0);
+        // Re-base the stored match row onto this frame's trimmed window; a match
+        // that scrolled off the top is skipped (a no-op when `cut == prev_cut`).
+        let Some(row_idx) = rebase_content_row(m.row, prev_cut, cut) else {
+            continue;
+        };
+        let shift = gutters.get(row_idx).copied().unwrap_or(0);
         let from = m.start.saturating_add(shift);
         let to = m.end.saturating_add(shift);
         let bg = if i == search.current {
@@ -5098,9 +5129,25 @@ fn apply_search_highlight(
         } else {
             other_bg
         };
-        if let Some(row) = folded.get_mut(m.row) {
+        if let Some(row) = folded.get_mut(row_idx) {
             *row = highlight_row_bg(row, from, to, bg);
         }
+    }
+}
+
+/// Re-base a stored content-row index onto the current frame's retained window.
+/// `prev_cut` / `cut` are how many front rows the `MAX_RENDER_ROWS` trim dropped
+/// last frame vs this frame: the stored `row` indexed the previous window, so
+/// when the window drops MORE rows (`cut > prev_cut`) the same content now lives
+/// `cut - prev_cut` rows earlier — returning `None` if it scrolled off the top —
+/// and when it drops FEWER the content moved down by `prev_cut - cut`. Equal cuts
+/// (the normal, non-marathon case) return the row unchanged. Pure + fail-open,
+/// all-`usize` (no signed casts).
+fn rebase_content_row(row: usize, prev_cut: usize, cut: usize) -> Option<usize> {
+    if cut >= prev_cut {
+        row.checked_sub(cut - prev_cut)
+    } else {
+        Some(row + (prev_cut - cut))
     }
 }
 
@@ -7794,6 +7841,55 @@ mod tests {
             selected_mask(&folded[0]),
             vec![false, false, true, true, true, false, false],
             "logical [0,3) maps to decorated [2,5) — gutter stays unselected"
+        );
+    }
+
+    #[test]
+    fn rebase_content_row_shifts_by_the_trim_delta() {
+        // Low finding — after a `MAX_RENDER_ROWS` front split_off, a stored
+        // selection / match row indexes the PREVIOUS frame's window, so it must
+        // be re-based by the change in trim amount (prev_cut → cut).
+        // No change in trim → identity (the normal, non-marathon case).
+        assert_eq!(rebase_content_row(42, 5, 5), Some(42));
+        // The window dropped 5 MORE front rows this frame → the same content is
+        // 5 rows earlier now.
+        assert_eq!(rebase_content_row(42, 0, 5), Some(37));
+        // A row within the newly-dropped front → scrolled off the top → skipped.
+        assert_eq!(rebase_content_row(3, 0, 5), None);
+        // The window dropped FEWER rows (it shrank, e.g. after /clear) → content
+        // moved DOWN by the delta.
+        assert_eq!(rebase_content_row(10, 4, 0), Some(14));
+    }
+
+    #[test]
+    fn apply_search_highlight_repaints_the_rebased_row() {
+        // The match was recorded at row 7 against the previous window; this frame
+        // trimmed 5 more front rows, so the same text now lives at row 2 and the
+        // highlight must land there — not at the stale row 7.
+        let mut folded = vec![
+            Line::from(Span::raw("row zero")),
+            Line::from(Span::raw("row one")),
+            Line::from(Span::raw("needle")),
+        ];
+        let search = crate::app::SearchState {
+            query: "needle".into(),
+            matches: vec![crate::app::SearchMatch {
+                row: 7,
+                start: 0,
+                end: 6,
+            }],
+            // A non-focused match paints with SELECTION_BG (what `selected_mask`
+            // checks); the focused one would use the brighter MATCH_CUR_BG.
+            current: 1,
+        };
+        apply_search_highlight(&mut folded, &search, &[], 0, 5);
+        assert!(
+            selected_mask(&folded[2]).iter().all(|&b| b),
+            "the match repaints the re-based row 2 (7 - 5), not the stale row 7"
+        );
+        assert!(
+            selected_mask(&folded[0]).iter().all(|&b| !b),
+            "no other row is touched"
         );
     }
 

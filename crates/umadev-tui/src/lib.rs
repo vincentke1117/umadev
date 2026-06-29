@@ -4116,6 +4116,30 @@ async fn next_resume_signal(sig: &mut Option<ResumeSignal>) {
 /// `select!` arm.
 const FRAME_MIN: Duration = Duration::from_millis(16);
 
+/// M1 — the bounded budget the cancel-drain branch waits for an aborting task to
+/// wind down before forcing the post-cancel cleanup. Captured ONCE as an
+/// ABSOLUTE deadline when the drain starts (see `cancel_deadline`) so the wait is
+/// a fixed budget; the old inline relative `timeout(2s, h)` was recreated every
+/// `select!` iteration, restarting its 2s on every 80ms tick so it never fired —
+/// a post-abort base task that never hit an await then wedged "stopping…".
+const CANCEL_DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
+/// M1 — await an aborting task `handle`, bounded by an ABSOLUTE `deadline`.
+/// Returns when the handle resolves OR the deadline passes, whichever is first —
+/// never longer. Keying off a fixed `tokio::time::Instant` (captured once when
+/// the drain started) is what makes the bound hold even though the enclosing
+/// `select!` recreates and re-polls this future every loop iteration:
+/// `timeout_at` measures against the stored instant, not a fresh relative
+/// duration. The previous inline `timeout(CANCEL_DRAIN_BUDGET, h)` restarted its
+/// relative budget on every 80ms render tick, so a post-abort task that never hit
+/// an await left the drain (and the visible "stopping…") wedged forever.
+async fn drain_cancelled_task(
+    handle: &mut tokio::task::JoinHandle<()>,
+    deadline: tokio::time::Instant,
+) {
+    let _ = tokio::time::timeout_at(deadline, handle).await;
+}
+
 /// R3 — the per-loop draw decision (pure, so it is unit-tested directly). Draw
 /// when a self-heal repaint is forced (`force_full_repaint`), when a latency-
 /// sensitive source asked for an immediate frame (`draw_now` — input / the
@@ -4169,6 +4193,11 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // live "stopping…" state. `Some` only between the Esc/Ctrl-C keypress and the
     // drain completing.
     let mut cancel_drain: Option<tokio::task::JoinHandle<()>> = None;
+    // M1 — the ABSOLUTE deadline the drain above waits until, captured ONCE when
+    // the drain starts so the budget is fixed across `select!` recreations (a
+    // relative per-iteration timeout never accumulated). `Some` exactly while
+    // `cancel_drain` is `Some`.
+    let mut cancel_deadline: Option<tokio::time::Instant> = None;
     // The director's persistent base session for the continuous run path — ONE
     // brain held across the whole TUI session so context flows across gate
     // blocks (see `spawn_continuous_block`). Always empty unless the continuous
@@ -4236,6 +4265,14 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // gap before the next event looks like a sleep/wake / re-attach.
     let resume_threshold = resume_gap();
     let mut last_input = Instant::now();
+    // Legacy-input EOF guard. `crossterm::EventStream::next()` yields `None` at
+    // stdin EOF and keeps yielding `None` (or a repeated `Err`) thereafter — a
+    // hot busy-spin that pegs the CPU and redraws every iteration. Once the
+    // source reports a non-event we PARK the input arm so the rest of the loop
+    // (the animation tick, engine events) keeps running, mirroring the owned
+    // reader which parks a closed channel by design. The owned path never returns
+    // `None` here, so this only ever trips on the legacy FD.
+    let mut input_closed = false;
     // R4 resize debounce — the (w, h) of the last frame we actually drew, so a
     // duplicate same-dimension Resize event doesn't trigger a second clear.
     let mut last_drawn_size: Option<(u16, u16)> = None;
@@ -4539,11 +4576,19 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     current = engine_rx.try_recv().ok();
                 }
             }
-            maybe_key = input.next() => {
+            maybe_key = input.next(), if !input_closed => {
                 // R3 — input (key / mouse / paste / resize) is latency-sensitive:
                 // draw the next frame immediately rather than waiting on the
                 // streaming budget, so keystrokes and scrolling never feel laggy.
                 draw_now = true;
+                // Legacy path: a `None` (stdin EOF) or repeated `Err` means the
+                // stream is dead. Park this arm so we don't busy-spin re-polling a
+                // closed FD (the owned reader never returns `None`, so this is a
+                // legacy-only guard). The frame already drew once; the rest of the
+                // loop keeps running on the tick + engine events.
+                if !matches!(&maybe_key, Some(Ok(_))) {
+                    input_closed = true;
+                }
                 // R5 — sleep-wake / stdin-gap self-heal. A key/mouse/resize/paste
                 // arriving after a long input gap looks like a resume from laptop
                 // sleep / tmux re-attach / ssh reconnect: the terminal may have
@@ -4788,6 +4833,11 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         // try_lock cleanup never races a still-held lock.
                                         h.abort();
                                         cancel_drain = Some(h);
+                                        // M1 — fix the drain budget to a single absolute
+                                        // instant so the 2s bound actually elapses.
+                                        cancel_deadline = Some(
+                                            tokio::time::Instant::now() + CANCEL_DRAIN_BUDGET,
+                                        );
                                         // Keep the spinner alive + show an explicit
                                         // "stopping…" line so the cancel reads as in-progress
                                         // (not frozen) until the drain settles.
@@ -5316,14 +5366,19 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             // (bounded so a wedged base can't hang the drain forever), then runs the
             // post-cancel cleanup that the `Action::Cancel` arm deferred. Until this
             // fires the loop keeps drawing the live "stopping…" state every tick.
-            () = async {
+            () = drain_cancelled_task(
                 // SAFETY: the `if` guard guarantees `Some`.
-                let h = cancel_drain.as_mut().expect("guarded by cancel_drain.is_some()");
-                let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
-            }, if cancel_drain.is_some() => {
+                cancel_drain.as_mut().expect("guarded by cancel_drain.is_some()"),
+                // M1 — the FIXED absolute deadline set alongside `cancel_drain`;
+                // fail-open to a fresh budget if somehow unset so the drain still
+                // self-bounds rather than waiting on the handle forever.
+                cancel_deadline
+                    .unwrap_or_else(|| tokio::time::Instant::now() + CANCEL_DRAIN_BUDGET),
+            ), if cancel_drain.is_some() => {
                 // R3 — the post-cancel cleanup flips visible state; draw promptly.
                 draw_now = true;
                 cancel_drain = None;
+                cancel_deadline = None;
                 // The aborted task has wound down (or the budget elapsed) — its
                 // session lock is released, so the cleanup `try_lock`s succeed.
                 // A continuous run was cancelled: close + drop the parked director
@@ -5391,6 +5446,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         if let Some(h) = run_task.take() {
                             h.abort();
                             cancel_drain = Some(h);
+                            // M1 — fix the drain budget to one absolute instant.
+                            cancel_deadline = Some(
+                                tokio::time::Instant::now() + CANCEL_DRAIN_BUDGET,
+                            );
                             app.begin_cancelling();
                         } else {
                             app.cancel_run();
@@ -5457,6 +5516,68 @@ fn current_run_options(app: &App, opts: &LaunchOptions) -> RunOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- M1: cancel-drain absolute-deadline bound ---------------------------
+
+    /// M1 regression — the cancel-drain wait must honour a FIXED absolute
+    /// deadline even though the event-loop `select!` recreates (and re-polls)
+    /// the drain future every iteration. The old inline `timeout(2s, h)`
+    /// recomputed a RELATIVE 2s on every 80ms tick, so a post-abort task whose
+    /// handle never resolves left the drain (and the visible "stopping…")
+    /// wedged forever. Here the handle never resolves and a frequent competing
+    /// branch drops + recreates the drain future every loop — the drain must
+    /// still complete at the deadline (a short real-time budget keeps the test
+    /// fast; production uses `CANCEL_DRAIN_BUDGET`).
+    #[tokio::test]
+    async fn cancel_drain_honors_absolute_deadline_despite_recreation() {
+        // A task that never finishes (a post-abort task that never hits an await).
+        let mut handle = tokio::spawn(std::future::pending::<()>());
+        let budget = Duration::from_millis(120);
+        let deadline = tokio::time::Instant::now() + budget;
+        let start = tokio::time::Instant::now();
+        let mut iters = 0u32;
+        loop {
+            iters += 1;
+            // Bound the loop so an M1 regression (the budget restarting each
+            // iteration → never firing) FAILS instead of hanging forever. The
+            // good path takes only ~12 iterations.
+            assert!(
+                iters < 1_000,
+                "drain never completed — the budget restarted each iteration (M1)"
+            );
+            tokio::select! {
+                () = drain_cancelled_task(&mut handle, deadline) => break,
+                // A frequent competing branch (like the 80ms render tick) that
+                // drops + recreates the drain future every iteration — the exact
+                // condition that defeated the old relative timeout.
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        let elapsed = tokio::time::Instant::now() - start;
+        assert!(
+            elapsed >= budget,
+            "drain returned before its budget elapsed despite recreation: {elapsed:?}"
+        );
+        handle.abort();
+    }
+
+    /// M1 — when the aborted task's handle resolves BEFORE the deadline, the
+    /// drain returns promptly (it does not wait out the full budget).
+    #[tokio::test]
+    async fn cancel_drain_returns_when_handle_resolves_early() {
+        let mut handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        // A far deadline; the handle resolves well before it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let start = tokio::time::Instant::now();
+        drain_cancelled_task(&mut handle, deadline).await;
+        let elapsed = tokio::time::Instant::now() - start;
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "drain should return when the handle resolves, not wait the full budget: {elapsed:?}"
+        );
+    }
 
     // --- R3 event coalescing + frame budget ---------------------------------
 

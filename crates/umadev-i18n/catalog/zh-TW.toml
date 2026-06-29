@@ -350,6 +350,7 @@
 "compact.compacted_notice" = "[compact] 已把 {} 則早前訊息摺疊成結構化摘要以釋放上下文;最近幾輪原樣保留,完整歷史已保留。"
 "run.steer_applied" = "[steer] 套用你排隊的訊息,按它重做當前階段…"
 "run.queued_unsent" = "[note] 流水線已結束,你排隊的訊息「{}」沒趕上 gate、未發送 —— 直接重新發給我即可。"
+"run.queued_dropped" = "[note] 執行已中止,你排隊的訊息「{}」未發送 —— 直接重新發給我即可。"
 "run.classified_build" = "-> 判斷為開發任務 · 進入 9 階段流水線(想中途停用 /cancel)"
 "design.suggest_hint" = "提示: 你還沒選設計系統。可用 /design <name> 在 run 前鎖定視覺方向:\n  {}。\n  不選也行 — worker 會自動根據需求推薦一個。"
 "run.preflight_plan" = "收到需求:\"{}\"\n\n設定: worker `{}` · 設計系統 `{}` · 範本 `{}`\n\n9 階段流水線:\n  1) research(競品 + discovery) -> 2) docs(PRD + Architecture + UIUX) -> [gate] docs_confirm\n  3) spec -> 4) frontend(按 UIUX tokens 實作) -> [gate] preview_confirm\n  5) backend -> 6) quality(5 維審查) -> 7) delivery -> proof-pack\n\n兩道 gate 預設自動通過(僅作為檢查點顯示);按 shift+Tab 可轉手動逐門審稿。流水線啟動中…"

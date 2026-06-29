@@ -1854,6 +1854,13 @@ pub struct App {
     /// by the renderer so the next frame can tell how many rows appeared below and
     /// re-anchor a scrolled-up view (P5b). `0` until the first render.
     pub transcript_prev_hidden: std::cell::Cell<usize>,
+    /// Previous frame's `MAX_RENDER_ROWS` front-trim amount (rows split off the
+    /// front of the retained scrollback), published by the renderer. The stored
+    /// selection / search-match rows index that trimmed window, so when this
+    /// frame trims a DIFFERENT amount (a marathon 8000+ row session that keeps
+    /// growing) the highlight must be re-based by the delta — else it paints a
+    /// row off until the next mouse event re-syncs it. `0` until the first render.
+    pub transcript_cut: std::cell::Cell<usize>,
     /// The maximum the transcript can scroll up (= rows hidden above the
     /// viewport), recomputed by the renderer every frame from the CURRENT
     /// width/height. Interior-mutable so the pure `render` fn can publish it for
@@ -2508,6 +2515,7 @@ impl App {
             history: VecDeque::new(),
             transcript_scroll: std::cell::Cell::new(0),
             transcript_prev_hidden: std::cell::Cell::new(0),
+            transcript_cut: std::cell::Cell::new(0),
             transcript_max_scroll: std::cell::Cell::new(0),
             transcript_viewport_rows: std::cell::Cell::new(0),
             input_text_cols: std::cell::Cell::new(0),
@@ -3501,6 +3509,19 @@ impl App {
         // its last (now stale) state doesn't hang under the transcript.
         self.clear_live_panels();
         self.push(ChatRole::System, body);
+        // M2 — an honest abort fires no further gate/completion, so a steer
+        // message parked in `queued_steer` (the pipeline-run queue) would stay
+        // stuck forever: the "queued N" chip stays falsely lit and no key path
+        // recovers it. Drain it here and surface it so the user knows to resend,
+        // clearing the chip. (The clean-completion path does the same at
+        // `BlockCompleted`.)
+        if !self.queued_steer.is_empty() {
+            let text = self.queued_steer.drain(..).collect::<Vec<_>>().join("\n");
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(self.lang, "run.queued_dropped", &[&text]),
+            );
+        }
         self.refresh_status();
     }
 
@@ -3916,7 +3937,10 @@ impl App {
             if added >= room {
                 break;
             }
-            if c != '\n' && c.is_control() {
+            // Keep newlines AND tabs; drop every other control char. Dropping
+            // `\t` silently stripped the indentation out of pasted tab-indented
+            // code (a real "my paste lost all its tabs" bug).
+            if c != '\n' && c != '\t' && c.is_control() {
                 continue;
             }
             buf.push(c);
@@ -6960,6 +6984,21 @@ impl App {
         // its text for editing.
         let text = self.history[idx].body().into_owned();
         self.history.truncate(idx);
+        // Keep the base-facing memory + durable transcript in lockstep with the
+        // visible rewind: drop the matching last user turn (and any reply after
+        // it) from BOTH `conversation` and `full_transcript`. Truncating only
+        // `history` left the dropped turn in the memory handed to the base (so a
+        // resend re-asked WITH it) and on disk (so a relaunch `/resume` restored
+        // it) — contradicting the "re-ask from that point" contract. Each vector
+        // is truncated at its OWN last `user` entry (compaction can desync their
+        // lengths), and the disk mirror is rewritten so the relaunch matches.
+        if let Some(c_idx) = self.conversation.iter().rposition(|m| m.role == "user") {
+            self.conversation.truncate(c_idx);
+        }
+        if let Some(t_idx) = self.full_transcript.iter().rposition(|m| m.role == "user") {
+            self.full_transcript.truncate(t_idx);
+        }
+        self.persist_chat();
         self.input = text;
         self.input_cursor = self.input_len();
         // Leave history recall + the quit/rewind arms in a clean state, and
@@ -7813,6 +7852,10 @@ impl App {
         // Drop chat turns parked behind the in-flight route so they can't fire
         // into a freshly-reset state.
         self.queued_chat.clear();
+        // M2 — also drop any pipeline-run steer parked in `queued_steer`. A user
+        // cancel ends the run, so a parked steer can never reach a gate; leaving
+        // it would keep the "queued N" chip falsely lit after the reset.
+        self.queued_steer.clear();
         self.pending_quit_confirm = false;
         // The aborted task has now fully wound down — leave the "stopping…" state.
         self.cancelling = false;
@@ -12257,72 +12300,170 @@ fn new_chat_session_id() -> String {
     )
 }
 
+/// M3 — drain a child pipe into a buffer **capped at `cap` bytes**, on its own
+/// thread, returning the captured bytes. A dedicated thread per stream avoids the
+/// classic two-pipe deadlock (a single reader blocked on stdout while stderr's
+/// pipe fills). Reading stops at the cap (the read end is then dropped, so the
+/// child blocks on a full pipe / takes `EPIPE` and is killed at the run deadline)
+/// and on EOF or any read error — so a runaway emitter (`yes`, `cat /dev/zero`)
+/// can NEVER buffer unbounded into memory the way `Command::output()` does.
+fn spawn_capped_pipe_reader<R: std::io::Read + Send + 'static>(
+    src: Option<R>,
+    cap: usize,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf: Vec<u8> = Vec::new();
+        let Some(mut r) = src else {
+            return buf;
+        };
+        let mut chunk = [0u8; 8192];
+        loop {
+            match r.read(&mut chunk) {
+                // EOF or a read error: stop draining this stream.
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let room = cap.saturating_sub(buf.len());
+                    if room == 0 {
+                        break; // cap reached — stop reading + drop the pipe end
+                    }
+                    buf.extend_from_slice(&chunk[..n.min(room)]);
+                    if buf.len() >= cap {
+                        break;
+                    }
+                }
+            }
+        }
+        buf
+    })
+}
+
 /// Run a one-off `!`-prefixed shell command in `root` and return
 /// `(success, combined_output)`. stdout + stderr are merged and bounded
 /// ([`bound_shell_output`]); a nonzero exit appends its code, a killed process a
 /// generic failure note, a spawn error an error line, and a >10s hang a timeout
 /// note — so the call ALWAYS returns and never panics or freezes the UI. The
 /// command is run via the platform shell (`sh -c` on unix, `cmd /C` on Windows)
-/// inside a worker thread with a bounded wait, so even a runaway command (e.g.
-/// `sleep 1000`) frees the UI after the deadline (the orphan thread simply ends
-/// when its child does). NOT routed to the base — a local convenience shell.
+/// with its stdout/stderr **piped and drained incrementally into bounded
+/// buffers** ([`spawn_capped_pipe_reader`]); a command still running past the
+/// 10s budget is **killed and reaped** (no orphan left running, no unbounded
+/// memory) before the timeout note returns. NOT routed to the base — a local
+/// convenience shell. M3: the previous `Command::output()` on a worker thread
+/// buffered stdout/stderr to EOF in memory and never killed the child on
+/// timeout, so `!yes` / `!cat /dev/zero` / `!tail -f` could OOM + run on.
 fn run_bang_command(root: &std::path::Path, cmd: &str, lang: umadev_i18n::Lang) -> (bool, String) {
-    let root = root.to_path_buf();
-    let cmd_owned = cmd.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        #[cfg(windows)]
-        let out = std::process::Command::new("cmd")
-            .args(["/C", &cmd_owned])
-            .current_dir(&root)
-            .output();
-        #[cfg(not(windows))]
-        let out = std::process::Command::new("sh")
-            .args(["-c", &cmd_owned])
-            .current_dir(&root)
-            .output();
-        // The receiver may already be gone (we timed out) — ignore the error.
-        let _ = tx.send(out);
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-        Ok(Ok(output)) => {
-            let mut body = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.trim().is_empty() {
-                if !body.is_empty() && !body.ends_with('\n') {
-                    body.push('\n');
-                }
-                body.push_str(&stderr);
-            }
-            let bounded = bound_shell_output(&body);
-            let ok = output.status.success();
-            if ok {
-                let text = if bounded.trim().is_empty() {
-                    umadev_i18n::t(lang, "tui.bang.no_output").to_string()
-                } else {
-                    bounded
-                };
-                return (true, text);
-            }
-            // A nonzero exit reports its code (or a generic note when the process
-            // was killed by a signal and has no code), keeping any output above it.
-            let note = match output.status.code() {
-                Some(code) => umadev_i18n::tf(lang, "tui.bang.exit", &[&code.to_string()]),
-                None => umadev_i18n::t(lang, "tui.bang.failed").to_string(),
-            };
-            let text = if bounded.trim().is_empty() {
-                note
-            } else {
-                format!("{bounded}\n{note}")
-            };
-            (false, text)
+    // Per-stream in-memory read cap (M3). Far above `bound_shell_output`'s
+    // 300-line / 16k-char display trim, so nothing visible is lost, yet a runaway
+    // stream is hard-bounded in memory.
+    const READ_CAP: usize = 256 * 1024;
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+    #[cfg(windows)]
+    let mut command = std::process::Command::new("cmd");
+    #[cfg(windows)]
+    command.args(["/C", cmd]);
+    #[cfg(not(windows))]
+    let mut command = std::process::Command::new("sh");
+    #[cfg(not(windows))]
+    command.args(["-c", cmd]);
+
+    let mut child = match command
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                false,
+                umadev_i18n::tf(lang, "tui.bang.spawn_failed", &[&e.to_string()]),
+            )
         }
-        Ok(Err(e)) => (
-            false,
-            umadev_i18n::tf(lang, "tui.bang.spawn_failed", &[&e.to_string()]),
-        ),
-        Err(_) => (false, umadev_i18n::t(lang, "tui.bang.timeout").to_string()),
+    };
+
+    // Drain each stream on its own thread into a bounded buffer.
+    let h_out = spawn_capped_pipe_reader(child.stdout.take(), READ_CAP);
+    let h_err = spawn_capped_pipe_reader(child.stderr.take(), READ_CAP);
+
+    // Wait for exit, bounded; KILL + reap on the deadline so a hung command never
+    // runs on as an orphan (the readers then EOF and join).
+    let deadline = std::time::Instant::now() + BUDGET;
+    let (status, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break (Some(s), false),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap + close pipes so readers EOF
+                    break (None, true);
+                }
+                std::thread::sleep(POLL);
+            }
+            Err(_) => break (None, false),
+        }
+    };
+
+    // Readers end on pipe EOF (after exit / kill) or at the cap; join their
+    // captured bytes. A join error (panicked reader — not expected) is treated
+    // as empty so the call still returns (fail-open).
+    let stdout_bytes = h_out.join().unwrap_or_default();
+    let stderr_bytes = h_err.join().unwrap_or_default();
+
+    let mut body = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    if !stderr.trim().is_empty() {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&stderr);
     }
+    let bounded = bound_shell_output(&body);
+
+    if timed_out {
+        // The command was killed at the deadline — surface any partial output
+        // above the timeout note.
+        let note = umadev_i18n::t(lang, "tui.bang.timeout").to_string();
+        let text = if bounded.trim().is_empty() {
+            note
+        } else {
+            format!("{bounded}\n{note}")
+        };
+        return (false, text);
+    }
+
+    if let Some(status) = status {
+        if status.success() {
+            let text = if bounded.trim().is_empty() {
+                umadev_i18n::t(lang, "tui.bang.no_output").to_string()
+            } else {
+                bounded
+            };
+            return (true, text);
+        }
+        // A nonzero exit reports its code (or a generic note when the process
+        // was killed by a signal and has no code), keeping any output above it.
+        let note = match status.code() {
+            Some(code) => umadev_i18n::tf(lang, "tui.bang.exit", &[&code.to_string()]),
+            None => umadev_i18n::t(lang, "tui.bang.failed").to_string(),
+        };
+        let text = if bounded.trim().is_empty() {
+            note
+        } else {
+            format!("{bounded}\n{note}")
+        };
+        return (false, text);
+    }
+
+    // `try_wait` errored (rare) — report a generic failure, keeping any output.
+    let note = umadev_i18n::t(lang, "tui.bang.failed").to_string();
+    let text = if bounded.trim().is_empty() {
+        note
+    } else {
+        format!("{bounded}\n{note}")
+    };
+    (false, text)
 }
 
 /// Cap a one-off shell command's output so a chatty command can't flood the
@@ -13293,6 +13434,37 @@ mod tests {
         );
     }
 
+    /// M3 regression — a runaway-output command (`yes` emits "y\n" forever) must
+    /// NOT buffer unbounded into memory the way `Command::output()` did (read to
+    /// EOF) and must NOT run on / hang. The per-stream reader caps in-memory bytes
+    /// and drops the pipe at the cap; `yes` then dies on SIGPIPE — so the call
+    /// returns PROMPTLY with BOUNDED output, with the kill-on-deadline path as the
+    /// backstop. Unix-only (`yes` / SIGPIPE semantics).
+    #[cfg(unix)]
+    #[test]
+    fn bang_runaway_output_is_bounded_and_does_not_hang() {
+        let root = std::env::temp_dir();
+        let start = std::time::Instant::now();
+        let (ok, out) = run_bang_command(&root, "yes", umadev_i18n::Lang::En);
+        let elapsed = start.elapsed();
+        // Killed by SIGPIPE (or the deadline) → not a clean success.
+        assert!(!ok, "a killed runaway command is not a success");
+        // Output is bounded (`bound_shell_output` caps at 300 lines / 16k chars),
+        // proving we never buffered the infinite stream into memory; add headroom
+        // for the appended failure note.
+        assert!(
+            out.chars().count() < 17_000,
+            "runaway output must be bounded, got {} chars",
+            out.chars().count()
+        );
+        // And it returned well under the 10s kill budget (SIGPIPE death, not a
+        // hang) — the old code would never even return from this for `yes`.
+        assert!(
+            elapsed < std::time::Duration::from_secs(9),
+            "runaway command must not hang: {elapsed:?}"
+        );
+    }
+
     #[test]
     fn transient_status_updates_field_without_growing_transcript() {
         // The long-phase heartbeat's periodic beats arrive as TransientStatus
@@ -13683,6 +13855,26 @@ mod tests {
         a.handle_paste("just a short note\nwith two lines");
         assert_eq!(a.input, "just a short note\nwith two lines");
         assert!(a.text_stash.is_empty(), "a small paste is never stashed");
+    }
+
+    #[test]
+    fn paste_preserves_tab_indentation() {
+        // Low finding — the insert filter keeps `\n` but used to drop ALL other
+        // control chars, silently stripping every `\t` out of pasted tab-indented
+        // code. Tabs must survive (other control chars still dropped).
+        let mut a = fresh_app(Some("offline"));
+        a.insert_str_at_cursor("\tfn main() {\n\t\tprintln!();\n\t}");
+        assert_eq!(
+            a.input, "\tfn main() {\n\t\tprintln!();\n\t}",
+            "pasted tab indentation must be preserved verbatim"
+        );
+        // A stray control char (e.g. a bell) is still filtered out.
+        let mut b = fresh_app(Some("offline"));
+        b.insert_str_at_cursor("a\u{7}b");
+        assert_eq!(
+            b.input, "ab",
+            "non-tab/newline control chars are still dropped"
+        );
     }
 
     #[test]
@@ -16076,6 +16268,61 @@ mod tests {
         assert!(a.pending_auto_continue.is_none());
     }
 
+    #[test]
+    fn aborted_block_drains_and_surfaces_a_parked_queued_steer() {
+        // M2 — a steer parked mid-phase that then hits an ABORT (the run errored,
+        // so no further gate/completion fires) must NOT stay stuck forever: the
+        // queue drains (the "queued N" chip clears) and the dropped text is
+        // surfaced so the user knows to resend.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::PipelineStarted {
+            slug: "demo".into(),
+            requirement: "build".into(),
+        });
+        for c in "make it dark mode".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Enter);
+        assert_eq!(
+            a.queued_steer.len(),
+            1,
+            "the steer parked while the phase ran"
+        );
+        let before = a.history.len();
+        // The producing block errors out (the ABORT_SENTINEL path).
+        a.mark_block_aborted("the base errored".into());
+        assert!(
+            a.queued_steer.is_empty(),
+            "an abort must drain the parked steer so the chip clears"
+        );
+        let surfaced = a
+            .history
+            .iter()
+            .skip(before)
+            .any(|m| m.body().contains("make it dark mode"));
+        assert!(
+            surfaced,
+            "the dropped steer must be surfaced for the user to resend"
+        );
+    }
+
+    #[test]
+    fn cancel_run_clears_a_parked_queued_steer() {
+        // M2 — a user cancel ends the run, so a parked steer can never reach a
+        // gate; it must be cleared so the "queued N" chip doesn't stay falsely lit.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::PipelineStarted {
+            slug: "demo".into(),
+            requirement: "build".into(),
+        });
+        a.queued_steer.push_back("steer me".into());
+        a.cancel_run();
+        assert!(
+            a.queued_steer.is_empty(),
+            "a user cancel must drop the parked steer"
+        );
+    }
+
     // ── Structured-choice gate picker ──────────────────────────────────────
 
     #[test]
@@ -17646,6 +17893,50 @@ mod tests {
             .collect();
         assert_eq!(users.len(), 1, "exactly the earlier user turn remains");
         assert_eq!(users[0].body().as_ref(), "first");
+    }
+
+    #[test]
+    fn rewind_truncates_conversation_and_transcript_to_match_history() {
+        // Low finding — double-Esc rewind dropped the last user turn from the
+        // VISIBLE history but not from `conversation` (the base-facing memory) or
+        // `full_transcript` (the on-disk record), so a resend re-asked WITH the
+        // dropped turn and a relaunch `/resume` restored it. All three must stay
+        // in lockstep.
+        let mut a = fresh_app(Some("offline"));
+        // Two complete turns recorded into BOTH the visible history and the
+        // base-facing memory, mirroring a real chat session.
+        a.push(ChatRole::You, "first");
+        a.record_user_turn("first");
+        a.record_chat_reply("reply one".to_string());
+        a.push(ChatRole::You, "second");
+        a.record_user_turn("second");
+        a.record_chat_reply("reply two".to_string());
+        assert_eq!(a.conversation.len(), 4, "two user + two assistant turns");
+        assert_eq!(a.full_transcript.len(), 4);
+
+        // Double-Esc rewind (idle, empty box): arm, then fire.
+        let _ = a.apply_key(KeyCode::Esc);
+        let _ = a.apply_key(KeyCode::Esc);
+        assert_eq!(a.input, "second", "last user turn reloaded for editing");
+
+        // The dropped turn is gone from the memory + durable transcript too — the
+        // base won't see it on resend and a relaunch won't restore it.
+        assert_eq!(
+            a.conversation
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "reply one"],
+            "conversation truncated to before the rewound user turn"
+        );
+        assert_eq!(
+            a.full_transcript
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "reply one"],
+            "durable transcript truncated to match"
+        );
     }
 
     #[test]
