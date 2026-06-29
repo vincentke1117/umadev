@@ -93,6 +93,14 @@ const ALWAYS_ON_RESERVE: usize = 6_800;
 /// is empty), so this budget is spent only when there is real code to map.
 const REPO_MAP_BUDGET: usize = 2_800;
 
+/// The character budget the user's EDITED team charter
+/// ([`crate::constitution::user_charter_firmware_block`]) may take in the
+/// always-on work-class head. The firmware already injects the built-in craft +
+/// anti-slop law, so this is spent ONLY when the user has actually customized
+/// `.umadev/constitution.md` (a pristine default injects nothing) — making the
+/// user's own non-negotiables operative without duplicating the built-ins.
+const CONSTITUTION_BUDGET: usize = 1_400;
+
 /// How much firmware a route warrants — the JIT dial. Pure chat is the lightest
 /// (identity only, no retrieval); a deliberate build is the fullest (every
 /// layer). Derived deterministically from the route's class + depth.
@@ -196,6 +204,21 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
         // layers are the JIT repo-map + knowledge below, which stay gated. Without
         // this, a UI built from chat skipped the design system and read as AI-slop.
         fw.push_block(ANTI_SLOP_LAW);
+
+        // ── The team's CHARTER (only when the user has EDITED it) ────────────
+        // The constitution (`.umadev/constitution.md`) makes the firmware's
+        // non-negotiables a thing the user can read AND edit. When the user has
+        // customized it, surface their version so their own operating principles
+        // reach the base on work turns — the built-in craft law above already
+        // covers a pristine/absent charter, so this injects NOTHING in the common
+        // case (no duplication, no extra tokens). One small synchronous read of a
+        // tiny file; fail-open (no file / unreadable → empty). Part of the
+        // always-on head (pushed before `reserve_jit_tail`), so a user-edited
+        // charter is high-priority, not throttled with the JIT tail.
+        let charter = crate::constitution::user_charter_firmware_block(root, CONSTITUTION_BUDGET);
+        if !charter.trim().is_empty() {
+            fw.push_block(&charter);
+        }
     }
 
     // The always-on head (identity + craft) is now fully in `buf` and can no longer
@@ -705,6 +728,66 @@ mod tests {
         assert!(
             !fw.contains("YOUR CODEBASE"),
             "no repo-map from an unreadable root"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_edited_charter_feeds_into_a_work_turn_but_not_chat() {
+        // Wave C firmware link: a user-EDITED `.umadev/constitution.md` surfaces in
+        // the work-class head so the team visibly operates by it; pure chat stays
+        // light (no charter); and a turn with no charter file is unchanged.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cdir = tmp.path().join(".umadev");
+        std::fs::create_dir_all(&cdir).unwrap();
+        std::fs::write(
+            cdir.join("constitution.md"),
+            "# My team rules\n\n- We pair on every PR.\n",
+        )
+        .unwrap();
+
+        // Work turn → the user's charter is injected.
+        let build = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &build, "做个登录页").await;
+        assert!(
+            fw.contains("TEAM CHARTER") && fw.contains("pair on every PR"),
+            "work turn carries the user-edited charter: {fw}"
+        );
+
+        // Pure chat → no charter (stays light).
+        let chat = route(RouteClass::Chat, Depth::Fast, Vec::new());
+        let fw_chat = compose_firmware(tmp.path(), &chat, "你好").await;
+        assert!(
+            !fw_chat.contains("TEAM CHARTER"),
+            "chat must not carry the charter: {fw_chat}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pristine_or_absent_charter_adds_no_firmware_block() {
+        // No charter file, and a pristine generated default, must both inject
+        // NOTHING — the built-in craft/anti-slop law already covers them.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let build = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+        let fw_absent = compose_firmware(tmp.path(), &build, "build a thing").await;
+        assert!(
+            !fw_absent.contains("TEAM CHARTER"),
+            "absent → no charter block"
+        );
+
+        // Generate the pristine default, then recompose: still no extra block.
+        let _ = crate::constitution::ensure_constitution(tmp.path());
+        let fw_default = compose_firmware(tmp.path(), &build, "build a thing").await;
+        assert!(
+            !fw_default.contains("TEAM CHARTER"),
+            "pristine default must not be re-injected: {fw_default}"
         );
     }
 

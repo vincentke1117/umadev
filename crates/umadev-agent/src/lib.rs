@@ -41,6 +41,7 @@ pub mod base_error;
 pub mod checkpoint;
 pub mod coach;
 pub mod config;
+pub mod constitution;
 pub mod context;
 pub mod continuous;
 pub mod coverage;
@@ -80,6 +81,10 @@ pub use adopt::{
 };
 pub use checkpoint::{
     create_run_baseline, rollback_run, run_baseline, Checkpoint, RUN_BASELINE_PREFIX,
+};
+pub use constitution::{
+    constitution_rel_path, ensure_constitution, read_constitution, regenerate_constitution,
+    render_constitution, user_charter_firmware_block, ConstitutionDoc,
 };
 pub use context::{compose_firmware, project_context, FIRMWARE_BUDGET};
 pub use continuous::{

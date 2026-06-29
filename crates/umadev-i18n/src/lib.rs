@@ -502,6 +502,30 @@ mod tests {
             "sandbox.set",
             "sandbox.danger_set",
             "sandbox.persist_failed",
+            // Wave C: the team constitution — the user-readable/editable charter of
+            // the team's non-negotiable operating principles, rendered by
+            // `umadev_agent::render_constitution` and surfaced by the TUI
+            // `/constitution` command.
+            "constitution.title",
+            "constitution.intro",
+            "constitution.section.craft",
+            "constitution.section.security",
+            "constitution.section.governance",
+            "constitution.article.icons",
+            "constitution.article.tokens",
+            "constitution.article.antislop",
+            "constitution.article.contract",
+            "constitution.article.craft",
+            "constitution.article.evidence",
+            "constitution.article.secrets",
+            "constitution.article.sensitive_paths",
+            "constitution.article.floor",
+            "constitution.article.irreversible",
+            "constitution.footer",
+            "constitution.overlay_title",
+            "constitution.edit_hint",
+            "constitution.generated",
+            "tui.cmd.constitution",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

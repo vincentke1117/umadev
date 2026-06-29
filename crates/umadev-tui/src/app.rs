@@ -3277,6 +3277,13 @@ impl App {
         Self::cmd("lessons", &[], None, CmdGroup::Inspect, "tui.cmd.lessons"),
         Self::cmd("team", &[], None, CmdGroup::Inspect, "tui.cmd.team"),
         Self::cmd(
+            "constitution",
+            &["charter"],
+            None,
+            CmdGroup::Inspect,
+            "tui.cmd.constitution",
+        ),
+        Self::cmd(
             "runs",
             &["history-runs"],
             None,
@@ -6178,6 +6185,7 @@ impl App {
             }
             "lessons" => self.slash_lessons(),
             "team" => self.slash_team(rest),
+            "constitution" => self.slash_constitution(),
             "mcp" => {
                 let output = self.run_subprocess_cli("mcp-manage list");
                 self.push(
@@ -7410,6 +7418,39 @@ impl App {
             ("team.deliverable.runtime", runtime),
             ("team.deliverable.deploy", deploy),
         ]
+    }
+
+    /// `/constitution` (alias `/charter`) — surface the team's **constitution**:
+    /// the visible, user-editable charter of the team's non-negotiable operating
+    /// principles (Wave C of the development-team repositioning). The firmware
+    /// already injects these non-negotiables into every turn; this makes them a
+    /// thing the user can READ and EDIT.
+    ///
+    /// On first use it generates `.umadev/constitution.md` from the rules the team
+    /// actually enforces + the craft principles the firmware injects, then shows
+    /// it in a scrollable overlay and notes the path so the user can edit it. An
+    /// existing (already user-edited) file is shown verbatim and NEVER clobbered.
+    /// Read-only + fail-open: a write failure still shows the in-memory default.
+    fn slash_constitution(&mut self) -> Action {
+        let doc = umadev_agent::ensure_constitution(&self.project_root);
+        self.overlay = Some(Overlay::from_body(
+            umadev_i18n::t(self.lang, "constitution.overlay_title"),
+            &doc.markdown,
+        ));
+        let path = doc.path.display().to_string();
+        // First-time generation gets a one-line "generated from the rules" note;
+        // every open notes where to edit it (and that edits are never overwritten).
+        if doc.generated {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(self.lang, "constitution.generated", &[&path]),
+            );
+        }
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(self.lang, "constitution.edit_hint", &[&path]),
+        );
+        Action::None
     }
 
     /// Fold a plan-steering edit (`skip` / `veto` / `add` / `up` / `down`) into
@@ -14321,6 +14362,77 @@ mod tests {
             out.contains(&format!("{pending} {deploy}")),
             "deploy proof pending: {out}"
         );
+    }
+
+    #[test]
+    fn constitution_command_registered_and_dispatchable() {
+        // Wave C: `/constitution` is one registry row (palette + help advertise it)
+        // AND has a dispatch arm — the lockstep parity test relies on both.
+        assert!(
+            App::COMMANDS.iter().any(|c| c.name == "constitution"),
+            "/constitution is in COMMANDS"
+        );
+        assert!(
+            dispatch_arm_verbs().iter().any(|v| v == "constitution"),
+            "/constitution has a dispatch arm"
+        );
+        // The `/charter` alias resolves back to it.
+        assert_eq!(
+            App::resolve_command("charter").map(|c| c.name),
+            Some("constitution")
+        );
+    }
+
+    #[test]
+    fn slash_constitution_generates_and_shows_the_charter() {
+        // First use with no file → generate the charter, open it in the overlay
+        // with the real non-negotiables, and note where the user can edit it.
+        let mut a = fresh_app(Some("offline"));
+        let before = a.history.len();
+        let action = a.try_slash_command("/constitution").unwrap();
+        assert_eq!(action, Action::None);
+        // The charter is shown in the overlay and names the enforced rules.
+        let body = a
+            .overlay
+            .as_ref()
+            .expect("charter overlay opened")
+            .lines
+            .join("\n");
+        assert!(body.contains("UD-CODE-001"), "charter shown: {body}");
+        // The file was actually generated on disk and not clobbered on a re-open.
+        let path = a.project_root.join(umadev_agent::constitution_rel_path());
+        assert!(path.exists(), "charter file generated");
+        // A System note tells the user where to edit it (path surfaced).
+        let notes: String = a
+            .history
+            .iter()
+            .skip(before)
+            .map(|m| m.body().clone())
+            .collect();
+        assert!(
+            notes.contains(&path.display().to_string()),
+            "edit hint names the path: {notes}"
+        );
+    }
+
+    #[test]
+    fn slash_constitution_shows_a_user_edited_file_without_clobbering() {
+        // An existing (user-edited) charter is shown verbatim and never rewritten.
+        let mut a = fresh_app(Some("offline"));
+        let path = a.project_root.join(umadev_agent::constitution_rel_path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let edited = "# Our rules\n\n- We pair on every PR.\n";
+        std::fs::write(&path, edited).unwrap();
+        let _ = a.try_slash_command("/constitution").unwrap();
+        let body = a
+            .overlay
+            .as_ref()
+            .expect("charter overlay opened")
+            .lines
+            .join("\n");
+        assert!(body.contains("pair on every PR"), "user file shown: {body}");
+        // On disk it is untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
     }
 
     #[test]
