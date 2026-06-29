@@ -7,12 +7,16 @@
 //! 3. Workspace is writable (write + delete a tmp file).
 //! 4. UD-META-001 spec manifest present and version-aligned.
 //! 5. AI coding host CLIs detected on PATH.
-//! 6. Claude Code PreToolUse governance hook installed (if `.claude/` exists).
-//! 7. Delivery / deployment readiness (after a run completes): delivery notes
+//! 6. Claude non-interactive auth: when `claude-code` is the selected backend, a
+//!    headless credential (`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`)
+//!    is available — an interactive `claude login` alone can 401 on UmaDev's
+//!    background calls.
+//! 7. Claude Code PreToolUse governance hook installed (if `.claude/` exists).
+//! 8. Delivery / deployment readiness (after a run completes): delivery notes
 //!    present with a deploy command, build output exists, and a deploy CLI
 //!    (vercel / netlify / wrangler) is on PATH.
 //!
-//! The hook check (6) was added in 4.6 alongside the restored real-time
+//! The hook check (7) was added in 4.6 alongside the restored real-time
 //! governance hook (`umadev install`). When `.claude/settings.json` exists
 //! but the hook isn't registered, the doctor suggests running `umadev install`.
 
@@ -68,6 +72,15 @@ pub async fn run_all(workspace: &Path) -> Vec<CheckResult> {
         check_spec_manifest(workspace),
     ];
     results.push(check_ai_backends().await);
+    // Distinct from the reachability check above: when `claude-code` is the
+    // SELECTED backend, confirm UmaDev's NON-INTERACTIVE drive of `claude` can
+    // actually authenticate (an interactive `claude login` alone is NOT enough —
+    // see `check_claude_noninteractive_auth`). The configured backend is read from
+    // the user config (fail-open to `None` / not-applicable).
+    let configured_backend = umadev_tui::config::load().backend;
+    results.push(check_claude_noninteractive_auth(
+        configured_backend.as_deref(),
+    ));
     results.push(check_git());
     results.push(check_user_config());
     results.push(check_claude_hook(workspace));
@@ -251,6 +264,84 @@ async fn check_ai_backends() -> CheckResult {
             status: Status::Passed,
             detail,
         }
+    }
+}
+
+/// Environment credentials that let `claude` authenticate in UmaDev's
+/// NON-INTERACTIVE drive (`claude --print …`), in the order we report them.
+/// `CLAUDE_CODE_OAUTH_TOKEN` (minted by `claude setup-token`) is the canonical
+/// fix for the user-reported 401; the API-key / custom-auth-token / cloud-routing
+/// vars also satisfy headless auth, so any one of them clears the check.
+const CLAUDE_NONINTERACTIVE_AUTH_ENV: &[&str] = &[
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+];
+
+/// `true` iff `key` is set to a non-empty (after-trim) value in the environment.
+fn env_is_set(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|v| !v.trim().is_empty())
+}
+
+/// Check whether the `claude-code` backend can authenticate UmaDev's
+/// **non-interactive** calls to `claude`.
+///
+/// The trap this catches: UmaDev drives `claude` headlessly (`claude --print
+/// --output-format stream-json …`), and that path authenticates from an **env
+/// credential**, NOT from the interactive `claude login` session. A user who has
+/// only run `claude login` therefore looks "logged in" to the reachability /
+/// `claude auth status` probe (so `check_ai_backends` PASSes), yet UmaDev's
+/// background turn comes back `401 Invalid authentication credentials` at
+/// runtime. The long-lived token from `claude setup-token` (exported as
+/// `CLAUDE_CODE_OAUTH_TOKEN`) is what makes the headless call work.
+///
+/// This is a distinct, clearly-worded row so the user sees the gap BEFORE a
+/// run 401s instead of after. Fail-open by contract: it is a **Warning**, never
+/// a hard FAIL (a missing token doesn't stop `doctor`), and it never penalizes
+/// the other backends — for any `backend` other than `claude-code` (including a
+/// not-yet-picked `None`) it is an informational PASS.
+fn check_claude_noninteractive_auth(backend: Option<&str>) -> CheckResult {
+    let name = "Claude non-interactive auth".to_string();
+    // Only meaningful when claude-code is the selected backend. codex / opencode
+    // / offline / not-yet-picked are unaffected (fail-open: never a spurious WARN
+    // for a backend that doesn't use this credential).
+    if backend != Some("claude-code") {
+        return CheckResult {
+            name,
+            status: Status::Passed,
+            detail: match backend {
+                Some(b) => format!("not applicable — selected backend is `{b}`"),
+                None => "not applicable — no backend selected yet".to_string(),
+            },
+        };
+    }
+    // claude-code IS selected: look for a credential that works headlessly.
+    match CLAUDE_NONINTERACTIVE_AUTH_ENV
+        .iter()
+        .copied()
+        .find(|&k| env_is_set(k))
+    {
+        Some(var) => CheckResult {
+            name,
+            status: Status::Passed,
+            detail: format!(
+                "{var} is set — UmaDev's non-interactive `claude` calls can authenticate."
+            ),
+        },
+        None => CheckResult {
+            name,
+            status: Status::Warning,
+            detail: "CLAUDE_CODE_OAUTH_TOKEN is not set. UmaDev drives `claude` NON-INTERACTIVELY \
+                 (`claude --print …`), which needs a long-lived token — an interactive `claude \
+                 login` alone can still return `401 Invalid authentication credentials` on \
+                 UmaDev's background calls. Fix: run `claude setup-token` to mint a long-lived \
+                 token, then export CLAUDE_CODE_OAUTH_TOKEN=<token> (add it to your shell rc, \
+                 e.g. ~/.zshrc / ~/.bashrc, so it persists across sessions)."
+                .to_string(),
+        },
     }
 }
 
@@ -565,19 +656,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_all_returns_ten_checks_on_empty_workspace() {
+    async fn run_all_returns_eleven_checks_on_empty_workspace() {
         let tmp = TempDir::new().unwrap();
         let results = run_all(tmp.path()).await;
-        assert_eq!(results.len(), 10);
+        assert_eq!(results.len(), 11);
         // No FAILs on a clean workspace — only a manifest WARN.
         assert!(results.iter().all(|r| r.status != Status::Failed));
-        // The "AI host backends" check warns iff no base CLI is on PATH,
-        // which differs between dev machines and CI -- exclude it so the only
-        // env-independent WARN asserted here is the missing manifest.
+        // The "AI host backends" check warns iff no base CLI is on PATH, and the
+        // "Claude non-interactive auth" check warns iff claude-code is the ambient
+        // configured backend with no token env — both differ between dev machines
+        // and CI, so exclude them; the only env-independent WARN asserted here is
+        // the missing manifest.
         assert_eq!(
             results
                 .iter()
                 .filter(|r| r.name != "AI host backends")
+                .filter(|r| r.name != "Claude non-interactive auth")
                 .filter(|r| r.status == Status::Warning)
                 .count(),
             1
@@ -591,11 +685,14 @@ mod tests {
             .write_to(tmp.path(), false)
             .unwrap();
         let results = run_all(tmp.path()).await;
-        // Everything passes except the env-dependent backend check, which
-        // warns when no base CLI is installed (e.g. in CI).
+        // Everything passes except the env-dependent checks: the backend check
+        // warns when no base CLI is installed (e.g. in CI), and the Claude
+        // non-interactive auth check warns when claude-code is the ambient
+        // configured backend with no token env — both are environment-dependent.
         let non_backend: Vec<_> = results
             .into_iter()
             .filter(|r| r.name != "AI host backends")
+            .filter(|r| r.name != "Claude non-interactive auth")
             .collect();
         assert!(all_passed(&non_backend));
     }
@@ -647,6 +744,72 @@ mod tests {
         assert!(!r.name.is_empty());
         // On a dev machine with CLIs installed it should pass; on CI it may warn.
         assert!(r.status == Status::Passed || r.status == Status::Warning);
+    }
+
+    #[test]
+    fn claude_noninteractive_auth_not_applicable_for_other_backends() {
+        // codex / opencode / offline must NEVER warn about a Claude token — the
+        // check is informational (PASS) and env-independent for them. (Reads no
+        // env on this path, so it's safe to run in parallel with the env-mutating
+        // test below.)
+        for b in ["codex", "opencode", "offline"] {
+            let r = check_claude_noninteractive_auth(Some(b));
+            assert_eq!(r.status, Status::Passed, "backend {b} must not warn");
+            assert!(r.detail.contains("not applicable"));
+            assert!(r.detail.contains(b));
+        }
+        // No backend picked yet → also a not-applicable PASS, never a WARN.
+        let none = check_claude_noninteractive_auth(None);
+        assert_eq!(none.status, Status::Passed);
+        assert!(none.detail.contains("not applicable"));
+    }
+
+    #[test]
+    fn claude_noninteractive_auth_warns_without_token_passes_with_it() {
+        // All env-mutating assertions live in ONE test (env is process-global) so
+        // they can't race a sibling. Snapshot + restore every credential var.
+        let saved: Vec<(&str, Option<String>)> = CLAUDE_NONINTERACTIVE_AUTH_ENV
+            .iter()
+            .map(|&k| (k, std::env::var(k).ok()))
+            .collect();
+        for &k in CLAUDE_NONINTERACTIVE_AUTH_ENV {
+            std::env::remove_var(k);
+        }
+
+        // No headless credential → WARN that points at `claude setup-token` +
+        // `CLAUDE_CODE_OAUTH_TOKEN`, and names the 401 the user actually hits.
+        let warn = check_claude_noninteractive_auth(Some("claude-code"));
+        assert_eq!(warn.status, Status::Warning);
+        assert!(warn.detail.contains("claude setup-token"));
+        assert!(warn.detail.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(warn.detail.contains("401"));
+        assert!(warn.detail.contains("non-interactive") || warn.detail.contains("NON-INTERACTIVE"));
+
+        // The setup-token credential present → PASS naming the satisfying var.
+        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-test");
+        let pass = check_claude_noninteractive_auth(Some("claude-code"));
+        assert_eq!(pass.status, Status::Passed);
+        assert!(pass.detail.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+        std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+
+        // An API key also satisfies headless auth (any credential clears it).
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test");
+        let pass_key = check_claude_noninteractive_auth(Some("claude-code"));
+        assert_eq!(pass_key.status, Status::Passed);
+        assert!(pass_key.detail.contains("ANTHROPIC_API_KEY"));
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        // A blank token is treated as unset (fail-open: no false PASS).
+        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "   ");
+        let blank = check_claude_noninteractive_auth(Some("claude-code"));
+        assert_eq!(blank.status, Status::Warning, "blank token must not pass");
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     #[test]
