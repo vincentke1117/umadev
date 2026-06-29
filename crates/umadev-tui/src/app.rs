@@ -1846,6 +1846,20 @@ pub struct App {
     /// cache and renders the whole body (the prior behaviour).
     pub(crate) stream_md_cache: std::cell::RefCell<crate::ui::StreamMarkdownCache>,
 
+    /// **R1 — settled-message render cache.** Holds the fully folded
+    /// `Vec<Line>` (markdown-parsed + width-folded) for each SETTLED (non-live,
+    /// non-animating) transcript message, keyed on its content + render context
+    /// (width / theme / lang / collapse). A settled message reuses its cached
+    /// rows verbatim instead of re-parsing pulldown-cmark and re-folding every
+    /// frame — the per-frame transcript cost drops from "re-parse + re-fold ALL
+    /// history" to "clone the cached rows". The cache whole-invalidates on a
+    /// width or theme change, per-entry-invalidates on a content change (the key
+    /// carries a content hash), and self-bounds by dropping any entry not touched
+    /// in the current frame. Fully fail-open: a borrow conflict or a miss simply
+    /// re-folds, byte-for-byte identical to the uncached path. See
+    /// [`crate::ui::MsgFoldCache`].
+    pub(crate) msg_fold_cache: std::cell::RefCell<crate::ui::MsgFoldCache>,
+
     /// Wall-clock of the LAST sign of life from the base — any worker stream
     /// event, host output line, or progress note. Drives the honest "stall"
     /// signal: when a phase is running but nothing has arrived for >3s (and no
@@ -2055,6 +2069,7 @@ impl App {
             stream_tool_batch: None,
             stream_text_active: false,
             stream_md_cache: std::cell::RefCell::new(crate::ui::StreamMarkdownCache::default()),
+            msg_fold_cache: std::cell::RefCell::new(crate::ui::MsgFoldCache::new()),
             last_output_at: None,
             tool_in_progress: false,
             long_op_in_progress: false,

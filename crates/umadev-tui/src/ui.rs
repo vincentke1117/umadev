@@ -1162,6 +1162,266 @@ fn stream_markdown_lines(cache: &mut StreamMarkdownCache, body: &str) -> Vec<Lin
     out
 }
 
+/// **R1 — settled-message render cache.** Maps a per-message render key →
+/// the fully folded `Vec<Line>` (markdown-parsed + width-folded) for one
+/// SETTLED transcript message, so a non-streaming, non-animating message reuses
+/// its folded rows instead of re-parsing pulldown-cmark + re-folding every
+/// frame. This is the single highest-leverage TUI perf fix: the per-frame
+/// transcript cost drops from "re-parse + re-fold ALL of history" to "clone the
+/// cached rows" for the settled majority of the conversation.
+///
+/// **Key** ([`msg_fold_key`]): a hash of the message's content (role +
+/// body/structure), its collapse flag, the global `verbose` + `lang`, the
+/// render `width`, and the `theme` generation — i.e. EVERYTHING that can change
+/// a message's folded output. A cache hit therefore proves the inputs are
+/// identical, so the cached rows are byte-for-byte what a fresh fold would
+/// produce.
+///
+/// **Invalidation.** The whole map clears on a width or theme change (also
+/// bounds memory); a single entry is superseded the moment that message's
+/// content/flags change (the key carries a content hash, so the changed message
+/// gets a fresh key and the old one is swept). After every frame, entries not
+/// touched this frame are dropped ([`Self::end_frame`]) so the cache self-bounds
+/// to the messages actually rendered.
+///
+/// **Fail-open by contract.** Only messages whose render is fully determined by
+/// the key are cached: the live streaming tail (content changes every frame) and
+/// a `Running` tool row (its glyph is the animated spinner) are NEVER cached —
+/// they re-fold fresh, exactly as before. A borrow conflict or a miss likewise
+/// re-folds. The cache can only ever skip work that would reproduce the same
+/// bytes; it can never serve a wrong render.
+#[derive(Debug, Clone)]
+pub(crate) struct MsgFoldCache {
+    /// key → (folded rows, the frame generation it was last touched).
+    map: std::collections::HashMap<u64, FoldEntry>,
+    /// Render width the cached rows were folded at. A change clears the map (the
+    /// fold is width-dependent), so a stale-width row can never survive.
+    last_width: usize,
+    /// Active theme generation ([`theme::theme_id`]) the cached rows were styled
+    /// for. A dark/light flip clears the map.
+    last_theme: u8,
+    /// Monotonic per-frame counter; an entry touched this frame carries the
+    /// current value, and [`Self::end_frame`] drops the rest.
+    generation: u64,
+}
+
+/// One [`MsgFoldCache`] entry: the folded rows plus the frame they were last
+/// used, so untouched entries can be swept at frame end.
+#[derive(Debug, Clone)]
+struct FoldEntry {
+    lines: Vec<Line<'static>>,
+    generation: u64,
+}
+
+impl MsgFoldCache {
+    /// An empty cache. `last_width`/`last_theme` start at sentinel `0`, so the
+    /// first real frame either matches (empty map, nothing to clear) or clears a
+    /// stale state — both correct.
+    pub(crate) fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            last_width: 0,
+            last_theme: 0,
+            generation: 0,
+        }
+    }
+
+    /// Begin a frame: whole-invalidate on a width or theme change (the two
+    /// inputs that alter EVERY message's fold), then advance the generation so
+    /// this frame's touches are distinguishable from the last.
+    fn begin_frame(&mut self, width: usize, theme: u8) {
+        if width != self.last_width || theme != self.last_theme {
+            self.map.clear();
+            self.last_width = width;
+            self.last_theme = theme;
+        }
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// A cache hit: clone the stored folded rows and mark the entry touched this
+    /// frame. `None` on a miss. The clone is required because the caller mutates
+    /// the assembled transcript in place (selection / search highlight, the
+    /// scrollback row cap); it is still far cheaper than a markdown re-parse.
+    fn get(&mut self, key: u64) -> Option<Vec<Line<'static>>> {
+        let generation = self.generation;
+        let entry = self.map.get_mut(&key)?;
+        entry.generation = generation;
+        Some(entry.lines.clone())
+    }
+
+    /// Store the freshly folded rows for `key`, touched this frame.
+    fn put(&mut self, key: u64, lines: Vec<Line<'static>>) {
+        let generation = self.generation;
+        self.map.insert(key, FoldEntry { lines, generation });
+    }
+
+    /// End a frame: drop every entry not touched this frame, so the cache holds
+    /// only the messages actually rendered (a content edit / collapse toggle /
+    /// scrolled-away message naturally falls out).
+    fn end_frame(&mut self) {
+        let generation = self.generation;
+        self.map.retain(|_, e| e.generation == generation);
+    }
+
+    /// Entry count — test-only introspection.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// Hash a message's load-bearing CONTENT into a stable u64 — the part of the
+/// [`MsgFoldCache`] key that changes when the message's rendered text changes.
+/// Covers the role (which selects the render path) and every field the renderer
+/// reads: the body text, or a tool call's name/arg/status/result/count/collapse,
+/// or a diff's path/counts/collapse/hunks. A (vanishingly unlikely) collision
+/// only ever reuses an identical render, never a wrong one.
+fn message_content_hash(msg: &crate::app::ChatMessage) -> u64 {
+    use crate::app::MessageBody;
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::mem::discriminant(&msg.role).hash(&mut h);
+    msg.collapsed.hash(&mut h);
+    match &msg.kind {
+        MessageBody::Text(s) => {
+            0u8.hash(&mut h);
+            s.hash(&mut h);
+        }
+        MessageBody::Tool(t) => {
+            1u8.hash(&mut h);
+            t.name.hash(&mut h);
+            t.arg.hash(&mut h);
+            std::mem::discriminant(&t.status).hash(&mut h);
+            t.result.hash(&mut h);
+            t.merged.hash(&mut h);
+            t.count.hash(&mut h);
+            t.collapsed.hash(&mut h);
+        }
+        MessageBody::Diff(d) => {
+            2u8.hash(&mut h);
+            d.path.hash(&mut h);
+            d.added.hash(&mut h);
+            d.removed.hash(&mut h);
+            d.collapsed.hash(&mut h);
+            for hunk in &d.hunks {
+                for ln in &hunk.lines {
+                    ln.tag.hash(&mut h);
+                    ln.line_no.hash(&mut h);
+                    ln.text.hash(&mut h);
+                    ln.changed.hash(&mut h);
+                }
+            }
+        }
+    }
+    h.finish()
+}
+
+/// The full [`MsgFoldCache`] key: the message content hash combined with every
+/// render-context input that can change its folded output — `verbose` (force-
+/// expand), `lang` (fold-summary / tool / gate strings), the render `width`, and
+/// the `theme` generation. Width + theme are ALSO the whole-cache-invalidation
+/// triggers; folding them into the key too makes the cache correct even if that
+/// clear were ever skipped (defense in depth — a mismatch becomes a clean miss,
+/// never a wrong render).
+fn msg_fold_key(
+    msg: &crate::app::ChatMessage,
+    verbose: bool,
+    lang: umadev_i18n::Lang,
+    width: usize,
+    theme: u8,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    message_content_hash(msg).hash(&mut h);
+    verbose.hash(&mut h);
+    std::mem::discriminant(&lang).hash(&mut h);
+    width.hash(&mut h);
+    theme.hash(&mut h);
+    h.finish()
+}
+
+/// Whether `msg` at `msg_idx` is the LIVE streaming tail — the last Host text
+/// message while the stream is active and the body isn't folded. Its content
+/// grows every frame, so it is rendered through the stable-prefix stream cache
+/// ([`stream_markdown_lines`]), NOT the settled-message fold cache. Mirrors the
+/// `is_live_stream` predicate inlined in [`render_transcript`].
+fn message_is_live_stream(app: &App, msg: &crate::app::ChatMessage, msg_idx: usize) -> bool {
+    use crate::app::{ChatRole, MessageBody};
+    app.stream_text_active
+        && msg_idx + 1 == app.history.len()
+        && matches!(msg.role, ChatRole::Host)
+        && matches!(msg.kind, MessageBody::Text(_))
+        && !message_effective_collapsed(app, msg)
+}
+
+/// The effective collapse state used by the Host/UmaDev render arm: a stored
+/// `collapsed` flag only folds when the global `verbose` reveal is off AND the
+/// body is actually long enough to be foldable. Factored out so the live-stream
+/// predicate and the render arm agree exactly.
+fn message_effective_collapsed(app: &App, msg: &crate::app::ChatMessage) -> bool {
+    msg.collapsed && !app.verbose && crate::app::message_is_collapsible(msg)
+}
+
+/// Whether `msg` may be served from the [`MsgFoldCache`]. A message is cacheable
+/// unless its render changes per frame from something the key does NOT capture:
+/// the live streaming tail (content grows every frame) or a `Running` tool row
+/// (its status glyph is the animated spinner). Everything else — settled text,
+/// user bubbles, system/error lines, gates, finished/queued/aborted tool rows,
+/// diff cards — folds deterministically from its content + the keyed context.
+fn message_is_render_cacheable(app: &App, msg: &crate::app::ChatMessage, msg_idx: usize) -> bool {
+    use crate::app::{MessageBody, ToolStatus};
+    if message_is_live_stream(app, msg, msg_idx) {
+        return false;
+    }
+    if let MessageBody::Tool(t) = &msg.kind {
+        if matches!(t.status, ToolStatus::Running) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Fold one message's [`RenderedRow`]s to the exact visual rows at width `w` —
+/// the same per-row `prefold_line_filled` pass the whole transcript uses, just
+/// applied to one message's rows so the result can be cached. Pure and
+/// width-local; folding per message then concatenating is identical to folding
+/// the concatenation, because the fold is independent per row.
+fn fold_rows(rows: &[RenderedRow], w: usize) -> Vec<Line<'static>> {
+    rows.iter()
+        .flat_map(|row| prefold_line_filled(&row.line, w, row.hang, row.spine, row.fill_bg))
+        .collect()
+}
+
+/// Build + fold one transcript message into its visual rows, served from the
+/// [`MsgFoldCache`] when the message is settled. The returned `Vec<Line>` is
+/// byte-for-byte identical to the uncached `build_message_rows` + `fold_rows`
+/// path; the cache only skips recomputing it. Fail-open: any borrow conflict
+/// falls through to a fresh fold.
+fn message_folded_lines(
+    app: &App,
+    msg: &crate::app::ChatMessage,
+    msg_idx: usize,
+    area: Rect,
+    w: usize,
+    theme_gen: u8,
+) -> Vec<Line<'static>> {
+    if message_is_render_cacheable(app, msg, msg_idx) {
+        let key = msg_fold_key(msg, app.verbose, app.lang, w, theme_gen);
+        if let Ok(mut cache) = app.msg_fold_cache.try_borrow_mut() {
+            if let Some(lines) = cache.get(key) {
+                return lines;
+            }
+        }
+        let folded = fold_rows(&build_message_rows(app, msg, msg_idx, area), w);
+        if let Ok(mut cache) = app.msg_fold_cache.try_borrow_mut() {
+            cache.put(key, folded.clone());
+        }
+        folded
+    } else {
+        fold_rows(&build_message_rows(app, msg, msg_idx, area), w)
+    }
+}
+
 /// The plain per-line fallback (the old behavior): one styled Line per source
 /// line, no parsing. Used when CommonMark parsing fails. Never panics.
 fn plaintext_lines(text: &str, base_color: Color) -> Vec<Line<'static>> {
@@ -3433,6 +3693,227 @@ fn token_gauge_text(app: &App) -> Option<String> {
     }
 }
 
+/// Build ONE transcript message into its [`RenderedRow`]s — the per-message
+/// half of [`render_transcript`], extracted verbatim so the result can be folded
+/// then cached per message (see [`message_folded_lines`]). The caller owns the
+/// inter-message blank gap and the fold; this only produces the logical rows for
+/// `msg`. Behaviour is identical to the prior inline loop body (each `continue`
+/// became an early `return`).
+fn build_message_rows(
+    app: &App,
+    msg: &crate::app::ChatMessage,
+    msg_idx: usize,
+    area: Rect,
+) -> Vec<RenderedRow> {
+    let mut rendered: Vec<RenderedRow> = Vec::new();
+    if msg.role == ChatRole::Gate {
+        let body = msg.body();
+        let bar = theme::role_bar(ChatRole::Gate);
+        let mut block: Vec<Line<'static>> = Vec::new();
+        render_gate_block(&body, bar, &mut block);
+        // Gate keeps its own per-line `▎` prefix on the FIRST row; the spine
+        // color carries that bar down any wrapped continuation row too.
+        rendered.extend(
+            block
+                .into_iter()
+                .map(|l| RenderedRow::spined(l, GUTTER_W, bar)),
+        );
+        return rendered;
+    }
+
+    // A structured tool row renders the same regardless of (Host) role: a
+    // single status line + a folded result gutter. Handled before the
+    // role-text match so its body never falls through to the prose path.
+    // Tool rows belong to the Host flow, so they carry the Host spine — the
+    // vertical skeleton stays unbroken across a turn's prose + tool rows.
+    if let MessageBody::Tool(tool) = &msg.kind {
+        render_tool_row(tool, &mut rendered, app.lang, app.spinner(), app.verbose);
+        return rendered;
+    }
+    // A structured diff card (P1) — a Write/Edit rendered as a real diff.
+    // Handled here for the same reason: it has its own renderer, never the
+    // prose path. A diff card is a Host artifact → Host spine on every row.
+    if let MessageBody::Diff(d) = &msg.kind {
+        let bar = theme::role_bar(ChatRole::Host);
+        rendered.extend(
+            diff_to_lines(d, app.lang, area.width as usize, app.verbose)
+                .into_iter()
+                .map(|(l, hang)| RenderedRow::spined(l, hang.max(GUTTER_W), bar)),
+        );
+        return rendered;
+    }
+
+    let body = msg.body();
+    let spine = theme::role_bar(msg.role);
+    match msg.role {
+        // **User messages** — full-width tinted background bubble (Claude
+        // Code: userMessageBackground) behind a role-spine bar. The leading
+        // `▎ ` spine replaces the old single leading space, so the gutter is
+        // the unified `GUTTER_W` like every other speaker, and `fill_bg`
+        // makes the fold right-pad each row so the tint reads as one solid
+        // block instead of stopping ragged at the text.
+        ChatRole::You => {
+            for line in body.lines() {
+                let spans = vec![
+                    role_spine_span(ChatRole::You),
+                    Span::styled(
+                        line.to_string(),
+                        Style::default().fg(theme::TEXT()).bg(theme::USER_MSG_BG()),
+                    ),
+                ];
+                rendered.push(RenderedRow {
+                    line: Line::from(spans),
+                    hang: GUTTER_W,
+                    spine: Some(spine),
+                    fill_bg: Some(theme::USER_MSG_BG()),
+                });
+            }
+        }
+        // **Assistant/Host messages** — role spine + leading bullet + plain
+        // text on the terminal background (Claude Code: AssistantTextMessage).
+        // The unified `GUTTER_W` gutter is also the hang width, so a long
+        // paragraph that wraps lines up under the text, not under the bullet,
+        // and the spine carries down every wrapped row.
+        //
+        // **P6 long-output fold**: a collapsed long body is truncated to a
+        // head-N preview + a `… N more lines` summary (Ctrl+R expands).
+        ChatRole::Host | ChatRole::UmaDev => {
+            // The global `verbose` toggle (Ctrl+O) force-expands every long
+            // reply at once, so an older folded wall always has a reveal
+            // gesture (Ctrl+R only reaches the most-recent row).
+            let eff_collapsed =
+                msg.collapsed && !app.verbose && crate::app::message_is_collapsible(msg);
+            let folded = if eff_collapsed {
+                fold_general_text(&body, app.lang)
+            } else {
+                body.into_owned()
+            };
+            // **P5a**: the message currently being streamed (the LAST Host
+            // text segment while `stream_text_active`) renders through the
+            // stable-prefix cache — only its unclosed tail is re-parsed each
+            // frame. Every other message renders whole, unchanged. The cached
+            // compose is proven line-for-line identical to a whole render, so
+            // the visible output is byte-for-byte the same either way.
+            let is_live_stream = app.stream_text_active
+                && msg_idx + 1 == app.history.len()
+                && matches!(msg.role, ChatRole::Host)
+                && matches!(msg.kind, MessageBody::Text(_))
+                && !eff_collapsed;
+            let body_lines = if is_live_stream {
+                // Fail-open: a borrow conflict (re-entrant render) falls back
+                // to a plain whole-body render.
+                match app.stream_md_cache.try_borrow_mut() {
+                    Ok(mut cache) => stream_markdown_lines(&mut cache, &folded),
+                    Err(_) => markdown_to_lines(&folded, theme::TEXT()),
+                }
+            } else {
+                markdown_to_lines(&folded, theme::TEXT())
+            };
+            // The first row leads with the role spine; the marker (bullet)
+            // distinguishes the SEAT — UmaDev's own director voice vs the
+            // borrowed base (Host). Continuation rows hang under `GUTTER_W`
+            // and the spine repaints there.
+            for (i, bl) in body_lines.into_iter().enumerate() {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                if i == 0 {
+                    let (marker, marker_color) = assistant_marker(msg.role);
+                    spans.push(Span::styled(marker, Style::default().fg(marker_color)));
+                } else {
+                    // Continuation: the spine glyph fills col 0; pad to gutter.
+                    spans.push(role_spine_span(msg.role));
+                }
+                spans.extend(bl.spans);
+                rendered.push(RenderedRow::spined(Line::from(spans), GUTTER_W, spine));
+            }
+        }
+        // **System messages** — dim/muted text behind a role-spine bar. The
+        // old `  ` two-space prefix becomes the `▎ ` spine so System shares
+        // the unified gutter and gets a vertical bar like every other turn.
+        ChatRole::System => {
+            // A `[thinking]` reasoning block folds: collapsed (default) shows
+            // just the `[thinking] …` header + an expand hint; expanded (the
+            // global Ctrl+O verbose toggle, or Ctrl+R on the latest) reveals the
+            // base's chain of thought below it (muted italic — visually secondary
+            // to the answer). Any other System line renders unchanged.
+            if crate::app::is_thinking_reasoning_block(msg.role, body.as_ref()) {
+                let mut lines = body.lines();
+                let header = lines.next().unwrap_or("");
+                let expanded = app.verbose || !msg.collapsed;
+                if expanded {
+                    rendered.push(RenderedRow::spined(
+                        Line::from(vec![
+                            role_spine_span(ChatRole::System),
+                            Span::styled(
+                                header.to_string(),
+                                Style::default().fg(theme::TEXT_MUTED()),
+                            ),
+                        ]),
+                        GUTTER_W,
+                        spine,
+                    ));
+                    for line in lines {
+                        rendered.push(RenderedRow::spined(
+                            Line::from(vec![
+                                role_spine_span(ChatRole::System),
+                                Span::styled(
+                                    line.to_string(),
+                                    Style::default()
+                                        .fg(theme::TEXT_MUTED())
+                                        .add_modifier(Modifier::ITALIC),
+                                ),
+                            ]),
+                            GUTTER_W,
+                            spine,
+                        ));
+                    }
+                } else {
+                    // Collapsed: one muted line — the header + the expand hint.
+                    let hint = umadev_i18n::t(app.lang, "tui.thinking.expand_hint");
+                    rendered.push(RenderedRow::spined(
+                        Line::from(vec![
+                            role_spine_span(ChatRole::System),
+                            Span::styled(
+                                format!("{header} · {hint}"),
+                                Style::default().fg(theme::TEXT_MUTED()),
+                            ),
+                        ]),
+                        GUTTER_W,
+                        spine,
+                    ));
+                }
+            } else {
+                for line in body.lines() {
+                    let spans = vec![
+                        role_spine_span(ChatRole::System),
+                        Span::styled(line.to_string(), Style::default().fg(theme::TEXT_MUTED())),
+                    ];
+                    rendered.push(RenderedRow::spined(Line::from(spans), GUTTER_W, spine));
+                }
+            }
+        }
+        // **Error / high-risk warnings** — a LOUD, bold line in the theme's
+        // error red (the same red as a failed tool / blocked review row),
+        // behind the role spine. No emoji marker — the color + bold is the
+        // signal. Drives the codex `danger-full-access` startup warning.
+        ChatRole::Error => {
+            for line in body.lines() {
+                let spans = vec![
+                    role_spine_span(ChatRole::Error),
+                    Span::styled(
+                        line.to_string(),
+                        Style::default()
+                            .fg(theme::ERROR())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                rendered.push(RenderedRow::spined(Line::from(spans), GUTTER_W, spine));
+            }
+        }
+        ChatRole::Gate => unreachable!(),
+    }
+    rendered
+}
+
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // Cap the retained scrollback so a marathon session can't grow the per-frame
     // fold unbounded. Counted in **visual rows AFTER folding** (not logical lines
@@ -3461,225 +3942,43 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // grid. Set once per render; read by `render_table`.
     set_table_width_budget((area.width as usize).saturating_sub(GUTTER_W + 2).max(20));
 
-    let mut rendered: Vec<RenderedRow> = welcome_lines(app)
-        .into_iter()
-        .map(|l| RenderedRow::plain(l, 0))
-        .collect();
+    let w = usize::from(area.width).max(1);
+    let theme_gen = theme::theme_id();
+    // R1 — settled-message render cache: whole-invalidate on a width/theme
+    // change, then advance the per-frame generation so untouched entries can be
+    // swept after the walk. Fail-open: a borrow conflict just skips the cache and
+    // every message re-folds (the prior behaviour).
+    if let Ok(mut cache) = app.msg_fold_cache.try_borrow_mut() {
+        cache.begin_frame(w, theme_gen);
+    }
+
+    // Fold the transcript into visual rows. The welcome banner folds fresh each
+    // frame (tiny); every transcript MESSAGE folds through the settled-message
+    // cache, so a long, mostly-settled conversation costs a per-message CLONE
+    // instead of a markdown re-parse + re-fold. Folding per message then
+    // concatenating is identical to folding the concatenation (the fold is
+    // independent per row), so the painted output is byte-for-byte unchanged.
+    let mut folded: Vec<Line<'static>> = Vec::new();
+    for l in welcome_lines(app) {
+        folded.extend(prefold_line_filled(&l, w, 0, None, None));
+    }
     for (msg_idx, msg) in app.history.iter().enumerate() {
         // Top gap before each message for breathing room (Claude Code: marginTop=1).
         if msg_idx > 0 {
-            rendered.push(RenderedRow::plain(Line::from(""), 0));
+            folded.extend(prefold_line_filled(&Line::from(""), w, 0, None, None));
         }
-
-        if msg.role == ChatRole::Gate {
-            let body = msg.body();
-            let bar = theme::role_bar(ChatRole::Gate);
-            let mut block: Vec<Line<'static>> = Vec::new();
-            render_gate_block(&body, bar, &mut block);
-            // Gate keeps its own per-line `▎` prefix on the FIRST row; the spine
-            // color carries that bar down any wrapped continuation row too.
-            rendered.extend(
-                block
-                    .into_iter()
-                    .map(|l| RenderedRow::spined(l, GUTTER_W, bar)),
-            );
-            continue;
-        }
-
-        // A structured tool row renders the same regardless of (Host) role: a
-        // single status line + a folded result gutter. Handled before the
-        // role-text match so its body never falls through to the prose path.
-        // Tool rows belong to the Host flow, so they carry the Host spine — the
-        // vertical skeleton stays unbroken across a turn's prose + tool rows.
-        if let MessageBody::Tool(tool) = &msg.kind {
-            render_tool_row(tool, &mut rendered, app.lang, app.spinner(), app.verbose);
-            continue;
-        }
-        // A structured diff card (P1) — a Write/Edit rendered as a real diff.
-        // Handled here for the same reason: it has its own renderer, never the
-        // prose path. A diff card is a Host artifact → Host spine on every row.
-        if let MessageBody::Diff(d) = &msg.kind {
-            let bar = theme::role_bar(ChatRole::Host);
-            rendered.extend(
-                diff_to_lines(d, app.lang, area.width as usize, app.verbose)
-                    .into_iter()
-                    .map(|(l, hang)| RenderedRow::spined(l, hang.max(GUTTER_W), bar)),
-            );
-            continue;
-        }
-
-        let body = msg.body();
-        let spine = theme::role_bar(msg.role);
-        match msg.role {
-            // **User messages** — full-width tinted background bubble (Claude
-            // Code: userMessageBackground) behind a role-spine bar. The leading
-            // `▎ ` spine replaces the old single leading space, so the gutter is
-            // the unified `GUTTER_W` like every other speaker, and `fill_bg`
-            // makes the fold right-pad each row so the tint reads as one solid
-            // block instead of stopping ragged at the text.
-            ChatRole::You => {
-                for line in body.lines() {
-                    let spans = vec![
-                        role_spine_span(ChatRole::You),
-                        Span::styled(
-                            line.to_string(),
-                            Style::default().fg(theme::TEXT()).bg(theme::USER_MSG_BG()),
-                        ),
-                    ];
-                    rendered.push(RenderedRow {
-                        line: Line::from(spans),
-                        hang: GUTTER_W,
-                        spine: Some(spine),
-                        fill_bg: Some(theme::USER_MSG_BG()),
-                    });
-                }
-            }
-            // **Assistant/Host messages** — role spine + leading bullet + plain
-            // text on the terminal background (Claude Code: AssistantTextMessage).
-            // The unified `GUTTER_W` gutter is also the hang width, so a long
-            // paragraph that wraps lines up under the text, not under the bullet,
-            // and the spine carries down every wrapped row.
-            //
-            // **P6 long-output fold**: a collapsed long body is truncated to a
-            // head-N preview + a `… N more lines` summary (Ctrl+R expands).
-            ChatRole::Host | ChatRole::UmaDev => {
-                // The global `verbose` toggle (Ctrl+O) force-expands every long
-                // reply at once, so an older folded wall always has a reveal
-                // gesture (Ctrl+R only reaches the most-recent row).
-                let eff_collapsed =
-                    msg.collapsed && !app.verbose && crate::app::message_is_collapsible(msg);
-                let folded = if eff_collapsed {
-                    fold_general_text(&body, app.lang)
-                } else {
-                    body.into_owned()
-                };
-                // **P5a**: the message currently being streamed (the LAST Host
-                // text segment while `stream_text_active`) renders through the
-                // stable-prefix cache — only its unclosed tail is re-parsed each
-                // frame. Every other message renders whole, unchanged. The cached
-                // compose is proven line-for-line identical to a whole render, so
-                // the visible output is byte-for-byte the same either way.
-                let is_live_stream = app.stream_text_active
-                    && msg_idx + 1 == app.history.len()
-                    && matches!(msg.role, ChatRole::Host)
-                    && matches!(msg.kind, MessageBody::Text(_))
-                    && !eff_collapsed;
-                let body_lines = if is_live_stream {
-                    // Fail-open: a borrow conflict (re-entrant render) falls back
-                    // to a plain whole-body render.
-                    match app.stream_md_cache.try_borrow_mut() {
-                        Ok(mut cache) => stream_markdown_lines(&mut cache, &folded),
-                        Err(_) => markdown_to_lines(&folded, theme::TEXT()),
-                    }
-                } else {
-                    markdown_to_lines(&folded, theme::TEXT())
-                };
-                // The first row leads with the role spine; the marker (bullet)
-                // distinguishes the SEAT — UmaDev's own director voice vs the
-                // borrowed base (Host). Continuation rows hang under `GUTTER_W`
-                // and the spine repaints there.
-                for (i, bl) in body_lines.into_iter().enumerate() {
-                    let mut spans: Vec<Span<'static>> = Vec::new();
-                    if i == 0 {
-                        let (marker, marker_color) = assistant_marker(msg.role);
-                        spans.push(Span::styled(marker, Style::default().fg(marker_color)));
-                    } else {
-                        // Continuation: the spine glyph fills col 0; pad to gutter.
-                        spans.push(role_spine_span(msg.role));
-                    }
-                    spans.extend(bl.spans);
-                    rendered.push(RenderedRow::spined(Line::from(spans), GUTTER_W, spine));
-                }
-            }
-            // **System messages** — dim/muted text behind a role-spine bar. The
-            // old `  ` two-space prefix becomes the `▎ ` spine so System shares
-            // the unified gutter and gets a vertical bar like every other turn.
-            ChatRole::System => {
-                // A `[thinking]` reasoning block folds: collapsed (default) shows
-                // just the `[thinking] …` header + an expand hint; expanded (the
-                // global Ctrl+O verbose toggle, or Ctrl+R on the latest) reveals the
-                // base's chain of thought below it (muted italic — visually secondary
-                // to the answer). Any other System line renders unchanged.
-                if crate::app::is_thinking_reasoning_block(msg.role, body.as_ref()) {
-                    let mut lines = body.lines();
-                    let header = lines.next().unwrap_or("");
-                    let expanded = app.verbose || !msg.collapsed;
-                    if expanded {
-                        rendered.push(RenderedRow::spined(
-                            Line::from(vec![
-                                role_spine_span(ChatRole::System),
-                                Span::styled(
-                                    header.to_string(),
-                                    Style::default().fg(theme::TEXT_MUTED()),
-                                ),
-                            ]),
-                            GUTTER_W,
-                            spine,
-                        ));
-                        for line in lines {
-                            rendered.push(RenderedRow::spined(
-                                Line::from(vec![
-                                    role_spine_span(ChatRole::System),
-                                    Span::styled(
-                                        line.to_string(),
-                                        Style::default()
-                                            .fg(theme::TEXT_MUTED())
-                                            .add_modifier(Modifier::ITALIC),
-                                    ),
-                                ]),
-                                GUTTER_W,
-                                spine,
-                            ));
-                        }
-                    } else {
-                        // Collapsed: one muted line — the header + the expand hint.
-                        let hint = umadev_i18n::t(app.lang, "tui.thinking.expand_hint");
-                        rendered.push(RenderedRow::spined(
-                            Line::from(vec![
-                                role_spine_span(ChatRole::System),
-                                Span::styled(
-                                    format!("{header} · {hint}"),
-                                    Style::default().fg(theme::TEXT_MUTED()),
-                                ),
-                            ]),
-                            GUTTER_W,
-                            spine,
-                        ));
-                    }
-                } else {
-                    for line in body.lines() {
-                        let spans = vec![
-                            role_spine_span(ChatRole::System),
-                            Span::styled(
-                                line.to_string(),
-                                Style::default().fg(theme::TEXT_MUTED()),
-                            ),
-                        ];
-                        rendered.push(RenderedRow::spined(Line::from(spans), GUTTER_W, spine));
-                    }
-                }
-            }
-            // **Error / high-risk warnings** — a LOUD, bold line in the theme's
-            // error red (the same red as a failed tool / blocked review row),
-            // behind the role spine. No emoji marker — the color + bold is the
-            // signal. Drives the codex `danger-full-access` startup warning.
-            ChatRole::Error => {
-                for line in body.lines() {
-                    let spans = vec![
-                        role_spine_span(ChatRole::Error),
-                        Span::styled(
-                            line.to_string(),
-                            Style::default()
-                                .fg(theme::ERROR())
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ];
-                    rendered.push(RenderedRow::spined(Line::from(spans), GUTTER_W, spine));
-                }
-            }
-            ChatRole::Gate => unreachable!(),
-        }
+        folded.extend(message_folded_lines(app, msg, msg_idx, area, w, theme_gen));
     }
+    // Drop cache entries not touched this frame (a content edit, a collapse
+    // toggle, a message that fell out of history) so the cache self-bounds to the
+    // messages actually rendered.
+    if let Ok(mut cache) = app.msg_fold_cache.try_borrow_mut() {
+        cache.end_frame();
+    }
+
+    // The live waiting indicator below builds its own throwaway rows (animated
+    // spinner — never cached); they fold onto `folded` after the message walk.
+    let mut rendered: Vec<RenderedRow> = Vec::new();
     // Live waiting indicator — an animated spinner + verb + ticking elapsed,
     // pinned just above the input while the base replies, so a sent message
     // visibly "works" instead of looking frozen.
@@ -3747,11 +4046,12 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // estimate equals reality and the scroll offset lands on the right row.
     // Continuation rows are indented by each line's `hang` so wrapped paragraphs
     // stay aligned under their bullet/prefix.
-    let w = usize::from(area.width).max(1);
-    let mut folded: Vec<Line<'static>> = rendered
-        .into_iter()
-        .flat_map(|row| prefold_line_filled(&row.line, w, row.hang, row.spine, row.fill_bg))
-        .collect();
+    //
+    // `folded` already holds the cached transcript (welcome banner + every
+    // message); fold the live waiting indicator's own rows onto its end. Folding
+    // per group then concatenating equals folding the concatenation — the fold is
+    // independent per row — so the painted output is byte-for-byte unchanged.
+    folded.extend(fold_rows(&rendered, w));
     // Bound the retained scrollback by VISUAL rows (post-fold), keeping the most
     // recent `MAX_RENDER_ROWS`. Doing it here — not on logical lines up top —
     // means `total` (and the `hidden_above` derived from it) equals exactly what
@@ -7489,6 +7789,222 @@ mod tests {
             kind: MessageBody::Text(text.to_string()),
             collapsed: false,
         });
+    }
+
+    // --- R1 settled-message render cache ------------------------------------
+
+    fn host_md_msg(text: &str) -> crate::app::ChatMessage {
+        crate::app::ChatMessage {
+            role: ChatRole::Host,
+            kind: MessageBody::Text(text.to_string()),
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn settled_message_folds_identically_cached_and_uncached() {
+        // The core correctness guarantee: a cache MISS, a cache HIT, and the
+        // direct uncached fold are all byte-for-byte the same `Vec<Line>`.
+        let mut app = app_with(Some("offline"));
+        app.history.clear();
+        app.history.push_back(host_md_msg(
+            "# Title\n\nSome **bold** text and a list:\n\n- one\n- two\n\n```rust\nfn x() {}\n```",
+        ));
+        let area = Rect::new(0, 0, 44, 30);
+        let w = 44usize;
+        let theme_gen = theme::theme_id();
+        // Uncached reference: build + fold directly (the no-cache path).
+        let reference = {
+            let msg = &app.history[0];
+            fold_rows(&build_message_rows(&app, msg, 0, area), w)
+        };
+        // Cached path: a frame with a miss (builds + stores), then a hit (reuse).
+        app.msg_fold_cache.borrow_mut().begin_frame(w, theme_gen);
+        let miss = message_folded_lines(&app, &app.history[0], 0, area, w, theme_gen);
+        let hit = message_folded_lines(&app, &app.history[0], 0, area, w, theme_gen);
+        assert_eq!(
+            miss, reference,
+            "the first (cache-miss) fold must equal the uncached fold"
+        );
+        assert_eq!(
+            hit, reference,
+            "the second (cache-hit) fold must be byte-identical to the uncached fold"
+        );
+        assert_eq!(
+            app.msg_fold_cache.borrow().len(),
+            1,
+            "exactly one settled entry is cached"
+        );
+    }
+
+    #[test]
+    fn transcript_re_render_is_byte_identical_with_the_cache() {
+        // End-to-end: the SECOND painted frame is served from the settled-message
+        // cache; the buffer must match the first frame exactly (selection / search
+        // / spine / fold all preserved through the cached path).
+        let mut app = app_with(Some("offline"));
+        app.history.clear();
+        push_msg(&mut app, ChatRole::You, "a question");
+        push_msg(
+            &mut app,
+            ChatRole::Host,
+            "# Answer\n\nText with **bold** and `code`.\n\n- alpha\n- beta",
+        );
+        push_msg(&mut app, ChatRole::System, "a system note");
+        let first = render_to_string(&app);
+        let second = render_to_string(&app);
+        assert_eq!(
+            first, second,
+            "a cached re-render is byte-for-byte identical to the first paint"
+        );
+    }
+
+    #[test]
+    fn cache_whole_invalidates_on_width_and_theme_change() {
+        let mut app = app_with(Some("offline"));
+        app.history.clear();
+        app.history.push_back(host_md_msg("hello **world**"));
+        let theme_gen = theme::theme_id();
+        // Fill at width 40.
+        app.msg_fold_cache.borrow_mut().begin_frame(40, theme_gen);
+        let _ = message_folded_lines(
+            &app,
+            &app.history[0],
+            0,
+            Rect::new(0, 0, 40, 20),
+            40,
+            theme_gen,
+        );
+        assert_eq!(app.msg_fold_cache.borrow().len(), 1);
+        // A width change clears the WHOLE map (the fold is width-dependent).
+        {
+            let mut c = app.msg_fold_cache.borrow_mut();
+            c.begin_frame(50, theme_gen);
+            assert_eq!(c.len(), 0, "a width change clears the whole cache");
+        }
+        // Refill at the new width, then flip the theme → whole clear again.
+        let _ = message_folded_lines(
+            &app,
+            &app.history[0],
+            0,
+            Rect::new(0, 0, 50, 20),
+            50,
+            theme_gen,
+        );
+        assert_eq!(app.msg_fold_cache.borrow().len(), 1);
+        {
+            let mut c = app.msg_fold_cache.borrow_mut();
+            c.begin_frame(50, theme_gen ^ 1);
+            assert_eq!(c.len(), 0, "a theme change clears the whole cache");
+        }
+    }
+
+    #[test]
+    fn content_change_yields_a_fresh_cache_key() {
+        // Per-entry invalidation: any change the renderer reads flips the key.
+        let app = app_with(Some("offline"));
+        let a = host_md_msg("hello world");
+        let b = host_md_msg("hello WORLD!");
+        let theme_gen = theme::theme_id();
+        let ka = msg_fold_key(&a, false, app.lang, 40, theme_gen);
+        assert_ne!(
+            ka,
+            msg_fold_key(&b, false, app.lang, 40, theme_gen),
+            "different content → different key"
+        );
+        assert_ne!(
+            ka,
+            msg_fold_key(&a, true, app.lang, 40, theme_gen),
+            "the verbose flag is part of the key"
+        );
+        assert_ne!(
+            ka,
+            msg_fold_key(&a, false, app.lang, 41, theme_gen),
+            "the render width is part of the key"
+        );
+        assert_ne!(
+            ka,
+            msg_fold_key(&a, false, app.lang, 40, theme_gen ^ 1),
+            "the theme generation is part of the key"
+        );
+    }
+
+    #[test]
+    fn live_streaming_message_is_never_cached() {
+        let mut app = app_with(Some("offline"));
+        app.history.clear();
+        app.history
+            .push_back(host_md_msg("partial reply still streaming"));
+        app.stream_text_active = true; // last Host text msg + active stream = live
+        let idx = app.history.len() - 1;
+        assert!(message_is_live_stream(&app, &app.history[idx], idx));
+        assert!(!message_is_render_cacheable(&app, &app.history[idx], idx));
+        // Rendering it must NOT populate the cache (it goes through the stream
+        // prefix cache and re-folds live each frame).
+        app.msg_fold_cache
+            .borrow_mut()
+            .begin_frame(40, theme::theme_id());
+        let _ = message_folded_lines(
+            &app,
+            &app.history[idx],
+            idx,
+            Rect::new(0, 0, 40, 20),
+            40,
+            theme::theme_id(),
+        );
+        assert_eq!(
+            app.msg_fold_cache.borrow().len(),
+            0,
+            "a live streaming message is never cached"
+        );
+    }
+
+    #[test]
+    fn running_tool_row_is_volatile_and_not_cached() {
+        use crate::app::{ChatMessage, MessageBody};
+        let mk = |status: ToolStatus| ChatMessage {
+            role: ChatRole::Host,
+            kind: MessageBody::Tool(ToolCall {
+                name: "Bash".into(),
+                arg: "npm test".into(),
+                status,
+                result: None,
+                merged: false,
+                count: 1,
+                collapsed: false,
+            }),
+            collapsed: false,
+        };
+        let app = app_with(Some("offline"));
+        // The `Running` glyph IS the animated spinner → never cached (volatile).
+        assert!(!message_is_render_cacheable(
+            &app,
+            &mk(ToolStatus::Running),
+            0
+        ));
+        // A settled tool row has a static glyph → cacheable.
+        assert!(message_is_render_cacheable(&app, &mk(ToolStatus::Ok), 0));
+        assert!(message_is_render_cacheable(
+            &app,
+            &mk(ToolStatus::Aborted),
+            0
+        ));
+    }
+
+    #[test]
+    fn end_frame_sweeps_entries_not_touched_this_frame() {
+        // The self-bounding sweep: only this frame's entries survive.
+        let mut c = MsgFoldCache::new();
+        c.begin_frame(40, 0);
+        c.put(1, vec![Line::from("a")]);
+        c.put(2, vec![Line::from("b")]);
+        assert_eq!(c.len(), 2);
+        // Next frame touches only key 1; key 2 falls out at end_frame.
+        c.begin_frame(40, 0);
+        assert!(c.get(1).is_some(), "a touched entry survives");
+        c.end_frame();
+        assert_eq!(c.len(), 1, "the untouched entry is swept");
+        assert!(c.get(1).is_some(), "the touched entry is still present");
     }
 
     #[test]

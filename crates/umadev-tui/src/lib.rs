@@ -3997,6 +3997,32 @@ async fn next_resume_signal(sig: &mut Option<ResumeSignal>) {
     }
 }
 
+/// R3 — minimum interval between streaming-driven transcript redraws. A burst of
+/// engine events keeps the frame dirty while this budget throttles the actual
+/// repaints to ~60fps, so token streaming costs ~one re-layout per frame instead
+/// of one per token. Latency-sensitive sources (input, the animation tick) bypass
+/// it; a pending redraw is always flushed within one budget via the frame-deadline
+/// `select!` arm.
+const FRAME_MIN: Duration = Duration::from_millis(16);
+
+/// R3 — the per-loop draw decision (pure, so it is unit-tested directly). Draw
+/// when a self-heal repaint is forced (`force_full_repaint`), when a latency-
+/// sensitive source asked for an immediate frame (`draw_now` — input / the
+/// animation tick / a cancel drain), or when the transcript is dirty
+/// (`needs_redraw`) AND at least one `budget` has elapsed since the last paint.
+/// A streaming burst keeps `needs_redraw` set while `since_last_draw < budget`,
+/// so the redraws coalesce to ~one per budget instead of one per token, yet a
+/// forced or interactive frame never waits.
+fn frame_budget_allows_draw(
+    force_full_repaint: bool,
+    draw_now: bool,
+    needs_redraw: bool,
+    since_last_draw: Duration,
+    budget: Duration,
+) -> bool {
+    force_full_repaint || draw_now || (needs_redraw && since_last_draw >= budget)
+}
+
 async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> Result<()> {
     let (sink, mut engine_rx) = ChannelSink::new();
     let sink = Arc::new(sink);
@@ -4102,6 +4128,23 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // registration failed — the select! arm is then inert (fail-open).
     let mut resume_sig = register_resume_signal();
 
+    // --- R3 event coalescing + frame budget -----------------------------------
+    // A burst of streaming engine events (each a token / progress note) must
+    // produce ONE redraw, not N full transcript re-layouts. Two cooperating
+    // levers: (1) the engine arm DRAINS all currently-pending events (`try_recv`)
+    // before yielding, so a token burst is applied in a single pass; (2) a ~16ms
+    // minimum interval gates streaming-driven redraws. `needs_redraw` marks the
+    // frame dirty from a budget-gated source (engine / route completion);
+    // `draw_now` forces an immediate frame for latency-sensitive sources (input,
+    // the 80ms animation tick, a cancel drain) so keystrokes and the spinner stay
+    // crisp. `force_full_repaint` (the self-heal scrub / resize / resume) always
+    // draws. The first frame draws unconditionally (`draw_now = true`).
+    let mut needs_redraw = false;
+    let mut draw_now = true;
+    let mut last_draw = Instant::now()
+        .checked_sub(FRAME_MIN)
+        .unwrap_or_else(Instant::now);
+
     loop {
         // R1 — periodic self-healing scrub. While a turn is LIVE (thinking /
         // tool running / active run), force a full clear+repaint on a low
@@ -4126,63 +4169,89 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             last_scrub = Instant::now();
         }
 
-        // Wrap the frame in a synchronized-output update when supported: the
-        // terminal holds back the paint until ESU, then swaps atomically, so a
-        // half-drawn frame can never surface (the root fix for mid-render
-        // garble). ESU is emitted UNCONDITIONALLY after the draw — even if it
-        // errored — so the terminal can never get stuck in synchronized mode.
-        // Both ends fail-open (`let _ =`): a write error never blocks the loop.
-        //
-        // R3 — BSU/ESU go through ratatui's OWN backend writer
-        // (`terminal.backend_mut()`), NOT a separate `std::io::stdout()` handle,
-        // so the synchronized-update brackets share buffering + flush ordering
-        // with the cell writes (no interleave between the wrapper and the frame).
-        if sync_output {
-            let _ = terminal.backend_mut().execute(BeginSynchronizedUpdate);
-        }
-        // R1/R4/R5 — a self-heal repaint was requested (periodic scrub, an
-        // atomic resize erase, a resume-from-gap / SIGCONT reassert, or Ctrl+L).
-        // Clear the screen + back buffer so the next draw repaints EVERY cell,
-        // done INSIDE the BSU/ESU block so the clear+draw swap atomically and the
-        // scrub is invisible on a sync-capable terminal. Old content stays on
-        // screen until the new frame swaps in. Fail-open: a clear error never
-        // blocks the draw.
-        if force_full_repaint {
-            let _ = terminal.clear();
-        }
-        // `.map(|f| f.area)` drops the `CompletedFrame`'s borrow of `terminal`
-        // (keeping only the Copy `Rect`), so the ESU write through
-        // `backend_mut()` below doesn't conflict with that borrow. The drawn
-        // size feeds the R4 resize debounce.
-        let draw_result = terminal.draw(|f| ui::render(f, app)).map(|f| f.area);
-        if sync_output {
-            let _ = terminal.backend_mut().execute(EndSynchronizedUpdate);
-        }
-        // The scrub/resize/resume repaint (if any) has now been painted.
-        force_full_repaint = false;
-        let drawn = draw_result?;
-        // Record the dimensions we just drew at for the R4 resize debounce. Only
-        // write on a real change (this also READS the prior value, so the initial
-        // `None` isn't a dead assignment).
-        if last_drawn_size != Some((drawn.width, drawn.height)) {
-            last_drawn_size = Some((drawn.width, drawn.height));
-        }
+        // R3 — frame-budget gate. Draw when a self-heal repaint is forced, when a
+        // latency-sensitive source asked for an immediate frame (`draw_now` —
+        // input, the 80ms animation tick, a cancel drain), or when the transcript
+        // is dirty (`needs_redraw`) AND at least one ~16ms budget has elapsed since
+        // the last paint. A streaming burst keeps `needs_redraw` set while the
+        // budget throttles the actual redraws, collapsing N token events into
+        // ~one repaint per frame interval. A still-pending redraw is flushed
+        // within the budget by the frame-deadline `select!` arm below.
+        let do_draw = frame_budget_allows_draw(
+            force_full_repaint,
+            draw_now,
+            needs_redraw,
+            last_draw.elapsed(),
+            FRAME_MIN,
+        );
+        if do_draw {
+            // Wrap the frame in a synchronized-output update when supported: the
+            // terminal holds back the paint until ESU, then swaps atomically, so a
+            // half-drawn frame can never surface (the root fix for mid-render
+            // garble). ESU is emitted UNCONDITIONALLY after the draw — even if it
+            // errored — so the terminal can never get stuck in synchronized mode.
+            // Both ends fail-open (`let _ =`): a write error never blocks the loop.
+            //
+            // R3 — BSU/ESU go through ratatui's OWN backend writer
+            // (`terminal.backend_mut()`), NOT a separate `std::io::stdout()` handle,
+            // so the synchronized-update brackets share buffering + flush ordering
+            // with the cell writes (no interleave between the wrapper and the frame).
+            if sync_output {
+                let _ = terminal.backend_mut().execute(BeginSynchronizedUpdate);
+            }
+            // R1/R4/R5 — a self-heal repaint was requested (periodic scrub, an
+            // atomic resize erase, a resume-from-gap / SIGCONT reassert, or Ctrl+L).
+            // Clear the screen + back buffer so the next draw repaints EVERY cell,
+            // done INSIDE the BSU/ESU block so the clear+draw swap atomically and the
+            // scrub is invisible on a sync-capable terminal. Old content stays on
+            // screen until the new frame swaps in. Fail-open: a clear error never
+            // blocks the draw.
+            if force_full_repaint {
+                let _ = terminal.clear();
+            }
+            // `.map(|f| f.area)` drops the `CompletedFrame`'s borrow of `terminal`
+            // (keeping only the Copy `Rect`), so the ESU write through
+            // `backend_mut()` below doesn't conflict with that borrow. The drawn
+            // size feeds the R4 resize debounce.
+            let draw_result = terminal.draw(|f| ui::render(f, app)).map(|f| f.area);
+            if sync_output {
+                let _ = terminal.backend_mut().execute(EndSynchronizedUpdate);
+            }
+            // The scrub/resize/resume repaint (if any) has now been painted.
+            force_full_repaint = false;
+            let drawn = draw_result?;
+            // Record the dimensions we just drew at for the R4 resize debounce. Only
+            // write on a real change (this also READS the prior value, so the initial
+            // `None` isn't a dead assignment).
+            if last_drawn_size != Some((drawn.width, drawn.height)) {
+                last_drawn_size = Some((drawn.width, drawn.height));
+            }
 
-        // Feature A — completion notification. A turn/run that reached a terminal
-        // state (finished / aborted / paused at a gate) in the PREVIOUS iteration
-        // armed a bell; the frame above has now painted that settled state, so
-        // emit the BEL byte HERE, BETWEEN frames, through the render's OWN backend
-        // writer (R3 single-writer discipline — never a fresh `stdout()` handle,
-        // never mid-paint, outside the BSU/ESU block). `execute` flushes it
-        // immediately. Fail-open: a write error never blocks the loop.
-        if app.take_bell() {
-            let _ = terminal
-                .backend_mut()
-                .execute(crossterm::style::Print('\u{7}'));
+            // Feature A — completion notification. A turn/run that reached a terminal
+            // state (finished / aborted / paused at a gate) in the PREVIOUS iteration
+            // armed a bell; the frame above has now painted that settled state, so
+            // emit the BEL byte HERE, BETWEEN frames, through the render's OWN backend
+            // writer (R3 single-writer discipline — never a fresh `stdout()` handle,
+            // never mid-paint, outside the BSU/ESU block). `execute` flushes it
+            // immediately. Fail-open: a write error never blocks the loop.
+            if app.take_bell() {
+                let _ = terminal
+                    .backend_mut()
+                    .execute(crossterm::style::Print('\u{7}'));
+            }
+            // The frame is painted: clear the dirty + immediate-draw flags and
+            // restart the budget clock, so the next streaming burst is throttled
+            // from this paint.
+            needs_redraw = false;
+            draw_now = false;
+            last_draw = Instant::now();
         }
 
         tokio::select! {
             maybe_route = route_rx.recv() => {
+                // R3 — a turn-completion decision changes the transcript; mark it
+                // dirty (budget-gated — route decisions aren't bursty).
+                needs_redraw = true;
                 match maybe_route {
                     // The brain-driven turn finished cleanly: the body already
                     // streamed live, so we only record it as the assistant turn
@@ -4217,7 +4286,16 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 }
             }
             maybe_event = engine_rx.recv() => {
-                if let Some(ev) = maybe_event {
+                // R3 — engine events change the transcript; mark it dirty
+                // (budget-gated so a streaming burst coalesces).
+                needs_redraw = true;
+                // R3 — drain EVERY currently-pending engine event in one pass so a
+                // burst of streaming tokens (or progress notes) is applied before a
+                // SINGLE redraw, not one full re-layout per token. Each event runs
+                // the exact same handling as before (no behaviour change); only the
+                // intervening redraws are coalesced.
+                let mut current = maybe_event;
+                while let Some(ev) = current.take() {
                     let was_finished = app.finished;
                     app.apply_engine(ev);
                     // Delivery build just completed (the banner with its preview URL
@@ -4321,9 +4399,16 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                             spawn_block(run_opts, app.brain_spec(), sink.clone(), block)
                         });
                     }
+                    // R3 — pull the next already-queued engine event (if any) and
+                    // apply it in this same pass; `None` ends the drain.
+                    current = engine_rx.try_recv().ok();
                 }
             }
             maybe_key = input.next() => {
+                // R3 — input (key / mouse / paste / resize) is latency-sensitive:
+                // draw the next frame immediately rather than waiting on the
+                // streaming budget, so keystrokes and scrolling never feel laggy.
+                draw_now = true;
                 // R5 — sleep-wake / stdin-gap self-heal. A key/mouse/resize/paste
                 // arriving after a long input gap looks like a resume from laptop
                 // sleep / tmux re-attach / ssh reconnect: the terminal may have
@@ -5072,6 +5157,8 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 let h = cancel_drain.as_mut().expect("guarded by cancel_drain.is_some()");
                 let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
             }, if cancel_drain.is_some() => {
+                // R3 — the post-cancel cleanup flips visible state; draw promptly.
+                draw_now = true;
                 cancel_drain = None;
                 // The aborted task has wound down (or the budget elapsed) — its
                 // session lock is released, so the cleanup `try_lock`s succeed.
@@ -5107,6 +5194,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 app.cancel_run();
             }
             _ = tick.tick() => {
+                // R3 — the 80ms animation tick advances the spinner / shimmer /
+                // elapsed clock, so draw this frame immediately (this also keeps
+                // the idle redraw cadence identical to before the budget gate).
+                draw_now = true;
                 // Flush any leaked-mouse-seq candidate that never completed — a
                 // lone `Esc` (or a partial `Esc [`) the user pressed and then
                 // paused on. Applying it now means a real Esc still arms the
@@ -5156,6 +5247,15 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 reassert_terminal_modes(terminal, app.mouse_scroll);
                 force_full_repaint = true;
             }
+            // R3 — frame-deadline flush. When a streaming burst marked the frame
+            // dirty but the ~16ms budget had not elapsed (so the loop-top draw was
+            // skipped), this wakes the loop EXACTLY at the budget deadline so the
+            // final frame of a burst paints within ~16ms even if no further event
+            // arrives. The `if needs_redraw` guard means the timer is only armed
+            // when a redraw is actually pending — an idle loop never spins on it.
+            () = tokio::time::sleep_until(
+                tokio::time::Instant::from_std(last_draw + FRAME_MIN)
+            ), if needs_redraw => {}
         }
 
         if app.should_quit {
@@ -5193,6 +5293,61 @@ fn current_run_options(app: &App, opts: &LaunchOptions) -> RunOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- R3 event coalescing + frame budget ---------------------------------
+
+    #[test]
+    fn frame_budget_coalesces_streaming_but_never_blocks_forced_or_interactive() {
+        let budget = Duration::from_millis(16);
+        // Streaming burst: dirty but UNDER budget → no draw (the coalescing).
+        assert!(
+            !frame_budget_allows_draw(false, false, true, Duration::from_millis(5), budget),
+            "a dirty frame under the budget must NOT redraw (coalesce the burst)"
+        );
+        // Same dirt, a full budget has elapsed → draw exactly once.
+        assert!(
+            frame_budget_allows_draw(false, false, true, Duration::from_millis(20), budget),
+            "a dirty frame past the budget redraws"
+        );
+        // Interactive (`draw_now`) bypasses the budget even at t=0.
+        assert!(
+            frame_budget_allows_draw(false, true, false, Duration::ZERO, budget),
+            "input / tick draws immediately, never throttled"
+        );
+        // A forced self-heal repaint always draws.
+        assert!(
+            frame_budget_allows_draw(true, false, false, Duration::ZERO, budget),
+            "a forced repaint always draws"
+        );
+        // Nothing dirty, nothing forced → no wasted redraw, however long idle.
+        assert!(
+            !frame_budget_allows_draw(false, false, false, Duration::from_secs(1), budget),
+            "an idle, clean frame must not redraw"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_drain_applies_all_pending_before_one_draw() {
+        // Mirrors the engine arm's drain: a first `recv()`, then a `try_recv()`
+        // loop that empties the channel — so a burst of N events is fully applied
+        // in ONE pass (one redraw), not N redraws. Proven on the exact pattern.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        for i in 0..5u32 {
+            tx.send(i).unwrap();
+        }
+        drop(tx);
+        let mut applied = Vec::new();
+        let mut current = rx.recv().await;
+        while let Some(ev) = current.take() {
+            applied.push(ev);
+            current = rx.try_recv().ok();
+        }
+        assert_eq!(
+            applied,
+            vec![0, 1, 2, 3, 4],
+            "a single drain pass applies EVERY pending event before the redraw"
+        );
+    }
 
     fn opts() -> LaunchOptions {
         LaunchOptions {
