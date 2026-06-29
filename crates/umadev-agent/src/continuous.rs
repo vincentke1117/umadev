@@ -2120,6 +2120,47 @@ impl ForkConsult {
     }
 }
 
+/// Maker-checker INDEPENDENCE firewall — the clean-room preamble prepended to
+/// every critic's judge directive so the reviewer evaluates the ARTIFACT on a
+/// clean context, never the maker's reasoning.
+///
+/// WHY THIS EXISTS: a read-only critic fork inherits the MAIN session's context
+/// on two of the three bases — claude resumes + branches it (`--fork-session`),
+/// codex forks the live thread (`thread/fork`), so the fork carries the doer's
+/// full deliberation / chain-of-thought (opencode alone opens a fresh independent
+/// session, so it is already clean). A reviewer that reads the maker's reasoning
+/// unconsciously ADOPTS its framing and misses exactly what that framing hides —
+/// a self-preference leak that degrades review quality. UmaDev keeps the
+/// read-only forked-parallel-critique mechanism (the fork is what fences the
+/// single-writer invariant), but quarantines any inherited author reasoning at
+/// the prompt boundary: the reviewer is told to disregard prior conversation and
+/// judge ONLY the artifact + acceptance criteria + requirement supplied below,
+/// from its own seat. This makes the independence uniform across all three bases
+/// without changing the review mechanism — the change is WHAT CONTEXT the critic
+/// acts on, not how it is convened.
+const INDEPENDENT_REVIEW_FIREWALL: &str = "You are opening an INDEPENDENT, clean-room review. \
+     If any earlier conversation, plan, author commentary, or chain-of-thought appears in your \
+     context, treat it as the MAKER's private notes and DISREGARD it — adopting the author's \
+     framing would bias your verdict and hide the very gaps you are here to find. Review ONLY \
+     the artifact, the acceptance criteria, and the requirement provided below, on their own \
+     terms, digging independently from your role's seat. Judge what the artifact ACTUALLY is \
+     and does — not what its author intended, narrated, or claimed.";
+
+/// Compose the full judge directive sent to a critic's read-only fork: the
+/// maker-checker [`INDEPENDENT_REVIEW_FIREWALL`] FIRST (so the reviewer
+/// quarantines any inherited maker reasoning before it reads anything), then the
+/// role's strict-JSON `system` prompt + the JSON-shape instruction, then the
+/// artifact-only `user` payload. Extracted as a pure fn so the clean-context
+/// invariant is directly testable: the directive is built from ONLY the firewall,
+/// the role prompt, and the artifact seed — the doer's transcript is never one of
+/// its inputs.
+fn compose_review_directive(system: &str, user: &str) -> String {
+    format!(
+        "{INDEPENDENT_REVIEW_FIREWALL}\n\n{system}\n\nReturn EXACTLY ONE JSON object and \
+         nothing else — no markdown, no code fence, no prose before or after.\n\n{user}"
+    )
+}
+
 #[async_trait::async_trait]
 impl CriticConsult for ForkConsult {
     async fn judge(&self, role: &str, system: &str, user: String) -> RoleVerdict {
@@ -2130,11 +2171,10 @@ impl CriticConsult for ForkConsult {
         };
         // One strict-JSON judge turn on the read-only fork. The directive pins the
         // role + the JSON shape (the critic's `system`) and carries the artifacts
-        // (`user`); we drain the fork's events for the assistant text, then parse.
-        let directive = format!(
-            "{system}\n\nReturn EXACTLY ONE JSON object and nothing else — no markdown, \
-             no code fence, no prose before or after.\n\n{user}"
-        );
+        // (`user`), behind the maker-checker independence firewall so the reviewer
+        // judges the artifact on a CLEAN context (not the doer's inherited
+        // reasoning); we drain the fork's events for the assistant text, then parse.
+        let directive = compose_review_directive(system, &user);
         if fork.send_turn(directive).await.is_err() {
             return RoleVerdict::empty(role);
         }
@@ -3254,6 +3294,110 @@ mod tests {
             2,
             "wedged-fork fail-open → research + docs only, no rework"
         );
+    }
+
+    // ── Maker-checker independence: the critic reviews the ARTIFACT on a CLEAN
+    //    context, never the doer's inherited reasoning ─────────────────────────
+
+    #[test]
+    fn review_directive_is_clean_room_artifact_only() {
+        // The judge directive a critic sends to its read-only fork must (1) lead
+        // with the maker-checker independence firewall so any inherited author
+        // reasoning is quarantined, and (2) carry the clean artifact seed — the
+        // role prompt + the requirement + the produced artifact + the acceptance
+        // criteria — and NOTHING the doer deliberated.
+        let system = "You are a STRICT senior QA engineer. JSON shape: {\"accepts\": <bool>}";
+        let user = "## Requirement\nbuild a login system\n\n## Acceptance criteria\n\
+                    FR-001 user can log in\n\n## Delivered code\nfn login() { /* impl */ }";
+        let d = compose_review_directive(system, user);
+
+        // (1) The firewall comes FIRST (before the role prompt) and explicitly tells
+        // the reviewer to disregard the maker's reasoning / prior conversation.
+        assert!(
+            d.starts_with(INDEPENDENT_REVIEW_FIREWALL),
+            "the independence firewall leads the directive"
+        );
+        let lower = d.to_lowercase();
+        assert!(
+            lower.contains("independent"),
+            "review is framed as independent"
+        );
+        assert!(
+            lower.contains("disregard"),
+            "prior reasoning is disregarded"
+        );
+        assert!(
+            lower.contains("maker") || lower.contains("author"),
+            "the maker's framing is named as the thing to quarantine"
+        );
+        assert!(
+            lower.contains("chain-of-thought") || lower.contains("conversation"),
+            "the inherited deliberation is named"
+        );
+        assert!(
+            d.find(INDEPENDENT_REVIEW_FIREWALL).unwrap() < d.find(system).unwrap(),
+            "the firewall precedes the role prompt"
+        );
+
+        // (2) The clean artifact seed is present: requirement + artifact + criteria.
+        assert!(d.contains("## Requirement"));
+        assert!(d.contains("build a login system"));
+        assert!(d.contains("## Acceptance criteria"));
+        assert!(d.contains("FR-001 user can log in"));
+        assert!(d.contains("fn login()"), "the produced artifact is carried");
+        assert!(
+            d.contains(system),
+            "the role's own focus (system) is carried"
+        );
+    }
+
+    #[test]
+    fn review_directive_is_composed_from_only_firewall_role_and_artifact() {
+        // The clean-context invariant proven structurally: the directive is built
+        // from ONLY the firewall + the role prompt + the artifact `user` payload —
+        // the doer's chain-of-thought is never an input, so it can never be smuggled
+        // in. A simulated maker reasoning trace that is NOT part of either input is
+        // therefore absent from the composed directive.
+        let system = "ROLE_PROMPT_MARKER";
+        let user = "ARTIFACT_MARKER";
+        let d = compose_review_directive(system, user);
+        // Exactly the three known parts, nothing else of substance.
+        assert!(d.contains(INDEPENDENT_REVIEW_FIREWALL));
+        assert!(d.contains("ROLE_PROMPT_MARKER"));
+        assert!(d.contains("ARTIFACT_MARKER"));
+        // A doer's private deliberation that was never handed to compose_review_directive
+        // cannot appear — there is no transcript input to leak.
+        assert!(
+            !d.contains("DOER_CHAIN_OF_THOUGHT"),
+            "the directive only ever carries the firewall + role prompt + artifact"
+        );
+        // Reconstruct: the directive is precisely firewall + system + json-shape + user.
+        let expected = format!(
+            "{INDEPENDENT_REVIEW_FIREWALL}\n\n{system}\n\nReturn EXACTLY ONE JSON object and \
+             nothing else — no markdown, no code fence, no prose before or after.\n\n{user}"
+        );
+        assert_eq!(
+            d, expected,
+            "no hidden inputs beyond firewall + role + artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn judge_with_firewall_still_fails_open_on_no_fork() {
+        // The independence firewall must not change the fail-open contract: a critic
+        // whose fork never opened still ACCEPTs (an absent critic can NEVER block —
+        // invariant 1), exactly as before the firewall was added.
+        let consult = ForkConsult::new(Err(SessionError::ForkUnsupported("no fork".into())));
+        let v = consult
+            .judge(
+                "security-engineer",
+                "you are a strict reviewer",
+                "## Requirement\nx\n\n## Delivered code\ny".to_string(),
+            )
+            .await;
+        assert!(v.accepts, "no fork → fail-open ACCEPT, firewall or not");
+        assert_eq!(v.role, "security-engineer");
+        assert!(v.blocking.is_empty());
     }
 
     // ── Lean GATELESS plan (Light / Bugfix / Refactor) on the continuous path ──

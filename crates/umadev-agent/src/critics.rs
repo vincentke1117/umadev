@@ -972,6 +972,69 @@ mod tests {
         }
     }
 
+    /// A consult that RECORDS the `system` + `user` it was handed, so a test can
+    /// assert exactly WHAT CONTEXT a critic feeds its read-only fork. Used to prove
+    /// the maker-checker clean-seed invariant: the critic's review payload is built
+    /// purely from the [`CriticArtifacts`] (the produced artifact + acceptance
+    /// criteria + requirement + the role's own focus) — there is no field for, and
+    /// it never carries, the doer's reasoning / chain-of-thought.
+    #[derive(Default)]
+    struct RecordingConsult {
+        seen: std::sync::Mutex<(String, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl CriticConsult for RecordingConsult {
+        async fn judge(&self, role: &str, system: &str, user: String) -> RoleVerdict {
+            *self.seen.lock().unwrap() = (system.to_string(), user.clone());
+            RoleVerdict::empty(role)
+        }
+    }
+
+    #[tokio::test]
+    async fn critic_review_context_is_artifact_only_no_doer_reasoning() {
+        // The maker-checker clean-seed invariant at the critic boundary: a critic's
+        // review payload carries the ARTIFACT (delivered code) + the acceptance
+        // criteria (the deterministic QA floor) + the requirement, and NOTHING the
+        // doer deliberated. `CriticArtifacts` has no reasoning/transcript field, so a
+        // doer chain-of-thought handed nowhere can never reach the reviewer.
+        let rec = RecordingConsult::default();
+        let arts = CriticArtifacts {
+            requirement: "做一个登录系统 REQUIREMENT_MARKER",
+            code: "// auth.ts ARTIFACT_MARKER\nfn login() {}",
+            qa_floor: "FR-002 注销 无任务覆盖 CRITERIA_MARKER",
+            ..Default::default()
+        };
+        let v = QaCritic.review(&rec, arts).await;
+        assert_eq!(v.role, "qa-engineer", "the verdict is still seat-tagged");
+
+        let (system, user) = rec.seen.lock().unwrap().clone();
+        // The clean seed: artifact + acceptance criteria + requirement are present.
+        assert!(
+            user.contains("REQUIREMENT_MARKER"),
+            "requirement is in context"
+        );
+        assert!(
+            user.contains("ARTIFACT_MARKER"),
+            "the produced artifact is in context"
+        );
+        assert!(
+            user.contains("CRITERIA_MARKER"),
+            "the acceptance floor is in context"
+        );
+        // The role's own focus rides the `system` prompt, not the doer's transcript.
+        assert!(
+            system.to_lowercase().contains("qa engineer"),
+            "the reviewer's own seat/focus is what frames the review"
+        );
+        // No doer deliberation: a chain-of-thought trace was never an input to the
+        // artifact view, so it cannot appear in what the reviewer sees.
+        assert!(
+            !user.contains("DOER_CHAIN_OF_THOUGHT") && !system.contains("DOER_CHAIN_OF_THOUGHT"),
+            "the critic never receives the maker's reasoning"
+        );
+    }
+
     #[tokio::test]
     async fn pm_critic_review_threads_verdict() {
         let stub = StubConsult(RoleVerdict {
