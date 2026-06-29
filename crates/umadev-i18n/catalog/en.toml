@@ -639,6 +639,13 @@
 "tui.hint.search" = "type to filter · Enter/↓ next · ↑ prev · Esc close"
 # Status row
 "tui.status.complete" = "[ok] complete"
+# Persistent token/cost gauge in the meta row (Feature A). `{}` is the compact
+# token count; the cost is the flat blended reference rate (estimate only).
+"tui.gauge.tokens" = "▍ {} tok"
+"tui.gauge.cost" = "≈${}"
+# Idle double-Esc rewind hint (Feature B): first Esc arms it, a second edits +
+# resends the last user message.
+"tui.rewind.hint" = "Press Esc again to edit & resend your last message"
 # Scrollable content overlay progress
 "tui.overlay.empty" = "(empty)"
 "tui.overlay.progress" = " {}-{} of {} · {}% "

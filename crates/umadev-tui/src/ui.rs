@@ -3323,6 +3323,42 @@ fn fmt_token_count(n: u64) -> String {
     }
 }
 
+/// Below this terminal width the persistent token/cost gauge is the FIRST chrome
+/// dropped from the meta row, so the backend / trust-chip / hint / live-status
+/// always win the space on a narrow terminal (matching the status-drop policy).
+const GAUGE_MIN_COLS: u16 = 60;
+
+/// The persistent token/cost gauge for the meta row: cumulative REAL session
+/// token spend (the base's own per-turn `TurnUsage` numbers, summed on `App`)
+/// and — once the blended reference rate rounds to something visible — a rough
+/// advisory cost. Returns `None` until the first real usage lands, so a fresh
+/// session shows no gauge (no `≈$0.00` clutter, never a fabricated number).
+///
+/// No "% of context" indicator: `session_tokens` is cumulative SPEND across the
+/// whole session (input+output summed every turn), not live context occupancy,
+/// and UmaDev derives no per-base context-window size — a percentage here would
+/// be a misleading number, so it is deliberately omitted (honest over decorative).
+fn token_gauge_text(app: &App) -> Option<String> {
+    if app.session_tokens == 0 {
+        return None;
+    }
+    let tokens = umadev_i18n::tf(
+        app.lang,
+        "tui.gauge.tokens",
+        &[&fmt_token_count(app.session_tokens)],
+    );
+    // Rough advisory cost — the SAME flat blended reference rate `umadev usage`
+    // prints, clearly an estimate (`≈`). Shown only once it rounds to a visible
+    // amount so a small session isn't cluttered with a `$0.00`.
+    let cost = umadev_agent::runner::rough_cost_usd(app.session_tokens);
+    if cost >= 0.01 {
+        let cost = umadev_i18n::tf(app.lang, "tui.gauge.cost", &[&format!("{cost:.2}")]);
+        Some(format!("{tokens} · {cost}"))
+    } else {
+        Some(tokens)
+    }
+}
+
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // Cap the retained scrollback so a marathon session can't grow the per-frame
     // fold unbounded. Counted in **visual rows AFTER folding** (not logical lines
@@ -4732,6 +4768,15 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     if queued > 0 {
         parts.push(("·".into(), theme::BORDER()));
         parts.push((format!("[queued {queued}]"), theme::WARNING()));
+    }
+    // Persistent token/cost gauge — the live consumption meter. Dropped FIRST on
+    // a narrow terminal (so the hint/status keep their room), and absent until
+    // there's real usage to show.
+    if area.width >= GAUGE_MIN_COLS {
+        if let Some(gauge) = token_gauge_text(app) {
+            parts.push(("·".into(), theme::BORDER()));
+            parts.push((gauge, theme::INFO()));
+        }
     }
     parts.push(("·".into(), theme::BORDER()));
     parts.push((hint, theme::TEXT_MUTED()));
@@ -6771,6 +6816,48 @@ mod tests {
             !narrow.join("").contains("READY"),
             "status dropped when it can't fit: {:?}",
             narrow.join("")
+        );
+    }
+
+    #[test]
+    fn token_gauge_renders_and_is_dropped_on_a_narrow_terminal() {
+        let mut app = app_with(Some("claude-code"));
+        // Pin English so the assertion is locale-independent (wide CJK glyphs
+        // get split across cells in the test buffer).
+        app.lang = umadev_i18n::Lang::En;
+        // Real cumulative usage has landed → the gauge has something to meter.
+        app.session_tokens = 94_000;
+
+        // Wide terminal: the gauge shows the token count (and its bar glyph) in
+        // the meta row.
+        let wide = render_chat_to_string(&app, 110, 16);
+        assert!(
+            wide.contains("94K tok"),
+            "gauge token count shown on a wide terminal: {wide}"
+        );
+        assert!(
+            wide.contains('\u{258d}'),
+            "gauge bar glyph (▍) shown when wide"
+        );
+
+        // Narrow terminal: the gauge is the FIRST chrome dropped, so the meta
+        // info / hint keep their room.
+        let narrow = render_chat_to_string(&app, 50, 16);
+        assert!(
+            !narrow.contains("94K tok"),
+            "gauge dropped on a too-narrow terminal: {narrow}"
+        );
+    }
+
+    #[test]
+    fn token_gauge_absent_until_there_is_real_usage() {
+        let app = app_with(Some("claude-code"));
+        // A fresh session has spent nothing — no gauge, no `≈$0.00` clutter and
+        // never a fabricated number.
+        assert_eq!(app.session_tokens, 0);
+        assert!(
+            token_gauge_text(&app).is_none(),
+            "no gauge before any usage"
         );
     }
 

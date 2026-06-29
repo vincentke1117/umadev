@@ -1522,6 +1522,14 @@ pub struct App {
     /// immediately. Cleared on any other keypress.
     pub pending_quit_confirm: bool,
 
+    /// First-Esc-to-arm, second-Esc-to-fire for the **rewind** gesture: on an
+    /// idle, EMPTY input with a prior user turn, a double-Esc re-loads the last
+    /// user message into the box for editing and drops the turns after it (so a
+    /// resend re-asks from that point). Set on the first Esc; the second Esc
+    /// rewinds. Cleared on any typing. Quitting moved to `/quit`, which freed
+    /// the idle double-Esc for this. `false` = not armed.
+    pub pending_rewind: bool,
+
     /// First-Esc-to-arm, second-Esc-to-interrupt while a run is in flight, so a
     /// stray keypress can't nuke a long build. Set on the first Esc; a second Esc
     /// within a short window actually cancels. `None` = not armed.
@@ -1796,6 +1804,7 @@ impl App {
             preview_server: std::sync::Arc::new(std::sync::Mutex::new(None)),
             project_root,
             pending_quit_confirm: false,
+            pending_rewind: false,
             interrupt_armed_at: None,
             session_tokens: 0,
             status: String::new(),
@@ -4838,6 +4847,27 @@ impl App {
                     self.interrupt_armed_at = Some(std::time::Instant::now());
                     return Action::None;
                 }
+                // Idle, EMPTY input, with a prior user turn → double-Esc REWINDS:
+                // re-load the last user message into the box for editing and drop
+                // the turns after it, so the user can fix + re-ask from that point
+                // (chat-only; file/run state is the engine's `checkpoint`, out of
+                // scope here). Quitting moved to `/quit`, so this idle gesture is
+                // free. A first Esc ARMS it (a stray keypress can't rewind); a
+                // second Esc fires. With no prior user message there's nothing to
+                // rewind → fall through to the quit-confirm below.
+                if self.input.is_empty() && self.last_user_msg_index().is_some() {
+                    if self.pending_rewind {
+                        self.pending_rewind = false;
+                        self.rewind_to_last_user_message();
+                        return Action::None;
+                    }
+                    self.pending_rewind = true;
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::t(self.lang, "tui.rewind.hint"),
+                    );
+                    return Action::None;
+                }
                 // Idle → require a SECOND Esc to actually quit, so a stray
                 // keypress (or the very Esc that just interrupted a run) can't
                 // drop the whole app by accident.
@@ -4856,11 +4886,13 @@ impl App {
             // ---- input editing ----
             KeyCode::Backspace => {
                 self.pending_quit_confirm = false;
+                self.pending_rewind = false;
                 self.backspace();
                 Action::None
             }
             KeyCode::Delete => {
                 self.pending_quit_confirm = false;
+                self.pending_rewind = false;
                 self.forward_delete();
                 Action::None
             }
@@ -5191,6 +5223,7 @@ impl App {
             // combo with no handler now lands on the `_` no-op below.
             KeyCode::Char(c) if !ctrl && !alt => {
                 self.pending_quit_confirm = false;
+                self.pending_rewind = false;
                 self.input_history_idx = None;
                 self.insert_at_cursor(c);
                 Action::None
@@ -5198,6 +5231,37 @@ impl App {
 
             _ => Action::None,
         }
+    }
+
+    /// Index of the most recent user (`You`) turn in the transcript, or `None`
+    /// when the user has not spoken yet. Drives the idle double-Esc rewind.
+    #[must_use]
+    fn last_user_msg_index(&self) -> Option<usize> {
+        self.history.iter().rposition(|m| m.role == ChatRole::You)
+    }
+
+    /// Rewind the CHAT transcript to the last user turn: re-load that message's
+    /// text into the input box for editing and drop it plus every turn after it,
+    /// so a resend re-asks from that point. Chat-only — it does NOT roll back
+    /// files or run state (that is the engine's `checkpoint`, out of scope).
+    /// Fail-open: a no-op when there is no prior user turn.
+    fn rewind_to_last_user_message(&mut self) {
+        let Some(idx) = self.last_user_msg_index() else {
+            return;
+        };
+        // `idx` is valid (just found by `rposition`); `body()` is the plain text
+        // of a `You` row. Drop the user turn + everything after it, then re-load
+        // its text for editing.
+        let text = self.history[idx].body().into_owned();
+        self.history.truncate(idx);
+        self.input = text;
+        self.input_cursor = self.input_len();
+        // Leave history recall + the quit/rewind arms in a clean state, and
+        // re-pin the transcript to the bottom so the freshly truncated tail shows.
+        self.input_history_idx = None;
+        self.pending_quit_confirm = false;
+        self.pending_rewind = false;
+        self.transcript_scroll_to_bottom();
     }
 
     /// Treat non-slash text as either a fresh requirement (if no run is
@@ -5856,6 +5920,9 @@ impl App {
             "clear" => {
                 self.history.clear();
                 self.conversation.clear();
+                // A cleared session starts metering from zero — the persistent
+                // token/cost gauge resets with the transcript.
+                self.session_tokens = 0;
                 self.transcript_scroll.set(0);
                 self.transcript_prev_hidden.set(0);
                 // P5a: a cleared transcript invalidates the streaming cache.
@@ -11859,6 +11926,26 @@ mod tests {
     }
 
     #[test]
+    fn session_tokens_accumulate_across_turns_and_reset_on_clear() {
+        let mut a = fresh_app(Some("offline"));
+        assert_eq!(a.session_tokens, 0, "a fresh session meters from zero");
+        // The base reports per-turn usage; the gauge total sums input+output.
+        a.apply_engine(EngineEvent::TurnUsage {
+            input_tokens: 1_200,
+            output_tokens: 800,
+        });
+        assert_eq!(a.session_tokens, 2_000, "the first turn's usage accrues");
+        a.apply_engine(EngineEvent::TurnUsage {
+            input_tokens: 500,
+            output_tokens: 500,
+        });
+        assert_eq!(a.session_tokens, 3_000, "usage accumulates across turns");
+        // `/clear` starts a fresh session — the meter resets with the transcript.
+        let _ = a.try_slash_command("/clear");
+        assert_eq!(a.session_tokens, 0, "/clear resets the token meter");
+    }
+
+    #[test]
     fn slash_claude_switches_backend_and_saves() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
@@ -13770,6 +13857,88 @@ mod tests {
         // Second Esc actually quits.
         let action = a.apply_key(KeyCode::Esc);
         assert_eq!(action, Action::Quit);
+    }
+
+    // ── Feature B: idle double-Esc rewinds (edit + resend the last message) ──
+
+    #[test]
+    fn double_esc_on_empty_idle_rewinds_last_user_message() {
+        let mut a = fresh_app(Some("offline"));
+        // `fresh_app` seeds a greeting; measure from there so the test is robust
+        // to the welcome prefix.
+        let base = a.history.len();
+        // A short conversation: two user turns, each with a reply.
+        a.push(ChatRole::You, "first");
+        a.push(ChatRole::Host, "reply one");
+        a.push(ChatRole::You, "second");
+        a.push(ChatRole::Host, "reply two");
+        assert!(a.input.is_empty(), "starts on an empty idle input");
+
+        // First Esc ARMS the rewind (a stray single Esc can't rewind) — input
+        // and transcript are untouched, and it never quits.
+        let r1 = a.apply_key(KeyCode::Esc);
+        assert_eq!(r1, Action::None);
+        assert!(a.pending_rewind, "first Esc arms the rewind");
+        assert!(a.input.is_empty(), "first Esc does not yet reload");
+        assert!(!a.should_quit);
+
+        // Second Esc FIRES: the last user message is re-loaded into the box, and
+        // the transcript is truncated to everything BEFORE that turn.
+        let r2 = a.apply_key(KeyCode::Esc);
+        assert_eq!(r2, Action::None);
+        assert_eq!(a.input, "second", "last user message reloaded for editing");
+        assert_eq!(a.input_cursor, a.input_len(), "cursor parked at the end");
+        assert!(!a.pending_rewind, "rewind disarmed after firing");
+        assert!(!a.should_quit, "rewind never quits");
+        // The last user turn + everything after it is gone; the earlier turn
+        // (`first` + its reply) survives.
+        assert_eq!(
+            a.history.len(),
+            base + 2,
+            "the last user turn + everything after dropped"
+        );
+        let users: Vec<_> = a
+            .history
+            .iter()
+            .filter(|m| m.role == ChatRole::You)
+            .collect();
+        assert_eq!(users.len(), 1, "exactly the earlier user turn remains");
+        assert_eq!(users[0].body().as_ref(), "first");
+    }
+
+    #[test]
+    fn double_esc_rewind_is_a_noop_without_a_prior_user_message() {
+        let mut a = fresh_app(Some("offline"));
+        // No user turn has been spoken yet → there is nothing to rewind, so the
+        // idle double-Esc falls through to the existing quit-confirm path.
+        assert!(a.last_user_msg_index().is_none());
+        let r1 = a.apply_key(KeyCode::Esc);
+        assert_eq!(r1, Action::None);
+        assert!(!a.pending_rewind, "no user turn → the rewind never arms");
+        assert!(
+            a.pending_quit_confirm,
+            "falls through to quit-confirm instead"
+        );
+        assert!(a.input.is_empty(), "input stays empty — nothing reloaded");
+    }
+
+    #[test]
+    fn esc_rewind_never_fires_mid_run() {
+        let mut a = fresh_app(Some("offline"));
+        a.push(ChatRole::You, "build me an app");
+        let len_before = a.history.len();
+        // A brain-driven turn is streaming — Esc must INTERRUPT it (double-press),
+        // never rewind the transcript out from under a live run.
+        a.agentic_in_flight = true;
+        let r1 = a.apply_key(KeyCode::Esc);
+        assert_eq!(r1, Action::None);
+        assert!(a.interrupt_armed(), "first Esc arms the interrupt mid-run");
+        assert!(!a.pending_rewind, "mid-run Esc never arms the rewind");
+        let r2 = a.apply_key(KeyCode::Esc);
+        assert_eq!(r2, Action::Cancel, "second Esc interrupts the run");
+        assert!(a.input.is_empty(), "rewind did not fire — input untouched");
+        assert_eq!(a.history.len(), len_before, "transcript untouched mid-run");
+        assert!(!a.should_quit);
     }
 
     // ── wheel / edge extends a drag-selection past the viewport ───────────

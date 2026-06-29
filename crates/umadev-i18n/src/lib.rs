@@ -353,6 +353,11 @@ mod tests {
             "tui.hint.finished",
             "tui.hint.running",
             "tui.hint.idle",
+            // Phase-2-C-P1: the persistent token/cost gauge in the meta row, and
+            // the idle double-Esc rewind hint.
+            "tui.gauge.tokens",
+            "tui.gauge.cost",
+            "tui.rewind.hint",
             "tui.palette.title",
             // Phase-2-C-P1: in-transcript search (Ctrl+F) — prompt label, live
             // match counter, empty-result note, and the open-search prompt hint.

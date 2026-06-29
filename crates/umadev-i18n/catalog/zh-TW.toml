@@ -634,6 +634,12 @@
 "tui.hint.search" = "輸入過濾 · Enter/↓ 下一個 · ↑ 上一個 · Esc 關閉"
 # 狀態列
 "tui.status.complete" = "[ok] 已完成"
+# 中繼資訊列的常駐 token / 成本計量(Feature A)。{} 是精簡 token 數;成本為統一估算
+# 參考費率(僅供參考)。
+"tui.gauge.tokens" = "▍ {} tok"
+"tui.gauge.cost" = "≈${}"
+# 閒置時連按兩次 Esc 回退提示(Feature B):第一次 Esc 預備,第二次把上一則訊息載回輸入框編輯並重送。
+"tui.rewind.hint" = "再按一次 Esc 編輯並重送上一則訊息"
 # 可捲動內容浮層進度
 "tui.overlay.empty" = "(空)"
 "tui.overlay.progress" = " 第 {}-{} 行 / 共 {} 行 · {}% "

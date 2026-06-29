@@ -634,6 +634,12 @@
 "tui.hint.search" = "输入过滤 · Enter/↓ 下一个 · ↑ 上一个 · Esc 关闭"
 # 状态栏
 "tui.status.complete" = "[ok] 已完成"
+# 元信息行的常驻 token / 成本计量(Feature A)。{} 是紧凑 token 数;成本为统一估算
+# 参考费率(仅供参考)。
+"tui.gauge.tokens" = "▍ {} tok"
+"tui.gauge.cost" = "≈${}"
+# 空闲时双击 Esc 回退提示(Feature B):第一次 Esc 预备,第二次把上一条消息载回输入框编辑并重发。
+"tui.rewind.hint" = "再按一次 Esc 编辑并重发上一条消息"
 # 可滚动内容浮层进度
 "tui.overlay.empty" = "(空)"
 "tui.overlay.progress" = " 第 {}-{} 行 / 共 {} 行 · {}% "
