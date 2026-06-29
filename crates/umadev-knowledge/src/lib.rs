@@ -90,3 +90,62 @@ pub use vector::VectorStore;
 /// The BM25 index (`bm25.bin`) and optional vector store (`vectors.bin`)
 /// live here; both are created on demand by their writers.
 pub const KB_INDEX_DIR: &str = ".umadev/kb-index";
+
+/// Test-only support: serialise + isolate tests that mutate the process-global
+/// embedding env vars (`UMADEV_EMBED_DIM` / `UMADEV_EMBED_MODEL` / the
+/// `OPENAI_*` keys / `UMADEV_EMBED_MODEL_DIR`). Rust runs a crate's tests in
+/// parallel threads sharing one process, so without serialisation these tests
+/// race on shared state — and, under the `vector-local` feature, a model
+/// installed at `~/.umadev/embed-model` would otherwise make every "no backend"
+/// test see a live local embedder.
+#[cfg(test)]
+pub(crate) mod testsupport {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn lock() -> &'static Mutex<()> {
+        static L: OnceLock<Mutex<()>> = OnceLock::new();
+        L.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Acquire the process-wide env lock so env-mutating tests don't race.
+    /// Poison-tolerant: a panicking holder doesn't cascade into the next test.
+    pub fn env_guard() -> MutexGuard<'static, ()> {
+        lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// RAII guard that holds the env lock AND points the bundled local-embed
+    /// backend at an empty directory, so `local_embed::is_available()` is false
+    /// regardless of any real model installed at `~/.umadev/embed-model`. The
+    /// previous `UMADEV_EMBED_MODEL_DIR` value is restored on drop.
+    pub struct NoLocalModel {
+        _guard: MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+        prev: Option<String>,
+    }
+
+    impl Drop for NoLocalModel {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("UMADEV_EMBED_MODEL_DIR", v),
+                None => std::env::remove_var("UMADEV_EMBED_MODEL_DIR"),
+            }
+        }
+    }
+
+    /// Neutralise the local backend for the duration of a test (see
+    /// [`NoLocalModel`]). Returns a guard that must be kept alive.
+    #[must_use]
+    pub fn without_local_model() -> NoLocalModel {
+        let guard = env_guard();
+        let prev = std::env::var("UMADEV_EMBED_MODEL_DIR").ok();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::env::set_var("UMADEV_EMBED_MODEL_DIR", dir.path());
+        NoLocalModel {
+            _guard: guard,
+            _dir: dir,
+            prev,
+        }
+    }
+}

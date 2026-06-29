@@ -235,19 +235,29 @@ fn hybrid_with_empty_vector_store_falls_back_to_bm25() {
 
 #[test]
 fn build_vector_store_is_noop_without_api_key() {
-    // build_vector_store_if_enabled must return None when no API key is set
-    // (the fail-open contract — the whole pipeline stays BM25).
+    // build_vector_store_if_enabled must return None when no embedding backend
+    // is reachable (the fail-open contract — the whole pipeline stays BM25).
     let tmp = TempDir::new().unwrap();
     setup_corpus(tmp.path());
     std::env::remove_var("OPENAI_EMBED_KEY");
     std::env::remove_var("OPENAI_API_KEY");
+    // Neutralise the bundled local backend (under the `vector-local` feature an
+    // installed ~/.umadev/embed-model would otherwise make is_enabled() true and
+    // really embed): point it at an empty dir so is_available() is false.
+    let no_model = TempDir::new().unwrap();
+    let prev_model_dir = std::env::var("UMADEV_EMBED_MODEL_DIR").ok();
+    std::env::set_var("UMADEV_EMBED_MODEL_DIR", no_model.path());
     let index =
         umadev_knowledge::load_or_build_index(tmp.path(), &tmp.path().join("knowledge/security"));
     let store = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(build_vector_store_if_enabled(tmp.path(), &index));
+    match prev_model_dir {
+        Some(v) => std::env::set_var("UMADEV_EMBED_MODEL_DIR", v),
+        None => std::env::remove_var("UMADEV_EMBED_MODEL_DIR"),
+    }
     assert!(
         store.is_none(),
-        "without API key, vector build must be no-op"
+        "without a reachable backend, vector build must be no-op"
     );
 }
