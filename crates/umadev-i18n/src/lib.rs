@@ -479,6 +479,18 @@ mod tests {
             "tui.diff.collapsed",
             "tui.diff.truncated",
             "tui.help.edit.expand",
+            // `/sandbox` — in-app view/change of the Codex base launch sandbox
+            // (current tier + the three options with a one-line WHY each, the
+            // set/danger-set confirmations, and the fail-open persist warning).
+            "sandbox.current",
+            "sandbox.why.read_only",
+            "sandbox.why.workspace_write",
+            "sandbox.why.danger",
+            "sandbox.usage",
+            "sandbox.codex_only",
+            "sandbox.set",
+            "sandbox.danger_set",
+            "sandbox.persist_failed",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

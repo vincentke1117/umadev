@@ -336,6 +336,68 @@ pub fn load_project_config(project_root: &Path) -> ProjectConfig {
     cfg
 }
 
+/// Persist the chosen Codex launch sandbox tier into the project's `.umadevrc`
+/// `[codex] sandbox_mode`, **merging** into any existing file so the user's
+/// other keys, comments, and formatting are preserved (via `toml_edit`). Lets
+/// the in-app `/sandbox <mode>` command save the change without the user
+/// hand-editing `.umadevrc` (or hacking `UMADEV_CODEX_SANDBOX` into a shell rc).
+///
+/// Always writes the canonical kebab id ([`CodexSandbox::as_codex_arg`]) so a
+/// later [`load_project_config`] reads back exactly the same tier. The write is
+/// atomic (temp file in the same dir + rename) so a crash mid-write can never
+/// truncate the config into something the TOML parser would later choke on.
+///
+/// **Fail-open by contract:** returns the I/O / parse error to the caller (the
+/// TUI still sets the session env + tells the user the persist failed) — it
+/// never panics, never blocks, and never widens the sandbox on failure. If
+/// `.umadevrc` exists but is not valid TOML it is *refused* (returns an error)
+/// rather than clobbered, so a transient parse bug can't wipe the user's config.
+///
+/// # Errors
+/// Propagates a filesystem write error, or an `InvalidData` error if an existing
+/// `.umadevrc` cannot be parsed as TOML (refusing to overwrite it).
+pub fn persist_codex_sandbox(project_root: &Path, mode: CodexSandbox) -> std::io::Result<()> {
+    use toml_edit::{value, DocumentMut, Item, Table};
+
+    let path = project_root.join(".umadevrc");
+    let mut doc = match std::fs::read_to_string(&path) {
+        // Empty / whitespace-only file → start a fresh document.
+        Ok(text) if text.trim().is_empty() => DocumentMut::new(),
+        // Existing config → parse-merge, preserving comments + sibling keys. A
+        // file that exists but isn't valid TOML is REFUSED (never clobbered).
+        Ok(text) => text.parse::<DocumentMut>().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(".umadevrc exists but isn't valid TOML ({e}); refusing to overwrite it"),
+            )
+        })?,
+        // No file yet → a fresh document.
+        Err(_) => DocumentMut::new(),
+    };
+
+    // Ensure a `[codex]` table exists, then set just `sandbox_mode`.
+    if !doc.get("codex").is_some_and(Item::is_table) {
+        doc["codex"] = Item::Table(Table::new());
+    }
+    doc["codex"]["sandbox_mode"] = value(mode.as_codex_arg());
+
+    let body = doc.to_string();
+    // Atomic write: temp file in the SAME dir (so the rename is same-filesystem
+    // and atomic on POSIX), carrying the pid so concurrent writers don't clobber
+    // a shared temp. Fall back to a direct write if the rename fails.
+    let tmp = path.with_file_name(format!(".umadevrc.tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, &body).is_ok() {
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::write(&path, &body).map_err(|_| e)?;
+        }
+        Ok(())
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&path, &body)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,5 +612,72 @@ mod tests {
         std::fs::write(tmp.path().join(".umadevrc"), "[quality]\nthreshold = 80\n").unwrap();
         let cfg = load_project_config(tmp.path());
         assert!(cfg.model.provider.is_none());
+    }
+
+    #[test]
+    fn persist_codex_sandbox_creates_file_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        // No `.umadevrc` yet — persisting must create one with the [codex] table.
+        persist_codex_sandbox(tmp.path(), CodexSandbox::DangerFullAccess).unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::DangerFullAccess);
+        let body = std::fs::read_to_string(tmp.path().join(".umadevrc")).unwrap();
+        assert!(body.contains("[codex]"));
+        assert!(body.contains("danger-full-access"));
+    }
+
+    #[test]
+    fn persist_codex_sandbox_merges_and_preserves_siblings() {
+        let tmp = TempDir::new().unwrap();
+        // An existing config with an unrelated section + a comment. The persist
+        // must keep both and only touch [codex] sandbox_mode.
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "# my notes\n[pipeline]\nauto_approve_gates = false\n",
+        )
+        .unwrap();
+        persist_codex_sandbox(tmp.path(), CodexSandbox::DangerFullAccess).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join(".umadevrc")).unwrap();
+        assert!(body.contains("# my notes"), "comment preserved");
+        assert!(
+            body.contains("auto_approve_gates = false"),
+            "sibling preserved"
+        );
+        assert!(body.contains("danger-full-access"));
+        // And it round-trips through the loader as the chosen tier.
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::DangerFullAccess);
+        assert!(!cfg.pipeline.auto_approve_gates);
+    }
+
+    #[test]
+    fn persist_codex_sandbox_overwrites_existing_codex_value() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[codex]\nsandbox_mode = \"danger-full-access\"\n",
+        )
+        .unwrap();
+        // Walk it back to the safe baseline.
+        persist_codex_sandbox(tmp.path(), CodexSandbox::WorkspaceWrite).unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::WorkspaceWrite);
+        let body = std::fs::read_to_string(tmp.path().join(".umadevrc")).unwrap();
+        assert!(!body.contains("danger-full-access"));
+        assert!(body.contains("workspace-write"));
+    }
+
+    #[test]
+    fn persist_codex_sandbox_refuses_unparseable_config() {
+        let tmp = TempDir::new().unwrap();
+        // A garbage (non-TOML) `.umadevrc` must be REFUSED, not clobbered, so a
+        // transient bug can't wipe the user's file (fail-open: error, not panic).
+        let garbage = "this is not [ valid toml = = =";
+        std::fs::write(tmp.path().join(".umadevrc"), garbage).unwrap();
+        let err = persist_codex_sandbox(tmp.path(), CodexSandbox::ReadOnly).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // The original file is untouched.
+        let body = std::fs::read_to_string(tmp.path().join(".umadevrc")).unwrap();
+        assert_eq!(body, garbage);
     }
 }

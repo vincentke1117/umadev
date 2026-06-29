@@ -2949,6 +2949,13 @@ impl App {
             CmdGroup::Worker,
             "tui.help.worker.model",
         ),
+        Self::cmd(
+            "sandbox",
+            &[],
+            Some("[read-only|workspace-write|danger-full-access]"),
+            CmdGroup::Worker,
+            "tui.cmd.sandbox",
+        ),
         // ── Pipeline & gates ──────────────────────────────────────────────
         Self::cmd(
             "run",
@@ -5853,6 +5860,7 @@ impl App {
             "auto" => self.slash_set_review_mode(true),
             "mode" => self.slash_mode(rest),
             "model" => self.slash_model(rest),
+            "sandbox" => self.slash_sandbox(rest),
             "lang" => self.slash_lang(rest),
             "setup" | "guide" => self.slash_setup(),
             "preview" => self.slash_preview(),
@@ -8513,6 +8521,111 @@ impl App {
         Action::None
     }
 
+    /// `/sandbox [read-only|workspace-write|danger-full-access]` — view or change
+    /// the **Codex base** launch sandbox without hand-editing `.umadevrc` (or
+    /// hacking `UMADEV_CODEX_SANDBOX` into a shell rc).
+    ///
+    /// No arg → show the CURRENT tier + the three options with a one-line WHY for
+    /// each. In particular it answers the "why does network need it?" question:
+    /// `workspace-write` (the default) sandboxes the base so the NETWORK and local
+    /// dev ports are blocked and `git` won't run — which is why `npm start`, a dev
+    /// server, package installs and `git commit` all FAIL under it;
+    /// `danger-full-access` removes the sandbox so full-stack work runs. If the
+    /// active base isn't codex, a note says the setting only applies to codex.
+    ///
+    /// A valid arg sets it for THIS session (publishes to `UMADEV_CODEX_SANDBOX`,
+    /// the env the codex driver reads — the SAME mechanism as startup) AND
+    /// persists it to `.umadevrc` so it survives a restart. The high-risk tier
+    /// reuses the SAME loud red liability warning shown at startup. An
+    /// unrecognised arg just prints usage (never crashes). Fail-open throughout:
+    /// a failed `.umadevrc` write still applies for the session + warns the user.
+    fn slash_sandbox(&mut self, rest: &str) -> Action {
+        use umadev_agent::config::CodexSandbox;
+        let arg = rest.trim();
+        let is_codex = self.backend.as_deref() == Some("codex");
+
+        // ── No arg: explain the current tier + the three options + WHY each. ──
+        if arg.is_empty() {
+            let current = effective_codex_sandbox(&self.project_root);
+            let mut body = umadev_i18n::tf(self.lang, "sandbox.current", &[current.as_codex_arg()]);
+            for key in [
+                "sandbox.why.read_only",
+                "sandbox.why.workspace_write",
+                "sandbox.why.danger",
+            ] {
+                body.push('\n');
+                body.push_str(umadev_i18n::t(self.lang, key));
+            }
+            if !is_codex {
+                body.push('\n');
+                body.push_str(umadev_i18n::t(self.lang, "sandbox.codex_only"));
+            }
+            body.push('\n');
+            body.push_str(umadev_i18n::t(self.lang, "sandbox.usage"));
+            self.push(ChatRole::System, body);
+            return Action::None;
+        }
+
+        // ── An arg: accept only a recognised tier; garbage → usage (no crash). ──
+        // `CodexSandbox::parse_fail_open` resolves the VALUE leniently, but we gate
+        // on an explicit recognised-token set first so a typo shows usage instead
+        // of silently resolving to `workspace-write`.
+        let normalized = arg.to_ascii_lowercase().replace('_', "-");
+        let recognized = matches!(
+            normalized.as_str(),
+            "read-only"
+                | "readonly"
+                | "workspace-write"
+                | "danger-full-access"
+                | "danger-full"
+                | "full-access"
+        );
+        if !recognized {
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, "sandbox.usage"));
+            return Action::None;
+        }
+        let mode = CodexSandbox::parse_fail_open(arg);
+
+        // Apply for THIS session: publish to the env the codex driver reads, so
+        // the next codex turn uses it — the SAME mechanism as startup.
+        std::env::set_var("UMADEV_CODEX_SANDBOX", mode.as_codex_arg());
+
+        // Persist to `.umadevrc` so it survives a restart. Fail-open: a write
+        // error still leaves the session env set; we just warn it didn't save.
+        let persisted = umadev_agent::config::persist_codex_sandbox(&self.project_root, mode);
+
+        // The high-risk tier reuses the SAME loud red startup liability warning.
+        if mode.is_high_risk() {
+            self.push(
+                ChatRole::Error,
+                umadev_i18n::t(self.lang, "codex.sandbox.danger_warning").to_string(),
+            );
+            self.push(
+                ChatRole::UmaDev,
+                umadev_i18n::t(self.lang, "sandbox.danger_set").to_string(),
+            );
+        } else {
+            self.push(
+                ChatRole::UmaDev,
+                umadev_i18n::tf(self.lang, "sandbox.set", &[mode.as_codex_arg()]),
+            );
+        }
+        // Remind that the change only bites once codex is the active base.
+        if !is_codex {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "sandbox.codex_only").to_string(),
+            );
+        }
+        if let Err(e) = persisted {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(self.lang, "sandbox.persist_failed", &[&e.to_string()]),
+            );
+        }
+        Action::None
+    }
+
     /// Apply a trust tier as the session override, keeping the legacy binary
     /// `auto_approve_override` consistent so the prompt chip + any old code path
     /// reads the same state.
@@ -9001,6 +9114,23 @@ fn resolve_and_publish_codex_sandbox(
         .resolved_sandbox();
     std::env::set_var("UMADEV_CODEX_SANDBOX", mode.as_codex_arg());
     mode
+}
+
+/// The Codex sandbox tier currently in effect, for DISPLAY (`/sandbox` with no
+/// arg). Reads the published `UMADEV_CODEX_SANDBOX` env first (what the codex
+/// driver will actually use this session — set at startup or by `/sandbox
+/// <mode>`), falling back to the project's `.umadevrc`. Pure read; unlike
+/// [`resolve_and_publish_codex_sandbox`] it does NOT mutate the environment.
+fn effective_codex_sandbox(project_root: &std::path::Path) -> umadev_agent::config::CodexSandbox {
+    use umadev_agent::config::CodexSandbox;
+    if let Ok(v) = std::env::var("UMADEV_CODEX_SANDBOX") {
+        if !v.trim().is_empty() {
+            return CodexSandbox::parse_fail_open(&v);
+        }
+    }
+    umadev_agent::config::load_project_config(project_root)
+        .codex
+        .resolved_sandbox()
 }
 
 /// Decide whether the high-risk codex-sandbox liability warning should fire: ONLY
@@ -15123,6 +15253,154 @@ mod tests {
             .history
             .iter()
             .any(|m| m.body().contains("nonsense") || m.body().contains("未知")));
+    }
+
+    /// Serialize the `/sandbox` tests that mutate the process-global
+    /// `UMADEV_CODEX_SANDBOX` env so they can't observe each other's writes when
+    /// the suite runs multi-threaded. Each test restores the var on exit. (Note:
+    /// `App::new` only PUBLISHES the var when it is unset/empty, so a non-empty
+    /// value set by `/sandbox` is never clobbered by a parallel `App::new`.)
+    static SANDBOX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn sandbox_env_restore(prev: Option<String>) {
+        match prev {
+            Some(v) => std::env::set_var("UMADEV_CODEX_SANDBOX", v),
+            None => std::env::remove_var("UMADEV_CODEX_SANDBOX"),
+        }
+    }
+
+    #[test]
+    fn sandbox_verb_is_registered_and_dispatchable() {
+        // The unified-registry contract (mirrors the /model lockstep guard): the
+        // palette, help overlay, and dispatcher all read App::COMMANDS, so
+        // `/sandbox` must be a registry row AND have a real dispatch arm.
+        assert!(
+            App::COMMANDS.iter().any(|c| c.name == "sandbox"),
+            "/sandbox is registered"
+        );
+        assert!(
+            dispatch_arm_verbs().iter().any(|v| v == "sandbox"),
+            "/sandbox has a dispatch arm"
+        );
+    }
+
+    #[test]
+    fn slash_sandbox_no_arg_shows_current_mode_and_all_options() {
+        let _guard = SANDBOX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var("UMADEV_CODEX_SANDBOX").ok();
+        // Pin a known tier so App::new can't emit a startup danger warning.
+        std::env::set_var("UMADEV_CODEX_SANDBOX", "workspace-write");
+        let mut a = fresh_app(Some("codex"));
+        let before = a.history.len();
+        a.slash_sandbox("");
+        let body = a
+            .history
+            .iter()
+            .skip(before)
+            .map(|m| m.body().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Current tier + all three options + a usage line are shown.
+        assert!(
+            body.contains("workspace-write"),
+            "shows current tier: {body}"
+        );
+        assert!(body.contains("read-only"), "lists read-only: {body}");
+        assert!(
+            body.contains("danger-full-access"),
+            "lists danger-full-access: {body}"
+        );
+        assert!(body.contains("/sandbox"), "shows usage: {body}");
+        sandbox_env_restore(prev);
+    }
+
+    #[test]
+    fn slash_sandbox_danger_sets_env_persists_rc_and_warns() {
+        let _guard = SANDBOX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var("UMADEV_CODEX_SANDBOX").ok();
+        std::env::set_var("UMADEV_CODEX_SANDBOX", "workspace-write");
+        let mut a = fresh_app(Some("codex"));
+        a.slash_sandbox("danger-full-access");
+        // (1) session env published for the next codex turn (same mechanism as startup).
+        assert_eq!(
+            std::env::var("UMADEV_CODEX_SANDBOX").as_deref(),
+            Ok("danger-full-access"),
+            "publishes the new tier to the session env"
+        );
+        // (2) persisted to .umadevrc so it survives a restart.
+        let cfg = umadev_agent::config::load_project_config(&a.project_root);
+        assert_eq!(
+            cfg.codex.resolved_sandbox(),
+            umadev_agent::config::CodexSandbox::DangerFullAccess,
+            "persists to .umadevrc [codex] sandbox_mode"
+        );
+        // (3) the SAME loud red startup liability warning was reused (an Error row).
+        assert!(
+            a.history.iter().any(|m| matches!(m.role, ChatRole::Error)),
+            "danger reuses the red liability warning"
+        );
+        sandbox_env_restore(prev);
+    }
+
+    #[test]
+    fn slash_sandbox_garbage_shows_usage_and_leaves_env_untouched() {
+        let _guard = SANDBOX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var("UMADEV_CODEX_SANDBOX").ok();
+        std::env::set_var("UMADEV_CODEX_SANDBOX", "workspace-write");
+        let mut a = fresh_app(Some("codex"));
+        let before = a.history.len();
+        a.slash_sandbox("yolo-root");
+        // Garbage never silently widens/narrows the sandbox.
+        assert_eq!(
+            std::env::var("UMADEV_CODEX_SANDBOX").as_deref(),
+            Ok("workspace-write"),
+            "garbage leaves the session env unchanged"
+        );
+        let body = a
+            .history
+            .iter()
+            .skip(before)
+            .map(|m| m.body().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("/sandbox"), "garbage shows usage: {body}");
+        sandbox_env_restore(prev);
+    }
+
+    #[test]
+    fn slash_sandbox_persist_failure_is_fail_open_env_still_set() {
+        let _guard = SANDBOX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var("UMADEV_CODEX_SANDBOX").ok();
+        std::env::set_var("UMADEV_CODEX_SANDBOX", "workspace-write");
+        let mut a = fresh_app(Some("codex"));
+        // Corrupt .umadevrc so the persist is REFUSED (returns Err) — the session
+        // env must STILL be set (fail-open) and the user warned the save failed.
+        std::fs::write(a.project_root.join(".umadevrc"), "= = not valid toml").unwrap();
+        a.slash_sandbox("read-only");
+        assert_eq!(
+            std::env::var("UMADEV_CODEX_SANDBOX").as_deref(),
+            Ok("read-only"),
+            "fail-open: session env set even though the persist failed"
+        );
+        let body = a
+            .history
+            .iter()
+            .map(|m| m.body().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains(".umadevrc"),
+            "warns the persist failed: {body}"
+        );
+        sandbox_env_restore(prev);
     }
 
     #[test]

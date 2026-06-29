@@ -211,6 +211,17 @@
 # Codex high-risk sandbox liability warning (only shown for danger-full-access on codex)
 "codex.sandbox.danger_warning" = "WARNING: Codex high-risk sandbox (danger-full-access) is ENABLED — you assume all risk to your system environment.\n  To revert: set [codex] sandbox_mode = \"workspace-write\" in .umadevrc, then restart."
 
+# /sandbox — view / change the Codex base launch sandbox in-app (no .umadevrc hand-edit)
+"sandbox.current" = "Codex sandbox is currently: {}\n  (applies to the codex base only — it controls what the codex worker may touch when it runs)"
+"sandbox.why.read_only" = "  read-only           the base can read your workspace but write nothing — safest, but it can't build"
+"sandbox.why.workspace_write" = "  workspace-write     default (safe): the base may write the project dir, but the sandbox blocks the NETWORK and local ports and won't run git — so `npm start` / a dev server can't open its port, package installs and outbound API calls are refused, and `git commit` fails"
+"sandbox.why.danger" = "  danger-full-access  full access: removes the sandbox so the network, local dev ports, and git all work again — this is what full-stack work needs (a dev server binds its port, installs & API calls reach out, commits land). HIGH RISK: the base can touch anything on your machine; you accept that risk"
+"sandbox.usage" = "Usage: /sandbox [read-only | workspace-write | danger-full-access]"
+"sandbox.codex_only" = "Note: the active base isn't codex, so this only takes effect once you switch to the codex base (/codex)."
+"sandbox.set" = "Codex sandbox set to {} — active this session and saved to .umadevrc."
+"sandbox.danger_set" = "Codex sandbox set to danger-full-access — active this session and saved to .umadevrc. Local ports / network / git are now unblocked; you accept all risk to your system environment."
+"sandbox.persist_failed" = "[warn] Applied for this session, but could not save to .umadevrc (it will revert on next launch): {}"
+
 # Shared config write error
 "config.write_failed" = "(could not write {}: {})"
 "config.save_failed_note" = "[warn] Setting applied for this session, but could not be saved (it will revert on next launch): {}"
@@ -709,6 +720,7 @@
 "tui.cmd.cancel" = "stop the running pipeline / agentic round"
 "tui.cmd.adopt" = "adopt an existing project (detect stack, index source, derive contract)"
 "tui.cmd.mode" = "trust tier: plan / guarded / auto"
+"tui.cmd.sandbox" = "Codex base launch sandbox: read-only / workspace-write / danger-full-access"
 "tui.cmd.lessons" = "what UmaDev has learned (pitfalls + proven patterns)"
 "tui.cmd.team" = "your AI development team — roster + this run's verdicts & deliverables"
 "tui.cmd.lang" = "switch UI language"

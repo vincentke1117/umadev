@@ -211,6 +211,17 @@
 # Codex 高危沙箱责任警告(仅在 codex 且 danger-full-access 时显示)
 "codex.sandbox.danger_warning" = "警告:Codex 高危沙箱模式(danger-full-access)已开启 —— 请自行承担系统环境风险。\n  关闭:在 .umadevrc 中设置 [codex] sandbox_mode = \"workspace-write\" 后重启。"
 
+# /sandbox —— 在应用内查看 / 修改 Codex 底座启动沙箱(无需手改 .umadevrc)
+"sandbox.current" = "Codex 沙箱当前为:{}\n  (仅对 codex 底座生效 —— 它决定 codex 运行时能动到哪些东西)"
+"sandbox.why.read_only" = "  read-only           只读:底座能读工作区但什么都不能写 —— 最安全,但没法构建"
+"sandbox.why.workspace_write" = "  workspace-write     默认(安全):可写项目目录,但沙箱会屏蔽网络和本地端口、也不跑 git —— 所以 npm start / 开发服务器开不了端口,装包和对外 API 请求会被拒,git commit 也会失败"
+"sandbox.why.danger" = "  danger-full-access  完全访问:解除沙箱,网络、本地开发端口、git 全部恢复 —— 全栈开发需要它(开发服务器能开端口、装包和 API 能联网、能提交)。高风险:底座可访问你机器上的任何东西,风险由你承担"
+"sandbox.usage" = "用法:/sandbox [read-only | workspace-write | danger-full-access]"
+"sandbox.codex_only" = "提示:当前底座不是 codex,这项设置要切到 codex 底座(/codex)后才生效。"
+"sandbox.set" = "Codex 沙箱已设为 {} —— 本次会话生效,并已写入 .umadevrc。"
+"sandbox.danger_set" = "Codex 沙箱已设为 danger-full-access —— 本次会话生效,并已写入 .umadevrc。本地端口 / 网络 / git 已解除限制,系统环境风险由你承担。"
+"sandbox.persist_failed" = "[warn] 本次会话已生效,但无法写入 .umadevrc(下次启动会恢复):{}"
+
 # Shared config write error
 "config.write_failed" = "(无法写入 {}: {})"
 "config.save_failed_note" = "[warn] 设置已对本会话生效,但未能持久化保存(下次启动会回退):{}"
@@ -705,6 +716,7 @@
 "tui.cmd.cancel" = "停止正在运行的流水线 / 智能体回合"
 "tui.cmd.adopt" = "接管现有项目(识别技术栈、索引源码、反推契约)"
 "tui.cmd.mode" = "信任档位:plan / guarded / auto"
+"tui.cmd.sandbox" = "Codex 底座启动沙箱:read-only / workspace-write / danger-full-access"
 "tui.cmd.lessons" = "UmaDev 学到的经验(踩坑 + 验证过的范式)"
 "tui.cmd.team" = "你的 AI 开发团队 —— 花名册 + 本次运行的评审与交付物"
 "tui.cmd.lang" = "切换界面语言"
