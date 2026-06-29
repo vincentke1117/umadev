@@ -3301,6 +3301,7 @@ dependencies = [
  "umadev-i18n",
  "umadev-runtime",
  "umadev-spec",
+ "unicode-segmentation",
  "unicode-width 0.2.0",
 ]
 

@@ -26,6 +26,7 @@ use std::collections::VecDeque;
 use crossterm::event::KeyCode;
 use umadev_agent::{EngineEvent, Gate};
 use umadev_spec::{Phase, PHASE_CHAIN};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config::UserConfig;
 
@@ -77,6 +78,16 @@ const COMPACTION_TAIL_BUDGET: usize = 1_200;
 const COMPACTION_MIN_TAIL: usize = 4;
 /// Max chars in the input box.
 const INPUT_CAP: usize = 8192;
+
+/// A bracketed paste with MORE than this many lines collapses to a single
+/// `[粘贴 N 行]` chip (the full text is stashed and re-expanded on submit)
+/// instead of flooding the input box into unscrollable noise. Mirrors the
+/// image-attachment chip mechanism for bulky text.
+const PASTE_CHIP_MIN_LINES: usize = 12;
+/// A bracketed paste with MORE than this many chars also collapses to a chip —
+/// catches a huge single-line paste (one 5 KB line is just as much noise as 40
+/// short ones). Either trigger fires the chip.
+const PASTE_CHIP_MIN_CHARS: usize = 1200;
 
 /// Max entries kept in the kill-ring (Ctrl+U/K/W feed it; Ctrl+Y / Alt+Y read
 /// it). The oldest entry falls off the back when a fresh, distinct kill pushes
@@ -1571,6 +1582,13 @@ pub struct App {
     /// chip (N = 1-based index into this Vec); on submit the chip is rewritten to
     /// an `@<abs-path>` mention the base ingests as an image. Cleared with the input.
     pub attachments: Vec<std::path::PathBuf>,
+    /// Large-paste text stash for the turn being composed. A bracketed paste over
+    /// [`PASTE_CHIP_MIN_LINES`] / [`PASTE_CHIP_MIN_CHARS`] is collapsed to a single
+    /// `[粘贴 N 行]` chip in `input` and its full text parked here, so a bulky
+    /// paste doesn't flood the box into unscrollable noise. On submit the chip is
+    /// expanded back to the full text inline (see [`Self::expand_attachments`]).
+    /// Cleared with the input. Same proven pattern as `attachments`, for text.
+    pub text_stash: Vec<String>,
     /// Past submitted texts. ↑↓ in an empty input box recalls them.
     pub input_history: VecDeque<String>,
     /// Recall cursor into `input_history`; `None` = editing a fresh draft.
@@ -2217,6 +2235,7 @@ impl App {
             input: String::new(),
             input_cursor: 0,
             attachments: Vec::new(),
+            text_stash: Vec::new(),
             input_history: VecDeque::new(),
             input_history_idx: None,
             input_history_draft: None,
@@ -3473,6 +3492,52 @@ impl App {
             .map_or(self.input.len(), |(i, _)| i)
     }
 
+    /// Char index of the GRAPHEME-cluster boundary immediately to the LEFT of
+    /// `char_pos` — i.e. the start of the user-perceived glyph that ends at
+    /// `char_pos`. A ZWJ emoji (👨‍👩‍👧), a flag / skin-tone sequence, or a
+    /// base char + combining marks is several codepoints but one cluster, so
+    /// stepping the caret / backspace over it must move by the whole cluster,
+    /// not one codepoint (which would split the glyph and corrupt the render).
+    /// Fail-open: returns `0` when already at the start, and a cluster that
+    /// straddles a mid-cluster caret resolves to its own start (de-corrupting
+    /// the caret) rather than panicking.
+    fn prev_grapheme(&self, char_pos: usize) -> usize {
+        if char_pos == 0 {
+            return 0;
+        }
+        // Boundaries appear in increasing order as `acc`; the last one strictly
+        // below `char_pos` is the target.
+        let mut boundary = 0;
+        let mut acc = 0;
+        for g in self.input.graphemes(true) {
+            if acc >= char_pos {
+                break;
+            }
+            boundary = acc;
+            acc += g.chars().count();
+        }
+        boundary
+    }
+
+    /// Char index of the GRAPHEME-cluster boundary immediately to the RIGHT of
+    /// `char_pos` — the end of the cluster that starts at `char_pos`. Mirror of
+    /// [`Self::prev_grapheme`] for the forward caret / forward-delete. Fail-open:
+    /// clamps to the buffer length.
+    fn next_grapheme(&self, char_pos: usize) -> usize {
+        let len = self.input_len();
+        if char_pos >= len {
+            return len;
+        }
+        let mut acc = 0;
+        for g in self.input.graphemes(true) {
+            acc += g.chars().count();
+            if acc > char_pos {
+                return acc;
+            }
+        }
+        len
+    }
+
     /// Insert one character at the cursor and advance.
     pub fn insert_at_cursor(&mut self, c: char) {
         if self.input_len() >= INPUT_CAP {
@@ -3527,29 +3592,34 @@ impl App {
         self.mention_dismissed = false;
     }
 
-    /// Delete the character BEFORE the cursor (Backspace).
+    /// Delete the GRAPHEME CLUSTER before the cursor (Backspace). Steps over a
+    /// whole ZWJ emoji / flag / base+combining glyph as one unit instead of
+    /// peeling off a single codepoint and leaving a mojibake half-glyph.
     pub fn backspace(&mut self) {
         if self.input_cursor == 0 {
             return;
         }
         self.snapshot_for_undo();
+        let start_char = self.prev_grapheme(self.input_cursor);
         let end = self.byte_index(self.input_cursor);
-        let start = self.byte_index(self.input_cursor - 1);
+        let start = self.byte_index(start_char);
         self.input.replace_range(start..end, "");
-        self.input_cursor -= 1;
+        self.input_cursor = start_char;
         self.palette_selected = 0;
         self.mention_selected = 0;
         self.mention_dismissed = false;
     }
 
-    /// Delete the character AT the cursor (forward Delete).
+    /// Delete the GRAPHEME CLUSTER at the cursor (forward Delete) — the mirror of
+    /// [`Self::backspace`], removing the whole glyph to the right as one unit.
     pub fn forward_delete(&mut self) {
         if self.input_cursor >= self.input_len() {
             return;
         }
         self.snapshot_for_undo();
         let start = self.byte_index(self.input_cursor);
-        let end = self.byte_index(self.input_cursor + 1);
+        let end_char = self.next_grapheme(self.input_cursor);
+        let end = self.byte_index(end_char);
         self.input.replace_range(start..end, "");
         self.palette_selected = 0;
     }
@@ -3805,15 +3875,28 @@ impl App {
         self.mention_selected = 0;
     }
 
-    /// Move cursor by `delta` characters, clamped to `[0, len]`.
+    /// Move the caret by `delta` GRAPHEME CLUSTERS, clamped to `[0, len]`. `delta`
+    /// is a step count: each step snaps to the next/previous cluster boundary so a
+    /// single ←/→ over a ZWJ emoji or a base+combining glyph moves past the whole
+    /// glyph as one unit (was: one codepoint, which split the cluster). Fail-open:
+    /// saturates at the buffer ends.
     pub fn move_cursor(&mut self, delta: isize) {
-        let len = self.input_len();
+        let steps = delta.unsigned_abs();
         if delta < 0 {
-            self.input_cursor = self.input_cursor.saturating_sub(delta.unsigned_abs());
+            for _ in 0..steps {
+                if self.input_cursor == 0 {
+                    break;
+                }
+                self.input_cursor = self.prev_grapheme(self.input_cursor);
+            }
         } else {
-            #[allow(clippy::cast_sign_loss)]
-            let fwd = delta as usize;
-            self.input_cursor = self.input_cursor.saturating_add(fwd).min(len);
+            let len = self.input_len();
+            for _ in 0..steps {
+                if self.input_cursor >= len {
+                    break;
+                }
+                self.input_cursor = self.next_grapheme(self.input_cursor);
+            }
         }
     }
 
@@ -3864,6 +3947,7 @@ impl App {
         self.input_history_idx = None;
         self.input_history_draft = None;
         self.attachments.clear();
+        self.text_stash.clear();
         self.mention_selected = 0;
         self.mention_dismissed = false;
     }
@@ -3873,6 +3957,25 @@ impl App {
     /// `@<path>` mention on submit — one definition keeps the two in lockstep.
     fn image_chip(&self, n: usize) -> String {
         format!("[{} {n}]", umadev_i18n::t(self.lang, "attach.image"))
+    }
+
+    /// Line count used in a large-paste chip label. `lines()` ignores a trailing
+    /// newline, so a paste ending in `\n` isn't undercounted by one; at least `1`
+    /// (a chip is never `[粘贴 0 行]`).
+    fn paste_line_count(text: &str) -> usize {
+        text.lines().count().max(1)
+    }
+
+    /// The chip token shown in the input box for a stashed large paste, e.g.
+    /// `[粘贴 42 行]` / `[pasted 42 lines]`. Derived purely from the stashed
+    /// text's line count, so the same definition recomputes the exact token on
+    /// expand — keeping insert and expand in lockstep (mirrors `image_chip`).
+    fn text_chip(&self, text: &str) -> String {
+        let n = Self::paste_line_count(text);
+        format!(
+            "[{}]",
+            umadev_i18n::tf(self.lang, "attach.paste", &[&n.to_string()])
+        )
     }
 
     /// Handle a bracketed-paste payload. If it is one (or several newline-separated)
@@ -3904,7 +4007,20 @@ impl App {
                 return;
             }
         }
-        // Not an attachable image paste → verbatim (real text, the dominant case).
+        // A BULKY text paste (many lines or a huge single line) collapses to a
+        // `[粘贴 N 行]` chip with the full text parked in `text_stash`, so it
+        // doesn't flood the box into unscrollable noise; it expands back inline
+        // on submit. Same proven chip+stash+expand pattern as images.
+        let lines = Self::paste_line_count(text);
+        let chars = text.chars().count();
+        if lines > PASTE_CHIP_MIN_LINES || chars > PASTE_CHIP_MIN_CHARS {
+            let chip = self.text_chip(text);
+            self.text_stash.push(text.to_string());
+            self.insert_str_at_cursor(&chip);
+            self.insert_str_at_cursor(" ");
+            return;
+        }
+        // A small paste → verbatim (real text, the dominant case).
         self.insert_str_at_cursor(text);
     }
 
@@ -3921,16 +4037,26 @@ impl App {
         Some(self.attachments.len())
     }
 
-    /// Rewrite every `[图片 N]` chip in `raw` to an `@<abs-path>` mention so the base
-    /// CLI ingests it as an image (it reads the file itself — UmaDev never base64s).
-    /// A chip with no backing attachment is left as-is. No-op without attachments.
+    /// Rewrite every composed-turn chip in `raw` back to what the base should
+    /// actually receive: each `[图片 N]` image chip becomes an `@<abs-path>`
+    /// mention (the base reads the file itself — UmaDev never base64s), and each
+    /// `[粘贴 N 行]` large-paste chip is replaced by its stashed full text inline.
+    /// A chip with no backing attachment / stash entry is left as-is. No-op when
+    /// nothing is attached or stashed.
     fn expand_attachments(&self, raw: &str) -> String {
-        if self.attachments.is_empty() {
-            return raw.to_string();
-        }
         let mut out = raw.to_string();
         for (i, path) in self.attachments.iter().enumerate() {
             out = out.replace(&self.image_chip(i + 1), &format!("@{}", path.display()));
+        }
+        // Large-paste chips: replace each stashed paste's chip with its full text.
+        // Done sequentially via `find` (first remaining occurrence) so two pastes
+        // that happen to share a line count — and thus an identical chip token —
+        // still map to their OWN stash entry in buffer order, not a collision.
+        for stash in &self.text_stash {
+            let chip = self.text_chip(stash);
+            if let Some(pos) = out.find(&chip) {
+                out.replace_range(pos..pos + chip.len(), stash);
+            }
         }
         out
     }
@@ -12672,6 +12798,98 @@ mod tests {
         assert!(app.input.contains("ghost.png"));
     }
 
+    // ---- I4: large-paste collapse to a chip ----
+
+    /// Build `n` distinct `"<prefix> <i>\n"` lines — test fixtures for the
+    /// large-paste chip (distinct markers let the assertions confirm the FULL
+    /// text round-trips through stash→expand).
+    fn numbered_lines(prefix: &str, n: usize) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        for i in 0..n {
+            let _ = writeln!(s, "{prefix} {i}");
+        }
+        s
+    }
+
+    #[test]
+    fn large_paste_collapses_to_a_chip_and_expands_on_submit() {
+        let mut a = fresh_app(Some("offline"));
+        // 20 lines → over the line threshold → one chip, not a 20-line flood.
+        let big = numbered_lines("line", 20);
+        a.handle_paste(&big);
+        assert!(
+            a.input.contains("粘贴") || a.input.contains("pasted") || a.input.contains("貼上"),
+            "a chip is shown, got: {}",
+            a.input
+        );
+        assert!(
+            !a.input.contains("line 15"),
+            "the bulk text is stashed, NOT flooding the box: {}",
+            a.input
+        );
+        assert_eq!(a.text_stash.len(), 1, "one paste stashed");
+        // On submit the chip expands back to the full text inline.
+        let expanded = a.expand_attachments(a.input.trim());
+        assert!(
+            expanded.contains("line 0") && expanded.contains("line 19"),
+            "chip expands to the full pasted text, got: {expanded}"
+        );
+    }
+
+    #[test]
+    fn huge_single_line_paste_also_collapses_to_a_chip() {
+        let mut a = fresh_app(Some("offline"));
+        // One line, but past the CHAR threshold → still chipped (1 line of noise
+        // is as unscrollable as 40 short ones).
+        let big = "x".repeat(PASTE_CHIP_MIN_CHARS + 50);
+        a.handle_paste(&big);
+        assert_eq!(a.text_stash.len(), 1, "one-line but huge → chipped");
+        assert!(
+            a.input.chars().count() < 30,
+            "box holds a compact chip, not the full {} chars",
+            big.len()
+        );
+        let expanded = a.expand_attachments(a.input.trim());
+        assert_eq!(expanded, big, "expands back to the exact pasted text");
+    }
+
+    #[test]
+    fn small_paste_inserts_inline_without_a_chip() {
+        let mut a = fresh_app(Some("offline"));
+        a.handle_paste("just a short note\nwith two lines");
+        assert_eq!(a.input, "just a short note\nwith two lines");
+        assert!(a.text_stash.is_empty(), "a small paste is never stashed");
+    }
+
+    #[test]
+    fn two_large_pastes_each_stash_and_expand_independently() {
+        let mut a = fresh_app(Some("offline"));
+        let a_text = numbered_lines("alpha", 15);
+        let b_text = numbered_lines("beta", 18);
+        a.handle_paste(&a_text);
+        a.handle_paste(&b_text);
+        assert_eq!(a.text_stash.len(), 2, "two pastes → two stash entries");
+        let expanded = a.expand_attachments(a.input.trim());
+        assert!(
+            expanded.contains("alpha 14") && expanded.contains("beta 17"),
+            "each chip expands to its OWN stashed text, got: {expanded}"
+        );
+    }
+
+    #[test]
+    fn paste_chip_is_fail_open_clear_resets_stash_and_expand_noops() {
+        let mut a = fresh_app(Some("offline"));
+        // expand with nothing stashed/attached returns the text unchanged.
+        assert_eq!(a.expand_attachments("hello"), "hello");
+        let big = numbered_lines("row", 30);
+        a.handle_paste(&big);
+        assert_eq!(a.text_stash.len(), 1);
+        a.clear_input();
+        assert!(a.text_stash.is_empty(), "clear_input drops the stash");
+        assert!(a.input.is_empty());
+    }
+
     #[test]
     fn chat_persists_and_a_restart_reopens_the_conversation() {
         // Wave 5 / G11: a restart must reopen the SAME dialogue (no goldfish).
@@ -15952,6 +16170,61 @@ mod tests {
         // Backspace once → just one CJK char gone, no panic.
         let _ = a.apply_key(KeyCode::Backspace);
         assert_eq!(a.input, "做");
+    }
+
+    // ---- I5: grapheme-cluster-aware cursor ----
+
+    #[test]
+    fn cursor_steps_over_zwj_emoji_as_one_grapheme() {
+        let mut a = fresh_app(Some("offline"));
+        // A ZWJ family emoji is several codepoints but ONE user-perceived glyph.
+        let family = "👨‍👩‍👧";
+        assert!(
+            family.chars().count() > 1,
+            "precondition: multi-codepoint cluster"
+        );
+        let n = family.chars().count();
+        a.insert_str_at_cursor(family);
+        assert_eq!(a.input_cursor, n, "cursor at the end after insert");
+        // One ← steps over the WHOLE cluster, not one codepoint.
+        a.move_cursor(-1);
+        assert_eq!(a.input_cursor, 0, "one ← jumps the whole ZWJ cluster");
+        // One → steps forward over the whole cluster.
+        a.move_cursor(1);
+        assert_eq!(a.input_cursor, n, "one → crosses the whole cluster");
+        // Backspace removes the whole glyph — no half-mojibake left behind.
+        a.backspace();
+        assert_eq!(a.input, "", "backspace deletes the whole cluster");
+    }
+
+    #[test]
+    fn cursor_steps_over_combining_mark_as_one_grapheme() {
+        let mut a = fresh_app(Some("offline"));
+        // 'e' + U+0301 COMBINING ACUTE = 2 codepoints, one grapheme "é".
+        let e_acute = "e\u{301}";
+        a.insert_str_at_cursor(e_acute);
+        assert_eq!(a.input.chars().count(), 2, "precondition: base + combining");
+        a.move_cursor(-1);
+        assert_eq!(a.input_cursor, 0, "← steps over base+combining as one unit");
+        // Forward-delete from the start removes the whole cluster, not just 'e'.
+        a.forward_delete();
+        assert_eq!(a.input, "", "forward-delete removes the whole cluster");
+    }
+
+    #[test]
+    fn cursor_still_steps_single_ascii_and_cjk_chars() {
+        let mut a = fresh_app(Some("offline"));
+        a.insert_str_at_cursor("ab做");
+        assert_eq!(a.input_cursor, 3);
+        a.move_cursor(-1);
+        assert_eq!(a.input_cursor, 2, "one ← over the CJK char");
+        a.move_cursor(-1);
+        assert_eq!(a.input_cursor, 1, "one ← over 'b'");
+        a.move_cursor(-1);
+        assert_eq!(a.input_cursor, 0, "one ← over 'a'");
+        // Forward-delete removes exactly one char (no over-eager cluster merge).
+        a.forward_delete();
+        assert_eq!(a.input, "b做", "forward-delete removed only 'a'");
     }
 
     // ---- Shift+Enter multi-line ----

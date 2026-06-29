@@ -136,6 +136,7 @@
 
 # Wave 1 — 即時計畫清單 + 團隊評審面板
 "attach.image" = "圖片"
+"attach.paste" = "貼上 {} 行"
 "model.unmanaged" = "UmaDev 不管理模型 —— 底座用它自己配置 / 登入的模型(官方訂閱,或你在底座裡接入的第三方 / 本地模型)。要換模型,請在底座(claude / codex / opencode)裡配置;UmaDev 只負責呼叫它。"
 "plan.synthesizing" = "正在規劃交付計畫——為該需求擬定步驟(複雜需求可能要等一會兒)…"
 "plan.posted" = "計畫已就緒——{} 步。下方清單會即時勾選;用 /plan 調整。"

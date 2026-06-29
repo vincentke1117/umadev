@@ -566,6 +566,11 @@ mod tests {
             "tui.cmd.tasks",
             "tui.chip.run",
             "tui.chip.run_indeterminate",
+            // Large-paste collapse: a bulky bracketed paste folds into this
+            // `[粘贴 N 行]` chip (and re-expands on submit) instead of flooding
+            // the input box — trilingual so the chip never ships a wrong-language
+            // label.
+            "attach.paste",
             // Wave C: the live team roster panel + handoff timeline — the convened
             // seats as named teammates with their live status (idle/working/
             // reviewing/blocked/done), and the seat→deliverable handoff entries.

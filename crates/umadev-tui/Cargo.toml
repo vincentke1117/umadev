@@ -18,6 +18,12 @@ umadev-i18n = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
+# Grapheme-cluster segmentation for the input model: the caret / backspace /
+# forward-delete step over whole user-perceived glyphs (ZWJ emoji, flag &
+# skin-tone sequences, base+combining marks) instead of splitting them
+# mid-codepoint. Already in the tree transitively (ratatui/textwrap pull it),
+# so this adds no new compile cost; pure-Rust, no ICU.
+unicode-segmentation = "1"
 # CommonMark pull parser — a pure-Rust, dependency-light event stream (no ICU,
 # no heavy parse tree). We compile the LIBRARY only (`default-features = false`
 # drops the `getopts`-backed `pulldown-cmark` binary) and feed its events into a
