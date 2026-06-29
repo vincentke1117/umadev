@@ -260,15 +260,25 @@ pub(crate) fn dedupe_operation_ids(endpoints: &mut [Endpoint]) {
     }
 }
 
+/// Synonyms that mark a header cell as the **Method** column (case-insensitive
+/// substring match).
+const METHOD_SYNONYMS: &[&str] = &["method", "verb"];
+/// Synonyms that mark a header cell as the **Path** column (case-insensitive
+/// substring match).
+const PATH_SYNONYMS: &[&str] = &["path", "endpoint", "url", "route"];
+
 /// Walk the markdown, find the first table with Method+Path columns, and
 /// parse its rows.
 fn extract_endpoints_from_table(md: &str) -> Vec<Endpoint> {
     let lines: Vec<&str> = md.lines().collect();
-    // Find the header row: a line starting with `|` that contains both
-    // "method" and "path" (case-insensitive).
+    // Find the header row: a line starting with `|` whose cells include both a
+    // method-ish and a path-ish column. A whole-line `contains` of the synonyms
+    // is enough to locate the row (the per-column resolution below is precise).
     let header_idx = lines.iter().position(|l| {
         let lower = l.to_ascii_lowercase();
-        l.trim().starts_with('|') && lower.contains("method") && lower.contains("path")
+        l.trim().starts_with('|')
+            && METHOD_SYNONYMS.iter().any(|s| lower.contains(s))
+            && PATH_SYNONYMS.iter().any(|s| lower.contains(s))
     });
 
     let Some(header_idx) = header_idx else {
@@ -281,9 +291,24 @@ fn extract_endpoints_from_table(md: &str) -> Vec<Endpoint> {
             .iter()
             .position(|h| h.to_ascii_lowercase().trim() == name)
     };
-    // `col` returns Option but this fn returns Vec, so we can't use `?`.
+    // Resolve a column by ANY of a set of synonyms via `contains` — mirroring
+    // the tolerant Auth match below. The header row is found permissively, so
+    // Method/Path resolution must be permissive too: a descriptive header like
+    // `HTTP Method` / `API Path` / `Endpoint` / `Route` previously FOUND the
+    // header (it contains "method"+"path") but resolved NO columns under an
+    // exact `==` test, yielding an empty spec that VACUOUSLY passed the
+    // UD-CODE-003 contract gate.
+    let col_any = |synonyms: &[&str]| -> Option<usize> {
+        headers.iter().position(|h| {
+            let h = h.to_ascii_lowercase();
+            let h = h.trim();
+            synonyms.iter().any(|s| h.contains(s))
+        })
+    };
+    // `col_any` returns Option but this fn returns Vec, so we can't use `?`.
     // Early-return empty when required columns are absent.
-    let (Some(method_col), Some(path_col)) = (col("method"), col("path")) else {
+    let (Some(method_col), Some(path_col)) = (col_any(METHOD_SYNONYMS), col_any(PATH_SYNONYMS))
+    else {
         return Vec::new();
     };
     let req_col = col("request");
@@ -448,6 +473,56 @@ mod tests {
                 Some(SecurityKind::Bearer),
                 "header `{header}` should be read as the auth column",
             );
+        }
+    }
+
+    #[test]
+    fn resolves_columns_with_descriptive_method_path_headers() {
+        // M6 regression: a header like `HTTP Method | API Path` used to FIND the
+        // header row (it contains "method" + "path") but resolve NO columns under
+        // the exact `==` match — producing an empty spec that VACUOUSLY passed the
+        // UD-CODE-003 contract gate. Method/Path now resolve permissively
+        // (`contains`), like the Auth column.
+        let md = "## API\n\n\
+                  | HTTP Method | API Path | Auth | Description |\n\
+                  |---|---|---|---|\n\
+                  | POST | /api/orders | Bearer | Create order |\n\
+                  | GET | /api/orders/:id | none | Get order |\n";
+        let spec = parse_architecture(md, "demo");
+        assert_eq!(
+            spec.len(),
+            2,
+            "descriptive `HTTP Method`/`API Path` headers must resolve real columns"
+        );
+        assert_eq!(spec.endpoints[0].method, HttpVerb::Post);
+        assert_eq!(spec.endpoints[0].path, "/api/orders");
+        assert_eq!(spec.endpoints[0].security, SecurityKind::Bearer);
+        assert_eq!(spec.endpoints[1].method, HttpVerb::Get);
+        assert_eq!(spec.endpoints[1].path, "/api/orders/:id");
+    }
+
+    #[test]
+    fn resolves_columns_with_method_path_synonym_headers() {
+        // The same tolerance covers the documented synonyms: Verb (method) and
+        // Endpoint / Route / Request URL (path).
+        for (method_header, path_header) in [
+            ("Verb", "Endpoint"),
+            ("Method", "Route"),
+            ("HTTP Verb", "Request URL"),
+        ] {
+            let md = format!(
+                "| {method_header} | {path_header} | Description |\n\
+                 |---|---|---|\n\
+                 | GET | /api/x | List |\n"
+            );
+            let spec = parse_architecture(&md, "t");
+            assert_eq!(
+                spec.len(),
+                1,
+                "headers `{method_header}`/`{path_header}` must resolve columns"
+            );
+            assert_eq!(spec.endpoints[0].method, HttpVerb::Get);
+            assert_eq!(spec.endpoints[0].path, "/api/x");
         }
     }
 

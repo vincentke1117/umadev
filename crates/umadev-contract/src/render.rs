@@ -314,7 +314,8 @@ fn yaml_scalar(s: &str) -> String {
         || s.contains(['\n', '\t', '\r'])
         || s.chars().next().map_or(false, is_yaml_indicator_lead)
         || s.ends_with(' ')
-        || s.ends_with('\t');
+        || s.ends_with('\t')
+        || is_yaml_reserved_scalar(s);
     if needs_quotes {
         // Double-quoted YAML scalar: escape backslash, quote, and the
         // control chars that would otherwise terminate/alter the line.
@@ -334,6 +335,49 @@ fn yaml_scalar(s: &str) -> String {
 /// (`-` / `?` start, or an ASCII digit — looks like a number/flow).
 fn is_yaml_indicator_lead(c: char) -> bool {
     c == '-' || c == '?' || c.is_ascii_digit()
+}
+
+/// Whether a bare (unquoted) scalar would be RE-PARSED by a YAML reader as a
+/// non-string (a boolean / null / number) instead of the string we mean. Such a
+/// value MUST be quoted: a `description` of `No` would otherwise re-parse as the
+/// boolean `false`, `~` / `null` as null, and `0755` as the number 493.
+///
+/// Covers the YAML 1.1 boolean/null vocabulary most readers honour (case
+/// insensitive) plus number-looking strings whose lead char the
+/// [`is_yaml_indicator_lead`] check misses (a leading `+` or `.`, e.g. `+5`,
+/// `.5`, `.inf`).
+fn is_yaml_reserved_scalar(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "true"
+            | "false"
+            | "yes"
+            | "no"
+            | "on"
+            | "off"
+            | "y"
+            | "n"
+            | "null"
+            | "~"
+            | ".inf"
+            | "-.inf"
+            | "+.inf"
+            | ".nan"
+    ) || is_plain_number(s)
+}
+
+/// Whether `s` is a plain decimal number (optional leading sign, digits, at most
+/// the float punctuation `.`/`e`/`E`/sign) — i.e. it would re-parse as a YAML
+/// number. Conservative: any other character makes it a normal string. The word
+/// forms `inf`/`nan`/`infinity` that `f64::parse` also accepts are rejected here
+/// because bare (unquoted) they are strings in YAML, not numbers.
+fn is_plain_number(s: &str) -> bool {
+    let body = s.strip_prefix(['+', '-']).unwrap_or(s);
+    !body.is_empty()
+        && body
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'))
+        && body.parse::<f64>().is_ok()
 }
 
 /// Build the `components.securitySchemes` object for the spec, including only
@@ -533,6 +577,41 @@ mod tests {
             yaml_scalar("she said \"hi\"\nthen left"),
             "\"she said \\\"hi\\\"\\nthen left\""
         );
+    }
+
+    #[test]
+    fn yaml_scalar_quotes_reserved_bool_null_scalars() {
+        // Regression: a string like `No` / `yes` / `true` / `~` / `null` was
+        // emitted BARE, so a Description of `No` re-parsed as the boolean
+        // `false` in openapi.yaml. They must now be quoted to stay strings.
+        for reserved in [
+            "No", "no", "NO", "Yes", "yes", "true", "False", "FALSE", "on", "off", "null", "Null",
+            "~", "y", "n",
+        ] {
+            assert_eq!(
+                yaml_scalar(reserved),
+                format!("\"{reserved}\""),
+                "`{reserved}` must be quoted so it stays a string"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_scalar_quotes_numeric_looking_strings() {
+        // Numbers whose lead char the indicator-lead check misses (`+`, `.`)
+        // used to slip through unquoted and re-parse as numbers.
+        for numeric in ["+5", ".5", ".inf", "-.inf", ".nan"] {
+            assert_eq!(
+                yaml_scalar(numeric),
+                format!("\"{numeric}\""),
+                "`{numeric}` must be quoted so it stays a string"
+            );
+        }
+        // Plain words and identifiers stay bare (no over-quoting).
+        assert_eq!(yaml_scalar("bearer"), "bearer");
+        assert_eq!(yaml_scalar("list_users"), "list_users");
+        assert_eq!(yaml_scalar("noop"), "noop");
+        assert_eq!(yaml_scalar("yesterday"), "yesterday");
     }
 
     #[test]

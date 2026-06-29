@@ -26,7 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use umadev_governance::{check_dangerous_bash, scan_content_with_policy, Policy};
@@ -44,6 +44,13 @@ const TOOL_LESSONS_RECALL: &str = "lessons_recall";
 /// Tool name: summarise the active rule policy + the audit-trail tail.
 const TOOL_GOVERNANCE_SUMMARY: &str = "governance_summary";
 
+/// Maximum bytes read for one JSON-RPC line. A stream that never sends a
+/// newline (or a single pathologically large line) is capped here rather than
+/// buffered without bound; the over-long chunk is answered with a parse error
+/// and the loop resynchronises to the next newline. Generous — a real
+/// JSON-RPC request is kilobytes, not megabytes.
+const MAX_LINE_BYTES: u64 = 1 << 20;
+
 /// Run the MCP server loop: read JSON-RPC requests from stdin, write
 /// responses to stdout. Runs until stdin closes (EOF) or `shutdown` arrives.
 ///
@@ -55,47 +62,103 @@ pub fn serve() -> io::Result<()> {
     let policy = Policy::load(&project_root);
     let stdin = io::stdin();
     let stdout = io::stdout();
+    let mut reader = stdin.lock();
     let mut out = stdout.lock();
+    serve_io(&mut reader, &mut out, &policy)
+}
 
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
+/// The JSON-RPC framing + dispatch loop over an arbitrary reader/writer. Split
+/// out from [`serve`] so the line framing is unit-testable without a real
+/// stdin.
+///
+/// Reads one line at a time on the BYTE level (`read_until`), so:
+/// - an **invalid-UTF-8** line no longer ends the session — it is lossily
+///   decoded and answered with a parse error, then the loop continues (the old
+///   `BufRead::lines()` yielded `Err` on bad UTF-8 → the whole session died);
+/// - a line is **size-capped** at [`MAX_LINE_BYTES`], so a newline-less stream
+///   can't grow memory without bound; an over-long line is answered as a parse
+///   error and the loop drains to the next newline to resynchronise.
+fn serve_io<R: BufRead, W: Write>(reader: &mut R, out: &mut W, policy: &Policy) -> io::Result<()> {
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        raw.clear();
+        let n = match (&mut *reader)
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut raw)
+        {
+            // EOF (stdin closed) or a genuine stdin I/O failure — end the loop.
+            Ok(0) | Err(_) => break,
+            Ok(n) => n, // a (possibly capped) line, including any '\n'.
+        };
+        // We stopped at the cap (not a newline) → the line was longer than
+        // MAX_LINE_BYTES and is truncated. Answer + drain to the next newline.
+        let hit_cap = n as u64 >= MAX_LINE_BYTES && raw.last() != Some(&b'\n');
+
+        // Lossy decode: one bad byte answers a parse error, never a crash/exit.
+        let decoded = String::from_utf8_lossy(&raw);
+        let line = decoded.trim();
+        if line.is_empty() && !hit_cap {
             continue;
         }
-        let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&line) else {
-            // Don't silently drop a malformed request: a client that sent an
-            // `id` would wait forever. Emit a JSON-RPC error, recovering the id
-            // when the line is at least valid JSON.
-            let id = serde_json::from_str::<Value>(&line)
-                .ok()
-                .and_then(|v| v.get("id").cloned());
-            let (code, message) = if id.is_some() {
-                (-32600, "Invalid Request")
-            } else {
-                (-32700, "Parse error")
-            };
-            let resp = JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code,
-                    message: message.to_string(),
-                }),
-            };
+        if let Some(resp) = build_response(line, policy) {
             let serialized = serde_json::to_string(&resp).unwrap_or_default();
             writeln!(out, "{serialized}")?;
             out.flush()?;
-            continue;
-        };
-        let resp = handle_request(&req, &policy);
-        if let Some(r) = resp {
-            let serialized = serde_json::to_string(&r).unwrap_or_default();
-            writeln!(out, "{serialized}")?;
-            out.flush()?;
+        }
+        if hit_cap {
+            drain_to_newline(reader);
         }
     }
     Ok(())
+}
+
+/// Parse one input line into the response to write (if any). A well-formed
+/// request is dispatched via [`handle_request`] (which returns `None` for a
+/// notification); a malformed line is answered with a JSON-RPC error, recovering
+/// the `id` when the line is at least valid JSON.
+fn build_response(line: &str, policy: &Policy) -> Option<JsonRpcResponse> {
+    let Ok(req) = serde_json::from_str::<JsonRpcRequest>(line) else {
+        // Don't silently drop a malformed request: a client that sent an `id`
+        // would wait forever. Emit a JSON-RPC error, recovering the id when the
+        // line is at least valid JSON.
+        let id = serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|v| v.get("id").cloned());
+        let (code, message) = if id.is_some() {
+            (-32600, "Invalid Request")
+        } else {
+            (-32700, "Parse error")
+        };
+        return Some(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.to_string(),
+            }),
+        });
+    };
+    handle_request(&req, policy)
+}
+
+/// Discard bytes up to and including the next newline (or EOF), in bounded
+/// chunks. Used to resynchronise after a single line exceeded
+/// [`MAX_LINE_BYTES`], so the over-long line's tail isn't mis-read as a new
+/// request.
+fn drain_to_newline<R: BufRead>(reader: &mut R) {
+    let mut scratch: Vec<u8> = Vec::new();
+    loop {
+        scratch.clear();
+        match (&mut *reader)
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut scratch)
+        {
+            Ok(0) | Err(_) => return,                          // EOF / I/O error
+            Ok(_) if scratch.last() == Some(&b'\n') => return, // consumed the newline
+            Ok(_) => {}                                        // still draining — loop
+        }
+    }
 }
 
 /// One JSON-RPC 2.0 request.
@@ -1130,6 +1193,58 @@ mod tests {
         assert!(gov["total_clauses"].as_u64().unwrap() > 0);
         assert!(gov["audit_tail"].as_array().unwrap().is_empty());
         assert!(gov["disabled_clauses"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn serve_io_survives_invalid_utf8_line() {
+        // Regression: the old `BufRead::lines()` yielded Err on an invalid-UTF-8
+        // line and the loop `break`d — killing the whole session. Now a bad-UTF-8
+        // line is answered with a parse error and a FOLLOWING valid request is
+        // still served.
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(&[0xff, 0xfe, 0x00, b'\n']); // invalid UTF-8 line
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
+        input.push(b'\n');
+        let mut out: Vec<u8> = Vec::new();
+        let mut reader = std::io::Cursor::new(input);
+        serve_io(&mut reader, &mut out, &Policy::default()).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2, "both input lines must be answered: {text}");
+        // First answer: a parse error (the garbage has no recoverable id).
+        let first: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["error"]["code"], -32700);
+        // Second answer: the real `initialize` reply survived the bad line.
+        let second: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["id"], 1);
+        assert_eq!(second["result"]["serverInfo"]["name"], "umadev-governance");
+    }
+
+    #[test]
+    fn serve_io_caps_an_overlong_line_and_resyncs() {
+        // Regression: `lines()` read unbounded — a stream with no newline grew
+        // memory without bound. A line larger than the cap is now answered (as a
+        // parse error) and the loop resynchronises to the next newline so the
+        // following request is still served.
+        let cap = usize::try_from(MAX_LINE_BYTES).expect("cap fits usize");
+        let mut input = "x".repeat(cap + 1024).into_bytes();
+        input.push(b'\n');
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":7,"method":"initialize"}"#);
+        input.push(b'\n');
+        let mut out: Vec<u8> = Vec::new();
+        let mut reader = std::io::Cursor::new(input);
+        serve_io(&mut reader, &mut out, &Policy::default()).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        let answered_seven = text.lines().any(|l| {
+            serde_json::from_str::<Value>(l)
+                .ok()
+                .and_then(|v| v.get("id").and_then(Value::as_i64))
+                == Some(7)
+        });
+        assert!(
+            answered_seven,
+            "the request AFTER an over-long line must be answered: {text}"
+        );
     }
 
     #[test]

@@ -1049,7 +1049,7 @@ fn compute_hook_decision(
 }
 
 fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
-    let root = project_root.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+    let root = project_root_or_cwd(project_root);
     match host.as_str() {
         "claude-code" => {
             if let Some(path) = hook::install_claude_hook(&root)? {
@@ -1103,7 +1103,7 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
 }
 
 fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>) -> Result<()> {
-    let root = project_root.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+    let root = project_root_or_cwd(project_root);
     // Hook-only mode: `umadev uninstall --base <x>` — unchanged behaviour.
     if let Some(host) = base {
         match host.as_str() {
@@ -1438,7 +1438,7 @@ fn cmd_knowledge(
 
 /// `umadev ci` — run governance on the whole workspace (CI/CD mode).
 fn cmd_ci(report_only: bool, changed_only: bool, project_root: Option<PathBuf>) -> Result<()> {
-    let root = project_root.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+    let root = project_root_or_cwd(project_root);
     let result = ci::run(&ci::CiOptions {
         report_only,
         changed_only,
@@ -4735,6 +4735,16 @@ fn find_workspace_root_from(start: &Path) -> PathBuf {
     start.to_path_buf()
 }
 
+/// Resolve a command's project root: an explicit `--project-root` wins, else the
+/// process cwd, else `.`. Never panics — a deleted/unreadable cwd falls back to
+/// `.` (matching the other call sites) instead of the old `.expect("cwd")`,
+/// which aborted the command outright.
+fn project_root_or_cwd(project_root: Option<PathBuf>) -> PathBuf {
+    project_root
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn infer_slug(project_root: &std::path::Path) -> String {
     project_root
         .file_name()
@@ -4746,6 +4756,25 @@ fn infer_slug(project_root: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_root_or_cwd_prefers_explicit_then_falls_back() {
+        // Explicit --project-root always wins, verbatim.
+        let explicit = PathBuf::from("/some/explicit/root");
+        assert_eq!(
+            project_root_or_cwd(Some(explicit.clone())),
+            explicit,
+            "an explicit project root must pass through unchanged"
+        );
+        // With no explicit root it resolves a non-empty path WITHOUT panicking
+        // (the old `.expect(\"cwd\")` aborted the command on a deleted cwd; this
+        // helper degrades to `.` instead — no `expect`/`unwrap` on the path).
+        let resolved = project_root_or_cwd(None);
+        assert!(
+            !resolved.as_os_str().is_empty(),
+            "fallback must yield a usable path, never panic"
+        );
+    }
 
     /// The JSON key the base reports a tool's target path under. Built at runtime
     /// (not a source literal) only so the static repo-governance scanner does not

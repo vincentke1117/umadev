@@ -470,13 +470,24 @@ fn collect_frontend_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     };
     for entry in rd.flatten() {
         let p = entry.path();
-        if p.is_dir() {
+        // Do NOT follow symlinks: `p.is_dir()` stats the symlink TARGET, so a
+        // symlinked directory was recursed into — it could point outside the
+        // project, or form a cycle. `symlink_metadata` stats the link itself, so
+        // a symlink (to a dir or a file) is classified here and skipped, matching
+        // the no-follow contract of UmaDev's other tree walkers.
+        let Ok(meta) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                 continue;
             }
             collect_frontend_sources(&p, out, depth + 1);
-        } else {
+        } else if meta.is_file() {
             let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
             if FRONTEND_EXTS.contains(&ext) {
                 out.push(p);
@@ -571,6 +582,36 @@ mod tests {
         )
         .unwrap();
         assert!(extract_frontend_calls(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn does_not_follow_directory_symlinks() {
+        // Regression: the walk used `p.is_dir()`, which follows symlinks, so a
+        // symlinked directory (a cycle, or an escape OUTSIDE the project) was
+        // recursed into. The walk must not follow directory symlinks.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A real frontend file OUTSIDE the tree we scan.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("leak.ts"), "fetch('/api/leak')").unwrap();
+        // The project tree we DO scan.
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::write(proj.join("src/app.ts"), "fetch('/api/real')").unwrap();
+        // A symlink inside the project pointing at the outside dir.
+        std::os::unix::fs::symlink(&outside, proj.join("src/linked")).unwrap();
+
+        let calls = extract_frontend_calls(&proj);
+        let paths: Vec<&str> = calls.iter().map(|c| c.path.as_str()).collect();
+        assert!(
+            paths.contains(&"/api/real"),
+            "real in-tree source must still be scanned: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"/api/leak"),
+            "a symlinked directory must NOT be followed: {paths:?}"
+        );
     }
 
     #[test]
