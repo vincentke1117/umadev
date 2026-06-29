@@ -974,6 +974,17 @@ async fn drive_director_loop_with_idle(
 /// keeps failing its acceptance pays the (bounded) re-drive cost.
 const MAX_STEP_FIX_ROUNDS: usize = 2;
 
+/// A step whose **blast radius** (the count of steps that transitively depend on it,
+/// [`Plan::blast_radius`]) reaches this is treated as HIGH-impact and earns ONE extra
+/// bounded fix round in [`drive_build_step`] — verification RIGOR weighted by blast
+/// radius. An upstream node many later steps build on is expensive to leave wrong, so
+/// the director tries harder to make it actually PASS its deterministic acceptance
+/// before giving up and marking it Blocked. The acceptance check itself is unchanged
+/// (the same deterministic floor; no critic verdict ever drives control), and the extra
+/// round is still finite + deadline-bounded — never an open grind. A leaf / low-impact
+/// step keeps the base [`MAX_STEP_FIX_ROUNDS`] budget.
+const HIGH_BLAST_RADIUS: usize = 2;
+
 /// A safety ceiling on total step transitions so a pathological plan (e.g. a brain
 /// that emitted a huge DAG, or a flapping readiness set) can never spin — generous
 /// (real plans are 3-8 steps) but finite. Mirrors the bounded-loop discipline.
@@ -1031,7 +1042,15 @@ async fn drive_plan_steps(
             ));
             break;
         }
-        let Some(step_id) = plan.ready_steps().first().map(|s| s.id.clone()) else {
+        // Blast-radius-weighted scheduling: among the currently-ready PEERS, drive the
+        // highest-blast-radius step FIRST (upstream-before-downstream when both are
+        // ready). This never breaks the DAG order — `ready_steps_prioritized` only
+        // reorders steps whose dependencies are ALL already Done — but it does the
+        // expensive-to-unwind work (a schema / contract / scaffold many steps depend on)
+        // earliest, so it is verified soonest AND, if it fails, reworked first: handling
+        // the high-impact upstream step before its peers can obviate the downstream
+        // rework (a Blocked upstream step strands its dependents, pruned below).
+        let Some(step_id) = plan.ready_steps_prioritized().first().map(|s| s.id.clone()) else {
             break; // nothing ready (all Done / Blocked, or a satisfied DAG) → finish
         };
         transitions += 1;
@@ -1051,9 +1070,21 @@ async fn drive_plan_steps(
         ));
         persist_plan_ref(plan, options);
 
+        // Blast radius of THIS step (downstream-dependent count) — weights its rework
+        // rigor: a high-blast-radius upstream step earns one extra bounded fix round.
+        let blast_radius = plan.blast_radius(&step_id);
         let outcome = match step.kind {
             plan_state::StepKind::Build => {
-                drive_build_step(session, options, events, route, &step, deadline).await
+                drive_build_step(
+                    session,
+                    options,
+                    events,
+                    route,
+                    &step,
+                    blast_radius,
+                    deadline,
+                )
+                .await
             }
             plan_state::StepKind::Review => {
                 drive_review_step(session, options, events, route, &step, deadline).await
@@ -1202,7 +1233,9 @@ fn step_goal_frame(options: &RunOptions) -> String {
 /// Drive ONE Build step: `summon` the step's seat serially on the main session with
 /// a focused directive (recalled pitfalls injected), then verify against the step's
 /// `acceptance` on the deterministic floor. A failing acceptance folds its evidence
-/// into a bounded fix re-drive ([`MAX_STEP_FIX_ROUNDS`]). Returns a [`StepOutcome`].
+/// into a bounded fix re-drive ([`MAX_STEP_FIX_ROUNDS`], plus one extra round for a
+/// high-blast-radius upstream step — rigor weighted by `blast_radius`, see
+/// [`HIGH_BLAST_RADIUS`]). Returns a [`StepOutcome`].
 ///
 /// Wall-clock ceiling (graceful): the `deadline` bounds the EXTRA fix rounds, not the
 /// real work — round 0 (the step's actual doer turn) ALWAYS runs, so a budget already
@@ -1214,9 +1247,18 @@ async fn drive_build_step(
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
     step: &plan_state::PlanStep,
+    // The step's blast radius (transitive downstream-dependent count). A HIGH value
+    // (≥ [`HIGH_BLAST_RADIUS`]) is an upstream node many steps build on — it earns one
+    // extra bounded fix round (rigor weighted by blast radius); a leaf keeps the base
+    // budget. See [`HIGH_BLAST_RADIUS`].
+    blast_radius: usize,
     deadline: std::time::Instant,
 ) -> StepOutcome {
     let seat_id = step.seat.role_id();
+    // Verification RIGOR weighted by blast radius: an expensive-to-unwind upstream step
+    // is tried ONE extra bounded round before it's given up as Blocked. Still finite
+    // and deadline-bounded; the deterministic acceptance is unchanged.
+    let max_fix_rounds = MAX_STEP_FIX_ROUNDS + usize::from(blast_radius >= HIGH_BLAST_RADIUS);
     // The step's focused instruction + (fail-open) recalled stack pitfalls so the
     // doer pre-empts a known trap. relevant_lessons_for_prompt is empty on first
     // runs / a miss, so the directive is unchanged then.
@@ -1241,7 +1283,7 @@ async fn drive_build_step(
 
     let mut drove = false;
     let mut last_reply = String::new();
-    for round in 0..=MAX_STEP_FIX_ROUNDS {
+    for round in 0..=max_fix_rounds {
         // Wall-clock ceiling (graceful): an EXTRA fix round past the budget is
         // abandoned — round 0 (the actual work) always runs, only the re-drives are
         // skipped, so a build can't keep grinding minute-long summon turns past its
@@ -1308,7 +1350,7 @@ async fn drive_build_step(
         }
         // Out of fix budget → leave the step unaccepted (the caller marks it Blocked
         // and the final gate still has the last word). Bounded — never an open grind.
-        if round >= MAX_STEP_FIX_ROUNDS {
+        if round >= max_fix_rounds {
             break;
         }
         // Fold this step's failing acceptance into the NEXT re-drive's directive so
@@ -4989,6 +5031,241 @@ mod tests {
         );
     }
 
+    // ── Blast-radius-weighted verification ordering: among ready peers the highest-
+    //    blast-radius (most-depended-on, expensive-to-unwind) step is scheduled +
+    //    reworked FIRST; a dependency still never runs before its prerequisite; a
+    //    high-blast-radius step earns one extra rigor fix round. ──
+
+    /// The ordered ids of the `active` PlanStepStatus events the run emitted — the
+    /// drive order the scheduler actually chose.
+    fn active_order(rec: &RecordingSink) -> Vec<String> {
+        rec.events()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::PlanStepStatus { id, status, .. } if status == "active" => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A 4-step plan: an independent low-impact peer (`config`, blast radius 0) listed
+    /// FIRST in plan order, an upstream `schema` (blast radius 2: `api` + `ui` depend on
+    /// it), and its two dependents. `config` and `schema` are both ready initially; the
+    /// blast-radius scheduler must drive `schema` first despite `config`'s earlier plan
+    /// position. `api`/`ui` can only run AFTER `schema` is Done (DAG order).
+    fn upstream_peer_plan() -> crate::plan_state::Plan {
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let mk = |id: &str, deps: &[&str]| PlanStep {
+            id: id.into(),
+            title: format!("Build the {id}"),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            status: StepStatus::Pending,
+        };
+        Plan {
+            steps: vec![
+                mk("config", &[]),      // radius 0, first in plan order
+                mk("schema", &[]),      // radius 2 (api + ui)
+                mk("api", &["schema"]), // gated by schema
+                mk("ui", &["schema"]),  // gated by schema
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_drives_high_blast_radius_ready_peer_first_keeping_dag_order() {
+        // Source seeded → every source-present step PASSES in one turn, so the schedule
+        // walks cleanly and we can read the pure DRIVE order. `schema` (radius 2) must be
+        // driven BEFORE `config` (radius 0) even though `config` is earlier in plan order
+        // — the expensive-to-unwind upstream work goes first. And `api`/`ui` (which
+        // depend on `schema`) must run AFTER `schema`, never before (DAG order intact).
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        let mut plan = upstream_peer_plan();
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
+
+        let order = active_order(&rec);
+        let pos = |id: &str| order.iter().position(|x| x == id).expect("step ran");
+        // Priority among the initial ready PEERS: schema (radius 2) before config (0).
+        assert!(
+            pos("schema") < pos("config"),
+            "the higher-blast-radius peer is scheduled first: {order:?}"
+        );
+        // DAG order preserved: a dependent never runs before its prerequisite.
+        assert!(
+            pos("schema") < pos("api") && pos("schema") < pos("ui"),
+            "a dependency (schema) runs before its dependents (api, ui): {order:?}"
+        );
+        // Every step completed cleanly (source present → all accepted).
+        assert!(
+            plan.steps
+                .iter()
+                .all(|s| s.status == crate::plan_state::StepStatus::Done),
+            "the whole DAG drained Done: {:?}",
+            plan.steps
+                .iter()
+                .map(|s| (s.id.clone(), s.status))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn rework_prioritizes_the_higher_blast_radius_blocking_peer() {
+        // NO source → both ready peers (schema, config) FAIL their source-present
+        // acceptance and are reworked, then marked Blocked. The blast-radius scheduler
+        // must rework the higher-impact `schema` (radius 2) FIRST — all of schema's
+        // directives land before any of config's. (schema's block then strands api/ui,
+        // which are pruned — its handling obviates their rework.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        // NO source seeded.
+        let (events, rec) = sink();
+        // Plenty of default-completing turns; a FUTURE deadline so the full per-step fix
+        // budget runs (isolates the rework ORDER from the wall-clock ceiling).
+        let mut sess = FakeSession::new(vec![], false, "");
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        let mut plan = upstream_peer_plan();
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
+
+        // schema is reworked before config: schema becomes Active first.
+        let order = active_order(&rec);
+        let pos = |id: &str| order.iter().position(|x| x == id);
+        assert!(
+            pos("schema").is_some() && pos("config").is_some(),
+            "both failing peers were driven: {order:?}"
+        );
+        assert!(
+            pos("schema") < pos("config"),
+            "the higher-blast-radius blocking peer is reworked first: {order:?}"
+        );
+        // Directive order confirms it at the turn level: every 'schema' directive lands
+        // before the first 'config' directive (schema's whole rework finishes first).
+        let sent = sent.lock().unwrap();
+        let last_schema = sent
+            .iter()
+            .rposition(|d| d.contains("Build the schema"))
+            .expect("schema was driven");
+        let first_config = sent
+            .iter()
+            .position(|d| d.contains("Build the config"))
+            .expect("config was driven");
+        assert!(
+            last_schema < first_config,
+            "schema's rework completes before config's begins: {sent:?}"
+        );
+        // schema ended Blocked; its dependents api/ui were stranded (pruned), not
+        // reworked — the upstream block obviated the downstream rework.
+        use crate::plan_state::StepStatus;
+        let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
+        assert_eq!(by("schema"), StepStatus::Blocked);
+        assert_eq!(by("config"), StepStatus::Blocked);
+        assert_eq!(by("api"), StepStatus::Blocked, "stranded behind schema");
+        assert_eq!(by("ui"), StepStatus::Blocked, "stranded behind schema");
+        assert!(
+            !order.contains(&"api".to_string()) && !order.contains(&"ui".to_string()),
+            "stranded dependents were never driven (rework obviated): {order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn high_blast_radius_step_earns_an_extra_fix_round() {
+        // Rigor weighted by blast radius: a HIGH-blast-radius failing step (schema,
+        // radius 2 ≥ HIGH_BLAST_RADIUS) is re-driven one MORE bounded round than a
+        // radius-0 leaf. With no source, schema fails every round; count the directives
+        // that carry ITS title (the final-gate fix turns don't) → MAX_STEP_FIX_ROUNDS+1
+        // base rounds + 1 rigor bonus.
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        // schema (radius 2: api + ui depend on it) is the only initially-ready step.
+        let mk = |id: &str, deps: &[&str]| PlanStep {
+            id: id.into(),
+            title: format!("Build the {id}"),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            status: StepStatus::Pending,
+        };
+        let mut plan = Plan {
+            steps: vec![
+                mk("schema", &[]),
+                mk("api", &["schema"]),
+                mk("ui", &["schema"]),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        assert_eq!(
+            plan.blast_radius("schema"),
+            2,
+            "schema is high-blast-radius"
+        );
+
+        let _ = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        let schema_directives = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| d.contains("Build the schema"))
+            .count();
+        // Base budget (MAX_STEP_FIX_ROUNDS + 1 = 3) + the rigor bonus (1) = 4 doer turns.
+        assert_eq!(
+            schema_directives,
+            MAX_STEP_FIX_ROUNDS + 1 + 1,
+            "a high-blast-radius step earns one extra fix round"
+        );
+    }
+
     // ── HIGH #1: the wall-clock deadline binds the step-internal + final-gate fix
     //    rounds (round 0 always runs; extra fix rounds past budget are skipped). ──
 
@@ -5376,6 +5653,7 @@ mod tests {
             &events,
             &route,
             &step,
+            0, // a leaf step (no dependents) → base fix budget, no rigor bonus
             std::time::Instant::now() + Duration::from_secs(3_600),
         )
         .await;

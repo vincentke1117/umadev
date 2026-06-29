@@ -211,6 +211,79 @@ impl Plan {
             .collect()
     }
 
+    /// The **blast radius** of a step: the number of OTHER steps that transitively
+    /// depend on it — the size of its downstream cone in the dependency DAG. An
+    /// UPSTREAM node (a schema, an API contract, the scaffold) that many later steps
+    /// build on has a LARGE blast radius: if it is wrong, everything downstream must be
+    /// unwound, so it is the most expensive place to be wrong. A leaf nobody depends on
+    /// has radius 0. The director reads this to verify the high-blast-radius work
+    /// FIRST / most rigorously and to prioritise reworking the highest-blast-radius
+    /// blocking step (its fix may obviate the downstream rework).
+    ///
+    /// Computed as reverse-reachability over `depends_on` (which points UPSTREAM, a
+    /// step → its prerequisites): the edges are inverted to a downstream adjacency, then
+    /// walked from `step_id`. Cycle-safe — a `visited` set bounds the walk even if a
+    /// residual cycle survived (the DAG is normally acyclic, see [`Self::normalized`]);
+    /// the start node itself is excluded. Returns 0 for an unknown id (fail-open). Pure.
+    #[must_use]
+    pub fn blast_radius(&self, step_id: &str) -> usize {
+        downstream_count(&self.downstream_adjacency(), step_id)
+    }
+
+    /// Precompute [`Self::blast_radius`] for EVERY step in one pass (one shared
+    /// downstream adjacency, a reachability walk per node) → `id → downstream-dependent
+    /// count`. The scheduler reads this to order ready peers (and a rework round to
+    /// order its blocking steps) by descending blast radius without rebuilding the
+    /// adjacency each time. Pure.
+    #[must_use]
+    pub fn blast_radius_map(&self) -> std::collections::HashMap<String, usize> {
+        let adj = self.downstream_adjacency();
+        self.steps
+            .iter()
+            .map(|s| (s.id.clone(), downstream_count(&adj, s.id.as_str())))
+            .collect()
+    }
+
+    /// [`Self::ready_steps`] ordered for the scheduler: highest **blast radius** FIRST,
+    /// so among the currently-ready PEERS the most expensive-to-unwind upstream step is
+    /// driven (and verified / reworked) before its lower-impact siblings. This never
+    /// breaks the DAG order — `ready_steps` already guarantees every returned step's
+    /// dependencies are `Done`, so a step still never runs before a prerequisite; this
+    /// only orders the independent peers among themselves. Equal-radius peers keep the
+    /// plan's original order (the sort is stable → deterministic). Pure.
+    #[must_use]
+    pub fn ready_steps_prioritized(&self) -> Vec<&PlanStep> {
+        let radius = self.blast_radius_map();
+        let mut ready = self.ready_steps();
+        // Stable sort by DESCENDING blast radius; ties keep original (plan) order.
+        ready.sort_by_key(|s| std::cmp::Reverse(radius.get(s.id.as_str()).copied().unwrap_or(0)));
+        ready
+    }
+
+    /// Build the **downstream** adjacency of the plan DAG: maps each step id to the ids
+    /// of the steps that DIRECTLY depend on it. `depends_on` points UPSTREAM (a step →
+    /// its prerequisites), so this inverts every edge — a downstream walk then becomes a
+    /// plain forward reachability. Only real step ids are keys/values (any dangling dep
+    /// that survived normalisation is ignored). Borrows from `self`; pure.
+    fn downstream_adjacency(&self) -> std::collections::HashMap<&str, Vec<&str>> {
+        let ids: HashSet<&str> = self.steps.iter().map(|s| s.id.as_str()).collect();
+        let mut adj: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::with_capacity(self.steps.len());
+        // Seed every real step so a leaf (nothing depends on it) still has an entry.
+        for s in &self.steps {
+            adj.entry(s.id.as_str()).or_default();
+        }
+        for s in &self.steps {
+            for d in &s.depends_on {
+                if ids.contains(d.as_str()) {
+                    // `d` is upstream of `s` ⇒ `s` is downstream of `d`.
+                    adj.entry(d.as_str()).or_default().push(s.id.as_str());
+                }
+            }
+        }
+        adj
+    }
+
     /// Set a step's status by id, returning `true` if the id was found. No-op +
     /// `false` for an unknown id (fail-open).
     pub fn mark(&mut self, id: &str, status: StepStatus) -> bool {
@@ -337,6 +410,32 @@ impl Plan {
             self.steps[i].depends_on.retain(|d| d != &dep);
         }
     }
+}
+
+/// Count the steps transitively reachable downstream from `start` over a
+/// [`Plan::downstream_adjacency`] map — i.e. how many steps (directly or transitively)
+/// depend on `start`. The walk is bounded by a `visited` set, so it terminates even if a
+/// residual cycle survived the DAG normalisation (cycle-safe); the start node itself is
+/// excluded from the count. An id absent from the map returns 0 (fail-open). Pure.
+fn downstream_count(adj: &std::collections::HashMap<&str, Vec<&str>>, start: &str) -> usize {
+    // Resolve the canonical key reference so `visited`/`stack` share the map's lifetime.
+    let Some((&start_key, _)) = adj.get_key_value(start) else {
+        return 0;
+    };
+    let mut visited: HashSet<&str> = HashSet::new();
+    visited.insert(start_key);
+    let mut stack = vec![start_key];
+    while let Some(node) = stack.pop() {
+        if let Some(neighbours) = adj.get(node) {
+            for &nb in neighbours {
+                if visited.insert(nb) {
+                    stack.push(nb);
+                }
+            }
+        }
+    }
+    // `visited` includes the start node; subtract it to count only the dependents.
+    visited.len() - 1
 }
 
 /// The relative path of the persisted plan under the project root.
@@ -908,6 +1007,136 @@ mod tests {
         assert!(
             settled.is_none(),
             "a hung base under a spent deadline settles fail-open to None (the plain single-turn build)"
+        );
+    }
+
+    #[test]
+    fn blast_radius_counts_transitive_downstream() {
+        // Linear chain a <- b <- c (c depends on b, b depends on a). a's downstream cone
+        // is {b, c} = 2; b's is {c} = 1; the leaf c is 0.
+        let p = plan(vec![step("a", &[]), step("b", &["a"]), step("c", &["b"])]);
+        assert_eq!(p.blast_radius("a"), 2);
+        assert_eq!(p.blast_radius("b"), 1);
+        assert_eq!(p.blast_radius("c"), 0);
+        // An unknown id fail-opens to 0.
+        assert_eq!(p.blast_radius("ghost"), 0);
+        // The precomputed map agrees with the per-id function.
+        let m = p.blast_radius_map();
+        assert_eq!(m.get("a").copied(), Some(2));
+        assert_eq!(m.get("b").copied(), Some(1));
+        assert_eq!(m.get("c").copied(), Some(0));
+    }
+
+    #[test]
+    fn blast_radius_handles_a_diamond_without_double_counting() {
+        // Diamond: a <- b, a <- c, then d depends on BOTH b and c. a's downstream cone
+        // is {b, c, d} = 3 — d is reachable via two paths but counted ONCE (set-based).
+        let p = plan(vec![
+            step("a", &[]),
+            step("b", &["a"]),
+            step("c", &["a"]),
+            step("d", &["b", "c"]),
+        ]);
+        assert_eq!(
+            p.blast_radius("a"),
+            3,
+            "diamond apex counts d once, not twice"
+        );
+        assert_eq!(p.blast_radius("b"), 1);
+        assert_eq!(p.blast_radius("c"), 1);
+        assert_eq!(p.blast_radius("d"), 0);
+    }
+
+    #[test]
+    fn blast_radius_is_cycle_safe() {
+        // A residual cycle (constructed DIRECTLY, bypassing `normalized`'s cycle-break)
+        // must not hang the reverse-reachability walk: the `visited` set bounds it.
+        // a -> b -> c -> a is a 3-cycle; each node reaches the other two → radius 2.
+        let p = plan(vec![
+            step("a", &["c"]),
+            step("b", &["a"]),
+            step("c", &["b"]),
+        ]);
+        assert_eq!(p.blast_radius("a"), 2);
+        assert_eq!(p.blast_radius("b"), 2);
+        assert_eq!(p.blast_radius("c"), 2);
+        // A 2-cycle a <-> b → each depends on the other → radius 1 (not an infinite loop).
+        let p2 = plan(vec![step("a", &["b"]), step("b", &["a"])]);
+        assert_eq!(p2.blast_radius("a"), 1);
+        assert_eq!(p2.blast_radius("b"), 1);
+    }
+
+    #[test]
+    fn ready_steps_prioritized_orders_ready_peers_by_blast_radius() {
+        // Two independent ready peers with DIFFERENT blast radii, plus two steps that
+        // depend on the high-radius one. `config` is listed FIRST in plan order but has
+        // radius 0; `schema` has radius 2 (api + ui depend on it). The prioritised
+        // schedule must surface `schema` BEFORE `config` even though plan order is the
+        // reverse — the upstream, expensive-to-unwind work is driven first.
+        let mut p = plan(vec![
+            step("config", &[]),      // radius 0, first in plan order
+            step("schema", &[]),      // radius 2 (api, ui)
+            step("api", &["schema"]), // not ready until schema is Done
+            step("ui", &["schema"]),
+        ]);
+        // Plain readiness is plan order: config, schema (api/ui gated by schema).
+        let ready: Vec<_> = p.ready_steps().iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ready, vec!["config", "schema"]);
+        // Prioritised readiness puts the higher-blast-radius peer first.
+        let prio: Vec<_> = p
+            .ready_steps_prioritized()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(prio, vec!["schema", "config"]);
+        // DAG correctness: a dependent never appears before its prerequisite is Done —
+        // api/ui are absent until schema completes.
+        assert!(!prio.contains(&"api".to_string()));
+        assert!(!prio.contains(&"ui".to_string()));
+        // After schema completes, api + ui join the ready set (now downstream is legal),
+        // and every prioritised step still has all deps Done (DAG invariant holds).
+        assert!(p.mark("schema", StepStatus::Done));
+        let prio2: Vec<_> = p
+            .ready_steps_prioritized()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        // config, api, ui are all radius 0 now → stable plan order is preserved.
+        assert_eq!(prio2, vec!["config", "api", "ui"]);
+        let done: HashSet<&str> = p
+            .steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Done)
+            .map(|s| s.id.as_str())
+            .collect();
+        for s in p.ready_steps_prioritized() {
+            assert!(
+                s.depends_on.iter().all(|d| done.contains(d.as_str())),
+                "a prioritised step never precedes an unfinished prerequisite: {}",
+                s.id
+            );
+        }
+    }
+
+    #[test]
+    fn blast_radius_map_prioritizes_rework_of_the_highest_impact_blocking_step() {
+        // The rework-priority primitive: given a set of steps that each carry a blocking
+        // finding, the director reworks the highest-blast-radius one FIRST. `schema`
+        // (radius 2) outranks the independent `docs` (radius 0), so sorting the blocking
+        // ids by the blast-radius map yields schema before docs.
+        let p = plan(vec![
+            step("schema", &[]),
+            step("api", &["schema"]),
+            step("ui", &["schema"]),
+            step("docs", &[]),
+        ]);
+        let radius = p.blast_radius_map();
+        let mut blocking = vec!["docs".to_string(), "schema".to_string()];
+        blocking.sort_by_key(|id| std::cmp::Reverse(radius.get(id.as_str()).copied().unwrap_or(0)));
+        assert_eq!(
+            blocking,
+            vec!["schema".to_string(), "docs".to_string()],
+            "the highest-blast-radius blocking step is reworked first"
         );
     }
 
