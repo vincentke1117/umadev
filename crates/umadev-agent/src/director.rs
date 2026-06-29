@@ -173,6 +173,14 @@ pub enum VerifyKind {
     /// Confirm real source files actually exist on disk (via
     /// [`crate::acceptance::source_files`]) — the "did anything get built" floor.
     SourcePresent,
+    /// Confirm the designer's **design-tokens** deliverable
+    /// (`design-tokens.{json,css}`) is a REAL file on the blackboard (via
+    /// [`crate::acceptance::design_tokens_files`]) — the designer seat's
+    /// anti-theatre floor. This is the deterministic half of the design system;
+    /// the existing governance (UD-CODE-001 emoji-as-icon / UD-CODE-002 hardcoded
+    /// colors) is the qualitative half — together they make "the team has a design
+    /// system" a checkable fact, not a narrated claim.
+    DesignTokensPresent,
 }
 
 impl VerifyKind {
@@ -183,6 +191,7 @@ impl VerifyKind {
             Self::BuildTest => "build-test",
             Self::Contract => "contract",
             Self::SourcePresent => "source-present",
+            Self::DesignTokensPresent => "design-tokens-present",
         }
     }
 }
@@ -504,6 +513,7 @@ pub async fn verify(
         VerifyKind::BuildTest => verify_build_test(options).await,
         VerifyKind::Contract => verify_contract(options),
         VerifyKind::SourcePresent => verify_source_present(options),
+        VerifyKind::DesignTokensPresent => verify_design_tokens(options),
     }
 }
 
@@ -576,6 +586,48 @@ fn verify_source_present(options: &RunOptions) -> VerifyResult {
         available: true,
         passed: n > 0,
         evidence: vec![format!("{n} source file(s) on disk")],
+    }
+}
+
+/// Confirm the designer's `design-tokens.{json,css}` deliverable is a REAL file on
+/// the blackboard — the designer seat's anti-theatre floor (a seat is only "done"
+/// when it produced its artifact, never a narration). `available` is always `true`
+/// (the check can always run — it just reads disk); `passed` iff at least one tokens
+/// file exists. Absent ⇒ a factual reject the director folds into a rework directive
+/// ("write the design system as real tokens"). Composes WITH, never replaces, the
+/// always-on governance that blocks emoji-as-icon (UD-CODE-001) + hardcoded colors
+/// (UD-CODE-002): tokens-present is existence, governance is quality. Fail-open:
+/// reading disk cannot error here (a missing tree simply yields no files → reject).
+fn verify_design_tokens(options: &RunOptions) -> VerifyResult {
+    let files = crate::acceptance::design_tokens_files(&options.project_root);
+    if files.is_empty() {
+        return VerifyResult {
+            available: true,
+            passed: false,
+            evidence: vec![
+                "no design-tokens.{json,css} on the blackboard — the designer must write the \
+                 design system as real token files (a type scale + color palette + spacing + \
+                 the component list), not just describe it"
+                    .to_string(),
+            ],
+        };
+    }
+    let names: Vec<String> = files
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&options.project_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        })
+        .collect();
+    VerifyResult {
+        available: true,
+        passed: true,
+        evidence: vec![format!(
+            "design tokens on the blackboard: {}",
+            names.join(", ")
+        )],
     }
 }
 
@@ -1091,6 +1143,32 @@ mod tests {
         let r = verify(&o, &ev, VerifyKind::SourcePresent).await;
         assert!(r.passed, "a project with source passes");
         assert!(r.evidence[0].contains("source file"));
+    }
+
+    #[tokio::test]
+    async fn verify_design_tokens_present_passes_only_with_a_real_tokens_file() {
+        // The designer seat's anti-theatre floor: DesignTokensPresent is available
+        // (it always can read disk) and passes ONLY when a real design-tokens file
+        // exists — absent ⇒ a factual reject (NOT an unavailable skip), so a designer
+        // that narrated "I designed the system" but wrote no tokens is caught.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        let ev = sink();
+        // No tokens file → available + NOT passed (a real reject, fail-open evidence).
+        let r = verify(&o, &ev, VerifyKind::DesignTokensPresent).await;
+        assert!(r.available, "the tokens check can always run (reads disk)");
+        assert!(!r.passed, "no design-tokens file → reject");
+        assert!(r.evidence[0].contains("design-tokens"));
+        // Write a real design-tokens.css → passes, with the file named as evidence.
+        std::fs::create_dir_all(tmp.path().join("src/styles")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/styles/design-tokens.css"),
+            ":root{--color-bg:#0b0b0c;--font-scale-1:0.75rem}",
+        )
+        .unwrap();
+        let r = verify(&o, &ev, VerifyKind::DesignTokensPresent).await;
+        assert!(r.passed, "a real design-tokens file passes");
+        assert!(r.evidence[0].contains("design-tokens.css"));
     }
 
     #[tokio::test]

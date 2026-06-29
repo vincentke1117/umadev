@@ -624,9 +624,13 @@ pub fn persona_for_role(role: &str) -> &'static str {
         "architect" | "architecture" | "tech-lead" => phase_persona(Phase::Spec),
         "uiux-designer" | "uiux" | "designer" | "ui" | "ux" => {
             "You are now working as a senior UI/UX designer. Your remit: a \
-             deliberate design system — tokens, typography, a declared icon library \
-             (never emoji), every component state — that reads as intentional craft, \
-             never a template."
+             deliberate design system delivered as REAL files on the blackboard — write \
+             `design-tokens.json` (the token source of truth: a typographic scale, a \
+             color palette, spacing, radii, and the component list) AND `design-tokens.css` \
+             (the same tokens as CSS custom properties the frontend imports — never \
+             hardcoded values). Declare an icon library (Lucide / Heroicons / Tabler — \
+             never emoji) and specify every component state. It must read as intentional \
+             craft, never a template."
         }
         "frontend-engineer" | "frontend" | "fe" => phase_persona(Phase::Frontend),
         "backend-engineer" | "backend" | "be" => phase_persona(Phase::Backend),

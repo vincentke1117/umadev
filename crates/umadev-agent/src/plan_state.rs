@@ -103,6 +103,12 @@ pub enum AcceptanceSpec {
     /// The frontend↔backend API contract + requirement coverage holds
     /// (`VerifyKind::Contract`).
     Contract,
+    /// The designer's **design-tokens** deliverable (`design-tokens.{json,css}`)
+    /// is a REAL file on the blackboard (`VerifyKind::DesignTokensPresent`) — the
+    /// designer seat's anti-theatre floor: a design system the team can IMPORT, not
+    /// just a narrated claim. Composes with the always-on governance that blocks
+    /// emoji-as-icon + hardcoded colors (existence here, quality there).
+    DesignTokensPresent,
     /// A review step is accepted by its reviewing seat (no blocking verdict).
     ReviewClean,
     /// No machine criterion — accepted when its work turn settles. The weakest
@@ -125,6 +131,9 @@ impl AcceptanceSpec {
             "source-present" | "source" | "files-exist" | "files" => Self::SourcePresent,
             "build-test" | "build" | "test" | "tests" | "lint" => Self::BuildTest,
             "contract" | "api-contract" | "api" => Self::Contract,
+            "design-tokens-present" | "design-tokens" | "design-system" | "tokens" => {
+                Self::DesignTokensPresent
+            }
             "review-clean" | "review" | "accepted" => Self::ReviewClean,
             "turn-settled" | "none" | "" => {
                 if kind == StepKind::Review {
@@ -339,6 +348,18 @@ impl Plan {
             // optimistic claim.
             s.status = StepStatus::Pending;
         }
+        // Wave B (team deliverables): enforce two structural ordering rules the brain
+        // is asked for but UmaDev guarantees deterministically, then break any cycle
+        // they introduce so the DAG always stays schedulable (fail-open).
+        //   1. CONTRACT-FIRST — the architect's API contract is a hard prerequisite of
+        //      every frontend/backend build step (lock the interface before building
+        //      against it). See [`Self::enforce_contract_first`].
+        //   2. TEST-AUTHOR ≠ CODE-AUTHOR — a QA test-authoring build step never depends
+        //      on the code it will check (de-biasing); it writes tests from the
+        //      contract/spec, schedulable before/independent of the code seat. See
+        //      [`Self::enforce_test_authoring_independence`].
+        self.enforce_contract_first();
+        self.enforce_test_authoring_independence();
         self.break_dependency_cycles();
         self.risks.retain(|r| !r.trim().is_empty());
         self.open_questions.retain(|q| !q.trim().is_empty());
@@ -408,6 +429,77 @@ impl Plan {
 
         for (i, dep) in to_drop {
             self.steps[i].depends_on.retain(|d| d != &dep);
+        }
+    }
+
+    /// **Contract-first DAG ordering** (Wave B deliverable 2) — make the architect's
+    /// API contract a hard `depends_on` PREREQUISITE of every frontend/backend BUILD
+    /// step, so the interface is LOCKED before the engineers build against it (the
+    /// contract is the handoff — `.umadev/contracts/openapi.*` + the architecture API
+    /// table). A "contract step" is any Build step seated by the architect OR whose
+    /// acceptance IS [`AcceptanceSpec::Contract`]; a "consumer" is any Build step
+    /// seated by the frontend/backend engineer. Each consumer gains an edge to each
+    /// contract step (deduped, never a self-edge). Any cycle this introduces (e.g. an
+    /// architect step the brain made depend on an engineer) is broken afterward by
+    /// [`Self::break_dependency_cycles`], so the DAG always stays schedulable.
+    /// No contract step ⇒ a deterministic no-op (fail-open). Pure over `self`.
+    fn enforce_contract_first(&mut self) {
+        use crate::critics::Seat;
+        let contract_ids: Vec<String> = self
+            .steps
+            .iter()
+            .filter(|s| {
+                s.kind == StepKind::Build
+                    && (s.seat == Seat::Architect || s.acceptance == AcceptanceSpec::Contract)
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        if contract_ids.is_empty() {
+            return; // no architect contract in this plan → nothing to order
+        }
+        for s in &mut self.steps {
+            if s.kind != StepKind::Build {
+                continue; // only a BUILD step consumes the contract by building on it
+            }
+            if !matches!(s.seat, Seat::FrontendEngineer | Seat::BackendEngineer) {
+                continue;
+            }
+            for cid in &contract_ids {
+                if cid != &s.id && !s.depends_on.contains(cid) {
+                    s.depends_on.push(cid.clone());
+                }
+            }
+        }
+    }
+
+    /// **Test-author ≠ code-author** (Wave B deliverable 3) — strip any dependency a
+    /// QA test-authoring BUILD step has on a frontend/backend code step, so the QA
+    /// seat writes tests INDEPENDENT of (and schedulable before) the code it checks.
+    /// A test written AGAINST the delivered code inherits that code's blind spots; a
+    /// SEPARATE author working from the contract/spec catches what the code-author
+    /// assumed away (the de-biasing principle). Only QA BUILD steps are affected — a
+    /// QA *review* step legitimately depends on the code (it reads it), and a QA
+    /// dependency on the architect's contract is KEPT (tests should bind the locked
+    /// interface). No QA build step / no code step ⇒ a no-op (fail-open). Pure.
+    fn enforce_test_authoring_independence(&mut self) {
+        use crate::critics::Seat;
+        let code_ids: HashSet<String> = self
+            .steps
+            .iter()
+            .filter(|s| {
+                s.kind == StepKind::Build
+                    && matches!(s.seat, Seat::FrontendEngineer | Seat::BackendEngineer)
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        if code_ids.is_empty() {
+            return;
+        }
+        for s in &mut self.steps {
+            // A QA test-authoring step is a QA-seated step that BUILDS (writes tests).
+            if s.kind == StepKind::Build && s.seat == Seat::QaEngineer {
+                s.depends_on.retain(|d| !code_ids.contains(d));
+            }
         }
     }
 }
@@ -602,7 +694,17 @@ pub async fn synthesize_plan(
          `seat`: one of product-manager, architect, uiux-designer, frontend-engineer, \
          backend-engineer, qa-engineer, security-engineer, devops-engineer. \
          `kind`: build | review. \
-         `acceptance`: source-present | build-test | contract | review-clean. \
+         `acceptance`: source-present | build-test | contract | design-tokens | review-clean. \
+         Team-deliverable rules (UmaDev ALSO enforces these structurally, so honour them): \
+         (a) when there is a UI surface, the uiux-designer has a BUILD step that writes the \
+         design system as real `design-tokens.{{json,css}}` files (acceptance=design-tokens) \
+         and every frontend step depends_on it; \
+         (b) the architect's API contract is a depends_on PREREQUISITE of every \
+         frontend/backend step (lock the interface first); \
+         (c) QA AUTHORS tests as its OWN build step (seat=qa-engineer, kind=build, \
+         acceptance=build-test) that does NOT depend on the frontend/backend code steps — \
+         the test-author must not be the code-author (de-biasing); a QA review step is \
+         separate. \
          JSON shape: {{\"steps\":[{{\"id\":\"scaffold\",\"title\":\"…\",\"seat\":\"…\",\
          \"kind\":\"build\",\"depends_on\":[],\"acceptance\":\"source-present\"}}],\
          \"risks\":[\"…\"],\"open_questions\":[\"…\"]}}",
@@ -671,12 +773,37 @@ mod tests {
         }
     }
 
+    /// A step with an explicit seat / kind / acceptance (for the Wave-B ordering
+    /// tests) — `step()` above always uses a frontend build step.
+    fn step_seat(
+        id: &str,
+        deps: &[&str],
+        seat: Seat,
+        kind: StepKind,
+        acceptance: AcceptanceSpec,
+    ) -> PlanStep {
+        PlanStep {
+            id: id.to_string(),
+            title: format!("step {id}"),
+            seat,
+            kind,
+            depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
+            acceptance,
+            status: StepStatus::Pending,
+        }
+    }
+
     fn plan(steps: Vec<PlanStep>) -> Plan {
         Plan {
             steps,
             risks: vec![],
             open_questions: vec![],
         }
+    }
+
+    /// Find a step's `depends_on` by id (test helper).
+    fn deps_of<'a>(p: &'a Plan, id: &str) -> &'a [String] {
+        &p.steps.iter().find(|s| s.id == id).unwrap().depends_on
     }
 
     #[test]
@@ -1157,6 +1284,219 @@ mod tests {
         assert_eq!(
             AcceptanceSpec::parse("", StepKind::Review),
             AcceptanceSpec::ReviewClean
+        );
+        // Wave B deliverable 1: the designer's design-tokens acceptance + its aliases.
+        for s in ["design-tokens", "design_tokens", "design-system", "tokens"] {
+            assert_eq!(
+                AcceptanceSpec::parse(s, StepKind::Build),
+                AcceptanceSpec::DesignTokensPresent,
+                "{s} → DesignTokensPresent"
+            );
+        }
+    }
+
+    // ── Wave B deliverable 2: contract-first DAG ordering ────────────────────
+
+    #[test]
+    fn contract_first_makes_engineers_depend_on_the_architect() {
+        // An architect contract step + a frontend + a backend build step that the
+        // brain left WITHOUT a contract dependency. Normalisation must insert the
+        // edge so neither engineer is ready until the architect's contract is Done.
+        let p = plan(vec![
+            step_seat(
+                "contract",
+                &[],
+                Seat::Architect,
+                StepKind::Build,
+                AcceptanceSpec::Contract,
+            ),
+            step_seat(
+                "fe",
+                &[],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "be",
+                &[],
+                Seat::BackendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized()
+        .expect("usable");
+        assert!(deps_of(&p, "fe").contains(&"contract".to_string()));
+        assert!(deps_of(&p, "be").contains(&"contract".to_string()));
+        // Only the architect's contract is ready first — the interface is locked
+        // BEFORE the engineers build against it.
+        let ready: Vec<_> = p.ready_steps().iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ready, vec!["contract"]);
+    }
+
+    #[test]
+    fn contract_first_recognizes_a_contract_acceptance_step_and_is_idempotent() {
+        // The "contract step" can be identified by acceptance=Contract even when not
+        // architect-seated, and an engineer that ALREADY depends on it gains no
+        // duplicate edge.
+        let p = plan(vec![
+            step_seat(
+                "api-spec",
+                &[],
+                Seat::BackendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::Contract,
+            ),
+            step_seat(
+                "fe",
+                &["api-spec"],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized()
+        .expect("usable");
+        // Exactly one edge, not a duplicate.
+        assert_eq!(deps_of(&p, "fe"), &["api-spec".to_string()]);
+    }
+
+    #[test]
+    fn contract_first_is_a_noop_without_an_architect_step() {
+        // No architect / contract step → nothing to order; the FE step is ready
+        // immediately (fail-open — we never fabricate a phantom prerequisite).
+        let p = plan(vec![step_seat(
+            "fe",
+            &[],
+            Seat::FrontendEngineer,
+            StepKind::Build,
+            AcceptanceSpec::SourcePresent,
+        )])
+        .normalized()
+        .expect("usable");
+        assert!(deps_of(&p, "fe").is_empty());
+    }
+
+    #[test]
+    fn contract_first_stays_acyclic_if_architect_depends_on_an_engineer() {
+        // A pathological plan where the architect step ALSO depends on the frontend
+        // step. Contract-first adds fe→contract; combined with the brain's
+        // contract→fe that is a cycle — the cycle-breaker must keep the DAG
+        // schedulable (at least one step ready, total deps bounded).
+        let p = plan(vec![
+            step_seat(
+                "contract",
+                &["fe"],
+                Seat::Architect,
+                StepKind::Build,
+                AcceptanceSpec::Contract,
+            ),
+            step_seat(
+                "fe",
+                &[],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized()
+        .expect("usable");
+        assert!(
+            !p.ready_steps().is_empty(),
+            "the cycle was broken → at least one step is ready: {:?}",
+            p.steps
+        );
+    }
+
+    // ── Wave B deliverable 3: QA test-author ≠ code-author ───────────────────
+
+    #[test]
+    fn qa_test_authoring_build_step_is_independent_of_the_code_steps() {
+        // A QA test-authoring BUILD step the brain (wrongly) made depend on the
+        // frontend + backend code, plus a legit dep on the architect's contract.
+        // Normalisation strips the CODE edges (de-biasing) but KEEPS the contract
+        // edge (tests should bind the locked interface).
+        let p = plan(vec![
+            step_seat(
+                "contract",
+                &[],
+                Seat::Architect,
+                StepKind::Build,
+                AcceptanceSpec::Contract,
+            ),
+            step_seat(
+                "fe",
+                &["contract"],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "be",
+                &["contract"],
+                Seat::BackendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "qa-tests",
+                &["contract", "fe", "be"],
+                Seat::QaEngineer,
+                StepKind::Build,
+                AcceptanceSpec::BuildTest,
+            ),
+        ])
+        .normalized()
+        .expect("usable");
+        let qa_deps = deps_of(&p, "qa-tests");
+        assert!(
+            qa_deps.contains(&"contract".to_string()),
+            "the contract edge is KEPT: {qa_deps:?}"
+        );
+        assert!(
+            !qa_deps.contains(&"fe".to_string()) && !qa_deps.contains(&"be".to_string()),
+            "the code edges are stripped (test-author ≠ code-author): {qa_deps:?}"
+        );
+        // Sequencing: once the contract is Done, the QA test step is ready
+        // ALONGSIDE the code (not gated behind it) — the test-author works in
+        // parallel with / before the code-author, never downstream of it.
+        let mut p = p;
+        assert!(p.mark("contract", StepStatus::Done));
+        let ready: Vec<String> = p.ready_steps().iter().map(|s| s.id.clone()).collect();
+        assert!(
+            ready.contains(&"qa-tests".to_string()),
+            "QA tests are ready independent of the code: {ready:?}"
+        );
+        assert!(ready.contains(&"fe".to_string()) && ready.contains(&"be".to_string()));
+    }
+
+    #[test]
+    fn qa_review_step_keeps_its_dependency_on_the_code() {
+        // De-biasing applies only to a QA BUILD (test-authoring) step. A QA REVIEW
+        // step legitimately depends on the code — it READS the delivered code — so
+        // its edge is preserved.
+        let p = plan(vec![
+            step_seat(
+                "fe",
+                &[],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "qa-review",
+                &["fe"],
+                Seat::QaEngineer,
+                StepKind::Review,
+                AcceptanceSpec::ReviewClean,
+            ),
+        ])
+        .normalized()
+        .expect("usable");
+        assert!(
+            deps_of(&p, "qa-review").contains(&"fe".to_string()),
+            "a QA review step keeps its code dependency (it reads the code)"
         );
     }
 }

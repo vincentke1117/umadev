@@ -1625,6 +1625,16 @@ async fn verify_step_acceptance(
         A::SourcePresent => acceptance_from_verify(
             director::verify(options, events, VerifyKind::SourcePresent).await,
         ),
+        // The designer seat's anti-theatre floor: the design system must be a REAL
+        // `design-tokens.{json,css}` file on the blackboard. This check is MORE
+        // specific than the generic source floor (it names the exact deliverable),
+        // so it stands on its own — a present tokens file is positive evidence, an
+        // absent one is an honest reject the director folds into a rework directive.
+        // (Not layered with source-present: a `design-tokens.json`-only deliverable
+        // is a non-source ext, so the source floor would falsely sink it.)
+        A::DesignTokensPresent => acceptance_from_verify(
+            director::verify(options, events, VerifyKind::DesignTokensPresent).await,
+        ),
         A::BuildTest => {
             // Honesty floor first: no source ⇒ fail regardless of a skipped build.
             let src = director::verify(options, events, VerifyKind::SourcePresent).await;
@@ -1928,6 +1938,7 @@ fn acceptance_label(spec: &plan_state::AcceptanceSpec) -> &'static str {
         A::SourcePresent => "real source files exist on disk",
         A::BuildTest => "the project's build/test passes",
         A::Contract => "the frontend↔backend API contract holds",
+        A::DesignTokensPresent => "the design-tokens.{json,css} design system exists on disk",
         A::ReviewClean => "the review team raises no blocking issue",
         A::TurnSettled => "the work turn completes",
     }

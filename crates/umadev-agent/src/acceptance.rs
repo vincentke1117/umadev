@@ -82,6 +82,54 @@ pub fn source_files(project_root: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Locate the designer's **design-tokens** deliverable on the blackboard — the
+/// `design-tokens.json` (the token source of truth: a type scale, color palette,
+/// spacing, the component list) and/or `design-tokens.css` (the same tokens as CSS
+/// custom properties the frontend imports). This is the deterministic backing for
+/// the `DesignTokensPresent` acceptance: the designer seat is only "done" when its
+/// design system is a REAL file, not a narrated claim (anti-theatre).
+///
+/// Bounded recursive scan (depth 6, first 8 hits) for a file named
+/// `design-tokens.json` / `design-tokens.css` (case-insensitive). Unlike
+/// [`source_files`] it deliberately DESCENDS into `output/` — a tokens file
+/// legitimately lives on the doc blackboard there — while still skipping
+/// build/vendor/VCS dirs. Pure + fail-open: an unreadable tree yields an empty list
+/// (treated by the caller as "absent"), never an error.
+#[must_use]
+pub fn design_tokens_files(project_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    find_design_tokens(project_root, &mut out, 0);
+    out
+}
+
+/// Recursive worker for [`design_tokens_files`] (bounded: depth 6, 8 files).
+fn find_design_tokens(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 6 || out.len() >= 8 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Skip dot-dirs + build/vendor/VCS dirs — but DO descend into `output`
+            // (the tokens file is a legitimate blackboard artifact there), so the
+            // generic `output` skip does not apply to this scan.
+            if name.starts_with('.') || (SKIP_DIRS.contains(&name) && name != "output") {
+                continue;
+            }
+            find_design_tokens(&p, out, depth + 1);
+        } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            let lower = name.to_ascii_lowercase();
+            if lower == "design-tokens.json" || lower == "design-tokens.css" {
+                out.push(p);
+            }
+        }
+    }
+}
+
 /// The concatenated source of the project (bounded to ~2 MB) — the surface we
 /// search for endpoint implementations.
 fn implementation_surface(root: &Path) -> String {
@@ -219,6 +267,41 @@ mod tests {
         .unwrap();
         let gaps2 = task_acceptance_gaps(tmp.path(), "demo");
         assert!(gaps2.is_empty(), "all endpoints implemented: {gaps2:?}");
+    }
+
+    #[test]
+    fn design_tokens_files_found_in_src_and_output_and_empty_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        // Absent → empty (the DesignTokensPresent acceptance then rejects).
+        assert!(
+            design_tokens_files(tmp.path()).is_empty(),
+            "no tokens file → empty (absent)"
+        );
+        // A CSS token file in a conventional style dir is found.
+        fs::create_dir_all(tmp.path().join("src/styles")).unwrap();
+        fs::write(
+            tmp.path().join("src/styles/design-tokens.css"),
+            ":root{--color-bg:#fff}",
+        )
+        .unwrap();
+        let found = design_tokens_files(tmp.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].ends_with("design-tokens.css"));
+        // A JSON token file on the doc blackboard (output/, normally skipped for
+        // source) is ALSO found — the scan descends into output for this artifact.
+        fs::create_dir_all(tmp.path().join("output")).unwrap();
+        fs::write(
+            tmp.path().join("output/design-tokens.json"),
+            r##"{"color":{"bg":"#fff"}}"##,
+        )
+        .unwrap();
+        let found = design_tokens_files(tmp.path());
+        assert_eq!(
+            found.len(),
+            2,
+            "both the css and the output json: {found:?}"
+        );
+        assert!(found.iter().any(|p| p.ends_with("design-tokens.json")));
     }
 
     #[test]
