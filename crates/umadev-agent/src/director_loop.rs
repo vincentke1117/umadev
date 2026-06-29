@@ -2292,6 +2292,14 @@ async fn drive_one_turn(
                     event: StreamEvent::Text { delta },
                 });
             }
+            SessionEvent::ThinkingDelta(delta) => {
+                // The base's extended-thinking reasoning — surfaced as a collapsed
+                // `[thinking]` block (transparency) and NOT folded into the answer
+                // `text` (which the deterministic floor / acceptance keys off).
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ThinkingDelta(delta),
+                });
+            }
             SessionEvent::ToolCall { name, input } => {
                 // Surface what the base actually DID (the source of truth). The
                 // governance hook governs the write itself in real time (claude); the

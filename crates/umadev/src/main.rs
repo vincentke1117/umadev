@@ -2248,8 +2248,12 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
             umadev_runtime::StreamEvent::Text { delta } => {
                 eprint!("{delta}");
             }
-            // A "thinking" pulse carries no content — don't spam the log with it.
-            umadev_runtime::StreamEvent::Thinking => {}
+            // A "thinking" pulse carries no content, and streamed reasoning
+            // (extended thinking) would interleave confusingly with the answer on
+            // the plain CLI log — the TUI folds reasoning into a collapsed
+            // `[thinking]` block, but here we keep the log clean and skip both.
+            umadev_runtime::StreamEvent::Thinking
+            | umadev_runtime::StreamEvent::ThinkingDelta(_) => {}
         },
         // Wave-1 director surface on the CLI: route decision, owned plan, step
         // progress, and team verdicts — so `umadev run` from a terminal also SEES

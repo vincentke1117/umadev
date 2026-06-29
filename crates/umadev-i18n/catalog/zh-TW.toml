@@ -594,6 +594,9 @@
 # 長輸出摺疊:摺疊摘要列 + 每則訊息的展開提示
 "tui.fold.collapsed" = "… 還有 {} 行 · {}"
 "tui.fold.expand_hint" = "Ctrl+O 展開全部"
+# 摺疊的 [thinking] 思考塊:附在 `[thinking] 正在思考… · 4.2s` 標頭後的展開提示,
+# 讓使用者知道底座的思考過程可以展開(全域 Ctrl+O 詳細開關會顯示思考文字)。
+"tui.thinking.expand_hint" = "Ctrl+O 展開思考"
 # 摺疊的 diff 卡片標頭:檔案 (+增 −刪) · 展開提示
 "tui.diff.collapsed" = "{} (+{} −{}) · {}"
 # 展開的 diff 渲染到行數上限後的截斷尾巴(開啟檔案檢視完整變更)

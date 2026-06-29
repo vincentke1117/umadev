@@ -467,7 +467,15 @@ fn parse_claude_stream_line(line: &str) -> Option<umadev_runtime::StreamEvent> {
                 let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match block_type {
                     "thinking" => {
-                        return Some(umadev_runtime::StreamEvent::Thinking);
+                        // The aggregate `thinking` block carries the full reasoning
+                        // text — surface it as a `ThinkingDelta` so the TUI renders a
+                        // collapsed `[thinking]` block. Fail-open: an empty/absent
+                        // `thinking` field degrades to the content-less pulse.
+                        let text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                        if text.is_empty() {
+                            return Some(umadev_runtime::StreamEvent::Thinking);
+                        }
+                        return Some(umadev_runtime::StreamEvent::ThinkingDelta(text.to_string()));
                     }
                     "text" => {
                         if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
@@ -987,12 +995,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_emits_thinking_indicator() {
-        // claude emits "thinking" content blocks — we emit a Thinking event
-        // so the TUI can show a "[thinking] thinking..." indicator.
+    fn parse_emits_thinking_text_as_reasoning_delta() {
+        // claude emits "thinking" content blocks carrying the reasoning text — we
+        // surface that text as a ThinkingDelta so the TUI shows a collapsed
+        // `[thinking]` block the user can expand.
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"let me reason"}]}}"#;
+        let ev = parse_claude_stream_line(line).expect("thinking should emit a reasoning delta");
+        assert!(
+            matches!(ev, StreamEvent::ThinkingDelta(ref t) if t == "let me reason"),
+            "expected ThinkingDelta carrying the reasoning text, got {ev:?}"
+        );
+    }
+
+    #[test]
+    fn parse_emits_content_less_thinking_pulse_when_no_text() {
+        // An empty/absent `thinking` field degrades fail-open to the content-less
+        // pulse (still opens the spinner block, just no reasoning to show).
         let line =
-            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"..."}]}}"#;
-        let ev = parse_claude_stream_line(line).expect("thinking should emit Thinking event");
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":""}]}}"#;
+        let ev = parse_claude_stream_line(line).expect("empty thinking still emits a pulse");
         assert!(matches!(ev, StreamEvent::Thinking));
     }
 

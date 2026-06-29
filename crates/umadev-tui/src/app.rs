@@ -52,8 +52,16 @@ const INPUT_CAP: usize = 8192;
 
 /// Marker prefix on the live `Thinking` placeholder System row (P5c). Used to
 /// re-validate the row before collapsing it to a summary, so a shifted/rolled-off
-/// history index can never rewrite an unrelated row.
+/// history index can never rewrite an unrelated row. Also the structural sentinel
+/// the renderer keys off to fold a reasoning block: a System row whose first line
+/// starts with this tag and that has reasoning lines below is a collapsible
+/// `[thinking]` block (the base's extended-thinking text, default-collapsed).
 pub(crate) const THINKING_PLACEHOLDER_TAG: &str = "[thinking]";
+
+/// Hard cap (bytes) on the reasoning text accumulated into ONE `[thinking]` block,
+/// so a long extended-thinking stream can never blow up the transcript / memory.
+/// Past this the block stops growing (the early reasoning is the useful part).
+pub(crate) const THINKING_REASONING_MAX: usize = 16_000;
 
 /// Which screen the TUI is showing.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -4341,16 +4349,34 @@ impl App {
                         // no-ops until the block collapses on the next real content.
                         self.stream_text_active = false;
                         self.stream_tool_batch = None;
-                        if self.thinking_block_idx.is_none() {
-                            self.thinking_block_start = Some(std::time::Instant::now());
-                            self.push(
-                                ChatRole::System,
-                                format!(
-                                    "{THINKING_PLACEHOLDER_TAG} {}",
-                                    umadev_i18n::t(self.lang, "status.thinking")
-                                ),
-                            );
-                            self.thinking_block_idx = Some(self.history.len() - 1);
+                        self.open_thinking_block();
+                    }
+                    umadev_runtime::StreamEvent::ThinkingDelta(delta) => {
+                        // Phase-2-C-P0 transparency: accumulate the base's
+                        // extended-thinking reasoning into ONE collapsible
+                        // `[thinking]` block (default collapsed — the global Ctrl+O
+                        // verbose toggle / Ctrl+R expands it). The first delta opens
+                        // the block (mirrors `Thinking`); every later delta appends
+                        // to the SAME row, so a long reasoning stream is one foldable
+                        // block, never a row per delta. The live "正在思考 (Ns)"
+                        // spinner is the bottom waiting indicator and is untouched.
+                        self.stream_text_active = false;
+                        self.stream_tool_batch = None;
+                        self.open_thinking_block();
+                        if let Some(idx) = self.thinking_block_idx {
+                            if let Some(text) =
+                                self.history.get_mut(idx).and_then(ChatMessage::text_mut)
+                            {
+                                // The reasoning lives BELOW the `[thinking] …` header
+                                // line, so the first chunk starts a fresh line. Bound
+                                // the block so a runaway stream can't grow unbounded.
+                                if text.len() < THINKING_REASONING_MAX {
+                                    if !text.contains('\n') {
+                                        text.push('\n');
+                                    }
+                                    text.push_str(&delta);
+                                }
+                            }
                         }
                     }
                 }
@@ -5432,46 +5458,89 @@ impl App {
         }
     }
 
-    /// P5c: close an open reasoning block — rewrite its live `[thinking]`
-    /// placeholder row to a one-line summary (`正在思考… · 4.2s`, timed from the
-    /// block start) instead of leaving an orphan spinner row. Called the moment
-    /// real content (text / a tool call / a result) arrives after a `Thinking`
-    /// event. No-op when no block is open.
+    /// Open (once) the live `[thinking]` reasoning block: push a single System
+    /// placeholder row (`[thinking] 正在思考…`), default-collapsed, and record its
+    /// index + start time. A no-op when a block is already open — so a burst of
+    /// `Thinking` / `ThinkingDelta` events never stacks a wall of rows. Shared by
+    /// both the content-less `Thinking` pulse and the text-bearing `ThinkingDelta`.
+    fn open_thinking_block(&mut self) {
+        if self.thinking_block_idx.is_some() {
+            return;
+        }
+        self.thinking_block_start = Some(std::time::Instant::now());
+        self.push(
+            ChatRole::System,
+            format!(
+                "{THINKING_PLACEHOLDER_TAG} {}",
+                umadev_i18n::t(self.lang, "status.thinking")
+            ),
+        );
+        let idx = self.history.len() - 1;
+        self.thinking_block_idx = Some(idx);
+        // Default collapsed: any reasoning text accumulated into this block hides
+        // behind the fold until the user expands it (Ctrl+O / Ctrl+R).
+        if let Some(msg) = self.history.get_mut(idx) {
+            msg.collapsed = true;
+        }
+    }
+
+    /// P5c: close an open reasoning block when real content arrives. Rewrites the
+    /// live `[thinking]` placeholder's HEADER line to a one-line summary (`正在思考…
+    /// · 4.2s`, timed from the block start). When the block accumulated reasoning
+    /// text (extended thinking), the reasoning is PRESERVED below the header and the
+    /// row stays a default-collapsed foldable block the user can expand (Ctrl+O);
+    /// with no reasoning it degrades to the legacy plain summary (the tag is dropped
+    /// — nothing to expand). No-op when no block is open.
     ///
     /// Fail-open: the stored index is re-validated against the row's content
     /// (still a System `[thinking]` row) before any rewrite, so a rolled-off or
     /// shifted index can never clobber an unrelated message; a missing timestamp
-    /// degrades to a plain "思考完成"/"done thinking" with no seconds.
+    /// degrades to a plain completion marker with no seconds.
     fn collapse_thinking_block(&mut self) {
         let Some(idx) = self.thinking_block_idx.take() else {
             return;
         };
         let start = self.thinking_block_start.take();
+        let label = umadev_i18n::t(self.lang, "status.thinking");
         let summary = match start {
-            Some(t) => {
-                // One decimal place of seconds — `思考 · 4.2s`.
-                let secs = t.elapsed().as_secs_f64();
-                format!(
-                    "{} · {secs:.1}s",
-                    umadev_i18n::t(self.lang, "status.thinking")
-                )
-            }
+            // One decimal place of seconds — `思考 · 4.2s`.
+            Some(t) => format!("{label} · {:.1}s", t.elapsed().as_secs_f64()),
             // Fail-open: no timing → a plain completion marker, no seconds.
-            None => format!("{} ✓", umadev_i18n::t(self.lang, "status.thinking")),
+            None => format!("{label} \u{2713}"),
         };
         // Re-validate: only rewrite if the row is still the System placeholder we
         // pushed (its content starts with the marker tag). Otherwise leave it be.
-        if let Some(msg) = self.history.get_mut(idx) {
-            let is_placeholder = msg.role == ChatRole::System
-                && msg
-                    .body()
-                    .trim_start()
-                    .starts_with(THINKING_PLACEHOLDER_TAG);
-            if is_placeholder {
-                if let Some(text) = msg.text_mut() {
-                    *text = summary;
-                }
+        let Some(msg) = self.history.get_mut(idx) else {
+            return;
+        };
+        let is_placeholder = msg.role == ChatRole::System
+            && msg
+                .body()
+                .trim_start()
+                .starts_with(THINKING_PLACEHOLDER_TAG);
+        if !is_placeholder {
+            return;
+        }
+        // Preserve any accumulated reasoning (the lines BELOW the header): rewrite
+        // only the header to the timed summary + keep the block foldable. With NO
+        // reasoning, drop the tag and leave a plain one-line summary (legacy path).
+        let mut has_reasoning = false;
+        if let Some(text) = msg.text_mut() {
+            // Own the reasoning first so the `*text = …` mutable write doesn't alias
+            // the `split_once` immutable borrow.
+            let reasoning = text
+                .split_once('\n')
+                .map(|(_, r)| r.to_string())
+                .filter(|r| !r.trim().is_empty());
+            if let Some(r) = reasoning {
+                *text = format!("{THINKING_PLACEHOLDER_TAG} {summary}\n{r}");
+                has_reasoning = true;
+            } else {
+                *text = summary;
             }
+        }
+        if has_reasoning {
+            msg.collapsed = true;
         }
     }
 
@@ -8948,11 +9017,27 @@ pub(crate) fn should_warn_codex_sandbox(
     mode.is_high_risk() && backend == Some("codex")
 }
 
+/// A System `[thinking]` reasoning block: its first line is the `[thinking] …`
+/// header and there is at least one reasoning line below it (the base's accumulated
+/// extended-thinking text). Such a row folds (default collapsed; Ctrl+O / Ctrl+R
+/// expands) — distinct from an ordinary one-line System status row, which never
+/// folds, and from a content-less / no-reasoning summary (whose tag was dropped on
+/// collapse, so it no longer starts with the tag).
+pub(crate) fn is_thinking_reasoning_block(role: ChatRole, body: &str) -> bool {
+    role == ChatRole::System
+        && body.trim_start().starts_with(THINKING_PLACEHOLDER_TAG)
+        && body.lines().count() > 1
+}
+
 pub(crate) fn message_is_collapsible(m: &ChatMessage) -> bool {
     match &m.kind {
         MessageBody::Text(s) => {
-            matches!(m.role, ChatRole::Host | ChatRole::UmaDev)
-                && s.lines().count() > FOLD_THRESHOLD
+            (matches!(m.role, ChatRole::Host | ChatRole::UmaDev)
+                && s.lines().count() > FOLD_THRESHOLD)
+                // A `[thinking]` reasoning block folds regardless of length, so the
+                // user can collapse/expand the base's chain of thought (Ctrl+R) and
+                // the global Ctrl+O reveal-all reaches it too.
+                || is_thinking_reasoning_block(m.role, s)
         }
         MessageBody::Tool(t) => t
             .result
@@ -13559,6 +13644,81 @@ mod tests {
         assert!(
             !row.contains(THINKING_PLACEHOLDER_TAG),
             "placeholder still collapsed without timing: {row:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_deltas_accumulate_into_one_collapsed_block() {
+        // Phase-2-C-P0: a stream of reasoning deltas must build ONE foldable
+        // `[thinking]` block (not a row per delta), default collapsed, and the
+        // reasoning text must be preserved in that single row.
+        let mut a = fresh_app(Some("offline"));
+        let before = a.history.len();
+        for chunk in ["Let me ", "think about ", "the architecture."] {
+            a.apply_engine(EngineEvent::WorkerStream {
+                event: umadev_runtime::StreamEvent::ThinkingDelta(chunk.into()),
+            });
+        }
+        // Exactly ONE new row despite three deltas.
+        assert_eq!(
+            a.history.len(),
+            before + 1,
+            "reasoning deltas must fold into one block, not a row per delta"
+        );
+        let idx = a.thinking_block_idx.expect("a reasoning block is open");
+        let body = a.history.get(idx).unwrap().body().into_owned();
+        assert!(
+            body.starts_with(THINKING_PLACEHOLDER_TAG),
+            "header tag: {body:?}"
+        );
+        assert!(
+            body.contains("Let me think about the architecture."),
+            "the full reasoning text is accumulated: {body:?}"
+        );
+        // Default collapsed, and recognized as a foldable reasoning block.
+        let msg = a.history.get(idx).unwrap();
+        assert!(msg.collapsed, "the reasoning block defaults to collapsed");
+        assert!(
+            crate::app::is_thinking_reasoning_block(msg.role, body.as_str()),
+            "row is a foldable [thinking] reasoning block"
+        );
+        // Real content closes the block but KEEPS the reasoning + the expandable tag.
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::Text {
+                delta: "Here is the plan.".into(),
+            },
+        });
+        assert!(a.thinking_block_idx.is_none(), "block closed after content");
+        let after = a.history.get(idx).unwrap();
+        let after_body = after.body().into_owned();
+        assert!(
+            after_body.starts_with(THINKING_PLACEHOLDER_TAG),
+            "a reasoning block keeps its expandable tag after collapse: {after_body:?}"
+        );
+        assert!(
+            after_body.contains("Let me think about the architecture."),
+            "the reasoning survives collapse so it can be expanded: {after_body:?}"
+        );
+        assert!(after.collapsed, "still collapsed (expand with Ctrl+O)");
+    }
+
+    #[test]
+    fn a_turn_with_no_thinking_shows_no_reasoning_block() {
+        // A plain answer with no reasoning deltas must add NO `[thinking]` block.
+        let mut a = fresh_app(Some("offline"));
+        let before = a.history.len();
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::Text {
+                delta: "just an answer".into(),
+            },
+        });
+        assert!(a.thinking_block_idx.is_none(), "no block opened");
+        assert!(
+            a.history
+                .iter()
+                .skip(before)
+                .all(|m| !m.body().contains(THINKING_PLACEHOLDER_TAG)),
+            "no [thinking] row when the turn never reasoned"
         );
     }
 

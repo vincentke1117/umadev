@@ -528,8 +528,10 @@ pub fn parse_stdout_line(line: &str) -> Vec<SessionEvent> {
 }
 
 /// A `stream_event` frame (present with `--include-partial-messages`) → a
-/// `TextDelta` for each `content_block_delta` carrying a `text_delta`. Thinking
-/// deltas, tool-arg (`input_json_delta`) deltas, and the start/stop frames are
+/// `TextDelta` for each `content_block_delta` carrying a `text_delta`, OR a
+/// `ThinkingDelta` for a `thinking_delta` (the base's extended-thinking
+/// reasoning, surfaced as a collapsed `[thinking]` block in the TUI). Tool-arg
+/// (`input_json_delta`) / `signature_delta` deltas and the start/stop frames are
 /// ignored — tool calls are surfaced from the final aggregate `assistant` block.
 fn parse_stream_event(v: &Value) -> Vec<SessionEvent> {
     let Some(event) = v.get("event") else {
@@ -539,15 +541,23 @@ fn parse_stream_event(v: &Value) -> Vec<SessionEvent> {
         return vec![];
     }
     let delta = event.get("delta");
-    if delta.and_then(|d| d.get("type")).and_then(Value::as_str) != Some("text_delta") {
-        return vec![]; // thinking_delta / input_json_delta → not displayed text
+    match delta.and_then(|d| d.get("type")).and_then(Value::as_str) {
+        Some("text_delta") => delta
+            .and_then(|d| d.get("text"))
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(|t| vec![SessionEvent::TextDelta(t.to_string())])
+            .unwrap_or_default(),
+        // Extended-thinking reasoning chunk: the text lives under `thinking`.
+        // Routed to the collapsed `[thinking]` block, NOT the answer stream.
+        Some("thinking_delta") => delta
+            .and_then(|d| d.get("thinking"))
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(|t| vec![SessionEvent::ThinkingDelta(t.to_string())])
+            .unwrap_or_default(),
+        _ => vec![], // input_json_delta / signature_delta → not displayed
     }
-    delta
-        .and_then(|d| d.get("text"))
-        .and_then(Value::as_str)
-        .filter(|t| !t.is_empty())
-        .map(|t| vec![SessionEvent::TextDelta(t.to_string())])
-        .unwrap_or_default()
 }
 
 /// Assistant content blocks → text deltas + tool calls.
@@ -971,9 +981,16 @@ mod tests {
             parse_stdout_line(line),
             vec![SessionEvent::TextDelta("Hello".to_string())]
         );
-        // A thinking / tool-arg delta is NOT surfaced as displayed text.
+        // A thinking delta is surfaced as ITS OWN reasoning event (the collapsed
+        // `[thinking]` block), NOT mixed into the answer text stream.
         let think = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}}"#;
-        assert!(parse_stdout_line(think).is_empty());
+        assert_eq!(
+            parse_stdout_line(think),
+            vec![SessionEvent::ThinkingDelta("hmm".to_string())]
+        );
+        // A tool-arg (`input_json_delta`) / signature delta is still NOT displayed.
+        let arg = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{"}}}"#;
+        assert!(parse_stdout_line(arg).is_empty());
         // The session is actually launched with the flag (both main + fork).
         assert!(session_args("sid", None, false)
             .iter()

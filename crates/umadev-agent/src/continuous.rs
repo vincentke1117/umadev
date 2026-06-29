@@ -538,6 +538,13 @@ async fn drive_phase(
                     event: StreamEvent::Text { delta: text },
                 });
             }
+            SessionEvent::ThinkingDelta(text) => {
+                // The base's extended-thinking reasoning — surfaced as a collapsed
+                // `[thinking]` block (transparency), never folded into the answer.
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ThinkingDelta(text),
+                });
+            }
             SessionEvent::ToolCall { name, input } => {
                 govern_tool_call(options, events, &policy, phase, &name, &input);
             }
@@ -1853,6 +1860,13 @@ async fn drive_rework_turn_with_idle(
                 text.push_str(&delta);
                 events.emit(EngineEvent::WorkerStream {
                     event: StreamEvent::Text { delta },
+                });
+            }
+            SessionEvent::ThinkingDelta(delta) => {
+                // Reasoning during a rework round — stream it to the collapsed
+                // `[thinking]` block; never accumulate it into the answer `text`.
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ThinkingDelta(delta),
                 });
             }
             SessionEvent::ToolCall { name, input } => {

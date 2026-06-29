@@ -3046,6 +3046,14 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     event: umadev_runtime::StreamEvent::Text { delta },
                 });
             }
+            umadev_runtime::SessionEvent::ThinkingDelta(delta) => {
+                // The base reasoned before answering this chat turn — surface that
+                // reasoning as a collapsed `[thinking]` block (Ctrl+O to expand), the
+                // transparency win. NOT accumulated into `text_acc` (the answer).
+                sink.emit(EngineEvent::WorkerStream {
+                    event: umadev_runtime::StreamEvent::ThinkingDelta(delta),
+                });
+            }
             umadev_runtime::SessionEvent::ToolCall { name, input } => {
                 // The FIRST workspace write flips the turn into a build (one-shot,
                 // fail-open). The base decides chat-vs-build by ACTING.

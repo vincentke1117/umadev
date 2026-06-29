@@ -310,11 +310,19 @@ pub enum StreamEvent {
         /// Warning message.
         message: String,
     },
-    /// The worker is in extended thinking mode (Claude's `thinking` blocks).
-    /// Emitted once when a thinking block starts so the TUI can show a
-    /// `[thinking] thinking...` indicator. No text payload — the thinking content is
-    /// private and not displayed.
+    /// The worker is in extended thinking mode (Claude's `thinking` blocks) but
+    /// exposed NO reasoning text — a content-less pulse so the TUI can open a
+    /// `[thinking]` indicator + spinner. Bases that DO expose the reasoning text
+    /// emit [`StreamEvent::ThinkingDelta`] instead (which also opens the block).
     Thinking,
+    /// A chunk of the worker's REASONING text (Claude's extended-thinking
+    /// `thinking` content — partial; concatenate for the full reasoning). Parallels
+    /// [`StreamEvent::Text`] but routes to a COLLAPSED `[thinking]` transcript block
+    /// the user can expand (the global Ctrl+O verbose toggle / Ctrl+R), so the
+    /// base's private chain of thought is visible for transparency without flooding
+    /// the answer stream. The first delta opens the block; later deltas accumulate
+    /// into the SAME one foldable block (never a row per delta).
+    ThinkingDelta(String),
 }
 
 impl StreamEvent {
@@ -519,6 +527,14 @@ pub enum TurnStatus {
 pub enum SessionEvent {
     /// A chunk of assistant text (concatenate for the full message).
     TextDelta(String),
+    /// A chunk of the base's REASONING text (Claude extended-thinking
+    /// `thinking_delta` blocks — partial; concatenate for the full reasoning).
+    /// Parallels [`SessionEvent::TextDelta`] but is the base's private chain of
+    /// thought, surfaced to the TUI as a COLLAPSED `[thinking]` block (transparency
+    /// without polluting the answer). **Fail-open:** a base that exposes no thinking
+    /// simply never emits this; an unparseable thinking frame is skipped, never a
+    /// panic.
+    ThinkingDelta(String),
     /// The base invoked a tool — `name` is the tool id (`Write`/`Edit`/`Bash`/
     /// `Read`/…), `input` the raw tool input (e.g. `{"file_path": "..."}`).
     /// This is where a real file write shows up.

@@ -594,6 +594,9 @@
 # 长输出折叠:折叠摘要行 + 每条消息的展开提示
 "tui.fold.collapsed" = "… 还有 {} 行 · {}"
 "tui.fold.expand_hint" = "Ctrl+O 展开全部"
+# 折叠的 [thinking] 思考块:附在 `[thinking] 正在思考… · 4.2s` 头部后的展开提示,
+# 让用户知道底座的思考过程可以展开(全局 Ctrl+O 详细开关会显示思考文本)。
+"tui.thinking.expand_hint" = "Ctrl+O 展开思考"
 # 折叠的 diff 卡头部:文件 (+增 −删) · 展开提示
 "tui.diff.collapsed" = "{} (+{} −{}) · {}"
 # 展开的 diff 渲染到行数上限后的截断尾巴(打开文件查看完整改动)

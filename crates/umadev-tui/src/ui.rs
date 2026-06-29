@@ -3396,12 +3396,68 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             // old `  ` two-space prefix becomes the `▎ ` spine so System shares
             // the unified gutter and gets a vertical bar like every other turn.
             ChatRole::System => {
-                for line in body.lines() {
-                    let spans = vec![
-                        role_spine_span(ChatRole::System),
-                        Span::styled(line.to_string(), Style::default().fg(theme::TEXT_MUTED())),
-                    ];
-                    rendered.push(RenderedRow::spined(Line::from(spans), GUTTER_W, spine));
+                // A `[thinking]` reasoning block folds: collapsed (default) shows
+                // just the `[thinking] …` header + an expand hint; expanded (the
+                // global Ctrl+O verbose toggle, or Ctrl+R on the latest) reveals the
+                // base's chain of thought below it (muted italic — visually secondary
+                // to the answer). Any other System line renders unchanged.
+                if crate::app::is_thinking_reasoning_block(msg.role, body.as_ref()) {
+                    let mut lines = body.lines();
+                    let header = lines.next().unwrap_or("");
+                    let expanded = app.verbose || !msg.collapsed;
+                    if expanded {
+                        rendered.push(RenderedRow::spined(
+                            Line::from(vec![
+                                role_spine_span(ChatRole::System),
+                                Span::styled(
+                                    header.to_string(),
+                                    Style::default().fg(theme::TEXT_MUTED()),
+                                ),
+                            ]),
+                            GUTTER_W,
+                            spine,
+                        ));
+                        for line in lines {
+                            rendered.push(RenderedRow::spined(
+                                Line::from(vec![
+                                    role_spine_span(ChatRole::System),
+                                    Span::styled(
+                                        line.to_string(),
+                                        Style::default()
+                                            .fg(theme::TEXT_MUTED())
+                                            .add_modifier(Modifier::ITALIC),
+                                    ),
+                                ]),
+                                GUTTER_W,
+                                spine,
+                            ));
+                        }
+                    } else {
+                        // Collapsed: one muted line — the header + the expand hint.
+                        let hint = umadev_i18n::t(app.lang, "tui.thinking.expand_hint");
+                        rendered.push(RenderedRow::spined(
+                            Line::from(vec![
+                                role_spine_span(ChatRole::System),
+                                Span::styled(
+                                    format!("{header} · {hint}"),
+                                    Style::default().fg(theme::TEXT_MUTED()),
+                                ),
+                            ]),
+                            GUTTER_W,
+                            spine,
+                        ));
+                    }
+                } else {
+                    for line in body.lines() {
+                        let spans = vec![
+                            role_spine_span(ChatRole::System),
+                            Span::styled(
+                                line.to_string(),
+                                Style::default().fg(theme::TEXT_MUTED()),
+                            ),
+                        ];
+                        rendered.push(RenderedRow::spined(Line::from(spans), GUTTER_W, spine));
+                    }
                 }
             }
             // **Error / high-risk warnings** — a LOUD, bold line in the theme's
@@ -5696,6 +5752,41 @@ mod tests {
         assert!(out.contains("[architect]"), "accepting seat shown: {out}");
         assert!(out.contains("[qa]"), "blocking seat shown");
         assert!(out.contains("no tests"), "first must-fix inlined");
+    }
+
+    #[test]
+    fn thinking_reasoning_block_hidden_until_verbose() {
+        // Phase-2-C-P0: the base's reasoning renders as a COLLAPSED `[thinking]`
+        // block — hidden by default, revealed by the global Ctrl+O verbose toggle.
+        let mut app = app_with(Some("offline"));
+        app.apply_engine(umadev_agent::EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ThinkingDelta("weigh the tradeoffs".into()),
+        });
+        // Real content closes the block but keeps the reasoning foldable.
+        app.apply_engine(umadev_agent::EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::Text {
+                delta: "the answer".into(),
+            },
+        });
+        // Collapsed (default): only the header + the expand hint show; the
+        // reasoning text itself is folded away.
+        app.verbose = false;
+        let collapsed = render_chat_to_string(&app, 100, 30);
+        assert!(
+            !collapsed.contains("weigh the tradeoffs"),
+            "reasoning hidden while collapsed: {collapsed}"
+        );
+        assert!(
+            collapsed.contains(crate::app::THINKING_PLACEHOLDER_TAG),
+            "the [thinking] header still shows when collapsed: {collapsed}"
+        );
+        // Global verbose (Ctrl+O) reveals the chain of thought.
+        app.verbose = true;
+        let expanded = render_chat_to_string(&app, 100, 30);
+        assert!(
+            expanded.contains("weigh the tradeoffs"),
+            "reasoning shown under the global verbose flag: {expanded}"
+        );
     }
 
     #[test]
