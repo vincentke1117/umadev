@@ -4718,6 +4718,10 @@
   font-size: clamp(54px, 4.25vw, 76px);
   line-height: 0.98;
   letter-spacing: 0;
+  /* Title slides are short by design; these guarantee no line can ever
+     push past the copy column (CJK can wrap, long tokens break). */
+  word-break: normal;
+  overflow-wrap: anywhere;
 }
 
 .hero p {
@@ -4835,6 +4839,9 @@
 
   .heroOverline {
     font-size: 26px;
+    /* Overline is a full phrase; let it wrap on phones instead of
+       overflowing past the right edge. */
+    white-space: normal;
   }
 
   .hero h1 {
@@ -5732,7 +5739,7 @@
   left: 50%;
   z-index: 5;
   display: grid;
-  grid-template-columns: repeat(3, minmax(108px, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   width: min(460px, calc(100% - 48px));
   max-width: 100%;
