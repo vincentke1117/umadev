@@ -303,6 +303,24 @@ pub struct CriticRow {
     pub advisory: Vec<String>,
 }
 
+/// The standing development team rendered by `/team` — the eight specialist
+/// seats plus the coordinator, in delivery order. Each entry is one i18n key
+/// whose string names the role AND the artifact it produces (the
+/// role→deliverable model surfaced by Wave C of the development-team
+/// repositioning). Kept module-level so the roster is one source of truth shared
+/// by `slash_team` and its tests.
+const TEAM_ROSTER: &[&str] = &[
+    "team.roster.pm",
+    "team.roster.architect",
+    "team.roster.designer",
+    "team.roster.frontend",
+    "team.roster.backend",
+    "team.roster.qa",
+    "team.roster.security",
+    "team.roster.devops",
+    "team.roster.coordinator",
+];
+
 /// Source of a chat message — used to colour the role label.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ChatRole {
@@ -2958,6 +2976,7 @@ impl App {
             "tui.help.inspect.pitfalls",
         ),
         Self::cmd("lessons", &[], None, CmdGroup::Inspect, "tui.cmd.lessons"),
+        Self::cmd("team", &[], None, CmdGroup::Inspect, "tui.cmd.team"),
         Self::cmd(
             "runs",
             &["history-runs"],
@@ -5455,6 +5474,7 @@ impl App {
                 Action::None
             }
             "lessons" => self.slash_lessons(),
+            "team" => self.slash_team(rest),
             "mcp" => {
                 let output = self.run_subprocess_cli("mcp-manage list");
                 self.push(
@@ -6576,6 +6596,117 @@ impl App {
         }
         body.push_str(umadev_i18n::t(self.lang, "plan.steer.usage"));
         self.push(ChatRole::UmaDev, body);
+    }
+
+    /// `/team` — surface the AI development team as a first-class concept (Wave C
+    /// of the development-team repositioning). Two parts, rendered as one
+    /// `ChatRole::UmaDev` note styled like [`show_plan_status`](Self::show_plan_status):
+    ///
+    /// 1. **The roster** (always) — the eight specialist seats plus the
+    ///    coordinator, each with the artifact it produces (the role→deliverable
+    ///    model from [`TEAM_ROSTER`]).
+    /// 2. **This run's team** (only with run context — a live plan OR recorded
+    ///    critic verdicts) — the convened seats with their latest verdict (reusing
+    ///    the team-review wording), and which deliverables actually EXIST on disk
+    ///    (`produced` / `pending`). With no run context it shows the convene hint.
+    ///
+    /// Read-only and fail-open: a missing `output/` dir / no plan just yields the
+    /// roster + the hint, never a panic.
+    fn slash_team(&mut self, _arg: &str) -> Action {
+        let mut body = String::new();
+        // (1) Roster — always shown.
+        body.push_str(umadev_i18n::t(self.lang, "team.title"));
+        body.push('\n');
+        for key in TEAM_ROSTER {
+            body.push_str("  ");
+            body.push_str(umadev_i18n::t(self.lang, key));
+            body.push('\n');
+        }
+        // (2) This run's team — only when there is run context.
+        let has_review = !self.critic_verdicts.is_empty();
+        let has_plan = !self.plan_steps.is_empty();
+        if has_review || has_plan {
+            body.push('\n');
+            body.push_str(umadev_i18n::t(self.lang, "team.run.header"));
+            body.push('\n');
+            // Convened seats + their latest verdict — same wording as the live
+            // team-review panel / `show_plan_status` ([seat] accepts / N must-fix).
+            if has_review {
+                let accepts = self.critic_verdicts.iter().filter(|c| c.accepts).count();
+                let blocking = self.critic_verdicts.len() - accepts;
+                body.push_str(&umadev_i18n::tf(
+                    self.lang,
+                    "plan.review.section",
+                    &[&accepts.to_string(), &blocking.to_string()],
+                ));
+                body.push('\n');
+                for c in &self.critic_verdicts {
+                    let verdict = if c.accepts {
+                        umadev_i18n::t(self.lang, "plan.review.accept").to_string()
+                    } else {
+                        umadev_i18n::tf(
+                            self.lang,
+                            "plan.review.block",
+                            &[&c.blocking.len().max(1).to_string()],
+                        )
+                    };
+                    body.push_str(&format!("  [{}] {verdict}\n", c.seat));
+                }
+            }
+            // Deliverables that actually exist on disk vs. still pending.
+            body.push_str(umadev_i18n::t(self.lang, "team.run.deliverables"));
+            body.push('\n');
+            for (label_key, exists) in self.team_deliverable_status() {
+                let mark = if exists {
+                    umadev_i18n::t(self.lang, "team.run.produced")
+                } else {
+                    umadev_i18n::t(self.lang, "team.run.pending")
+                };
+                body.push_str(&format!(
+                    "  {mark} {}\n",
+                    umadev_i18n::t(self.lang, label_key)
+                ));
+            }
+        } else {
+            body.push('\n');
+            body.push_str(umadev_i18n::t(self.lang, "team.no_run"));
+            body.push('\n');
+        }
+        self.push(ChatRole::UmaDev, body);
+        Action::None
+    }
+
+    /// Scan the workspace for each team deliverable, returning `(label_key,
+    /// exists)` pairs in delivery order. Read-only + fail-open: a missing
+    /// `output/` dir or an unreadable path counts as `pending`, never panics. The
+    /// docs match by filename suffix so any project slug resolves; the proof +
+    /// contract locations reuse the agent's canonical relative paths.
+    fn team_deliverable_status(&self) -> Vec<(&'static str, bool)> {
+        let root = &self.project_root;
+        // `output/*-{prd,architecture,uiux}.md` — match by suffix (slug-agnostic).
+        let output_has = |suffix: &str| -> bool {
+            std::fs::read_dir(root.join("output"))
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(suffix)))
+        };
+        let contract = root.join(".umadev/contracts/openapi.json").exists()
+            || root.join(".umadev/contracts/openapi.yaml").exists();
+        let runtime = root.join(umadev_agent::runtime_proof_rel_path()).exists();
+        let deploy = root.join(umadev_agent::deploy_proof_rel_path()).exists();
+        vec![
+            ("team.deliverable.prd", output_has("-prd.md")),
+            (
+                "team.deliverable.architecture",
+                output_has("-architecture.md"),
+            ),
+            ("team.deliverable.uiux", output_has("-uiux.md")),
+            ("team.deliverable.contract", contract),
+            ("team.deliverable.runtime", runtime),
+            ("team.deliverable.deploy", deploy),
+        ]
     }
 
     /// Fold a plan-steering edit (`skip` / `veto` / `add` / `up` / `down`) into
@@ -12629,6 +12760,126 @@ mod tests {
         // A blocking seat's FULL findings are listed, not just the first.
         assert!(out.contains("no tests for login"), "first finding: {out}");
         assert!(out.contains("no error handling"), "second finding: {out}");
+    }
+
+    #[test]
+    fn team_command_registered_and_dispatchable() {
+        // Wave C: `/team` is one registry row (so the palette + help advertise it)
+        // AND has a dispatch arm — the lockstep parity test relies on both.
+        assert!(
+            App::COMMANDS.iter().any(|c| c.name == "team"),
+            "/team is in COMMANDS"
+        );
+        assert!(
+            dispatch_arm_verbs().iter().any(|v| v == "team"),
+            "/team has a dispatch arm"
+        );
+    }
+
+    #[test]
+    fn slash_team_no_run_shows_roster_and_convene_hint() {
+        // No plan, no verdicts, no output dir → roster + the "convenes on a build"
+        // hint, never the run section.
+        let mut a = fresh_app(Some("offline"));
+        let before = a.history.len();
+        let action = a.try_slash_command("/team").unwrap();
+        assert_eq!(action, Action::None);
+        let out: String = a
+            .history
+            .iter()
+            .skip(before)
+            .map(|m| m.body().clone())
+            .collect();
+        // Roster: the title + every seat's role→deliverable line is present.
+        assert!(
+            out.contains(umadev_i18n::t(a.lang, "team.title")),
+            "title: {out}"
+        );
+        for key in TEAM_ROSTER {
+            assert!(
+                out.contains(umadev_i18n::t(a.lang, key)),
+                "roster row {key} present: {out}"
+            );
+        }
+        // No run context → the convene hint, NOT the run header.
+        assert!(
+            out.contains(umadev_i18n::t(a.lang, "team.no_run")),
+            "hint: {out}"
+        );
+        assert!(
+            !out.contains(umadev_i18n::t(a.lang, "team.run.header")),
+            "no run section without context: {out}"
+        );
+    }
+
+    #[test]
+    fn slash_team_with_verdicts_shows_per_seat_verdicts() {
+        // Recorded critic verdicts are run context → the run section lists each
+        // convened seat with its verdict (reusing the team-review wording).
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::CriticVerdict {
+            seat: "architect".into(),
+            accepts: true,
+            blocking: vec![],
+            advisory: vec![],
+        });
+        a.apply_engine(EngineEvent::CriticVerdict {
+            seat: "qa".into(),
+            accepts: false,
+            blocking: vec!["no tests for login".into()],
+            advisory: vec![],
+        });
+        let before = a.history.len();
+        let _ = a.try_slash_command("/team").unwrap();
+        let out: String = a
+            .history
+            .iter()
+            .skip(before)
+            .map(|m| m.body().clone())
+            .collect();
+        assert!(
+            out.contains(umadev_i18n::t(a.lang, "team.run.header")),
+            "run header: {out}"
+        );
+        assert!(out.contains("[architect]"), "accepting seat: {out}");
+        assert!(out.contains("[qa]"), "blocking seat: {out}");
+    }
+
+    #[test]
+    fn slash_team_reports_produced_vs_pending_deliverables() {
+        // A deliverable that exists on disk renders `produced`; one that does not
+        // renders `pending`. Need run context for the deliverables block to show.
+        let mut a = fresh_app(Some("offline"));
+        let out_dir = a.project_root.join("output");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("demo-prd.md"), "# PRD").unwrap();
+        a.apply_engine(EngineEvent::CriticVerdict {
+            seat: "pm".into(),
+            accepts: true,
+            blocking: vec![],
+            advisory: vec![],
+        });
+        let before = a.history.len();
+        let _ = a.try_slash_command("/team").unwrap();
+        let out: String = a
+            .history
+            .iter()
+            .skip(before)
+            .map(|m| m.body().clone())
+            .collect();
+        let produced = umadev_i18n::t(a.lang, "team.run.produced");
+        let pending = umadev_i18n::t(a.lang, "team.run.pending");
+        let prd = umadev_i18n::t(a.lang, "team.deliverable.prd");
+        let deploy = umadev_i18n::t(a.lang, "team.deliverable.deploy");
+        // The written PRD shows produced; the absent deploy proof shows pending.
+        assert!(
+            out.contains(&format!("{produced} {prd}")),
+            "PRD produced: {out}"
+        );
+        assert!(
+            out.contains(&format!("{pending} {deploy}")),
+            "deploy proof pending: {out}"
+        );
     }
 
     #[test]
