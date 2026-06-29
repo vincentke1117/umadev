@@ -48,6 +48,16 @@ pub(crate) const FOLD_HEAD_GENERAL: usize = 3;
 /// Head lines kept when a long SHELL (Bash) tool result is folded — shell output
 /// gets a deeper preview (the tail of a build log is usually the signal).
 pub(crate) const FOLD_HEAD_SHELL: usize = 10;
+/// **Hard render cap** for a single tool result / text body when it is shown
+/// EXPANDED (not the per-message Ctrl+R fold). Even content that is force-expanded
+/// — a failed tool's error, a non-collapsed reply, a freshly streamed wall — is
+/// capped to this many SOURCE lines + a `+N 行 (Ctrl+O 展开)` footer so one giant
+/// output can never dominate the transcript. Released by the global `verbose`
+/// (Ctrl+O) toggle, which renders the whole thing (still under the global
+/// `MAX_RENDER_ROWS` post-fold cap). Generous on purpose: only a pathological
+/// (hundreds/thousands of lines) output ever trips it, so normal replies are
+/// untouched.
+pub(crate) const FOLD_HARD_CAP: usize = 120;
 /// FIFO **fail-open floor** for the in-memory working transcript: when a
 /// token-budgeted compaction can't run (the summary `complete()` failed / the
 /// base is offline / the circuit breaker is tripped), the working view falls back
@@ -1850,6 +1860,16 @@ pub struct App {
     /// lockstep with `transcript_rows`. In a `RefCell` for the same borrow reason.
     pub transcript_gutters: std::cell::RefCell<Vec<usize>>,
 
+    /// **Per-row soft-wrap flag** — `transcript_row_wraps[i] == true` marks cached
+    /// row `i` as a soft-wrap CONTINUATION of row `i-1` (the renderer folded ONE
+    /// logical line across both). A drag-copy reads this (via
+    /// [`crate::selection::extract_wrapped`]) to rejoin a wrapped paragraph into a
+    /// single line — no mid-line breaks at the fold points — while keeping the
+    /// newline at every real logical break. In lockstep with `transcript_rows`; a
+    /// length skew fails open (a missing flag ⇒ a real line break). `RefCell` for
+    /// the same borrow reason as the rows.
+    pub transcript_row_wraps: std::cell::RefCell<Vec<bool>>,
+
     /// The transcript rectangle `(left, top, width, height)` from the last
     /// frame, published by `ui::render_transcript`. The event loop maps a mouse
     /// `(col, row)` against this to decide inside/outside the transcript and to
@@ -2405,6 +2425,7 @@ impl App {
             last_drag_mouse: None,
             transcript_rows: std::cell::RefCell::new(Vec::new()),
             transcript_gutters: std::cell::RefCell::new(Vec::new()),
+            transcript_row_wraps: std::cell::RefCell::new(Vec::new()),
             transcript_area: std::cell::Cell::new((0, 0, 0, 0)),
             transcript_first_visible: std::cell::Cell::new(0),
             conversation: Vec::new(),
@@ -3607,7 +3628,11 @@ impl App {
         }
         let text = {
             let rows = self.transcript_rows.borrow();
-            crate::selection::extract(&rows, &sel)
+            let wraps = self.transcript_row_wraps.borrow();
+            // Rejoin soft-wrapped visual rows so a wrapped paragraph copies as one
+            // line; `wraps` is in lockstep with `rows` and fails open to a plain
+            // newline-per-row extract when empty/short.
+            crate::selection::extract_wrapped(&rows, &wraps, &sel)
         };
         if text.is_empty() {
             return None;
@@ -3618,6 +3643,53 @@ impl App {
             umadev_i18n::tf(self.lang, "tui.copied", &[&count.to_string()]),
         );
         Some(text)
+    }
+
+    /// Render the chat history to a plain-text transcript for the **scrollback
+    /// handoff** on a clean exit: after UmaDev leaves the alternate screen (which
+    /// has no native scrollback), this text is printed to the MAIN screen so the
+    /// conversation survives the exit instead of vanishing with the alt buffer.
+    ///
+    /// Each turn is its speaker tag + body (the flat [`MessageBody::as_text`]
+    /// rendering, so a tool call / diff collapses to its one-line form), separated
+    /// by blank lines. Empty / whitespace-only turns are skipped. Pure +
+    /// fail-open: an empty history yields `""` (the caller prints nothing).
+    #[must_use]
+    pub fn transcript_plaintext(&self) -> String {
+        let mut out = String::new();
+        for msg in &self.history {
+            let body = msg.body();
+            let body = body.trim_end();
+            if body.trim().is_empty() {
+                continue;
+            }
+            // A short, language-neutral speaker tag. The base's own output (Host)
+            // carries no tag so it reads as the assistant's prose; the others are
+            // marked so the user can tell who said what in the scrollback.
+            let tag = match msg.role {
+                ChatRole::You => "› ",
+                ChatRole::UmaDev => "UmaDev: ",
+                ChatRole::Gate => "GATE: ",
+                ChatRole::System => "· ",
+                ChatRole::Error => "! ",
+                ChatRole::Host => "",
+            };
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            // Tag only the first line; a multi-line body keeps its own line breaks.
+            let mut lines = body.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(tag);
+                out.push_str(first);
+                out.push('\n');
+                for line in lines {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        out
     }
 
     // ---- input editing helpers (char-cursor over a UTF-8 String) ---------
@@ -17120,6 +17192,52 @@ mod tests {
         assert!(a.input.is_empty(), "rewind did not fire — input untouched");
         assert_eq!(a.history.len(), len_before, "transcript untouched mid-run");
         assert!(!a.should_quit);
+    }
+
+    #[test]
+    fn transcript_plaintext_handoff_renders_history_and_skips_empties() {
+        // The scrollback handoff: a clean-exit dump of the conversation. Each turn
+        // is its speaker tag + body; whitespace-only turns are dropped.
+        let mut a = fresh_app(Some("offline"));
+        a.history.clear();
+        a.push(ChatRole::You, "build me an app");
+        a.push(ChatRole::Host, "sure, here is the plan");
+        a.push(ChatRole::System, "   "); // whitespace-only → skipped
+        a.push(ChatRole::UmaDev, "done");
+        let dump = a.transcript_plaintext();
+        assert!(
+            dump.contains("build me an app"),
+            "user turn present: {dump}"
+        );
+        assert!(
+            dump.contains("sure, here is the plan"),
+            "host turn present (untagged): {dump}"
+        );
+        assert!(
+            dump.contains("UmaDev: done"),
+            "umadev turn is tagged: {dump}"
+        );
+        assert!(
+            !dump.lines().any(|l| l.trim() == "·"),
+            "the whitespace-only system turn is skipped: {dump}"
+        );
+        // An empty history hands off nothing (the caller prints nothing).
+        a.history.clear();
+        assert!(a.transcript_plaintext().is_empty());
+    }
+
+    #[test]
+    fn transcript_plaintext_keeps_multiline_bodies_intact() {
+        // A multi-line body keeps its own line breaks; only the first line is
+        // tagged so the block reads cleanly in scrollback.
+        let mut a = fresh_app(Some("offline"));
+        a.history.clear();
+        a.push(ChatRole::You, "line one\nline two\nline three");
+        let dump = a.transcript_plaintext();
+        assert!(dump.contains("line one"));
+        assert!(dump.contains("line two"));
+        assert!(dump.contains("line three"));
+        assert!(dump.ends_with('\n'), "the dump ends on a fresh line");
     }
 
     // ── wheel / edge extends a drag-selection past the viewport ───────────

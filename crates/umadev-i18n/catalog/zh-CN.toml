@@ -672,6 +672,8 @@
 # 长输出折叠:折叠摘要行 + 每条消息的展开提示
 "tui.fold.collapsed" = "… 还有 {} 行 · {}"
 "tui.fold.expand_hint" = "Ctrl+O 展开全部"
+# 硬性渲染上限提示:即使是展开的工具结果/回复也会被截断,避免单个超大输出霸屏。{} = 隐藏行数;Ctrl+O 展开全部。
+"tui.fold.hard_capped" = "+{} 行 (Ctrl+O 展开)"
 # 折叠的 [thinking] 思考块:附在 `[thinking] 正在思考… · 4.2s` 头部后的展开提示,
 # 让用户知道底座的思考过程可以展开(全局 Ctrl+O 详细开关会显示思考文本)。
 "tui.thinking.expand_hint" = "Ctrl+O 展开思考"

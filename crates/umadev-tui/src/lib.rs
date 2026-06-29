@@ -121,6 +121,15 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
         }
     }
     restore_terminal(&mut terminal);
+    // Native scrollback handoff: on a CLEAN quit, now that the alt screen is gone
+    // and we're back on the MAIN screen, print the conversation so it lands in the
+    // terminal's real scrollback instead of vanishing with the alt buffer. Only on
+    // a clean exit (an error path already prints its own diagnostics) and only when
+    // there is actually a conversation to hand off. Fail-open: a write error is
+    // ignored — it can never block the exit.
+    if result.is_ok() {
+        print_scrollback_handoff(&app);
+    }
     // Reset terminal window title on exit.
     {
         use std::io::Write;
@@ -128,6 +137,24 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
         let _ = std::io::stdout().flush();
     }
     result
+}
+
+/// Print the chat transcript to the MAIN screen (real terminal scrollback) on a
+/// clean exit, so the conversation survives leaving the alternate screen. Called
+/// AFTER [`restore_terminal`] has switched back to the primary buffer, so the text
+/// scrolls the normal screen and persists. No-op for an empty history; every write
+/// is best-effort (fail-open).
+fn print_scrollback_handoff(app: &App) {
+    use std::io::Write;
+    let text = app.transcript_plaintext();
+    if text.trim().is_empty() {
+        return;
+    }
+    let mut out = std::io::stdout();
+    // A leading blank row separates the handoff from the shell prompt that the
+    // restored primary screen shows; the body already ends in a newline.
+    let _ = write!(out, "\n{text}");
+    let _ = out.flush();
 }
 
 /// Replace the global panic hook with one that restores the terminal
@@ -3617,6 +3644,13 @@ fn clipboard_is_remote() -> bool {
     std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
 }
 
+/// Whether we're running INSIDE tmux (`TMUX` set). A bare OSC 52 clipboard write
+/// is swallowed by tmux; the copy must be wrapped in tmux's DCS passthrough (see
+/// [`selection::osc52_for`]) to reach the outer terminal. Cheap env-only check.
+fn clipboard_in_tmux() -> bool {
+    std::env::var_os("TMUX").is_some()
+}
+
 /// Copy `text` to the system clipboard via the **native OS command** (the path
 /// that works even in macOS Terminal.app, which has no OSC 52): `pbcopy` on
 /// macOS; on Linux/BSD try `wl-copy`, then `xclip -selection clipboard`, then
@@ -4593,16 +4627,22 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                             if clipboard_is_remote() {
                                                 // SSH: a native command would target the
                                                 // FAR host, so OSC 52 is the only path the
-                                                // user's terminal can honor. Write it
-                                                // through the render's SINGLE backend writer
-                                                // (`terminal.backend_mut()`), on the UI
+                                                // user's terminal can honor. Inside tmux the
+                                                // bare OSC 52 is swallowed, so wrap it in
+                                                // tmux's DCS passthrough so it reaches the
+                                                // OUTER terminal (the SSH + tmux copy fix).
+                                                // Write it through the render's SINGLE backend
+                                                // writer (`terminal.backend_mut()`), on the UI
                                                 // thread, BETWEEN frames (this arm runs after
                                                 // the loop-top draw completed) — so the
                                                 // escape bytes can NEVER interleave mid-frame
                                                 // the way a `spawn_blocking` stdout write
                                                 // could (R3 single-writer). Fail-open.
                                                 use std::io::Write as _;
-                                                let seq = crate::selection::osc52_sequence(&text);
+                                                let seq = crate::selection::osc52_for(
+                                                    &text,
+                                                    clipboard_in_tmux(),
+                                                );
                                                 let backend = terminal.backend_mut();
                                                 let _ = backend.write_all(seq.as_bytes());
                                                 let _ = backend.flush();

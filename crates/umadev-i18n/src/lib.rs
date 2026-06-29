@@ -511,6 +511,7 @@ mod tests {
             "tui.tool.aborted",
             "tui.fold.collapsed",
             "tui.fold.expand_hint",
+            "tui.fold.hard_capped",
             "tui.thinking.expand_hint",
             "tui.diff.collapsed",
             "tui.diff.truncated",

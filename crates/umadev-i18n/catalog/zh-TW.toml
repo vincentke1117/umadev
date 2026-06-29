@@ -672,6 +672,8 @@
 # 長輸出摺疊:摺疊摘要列 + 每則訊息的展開提示
 "tui.fold.collapsed" = "… 還有 {} 行 · {}"
 "tui.fold.expand_hint" = "Ctrl+O 展開全部"
+# 硬性算繪上限提示:即使是展開的工具結果/回覆也會被截斷,避免單個超大輸出霸佔畫面。{} = 隱藏行數;Ctrl+O 展開全部。
+"tui.fold.hard_capped" = "+{} 行 (Ctrl+O 展開)"
 # 摺疊的 [thinking] 思考塊:附在 `[thinking] 正在思考… · 4.2s` 標頭後的展開提示,
 # 讓使用者知道底座的思考過程可以展開(全域 Ctrl+O 詳細開關會顯示思考文字)。
 "tui.thinking.expand_hint" = "Ctrl+O 展開思考"

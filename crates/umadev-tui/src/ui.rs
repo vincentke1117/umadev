@@ -1205,11 +1205,14 @@ pub(crate) struct MsgFoldCache {
     generation: u64,
 }
 
-/// One [`MsgFoldCache`] entry: the folded rows plus the frame they were last
-/// used, so untouched entries can be swept at frame end.
+/// One [`MsgFoldCache`] entry: the folded rows, the per-row soft-wrap flags (in
+/// lockstep with `lines` — `wraps[i]` marks visual row `i` as a soft-wrap
+/// continuation of row `i-1`, so a drag-copy can rejoin a wrapped line), plus the
+/// frame they were last used, so untouched entries can be swept at frame end.
 #[derive(Debug, Clone)]
 struct FoldEntry {
     lines: Vec<Line<'static>>,
+    wraps: Vec<bool>,
     generation: u64,
 }
 
@@ -1238,21 +1241,30 @@ impl MsgFoldCache {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// A cache hit: clone the stored folded rows and mark the entry touched this
-    /// frame. `None` on a miss. The clone is required because the caller mutates
-    /// the assembled transcript in place (selection / search highlight, the
-    /// scrollback row cap); it is still far cheaper than a markdown re-parse.
-    fn get(&mut self, key: u64) -> Option<Vec<Line<'static>>> {
+    /// A cache hit: clone the stored folded rows + their soft-wrap flags and mark
+    /// the entry touched this frame. `None` on a miss. The clone is required
+    /// because the caller mutates the assembled transcript in place (selection /
+    /// search highlight, the scrollback row cap); it is still far cheaper than a
+    /// markdown re-parse.
+    fn get(&mut self, key: u64) -> Option<(Vec<Line<'static>>, Vec<bool>)> {
         let generation = self.generation;
         let entry = self.map.get_mut(&key)?;
         entry.generation = generation;
-        Some(entry.lines.clone())
+        Some((entry.lines.clone(), entry.wraps.clone()))
     }
 
-    /// Store the freshly folded rows for `key`, touched this frame.
-    fn put(&mut self, key: u64, lines: Vec<Line<'static>>) {
+    /// Store the freshly folded rows + their soft-wrap flags for `key`, touched
+    /// this frame.
+    fn put(&mut self, key: u64, lines: Vec<Line<'static>>, wraps: Vec<bool>) {
         let generation = self.generation;
-        self.map.insert(key, FoldEntry { lines, generation });
+        self.map.insert(
+            key,
+            FoldEntry {
+                lines,
+                wraps,
+                generation,
+            },
+        );
     }
 
     /// End a frame: drop every entry not touched this frame, so the cache holds
@@ -1386,10 +1398,20 @@ fn message_is_render_cacheable(app: &App, msg: &crate::app::ChatMessage, msg_idx
 /// applied to one message's rows so the result can be cached. Pure and
 /// width-local; folding per message then concatenating is identical to folding
 /// the concatenation, because the fold is independent per row.
-fn fold_rows(rows: &[RenderedRow], w: usize) -> Vec<Line<'static>> {
-    rows.iter()
-        .flat_map(|row| prefold_line_filled(&row.line, w, row.hang, row.spine, row.fill_bg))
-        .collect()
+fn fold_rows(rows: &[RenderedRow], w: usize) -> (Vec<Line<'static>>, Vec<bool>) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut wraps: Vec<bool> = Vec::new();
+    for row in rows {
+        let folded = prefold_line_filled(&row.line, w, row.hang, row.spine, row.fill_bg);
+        // The first visual row of a logical line is a real line; every row AFTER it
+        // is a soft-wrap continuation (joined on drag-copy). Keeps `lines`/`wraps`
+        // in lockstep so the selection can rejoin a wrapped line into one.
+        for (i, l) in folded.into_iter().enumerate() {
+            lines.push(l);
+            wraps.push(i > 0);
+        }
+    }
+    (lines, wraps)
 }
 
 /// Build + fold one transcript message into its visual rows, served from the
@@ -1404,19 +1426,19 @@ fn message_folded_lines(
     area: Rect,
     w: usize,
     theme_gen: u8,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<bool>) {
     if message_is_render_cacheable(app, msg, msg_idx) {
         let key = msg_fold_key(msg, app.verbose, app.lang, w, theme_gen);
         if let Ok(mut cache) = app.msg_fold_cache.try_borrow_mut() {
-            if let Some(lines) = cache.get(key) {
-                return lines;
+            if let Some(folded) = cache.get(key) {
+                return folded;
             }
         }
-        let folded = fold_rows(&build_message_rows(app, msg, msg_idx, area), w);
+        let (lines, wraps) = fold_rows(&build_message_rows(app, msg, msg_idx, area), w);
         if let Ok(mut cache) = app.msg_fold_cache.try_borrow_mut() {
-            cache.put(key, folded.clone());
+            cache.put(key, lines.clone(), wraps.clone());
         }
-        folded
+        (lines, wraps)
     } else {
         fold_rows(&build_message_rows(app, msg, msg_idx, area), w)
     }
@@ -3578,8 +3600,20 @@ fn render_tool_row(
     let gutter = result_gutter();
     let lines: Vec<&str> = result.lines().collect();
     let foldable = lines.len() > crate::app::FOLD_THRESHOLD;
-    let shown: Vec<&str> = if show_collapsed && foldable {
+    let collapse = show_collapsed && foldable;
+    // R6 — hard render cap: even when the result is shown EXPANDED (a failed
+    // call's error, a non-collapsed OK call), bound it to `FOLD_HARD_CAP` source
+    // lines + a `+N 行 (Ctrl+O 展开)` footer so one giant output can't dominate the
+    // transcript. `verbose` (Ctrl+O) releases the cap and renders the whole thing.
+    let hard_cap = !collapse && !verbose && lines.len() > crate::app::FOLD_HARD_CAP;
+    let shown: Vec<&str> = if collapse {
         lines.iter().take(head_n).copied().collect()
+    } else if hard_cap {
+        lines
+            .iter()
+            .take(crate::app::FOLD_HARD_CAP)
+            .copied()
+            .collect()
     } else {
         lines.clone()
     };
@@ -3597,14 +3631,53 @@ fn render_tool_row(
             spine,
         ));
     }
-    if show_collapsed && foldable {
+    if collapse {
         let hidden = lines.len().saturating_sub(head_n);
         rendered.push(RenderedRow::spined(
             fold_summary_line(hidden, lang),
             3,
             spine,
         ));
+    } else if hard_cap {
+        let hidden = lines.len().saturating_sub(crate::app::FOLD_HARD_CAP);
+        rendered.push(RenderedRow::spined(
+            hard_cap_footer_line(hidden, lang),
+            3,
+            spine,
+        ));
     }
+}
+
+/// The `+N 行 (Ctrl+O 展开)` footer row shown under an EXPANDED tool result / body
+/// truncated by the hard render cap ([`crate::app::FOLD_HARD_CAP`]). Distinct from
+/// [`fold_summary_line`] (the per-message Ctrl+R fold): this footer advertises the
+/// GLOBAL Ctrl+O reveal, the only gesture that lifts the hard cap.
+fn hard_cap_footer_line(hidden: usize, lang: umadev_i18n::Lang) -> Line<'static> {
+    let text = umadev_i18n::tf(lang, "tui.fold.hard_capped", &[&hidden.to_string()]);
+    Line::from(Span::styled(text, Style::default().fg(theme::TEXT_MUTED())))
+}
+
+/// Hard-cap a long EXPANDED text body to [`crate::app::FOLD_HARD_CAP`] source
+/// lines + a `+N 行 (Ctrl+O 展开)` footer, so one giant non-collapsed reply can't
+/// dominate the transcript. Returns the body unchanged when it already fits.
+/// Pure; the footer is appended as plain text and flows through the markdown
+/// renderer (mirrors [`fold_general_text`]).
+fn fold_hard_cap_text(body: &str, lang: umadev_i18n::Lang) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.len() <= crate::app::FOLD_HARD_CAP {
+        return body.to_string();
+    }
+    let hidden = lines.len().saturating_sub(crate::app::FOLD_HARD_CAP);
+    let footer = umadev_i18n::tf(lang, "tui.fold.hard_capped", &[&hidden.to_string()]);
+    let mut head: String = lines
+        .iter()
+        .take(crate::app::FOLD_HARD_CAP)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    head.push_str("\n\n");
+    head.push_str(&footer);
+    head
 }
 
 /// The `… N more lines · Ctrl+R expand` summary row shown under a folded body.
@@ -3851,8 +3924,16 @@ fn build_message_rows(
             // gesture (Ctrl+R only reaches the most-recent row).
             let eff_collapsed =
                 msg.collapsed && !app.verbose && crate::app::message_is_collapsible(msg);
+            // R6 — hard render cap: a long body that is NOT the per-message fold and
+            // NOT the live-streaming tail is still bounded to `FOLD_HARD_CAP` lines +
+            // a `+N 行 (Ctrl+O 展开)` footer so one giant reply can't dominate. The
+            // actively-streaming message is left uncapped (the user is watching its
+            // tail); Ctrl+O (`verbose`) releases the cap everywhere.
+            let live = message_is_live_stream(app, msg, msg_idx);
             let folded = if eff_collapsed {
                 fold_general_text(&body, app.lang)
+            } else if !app.verbose && !live {
+                fold_hard_cap_text(&body, app.lang)
             } else {
                 body.into_owned()
             };
@@ -4027,15 +4108,37 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // concatenating is identical to folding the concatenation (the fold is
     // independent per row), so the painted output is byte-for-byte unchanged.
     let mut folded: Vec<Line<'static>> = Vec::new();
+    // Per-row soft-wrap flag, in lockstep with `folded`: `folded_wraps[i]` is true
+    // when row `i` is a soft-wrap continuation of row `i-1` (same logical line), so
+    // a drag-copy rejoins a wrapped paragraph into one line instead of breaking at
+    // every fold point. `push_wrapped` keeps the two vectors aligned.
+    let mut folded_wraps: Vec<bool> = Vec::new();
+    let push_wrapped =
+        |folded: &mut Vec<Line<'static>>, wraps: &mut Vec<bool>, rows: Vec<Line<'static>>| {
+            for (i, l) in rows.into_iter().enumerate() {
+                folded.push(l);
+                wraps.push(i > 0);
+            }
+        };
     for l in welcome_lines(app) {
-        folded.extend(prefold_line_filled(&l, w, 0, None, None));
+        push_wrapped(
+            &mut folded,
+            &mut folded_wraps,
+            prefold_line_filled(&l, w, 0, None, None),
+        );
     }
     for (msg_idx, msg) in app.history.iter().enumerate() {
         // Top gap before each message for breathing room (Claude Code: marginTop=1).
         if msg_idx > 0 {
-            folded.extend(prefold_line_filled(&Line::from(""), w, 0, None, None));
+            push_wrapped(
+                &mut folded,
+                &mut folded_wraps,
+                prefold_line_filled(&Line::from(""), w, 0, None, None),
+            );
         }
-        folded.extend(message_folded_lines(app, msg, msg_idx, area, w, theme_gen));
+        let (lines, wraps) = message_folded_lines(app, msg, msg_idx, area, w, theme_gen);
+        folded.extend(lines);
+        folded_wraps.extend(wraps);
     }
     // Drop cache entries not touched this frame (a content edit, a collapse
     // toggle, a message that fell out of history) so the cache self-bounds to the
@@ -4119,14 +4222,25 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // message); fold the live waiting indicator's own rows onto its end. Folding
     // per group then concatenating equals folding the concatenation — the fold is
     // independent per row — so the painted output is byte-for-byte unchanged.
-    folded.extend(fold_rows(&rendered, w));
+    {
+        let (lines, wraps) = fold_rows(&rendered, w);
+        folded.extend(lines);
+        folded_wraps.extend(wraps);
+    }
     // Bound the retained scrollback by VISUAL rows (post-fold), keeping the most
     // recent `MAX_RENDER_ROWS`. Doing it here — not on logical lines up top —
     // means `total` (and the `hidden_above` derived from it) equals exactly what
     // is paintable + reachable, so Home/PageUp can always reach the top of the
     // kept history instead of clamping short of truncated-but-uncounted rows.
+    // `folded_wraps` is split in lockstep so the soft-wrap flags stay aligned with
+    // the rows that survive (the new first row's flag is harmless — extraction
+    // never reads a leading continuation).
     if folded.len() > MAX_RENDER_ROWS {
-        folded = folded.split_off(folded.len() - MAX_RENDER_ROWS);
+        let cut = folded.len() - MAX_RENDER_ROWS;
+        folded = folded.split_off(cut);
+        if folded_wraps.len() >= cut {
+            folded_wraps = folded_wraps.split_off(cut);
+        }
     }
     let total = folded.len();
     // The scroll-hint title (added below when content overflows) is a `Block` title
@@ -4202,6 +4316,10 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             rows.push(logical);
             gutters.push(gutter);
         }
+        // Publish the per-row soft-wrap flags so a drag-copy can rejoin a wrapped
+        // logical line (no mid-line breaks). In lockstep with `rows`; any length
+        // skew fails open (a missing flag ⇒ a real line break).
+        *app.transcript_row_wraps.borrow_mut() = folded_wraps;
     }
     let content_top = if title_shown {
         area.y.saturating_add(1)
@@ -7570,6 +7688,105 @@ mod tests {
     }
 
     #[test]
+    fn selection_highlight_is_a_solid_bg_not_a_reverse_modifier() {
+        // R4(a): the highlight paints a SOLID themed background and keeps the
+        // span's own fg — it must NOT use the REVERSED modifier (which would
+        // per-cell-invert over syntax colors, fragmenting the wash). Build a
+        // syntax-colored line and confirm the selected span carries the
+        // selection bg + no REVERSED bit, and its fg is preserved.
+        let line = Line::from(vec![
+            Span::styled("fn ", Style::default().fg(Color::Blue)),
+            Span::styled("main", Style::default().fg(Color::Green)),
+        ]);
+        let hl = highlight_row(&line, 0, 7); // all of "fn main"
+        let sel_bg = theme::SELECTION_BG();
+        for span in &hl.spans {
+            assert_eq!(
+                span.style.bg,
+                Some(sel_bg),
+                "every selected span carries the solid themed selection bg"
+            );
+            assert!(
+                !span.style.add_modifier.contains(Modifier::REVERSED),
+                "the highlight never uses the REVERSED modifier"
+            );
+        }
+        // The syntax fg survives the wash (solid bg, not an inverse).
+        assert_eq!(hl.spans.first().expect("span").style.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn fold_rows_marks_soft_wrap_continuations() {
+        // R4(b): a single logical line that wraps across visual rows must mark
+        // every row AFTER the first as a soft-wrap continuation, while a second
+        // (separate) logical line stays a fresh row.
+        let rows = vec![
+            RenderedRow::plain(
+                Line::from(Span::raw("alpha beta gamma delta epsilon zeta")),
+                0,
+            ),
+            RenderedRow::plain(Line::from(Span::raw("standalone")), 0),
+        ];
+        let (lines, wraps) = fold_rows(&rows, 12);
+        assert_eq!(lines.len(), wraps.len(), "lines and wraps stay in lockstep");
+        assert!(lines.len() > 3, "the long line wrapped into several rows");
+        // The first row of the first logical line is NOT a continuation.
+        assert!(!wraps[0], "row 0 is a real logical line start");
+        // The wrapped rows of the first line ARE continuations.
+        assert!(wraps[1], "row 1 is a soft-wrap continuation");
+        // The standalone second logical line is a fresh start (not a continuation).
+        assert!(
+            !wraps[lines.len() - 1],
+            "the separate second line is a real line start, not a wrap"
+        );
+    }
+
+    #[test]
+    fn soft_wrapped_selection_copies_as_one_rejoined_line() {
+        // R4(b) end-to-end: render a message whose body wraps, then a selection
+        // spanning the wrap copies WITHOUT the mid-line break — `extract_wrapped`
+        // rejoins the visual rows via the published `transcript_row_wraps`.
+        let mut app = app_with(Some("offline"));
+        app.history.clear();
+        push_msg(
+            &mut app,
+            ChatRole::Host,
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu \
+             nu xi omicron pi rho sigma tau upsilon phi chi psi omega and then \
+             several more words to be sure this paragraph folds across rows",
+        );
+        // Render wide enough that the chat surface paints (a too-narrow terminal
+        // bails), but with a body long enough to fold across several visual rows so
+        // the per-row caches (rows / wraps) get published with a continuation.
+        let _ = render_chat_at(&app, 80, 24);
+        let rows = app.transcript_rows.borrow();
+        let wraps = app.transcript_row_wraps.borrow();
+        assert_eq!(
+            rows.len(),
+            wraps.len(),
+            "rows and wraps published in lockstep"
+        );
+        // Find the first wrapped (continuation) row produced by the body.
+        let cont = wraps.iter().position(|&w| w);
+        assert!(
+            cont.is_some(),
+            "the wrapped body produced a continuation row"
+        );
+        let cont = cont.unwrap();
+        // Select from the start of the wrapped line's first row through the end of
+        // its continuation row.
+        let sel = crate::selection::Selection {
+            anchor: (cont - 1, 0),
+            cursor: (cont, rows[cont].chars().count()),
+        };
+        let copied = crate::selection::extract_wrapped(&rows, &wraps, &sel);
+        assert!(
+            !copied.contains('\n'),
+            "a soft-wrapped line copies as ONE line (no mid-line break): {copied:?}"
+        );
+    }
+
+    #[test]
     fn logical_row_and_gutter_strips_spine_and_trailing_padding() {
         // A wrapped continuation row: spine glyph + hang space, then content. The
         // logical text drops the `▎`-gutter and the gutter width is 2.
@@ -8064,8 +8281,8 @@ mod tests {
         // The self-bounding sweep: only this frame's entries survive.
         let mut c = MsgFoldCache::new();
         c.begin_frame(40, 0);
-        c.put(1, vec![Line::from("a")]);
-        c.put(2, vec![Line::from("b")]);
+        c.put(1, vec![Line::from("a")], vec![false]);
+        c.put(2, vec![Line::from("b")], vec![false]);
         assert_eq!(c.len(), 2);
         // Next frame touches only key 1; key 2 falls out at end_frame.
         c.begin_frame(40, 0);
@@ -8621,6 +8838,81 @@ mod tests {
             revealed.contains("tool-line-29"),
             "global verbose reveals the full tool result: {revealed}"
         );
+    }
+
+    #[test]
+    fn hard_cap_truncates_a_huge_expanded_tool_result() {
+        // R6: a FAILED tool is force-expanded (never collapsed), so a giant error
+        // dump would otherwise dominate the transcript. The hard render cap bounds
+        // it to FOLD_HARD_CAP source lines + a `+N (Ctrl+O ...)` footer; Ctrl+O
+        // (verbose) releases the cap and shows the whole thing.
+        let cap = crate::app::FOLD_HARD_CAP;
+        let extra = 50usize;
+        let result: String = (0..cap + extra)
+            .map(|i| format!("err-line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tool = ToolCall {
+            name: "Bash".into(),
+            arg: "build".into(),
+            status: ToolStatus::Fail,
+            result: Some(result),
+            merged: false,
+            count: 1,
+            collapsed: false,
+        };
+        let joined = |verbose: bool| -> String {
+            let mut rows = Vec::new();
+            render_tool_row(&tool, &mut rows, umadev_i18n::Lang::En, ' ', verbose);
+            rows.iter()
+                .flat_map(|r| r.line.spans.iter())
+                .map(|s| s.content.as_ref().to_string())
+                .collect()
+        };
+        let capped = joined(false);
+        // The last line is hidden, the head is shown, and the footer advertises Ctrl+O.
+        assert!(
+            !capped.contains(&format!("err-line-{}", cap + extra - 1)),
+            "the hard cap hides the tail of a huge expanded result"
+        );
+        assert!(capped.contains("err-line-0"), "the head is still shown");
+        assert!(
+            capped.contains(&format!("+{extra}")) && capped.contains("Ctrl+O"),
+            "a `+N (Ctrl+O ...)` footer is shown: {capped}"
+        );
+        // Ctrl+O reveals the whole thing.
+        let revealed = joined(true);
+        assert!(
+            revealed.contains(&format!("err-line-{}", cap + extra - 1)),
+            "global verbose lifts the hard cap and shows the full result"
+        );
+    }
+
+    #[test]
+    fn fold_hard_cap_text_caps_long_body_and_passes_short() {
+        // Under the cap → unchanged. Over the cap → head FOLD_HARD_CAP lines + a
+        // blank + the trilingual `+N` footer.
+        let short = "one\ntwo\nthree";
+        assert_eq!(
+            fold_hard_cap_text(short, umadev_i18n::Lang::En),
+            short,
+            "a short body is returned verbatim"
+        );
+        let cap = crate::app::FOLD_HARD_CAP;
+        let long: String = (0..cap + 7)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = fold_hard_cap_text(&long, umadev_i18n::Lang::En);
+        let kept = out.lines().filter(|l| l.starts_with('L')).count();
+        assert_eq!(kept, cap, "exactly FOLD_HARD_CAP source lines are kept");
+        assert!(
+            out.contains("+7") && out.contains("Ctrl+O"),
+            "the hidden-count footer is appended: {out}"
+        );
+        // Trilingual: the zh footer differs from en and still carries the count.
+        let zh = fold_hard_cap_text(&long, umadev_i18n::Lang::ZhCn);
+        assert!(zh.contains("+7") && zh.contains("展开"), "zh footer: {zh}");
     }
 
     #[test]

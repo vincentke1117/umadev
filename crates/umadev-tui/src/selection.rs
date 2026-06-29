@@ -202,6 +202,59 @@ pub fn extract(rows: &[String], sel: &Selection) -> String {
     out
 }
 
+/// Like [`extract`], but **rejoins soft-wrapped visual rows** into their logical
+/// line instead of breaking on every visual-row boundary.
+///
+/// `wraps[i] == true` marks visual row `i` as a soft-wrap CONTINUATION of row
+/// `i-1` (the renderer folded ONE logical line across both), so the boundary
+/// before it carries **no newline** — a paragraph that wrapped over three rows
+/// copies as one unbroken line. `wraps[i] == false` (or a missing entry) is a
+/// real logical line break and keeps its `'\n'`. Fail-open by contract: a `wraps`
+/// shorter than `rows` (or empty) degrades each missing flag to `false`, so the
+/// result is identical to [`extract`] — never a panic.
+#[must_use]
+pub fn extract_wrapped(rows: &[String], wraps: &[bool], sel: &Selection) -> String {
+    let ((sr, sc), (er, ec)) = sel.normalized();
+    if sr >= rows.len() {
+        return String::new();
+    }
+    let er = er.min(rows.len() - 1);
+    // A row is JOINED to its predecessor (no newline) only when it is a soft-wrap
+    // continuation. A missing flag fails open to a real break (a newline).
+    let is_continuation = |r: usize| wraps.get(r).copied().unwrap_or(false);
+    let slice = |row: usize, from: usize, to: usize| -> String {
+        let Some(s) = rows.get(row) else {
+            return String::new();
+        };
+        let len = s.chars().count();
+        let from = from.min(len);
+        let to = to.min(len);
+        if to <= from {
+            return String::new();
+        }
+        s.chars().skip(from).take(to - from).collect()
+    };
+    if sr >= er {
+        let end_col = if sr == er { ec } else { usize::MAX };
+        return slice(sr, sc, end_col);
+    }
+    let mut out = String::new();
+    out.push_str(&slice(sr, sc, usize::MAX));
+    for r in (sr + 1)..er {
+        if !is_continuation(r) {
+            out.push('\n');
+        }
+        if let Some(s) = rows.get(r) {
+            out.push_str(s);
+        }
+    }
+    if !is_continuation(er) {
+        out.push('\n');
+    }
+    out.push_str(&slice(er, 0, ec));
+    out
+}
+
 /// Standard-alphabet (RFC 4648) base64 encoder, no padding omission — emits the
 /// canonical `=` padding. Implemented inline so the TUI gains the OSC 52
 /// clipboard path without a new crate dependency.
@@ -240,6 +293,33 @@ pub fn base64_encode(data: &[u8]) -> String {
 #[must_use]
 pub fn osc52_sequence(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+}
+
+/// Wrap an escape sequence in **tmux's DCS passthrough** so tmux forwards it to
+/// the OUTER terminal instead of swallowing it: `ESC P tmux ; <payload> ESC \`,
+/// with every `ESC` in the payload DOUBLED (tmux's escaping rule). Without this,
+/// an OSC 52 clipboard write emitted from inside tmux never reaches the user's
+/// real terminal — so a copy over SSH + tmux silently fails. Pure; outside tmux
+/// the caller should pass the bare sequence instead.
+#[must_use]
+pub fn tmux_passthrough(seq: &str) -> String {
+    let doubled = seq.replace('\x1b', "\x1b\x1b");
+    format!("\x1bPtmux;{doubled}\x1b\\")
+}
+
+/// The OSC 52 clipboard-set sequence for `text`, wrapped for tmux when `in_tmux`
+/// so it reaches the outer terminal. Outside tmux this is exactly
+/// [`osc52_sequence`]. This is the remote/SSH fallback: a native OS clipboard
+/// command targets the FAR host, and a bare OSC 52 is eaten by tmux — only the
+/// passthrough-wrapped form reaches the terminal the user is actually sitting at.
+#[must_use]
+pub fn osc52_for(text: &str, in_tmux: bool) -> String {
+    let seq = osc52_sequence(text);
+    if in_tmux {
+        tmux_passthrough(&seq)
+    } else {
+        seq
+    }
 }
 
 /// Pure decision: which clipboard path to PREFER for the current environment.
@@ -534,6 +614,71 @@ mod tests {
         assert_eq!(extract(&rows, &partial), "ort");
     }
 
+    // ── Soft-wrap-aware extraction ────────────────────────────────────────
+    #[test]
+    fn extract_wrapped_rejoins_a_soft_wrapped_line_without_newlines() {
+        // One logical line "the quick brown fox" folded across three visual rows.
+        // wraps marks rows 1 and 2 as continuations, so the whole span copies as
+        // one line — no mid-line breaks at the fold points.
+        let rows = vec![
+            "the quick".to_string(),
+            "brown".to_string(),
+            "fox".to_string(),
+        ];
+        let wraps = vec![false, true, true];
+        let sel = Selection {
+            anchor: (0, 0),
+            cursor: (2, 3),
+        };
+        assert_eq!(extract_wrapped(&rows, &wraps, &sel), "the quickbrownfox");
+    }
+
+    #[test]
+    fn extract_wrapped_keeps_newlines_at_real_logical_breaks() {
+        // Two logical lines, the first wrapped over two rows. Row 1 is a
+        // continuation (joined), row 2 is a fresh logical line (newline kept).
+        let rows = vec![
+            "first half".to_string(),
+            "second half".to_string(),
+            "next line".to_string(),
+        ];
+        let wraps = vec![false, true, false];
+        let sel = Selection {
+            anchor: (0, 0),
+            cursor: (2, 9),
+        };
+        assert_eq!(
+            extract_wrapped(&rows, &wraps, &sel),
+            "first halfsecond half\nnext line"
+        );
+    }
+
+    #[test]
+    fn extract_wrapped_fails_open_to_extract_when_flags_missing() {
+        // An empty / short `wraps` degrades every boundary to a real break, so the
+        // result matches the newline-per-row `extract`.
+        let rows = vec!["alpha".to_string(), "beta".to_string()];
+        let sel = Selection {
+            anchor: (0, 0),
+            cursor: (1, 4),
+        };
+        assert_eq!(
+            extract_wrapped(&rows, &[], &sel),
+            extract(&rows, &sel),
+            "no flags ⇒ identical to extract"
+        );
+    }
+
+    #[test]
+    fn extract_wrapped_single_row_is_a_plain_substring() {
+        let rows = vec!["hello world".to_string()];
+        let sel = Selection {
+            anchor: (0, 6),
+            cursor: (0, 11),
+        };
+        assert_eq!(extract_wrapped(&rows, &[false], &sel), "world");
+    }
+
     // ── base64 + OSC 52 ───────────────────────────────────────────────────
     #[test]
     fn base64_matches_known_vectors() {
@@ -560,6 +705,39 @@ mod tests {
         assert_eq!(seq, "\u{1b}]52;c;Zm9vYmFy\u{07}");
         assert_eq!(seq.as_bytes()[0], 0x1b, "starts with ESC");
         assert_eq!(*seq.as_bytes().last().unwrap(), 0x07, "ends with BEL");
+    }
+
+    // ── tmux DCS passthrough (cross-tmux/SSH copy) ────────────────────────
+    #[test]
+    fn tmux_passthrough_wraps_and_doubles_esc() {
+        // `ESC P tmux ; <payload, ESC doubled> ESC \`.
+        let seq = osc52_sequence("foobar"); // "\x1b]52;c;Zm9vYmFy\x07"
+        let wrapped = tmux_passthrough(&seq);
+        assert!(wrapped.starts_with("\x1bPtmux;"), "opens with the tmux DCS");
+        assert!(
+            wrapped.ends_with("\x1b\\"),
+            "closes with ST (ESC backslash)"
+        );
+        // The inner OSC's leading ESC is doubled (tmux's escaping rule).
+        assert!(
+            wrapped.contains("\x1b\x1b]52;c;Zm9vYmFy\x07"),
+            "the payload ESC is doubled: {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn osc52_for_wraps_only_inside_tmux() {
+        // Outside tmux → the bare sequence; inside tmux → the passthrough form.
+        assert_eq!(
+            osc52_for("hi", false),
+            osc52_sequence("hi"),
+            "outside tmux the bare OSC 52 is emitted"
+        );
+        assert_eq!(
+            osc52_for("hi", true),
+            tmux_passthrough(&osc52_sequence("hi")),
+            "inside tmux the OSC 52 is wrapped for passthrough"
+        );
     }
 
     // ── clipboard path routing ────────────────────────────────────────────

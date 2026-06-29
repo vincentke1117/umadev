@@ -676,6 +676,9 @@
 # the most recent (which Ctrl+R toggles) still advertises a working gesture.
 "tui.fold.collapsed" = "… {} more lines · {}"
 "tui.fold.expand_hint" = "Ctrl+O expand all"
+# Hard render cap footer: even an EXPANDED tool result / reply is capped so one
+# giant output can't dominate the transcript. {} = lines hidden; Ctrl+O reveals all.
+"tui.fold.hard_capped" = "+{} lines (Ctrl+O to expand)"
 # Collapsed `[thinking]` reasoning block: the expand-affordance appended to the
 # `[thinking] thinking… · 4.2s` header so the user knows the base's chain of
 # thought is foldable (the global Ctrl+O verbose toggle reveals the reasoning).
