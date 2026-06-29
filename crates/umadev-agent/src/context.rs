@@ -219,6 +219,26 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
         if !charter.trim().is_empty() {
             fw.push_block(&charter);
         }
+
+        // ── Durable PROJECT FACTS — recalled on EVERY work turn ──────────────
+        // Facts the team already resolved about THIS project (a JDK/binary path, a
+        // required version/port, a build/run/test command, an architecture decision,
+        // a user preference), persisted to `.umadev/memory/facts.jsonl`. Recalled
+        // into the ALWAYS-ON head (not the throttled JIT tail) ON PURPOSE: the whole
+        // point is the base sees the facts regardless of the bounded transcript or a
+        // base context rotation, so it never re-searches a fact it already found —
+        // head placement guarantees they survive the budget. The block also carries
+        // the record-guidance, so the base persists new durable facts the same way.
+        // Bounded ([`crate::project_facts::FACTS_FIRMWARE_BUDGET`]) + fail-open: no
+        // store / a corrupt store → empty, behaving exactly as before. One small
+        // inline read, like the charter read above; nothing on a pure-chat turn.
+        let facts = crate::project_facts::facts_firmware_block(
+            root,
+            crate::project_facts::FACTS_FIRMWARE_BUDGET,
+        );
+        if !facts.trim().is_empty() {
+            fw.push_block(&facts);
+        }
     }
 
     // The always-on head (identity + craft) is now fully in `buf` and can no longer
@@ -788,6 +808,70 @@ mod tests {
         assert!(
             !fw_default.contains("TEAM CHARTER"),
             "pristine default must not be re-injected: {fw_default}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_facts_are_recalled_into_a_work_turn_with_record_guidance() {
+        // The memory-loss fix: a fact recorded on this project is recalled into the
+        // firmware on a later work turn (so the base never re-searches it), AND the
+        // block carries the record-guidance so the base can persist new facts.
+        let tmp = tempfile::TempDir::new().unwrap();
+        crate::project_facts::record_fact(
+            tmp.path(),
+            crate::project_facts::Fact::new("JDK17", "/usr/lib/jvm/jdk-17", Some("path")),
+        );
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::BackendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &r, "用 JDK 编译并打包").await;
+        assert!(
+            fw.contains("KNOWN PROJECT FACTS"),
+            "work turn recalls the facts block: {fw}"
+        );
+        assert!(
+            fw.contains("/usr/lib/jvm/jdk-17"),
+            "the resolved fact is recalled verbatim: {fw}"
+        );
+        assert!(
+            fw.contains(crate::project_facts::FACTS_REL_PATH),
+            "record-guidance (the store path) is present: {fw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_chat_does_not_carry_the_facts_block() {
+        // Pure chat stays light (no retrieval) — even with facts on disk, a chat turn
+        // carries no facts block, matching the repo-map/knowledge gating.
+        let tmp = tempfile::TempDir::new().unwrap();
+        crate::project_facts::record_fact(
+            tmp.path(),
+            crate::project_facts::Fact::new("JDK17", "/usr/lib/jvm/jdk-17", Some("path")),
+        );
+        let r = route(RouteClass::Chat, Depth::Fast, Vec::new());
+        let fw = compose_firmware(tmp.path(), &r, "你好,在吗?").await;
+        assert!(
+            !fw.contains("KNOWN PROJECT FACTS"),
+            "chat must not carry the facts block: {fw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_facts_means_no_facts_block() {
+        // Fail-open / first-ever turn: with no fact store, a work turn carries no
+        // facts block (behaves exactly as before this feature).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &r, "做一个登录页").await;
+        assert!(
+            !fw.contains("KNOWN PROJECT FACTS"),
+            "no store → no facts block: {fw}"
         );
     }
 

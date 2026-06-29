@@ -60,6 +60,7 @@ pub mod phases;
 pub mod plan_state;
 pub mod planner;
 pub mod pr;
+pub mod project_facts;
 pub mod review;
 pub mod router;
 pub mod run_lock;
