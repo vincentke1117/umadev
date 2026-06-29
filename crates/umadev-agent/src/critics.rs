@@ -677,11 +677,14 @@ impl RoleCritic for DevOpsCritic {
 }
 
 /// The docs-stage cross-review team, scaled to the task. A lean task gets NO
-/// critic team (the deterministic floor + the existing single judge are enough);
-/// a heavyweight greenfield / full build gets the PM + architect + designer
+/// critic team (the deterministic floor + the existing single judge are enough); a
+/// pure DOCUMENT task ([`TaskKind::DocsOnly`] — a PRD / spec / design doc / report)
+/// gets ONE editorial PM seat (the document wants a single "does it serve the
+/// requirement, is it coherent and complete" read, not a product-review trio); a
+/// heavyweight greenfield / full product build gets the PM + architect + designer
 /// cross-review. This reuses the planner's complexity tiering (invariant: never
-/// MORE ceremony than the task warrants) so a one-line tweak never pays for a
-/// review team.
+/// MORE ceremony than the task warrants) so a one-line tweak — or a document —
+/// never pays for a full review team.
 #[must_use]
 pub fn docs_team_for_kind(kind: crate::planner::TaskKind) -> Vec<Box<dyn RoleCritic>> {
     use crate::planner::TaskKind;
@@ -689,14 +692,20 @@ pub fn docs_team_for_kind(kind: crate::planner::TaskKind) -> Vec<Box<dyn RoleCri
         // Lean / trivial paths: no cross-review team. The deterministic floor
         // (coverage / contract) plus the existing tech-lead assessment stand.
         TaskKind::Light | TaskKind::Bugfix | TaskKind::Refactor => Vec::new(),
+        // A pure DOCUMENT task (a PRD / spec / design doc / report — the deliverable IS
+        // the document, not a product) gets ONE editorial seat: a single PM read of
+        // "does it serve the requirement, is it coherent and complete". A document does
+        // NOT warrant a full PM + architect + designer trio building+reviewing a .md —
+        // that is the token-burn this fix removes.
+        TaskKind::DocsOnly => vec![Box::new(PmCritic)],
         // A backend-only build produces no UI, so the UIUX seat has nothing to
         // review — the docs team is just PM + architect there.
         TaskKind::BackendOnly => {
             vec![Box::new(PmCritic), Box::new(ArchitectureCritic)]
         }
-        // Everything that produces real docs WITH a UI surface gets the full docs
+        // A real PRODUCT build that produces docs WITH a UI surface gets the full docs
         // cross-review team: PM + architect + UI/UX designer.
-        TaskKind::Greenfield | TaskKind::FrontendOnly | TaskKind::DocsOnly => {
+        TaskKind::Greenfield | TaskKind::FrontendOnly => {
             vec![
                 Box::new(PmCritic),
                 Box::new(ArchitectureCritic),
@@ -911,16 +920,21 @@ mod tests {
         assert!(docs_team_for_kind(TaskKind::Light).is_empty());
         assert!(docs_team_for_kind(TaskKind::Bugfix).is_empty());
         assert!(docs_team_for_kind(TaskKind::Refactor).is_empty());
-        // Greenfield / UI-bearing doc tasks → PM + architect + UI/UX designer.
+        // Greenfield / UI-bearing PRODUCT builds → PM + architect + UI/UX designer.
         let team = docs_team_for_kind(TaskKind::Greenfield);
         assert_eq!(team.len(), 3);
         let roles: Vec<&str> = team.iter().map(|c| c.role()).collect();
         assert!(roles.contains(&"product-manager"));
         assert!(roles.contains(&"architect"));
         assert!(roles.contains(&"uiux-designer"));
-        // Frontend-only + docs-only also have a UI surface → designer seated.
+        // Frontend-only product build also has a UI surface → designer seated.
         assert_eq!(docs_team_for_kind(TaskKind::FrontendOnly).len(), 3);
-        assert_eq!(docs_team_for_kind(TaskKind::DocsOnly).len(), 3);
+        // A pure DOCUMENT task (PRD / spec / design doc / report) is NOT a product —
+        // it convenes a SINGLE editorial PM seat (the token-burn fix: no longer the
+        // old PM + architect + designer trio building+reviewing a .md).
+        let docs = docs_team_for_kind(TaskKind::DocsOnly);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].role(), "product-manager");
         // Backend-only produces no UI → designer NOT seated (PM + architect only).
         let be = docs_team_for_kind(TaskKind::BackendOnly);
         assert_eq!(be.len(), 2);

@@ -3239,15 +3239,18 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
             mode,
             strict_coverage: umadev_agent::strict_coverage_from_env(),
         };
-        // Size the QC team from the reactive build route (the same behaviour-derived
-        // `Build`/`Fast` route the intent card showed when the write was detected),
-        // scaled DOWN for a doc write: a README / changelog / single doc is NOT a UI
+        // Size the QC team by REALITY, scaled DOWN for a documentation delivery: a
+        // turn that produced NO real source on disk (a documentation delivery — a PRD
+        // / spec / design doc / report / README, the deliverable is the .md, not code)
+        // OR an ask that is a document task (`is_document_task`) is NOT a UI/code
         // delivery, so it convenes NO review team. This is the belt-and-suspenders for
-        // the user-reported "generating a README runs a full review" case — even if a
-        // doc phrasing ever slipped the lean QC short-circuit (`run_auto_qc` keys off
-        // `is_lean_build(requirement)`), an empty team can fork nothing.
+        // the user-reported "generating a document runs a full review" case — even if a
+        // doc phrasing ever slipped the lean QC short-circuit (`run_auto_qc`), an empty
+        // team can fork nothing. Broader than the old README-only `is_doc_task`: it now
+        // catches every zero-source doc delivery, however the ask was phrased.
         let mut qc_route = reactive_build_route();
-        if umadev_agent::planner::is_doc_task(&text) {
+        let produced_no_source = umadev_agent::acceptance::source_files(&project_root).is_empty();
+        if produced_no_source || umadev_agent::planner::is_document_task(&text) {
             qc_route.team = Vec::new();
         }
         let sink_dyn: Arc<dyn EventSink> = sink.clone();

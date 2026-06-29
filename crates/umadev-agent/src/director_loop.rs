@@ -2959,9 +2959,21 @@ async fn run_auto_qc(
     // Fail-open + safe: `is_lean_build` only fires on a clearly-lean classification
     // (an unrecognised / real-product goal stays heavyweight), so a real product is
     // never under-checked by accident.
-    if crate::planner::is_lean_build(&options.requirement) {
+    //
+    // DOCUMENT-AWARE (the token-burn fix): a document task (a PRD / spec / design doc
+    // / report — `is_document_task`) and, equivalently, any turn that produced ZERO
+    // source on disk (a documentation delivery — the source-present floor above
+    // already neutrally passed it) is in the SAME position as a lean goal: there is
+    // no code to re-build or fork-review, so the duplicate build + the fork team are
+    // pure overhead over a .md. The governance scan above still ran (the moat is
+    // kept); only the code-shaped half of QC is skipped. A real product (non-empty
+    // source, non-document) is untouched.
+    if crate::planner::is_lean_build(&options.requirement)
+        || crate::planner::is_document_task(&options.requirement)
+        || crate::acceptance::source_files(&options.project_root).is_empty()
+    {
         events.emit(EngineEvent::Note(
-            "team · lean goal — source present, skipping the duplicate build + fork review"
+            "team · lean / document goal — source check done, skipping the duplicate build + fork review"
                 .to_string(),
         ));
         return QcReport { blocking };

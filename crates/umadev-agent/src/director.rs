@@ -579,9 +579,27 @@ fn verify_contract(options: &RunOptions) -> VerifyResult {
 /// Confirm real source files exist on disk — the cheapest objective reality
 /// floor. Zero source = a build that claimed done produced nothing (`passed =
 /// false`); any source = passed, with the file count as evidence.
+///
+/// **Document-aware** (the token-burn fix): a document task (a PRD / spec / design
+/// doc / report — [`crate::planner::is_document_task`]) is EXPECTED to produce zero
+/// source — its deliverable is the document, not code (this mirrors `phases.rs`'s
+/// `expects_code`). So for a document task, zero source is a NEUTRAL pass (nothing to
+/// verify), never a "no real source → create the code" blocker — which would otherwise
+/// fabricate a pointless rework loop for every doc. A non-document task is unchanged:
+/// zero source still fails. Fail-open: reading disk cannot error here.
 fn verify_source_present(options: &RunOptions) -> VerifyResult {
     let files = crate::acceptance::source_files(&options.project_root);
     let n = files.len();
+    if n == 0 && crate::planner::is_document_task(&options.requirement) {
+        return VerifyResult {
+            available: true,
+            passed: true,
+            evidence: vec![
+                "document task — no source code expected (the deliverable is the document)"
+                    .to_string(),
+            ],
+        };
+    }
     VerifyResult {
         available: true,
         passed: n > 0,
@@ -1143,6 +1161,34 @@ mod tests {
         let r = verify(&o, &ev, VerifyKind::SourcePresent).await;
         assert!(r.passed, "a project with source passes");
         assert!(r.evidence[0].contains("source file"));
+    }
+
+    #[tokio::test]
+    async fn verify_source_present_is_document_aware() {
+        // The token-burn fix: a DOCUMENT task (a PRD / spec / design doc / report) is
+        // EXPECTED to produce zero source — its deliverable is the document, not code.
+        // So zero source for a document task is a NEUTRAL pass, never the "no real
+        // source → create the code" blocker that fabricated a rework loop for docs.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.requirement = "帮我写一份产品需求文档(PRD)".to_string();
+        let ev = sink();
+        let r = verify(&o, &ev, VerifyKind::SourcePresent).await;
+        assert!(r.available);
+        assert!(
+            r.passed,
+            "a document task with zero source is a neutral pass, not a blocker"
+        );
+        assert!(r.evidence[0].contains("document task"));
+        // A NON-document task with zero source still fails (a real build that produced
+        // nothing is the decisive blocking finding — unchanged).
+        let mut o2 = opts(tmp.path());
+        o2.requirement = "做一个待办事项应用".to_string();
+        let r2 = verify(&o2, &ev, VerifyKind::SourcePresent).await;
+        assert!(
+            !r2.passed,
+            "a real product build with zero source still fails"
+        );
     }
 
     #[tokio::test]

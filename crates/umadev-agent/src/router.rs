@@ -687,6 +687,16 @@ const ROUTER_TRIAGE_SYSTEM: &str =
      just a file path: delivering a product from a spec is real, multi-part work. \
      Reserve `quick_edit` for a SMALL, single-surface change to something that already \
      exists. \
+     Distinct from BOTH of the above: a request to WRITE / PRODUCE a DOCUMENT as the \
+     deliverable ITSELF — a PRD, a spec, a design doc, a technical proposal, a research \
+     / status report, a 需求文档 / 技术方案 / 设计文档 / 调研报告 / 周报 — is \
+     `kind:docs_only` with `complexity:simple`: the output is a written document, NOT a \
+     built product, so it wants ONE editorial pass (does it serve the requirement, is it \
+     coherent and complete), never a full delivery team or a source-code build. This is \
+     the OPPOSITE of 'build the product DESCRIBED IN a document' above — WRITING the spec \
+     is a light `docs_only` task; IMPLEMENTING what the spec describes is \
+     `build`/`greenfield`. Do not size a document up to a product just because it is \
+     long or detailed. \
      `kind`: greenfield | frontend_only | backend_only | bugfix | refactor | docs_only | \
      light. `complexity`: simple | medium | complex. Only set `clarify_question` when the \
      request is genuinely ambiguous in a way you could NOT resolve by reading the code — \
@@ -1046,6 +1056,44 @@ mod tests {
                 usage: Usage::default(),
             })
         }
+    }
+
+    #[test]
+    fn triage_prompt_sizes_a_document_as_docs_only_simple() {
+        // The PRIMARY brain-first fix: the triage prompt must instruct the borrowed
+        // brain to size a request to WRITE a document (the deliverable IS the document)
+        // as `docs_only` / `simple` — distinct from building the product the document
+        // describes. So the AUTHORITATIVE brain sizes a document light on the route
+        // surface; the deterministic keyword tables are only the fail-open floor.
+        let p = ROUTER_TRIAGE_SYSTEM;
+        assert!(p.contains("docs_only"), "prompt names the docs_only kind");
+        assert!(
+            p.contains("WRITE / PRODUCE a DOCUMENT") || p.contains("WRITE a document"),
+            "prompt distinguishes WRITING a document as the deliverable"
+        );
+        assert!(
+            p.contains("complexity:simple") || p.contains("`complexity:simple`"),
+            "a document is sized simple"
+        );
+        // It is framed as the OPPOSITE of building the product the document describes.
+        assert!(
+            p.to_lowercase().contains("opposite") && p.to_lowercase().contains("describes"),
+            "the docs clause contrasts writing the spec vs. implementing it"
+        );
+    }
+
+    #[tokio::test]
+    async fn brain_sizes_a_document_write_light_no_team() {
+        // End-to-end: when the brain returns `kind:docs_only, complexity:simple` for a
+        // document write, the route is a light one — DocsOnly kind, Fast depth, and
+        // ZERO team (a document does not convene a delivery roster).
+        let brain = TriageBrain(
+            "{\"class\":\"build\",\"kind\":\"docs_only\",\"complexity\":\"simple\",\"confidence\":0.9}",
+        );
+        let p = route_via_brain(&brain, "帮我写一份产品需求文档(PRD)").await;
+        assert_eq!(p.kind, TaskKind::DocsOnly);
+        assert_eq!(p.depth, Depth::Fast);
+        assert!(p.team.is_empty(), "a document write convenes no team");
     }
 
     #[tokio::test]

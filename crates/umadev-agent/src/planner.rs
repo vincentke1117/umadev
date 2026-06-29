@@ -278,6 +278,94 @@ pub fn is_doc_task(requirement: &str) -> bool {
     is_doc_artifact(&requirement.to_lowercase())
 }
 
+/// Whether `requirement` asks to PRODUCE a document as the deliverable ITSELF — the
+/// BROAD superset of [`is_doc_task`]: the README-class artifacts PLUS the planning /
+/// spec / design-doc phrasings (a PRD / 需求文档 / 技术方案 / 设计文档 / design doc /
+/// spec doc / 方案 / report / 报告 / 周报, "write / draft a … doc", …).
+///
+/// This is the **fail-open deterministic FLOOR** for the brain-first document sizing:
+/// the router triage ([`crate::router`] `ROUTER_TRIAGE_SYSTEM`) is the AUTHORITATIVE
+/// judge of "write a document vs. build the product" — this fires only when the brain
+/// did not / could not decide (offline / unreachable). A document is a write-the-doc
+/// task, NOT a product build, so without this floor a document whose phrasing missed
+/// every narrower keyword would fall to the heavyweight [`TaskKind::Greenfield`] default
+/// (a full 8-seat team building+reviewing a .md — the token-burn bug). Still vetoed by
+/// [`has_heavy_signal`] so "build a docs PLATFORM" (a real product that merely mentions
+/// documents) stays a product. Deterministic + fail-open.
+///
+/// The [`has_heavy_signal`] veto is baked IN here (unlike the raw [`is_doc_task`]) so
+/// every caller — the QC short-circuit, the source-present floor, the TUI team
+/// sizing — agrees that a docs-platform PRODUCT is NOT a document task without each
+/// re-applying the veto.
+#[must_use]
+pub fn is_document_task(requirement: &str) -> bool {
+    let q = requirement.to_lowercase();
+    is_document_artifact(&q) && !has_heavy_signal(&q)
+}
+
+/// The document-task token check over an already-lowercased string — the shared body
+/// of [`is_document_task`] and [`classify`]'s document step. A superset of
+/// [`is_doc_artifact`]: the README-class artifacts PLUS planning / spec / design-doc
+/// phrasings. Kept distinct from the README-only [`is_doc_artifact`] so the lighter
+/// README path (→ [`TaskKind::Light`]) and the planning-doc path (→
+/// [`TaskKind::DocsOnly`]) stay separable in [`classify`].
+fn is_document_artifact(q: &str) -> bool {
+    if is_doc_artifact(q) {
+        return true;
+    }
+    let has = |needles: &[&str]| needles.iter().any(|n| q.contains(n));
+    has(&[
+        // Planning / spec / design / report docs (en) — the deliverable IS the document.
+        // Doc-shaped phrasings only for the otherwise-ambiguous tokens ("spec" /
+        // "方案" also read as "build TO this spec / 实现这个方案" — left to the brain),
+        // so the offline floor never mis-sizes a build DOWN to a doc.
+        "prd",
+        "design doc",
+        "design document",
+        "spec doc",
+        "tech spec",
+        "technical spec",
+        "specification",
+        "requirements doc",
+        "requirements document",
+        "research report",
+        "status report",
+        "report doc",
+        "whitepaper",
+        "white paper",
+        "proposal",
+        "write a doc",
+        "write the doc",
+        "draft a doc",
+        "draft the doc",
+        "write a spec",
+        "draft a spec",
+        "write a report",
+        "draft a report",
+        // Planning / spec / design / report docs (zh).
+        "需求文档",
+        "需求说明",
+        "技术方案",
+        "设计文档",
+        "设计方案",
+        "方案文档",
+        "调研报告",
+        "技术文档",
+        "产品文档",
+        "规格说明",
+        "规格文档",
+        "报告",
+        "周报",
+        "日报",
+        "月报",
+        "写方案",
+        "写个方案",
+        "写一份方案",
+        "写文档",
+        "撰写文档",
+    ])
+}
+
 /// The doc-artifact token check over an already-lowercased string — the shared body
 /// of [`is_doc_task`] and [`classify`]'s doc step (so the latter reuses its own
 /// lowercased `q` without re-allocating).
@@ -459,6 +547,24 @@ pub fn classify(requirement: &str) -> TaskKind {
     //      above and keeps its full doc-review.
     if is_doc_artifact(&q) && !has_heavy_signal(&q) {
         return TaskKind::Light;
+    }
+
+    // 4.6. A planning / spec / design DOCUMENT as the deliverable itself — a PRD,
+    //      技术方案, 设计文档, design doc, 调研报告 / report, 周报, … . This is the
+    //      FAIL-OPEN deterministic floor for the brain-first document sizing: the
+    //      router triage (`ROUTER_TRIAGE_SYSTEM`) is the AUTHORITATIVE judge of
+    //      "write a document vs. build the product", and this only fires when the
+    //      brain didn't / couldn't decide. A document is a write-the-doc task, NOT a
+    //      product build, so WITHOUT this step it misses every narrower needle above
+    //      and falls to the heavyweight `Greenfield` default below — the exact
+    //      token-burn bug (a full team building+reviewing a .md). Routed to
+    //      `DocsOnly`, the document kind, whose review scales to a single editorial
+    //      PM read (`critics::docs_team_for_kind`). It runs BEFORE the frontend /
+    //      backend split so "写一份前端设计文档" is a document, not FrontendOnly.
+    //      Vetoed by `has_heavy_signal` so "build a docs PLATFORM" stays a real
+    //      product. (README-class light artifacts already matched 4.5 → Light above.)
+    if is_document_artifact(&q) && !has_heavy_signal(&q) {
+        return TaskKind::DocsOnly;
     }
 
     // 5. Frontend vs backend split (distinctive tokens only).
@@ -1031,11 +1137,17 @@ mod tests {
             classify("做一个 readme 生成器 SaaS 平台,带账号和数据库"),
             TaskKind::Light,
         );
-        // A heavyweight PLANNING doc (PRD / 需求文档 / 技术方案) stays DocsOnly and keeps
-        // its full PM + architect + designer doc-review — only a light README-class
-        // artifact is downgraded to Light.
+        // A PLANNING doc (PRD / 需求文档 / 技术方案 / 设计文档 / report) stays a
+        // DocsOnly DOCUMENT task — NOT downgraded to a Light README, and NOT a product.
         assert_eq!(classify("先写需求文档"), TaskKind::DocsOnly);
         assert_eq!(classify("写个技术方案"), TaskKind::DocsOnly);
+        // The token-burn fix: a planning document now convenes a SINGLE editorial PM
+        // seat (no longer the old PM + architect + designer trio), and ZERO code-review
+        // team — a document is not a product build.
+        let docs = crate::critics::docs_team_for_kind(TaskKind::DocsOnly);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].role(), "product-manager");
+        assert!(crate::critics::quality_team_for_kind(TaskKind::DocsOnly).is_empty());
         // And the lean README path convenes NO team at any stage.
         assert!(crate::critics::Seat::team_for_kind(TaskKind::Light).is_empty());
         assert!(crate::critics::quality_team_for_kind(TaskKind::Light).is_empty());
@@ -1055,6 +1167,57 @@ mod tests {
         assert!(mentions_ui_surface("a small landing page"));
         assert!(!mentions_ui_surface("生成一个 README.md"));
         assert!(!mentions_ui_surface("写个脚本统计行数"));
+    }
+
+    #[test]
+    fn document_tasks_are_docs_only_not_greenfield() {
+        // The token-burn fix (deterministic fail-open floor): a request to WRITE a
+        // planning / spec / design / report DOCUMENT — phrased many ways the narrower
+        // keyword tables don't list — is a DOCUMENT task (DocsOnly, the lean document
+        // kind), NOT the heavyweight Greenfield product build a missed keyword used to
+        // fall through to (a full 8-seat team building+reviewing a .md).
+        for r in [
+            "帮我写一份产品需求文档(PRD)",
+            "写一个技术方案",
+            "produce a design doc for the onboarding flow",
+            "draft a technical spec document",
+            "写一份系统设计文档",
+            "帮我出一个调研报告",
+            "写本周的周报",
+            "write a research report on caching strategies",
+            "撰写一份产品文档",
+        ] {
+            assert_eq!(classify(r), TaskKind::DocsOnly, "should be DocsOnly: {r}");
+            assert!(is_document_task(r), "should be a document task: {r}");
+            // A document is NOT Greenfield, and convenes at most a single editorial PM
+            // seat (no code-review team at all).
+            assert_ne!(classify(r), TaskKind::Greenfield, "never Greenfield: {r}");
+            assert_eq!(
+                crate::critics::docs_team_for_kind(classify(r)).len(),
+                1,
+                "a document convenes one editorial PM seat: {r}"
+            );
+            assert!(
+                crate::critics::quality_team_for_kind(classify(r)).is_empty(),
+                "a document convenes no code-review team: {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn document_task_veto_keeps_a_product_and_a_real_build_unchanged() {
+        // A docs PLATFORM / product that merely mentions documents is VETOED by the
+        // heavy signal → never the lean document kind, it stays a real product build.
+        assert_ne!(classify("做一个 PRD 管理 SaaS 平台"), TaskKind::DocsOnly);
+        assert!(!is_document_task("做一个 prd 管理 saas 平台"));
+        // A real product build is UNCHANGED — still Greenfield (full roster + gates).
+        assert_eq!(classify("做一个电商平台"), TaskKind::Greenfield);
+        assert_eq!(classify("做一个待办事项应用"), TaskKind::Greenfield);
+        // is_document_task is false for product builds / code work / a README artifact
+        // (a README is a Light file-write, handled separately — not a planning doc).
+        assert!(!is_document_task("做一个电商平台"));
+        assert!(!is_document_task("修复登录 bug"));
+        assert!(!is_document_task("做一个简单的待办单页应用,纯前端"));
     }
 
     #[test]
