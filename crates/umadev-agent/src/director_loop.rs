@@ -586,6 +586,19 @@ pub async fn drive_director_loop_routed(
     //    route → no card, current behaviour).
     if let Some(r) = route {
         events.emit(EngineEvent::intent_decided(r));
+        // ADVISORY self-evolution consult (fail-open): if THIS route class has a
+        // measured, trustworthy-LOW first-pass acceptance rate (the cheap path has
+        // historically been unreliable here), surface a nudge toward more consult /
+        // lower autonomy. Pure advisory — it changes nothing about the deterministic
+        // floor, the gates, or loop termination; it only informs the user + the
+        // default. No signal (too few samples / a healthy rate / a fresh project) →
+        // nothing is emitted and behaviour is byte-for-byte unchanged.
+        if let Some(nudge) = crate::first_pass::low_confidence_nudge(
+            &options.project_root,
+            &crate::first_pass::class_kind(r.class.as_str()),
+        ) {
+            events.emit(EngineEvent::Note(nudge));
+        }
     }
 
     // Read the idle watchdog window + the wall-clock build budget ONCE at the
@@ -1338,6 +1351,11 @@ async fn drive_build_step(
         // honestly left unaccepted (→ the caller marks it Blocked), so a dead session
         // can't silently tick steps 2..N Done over an empty build.
         if verdict.accepted && (drove || verdict.has_positive_evidence) {
+            // FIRST-PASS ACCEPTANCE signal (advisory self-evolution, fail-open):
+            // this proposal PASSED verification — record whether it did so on the
+            // FIRST attempt (round 0, no rework) or only after one or more fix
+            // rounds. Telemetry only; it never affects this step's outcome below.
+            record_step_first_pass(options, events, route, step, round == 0);
             return StepOutcome {
                 accepted: true,
                 reply: last_reply,
@@ -1367,11 +1385,52 @@ async fn drive_build_step(
             acceptance_label(&step.acceptance),
         );
     }
+    // FIRST-PASS ACCEPTANCE signal (advisory, fail-open): the cheap path never
+    // passed verification — definitively NOT a first-pass. Only record when a real
+    // doer turn actually ran (`drove`): a dead/hung session that produced no
+    // proposal is an infrastructure miss, not a measurable cheap-path failure, so
+    // it must not poison the rate.
+    if drove {
+        record_step_first_pass(options, events, route, step, false);
+    }
     StepOutcome {
         accepted: false,
         reply: last_reply,
         drove,
         made_progress: false,
+    }
+}
+
+/// Record this build step's FIRST-PASS acceptance outcome into UmaDev's measured
+/// engineering-doctrine signal ([`crate::first_pass`]) and surface the running
+/// rate as a visible advisory [`EngineEvent::Note`].
+///
+/// `first_pass` is `true` iff the step's deterministic acceptance passed on the
+/// FIRST attempt (round 0, ZERO rework rounds). The outcome is recorded under BOTH
+/// the doer-seat kind (the step-kind dimension) AND the route-class kind (the
+/// route-class dimension), so both accumulate from one call. ADVISORY + FAIL-OPEN:
+/// recording never changes the step's pass/fail outcome, the loop, or any gate —
+/// it only feeds the visible metric + later nudges.
+fn record_step_first_pass(
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    route: &RoutePlan,
+    step: &plan_state::PlanStep,
+    first_pass: bool,
+) {
+    for kind in [
+        crate::first_pass::seat_kind(step.seat.role_id()),
+        crate::first_pass::class_kind(route.class.as_str()),
+    ] {
+        crate::first_pass::record(&options.project_root, &kind, first_pass);
+        // Surface the running rate so the signal is visible (only once a kind has
+        // crossed the trusted min-sample threshold). Pure observation.
+        if let Some(rate) = crate::first_pass::first_pass_rate(&options.project_root, &kind) {
+            events.emit(EngineEvent::Note(format!(
+                "signal · first-pass acceptance {kind}: {:.0}% (advisory; the floor still governs)",
+                rate * 100.0
+            )));
+        }
     }
 }
 
@@ -5199,6 +5258,169 @@ mod tests {
         assert!(
             !order.contains(&"api".to_string()) && !order.contains(&"ui".to_string()),
             "stranded dependents were never driven (rework obviated): {order:?}"
+        );
+    }
+
+    // ── First-pass acceptance signal: the measured engineering-doctrine telemetry
+    //    (advisory, fail-open). A step that PASSES on the first acceptance check
+    //    (no rework) is recorded first_pass+attempts; a step that needed rework /
+    //    never passed is recorded attempts-only — keyed by BOTH the doer-seat kind
+    //    and the route-class kind. It never changes a step's outcome. ──
+
+    #[tokio::test]
+    async fn first_pass_signal_records_clean_steps_as_first_pass() {
+        // Source seeded → every source-present step PASSES on round 0 (zero rework).
+        // Each of the 4 FrontendEngineer Build steps on a Build route is therefore a
+        // FIRST-PASS, recorded under both the seat kind and the class kind. The run
+        // still completes Done — the signal is pure telemetry.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route(); // class = Build
+        let mut plan = upstream_peer_plan(); // 4 Build steps, all FrontendEngineer
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
+        // Advisory invariant: the signal did NOT change the build outcome.
+        assert!(
+            plan.steps
+                .iter()
+                .all(|s| s.status == crate::plan_state::StepStatus::Done),
+            "all steps still drained Done (advisory only): {:?}",
+            plan.steps
+                .iter()
+                .map(|s| (s.id.clone(), s.status))
+                .collect::<Vec<_>>()
+        );
+        // The recorded aggregate: 4 first-pass attempts under each dimension.
+        let stats = crate::first_pass::load(tmp.path());
+        let class = crate::first_pass::class_kind("build");
+        let seat = crate::first_pass::seat_kind("frontend-engineer");
+        let cs = stats.kinds.get(&class).copied().expect("class recorded");
+        let ss = stats.kinds.get(&seat).copied().expect("seat recorded");
+        assert_eq!(
+            (cs.attempts, cs.first_pass),
+            (4, 4),
+            "class:build all first-pass"
+        );
+        assert_eq!((ss.attempts, ss.first_pass), (4, 4), "seat all first-pass");
+    }
+
+    #[tokio::test]
+    async fn first_pass_signal_records_reworked_steps_as_attempts_only() {
+        // NO source → the two ready peers (schema, config) FAIL their source-present
+        // acceptance through every fix round and are marked Blocked (api/ui are
+        // stranded, never driven). Each driven step is recorded attempts+1 /
+        // first_pass+0. The Blocked outcome is unchanged — the signal is advisory.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // NO source seeded.
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        let mut plan = upstream_peer_plan();
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
+        // Advisory invariant: schema + config still ended Blocked (signal changed
+        // nothing about loop termination / the deterministic floor).
+        use crate::plan_state::StepStatus;
+        let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
+        assert_eq!(by("schema"), StepStatus::Blocked);
+        assert_eq!(by("config"), StepStatus::Blocked);
+        // Only schema + config were driven (api/ui stranded) → 2 attempts, 0 first-pass.
+        let stats = crate::first_pass::load(tmp.path());
+        let class = crate::first_pass::class_kind("build");
+        let cs = stats.kinds.get(&class).copied().expect("class recorded");
+        assert_eq!(
+            (cs.attempts, cs.first_pass),
+            (2, 0),
+            "reworked/failed steps bump attempts only"
+        );
+        // The signal is correctly NOT first-pass; the rate is 0% but below the min
+        // sample so it stays untrusted (None) — no false confidence on 2 samples.
+        assert_eq!(crate::first_pass::first_pass_rate(tmp.path(), &class), None);
+    }
+
+    #[tokio::test]
+    async fn routed_loop_surfaces_a_low_confidence_nudge_advisory() {
+        // Pre-seed a trustworthy-LOW first-pass history for the build class, then run
+        // the routed entry: it surfaces the IntentDecided card AND an advisory nudge
+        // toward more consult / lower autonomy — without changing the build outcome.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let class = crate::first_pass::class_kind("build");
+        for _ in 0..6 {
+            crate::first_pass::record(tmp.path(), &class, false); // 0/6 → low
+        }
+        let (events, rec) = sink();
+        let turns = vec![text_turn("Built it end to end. Done.")];
+        let mut sess = FakeSession::new(turns, false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+
+        let outcome =
+            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+        // The advisory nudge fired (it never blocks the run).
+        assert!(
+            rec.events().iter().any(|e| matches!(
+                e,
+                EngineEvent::Note(n) if n.contains("一次过验收率偏低")
+            )),
+            "a low-confidence advisory nudge is surfaced: {:?}",
+            rec.events()
+        );
+        // IntentDecided still fired exactly once (the nudge is additive, not a swap).
+        assert_eq!(
+            rec.count(|e| matches!(e, EngineEvent::IntentDecided { .. })),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_loop_emits_no_nudge_without_a_signal() {
+        // A FRESH project (no stats file) → the consult finds no signal → NO nudge is
+        // emitted and behaviour is byte-for-byte the pre-signal path. Guards fail-open.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let turns = vec![text_turn("Built it. Done.")];
+        let mut sess = FakeSession::new(turns, false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+
+        let outcome =
+            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+        assert!(
+            !rec.events().iter().any(|e| matches!(
+                e,
+                EngineEvent::Note(n) if n.contains("一次过验收率偏低")
+            )),
+            "no signal → no nudge (fail-open, unchanged behaviour)"
         );
     }
 

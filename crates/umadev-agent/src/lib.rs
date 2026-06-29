@@ -52,6 +52,7 @@ pub mod director_loop;
 pub mod error_kb;
 pub mod events;
 pub mod experts;
+pub mod first_pass;
 pub mod gates;
 pub mod lessons;
 pub mod manifest;
@@ -110,6 +111,11 @@ pub use director_loop::{
     run_post_build_qc, DirectorLoopOutcome,
 };
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
+pub use first_pass::{
+    autonomy_default as first_pass_autonomy_default, class_kind as first_pass_class_kind,
+    first_pass_rate, low_confidence_nudge as first_pass_low_confidence_nudge,
+    seat_kind as first_pass_seat_kind, FirstPassStats, KindStat,
+};
 pub use gates::{claims_code_changes, classify_reply, Gate, GateOutcome};
 pub use lessons::{
     apply_dev_error_trust, apply_trust_for_identities, apply_trust_for_signatures,
