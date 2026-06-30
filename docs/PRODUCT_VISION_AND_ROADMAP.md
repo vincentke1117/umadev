@@ -6,15 +6,15 @@
 > (a product manager, architect, UI/UX designer, frontend, backend, QA, security, and
 > DevOps — eight specialists, coordinated by a scheduling seat) — an honest gap
 > analysis against the current code, and an executable, impact-ordered roadmap to
-> launch. The headline (a coding agent that works like a real dev team — the team is
-> how it works; the coordinator seat is the glue, not the star) frames this whole
-> document; the layered architecture below is how that team is wired.
+> launch. The headline — a coding agent that works like a real dev team — frames this
+> whole document: the team is how it works, a coordinator seat schedules and gates it,
+> and the layered architecture below is how that team is wired.
 >
-> **The product is the team, not the director.** A solo developer or a small team
+> **The product is the team.** A solo developer or a small team
 > instantly gets a full, disciplined development team — eight role specialists that
-> plan, build, review, and sign off like a real team. The "director" is the
-> coordinator seat (it routes, owns the visible plan, schedules the team, enforces
-> the gates, leaves the audit trail); it is the glue, not the star.
+> plan, build, review, and sign off like a real team, with a coordinator seat that
+> routes the request, owns the visible plan, schedules the team, enforces the gates,
+> and leaves the audit trail.
 >
 > **Non-negotiable identity:** UmaDev is **firmware over a borrowed brain**. It owns
 > **no model**, brokers **no endpoint**, and does **not** re-implement the base's
@@ -44,7 +44,7 @@ visible event surface) — not greenfield invention.
 ## 1. Target Architecture — how the development team is wired
 
 UmaDev is one engine with five layers — the machinery that turns the eight-role team
-into a running system, with the director seat as its coordinator. The base brain is
+into a running system, coordinated by the scheduling seat. The base brain is
 consulted at **explicit decision points** to produce **typed artifacts UmaDev owns**;
 UmaDev then drives the base body deterministically against those artifacts. Everything is **fail-open**: any
 brain consult that fails or returns garbage falls back to a deterministic floor and

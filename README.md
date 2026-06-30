@@ -21,7 +21,7 @@ umadev is **a coding agent that works like a real dev team**. It drives an AI co
 
 What you get is **a whole AI development team**. Eight specialists — product manager, architect, UI/UX designer, frontend engineer, backend engineer, QA, security, and DevOps — plan, build, review, and sign off the way a real team does, borrowing your already-logged-in base as their shared brain. You describe what you want in plain language, and the team turns it into runnable, shippable, auditable software: it researches, writes the PRD, architecture, and UI/UX, builds the frontend and backend, runs the quality and governance checks, and hands back the code plus a delivery proof. It sizes itself to the task — a small edit stays a small edit; a full project convenes the full roster.
 
-A ninth seat — the **coordinator** (the team's technical lead) — is the glue, not the headline: it routes the request, owns a visible plan, schedules the team, enforces the gates, and leaves the audit trail. It doesn't type code itself; the base (the AI coding CLI) is the engineer that does the work. The roles coordinate only through shared artifact files and structured verdicts — they never chat to each other.
+A ninth seat, the **coordinator** (the team's technical lead), routes the request, owns a visible plan, schedules the team, enforces the gates, and leaves the audit trail. It doesn't write code; the base — the AI coding CLI — is the engineer that does that. The roles coordinate through shared artifact files and structured verdicts, never by chatting to each other.
 
 It's a single Rust binary. npm is just the delivery shell.
 
@@ -143,7 +143,7 @@ umadev will:
 9. **Run the full quality gate.** Build, test, lint, contract check, runtime probe, governance scan.
 10. **Produce the delivery pack.** Scorecard, proof pack, compliance mapping — on disk and ready to hand to a teammate, client, or reviewer.
 
-This is not "AI chatted and said done." It leaves real artifacts on disk.
+You end up with real files on disk — the research note, the three docs, source, a quality report, and a proof pack.
 
 ---
 
@@ -158,7 +158,7 @@ umadev has grown that into a coding agent that works like a real dev team:
 - **From single-point governance to whole-pipeline governance.** It no longer only checks code; every phase from requirement to delivery is brought under the process and its gates.
 - **From loose scripts to a spec-driven system.** The source of truth is [UMADEV_HOST_SPEC_V1](spec/UMADEV_HOST_SPEC_V1.md), 32 clauses, ~112 governance rules.
 - **Rewritten in Rust.** One binary, fast startup, low dependency surface, cross-platform distribution.
-- **From blocking bad output to delivering like a team.** Claude Code / Codex / OpenCode are the brain and hands; umadev is the coding agent that works like a real dev team, with governance as its safety net rather than the whole product.
+- **From blocking bad output to delivering like a team.** Claude Code / Codex / OpenCode are the brain and hands; umadev is the coding agent that works like a real dev team, with governance as the safety net underneath.
 
 > `super-dev` asked: "how do we stop AI from writing bad code?" umadev asks: "how do we make AI deliver a complete, shippable, auditable project — the way a real software team would?"
 
@@ -196,9 +196,9 @@ flowchart LR
 ## Features
 
 - **Drives a base you already use.** Claude Code, Codex, or OpenCode, run as one continuous session so the base keeps its context across a whole build instead of starting cold each step. No API key of its own.
-- **A whole dev team, not one assistant.** Eight specialists — product manager, architect, UI/UX designer, frontend engineer, backend engineer, QA, security, and DevOps — each own a deliverable (PRD, API contract, design system, the build, tests + runtime-proof, security audit, deploy-proof) and plan, implement, review, and sign off the way a real team does. A coordinator schedules them, owns the plan, and enforces the gates.
+- **A whole dev team.** Eight specialists — product manager, architect, UI/UX designer, frontend engineer, backend engineer, QA, security, and DevOps — each own a deliverable (PRD, API contract, design system, the build, tests + runtime-proof, security audit, deploy-proof) and plan, implement, review, and sign off the way a real team does. A coordinator schedules them, owns the plan, and enforces the gates.
 - **Plans the work and shows it.** A build becomes a dependency plan (`.umadev/plan.json`) rendered as a live checklist you can steer with `/plan`. Steps are driven step by step; the coordinator owns the plan, not the base.
-- **A build in chat is a real build.** A build typed in the chat UI earns the same planning, team scheduling, governance, and delivery proof as `umadev run`. There is no weaker chat path.
+- **A build in chat is a real build.** A build typed in the chat UI earns the same planning, team scheduling, governance, and delivery proof as `umadev run`.
 - **Ships a delivery proof.** PRD, architecture, and UI/UX docs, a scorecard, and a proof pack — scaled to the task, so a one-page change doesn't get an enterprise dossier.
 - **Carries engineering standards into the base — with a fully-local dual-channel RAG.** 459 curated knowledge files (commercial-grade engineering standards, design rules) plus a map of your existing code are compiled into the binary and retrieved on every working turn by a two-channel hybrid engine: pure-Rust BM25 + a local vector model (`multilingual-e5-small`, f16, via candle) fused with RRF, HyDE query expansion on top. No API key, no network, millisecond recall over your own standards and business docs. Zero config.
 - **Self-evolving memory — it learns from each run.** Mistakes the base hits are recorded with a frequency signal to a local store; a genuine recurrence triggers a higher-level corrective *reflection*. Both are recalled into later prompts, so the same pitfall isn't repeated — umadev gets better on your codebase the more you use it.
@@ -255,7 +255,7 @@ The firmware is pre-loaded once at launch, so the first reply doesn't pay the 30
 
 ## The Team
 
-umadev convenes a nine-seat team — eight specialists plus a coordinator — and each role is a real job function with a real deliverable, not a label. Each role owns something concrete on the shared blackboard:
+umadev convenes a nine-seat team — eight specialists plus a coordinator — and each role is a real job function with a real deliverable. Each role owns something concrete on the shared blackboard:
 
 | Role | What it owns (deliverable on the shared blackboard) |
 |---|---|
@@ -356,7 +356,7 @@ Offline mode (`/offline`) makes no model calls and no network requests. It is an
 
 ## The Full Delivery Flow
 
-For a heavyweight greenfield build, the coordinator can expand the plan into the full nine-phase chain. This is the most complete delivery path — not a funnel every message is forced through.
+For a heavyweight greenfield build, the coordinator expands the plan into the full nine-phase chain — the most complete delivery path. Most requests route to something shorter.
 
 ```mermaid
 flowchart LR
