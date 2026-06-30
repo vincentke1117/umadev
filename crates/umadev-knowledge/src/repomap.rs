@@ -555,6 +555,13 @@ fn extract_symbols(text: &str, lang: Lang) -> Vec<Symbol> {
         return Vec::new();
     }
     let mut out = Vec::new();
+    // Multi-line comment / docstring state — a declaration-looking line INSIDE a
+    // `/* ... */` block comment or a triple-quoted docstring is NOT a real symbol
+    // and must not be captured as a phantom (LOW #6). Line-granular: cheap, and
+    // enough to kill the common multi-line-block-comment / docstring false
+    // positives (license headers, commented-out code, Python docstrings).
+    let mut in_block = false;
+    let mut doc_marker: Option<&'static str> = None;
     for (i, raw_line) in text.lines().enumerate() {
         if out.len() >= limits::MAX_SYMBOLS_PER_FILE {
             break;
@@ -566,6 +573,45 @@ fn extract_symbols(text: &str, lang: Lang) -> Vec<Symbol> {
         }
         let line = raw_line.trim_end();
         let trimmed = line.trim_start();
+
+        // --- comment / docstring state machine (skip symbol matching inside) ---
+        if in_block {
+            if trimmed.contains("*/") {
+                in_block = false;
+            }
+            continue;
+        }
+        if let Some(marker) = doc_marker {
+            if trimmed.contains(marker) {
+                doc_marker = None;
+            }
+            continue;
+        }
+        // A block comment opened with a line beginning `/*` (covers `/*`, `/**`
+        // JSDoc, `/* commented code`). A single-line `/* ... */` closes on the
+        // same line, so it does not enter the multi-line state.
+        if trimmed.starts_with("/*") {
+            if !trimmed.contains("*/") {
+                in_block = true;
+            }
+            continue; // a comment opener carries no symbol
+        }
+        // Python triple-quoted docstring (`"""` or `'''`). Enters the docstring
+        // state unless the same line also closes it.
+        if matches!(lang, Lang::Python)
+            && (trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''"))
+        {
+            let marker = if trimmed.starts_with("\"\"\"") {
+                "\"\"\""
+            } else {
+                "'''"
+            };
+            if !trimmed[marker.len()..].contains(marker) {
+                doc_marker = Some(marker);
+            }
+            continue;
+        }
+
         if trimmed.is_empty()
             || trimmed.starts_with("//")
             || trimmed.starts_with('#') && lang != Lang::Python && lang != Lang::Ruby
@@ -1394,6 +1440,57 @@ mod tests {
         assert!(!n.iter().any(|s| s == "notReal"));
         assert!(!n.iter().any(|s| s == "AlsoNotReal"));
         assert!(!n.iter().any(|s| s == "hello"));
+    }
+
+    #[test]
+    fn multiline_block_comment_symbols_are_not_captured() {
+        // LOW #6: declaration-looking lines INSIDE a multi-line `/* ... */` block
+        // comment must NOT be captured as phantom symbols; the real symbol after
+        // the comment must still be found.
+        let syms = extract_symbols(
+            "/*\nexport class CommentedOut {}\nfunction alsoCommented() {}\n*/\nexport class Real {}\n",
+            Lang::JsTs,
+        );
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"Real"),
+            "the real symbol after the comment is captured"
+        );
+        assert!(
+            !names.contains(&"CommentedOut"),
+            "a class inside the block comment must not be captured: {names:?}"
+        );
+        assert!(
+            !names.contains(&"alsoCommented"),
+            "a fn inside the block comment must not be captured: {names:?}"
+        );
+    }
+
+    #[test]
+    fn python_docstring_symbols_are_not_captured() {
+        // LOW #6: a `def`/`class` inside a triple-quoted docstring is documentation
+        // text, not a symbol.
+        let syms = extract_symbols(
+            "def real_fn():\n    \"\"\"\n    def fake_in_doc():\n    class FakeInDoc:\n    \"\"\"\n    pass\nclass RealClass:\n    pass\n",
+            Lang::Python,
+        );
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"real_fn"),
+            "the real def is captured: {names:?}"
+        );
+        assert!(
+            names.contains(&"RealClass"),
+            "the real class is captured: {names:?}"
+        );
+        assert!(
+            !names.contains(&"fake_in_doc"),
+            "a def inside the docstring must not be captured: {names:?}"
+        );
+        assert!(
+            !names.contains(&"FakeInDoc"),
+            "a class inside the docstring must not be captured: {names:?}"
+        );
     }
 
     // --- (2) ranking ---------------------------------------------------------

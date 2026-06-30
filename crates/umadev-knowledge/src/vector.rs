@@ -206,6 +206,16 @@ pub struct VectorStore {
     /// All stored vectors.
     #[serde(default)]
     vectors: Vec<StoredVector>,
+    /// Fingerprint of the index's chunk-position mapping at the time the store
+    /// was built (`index::corpus_fingerprint`). The retriever compares this to
+    /// the live index's fingerprint before keying vector hits on positional
+    /// `chunk_idx`; a mismatch means the corpus shifted since the store was
+    /// built, so vector fusion is skipped to avoid attributing a stale hit to
+    /// the WRONG chunk (MED #4). `#[serde(default)]` keeps old cache blobs (which
+    /// have an empty signature) readable — they simply read as "mismatched" until
+    /// the next rebuild restamps them, degrading safely to BM25.
+    #[serde(default)]
+    corpus_sig: String,
 }
 
 impl VectorStore {
@@ -216,6 +226,7 @@ impl VectorStore {
             model: String::new(),
             dim: EMBED_DIM,
             vectors: Vec::new(),
+            corpus_sig: String::new(),
         }
     }
 
@@ -367,6 +378,9 @@ impl VectorStore {
             model: model.to_string(),
             dim,
             vectors,
+            // Stamped separately by the index builder via `set_corpus_sig` once
+            // it has the live index in hand (MED #4); empty here means "unstamped".
+            corpus_sig: String::new(),
         }
     }
 
@@ -401,6 +415,21 @@ impl VectorStore {
     #[must_use]
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// The fingerprint of the chunk-position mapping this store was built over
+    /// (`index::corpus_fingerprint`). Empty for an unstamped / legacy store. The
+    /// retriever compares this to the live index before fusing vector hits (MED
+    /// #4).
+    #[must_use]
+    pub fn corpus_sig(&self) -> &str {
+        &self.corpus_sig
+    }
+
+    /// Stamp the store with the live index's chunk-position fingerprint. Called
+    /// by the index builder once it has the index in hand (MED #4).
+    pub fn set_corpus_sig(&mut self, sig: String) {
+        self.corpus_sig = sig;
     }
 }
 
@@ -805,6 +834,7 @@ mod tests {
                     chunk_idx: 2,
                 },
             ],
+            corpus_sig: String::new(),
         };
         let query = vec![1.0, 0.0, 0.0];
         let hits = store.search(&query, 3);
@@ -843,6 +873,7 @@ mod tests {
                     chunk_idx: 9,
                 },
             ],
+            corpus_sig: String::new(),
         };
         let hits = store.search_with_idx(&[1.0, 0.0, 0.0], 3);
         assert_eq!(hits.len(), 2, "both colliding-section entries returned");
@@ -865,6 +896,7 @@ mod tests {
                 body_hash: 0,
                 chunk_idx: 0,
             }],
+            corpus_sig: String::new(),
         };
         // Query of wrong dimension → empty, not a panic.
         assert!(store.search(&[0.0; 5], 1).is_empty());
@@ -882,6 +914,7 @@ mod tests {
                 body_hash: 123,
                 chunk_idx: 7,
             }],
+            corpus_sig: String::new(),
         };
         let bytes = serde_json::to_vec(&store).unwrap();
         let back: VectorStore = serde_json::from_slice(&bytes).unwrap();
@@ -901,6 +934,22 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back.entries()[0].0, 0); // chunk_idx defaulted to 0
         assert_eq!(back.entries()[0].3, 0); // body_hash defaulted to 0
+                                            // MED #4: an old cache blob with no corpus_sig defaults to empty, so it
+                                            // reads as "mismatched" and degrades safely to BM25 until restamped.
+        assert_eq!(back.corpus_sig(), "");
+    }
+
+    #[test]
+    fn corpus_sig_is_set_and_round_trips() {
+        // MED #4: the chunk-position fingerprint stamp must persist through serde.
+        let mut store =
+            VectorStore::from_embedded("m", vec![(0, "a".into(), "s".into(), 0, vec![1.0, 0.0])]);
+        assert_eq!(store.corpus_sig(), "", "unstamped by from_embedded");
+        store.set_corpus_sig("fp-abc123".into());
+        assert_eq!(store.corpus_sig(), "fp-abc123");
+        let bytes = serde_json::to_vec(&store).unwrap();
+        let back: VectorStore = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.corpus_sig(), "fp-abc123", "corpus_sig round-trips");
     }
 
     #[test]

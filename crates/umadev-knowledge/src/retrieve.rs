@@ -342,19 +342,32 @@ pub fn retrieve_with_vector_and_expansion(
     let ranked = if use_vector {
         let query_vec = query_vec.unwrap_or(&[]);
         let store = vector::VectorStore::load(project_root);
+        // MED #4: only fuse when the store was built over the SAME chunk-position
+        // mapping as the live index. BM25 rebuilds lazily at query time while the
+        // vector store rebuilds separately (async), so a corpus changed since the
+        // store was built shifts `chunk_idx` — a stale-yet-in-range hit would then
+        // attribute to the WRONG chunk. A fingerprint mismatch (or an unstamped /
+        // legacy store) skips vector fusion (BM25-only) until the store is rebuilt.
+        let store_aligned =
+            !store.is_empty() && store.corpus_sig() == crate::index::corpus_fingerprint(&index);
         // P0-2: collision-safe — fuse on the store's `chunk_idx`, not the lossy
         // `(path, section)` remap that silently dropped legitimate colliding hits.
-        let vec_hits = if store.is_empty() {
-            Vec::new()
+        let vec_hits = if store_aligned {
+            store.search_with_idx(query_vec, over_fetch)
         } else {
-            store.search_with_idx(query_vec, config.top_k * 3)
+            Vec::new()
         };
         if vec_hits.is_empty() {
             bm25_hits
         } else {
-            // Real RRF fusion: merge the two ranked lists. Fall back to BM25 if
-            // fusion somehow empties (defensive).
-            let fused = rrf_fuse(&index, &bm25_hits, &vec_hits, RRF_K, config.top_k);
+            // Fuse the OVER-FETCHED, UNFILTERED BM25 list with the vector list so
+            // both channels contribute symmetrically before truncation (#7
+            // de-bias), THEN run the fused ranking through `filter_by_phase` so the
+            // vector channel can NOT reintroduce off-phase chunks the BM25 filter
+            // excludes — e.g. a `design-systems` chunk in the Frontend phase (MED
+            // #2). Truncation to top_k happens inside the post-fusion phase filter.
+            let fused = rrf_fuse(&index, &bm25_raw, &vec_hits, RRF_K, over_fetch);
+            let fused = filter_by_phase(&index, &fused, phase, config.top_k);
             if fused.is_empty() {
                 bm25_hits
             } else {
@@ -632,28 +645,44 @@ fn normalise(index: &Bm25Index, hits: Vec<(usize, f64)>) -> Vec<ScoredChunk> {
         .fold(0.0_f64, f64::max)
         .max(1e-9);
     let min_score = min_score_filter();
-    // `hits` arrives sorted by score (BM25 / RRF), so rank 0 is the best match.
-    hits.into_iter()
-        .enumerate()
-        .map(|(rank, (idx, score))| {
+    // Attach the boosted score to each hit, carrying the chunk_idx for a
+    // deterministic tiebreak.
+    let mut scored: Vec<(usize, ScoredChunk)> = hits
+        .into_iter()
+        .map(|(idx, score)| {
             let base = (score / max) as f32;
             let qs = index.chunks[idx].quality_score.unwrap_or(50).clamp(0, 100);
-            // Weak boost: score × (1 + quality/200). quality=50 → ×1.0 (neutral),
-            // quality=100 → ×1.5, quality=0 → ×0.5. Clamped to 1.0.
+            // Weak boost: score × (1 + quality/200). quality=50 → ×1.25,
+            // quality=100 → ×1.5, quality=0 → ×1.0. Clamped to 1.0.
             let boosted = (base * (1.0 + qs as f32 / 200.0)).min(1.0);
             (
-                rank,
+                idx,
                 ScoredChunk {
                     chunk: index.chunks[idx].clone(),
                     score: boosted,
                 },
             )
         })
-        // Drop noise below the (configurable) threshold — but NEVER drop the
-        // top hit, so a real match can't vanish when min_score is raised high
-        // (e.g. 1.0 would otherwise return empty unless quality_score == 100).
-        .filter(|(rank, sc)| *rank == 0 || sc.score >= min_score)
-        .map(|(_, sc)| sc)
+        .collect();
+    // MED #3: actually RE-SORT by the boosted score (desc), tiebreak ascending
+    // chunk_idx for determinism. Previously the boost was attached but the list
+    // kept its raw-score order, so curated docs never ranked higher in ORDER (the
+    // boost only flipped the min_score gate). Sorting before the gate makes the
+    // quality boost reorder, and the new rank-0 is the genuine best (boosted).
+    scored.sort_by(|a, b| {
+        b.1.score
+            .partial_cmp(&a.1.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    // Drop noise below the (configurable) threshold — but NEVER drop the top
+    // hit, so a real match can't vanish when min_score is raised high (e.g. 1.0
+    // would otherwise return empty unless quality_score == 100).
+    scored
+        .into_iter()
+        .enumerate()
+        .filter(|(rank, (_, sc))| *rank == 0 || sc.score >= min_score)
+        .map(|(_, (_, sc))| sc)
         .collect()
 }
 
@@ -1229,5 +1258,231 @@ mod tests {
         let vec_hits: Vec<(u32, f32)> = vec![(0, 0.9), (1, 0.7), (2, 0.5)];
         let fused = rrf_fuse(&index, &bm25, &vec_hits, 60, 2);
         assert_eq!(fused.len(), 2);
+    }
+
+    #[test]
+    fn quality_boost_reorders_not_just_filters() {
+        // MED #3: a curated chunk (high quality_score) with a slightly LOWER raw
+        // score must rank ABOVE a neutral chunk with a higher raw score, because
+        // `normalise` now RE-SORTS by the boosted score. Previously the boost was
+        // attached but the order stayed raw-score, so curated docs never actually
+        // ranked higher in ORDER.
+        let a = crate::chunker::chunk_text("a.md", "# A\n\n## S\n\naaa body")[0].clone();
+        let b = crate::chunker::chunk_text("b.md", "# B\n\n## S\n\nbbb body")[0].clone();
+        let c = crate::chunker::chunk_text(
+            "c.md",
+            "---\nquality_score: 100\n---\n# C\n\n## S\n\nccc body",
+        )[0]
+        .clone();
+        let index = Bm25Index::from_chunks(vec![a, b, c]); // idx 0=a, 1=b, 2=c
+                                                           // Raw order a(1.0) > b(0.65) > c(0.6). After boost: a=1.0,
+                                                           // b=0.65×1.25=0.8125, c=0.6×1.5=0.9 → c must overtake b.
+        let out = normalise(&index, vec![(0, 1.0), (1, 0.65), (2, 0.6)]);
+        let paths: Vec<&str> = out.iter().map(|h| h.chunk.meta.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["a.md", "c.md", "b.md"],
+            "quality boost must reorder the curated chunk c above b: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn normalise_tiebreak_is_deterministic_by_index() {
+        // Two chunks that tie on boosted score must order by ascending chunk_idx,
+        // reproducibly (the crate's stated determinism).
+        let a = crate::chunker::chunk_text("a.md", "# A\n\n## S\n\naaa")[0].clone();
+        let b = crate::chunker::chunk_text("b.md", "# B\n\n## S\n\nbbb")[0].clone();
+        let index = Bm25Index::from_chunks(vec![a, b]);
+        for _ in 0..32 {
+            // Equal raw score + equal (default) quality → equal boosted score.
+            let out = normalise(&index, vec![(1, 0.5), (0, 0.5)]);
+            let paths: Vec<&str> = out.iter().map(|h| h.chunk.meta.path.as_str()).collect();
+            assert_eq!(paths, vec!["a.md", "b.md"], "lower chunk_idx wins the tie");
+        }
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn vector_channel_is_phase_filtered() {
+        // MED #2: the vector channel must NOT reintroduce off-phase chunks the
+        // BM25 phase filter excludes. In the Frontend phase a `design-systems/`
+        // chunk is deliberately excluded (it's inlined as the binding contract,
+        // not retrieved); even when the vector store ranks it #1 it must not
+        // surface.
+        let _env = crate::testsupport::env_guard();
+        let prev_key = std::env::var("OPENAI_API_KEY").ok();
+        std::env::set_var("OPENAI_API_KEY", "test-dummy-no-network");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kd = tmp.path().join("knowledge");
+        fs::create_dir_all(kd.join("frontend")).unwrap();
+        fs::create_dir_all(kd.join("design-systems")).unwrap();
+        // In-phase doc the BM25 query hits (so the phase filter is non-empty and
+        // does not fall back to unfiltered).
+        fs::write(
+            kd.join("frontend/components.md"),
+            "# Components\n\n## Buttons\n\nbutton component primary variant states",
+        )
+        .unwrap();
+        // Off-phase (Frontend) doc the BM25 query does NOT hit, but the vector
+        // store will rank #1 for the query vector.
+        fs::write(
+            kd.join("design-systems/archetype.md"),
+            "# Archetype\n\n## Palette\n\nbrandpalettetoken neutralscale elevation",
+        )
+        .unwrap();
+
+        // Build the index the SAME way retrieve will, so chunk positions + the
+        // fingerprint align.
+        let index = load_or_build_index_multi(tmp.path(), &corpus_dirs(tmp.path(), &kd));
+        let ds_idx = index
+            .chunks
+            .iter()
+            .position(|c| c.meta.path.contains("design-systems"))
+            .expect("design-systems chunk indexed");
+
+        let qvec = vec![1.0f32, 0.0, 0.0, 0.0];
+        let entries: Vec<(u32, String, String, u64, Vec<f32>)> = index
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let v = if i == ds_idx {
+                    vec![1.0f32, 0.0, 0.0, 0.0]
+                } else {
+                    vec![0.0f32, 1.0, 0.0, 0.0]
+                };
+                (
+                    u32::try_from(i).unwrap(),
+                    c.meta.path.clone(),
+                    c.meta.section.clone(),
+                    0,
+                    v,
+                )
+            })
+            .collect();
+        let mut store = vector::VectorStore::from_embedded("test-model", entries);
+        // Stamp with the live fingerprint so the MED #4 alignment gate lets fusion run.
+        store.set_corpus_sig(crate::index::corpus_fingerprint(&index));
+        store.save(tmp.path());
+
+        let cfg = RetrievalConfig {
+            enabled: true,
+            engine: RetrievalEngine::Hybrid,
+            top_k: 5,
+            custom_dirs: vec![],
+        };
+        let hits = retrieve_with_vector(
+            tmp.path(),
+            &kd,
+            &cfg,
+            "button component",
+            Phase::Frontend,
+            Some(&qvec),
+        );
+        let paths: Vec<&str> = hits.iter().map(|h| h.chunk.meta.path.as_str()).collect();
+        assert!(
+            paths.iter().any(|p| p.contains("frontend/components")),
+            "the in-phase frontend chunk must surface: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("design-systems")),
+            "the off-phase design-systems chunk must NOT surface even though the vector store ranks it #1: {paths:?}"
+        );
+
+        match prev_key {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn vector_fusion_skipped_on_corpus_signature_mismatch() {
+        // MED #4: when the cached vector store's corpus fingerprint does not match
+        // the live index (the corpus shifted since the store was built), vector
+        // fusion is skipped so a stale positional chunk_idx can't attribute a hit
+        // to the WRONG chunk. Proven with a query that matches NOTHING in BM25: a
+        // MATCHING fingerprint surfaces the vector-only chunk; a STALE one must not.
+        let _env = crate::testsupport::env_guard();
+        let prev_key = std::env::var("OPENAI_API_KEY").ok();
+        std::env::set_var("OPENAI_API_KEY", "test-dummy-no-network");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kd = seed_corpus(tmp.path());
+        let index = load_or_build_index_multi(tmp.path(), &corpus_dirs(tmp.path(), &kd));
+        let login_idx = index
+            .chunks
+            .iter()
+            .position(|c| c.meta.path.contains("login"))
+            .expect("login chunk indexed");
+
+        let qvec = vec![1.0f32, 0.0, 0.0, 0.0];
+        let entries: Vec<(u32, String, String, u64, Vec<f32>)> = index
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let v = if i == login_idx {
+                    vec![1.0f32, 0.0, 0.0, 0.0]
+                } else {
+                    vec![0.0f32, 1.0, 0.0, 0.0]
+                };
+                (
+                    u32::try_from(i).unwrap(),
+                    c.meta.path.clone(),
+                    c.meta.section.clone(),
+                    0,
+                    v,
+                )
+            })
+            .collect();
+
+        let cfg = RetrievalConfig {
+            enabled: true,
+            engine: RetrievalEngine::Hybrid,
+            top_k: 5,
+            custom_dirs: vec![],
+        };
+        // The query matches NOTHING in BM25, so any hit can only come from vectors.
+        let query = "zzzvectoronlyquery";
+
+        // (A) MATCHING fingerprint → fusion runs → the vector-only chunk surfaces.
+        let mut good = vector::VectorStore::from_embedded("m", entries.clone());
+        good.set_corpus_sig(crate::index::corpus_fingerprint(&index));
+        good.save(tmp.path());
+        let hits_match =
+            retrieve_with_vector(tmp.path(), &kd, &cfg, query, Phase::Research, Some(&qvec));
+        assert!(
+            hits_match
+                .iter()
+                .any(|h| h.chunk.meta.path.contains("login")),
+            "matching fingerprint -> vector fusion surfaces the vector-only chunk: {:?}",
+            hits_match
+                .iter()
+                .map(|h| &h.chunk.meta.path)
+                .collect::<Vec<_>>()
+        );
+
+        // (B) STALE fingerprint → fusion skipped → BM25-only → nothing for a query
+        // that matches nothing lexically.
+        let mut stale = vector::VectorStore::from_embedded("m", entries);
+        stale.set_corpus_sig("stale-fingerprint-that-will-not-match".into());
+        stale.save(tmp.path());
+        let hits_stale =
+            retrieve_with_vector(tmp.path(), &kd, &cfg, query, Phase::Research, Some(&qvec));
+        assert!(
+            !hits_stale.iter().any(|h| h.chunk.meta.path.contains("login")),
+            "stale fingerprint -> vector fusion skipped, the vector-only chunk must NOT surface: {:?}",
+            hits_stale
+                .iter()
+                .map(|h| &h.chunk.meta.path)
+                .collect::<Vec<_>>()
+        );
+
+        match prev_key {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
     }
 }

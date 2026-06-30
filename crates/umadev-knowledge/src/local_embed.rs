@@ -83,6 +83,14 @@ pub fn local_dim() -> Option<usize> {
 struct LoadedModel {
     model: BertModel,
     tokenizer: Tokenizer,
+    /// The model's maximum sequence length (`max_position_embeddings` from
+    /// `config.json`; e5-small = 512). A section tokenising to MORE than this
+    /// would push `seq_len` past the position-embedding table and make candle
+    /// error the whole forward pass — which previously nulled the ENTIRE batch
+    /// and silently disabled the bundled local vector layer for any corpus
+    /// holding even one long section. Token ids are capped to this before the
+    /// forward pass (HIGH #1).
+    max_seq_len: usize,
 }
 
 /// Process-wide model cache keyed by the resolved model directory. Loading is
@@ -136,7 +144,30 @@ fn load_model(dir: &Path) -> candle_core::Result<LoadedModel> {
     let vb = VarBuilder::from_tensors(tensors, DTYPE, &device);
     let model = BertModel::load(vb, &config)?;
     let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(to_msg)?;
-    Ok(LoadedModel { model, tokenizer })
+    let max_seq_len = read_max_seq_len(&config_text);
+    Ok(LoadedModel {
+        model,
+        tokenizer,
+        max_seq_len,
+    })
+}
+
+/// The model's position-embedding limit, read from the raw `config.json` text
+/// (NOT via a candle struct field, so it is robust to candle config-shape
+/// changes). Falls back to 512 (the e5/BERT-family default) when the field is
+/// absent, unparseable, or zero. This is the cap [`embed_one`] truncates token
+/// ids to so an over-long section can't error the forward pass (HIGH #1).
+fn read_max_seq_len(config_text: &str) -> usize {
+    #[derive(serde::Deserialize)]
+    struct MaxPos {
+        #[serde(default)]
+        max_position_embeddings: usize,
+    }
+    serde_json::from_str::<MaxPos>(config_text)
+        .ok()
+        .map(|m| m.max_position_embeddings)
+        .filter(|&n| n > 0)
+        .unwrap_or(512)
 }
 
 /// Embed `texts` with the bundled local model. `is_query` selects the e5
@@ -156,30 +187,80 @@ pub fn embed_texts(texts: &[String], is_query: bool) -> Option<Vec<Vec<f32>>> {
 
 fn embed_inner(dir: &Path, texts: &[String], is_query: bool) -> candle_core::Result<Vec<Vec<f32>>> {
     let device = Device::Cpu;
-    let to_msg =
-        |e: Box<dyn std::error::Error + Send + Sync>| candle_core::Error::Msg(e.to_string());
-
     // Reuse the cached (model, tokenizer) — loaded ONCE per process, not per
     // query. The heavy safetensors load + graph build happens on first use only.
     let loaded = cached_model(dir)?;
-    let model = &loaded.model;
-    let tokenizer = &loaded.tokenizer;
-
     let prefix = if is_query { "query: " } else { "passage: " };
-    let mut out = Vec::with_capacity(texts.len());
-    for t in texts {
-        let enc = tokenizer
-            .encode(format!("{prefix}{t}"), true)
-            .map_err(to_msg)?;
-        let ids = Tensor::new(enc.get_ids(), &device)?.unsqueeze(0)?;
-        let type_ids = ids.zeros_like()?;
-        let mask = Tensor::new(enc.get_attention_mask(), &device)?.unsqueeze(0)?;
-        let hidden = model.forward(&ids, &type_ids, Some(&mask))?;
-        let pooled = mean_pool(&hidden, &mask)?;
-        let normed = l2_normalize(&pooled)?;
-        out.push(normed.squeeze(0)?.to_vec1::<f32>()?);
-    }
-    Ok(out)
+    // Embed each text INDEPENDENTLY so one bad text (a tokeniser quirk, an
+    // unexpected per-row inference error) can't null the whole batch — a failed
+    // row is zero-filled below to the width of a good one, keeping the
+    // input-aligned length the caller checks. Over-long sections are token-capped
+    // inside `embed_one` so they no longer error at all (HIGH #1).
+    let rows: Vec<Option<Vec<f32>>> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| match embed_one(&loaded, &device, prefix, t) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::debug!(
+                    "local embed: text {i} failed ({e}); zero-filling to keep the batch"
+                );
+                None
+            }
+        })
+        .collect();
+    assemble_batch(rows).ok_or_else(|| {
+        candle_core::Error::Msg("local embed produced no usable vectors (every text failed)".into())
+    })
+}
+
+/// Embed ONE text. The token ids are capped to the model's `max_seq_len`
+/// (e5-small = 512) before the forward pass, so a section longer than the
+/// model's context window embeds (truncated) rather than making the BertModel
+/// error — the root of HIGH #1, where one long curated section nulled the whole
+/// batch and silently disabled the marketed local fp16 layer.
+fn embed_one(
+    loaded: &LoadedModel,
+    device: &Device,
+    prefix: &str,
+    text: &str,
+) -> candle_core::Result<Vec<f32>> {
+    let to_msg =
+        |e: Box<dyn std::error::Error + Send + Sync>| candle_core::Error::Msg(e.to_string());
+    let enc = loaded
+        .tokenizer
+        .encode(format!("{prefix}{text}"), true)
+        .map_err(to_msg)?;
+    let cap = capped_len(enc.get_ids().len(), loaded.max_seq_len);
+    let ids = Tensor::new(&enc.get_ids()[..cap], device)?.unsqueeze(0)?;
+    let type_ids = ids.zeros_like()?;
+    let mask = Tensor::new(&enc.get_attention_mask()[..cap], device)?.unsqueeze(0)?;
+    let hidden = loaded.model.forward(&ids, &type_ids, Some(&mask))?;
+    let pooled = mean_pool(&hidden, &mask)?;
+    let normed = l2_normalize(&pooled)?;
+    normed.squeeze(0)?.to_vec1::<f32>()
+}
+
+/// The number of leading tokens to feed the model: at most `max` (the model's
+/// position-embedding limit). Capping here instead of letting the BertModel
+/// error on `seq_len > max_position_embeddings` is the HIGH #1 fix. `max.max(1)`
+/// guards against a degenerate (zero) limit ever producing an empty slice.
+fn capped_len(len: usize, max: usize) -> usize {
+    len.min(max.max(1))
+}
+
+/// Assemble per-text embedding outcomes into a dense, input-aligned batch. A
+/// failed row (`None`) is zero-filled to the width of the first successful row,
+/// so a single bad text can't null the whole batch. Returns `None` (fail-open)
+/// ONLY when every row failed (no width to fill to) — the caller then drops to
+/// the HTTP backend / BM25.
+fn assemble_batch(rows: Vec<Option<Vec<f32>>>) -> Option<Vec<Vec<f32>>> {
+    let dim = rows.iter().flatten().map(Vec::len).next()?;
+    Some(
+        rows.into_iter()
+            .map(|r| r.unwrap_or_else(|| vec![0.0; dim]))
+            .collect(),
+    )
 }
 
 /// Attention-masked mean pooling over the token dimension. `hidden` is
@@ -235,6 +316,71 @@ mod tests {
             Some(v) => std::env::set_var(ENV_MODEL_DIR, v),
             None => std::env::remove_var(ENV_MODEL_DIR),
         }
+    }
+
+    #[test]
+    fn capped_len_truncates_oversize_sections() {
+        // HIGH #1: a section tokenising to MORE than the model's position limit
+        // is capped to the limit (so it embeds, truncated, instead of erroring
+        // the forward pass and nulling the whole batch).
+        assert_eq!(capped_len(1000, 512), 512, "over-limit length is capped");
+        assert_eq!(capped_len(10, 512), 10, "under-limit length is untouched");
+        assert_eq!(capped_len(512, 512), 512, "exactly-at-limit is kept");
+        // Defensive: a degenerate (zero) limit must never produce an empty slice.
+        assert_eq!(capped_len(5, 0), 1);
+    }
+
+    #[test]
+    fn assemble_batch_zero_fills_a_failed_row_not_the_whole_batch() {
+        // HIGH #1: one bad text (None) must NOT null the batch — it is zero-filled
+        // to the width of a good row, and the batch length stays input-aligned
+        // (so the caller's `len == texts.len()` check still passes and the rest of
+        // the corpus keeps its real vectors).
+        let good = vec![0.1f32, 0.2, 0.3];
+        let rows = vec![Some(good.clone()), None, Some(good.clone())];
+        let out = assemble_batch(rows).expect("a good row exists -> Some");
+        assert_eq!(out.len(), 3, "length stays aligned with the input");
+        assert_eq!(out[0], good);
+        assert_eq!(
+            out[1],
+            vec![0.0; 3],
+            "the failed row is zero-filled to width 3"
+        );
+        assert_eq!(out[2], good);
+    }
+
+    #[test]
+    fn read_max_seq_len_reads_config_and_falls_back() {
+        // HIGH #1: the truncation cap comes from config.json; a missing/zero
+        // field falls back to 512 (the e5/BERT default) so capping always happens.
+        assert_eq!(read_max_seq_len(r#"{"max_position_embeddings": 512}"#), 512);
+        assert_eq!(read_max_seq_len(r#"{"max_position_embeddings": 256}"#), 256);
+        assert_eq!(
+            read_max_seq_len(r#"{"hidden_size": 384}"#),
+            512,
+            "absent -> 512"
+        );
+        assert_eq!(read_max_seq_len("not json"), 512, "unparseable -> 512");
+        assert_eq!(
+            read_max_seq_len(r#"{"max_position_embeddings": 0}"#),
+            512,
+            "zero -> 512"
+        );
+    }
+
+    #[test]
+    fn assemble_batch_all_failed_is_none() {
+        // Only when EVERY row failed (no width to fill to) do we fail open to None
+        // so the caller drops to the HTTP backend / BM25.
+        let rows: Vec<Option<Vec<f32>>> = vec![None, None];
+        assert!(
+            assemble_batch(rows).is_none(),
+            "all-failed -> None (fail-open)"
+        );
+        assert!(
+            assemble_batch(Vec::new()).is_none(),
+            "an empty batch has no width -> None"
+        );
     }
 
     #[test]

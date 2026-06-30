@@ -349,10 +349,29 @@ fn parse_front_matter_fields(yaml: &str) -> FrontMatterFields {
     }
 }
 
+/// Whether a trimmed line opens or closes a fenced code block — a run of three
+/// or more backticks or tildes (` ``` ` / `~~~`). Used to toggle fence state so
+/// a markdown heading (`#`/`##`) INSIDE a code block (common in standards docs
+/// that show example markdown) is not mistaken for a real heading boundary
+/// (MED #5).
+fn is_code_fence(trimmed: &str) -> bool {
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
 /// First `# Title` line, returning the title without the leading `# `.
+/// Fence-aware: a `# x` inside a fenced code block before the real H1 (e.g. an
+/// example snippet) is skipped rather than mis-taken as the title (MED #5).
 fn extract_h1_title(body: &str) -> Option<String> {
+    let mut in_fence = false;
     for line in body.lines() {
         let trimmed = line.trim_start();
+        if is_code_fence(trimmed) {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue; // a `#` inside a code fence is not a heading
+        }
         if let Some(rest) = trimmed.strip_prefix("# ") {
             return Some(rest.trim().to_string());
         }
@@ -398,20 +417,33 @@ fn split_on_h2(body: &str) -> Vec<(String, String)> {
     let mut sections: Vec<(String, String)> = Vec::new();
     let mut current_heading = String::from("Overview");
     let mut current_body = String::new();
+    // Track fenced-code state so a `## ` line INSIDE a ```/~~~ block (e.g. a doc
+    // that embeds example markdown) does NOT split the section mid-fence into a
+    // fake heading + a fractured code body (MED #5).
+    let mut in_fence = false;
 
     for line in body.lines() {
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("## ") {
-            // Flush the previous section.
-            sections.push((
-                std::mem::take(&mut current_heading),
-                std::mem::take(&mut current_body),
-            ));
-            current_heading = rest.trim().to_string();
-        } else {
+        if is_code_fence(trimmed) {
+            in_fence = !in_fence;
+            // The fence delimiter line is part of the section body.
             current_body.push_str(line);
             current_body.push('\n');
+            continue;
         }
+        if !in_fence {
+            if let Some(rest) = trimmed.strip_prefix("## ") {
+                // Flush the previous section.
+                sections.push((
+                    std::mem::take(&mut current_heading),
+                    std::mem::take(&mut current_body),
+                ));
+                current_heading = rest.trim().to_string();
+                continue;
+            }
+        }
+        current_body.push_str(line);
+        current_body.push('\n');
     }
     sections.push((current_heading, current_body));
 
@@ -461,6 +493,44 @@ mod tests {
         assert_eq!(chunks[0].meta.title, "Postgres");
         // Tuning section captured as its own chunk.
         assert!(chunks[1].body.contains("shared_buffers"));
+    }
+
+    #[test]
+    fn code_fence_h2_does_not_split_section() {
+        // MED #5: a `## ` line inside a fenced code block (common when a doc shows
+        // an example markdown snippet) must NOT be treated as a heading boundary —
+        // the whole fenced block stays in ONE section's body.
+        let md = "# Doc\n\n## Real Section\n\nintro paragraph\n\n```md\n## Example heading inside fence\nfenced body line\n```\n\nafter the fence\n";
+        let chunks = chunk_text("docs/standards.md", md);
+        let sections: Vec<&str> = chunks.iter().map(|c| c.meta.section.as_str()).collect();
+        assert_eq!(
+            chunks.len(),
+            1,
+            "the fenced ## must not create a second section: {sections:?}"
+        );
+        assert_eq!(chunks[0].meta.section, "Real Section");
+        assert!(
+            chunks[0].body.contains("## Example heading inside fence"),
+            "the fenced heading stays verbatim inside the section body"
+        );
+        assert!(
+            chunks[0].body.contains("fenced body line"),
+            "the fenced code body is not fractured off"
+        );
+        assert!(
+            chunks[0].body.contains("after the fence"),
+            "content after the closing fence stays in the same section"
+        );
+    }
+
+    #[test]
+    fn tilde_fence_h2_does_not_split_section() {
+        // The tilde-fence (~~~) form must be tracked too (MED #5).
+        let md = "# Doc\n\n## Only Section\n\n~~~\n## not a heading\n~~~\n\ntail\n";
+        let chunks = chunk_text("docs/x.md", md);
+        assert_eq!(chunks.len(), 1, "tilde fence must not split");
+        assert_eq!(chunks[0].meta.section, "Only Section");
+        assert!(chunks[0].body.contains("## not a heading"));
     }
 
     #[test]

@@ -430,6 +430,13 @@ pub fn load_or_build_index_multi(project_root: &Path, knowledge_dirs: &[PathBuf]
             walk_md(dir, &mut paths, 0);
         }
     }
+    // Sort the collected paths so chunk POSITIONS are stable run-to-run: `walk_md`
+    // collects in `read_dir` order, which is unspecified and can vary between
+    // machines / after a file is added or removed. A stable position is what the
+    // vector store's positional `chunk_idx` keys on, so an unstable order would
+    // desync BM25 from the cached vector store and attribute a vector hit to the
+    // WRONG chunk (MED #4).
+    paths.sort();
     let signature = corpus_signature(&paths, knowledge_dirs);
 
     // Cache check: if the signature matches the stored one, load directly.
@@ -617,6 +624,39 @@ fn body_hash(body: &str) -> u64 {
     u64::from_be_bytes(digest[..8].try_into().expect("sha256 is 32 bytes"))
 }
 
+/// A deterministic fingerprint of an index's CHUNK-POSITION MAPPING: the ordered
+/// `(path, section)` identity of every chunk plus the chunk count, hashed
+/// (truncated SHA-256). The vector store is stamped with this at build time
+/// ([`build_vector_store_if_enabled`]); the retriever compares it against the
+/// live index before keying vector hits on positional `chunk_idx`.
+///
+/// MED #4: BM25 rebuilds lazily at query time while the vector store rebuilds
+/// separately (async), so after a knowledge file is added/removed a
+/// stale-yet-in-range `chunk_idx` would map a vector hit onto a DIFFERENT chunk.
+/// A fingerprint mismatch detects exactly that (a file add/remove changes the
+/// ordered identity sequence) so the retriever can skip vector fusion (or wait
+/// for the rebuild) rather than attribute a hit to the wrong chunk. Keyed on
+/// `(path, section)` + count — the positional mapping — NOT body content (which
+/// the store's per-chunk `body_hash` already invalidates).
+#[must_use]
+pub fn corpus_fingerprint(index: &Bm25Index) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update((index.chunks.len() as u64).to_be_bytes());
+    for c in &index.chunks {
+        hasher.update(c.meta.path.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(c.meta.section.as_bytes());
+        hasher.update([0u8]);
+    }
+    let digest = hasher.finalize();
+    digest.iter().take(16).fold(String::new(), |mut acc, b| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
 /// The text that gets embedded for a chunk: title + section + body. This is
 /// the exact string the embedding model sees, so it must be deterministic
 /// across rebuilds for the cache to hit.
@@ -656,6 +696,13 @@ pub async fn build_vector_store_if_enabled(
     if !store.is_empty() && (store.model() != model || store.dim() != vector::active_dim()) {
         store = vector::VectorStore::disabled();
     }
+
+    // MED #4: stamp the store with the live index's chunk-position fingerprint so
+    // the retriever can detect a corpus that shifted since the store was built
+    // (a file added/removed → every later chunk_idx shifts) and skip keying
+    // vector hits on a now-misaligned positional chunk_idx. Set ONCE here, before
+    // the branches below: `replace` preserves it and every save path persists it.
+    store.set_corpus_sig(corpus_fingerprint(index));
 
     // Content-addressed reuse: key on (path, section, body_hash), NOT the
     // volatile positional chunk index. Keying on position re-embedded identical
@@ -1049,6 +1096,52 @@ B: {sb}"
             sa.contains("security/login.md"),
             "signature must contain nested relative path"
         );
+    }
+
+    #[test]
+    fn walk_md_paths_are_sorted_for_stable_chunk_positions() {
+        // MED #4 (b): chunk POSITIONS must be stable regardless of read_dir order.
+        // Files are written in non-sorted order; the resulting chunk paths must
+        // come out sorted ascending so the positional chunk_idx (the vector store
+        // keys on it) is deterministic across machines / after a file add/remove.
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let kd = root.join("knowledge");
+        fs::create_dir_all(&kd).unwrap();
+        // Deliberately reverse creation order.
+        fs::write(kd.join("c.md"), "# C\n\n## S\n\ngamma").unwrap();
+        fs::write(kd.join("a.md"), "# A\n\n## S\n\nalpha").unwrap();
+        fs::write(kd.join("b.md"), "# B\n\n## S\n\nbeta").unwrap();
+
+        let idx = load_or_build_index(root, &kd);
+        let paths: Vec<&str> = idx.chunks.iter().map(|c| c.meta.path.as_str()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            paths, sorted,
+            "chunk paths must be in stable sorted order: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn corpus_fingerprint_changes_when_a_chunk_is_added_or_removed() {
+        // MED #4: the fingerprint keys on the ordered (path, section) identity +
+        // count, so adding/removing a chunk (which shifts every later chunk_idx)
+        // changes it — exactly the desync the retriever's alignment gate detects.
+        let one = idx_from(&[("a.md", "# A\n\n## S\n\nalpha")]);
+        let two = idx_from(&[
+            ("a.md", "# A\n\n## S\n\nalpha"),
+            ("b.md", "# B\n\n## S\n\nbeta"),
+        ]);
+        assert_ne!(
+            corpus_fingerprint(&one),
+            corpus_fingerprint(&two),
+            "adding a chunk must change the corpus fingerprint"
+        );
+        // Identical corpora → identical fingerprint (deterministic).
+        let one_again = idx_from(&[("a.md", "# A\n\n## S\n\nalpha")]);
+        assert_eq!(corpus_fingerprint(&one), corpus_fingerprint(&one_again));
     }
 
     #[test]
