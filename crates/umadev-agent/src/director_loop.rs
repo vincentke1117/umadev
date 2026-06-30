@@ -1212,6 +1212,9 @@ async fn drive_plan_steps(
         // `title` is moved into the status event below.
         let step_title = step.title.clone();
         let step_kind = step.kind;
+        // PLAN RECITATION (bounded): a compact "where we are in the plan" line so the
+        // base stays anchored to the whole plan over a long step-by-step run.
+        let plan_progress = plan_progress_recitation(plan, &step_id);
         let outcome = match step.kind {
             plan_state::StepKind::Build => {
                 drive_build_step(
@@ -1220,6 +1223,7 @@ async fn drive_plan_steps(
                     events,
                     route,
                     &step,
+                    &plan_progress,
                     blast_radius,
                     deadline,
                 )
@@ -1452,6 +1456,52 @@ fn step_goal_frame(options: &RunOptions) -> String {
     )
 }
 
+/// A COMPACT plan-progress recitation appended to each step directive — the
+/// "next-steps" half of plan recitation ([`step_goal_frame`] is the goal half).
+///
+/// Periodically RE-STATING where the build is in the overall plan — how many steps
+/// are done and what still lies ahead — over a long multi-step run keeps the base
+/// anchored to the whole plan instead of drifting on a long sequence of isolated
+/// step turns (a known long-horizon failure mode). It is recited on EVERY step (the
+/// strongest "every N" bound, N=1) but is itself BOUNDED — at most the next two
+/// upcoming titles, each head-clipped — so it stays one compact line and never
+/// bloats the directive or the base's input budget. Fail-open: a trivial (≤1-step)
+/// plan yields nothing, and the last step recites only its position.
+fn plan_progress_recitation(plan: &Plan, current_step_id: &str) -> String {
+    let total = plan.steps.len();
+    // A single-step plan has no broader plan to keep in view — skip the recitation
+    // entirely (the goal frame already states the objective).
+    if total <= 1 {
+        return String::new();
+    }
+    let done = plan
+        .steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Done)
+        .count();
+    // The next still-to-do steps that come AFTER this one in plan order — bounded to
+    // two and each title head-clipped, so the recitation stays a single compact line.
+    // (A finished step — Done or Blocked — is skipped so "ahead" is honestly ahead.)
+    let upcoming: Vec<String> = plan
+        .steps
+        .iter()
+        .skip_while(|s| s.id != current_step_id)
+        .skip(1)
+        .filter(|s| !matches!(s.status, StepStatus::Done | StepStatus::Blocked))
+        .take(2)
+        .map(|s| crate::experts::excerpt(&s.title, 60))
+        .collect();
+    let ahead = if upcoming.is_empty() {
+        "this is the final step — finishing it completes the plan.".to_string()
+    } else {
+        format!("still ahead after this step: {}.", upcoming.join("; "))
+    };
+    format!(
+        "## Plan progress (keep the whole plan in view)\n\
+         {done} of {total} plan steps complete; {ahead}"
+    )
+}
+
 /// Drive ONE Build step: `summon` the step's seat serially on the main session with
 /// a focused directive (recalled pitfalls injected), then verify against the step's
 /// `acceptance` on the deterministic floor. A failing acceptance folds its evidence
@@ -1463,12 +1513,17 @@ fn step_goal_frame(options: &RunOptions) -> String {
 /// real work — round 0 (the step's actual doer turn) ALWAYS runs, so a budget already
 /// spent before this step never starves the step itself; only the re-drives past the
 /// budget are skipped (the doc'd "hard ceiling" is honoured inside the step too).
+#[allow(clippy::too_many_arguments)]
 async fn drive_build_step(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
     step: &plan_state::PlanStep,
+    // A compact plan-progress recitation ([`plan_progress_recitation`]) appended to
+    // this step's directive so the base stays anchored to the overall plan over a
+    // long run. Empty for a trivial plan; bounded by construction.
+    plan_progress: &str,
     // The step's blast radius (transitive downstream-dependent count). A HIGH value
     // (≥ [`HIGH_BLAST_RADIUS`]) is an upstream node many steps build on — it earns one
     // extra bounded fix round (rigor weighted by blast radius); a leaf keeps the base
@@ -1498,6 +1553,13 @@ async fn drive_build_step(
         step.title,
         route_focus_line(route)
     );
+    // PLAN RECITATION: re-state where this step sits in the whole plan so the base
+    // does not drift on a long step sequence. Bounded + fail-open (empty for a
+    // trivial plan).
+    if !plan_progress.trim().is_empty() {
+        instruction.push_str("\n\n");
+        instruction.push_str(plan_progress.trim());
+    }
     if !pitfalls.trim().is_empty() {
         instruction.push_str("\n\n## Known pitfalls to avoid (from past runs)\n");
         instruction.push_str(pitfalls.trim());
@@ -1621,6 +1683,12 @@ async fn drive_build_step(
             verdict.evidence_line(),
             step_criterion_label(step),
         );
+        // Re-recite the plan position on a fix re-drive too, so a long fix sequence
+        // on one step stays anchored to the overall plan.
+        if !plan_progress.trim().is_empty() {
+            instruction.push_str("\n\n");
+            instruction.push_str(plan_progress.trim());
+        }
     }
     // FIRST-PASS ACCEPTANCE signal (advisory, fail-open): the cheap path never
     // passed verification — definitively NOT a first-pass. Only record when a real
@@ -7362,7 +7430,8 @@ mod tests {
             &events,
             &route,
             &step,
-            0, // a leaf step (no dependents) → base fix budget, no rigor bonus
+            "", // no plan-progress recitation in this single-step unit test
+            0,  // a leaf step (no dependents) → base fix budget, no rigor bonus
             std::time::Instant::now() + Duration::from_secs(3_600),
         )
         .await;
@@ -7474,7 +7543,8 @@ mod tests {
             &events,
             &route,
             &step,
-            0, // leaf step → base fix budget (MAX_STEP_FIX_ROUNDS), no rigor bonus
+            "", // no plan-progress recitation in this single-step unit test
+            0,  // leaf step → base fix budget (MAX_STEP_FIX_ROUNDS), no rigor bonus
             std::time::Instant::now() + Duration::from_secs(3_600),
         )
         .await;
@@ -7524,6 +7594,7 @@ mod tests {
             &events,
             &route,
             &step,
+            "", // no plan-progress recitation in this single-step unit test
             0,
             std::time::Instant::now() + Duration::from_secs(3_600),
         )
@@ -7913,6 +7984,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn plan_progress_recitation_is_bounded_and_honest() {
+        // PLAN RECITATION lock test: the compact per-step "where we are in the plan"
+        // line must (a) state the honest position, (b) name only the NEXT up-to-two
+        // upcoming steps, and (c) be empty for a trivial plan — so a long step-by-step
+        // run keeps the base anchored to the whole plan without bloating the directive.
+        use crate::plan_state::{Plan, StepStatus};
+
+        let plan = Plan {
+            steps: vec![
+                resume_step("s1", "scaffold the project", &[], StepStatus::Done),
+                resume_step("s2", "build the auth route", &["s1"], StepStatus::Active),
+                resume_step("s3", "build the dashboard", &["s2"], StepStatus::Pending),
+                resume_step("s4", "wire the payments flow", &["s3"], StepStatus::Pending),
+                resume_step("s5", "add the settings page", &["s4"], StepStatus::Pending),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+
+        let recit = plan_progress_recitation(&plan, "s2");
+        // Honest position — the current (Active) step is not yet counted complete.
+        assert!(
+            recit.contains("1 of 5 plan steps complete"),
+            "recites the honest position: {recit}"
+        );
+        // Names the NEXT (up to two) upcoming steps…
+        assert!(
+            recit.contains("build the dashboard"),
+            "names the next step: {recit}"
+        );
+        assert!(
+            recit.contains("wire the payments flow"),
+            "names the 2nd next step: {recit}"
+        );
+        // …but is BOUNDED to two — the third pending step is NOT listed.
+        assert!(
+            !recit.contains("add the settings page"),
+            "recitation is bounded to two upcoming steps: {recit}"
+        );
+        // …and never re-lists the already-done step.
+        assert!(
+            !recit.contains("scaffold the project"),
+            "omits the done step: {recit}"
+        );
+
+        // The LAST step recites only its position (no upcoming) — still bounded.
+        let last = plan_progress_recitation(&plan, "s5");
+        assert!(
+            last.contains("final step"),
+            "the last step recites its position with no upcoming: {last}"
+        );
+
+        // FAIL-OPEN: a trivial single-step plan emits nothing (the goal frame suffices).
+        let solo = Plan {
+            steps: vec![resume_step("only", "do the thing", &[], StepStatus::Active)],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        assert!(
+            plan_progress_recitation(&solo, "only").is_empty(),
+            "a single-step plan needs no progress recitation"
+        );
+    }
+
     #[tokio::test]
     async fn resume_drives_only_the_remaining_steps_not_the_done_ones() {
         // The resume entry loads a persisted plan with some Done + some Pending steps
@@ -7974,6 +8110,13 @@ mod tests {
                 .any(|d| d.contains("做一个完整的产品") && d.contains("Overall goal")),
             "the resumed step directive restates the original goal, not just the step \
              title: {sent:?}"
+        );
+        // Plan recitation is threaded into the live directive: the driven step carries
+        // the compact "where we are in the plan" line (1 of 2 done — beta is last).
+        assert!(
+            sent.iter()
+                .any(|d| d.contains("Plan progress") && d.contains("1 of 2 plan steps complete")),
+            "the step directive recites the plan position so the base stays anchored: {sent:?}"
         );
 
         // The persisted plan now has both steps Done (alpha preserved, beta completed).

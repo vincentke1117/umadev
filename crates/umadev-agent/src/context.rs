@@ -48,6 +48,21 @@
 //! identity beats 心法 beats memory beats knowledge. A chat turn injects only
 //! the (short) identity — no retrieval — so day-to-day conversation stays fast.
 //!
+//! ## KV-cache-stable prefix (base-I/O economy)
+//!
+//! The layer order is ALSO chosen for the base's prompt KV-cache. The maximally
+//! STABLE material — identity → output-language → craft law → anti-slop law →
+//! user charter — is emitted FIRST and is byte-identical across turns that differ
+//! only in their per-turn inputs, so the base re-uses its cached attention over
+//! that prefix instead of re-paying the whole prompt every turn. Everything that
+//! changes turn to turn — the recorded project facts, the app-runtime directive
+//! (keyed off the requirement), the repo-map slice, the pitfall digest, the
+//! knowledge digest — is emitted AFTER that stable prefix, and each such block is
+//! deterministically ordered (no `HashMap` iteration, no timestamp high in the
+//! prefix). Reordering a volatile block above the stable head would silently bust
+//! the cache and re-pay the prefix every turn; the `stable_prefix_*` lock tests
+//! pin the boundary so a future edit can't regress it.
+//!
 //! ## Fail-open by contract (mirrors the governance kernel + the router)
 //!
 //! Every retrieval is best-effort: a missing `knowledge/` dir, a disabled KB, an
@@ -219,6 +234,16 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
         if !charter.trim().is_empty() {
             fw.push_block(&charter);
         }
+
+        // ══ STABLE → VOLATILE BOUNDARY (KV-cache) ════════════════════════════
+        // Everything ABOVE this point (identity, output-language, craft law,
+        // anti-slop law, user charter) is byte-stable across turns and forms the
+        // base's cacheable prefix. Everything BELOW — recorded facts, the
+        // requirement-keyed app-runtime directive, and the JIT tail (repo-map,
+        // pitfall + knowledge digests) — changes turn to turn and is placed AFTER
+        // the stable head ON PURPOSE so the prefix keeps hitting the KV-cache. Do
+        // NOT move a volatile block above this line (it busts the cache); see the
+        // `stable_prefix_*` lock tests.
 
         // ── Durable PROJECT FACTS — recalled on EVERY work turn ──────────────
         // Facts the team already resolved about THIS project (a JDK/binary path, a
@@ -1090,5 +1115,130 @@ mod tests {
         assert_eq!(FirmwareTier::for_route(&dbg_deep), FirmwareTier::Full);
         let build = route(RouteClass::Build, Depth::Fast, Vec::new());
         assert_eq!(FirmwareTier::for_route(&build), FirmwareTier::Full);
+    }
+
+    #[tokio::test]
+    async fn stable_prefix_is_a_byte_identical_leading_prefix() {
+        // KV-CACHE INVARIANT: the firmware's stable head (identity → output-language →
+        // craft → anti-slop → charter) must lead and be byte-identical regardless of
+        // the per-turn volatile inputs. A head-only compose (a blank repo: no facts, no
+        // repo-map, no lessons, no knowledge) must therefore be an EXACT leading prefix
+        // of a compose that carries a full volatile tail — proving nothing volatile is
+        // interleaved above the stable head (which would bust the base's KV-cache).
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
+        // A non-AI build so the app-runtime directive is empty in BOTH (kept identical).
+        let req = "做一个待办事项 SaaS 产品";
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+
+        // Compose A — blank repo → the pure stable head, no volatile tail.
+        let head_dir = tempfile::TempDir::new().unwrap();
+        let head = compose_firmware(head_dir.path(), &r, req).await;
+
+        // Compose B — same route/config, but a full volatile tail: brownfield code
+        // (repo-map) + a recorded fact + matching curated knowledge.
+        let full_dir = tempfile::TempDir::new().unwrap();
+        seed_brownfield(full_dir.path());
+        crate::project_facts::record_fact(
+            full_dir.path(),
+            crate::project_facts::Fact::new("port", "8080", Some("port")),
+        );
+        let kd = full_dir.path().join("knowledge/frontend");
+        std::fs::create_dir_all(&kd).unwrap();
+        std::fs::write(
+            kd.join("std.md"),
+            "# Frontend\n\n## Design tokens\n\nUse design tokens and component states for a SaaS todo product.",
+        )
+        .unwrap();
+        let full = compose_firmware(full_dir.path(), &r, req).await;
+
+        // The volatile tail must actually be present (else the test proves nothing)…
+        assert!(
+            full.chars().count() > head.chars().count(),
+            "compose B must carry a volatile tail"
+        );
+        assert!(
+            full.contains("YOUR CODEBASE") || full.contains("KNOWN PROJECT FACTS"),
+            "compose B carries volatile blocks: {full}"
+        );
+        // …and the stable head must be a BYTE-EXACT leading prefix of it.
+        assert!(
+            full.starts_with(&head),
+            "the stable head must be a byte-identical leading prefix:\nHEAD=<<{head}>>\nFULL=<<{full}>>"
+        );
+        // Sanity: the head actually contains the stable blocks it claims to.
+        assert!(head.to_lowercase().contains("umadev"), "identity in head");
+        assert!(head.contains("HOW YOUR TEAM BUILDS"), "craft in head");
+        assert!(head.contains("ANTI-AI-SLOP"), "anti-slop in head");
+    }
+
+    #[tokio::test]
+    async fn stable_prefix_holds_across_two_different_volatile_tails() {
+        // The literal lock: two work turns with the SAME route/config but DIFFERENT
+        // volatile inputs (different repo-map + different facts) must share a byte-
+        // identical leading prefix THROUGH the last stable block (the anti-slop law) —
+        // the volatile boundary. Only what comes after it may differ.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
+        let req = "做一个待办事项 SaaS 产品";
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+
+        // Repo A — TS checkout/auth + a port fact.
+        let a_dir = tempfile::TempDir::new().unwrap();
+        seed_brownfield(a_dir.path());
+        crate::project_facts::record_fact(
+            a_dir.path(),
+            crate::project_facts::Fact::new("port", "8080", Some("port")),
+        );
+        let a = compose_firmware(a_dir.path(), &r, req).await;
+
+        // Repo B — a totally different file + a different fact.
+        let b_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            b_dir.path().join("payments.go"),
+            "package main\nfunc ChargeCard() {}\nfunc Refund() {}\n",
+        )
+        .unwrap();
+        crate::project_facts::record_fact(
+            b_dir.path(),
+            crate::project_facts::Fact::new("jdk", "/opt/jdk-17", Some("path")),
+        );
+        let b = compose_firmware(b_dir.path(), &r, req).await;
+
+        // The two composes DIFFER (different volatile tails)…
+        assert_ne!(a, b, "the two composes must carry different volatile tails");
+        // …but the stable prefix THROUGH the anti-slop law is byte-identical.
+        let anchor = a.find(ANTI_SLOP_LAW).expect("anti-slop law present") + ANTI_SLOP_LAW.len();
+        assert_eq!(
+            a.as_bytes().get(..anchor),
+            b.as_bytes().get(..anchor),
+            "the stable prefix up to the volatile boundary must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn firmware_budget_constants_are_bounded_and_sane() {
+        // CONTEXT BUDGET: the firmware is an OVERLAY on top of the base's own (large)
+        // system prompt + the per-turn directive, so it must stay a small high-signal
+        // slice and leave most of the window for the actual work. Lock the
+        // relationships at COMPILE time so a future edit can't quietly let the firmware
+        // crowd out the work (a `const {}` assertion fails the build, not just a run).
+        const {
+            // The firmware stays a small overlay, not a second corpus.
+            assert!(FIRMWARE_BUDGET <= 16_000);
+            // The JIT tail reserve is a fraction of the whole budget — the stable head
+            // (identity + craft + law) always has room to lead.
+            assert!(ALWAYS_ON_RESERVE < FIRMWARE_BUDGET);
+            // The repo-map slice is ONE part of the JIT tail, not all of it.
+            assert!(REPO_MAP_BUDGET < ALWAYS_ON_RESERVE);
+            // The user charter is a bounded slice of the head.
+            assert!(CONSTITUTION_BUDGET < FIRMWARE_BUDGET);
+        }
     }
 }
