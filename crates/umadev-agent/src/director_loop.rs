@@ -1150,6 +1150,11 @@ async fn drive_plan_steps(
     // The running count of completed BUILD steps — the "work turn" tally that the
     // active fact-extraction backstop throttles on (see `crate::fact_extract`).
     let mut work_turns = 0usize;
+    // CIRCUIT BREAKER (UD-FLOW-008): trip after CONSECUTIVE_FAILURE_THRESHOLD
+    // consecutive same-class step-verification failures with NO intervening progress,
+    // so a build where the base keeps failing the same way STOPS with a diagnosis
+    // instead of grinding to MAX_STEP_TRANSITIONS burning effort. A Done step resets it.
+    let mut failure_breaker = crate::trust::ConsecutiveFailureBreaker::new();
 
     // Walk the DAG by readiness: drive each ready step, mark it, repeat. A step that
     // can't be accepted (after its bounded fix budget) is marked Blocked so it stops
@@ -1203,6 +1208,10 @@ async fn drive_plan_steps(
         // Blast radius of THIS step (downstream-dependent count) — weights its rework
         // rigor: a high-blast-radius upstream step earns one extra bounded fix round.
         let blast_radius = plan.blast_radius(&step_id);
+        // Capture the title + kind for the circuit-breaker diagnosis BEFORE the step's
+        // `title` is moved into the status event below.
+        let step_title = step.title.clone();
+        let step_kind = step.kind;
         let outcome = match step.kind {
             plan_state::StepKind::Build => {
                 drive_build_step(
@@ -1274,6 +1283,36 @@ async fn drive_plan_steps(
         // a step that actually ticked Done moves the phase; a Blocked step leaves it.
         // Fail-open. This is what keeps `/status` honest as the build progresses.
         sync_phase_from_plan(plan, options);
+
+        // CIRCUIT BREAKER (UD-FLOW-008). Feed this step's outcome into the
+        // consecutive-same-class-failure breaker: a Done step is real progress (reset);
+        // a step that actually DROVE a turn but could not pass its acceptance (a real
+        // verification/rework failure) records a same-class failure. A neutral skip (an
+        // empty-team review, or a dead-but-accepted step — `!drove`, or accepted with no
+        // progress) is NEITHER a failure nor progress, so it never trips and never resets.
+        // When the breaker trips we STOP scheduling new steps and fall through to the
+        // honest final gate + finalize(clean=false) with a typed diagnosis surfaced,
+        // instead of looping to MAX_STEP_TRANSITIONS burning the base's effort.
+        if status == StepStatus::Done {
+            failure_breaker.record_success();
+        } else if drove && !accepted {
+            let class = match step_kind {
+                plan_state::StepKind::Build => "build-verify",
+                plan_state::StepKind::Review => "review-verify",
+            };
+            if failure_breaker.record_failure(class) {
+                events.emit(EngineEvent::Note(format!(
+                    "team · {} — stopping the schedule early (last failing step: {}). \
+                     The base could not make the plan steps pass their acceptance; fix \
+                     the blocker or raise the plan quality, then /continue.",
+                    failure_breaker
+                        .diagnosis()
+                        .unwrap_or_else(|| "circuit breaker tripped".to_string()),
+                    step_title,
+                )));
+                break;
+            }
+        }
 
         // ACTIVE FACT-RECORDING BACKSTOP — after a Build step that did REAL work,
         // extract this turn's durable facts ourselves (a read-only fork asking the
@@ -6517,6 +6556,76 @@ mod tests {
         assert!(
             note_seen(&rec, "因前置被阻塞而跳过"),
             "the stranded-scope Note is surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_stops_a_flailing_plan_early_with_a_diagnosis() {
+        // UD-FLOW-008 circuit breaker: a plan of INDEPENDENT build steps that each
+        // fail their acceptance (no source on disk → source-present rejects every step)
+        // is a same-class flail. After CONSECUTIVE_FAILURE_THRESHOLD consecutive
+        // build-verify failures the breaker trips: the schedule STOPS early (later steps
+        // are never driven) and a typed diagnosis Note is surfaced — instead of looping
+        // through all MAX_STEP_TRANSITIONS burning the base's effort. The run still
+        // settles cleanly (Done, honestly NOT clean), never a wedge.
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        // NO source seeded → every source-present Build step fails its acceptance.
+        let (events, rec) = sink();
+        // More INDEPENDENT steps than the threshold, so the breaker (not exhaustion)
+        // is what stops the loop — proving an EARLY, diagnosed stop.
+        let n_steps = (crate::trust::CONSECUTIVE_FAILURE_THRESHOLD as usize) + 2;
+        let mk = |id: &str| PlanStep {
+            id: id.into(),
+            title: format!("step {id}"),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: vec![], // all independent → all ready, all driven in turn
+            acceptance: AcceptanceSpec::SourcePresent,
+            status: StepStatus::Pending,
+        };
+        let mut plan = Plan {
+            steps: (0..n_steps).map(|i| mk(&format!("s{i}"))).collect(),
+            risks: vec![],
+            open_questions: vec![],
+        };
+        // Plenty of default-completing turns; a future deadline so the breaker (not the
+        // wall-clock budget) is what stops the schedule.
+        let turns: Vec<Vec<SessionEvent>> =
+            (0..40).map(|_| text_turn("Worked on it. Done.")).collect();
+        let mut sess = FakeSession::new(turns, false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string(); // a build (not a document task)
+        let route = build_route();
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        // Settles cleanly (never hangs / never disguises the failures as success).
+        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
+        // EARLY stop: exactly threshold steps were ever driven (went Active); the rest
+        // were never scheduled because the breaker tripped.
+        let driven = active_order(&rec).len();
+        assert_eq!(
+            driven,
+            crate::trust::CONSECUTIVE_FAILURE_THRESHOLD as usize,
+            "the breaker stops the schedule after N consecutive failures, before exhausting \
+             all {n_steps} steps (drove {driven})"
+        );
+        // A typed diagnosis was surfaced naming WHAT kept failing.
+        assert!(
+            note_seen(&rec, "circuit breaker tripped")
+                && note_seen(&rec, "build-verify")
+                && note_seen(&rec, "stopping the schedule early"),
+            "a typed circuit-breaker diagnosis is surfaced: {:?}",
+            rec.events()
         );
     }
 

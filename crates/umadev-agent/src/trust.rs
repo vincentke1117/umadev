@@ -145,6 +145,16 @@ pub enum Reversibility {
     /// A destructive / unbounded shell verb (`rm -rf`, `dd`, `mkfs`, writes
     /// outside the workspace, …). Always escalated.
     Destructive,
+    /// The action **cannot be confidently classified as safe/reversible** — it
+    /// hides its real effect from the token classifier behind an
+    /// indirection/encoding construct (`eval`, `base64 -d`, a pipe into a shell,
+    /// an inline-interpreter `-c`/`-e` payload, `\x` byte escapes, a backtick
+    /// substitution). On that UNCERTAINTY the fail-CLOSED boundary treats it as
+    /// **potentially irreversible** and always escalates (confirm/deny), rather
+    /// than silently allowing a payload the scan can't see into. This is the
+    /// fail-closed-on-uncertainty default for the irreversible permit — distinct
+    /// from the fail-OPEN advisory governance, which is unchanged.
+    Uncertain,
 }
 
 impl Reversibility {
@@ -163,6 +173,7 @@ impl Reversibility {
             Self::VersionControl => "trust.reason.git",
             Self::Network => "trust.reason.network",
             Self::Destructive => "trust.reason.destructive",
+            Self::Uncertain => "trust.reason.uncertain",
         }
     }
 }
@@ -246,10 +257,78 @@ const NETWORK_TOKENS: &[&str] = &[
     "https://",
 ];
 
+/// Indirection / encoding constructs that HIDE an action's real effect from the
+/// token classifier — any of them could smuggle a destructive payload past
+/// [`DESTRUCTIVE_TOKENS`] / [`NETWORK_TOKENS`] / the VCS scan. Their presence means
+/// the command **cannot be confidently classified as safe** ([`command_is_obfuscated`]),
+/// so the fail-CLOSED boundary treats it as [`Reversibility::Uncertain`].
+///
+/// Deliberately scoped to HIGH-SIGNAL markers (an inline-interpreter `-c`/`-e`
+/// payload, a pipe into a shell) so an ordinary reversible build/dev command never
+/// trips this — the four invariants + the "a guarded/auto run is never wedged
+/// DENY-ing reversible work" contract stay intact; only a genuinely opaque command
+/// goes fail-closed.
+const PIPE_TO_SHELL_MARKERS: &[&str] = &[
+    "| sh", "|sh", "| bash", "|bash", "| zsh", "|zsh", "| dash", "|dash", "| ksh", "|ksh",
+    "| fish", "|fish", "| csh", "|csh",
+];
+
+/// Interpreters invoked with an INLINE code string the token scan can't see into
+/// (`bash -c '<payload>'`, `python -c '<payload>'`, …). All entries are lowercase —
+/// [`command_is_obfuscated`] tests them against the already-lowercased command.
+const INLINE_CODE_MARKERS: &[&str] = &[
+    "sh -c",
+    "bash -c",
+    "zsh -c",
+    "dash -c",
+    "ksh -c",
+    "python -c",
+    "python3 -c",
+    "perl -e",
+    "ruby -e",
+    "node -e",
+    "node --eval",
+    "php -r",
+];
+
+/// Whether the already-lowercased `cmd` uses an indirection/encoding construct that
+/// hides its real effect from the deterministic token classifier — the
+/// fail-CLOSED-on-uncertainty trigger. Returns `true` for: `eval` at a command
+/// position; `base64` with a decode flag (an encoded payload being unpacked); a pipe
+/// into a shell interpreter; an interpreter running an inline code string; `\x`/`\u`
+/// byte escapes used to hide characters; or a backtick command substitution (a hidden
+/// sub-command). Conservative + dependency-free; any odd input simply yields `false`
+/// in the underlying [`verb_at_command_position`] (never a parser-quirk escalation
+/// the caller can't explain).
+fn command_is_obfuscated(cmd: &str) -> bool {
+    // `eval` constructs and runs an arbitrary string — the classic obfuscation entry.
+    if verb_at_command_position(cmd, "eval") {
+        return true;
+    }
+    // `base64 … -d/--decode` unpacks an encoded payload the scan never sees.
+    if cmd.contains("base64")
+        && (cmd.contains(" -d") || cmd.contains("--decode") || cmd.contains(" -di"))
+    {
+        return true;
+    }
+    // A pipe into a shell, or an interpreter running an inline code string.
+    if PIPE_TO_SHELL_MARKERS.iter().any(|m| cmd.contains(m))
+        || INLINE_CODE_MARKERS.iter().any(|m| cmd.contains(m))
+    {
+        return true;
+    }
+    // Hex/unicode byte escapes hide characters from the scan; a backtick substitution
+    // runs a hidden sub-command.
+    cmd.contains("\\x") || cmd.contains("\\u") || cmd.contains('`')
+}
+
 /// Classify a candidate action — a shell command string and/or a target path —
 /// into a [`Reversibility`] class. Order matters: the most dangerous class
-/// wins (destructive > network > version-control > reversible) so that, e.g.,
-/// `rm -rf .git` is reported as destructive rather than merely VCS.
+/// wins (destructive > network > version-control > **uncertain** > reversible) so
+/// that, e.g., `rm -rf .git` is reported as destructive rather than merely VCS, and
+/// an obfuscated command that DOES carry a recognizable token still gets its precise
+/// class — only one that evades every token scan falls through to
+/// [`Reversibility::Uncertain`] (the fail-closed default).
 ///
 /// Pure and deterministic. Either argument may be empty.
 #[must_use]
@@ -276,6 +355,15 @@ pub fn reversibility_class(command: &str, target_path: &str) -> Reversibility {
     // file is NOT in `.git/` and stays reversible.
     if path_touches_vcs(&cmd) || path_touches_vcs(&target_path.to_ascii_lowercase()) {
         return Reversibility::VersionControl;
+    }
+    // FAIL-CLOSED BOUNDARY (UD-FLOW-008). A non-empty command that evaded every token
+    // scan above but hides its effect behind an indirection/encoding construct CANNOT
+    // be confidently vetted as safe — so we do NOT fall through to the (allow-by-default)
+    // `Reversible` arm. Instead it is `Uncertain` → potentially irreversible → escalated
+    // in EVERY trust mode. An EMPTY command (a bare file write/read) is unambiguous and
+    // stays reversible, as do all the recognized safe build/dev/read commands.
+    if !cmd.is_empty() && command_is_obfuscated(&cmd) {
+        return Reversibility::Uncertain;
     }
     Reversibility::Reversible
 }
@@ -893,6 +981,115 @@ impl CircuitBreaker {
     pub fn reset(&mut self) {
         self.failures.clear();
         self.tripped = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Consecutive same-class failure breaker — stop a flailing loop (UD-FLOW-008)
+// ---------------------------------------------------------------------------
+
+/// How many **consecutive** failures of the SAME class trip the
+/// [`ConsecutiveFailureBreaker`]. Small + bounded: a couple of failed re-drives are
+/// normal engineering, but the SAME thing failing this many times in a row with no
+/// intervening progress is a flail, not work — the loop should STOP and surface a
+/// diagnosis rather than grind on burning the base's effort/tokens.
+///
+/// Distinct from [`CIRCUIT_THRESHOLD`], which counts a *burst* of ANY failures inside
+/// a time window; this counts repeated failures of one class with no success between.
+pub const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
+
+/// A deterministic, dependency-free breaker over **consecutive same-class** failures
+/// — the "the base keeps failing the same step the same way" signal. The caller
+/// records each failure with a class key (a tool's error class, a step's
+/// verification-failure category, …); a failure of a NEW class restarts the streak,
+/// and any [`Self::record_success`] (real progress) clears it. When the streak
+/// reaches [`CONSECUTIVE_FAILURE_THRESHOLD`] the breaker trips and LATCHES the class
+/// that kept failing, so the caller can stop the loop cleanly with a typed diagnosis
+/// ([`Self::diagnosis`]) instead of looping to its hard transition ceiling.
+///
+/// Owns no clock and no IO — fully deterministic for tests. It only ever *adds* an
+/// early, diagnosed stop; it never disguises failure as success.
+#[derive(Debug, Clone, Default)]
+pub struct ConsecutiveFailureBreaker {
+    /// The class of the current consecutive-failure streak (`None` after a success
+    /// or before the first failure).
+    current_class: Option<String>,
+    /// Length of the current same-class streak.
+    streak: u32,
+    /// Latched once the breaker trips — the class that crossed the threshold, kept
+    /// for the diagnosis. Cleared only by [`Self::reset`].
+    tripped_class: Option<String>,
+}
+
+impl ConsecutiveFailureBreaker {
+    /// A fresh breaker with no recorded failures.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a failure of `class`. A failure matching the current streak grows it;
+    /// a DIFFERENT class restarts the streak at 1 (the previous flail recovered or
+    /// changed shape). Returns `true` the first time the streak reaches
+    /// [`CONSECUTIVE_FAILURE_THRESHOLD`] (the trip), latching `class` for the diagnosis.
+    pub fn record_failure(&mut self, class: &str) -> bool {
+        if self.current_class.as_deref() == Some(class) {
+            self.streak = self.streak.saturating_add(1);
+        } else {
+            self.current_class = Some(class.to_string());
+            self.streak = 1;
+        }
+        if self.streak >= CONSECUTIVE_FAILURE_THRESHOLD && self.tripped_class.is_none() {
+            self.tripped_class = Some(class.to_string());
+            return true;
+        }
+        false
+    }
+
+    /// Record real progress — clears the current failure streak so a recovered run is
+    /// never tripped by failures from before the recovery. Does NOT un-latch a breaker
+    /// that already tripped (the caller stops immediately on the trip).
+    pub fn record_success(&mut self) {
+        self.current_class = None;
+        self.streak = 0;
+    }
+
+    /// `true` once the breaker has tripped (a same-class failure flail crossed the
+    /// threshold).
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.tripped_class.is_some()
+    }
+
+    /// The class that tripped the breaker, if any.
+    #[must_use]
+    pub fn tripped_class(&self) -> Option<&str> {
+        self.tripped_class.as_deref()
+    }
+
+    /// The current same-class streak length (0 after a success / before any failure).
+    #[must_use]
+    pub fn streak(&self) -> u32 {
+        self.streak
+    }
+
+    /// A typed, human-facing diagnosis of WHAT kept failing — `None` until the breaker
+    /// trips. Surfaced (e.g. as an `EngineEvent::Note`) when the loop stops early.
+    #[must_use]
+    pub fn diagnosis(&self) -> Option<String> {
+        self.tripped_class.as_ref().map(|c| {
+            format!(
+                "circuit breaker tripped: {CONSECUTIVE_FAILURE_THRESHOLD} consecutive \
+                 '{c}' failures with no progress"
+            )
+        })
+    }
+
+    /// Manually re-arm the breaker (e.g. after the user reviews and continues).
+    pub fn reset(&mut self) {
+        self.current_class = None;
+        self.streak = 0;
+        self.tripped_class = None;
     }
 }
 
@@ -1698,5 +1895,176 @@ mod tests {
         assert!(cb.is_open());
         cb.reset();
         assert!(!cb.is_open());
+    }
+
+    // ---- fail-CLOSED irreversible boundary on uncertainty -----------------
+
+    #[test]
+    fn obfuscated_destructive_command_defaults_to_confirm_in_every_mode() {
+        // The fail-CLOSED-on-uncertainty default: a command whose real effect is HIDDEN
+        // from the token classifier (eval / base64-decode / pipe-to-shell / inline
+        // interpreter / hex escape / backtick substitution) can't be confidently vetted
+        // as safe, so it is `Uncertain` → potentially irreversible → it must CONFIRM in
+        // EVERY mode (Auto included), NOT be silently allowed. None of these carries a
+        // recognizable destructive/network/VCS token, so pre-fix they fell through to
+        // `Reversible` and Auto ran them silently — the exact fail-open hole.
+        for cmd in [
+            "eval \"$(echo cm0gLXJmIH4gLwo= | base64 -d)\"", // base64 -> eval rm -rf ~
+            "bash -c \"$payload\"",                          // inline interpreter
+            "echo ZG9zdHVmZg== | base64 --decode | sh",      // decode then pipe to shell
+            "curl_alias | sh",                               // pipe into a shell
+            "python -c \"import os; os.system('x')\"",       // inline python
+            "printf '\\x72\\x6d' ",                          // hex-escaped bytes
+            "run `whoami`",                                  // backtick substitution
+        ] {
+            assert_eq!(
+                reversibility_class(cmd, ""),
+                Reversibility::Uncertain,
+                "{cmd:?} must classify as Uncertain (can't be confirmed safe)"
+            );
+            for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
+                assert!(
+                    requires_confirmation(mode, cmd, ""),
+                    "obfuscated {cmd:?} must confirm in {mode:?} (fail-closed)"
+                );
+            }
+            // The floor wins over the ledger too: an Uncertain action is never
+            // remembered and never auto-allowed, even with forged rules.
+            let mut led = TrustLedger::default();
+            assert!(
+                !led.remember_approval(cmd, ""),
+                "Uncertain is never recorded"
+            );
+            led.allow_rules.insert("shell".into());
+            assert!(
+                requires_confirmation_with_ledger(
+                    TrustMode::Auto,
+                    cmd,
+                    "",
+                    Path::new("/work/project"),
+                    &led
+                ),
+                "an Uncertain action still confirms despite a forged 'shell' rule: {cmd:?}"
+            );
+            // The graduated capability gate is fail-closed on it as well.
+            assert!(capability_requires_confirmation(
+                &CapabilityPolicy::for_mode(TrustMode::Auto),
+                cmd,
+                ""
+            ));
+        }
+    }
+
+    #[test]
+    fn clearly_safe_and_recognized_commands_stay_classified_not_uncertain() {
+        // The fail-closed boundary must NOT over-escalate: a clearly-safe READ, a normal
+        // in-tree write, and ordinary recognized build/dev commands stay confidently
+        // classified (Reversible) — Auto/Guarded still run them without a confirmation, so
+        // a run is never wedged. (A more dangerous token still wins where present.)
+        for (cmd, tgt) in [
+            ("cat src/main.rs", ""),
+            ("ls", ""),
+            ("git status", ""),
+            ("cargo build", ""),
+            ("npm run build", ""),
+            ("cargo test", ""),
+            ("node transform.js", ""), // 'transform' contains no marker
+            ("make -j 8", ""),
+            ("", "src/app.tsx"), // a bare in-tree write
+        ] {
+            assert_eq!(
+                reversibility_class(cmd, tgt),
+                Reversibility::Reversible,
+                "{cmd:?}/{tgt:?} is confidently safe — must NOT be Uncertain"
+            );
+            // A clearly-safe read still passes in every mode (never escalated).
+            if cmd.starts_with("cat") || cmd == "ls" || cmd == "git status" {
+                for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
+                    assert!(
+                        !requires_confirmation(mode, cmd, tgt),
+                        "a clearly-safe read must pass in {mode:?}: {cmd:?}"
+                    );
+                }
+            }
+        }
+        // A recognizable token still wins over the generic Uncertain class: an obfuscated
+        // wrapper around a KNOWN-bad payload reports the precise (more informative) class.
+        assert_eq!(
+            reversibility_class("eval \"rm -rf /\"", ""),
+            Reversibility::Destructive,
+            "a visible destructive token wins over the generic Uncertain class"
+        );
+        assert_eq!(
+            reversibility_class("bash -c \"git push origin main\"", ""),
+            Reversibility::Network,
+            "a visible network token wins over Uncertain"
+        );
+    }
+
+    #[test]
+    fn advisory_governance_contract_is_unchanged_only_the_permit_went_fail_closed() {
+        // Guard the contract: the fail-closed change touches ONLY the irreversible permit
+        // (the destructive/uncertain default). A reversible in-tree write — the thing a
+        // guarded/auto run does constantly — is STILL not escalated by the floor, so the
+        // fail-open "never wedge the host doing reversible work" behaviour is intact.
+        for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
+            assert!(
+                !requires_confirmation(mode, "", "src/app.tsx"),
+                "reversible in-tree write stays automatic in {mode:?} (fail-open preserved)"
+            );
+        }
+        assert!(!requires_confirmation(TrustMode::Auto, "npm run build", ""));
+        assert!(!requires_confirmation(
+            TrustMode::Guarded,
+            "npm run build",
+            ""
+        ));
+    }
+
+    // ---- consecutive same-class failure breaker --------------------------
+
+    #[test]
+    fn consecutive_failure_breaker_trips_after_n_same_class_then_diagnoses() {
+        let mut b = ConsecutiveFailureBreaker::new();
+        // Below threshold → not open, no diagnosis yet.
+        for _ in 0..(CONSECUTIVE_FAILURE_THRESHOLD - 1) {
+            assert!(!b.record_failure("build-verify"), "below threshold");
+        }
+        assert!(!b.is_open());
+        assert!(b.diagnosis().is_none());
+        // The threshold-th SAME-class failure trips it ONCE, latching the class.
+        assert!(b.record_failure("build-verify"), "trips here");
+        assert!(b.is_open());
+        assert_eq!(b.tripped_class(), Some("build-verify"));
+        let diag = b.diagnosis().expect("a typed diagnosis is available");
+        assert!(diag.contains("build-verify") && diag.contains("consecutive"));
+        // A further failure does not re-trip (latched, no double-fire).
+        assert!(!b.record_failure("build-verify"));
+    }
+
+    #[test]
+    fn consecutive_failure_breaker_resets_on_success_or_a_different_class() {
+        let mut b = ConsecutiveFailureBreaker::new();
+        // A DIFFERENT class restarts the streak — heterogeneous failures don't accumulate.
+        assert!(!b.record_failure("build-verify"));
+        assert!(!b.record_failure("review-verify"));
+        assert!(!b.record_failure("build-verify"));
+        assert_eq!(b.streak(), 1, "a new class restarts the streak");
+        assert!(!b.is_open(), "interleaved classes never trip");
+        // Real progress (a success) clears the streak so a recovered run isn't tripped.
+        b.record_failure("build-verify");
+        b.record_success();
+        assert_eq!(b.streak(), 0);
+        for _ in 0..(CONSECUTIVE_FAILURE_THRESHOLD - 1) {
+            assert!(!b.record_failure("build-verify"));
+        }
+        assert!(
+            !b.is_open(),
+            "post-success streak hasn't reached threshold yet"
+        );
+        assert!(b.record_failure("build-verify"), "now it trips");
+        b.reset();
+        assert!(!b.is_open());
+        assert!(b.diagnosis().is_none());
     }
 }

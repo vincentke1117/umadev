@@ -71,6 +71,7 @@
 "trust.reason.git" = "触及 .git 版本库内部(可能改写历史)"
 "trust.reason.network" = "涉及网络(推送/拉取/下载)"
 "trust.reason.destructive" = "破坏性/不可逆 shell 操作"
+"trust.reason.uncertain" = "无法确认安全——可能不可逆(混淆/间接命令)"
 "trust.cap.read" = "读取(自动)"
 "trust.cap.write" = "编辑文件(受控)"
 "trust.cap.shell" = "执行 shell 命令(确认)"

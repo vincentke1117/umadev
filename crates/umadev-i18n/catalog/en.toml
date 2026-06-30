@@ -71,6 +71,7 @@
 "trust.reason.git" = "touches .git internals (can rewrite history)"
 "trust.reason.network" = "reaches the network (push/pull/download)"
 "trust.reason.destructive" = "destructive / irreversible shell action"
+"trust.reason.uncertain" = "can't be confirmed safe — possibly irreversible (obfuscated / indirect command)"
 "trust.cap.read" = "read (auto)"
 "trust.cap.write" = "edit files (guarded)"
 "trust.cap.shell" = "run shell commands (confirm)"
