@@ -521,12 +521,19 @@ mod tests {
 
     #[test]
     fn record_is_fail_open_on_an_unwritable_root() {
-        // A root that can't be created/written never panics; recording is a no-op
-        // and a later load is empty.
-        let missing = Path::new("/nonexistent/umadev/facts/unwritable/xyz");
+        // A root whose PARENT is a regular file can never be created/written
+        // (making a directory under a file fails on every OS); recording is a
+        // no-op and a later load is empty — never a panic. (A bare `/nonexistent`
+        // path is not cross-platform: on windows a leading `/` is drive-relative
+        // and `C:\nonexistent\...` is usually creatable, so the write would
+        // unexpectedly succeed and the store would be non-empty.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let unwritable = blocker.join("umadev/facts/unwritable/xyz");
         // Returns the applied count but the write silently fails (fail-open).
-        let _ = record_fact(missing, Fact::new("k", "v", None::<String>));
-        assert!(load_facts(missing).is_empty());
+        let _ = record_fact(&unwritable, Fact::new("k", "v", None::<String>));
+        assert!(load_facts(&unwritable).is_empty());
     }
 
     #[test]

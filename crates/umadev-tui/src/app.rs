@@ -1532,9 +1532,16 @@ fn is_image_path(s: &str) -> bool {
 }
 
 /// Normalise a pasted path token the way a terminal mangles a dragged file:
-/// drop a `file://` scheme, strip one layer of matching outer quotes, and undo
-/// shell backslash-escapes (`my\ pic.png` → `my pic.png`). Leaves a plain path
-/// untouched.
+/// drop a `file://` scheme, strip one layer of matching outer quotes, and (on
+/// unix) undo shell backslash-escapes (`my\ pic.png` → `my pic.png`). Leaves a
+/// plain path untouched.
+///
+/// The backslash-unescape is **unix-only**: a unix terminal escapes spaces in a
+/// dragged path with `\`, but on WINDOWS the backslash is the PATH SEPARATOR
+/// (`C:\Users\…\shot.png`), so stripping it would corrupt every pasted path
+/// (`C:\Users\…` → `C:Users…`) and the later `canonicalize` would fail — a real
+/// bug for windows users dragging an image in, not just a test artefact. There
+/// the path is passed through with its separators intact.
 fn unquote_unescape(s: &str) -> String {
     let s = s.trim();
     let s = s.strip_prefix("file://").unwrap_or(s);
@@ -1547,6 +1554,11 @@ fn unquote_unescape(s: &str) -> String {
     } else {
         s
     };
+    // On windows the backslash is a path separator, never a shell escape — keep
+    // the path verbatim so it stays canonicalisable.
+    if cfg!(windows) {
+        return s.to_string();
+    }
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

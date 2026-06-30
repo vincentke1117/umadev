@@ -1266,6 +1266,31 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// An absolute path that lies OUTSIDE any project tree, chosen PER-OS. A
+    /// leading `/` is absolute on unix but NOT on windows (a windows absolute
+    /// carries a drive letter / UNC prefix), so the escape classifier only
+    /// recognises the matching literal; `~`/`..` escapes are platform-neutral.
+    /// Lets one out-of-tree-write trust test body assert the same semantics on
+    /// both platforms.
+    fn out_of_tree_abs() -> &'static str {
+        if cfg!(windows) {
+            "C:\\Windows\\System32\\drivers\\etc\\hosts"
+        } else {
+            "/etc/hosts"
+        }
+    }
+
+    /// A real, ABSOLUTE workspace root, chosen per-OS (a windows absolute carries
+    /// a drive letter, so `/Users/...` would not be absolute there and the
+    /// root-aware containment check would never engage).
+    fn real_root() -> &'static Path {
+        Path::new(if cfg!(windows) {
+            "C:\\Users\\me\\project"
+        } else {
+            "/Users/me/project"
+        })
+    }
+
     #[test]
     fn mode_parse_round_trips_and_aliases() {
         assert_eq!(TrustMode::parse("plan"), Some(TrustMode::Plan));
@@ -1489,7 +1514,9 @@ mod tests {
         // The bug fixed: Guarded and Auto must NOT be identical per-action. A
         // write that ESCAPES the workspace (not checkpoint-rewindable) is the
         // concrete delta — Guarded/Plan confirm it, Auto (max trust) allows it.
-        for out in ["/etc/hosts", "~/.ssh/config", "../../escape.txt"] {
+        // The absolute system path is per-OS (a leading `/` is not absolute on
+        // windows); `~`/`..` escapes are platform-neutral.
+        for out in [out_of_tree_abs(), "~/.ssh/config", "../../escape.txt"] {
             assert!(
                 requires_confirmation(TrustMode::Guarded, "", out),
                 "guarded confirms out-of-tree write {out}"
@@ -1504,13 +1531,23 @@ mod tests {
             );
         }
         // A normal in-tree write (relative or absolute under the project) is auto
-        // in every mode — the escape heuristic must not mis-flag it.
-        for p in [
-            "src/app.tsx",
-            "output/demo-prd.md",
-            "/Users/me/project/src/x.rs",
-            "/var/folders/xx/proj/src/y.rs",
-        ] {
+        // in every mode — the escape heuristic must not mis-flag it. The absolute
+        // forms are per-OS (a leading `/` is not absolute on windows).
+        let in_tree: &[&str] = if cfg!(windows) {
+            &[
+                "src\\app.tsx",
+                "output\\demo-prd.md",
+                "C:\\Users\\me\\project\\src\\x.rs",
+            ]
+        } else {
+            &[
+                "src/app.tsx",
+                "output/demo-prd.md",
+                "/Users/me/project/src/x.rs",
+                "/var/folders/xx/proj/src/y.rs",
+            ]
+        };
+        for p in in_tree {
             for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
                 assert!(
                     !requires_confirmation(mode, "", p),
@@ -1528,9 +1565,10 @@ mod tests {
     fn ledger_remembers_reversible_class_and_is_not_reasked() {
         // T2: an APPROVED reversible class persists + isn't re-asked for THIS
         // project. Guarded confirms an out-of-tree write; after the user approves
-        // it once, the same class auto-allows.
-        let root = Path::new("/work/project");
-        let (cmd, tgt) = ("", "/etc/hosts");
+        // it once, the same class auto-allows. (The out-of-tree target + root are
+        // per-OS so the escape classifier sees a real absolute on both.)
+        let root = real_root();
+        let (cmd, tgt) = ("", out_of_tree_abs());
         let empty = TrustLedger::default();
         // Before learning: guarded would confirm.
         assert!(requires_confirmation_with_ledger(
@@ -1565,15 +1603,18 @@ mod tests {
     #[test]
     fn ledger_round_trips_allow_rules_atomically_and_fail_open() {
         let tmp = TempDir::new().unwrap();
+        // The out-of-tree write target is per-OS (a leading `/` is not absolute on
+        // windows, so it would classify as in-tree there).
+        let out = out_of_tree_abs();
         // No ledger on disk → behaves exactly as today (fail-open).
-        assert!(remember_project_approval(tmp.path(), "", "/etc/hosts"));
+        assert!(remember_project_approval(tmp.path(), "", out));
         // Persisted + reloaded: the rule survives and short-circuits the prompt.
         let back = TrustLedger::load(tmp.path());
         assert!(back.allow_rules.contains("write_out_of_tree"));
         assert!(!requires_confirmation_with_ledger(
             TrustMode::Guarded,
             "",
-            "/etc/hosts",
+            out,
             tmp.path(),
             &back
         ));
@@ -1586,7 +1627,7 @@ mod tests {
         assert!(requires_confirmation_with_ledger(
             TrustMode::Guarded,
             "",
-            "/etc/hosts",
+            out,
             tmp2.path(),
             &none
         ));
@@ -1680,26 +1721,49 @@ mod tests {
         // MEDIUM M4: the DEFAULT (Guarded) mode must confirm an absolute write that
         // lands OUTSIDE the real workspace root — even paths the old short denylist
         // missed (`/Library/LaunchAgents/`, `/opt/`, `/var/`, another user's home).
-        let root = Path::new("/Users/me/project");
+        // Root + targets are per-OS: a windows absolute carries a drive letter, so
+        // the unix `/...` literals are not absolute there and the containment check
+        // would never engage.
+        let root = real_root();
         let ledger = TrustLedger::default();
-        for outside in [
-            "/Library/LaunchAgents/evil.plist",
-            "/opt/boot/x",
-            "/var/root/x",
-            "/Users/other/.ssh/authorized_keys",
-            "/private/etc/cron.d/x",
-        ] {
+        let outside_paths: &[&str] = if cfg!(windows) {
+            &[
+                "C:\\Windows\\System32\\drivers\\etc\\hosts",
+                "C:\\Program Files\\evil\\x",
+                "C:\\ProgramData\\evil\\run.bat",
+                "C:\\Users\\other\\.ssh\\authorized_keys",
+                "D:\\data\\x",
+            ]
+        } else {
+            &[
+                "/Library/LaunchAgents/evil.plist",
+                "/opt/boot/x",
+                "/var/root/x",
+                "/Users/other/.ssh/authorized_keys",
+                "/private/etc/cron.d/x",
+            ]
+        };
+        for &outside in outside_paths {
             assert!(
                 requires_confirmation_with_ledger(TrustMode::Guarded, "", outside, root, &ledger),
                 "guarded (default) must confirm an out-of-tree write: {outside}"
             );
         }
         // An in-tree write (relative, or absolute UNDER the real root) stays automatic.
-        for inside in [
-            "src/app.tsx",
-            "/Users/me/project/src/app.tsx",
-            "/Users/me/project/output/demo-prd.md",
-        ] {
+        let inside_paths: &[&str] = if cfg!(windows) {
+            &[
+                "src\\app.tsx",
+                "C:\\Users\\me\\project\\src\\app.tsx",
+                "C:\\Users\\me\\project\\output\\demo-prd.md",
+            ]
+        } else {
+            &[
+                "src/app.tsx",
+                "/Users/me/project/src/app.tsx",
+                "/Users/me/project/output/demo-prd.md",
+            ]
+        };
+        for &inside in inside_paths {
             assert!(
                 !requires_confirmation_with_ledger(TrustMode::Guarded, "", inside, root, &ledger),
                 "an in-tree write must stay automatic in guarded: {inside}"

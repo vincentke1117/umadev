@@ -372,15 +372,22 @@ mod tests {
 
     #[test]
     fn fail_open_on_an_unwritable_root() {
-        // A root under a non-existent, unwritable parent can't be persisted, but
-        // the call must still return the in-memory default — never panic/error.
-        let missing = Path::new("/nonexistent/umadev/constitution/root/xyz");
-        let doc = ensure_constitution(missing);
+        // A root whose PARENT is a regular file can never be persisted (creating a
+        // directory under a file fails on every OS), yet the call must still return
+        // the in-memory default — never panic/error. (A bare `/nonexistent/...`
+        // path is not cross-platform: on windows a leading `/` is drive-relative
+        // and `C:\nonexistent\...` is usually creatable, so the write would
+        // unexpectedly succeed and the read-back would not be `None`.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let unwritable = blocker.join("umadev/constitution/root/xyz");
+        let doc = ensure_constitution(&unwritable);
         assert!(doc.generated);
         assert!(!doc.markdown.is_empty(), "in-memory default still produced");
         assert!(doc.markdown.contains("UD-CODE-001"));
-        // Read-only helper on a missing dir is None (fail-open).
-        assert!(read_constitution(missing).is_none());
+        // Read-only helper under the unwritable root is None (fail-open).
+        assert!(read_constitution(&unwritable).is_none());
     }
 
     #[test]
