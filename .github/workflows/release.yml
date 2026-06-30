@@ -110,9 +110,12 @@ jobs:
           set -euo pipefail
           mkdir -p model
           BASE=https://huggingface.co/intfloat/multilingual-e5-small/resolve/main
-          curl -fsSL "$BASE/config.json"       -o model/config.json
-          curl -fsSL "$BASE/tokenizer.json"    -o model/tokenizer.json
-          curl -fsSL "$BASE/model.safetensors" -o model/model.f32.safetensors
+          # --retry-all-errors retries a transient HuggingFace 429/5xx (it once
+          # failed the whole Release); 5 tries with a 15s backoff is plenty.
+          DL="curl --retry 5 --retry-delay 15 --retry-all-errors -fsSL"
+          $DL "$BASE/config.json"       -o model/config.json
+          $DL "$BASE/tokenizer.json"    -o model/tokenizer.json
+          $DL "$BASE/model.safetensors" -o model/model.f32.safetensors
           python3 -m pip install --quiet safetensors numpy
           python3 npm/scripts/quantize-model.py model/model.f32.safetensors model/model.safetensors
           rm -f model/model.f32.safetensors
