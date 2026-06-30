@@ -5212,8 +5212,20 @@ const INPUT_MAX_ROWS: u16 = 6;
 /// How many rows the prompt block needs: visible input rows + underline + meta.
 /// Used by `render_chat` to size the layout BEFORE rendering, so the box grows.
 fn prompt_block_height(input: &str, area_width: u16, prefix: u16) -> u16 {
-    let total = wrap_input_rows(input, input_text_width(area_width, prefix)).len();
-    let visible = (u16::try_from(total).unwrap_or(INPUT_MAX_ROWS)).clamp(1, INPUT_MAX_ROWS);
+    input_block_rows(input, input_text_width(area_width, prefix))
+}
+
+/// The rendered input-box height (clamped visible rows + underline + meta) for
+/// `input` at `text_cols` available text columns — the value `render_chat` lays
+/// out for the prompt. Shared with [`crate::app::App::input_block_height`] (and
+/// the event loop's generic height-change guard) so a height-changing edit (a
+/// multi-line history recall, a paste chip, a wrap/newline) can detect the box
+/// growing/shrinking and force a full repaint that wipes the rows the shift
+/// vacates — the root fix for the Windows-console overlap garble. The clamp to
+/// `INPUT_MAX_ROWS` means a 3-line vs a 10-line input report the SAME height, so
+/// a recall that doesn't actually change the box never forces a needless repaint.
+pub(crate) fn input_block_rows(input: &str, text_cols: u16) -> u16 {
+    let visible = wrapped_row_count(input, text_cols).clamp(1, INPUT_MAX_ROWS);
     visible + 2 // + underline + meta row
 }
 

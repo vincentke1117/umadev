@@ -2323,6 +2323,21 @@ pub struct App {
     /// `true` when the user asked to quit.
     pub should_quit: bool,
 
+    /// One-shot request for a FULL clear + redraw on the next frame, drained by
+    /// the event loop via [`Self::take_force_repaint`]. Set by an operation that
+    /// can leave STALE rows on a console whose incremental-diff repaint differs
+    /// from a VT-strict terminal — notably the Windows console (conhost /
+    /// PowerShell) after a **history recall** that swaps a one-row input for a
+    /// multi-line entry (the transcript above shifts) or a **`/clear`** that
+    /// empties the transcript. The loop folds this into its `force_full_repaint`
+    /// gate, which `terminal.clear()`s (a real `Clear(All)` + a ratatui
+    /// back-buffer reset) so the next draw repaints EVERY cell and no row the
+    /// shift vacated survives. Fail-open: a missed flag only forgoes one full
+    /// repaint — the periodic self-heal scrub / Ctrl+L still recover. Defaults
+    /// `false`; the unix render path is unaffected (its diff already wipes the
+    /// vacated cells, so the extra clear is invisible under synchronized output).
+    pub force_repaint: bool,
+
     /// Wall-clock start of the current running block. Drives the live
     /// `[m:ss]` elapsed counter in the status bar so long worker calls
     /// don't read as "frozen". `None` when nothing is running.
@@ -2635,6 +2650,7 @@ impl App {
             // override, so the renderer agrees with the base drivers from turn one.
             show_process_logs: umadev_host::process_logs::show_process_logs(),
             should_quit: false,
+            force_repaint: false,
             run_started_at: None,
             phase_started_at: None,
             pending_auto_continue: None,
@@ -4416,6 +4432,34 @@ impl App {
         true
     }
 
+    /// Request a FULL clear + redraw on the next frame (see [`Self::force_repaint`]).
+    /// Idempotent; called by the height-changing operations that can otherwise
+    /// leave stale overlapping rows on the Windows console (a multi-line history
+    /// recall, `/clear`).
+    pub fn request_full_repaint(&mut self) {
+        self.force_repaint = true;
+    }
+
+    /// Take + clear the pending full-repaint request. The event loop ORs this
+    /// into its `force_full_repaint` gate each iteration, so a height change
+    /// (multi-line history recall) or a `/clear` clears the screen + resets
+    /// ratatui's back-buffer before the next draw. Drains in one shot (a second
+    /// call returns `false`) so exactly one full repaint is forced, then the
+    /// cheap incremental diff resumes. Returns `false` in the steady state.
+    #[must_use]
+    pub fn take_force_repaint(&mut self) -> bool {
+        std::mem::take(&mut self.force_repaint)
+    }
+
+    /// The rendered input-box height (clamped visible rows + underline + meta) at
+    /// the text width the renderer last published. Mirrors
+    /// [`crate::ui::input_block_rows`] so a height-changing edit can decide whether
+    /// the prompt actually grew/shrank (the clamp means recalling a 3-line vs a
+    /// 10-line entry both cap at the same box height → no needless repaint).
+    pub(crate) fn input_block_height(&self) -> u16 {
+        crate::ui::input_block_rows(&self.input, self.input_text_cols.get())
+    }
+
     /// Clear the input buffer + reset cursor + history-recall index.
     pub fn clear_input(&mut self) {
         self.input.clear();
@@ -4725,6 +4769,12 @@ impl App {
         if self.input_history.is_empty() {
             return;
         }
+        // Snapshot the box height BEFORE the recall: pulling a multi-line entry
+        // into a one-row box grows the prompt and shifts the transcript above it,
+        // which leaves stale overlapping rows on the Windows console. If the
+        // rendered height changes, force a full clear+redraw (see
+        // `request_full_repaint`).
+        let before = self.input_block_height();
         let new_idx = match self.input_history_idx {
             None => {
                 // Recall is BEGINNING — stash whatever the user was typing so
@@ -4740,6 +4790,9 @@ impl App {
             self.input = s.clone();
             self.input_cursor = self.input_len();
         }
+        if self.input_block_height() != before {
+            self.request_full_repaint();
+        }
     }
 
     /// Step forward through input history. At the most-recent entry,
@@ -4748,6 +4801,10 @@ impl App {
         let Some(idx) = self.input_history_idx else {
             return;
         };
+        // Same height-shift guard as `input_history_back`: stepping forward can
+        // SHRINK the box (a multi-line entry → a shorter one / the empty draft),
+        // which vacates rows the Windows console may leave as stale overlap.
+        let before = self.input_block_height();
         if idx + 1 < self.input_history.len() {
             self.input_history_idx = Some(idx + 1);
             if let Some(s) = self.input_history.get(idx + 1) {
@@ -4760,6 +4817,9 @@ impl App {
             self.input_history_idx = None;
             self.input = self.input_history_draft.take().unwrap_or_default();
             self.input_cursor = self.input_len();
+        }
+        if self.input_block_height() != before {
+            self.request_full_repaint();
         }
     }
 
@@ -8289,6 +8349,11 @@ impl App {
                     ChatRole::System,
                     umadev_i18n::t(self.lang, "slash.history_cleared"),
                 );
+                // `/clear` empties the transcript without changing the input-box
+                // height, so the loop's generic height-change guard can't catch
+                // it: force a full clear+redraw so the dropped rows can't survive
+                // as stale overlap on the Windows console (conhost / PowerShell).
+                self.request_full_repaint();
                 Action::None
             }
             "claude" => self.slash_backend(Some("claude-code")),
@@ -16703,6 +16768,114 @@ mod tests {
         assert!(!a.should_quit);
         assert_eq!(a.apply_key(KeyCode::Esc), Action::Cancel);
         assert!(!a.should_quit);
+    }
+
+    // ---- Windows-console render garble: force a full repaint when an operation
+    // shifts the layout, so ratatui's incremental diff can't leave stale
+    // overlapping rows on conhost / PowerShell. ------------------------------
+
+    #[test]
+    fn multiline_history_recall_forces_full_repaint() {
+        let mut a = fresh_app(Some("offline"));
+        // The renderer publishes the available input text width; pin it so the
+        // height comparison is deterministic.
+        a.input_text_cols.set(40);
+        // A multi-line prior submission. Recalling it into the empty one-row box
+        // GROWS the prompt, shifting the transcript above it — exactly the case
+        // that leaves overlapping garble on the Windows console.
+        a.remember_submission("line one\nline two\nline three");
+        assert!(!a.force_repaint, "no repaint pending before the recall");
+        a.input_history_back();
+        assert_eq!(a.input, "line one\nline two\nline three");
+        assert!(
+            a.take_force_repaint(),
+            "a multi-line recall that grows the input box must force a full repaint"
+        );
+        // The request drains in ONE shot — exactly one full repaint, then the
+        // cheap incremental diff resumes.
+        assert!(!a.take_force_repaint(), "the repaint request drains once");
+    }
+
+    #[test]
+    fn same_height_history_recall_does_not_force_repaint() {
+        let mut a = fresh_app(Some("offline"));
+        a.input_text_cols.set(40);
+        // A short single-line entry: recalling it into the empty box keeps the
+        // box one row tall (nothing above shifts), so no full repaint is needed.
+        a.remember_submission("hi");
+        a.input_history_back();
+        assert_eq!(a.input, "hi");
+        assert!(
+            !a.take_force_repaint(),
+            "a same-height recall must NOT force a needless full repaint"
+        );
+    }
+
+    #[test]
+    fn history_forward_shrink_forces_full_repaint() {
+        let mut a = fresh_app(Some("offline"));
+        a.input_text_cols.set(40);
+        a.remember_submission("a\nb\nc\nd"); // four rows tall
+        a.remember_submission("short"); // one row
+        a.input_history_back(); // -> "short" (same height as empty draft)
+        let _ = a.take_force_repaint(); // clear whatever that step set
+        a.input_history_back(); // -> the tall entry (grows)
+        assert!(
+            a.take_force_repaint(),
+            "growing the box on the way back forces a repaint"
+        );
+        // Stepping FORWARD shrinks the tall entry back to "short": the box loses
+        // rows, which must also force a full repaint (the shrink-leaves-stale-rows
+        // case — the back-buffer reset is what wipes them).
+        a.input_history_forward();
+        assert_eq!(a.input, "short");
+        assert!(
+            a.take_force_repaint(),
+            "shrinking the input box on forward-recall must force a full repaint"
+        );
+    }
+
+    #[test]
+    fn slash_clear_forces_full_repaint() {
+        let mut a = fresh_app(Some("offline"));
+        // Put content in the transcript so `/clear` actually drops rows.
+        a.push(ChatRole::You, "hello");
+        a.push(ChatRole::UmaDev, "hi there");
+        // Dispatch `/clear` exactly as the user types it.
+        for c in "/clear".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let action = a.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::None);
+        // The prior conversation is dropped (only the "history cleared" system
+        // confirmation remains).
+        assert!(
+            !a.history.iter().any(|m| m.body().contains("hi there")),
+            "/clear drops the prior transcript"
+        );
+        assert!(
+            a.take_force_repaint(),
+            "/clear drops transcript rows without changing the input height, so it \
+             must force a full repaint itself (the generic height guard can't catch it)"
+        );
+    }
+
+    #[test]
+    fn input_block_rows_clamps_so_oversized_inputs_report_equal_height() {
+        // Two inputs that both exceed the visible cap report the SAME box height,
+        // so swapping one for the other never forces a needless repaint.
+        let tall = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj";
+        let taller = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm";
+        assert_eq!(
+            crate::ui::input_block_rows(tall, 40),
+            crate::ui::input_block_rows(taller, 40),
+            "the visible-row clamp makes both oversized inputs report one height"
+        );
+        // A one-line vs a three-line input DO differ in height.
+        assert_ne!(
+            crate::ui::input_block_rows("one", 40),
+            crate::ui::input_block_rows("one\ntwo\nthree", 40),
+        );
     }
 
     #[test]

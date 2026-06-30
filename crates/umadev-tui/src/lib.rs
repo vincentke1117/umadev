@@ -164,12 +164,13 @@ fn print_scrollback_handoff(app: &App) {
 fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Best-effort restoration — ignore errors, we're panicking anyway.
+        // Best-effort restoration — ignore errors, we're panicking anyway. Routes
+        // through the SAME complete + ordered restore as the normal teardown so a
+        // panic can't leave the Windows console stuck on the alt screen / in raw
+        // mode (raw mode OFF first, then the writer sequence).
         let _ = disable_raw_mode();
-        let _ = std::io::stdout().execute(DisableBracketedPaste);
-        let _ = std::io::stdout().execute(DisableMouseCapture);
-        let _ = std::io::stdout().execute(LeaveAlternateScreen);
-        let _ = std::io::stdout().execute(crossterm::cursor::Show);
+        let mut out = std::io::stdout();
+        restore_sequence(&mut out);
         // Print a visible marker so the user knows it was a panic, not a
         // clean exit, then defer to the previous hook for the backtrace.
         eprintln!("\n\numadev: panic — terminal restored.\n");
@@ -3777,12 +3778,13 @@ fn setup_terminal() -> Result<Term> {
     // its error through this, which undoes whatever was switched on before
     // propagating. Errors during the undo are ignored (we're already failing).
     fn fail(e: impl Into<anyhow::Error>) -> anyhow::Error {
-        let mut out = std::io::stdout();
-        let _ = out.execute(DisableMouseCapture);
-        let _ = out.execute(DisableBracketedPaste);
-        let _ = out.execute(LeaveAlternateScreen);
-        let _ = out.execute(crossterm::cursor::Show);
+        // Undo whatever was switched on before this step failed, via the SAME
+        // complete + ordered restore as the normal teardown / panic hook (raw mode
+        // OFF first, then the writer sequence). Errors during the undo are ignored
+        // — we're already failing.
         let _ = disable_raw_mode();
+        let mut out = std::io::stdout();
+        restore_sequence(&mut out);
         e.into()
     }
 
@@ -3817,17 +3819,49 @@ fn setup_terminal() -> Result<Term> {
     Ok(terminal)
 }
 
+/// Emit the FULL terminal-restore sequence to `out`, in the reverse-of-setup
+/// order, so EVERY exit path (the normal teardown, the panic hook, a mid-setup
+/// failure) leaves the terminal exactly as it was found — the root fix for
+/// "PowerShell is unusable after `/exit`, must close + reopen the window."
+///
+/// On the Windows console (conhost), an alternate screen that is never left, a
+/// mouse-capture / bracketed-paste mode that is never cleared, or a hidden
+/// cursor / non-default SGR that bleeds onto the restored primary buffer each
+/// leave the shell broken. The matching disable for every mode setup turned on
+/// must run, in order:
+///  1. (caller, first) `disable_raw_mode()` — restores console-input echo + line
+///     editing while VT processing is still active.
+///  2. `LeaveAlternateScreen` — back to the primary screen buffer.
+///  3. `DisableMouseCapture` — stop SGR mouse reports leaking as `;…M` text.
+///  4. `DisableBracketedPaste` (`\x1b[?2004l`).
+///  5. `EndSynchronizedUpdate` (`\x1b[?2026l`) — defensively clear DEC-2026 even
+///     though every BSU is balanced by an ESU in the loop, so a process that
+///     exits can never strand the terminal mid-update.
+///  6. `cursor::Show` (`\x1b[?25h`) — the caret must be visible at the shell.
+///  7. `ResetColor` (`\x1b[0m`) — drop any lingering SGR so the prompt isn't
+///     painted in the last frame's colors.
+///
+/// Each step is best-effort (`let _ =`) so one failure can't short-circuit the
+/// rest, and the whole sequence is IDEMPOTENT (every mode is level-triggered),
+/// so running it from several exit paths is harmless.
+fn restore_sequence<W: std::io::Write>(out: &mut W) {
+    let _ = out.execute(LeaveAlternateScreen);
+    let _ = out.execute(DisableMouseCapture);
+    let _ = out.execute(DisableBracketedPaste);
+    let _ = out.execute(EndSynchronizedUpdate);
+    let _ = out.execute(crossterm::cursor::Show);
+    let _ = out.execute(crossterm::style::ResetColor);
+    let _ = out.flush();
+}
+
 fn restore_terminal(terminal: &mut Term) {
-    // Every step is best-effort: a failure in one (e.g. disable_raw_mode on a
-    // half-closed TTY) must NOT short-circuit the rest, or the terminal could
-    // be left in mouse-reporting / alt-screen mode. DisableMouseCapture in
-    // particular must always run on the normal-exit path — it's the partner to
-    // EnableMouseCapture in setup_terminal and the panic hook.
+    // Raw mode OFF first (a global console-input mode, not a writer command), then
+    // the rest of the restore sequence through the render's OWN backend writer so
+    // it shares buffering/flush ordering with the frame writes. Best-effort: a
+    // failure in one step (e.g. `disable_raw_mode` on a half-closed TTY) must NOT
+    // short-circuit the alt-screen leave / mouse-capture disable below.
     let _ = disable_raw_mode();
-    let _ = terminal.backend_mut().execute(DisableBracketedPaste);
-    let _ = terminal.backend_mut().execute(DisableMouseCapture);
-    let _ = terminal.backend_mut().execute(LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
+    restore_sequence(terminal.backend_mut());
 }
 
 /// Whether the terminal supports **DEC private mode 2026 (synchronized output)**
@@ -4352,6 +4386,16 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // R4 resize debounce — the (w, h) of the last frame we actually drew, so a
     // duplicate same-dimension Resize event doesn't trigger a second clear.
     let mut last_drawn_size: Option<(u16, u16)> = None;
+    // Generic input-height-change guard. The rendered input-box height from the
+    // previous iteration; when it changes (a multi-line history recall, a paste
+    // chip expanding, a wrap/newline, a submit clearing a tall box) the prompt
+    // grows/shrinks and the transcript above it shifts. ratatui's diff rewrites
+    // the shifted cells on a VT-strict terminal, but the Windows console can
+    // leave the rows the shift VACATED as stale overlap — so a height delta
+    // forces a full clear + back-buffer reset on the next frame. `None` until the
+    // first frame publishes a real text width. Fail-open: the source events
+    // (`request_full_repaint` on recall / `/clear`) also set the flag directly.
+    let mut last_input_block_rows: Option<u16> = None;
     // R5 SIGCONT listener (Unix job-control resume). `None` on non-unix / if
     // registration failed — the select! arm is then inert (fail-open).
     let mut resume_sig = register_resume_signal();
@@ -4396,6 +4440,28 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             force_full_repaint = true;
             last_scrub = Instant::now();
         }
+
+        // Drain a one-shot full-repaint request raised by a height-changing or
+        // transcript-clearing operation (a multi-line history recall, `/clear`).
+        // Folded into the SAME `force_full_repaint` gate as the R1/R4/R5 self-heal
+        // so the next frame does a real `Clear` + ratatui back-buffer reset and no
+        // row the change vacated can survive as stale overlap on the Windows
+        // console. Fail-open: a missed flag only forgoes one full repaint.
+        if app.take_force_repaint() {
+            force_full_repaint = true;
+        }
+        // Generic input-height-change guard: if the rendered input-box height
+        // differs from the last frame's, the prompt grew/shrank and the content
+        // above it shifted — force a full repaint so the vacated rows are wiped
+        // (the Windows-console overlap fix for paste-chip expansion, wrapping, a
+        // newline, a submit clearing a tall box, and as a backstop for recall).
+        // Uses the text width the renderer published last frame; `None` on the
+        // very first iteration so the initial paint is never forced spuriously.
+        let input_rows_now = app.input_block_height();
+        if last_input_block_rows.is_some_and(|prev| prev != input_rows_now) {
+            force_full_repaint = true;
+        }
+        last_input_block_rows = Some(input_rows_now);
 
         // R3 — frame-budget gate. Draw when a self-heal repaint is forced, when a
         // latency-sensitive source asked for an immediate frame (`draw_now` —
@@ -5612,6 +5678,108 @@ fn current_run_options(app: &App, opts: &LaunchOptions) -> RunOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Windows-console teardown: every exit path must FULLY restore the
+    // terminal, symmetric with setup and in reverse order, or conhost leaves
+    // PowerShell stuck on the alt screen / in raw mode. --------------------
+
+    /// The shared restore sequence used by the normal teardown, the panic hook,
+    /// and the mid-setup failure path must be COMPLETE (leave the alternate
+    /// screen, disable mouse capture + bracketed paste + synchronized output,
+    /// show the cursor, reset SGR) and emitted in reverse-of-setup ORDER. On the
+    /// Windows console a missing alt-screen leave or a stuck mode is exactly the
+    /// "must close the window and reopen" report. (`disable_raw_mode` is the
+    /// caller's first step — a global console-input mode, not a writer command.)
+    #[test]
+    fn restore_sequence_is_complete_and_in_reverse_setup_order() {
+        let mut buf: Vec<u8> = Vec::new();
+        restore_sequence(&mut buf);
+        let s = String::from_utf8_lossy(&buf);
+        let leave = s
+            .find("\x1b[?1049l")
+            .expect("must leave the alternate screen");
+        let mouse = s.find("\x1b[?1000l").expect("must disable mouse capture");
+        let paste = s.find("\x1b[?2004l").expect("must disable bracketed paste");
+        let sync = s
+            .find("\x1b[?2026l")
+            .expect("must disable synchronized output");
+        let show = s.find("\x1b[?25h").expect("must show the cursor");
+        let reset = s.find("\x1b[0m").expect("must reset SGR/colors");
+        assert!(
+            leave < mouse && mouse < paste && paste < sync && sync < show && show < reset,
+            "restore must run in reverse-of-setup order so conhost honours each step: \
+             leave={leave} mouse={mouse} paste={paste} sync={sync} show={show} reset={reset}"
+        );
+    }
+
+    /// The sequence is IDEMPOTENT: running it twice (e.g. the panic hook fired,
+    /// then the normal teardown also ran) emits the same modes again with no
+    /// extra state — each is level-triggered, so a double restore is harmless.
+    #[test]
+    fn restore_sequence_is_idempotent() {
+        let mut once: Vec<u8> = Vec::new();
+        restore_sequence(&mut once);
+        let mut twice: Vec<u8> = Vec::new();
+        restore_sequence(&mut twice);
+        restore_sequence(&mut twice);
+        // The second invocation just repeats the same restore bytes — it never
+        // wedges or diverges (the property we care about is "complete every time").
+        assert!(twice.windows(once.len()).any(|w| w == once.as_slice()));
+        assert!(String::from_utf8_lossy(&twice).contains("\x1b[?1049l"));
+    }
+
+    /// The `force_full_repaint` path the event loop takes on a height change /
+    /// `/clear` is `terminal.clear()`, which wipes the screen AND resets
+    /// ratatui's back-buffer so the next (shorter) draw repaints every cell — so
+    /// a SHRINK leaves no stale rows. Without the clear, ratatui's incremental
+    /// diff would only rewrite the changed top cells and leave the vacated rows
+    /// as overlap (the Windows-console garble).
+    #[test]
+    fn full_repaint_clears_stale_rows_on_a_shrink() {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Paragraph;
+        let mut term = Terminal::new(TestBackend::new(8, 4)).expect("test terminal");
+        // Frame 1: a TALL paint filling all four rows.
+        term.draw(|f| {
+            f.render_widget(Paragraph::new("AAAA\nAAAA\nAAAA\nAAAA"), f.area());
+        })
+        .expect("draw 1");
+        // The force_full_repaint path: clear() + a SHORTER redraw.
+        term.clear().expect("clear");
+        term.draw(|f| {
+            f.render_widget(Paragraph::new("B"), f.area());
+        })
+        .expect("draw 2");
+        // No stale 'A' may survive anywhere — the shrink left no overlap.
+        let buf = term.backend().buffer();
+        let mut stale = false;
+        for y in 0..4 {
+            for x in 0..8 {
+                if buf[(x, y)].symbol() == "A" {
+                    stale = true;
+                }
+            }
+        }
+        assert!(
+            !stale,
+            "clear() + redraw must wipe the rows a shrink vacated"
+        );
+    }
+
+    /// A forced repaint always draws, regardless of the streaming frame budget,
+    /// so the clear+redraw can't be throttled away on the frame a height change
+    /// happens.
+    #[test]
+    fn forced_repaint_always_draws_within_budget() {
+        // force_full_repaint = true overrides a not-yet-elapsed budget.
+        assert!(frame_budget_allows_draw(
+            true,
+            false,
+            false,
+            Duration::from_millis(0),
+            FRAME_MIN,
+        ));
+    }
 
     // --- M1: cancel-drain absolute-deadline bound ---------------------------
 
