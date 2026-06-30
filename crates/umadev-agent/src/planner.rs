@@ -464,7 +464,14 @@ pub fn classify(requirement: &str) -> TaskKind {
         "报错",
         "闪退",
         "hotfix",
-    ]) {
+    ]) && !(has_heavy_signal(&q) && asks_to_build_new_scope(&q))
+    {
+        // M1: a bug-fix verb that ALSO carries a heavyweight surface AND explicit
+        // additive-build intent ("fix the checkout and build a full dashboard with
+        // auth") is a real build wearing a fix verb — escalate it off the lean path
+        // (which would skip research / docs / both confirm gates / delivery + run an
+        // empty review team). The veto needs BOTH signals so a genuine bug-fix that
+        // merely MENTIONS a heavy area ("修复登录页的小 bug") stays lean (no over-block).
         return TaskKind::Bugfix;
     }
     // 2. Refactor / cleanup.
@@ -478,7 +485,12 @@ pub fn classify(requirement: &str) -> TaskKind {
         "拆分模块",
         "tidy up",
         "代码结构",
-    ]) {
+    ]) && !(has_heavy_signal(&q) && asks_to_build_new_scope(&q))
+    {
+        // M1: same combined veto — "重构整个系统,加登录、支付、数据库" pairs a heavy
+        // surface (登录/支付/数据库) with additive-build intent (整个系统/加登录), so it
+        // is an additive heavyweight build, not a behavior-preserving refactor → escalate
+        // it off the lean path. A pure refactor that only mentions a heavy area stays lean.
         return TaskKind::Refactor;
     }
     // 3. Docs / research / planning only.
@@ -764,6 +776,44 @@ fn has_heavy_signal(q: &str) -> bool {
         "marketplace",
         "shopping cart",
         "inventory",
+    ])
+}
+
+/// Whether the requirement asks to BUILD / ADD genuinely NEW scope (a whole system,
+/// a new feature/module, an extra surface) ON TOP OF a fix/refactor verb — the tell
+/// that a "fix"/"refactor"-worded ask is actually an additive heavyweight build
+/// ("重构整个系统,加登录、支付、数据库" / "fix the checkout and build a full dashboard
+/// with auth"). Deliberately NARROW: it matches explicit build/add-a-thing phrasings
+/// (a determiner/conjunction-anchored `build a|the|out`, `加X`, `搭建`, `新增…系统`),
+/// NOT a bare heavy NOUN — so a genuine bug-fix that merely MENTIONS a heavy area
+/// ("修复登录页的一个小 bug") is NOT mistaken for a build. Combined with
+/// [`has_heavy_signal`] at the Bugfix/Refactor veto so escalation needs BOTH a heavy
+/// surface AND additive-build intent.
+fn asks_to_build_new_scope(q: &str) -> bool {
+    let has = |needles: &[&str]| needles.iter().any(|n| q.contains(n));
+    has(&[
+        // English — an explicit "build/create a whole new thing" verb, anchored by a
+        // determiner / conjunction so a bare "the build failed" never trips it.
+        "build a",
+        "build an",
+        "build the ",
+        "build out",
+        "and build",
+        "build a full",
+        "full dashboard",
+        "create a full",
+        // Chinese — additive "build/add a system/feature/module" phrasings.
+        "整个系统",
+        "搭建",
+        "新建",
+        "加登录",
+        "加支付",
+        "加数据库",
+        "加注册",
+        "加鉴权",
+        "新增功能",
+        "新增模块",
+        "新增系统",
     ])
 }
 
@@ -1107,15 +1157,37 @@ mod tests {
 
     #[test]
     fn classifies_bugfix() {
-        assert_eq!(classify("修复登录页的 bug"), TaskKind::Bugfix);
-        assert_eq!(classify("登录一直报错,帮我修一下"), TaskKind::Bugfix);
+        // Pure bug-fix asks with NO heavyweight signal stay on the lean Bugfix path.
+        assert_eq!(classify("修复首页排版的 bug"), TaskKind::Bugfix);
+        assert_eq!(classify("这个功能一直报错,帮我修一下"), TaskKind::Bugfix);
         assert_eq!(classify("the app crashes on submit"), TaskKind::Bugfix);
     }
 
     #[test]
     fn classifies_refactor() {
+        // Behavior-preserving refactors with NO heavyweight signal stay lean.
         assert_eq!(classify("重构 app.rs 拆分模块"), TaskKind::Refactor);
-        assert_eq!(classify("refactor the auth module"), TaskKind::Refactor);
+        assert_eq!(classify("refactor the parser module"), TaskKind::Refactor);
+    }
+
+    #[test]
+    fn heavy_bugfix_or_refactor_escalates_off_the_lean_path() {
+        // M1 regression: a bug-fix / refactor VERB carrying a heavyweight signal
+        // (auth / payment / database / dashboard / …) is an additive product build,
+        // not a lean fix. The `has_heavy_signal` veto must keep it OFF the lean path
+        // (which would skip research / docs / both confirm gates / delivery + run an
+        // empty review team). It escalates to a heavyweight kind.
+        assert!(
+            !classify("重构整个系统,加登录、支付、数据库").is_lean_build(),
+            "a refactor that ADDS auth/payment/db is a heavyweight build, not a lean refactor"
+        );
+        assert!(
+            !classify("fix the checkout and build a full dashboard with auth").is_lean_build(),
+            "a 'fix' that also builds a full dashboard with auth must escalate, not stay lean"
+        );
+        // Sanity: the lean verbs without any heavy signal still classify lean.
+        assert!(classify("修复首页的小 bug").is_lean_build());
+        assert!(classify("refactor the parser module").is_lean_build());
     }
 
     #[test]

@@ -24,8 +24,8 @@ use crate::experts::{
 };
 use crate::gates::Gate;
 use crate::phases::{
-    run_backend, run_delivery, run_docs, run_frontend, run_quality, run_research, run_spec,
-    DocsContent, PhaseOutput,
+    run_backend, run_delivery, run_docs, run_frontend, run_frontend_with_kind, run_quality,
+    run_quality_with_kind, run_research, run_spec, DocsContent, PhaseOutput,
 };
 use crate::state::{write_workflow_state, WorkflowState};
 
@@ -5294,7 +5294,9 @@ impl<R: Runtime> AgentRunner<R> {
         }
         completed.push(self.record_phase_maybe_degraded(
             Phase::Frontend,
-            run_frontend(&self.options),
+            // M7: thread the FORCED Light kind so the frontend phase does not post a
+            // spurious preview-confirm gate the lean plan never scheduled.
+            run_frontend_with_kind(&self.options, Some(plan.kind)),
             fe_degraded,
         )?);
         self.record_phase_timing(Phase::Frontend, phase_start);
@@ -5311,7 +5313,10 @@ impl<R: Runtime> AgentRunner<R> {
         let phase_start = std::time::Instant::now();
         self.transition(Phase::Quality, "")?;
         self.start_phase(Phase::Quality);
-        let quality_result = run_quality(&self.options);
+        // M8: thread the FORCED Light kind so the doc-N/A guard reads the EXECUTED
+        // plan (no Docs) rather than re-classifying the requirement (which could
+        // re-derive Greenfield and penalise the run for PRD/arch/UIUX it skipped).
+        let quality_result = run_quality_with_kind(&self.options, Some(plan.kind));
         completed.push(self.record_phase(Phase::Quality, quality_result)?);
         self.record_phase_timing(Phase::Quality, phase_start);
         self.maybe_verify(Phase::Quality).await;

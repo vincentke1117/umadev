@@ -686,9 +686,40 @@ pub fn run_spec(opts: &RunOptions) -> io::Result<PhaseOutput> {
 // frontend → preview_confirm
 // =====================================================================
 
+/// Whether the run's EXECUTED plan includes `phase`. Prefers the actual executed
+/// `kind` threaded by the runner (e.g. `umadev quick` FORCES [`crate::planner::TaskKind::Light`]
+/// regardless of how the requirement reads); falls back to re-deriving the plan from
+/// the requirement only when the caller didn't thread a kind (the full-path callers,
+/// where the executed plan IS derived from the requirement anyway). M7/M8: this stops a
+/// phase from re-classifying `opts.requirement` and DISAGREEING with the plan the run
+/// actually executed.
+fn executed_plan_includes(
+    opts: &RunOptions,
+    executed_kind: Option<crate::planner::TaskKind>,
+    phase: Phase,
+) -> bool {
+    match executed_kind {
+        Some(k) => k.phases().contains(&phase),
+        None => crate::planner::plan(&opts.requirement).includes(phase),
+    }
+}
+
 /// Run the `frontend` phase. V1 only records the phase transition;
 /// real implementation work belongs to the LLM milestone.
 pub fn run_frontend(opts: &RunOptions) -> io::Result<PhaseOutput> {
+    run_frontend_with_kind(opts, None)
+}
+
+/// [`run_frontend`] with the run's EXECUTED kind threaded in (M7). When the executed
+/// plan omits `PreviewConfirm` (a lean Bugfix / Refactor / Light plan — see
+/// [`crate::planner::TaskKind::phases`]), the frontend phase must NOT post a spurious
+/// preview-gate pause the planner deliberately did not schedule. Passing `None`
+/// re-derives the plan from the requirement (the byte-for-byte prior behaviour for the
+/// full-path callers).
+pub fn run_frontend_with_kind(
+    opts: &RunOptions,
+    executed_kind: Option<crate::planner::TaskKind>,
+) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
     let output_dir = opts.project_root.join("output");
     fs::create_dir_all(&output_dir)?;
@@ -724,7 +755,12 @@ pub fn run_frontend(opts: &RunOptions) -> io::Result<PhaseOutput> {
     Ok(PhaseOutput {
         phase: Phase::Frontend,
         artifacts: vec![note],
-        gate: Some(crate::gates::Gate::PreviewConfirm),
+        // M7: only schedule the preview-confirm gate when the EXECUTED plan includes it.
+        // A lean Bugfix / Refactor / Light plan is `[Spec, Frontend, Backend, Quality]`
+        // (no PreviewConfirm); hard-coding the gate here forced a spurious preview pause
+        // the planner deliberately omitted.
+        gate: executed_plan_includes(opts, executed_kind, Phase::PreviewConfirm)
+            .then_some(crate::gates::Gate::PreviewConfirm),
         degraded: false,
     })
 }
@@ -826,6 +862,21 @@ pub struct QualitySummary {
 /// Run the `quality` phase (`UD-EVID-003`). Scans workspace artifacts +
 /// audit logs and writes `output/<slug>-quality-gate.json`.
 pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
+    run_quality_with_kind(opts, None)
+}
+
+/// [`run_quality`] with the run's EXECUTED kind threaded in (M8). The doc-N/A guard
+/// (which marks PRD / architecture / UIUX checks `n/a` for a lean plan that skips the
+/// Docs phase) must read the plan the run ACTUALLY executed — not a re-classification
+/// of `opts.requirement`. `umadev quick 做一个电商平台` FORCES `Light` (no docs), but
+/// `classify("做一个电商平台")` re-derives `Greenfield` (which includes Docs); without
+/// the executed kind the guard wouldn't fire and the run is penalised for PRD/arch/UIUX
+/// it was told would be skipped (a false quality-gate fail). Passing `None` re-derives
+/// from the requirement (the byte-for-byte prior behaviour for the full-path callers).
+pub fn run_quality_with_kind(
+    opts: &RunOptions,
+    executed_kind: Option<crate::planner::TaskKind>,
+) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
     let output_dir = opts.project_root.join("output");
     fs::create_dir_all(&output_dir)?;
@@ -1012,8 +1063,9 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
     // plan-only task does NOT include Frontend/Backend, so this check is `passed`
     // (no false alarm).
     {
-        let plan = crate::planner::plan(&opts.requirement);
-        let expects_code = plan.includes(Phase::Frontend) || plan.includes(Phase::Backend);
+        // M8: read the EXECUTED plan (the run's actual kind), not a re-classification.
+        let expects_code = executed_plan_includes(opts, executed_kind, Phase::Frontend)
+            || executed_plan_includes(opts, executed_kind, Phase::Backend);
         let source_count = crate::acceptance::source_files(&opts.project_root).len();
         let (status, score, details) = if !expects_code {
             (
@@ -1622,7 +1674,7 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
     // for an artifact it was never asked to produce. So N/A those doc-bound
     // checks for a lean plan (only when they are PENALISING; a doc that somehow
     // exists and passes stays live). Code/floor/verify checks are untouched.
-    if !crate::planner::plan(&opts.requirement).includes(Phase::Docs) {
+    if !executed_plan_includes(opts, executed_kind, Phase::Docs) {
         for c in &mut checks {
             if DOC_BOUND_CHECKS.contains(&c.name.as_str()) && c.status != "passed" {
                 c.status = "n/a".to_string();
@@ -3955,8 +4007,37 @@ mod tests {
     #[test]
     fn frontend_writes_notes_and_pauses_at_preview_gate() {
         let tmp = TempDir::new().unwrap();
+        // The default opts requirement ("build a login system") plans Greenfield, which
+        // includes PreviewConfirm → the gate is posted.
         let out = run_frontend(&opts(tmp.path())).unwrap();
         assert_eq!(out.phase, Phase::Frontend);
+        assert_eq!(out.gate, Some(crate::gates::Gate::PreviewConfirm));
+    }
+
+    #[test]
+    fn frontend_skips_preview_gate_for_a_lean_plan_without_it() {
+        // M7 regression: a lean Bugfix / Refactor / Light plan is
+        // `[Spec, Frontend, Backend, Quality]` — NO PreviewConfirm. The frontend phase
+        // must NOT post a spurious preview-gate pause the planner deliberately omitted.
+        let tmp = TempDir::new().unwrap();
+        for kind in [
+            crate::planner::TaskKind::Bugfix,
+            crate::planner::TaskKind::Refactor,
+            crate::planner::TaskKind::Light,
+        ] {
+            let out = run_frontend_with_kind(&opts(tmp.path()), Some(kind)).unwrap();
+            assert_eq!(out.phase, Phase::Frontend);
+            assert!(
+                out.gate.is_none(),
+                "{kind:?} omits PreviewConfirm — the frontend phase must not pause at a preview gate"
+            );
+        }
+        // A kind that DOES include PreviewConfirm still posts the gate.
+        let out = run_frontend_with_kind(
+            &opts(tmp.path()),
+            Some(crate::planner::TaskKind::FrontendOnly),
+        )
+        .unwrap();
         assert_eq!(out.gate, Some(crate::gates::Gate::PreviewConfirm));
     }
 
@@ -5018,6 +5099,49 @@ mod tests {
         assert!(
             report.checks.iter().any(|c| c.status == "n/a"),
             "a static-frontend run should mark some surface-bound checks N/A"
+        );
+    }
+
+    #[test]
+    fn quality_doc_na_guard_reads_executed_kind_not_reclassified_requirement() {
+        // M8 regression: `umadev quick 做一个电商平台` FORCES Light (no Docs phase),
+        // but classify("做一个电商平台") re-derives Greenfield (which INCLUDES Docs).
+        // The doc-N/A guard must read the run's EXECUTED kind, else a lean run is
+        // penalised for PRD/architecture/UIUX it was explicitly told would be skipped.
+        let tmp = TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个电商平台".to_string();
+        // Sanity: re-deriving the plan from the requirement yields a Docs-bearing plan.
+        assert!(crate::planner::plan(&o.requirement).includes(Phase::Docs));
+
+        // Executed as the FORCED Light kind → the doc-bound checks are N/A (not penalising).
+        let light = run_quality_with_kind(&o, Some(crate::planner::TaskKind::Light)).unwrap();
+        let report_l: QualityReport =
+            serde_json::from_str(&fs::read_to_string(&light.artifacts[0]).unwrap()).unwrap();
+        assert!(
+            report_l
+                .checks
+                .iter()
+                .any(|c| DOC_BOUND_CHECKS.contains(&c.name.as_str()) && c.status == "n/a"),
+            "a Light-executed run must N/A the doc-bound checks: {:?}",
+            report_l
+                .checks
+                .iter()
+                .map(|c| (c.name.clone(), c.status.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        // Re-classified from the requirement (None) → Greenfield includes Docs → the
+        // doc-bound checks stay LIVE (the buggy behaviour the forced path used to hit).
+        let reclassified = run_quality(&o).unwrap();
+        let report_r: QualityReport =
+            serde_json::from_str(&fs::read_to_string(&reclassified.artifacts[0]).unwrap()).unwrap();
+        assert!(
+            report_r
+                .checks
+                .iter()
+                .any(|c| DOC_BOUND_CHECKS.contains(&c.name.as_str()) && c.status != "n/a"),
+            "re-deriving Greenfield from the requirement keeps doc-bound checks live (penalising)"
         );
     }
 

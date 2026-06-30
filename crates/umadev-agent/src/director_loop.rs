@@ -1362,19 +1362,25 @@ async fn drive_plan_steps(
     // does not re-drive here (each step was already verified); it folds any residual
     // finding into ONE last fix turn, bounded, then settles. This guarantees a
     // step-driven build is never held to a WEAKER bar than the single-turn build.
-    let final_reply =
+    let final_gate =
         run_final_gate(session, options, events, route, &last_reply, deadline, "").await;
-    if !final_reply.is_empty() {
-        last_reply = final_reply;
+    if !final_gate.reply.is_empty() {
+        last_reply = final_gate.reply;
     }
 
     // Persist the plan's terminal state for resume.
     persist_plan_ref(plan, options);
     // Sync the 9-phase workflow state at finalize. HONEST clean signal: every step
-    // reached Done (none Blocked / stranded) — only then may the build claim
-    // `delivery`; otherwise the state advances to the furthest phase that actually
-    // completed, so `/status` reflects where the build really stopped. Fail-open.
-    let clean = plan.steps.iter().all(|s| s.status == StepStatus::Done);
+    // reached Done (none Blocked / stranded) AND the final whole-build gate settled
+    // clean — only then may the build claim `delivery`. H1: the final gate runs the
+    // cross-cutting checks (coverage / contract / runtime-proof / governance / fork
+    // review); its clean-ness was previously DISCARDED, so a build with every step
+    // Done but a DIRTY final gate (a dropped FR / contract drift / unverified
+    // runtime-proof) finalized as success. AND the gate's clean signal in, so an
+    // incomplete build can never be disguised as a clean delivery. This makes the
+    // step path's gate never weaker than the single-turn loop (which already gates
+    // finalize INSIDE `qc.is_clean()`). Fail-open: a dirty gate just means "not clean".
+    let clean = plan.steps.iter().all(|s| s.status == StepStatus::Done) && final_gate.clean;
     finalize_phase_from_plan(plan, options, clean);
     // Wave 4 (§L4 / G8): a step-driven (always deliberate) build leaves the FULL
     // shareable delivery — core docs + proof-pack + scorecard — but ONLY when the
@@ -2130,6 +2136,13 @@ async fn verify_step_evidence(
                 path,
                 status,
             } => route_responds_outcome(runtime.as_ref(), method, path, *status),
+            // M6: an under-specified brain evidence entry is ALWAYS an unmet gap — it
+            // never auto-passes, so the step is held to a falsifiable bar instead of
+            // silently degrading to the coarse "any source exists" default.
+            E::Malformed { detail } => EvidenceOutcome::Gap(format!(
+                "declared evidence is under-specified ({detail}) — name the concrete \
+                 file/route/needle so this step has a falsifiable acceptance bar"
+            )),
         };
         match outcome {
             EvidenceOutcome::Pass => any_positive = true,
@@ -2275,7 +2288,7 @@ fn route_responds_outcome(
     runtime: Option<&crate::runtime_proof::RuntimeProof>,
     method: &str,
     path: &str,
-    status: u16,
+    status: Option<u16>,
 ) -> EvidenceOutcome {
     let Some(proof) = runtime else {
         return EvidenceOutcome::Skip;
@@ -2294,23 +2307,25 @@ fn route_responds_outcome(
             "declared {method} {path} responds but that route was not among the probed routes"
         ));
     };
-    let ok = if status == 0 {
-        probe.ok
-    } else {
-        probe.status == status
+    // L2: `None` = any non-error response; `Some(code)` = require exactly `code`
+    // (including a required error status like 401).
+    let ok = match status {
+        None => probe.ok,
+        Some(want) => probe.status == want,
     };
     if ok {
         EvidenceOutcome::Pass
-    } else if status == 0 {
-        EvidenceOutcome::Gap(format!(
-            "declared {method} {path} responds OK but it returned status {}",
-            probe.status
-        ))
     } else {
-        EvidenceOutcome::Gap(format!(
-            "declared {method} {path} responds {status} but it returned status {}",
-            probe.status
-        ))
+        match status {
+            None => EvidenceOutcome::Gap(format!(
+                "declared {method} {path} responds OK but it returned status {}",
+                probe.status
+            )),
+            Some(want) => EvidenceOutcome::Gap(format!(
+                "declared {method} {path} responds {want} but it returned status {}",
+                probe.status
+            )),
+        }
     }
 }
 
@@ -2351,6 +2366,21 @@ fn source_mentions(root: &std::path::Path, needle: &str) -> bool {
 /// minute-level FIX TURN it would trigger is skipped once the deadline is spent (the
 /// doc'd "hard ceiling" — the build could otherwise run several fix turns over budget
 /// here). The objective hard-gate the caller runs still owns reality.
+/// The outcome of [`run_final_gate`]: the final fix-turn reply PLUS whether the gate
+/// settled CLEAN. H1: the step-driven caller must AND `clean` into its finalize
+/// decision — a build whose steps all ticked Done but whose final cross-cutting gate
+/// (coverage / contract / runtime-proof / governance / fork review) stayed DIRTY must
+/// NOT be finalized as a clean delivery (which would ship a full proof-pack/scorecard
+/// disguising an incomplete build as success).
+struct FinalGateOutcome {
+    /// The last fix-turn's reply (empty when QC was already clean / no fix ran).
+    reply: String,
+    /// `true` only when the QC read came back clean within the bounded rounds;
+    /// `false` when the gate settled with residual blocking findings (budget /
+    /// deadline / dead session).
+    clean: bool,
+}
+
 async fn run_final_gate(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -2363,7 +2393,7 @@ async fn run_final_gate(
     // turn carries the team's standards + memory). `""` = the byte-for-byte original
     // directive (the `/run` step-driver passes this), so existing callers are unchanged.
     fix_prefix: &str,
-) -> String {
+) -> FinalGateOutcome {
     let mut last_reply = String::new();
     // The incremental-verify signal seeds from the LAST step's reply (the steps just
     // ran the build/test); each fix round below then carries its own turn's reply.
@@ -2382,14 +2412,20 @@ async fn run_final_gate(
         )
         .await;
         if qc.is_clean() {
-            return last_reply;
+            return FinalGateOutcome {
+                reply: last_reply,
+                clean: true,
+            };
         }
         if round + 1 >= MAX_QC_ROUNDS {
             events.emit(EngineEvent::Note(
                 "team · final QC reached its fix-round budget — settling (objective hard-gate decides reality)"
                     .to_string(),
             ));
-            return last_reply;
+            return FinalGateOutcome {
+                reply: last_reply,
+                clean: false,
+            };
         }
         // Wall-clock ceiling (graceful): the QC READ above ran (the floor still bites),
         // but the minute-level FIX TURN it would trigger is skipped once the budget is
@@ -2402,7 +2438,10 @@ async fn run_final_gate(
                  hard-gate (raise UMADEV_RUN_BUDGET_SECS for more fix rounds)"
                     .to_string(),
             ));
-            return last_reply;
+            return FinalGateOutcome {
+                reply: last_reply,
+                clean: false,
+            };
         }
         // Fold the residual findings into ONE fix turn on the main session — with the
         // optional context prefix (knowledge + pitfalls) front-loaded for a chat-build.
@@ -2420,10 +2459,20 @@ async fn run_final_gate(
                 verify_signal = t.text.clone();
                 last_reply = t.text;
             }
-            Err(_) => return last_reply, // a dead/hung session → settle (fail-open)
+            // A dead/hung session → settle (fail-open). The gate did NOT clear, so the
+            // residual findings stand and the caller must not finalize as clean.
+            Err(_) => {
+                return FinalGateOutcome {
+                    reply: last_reply,
+                    clean: false,
+                }
+            }
         }
     }
-    last_reply
+    FinalGateOutcome {
+        reply: last_reply,
+        clean: false,
+    }
 }
 
 /// **The full post-build QC pass for a CHAT-ORIGINATED build** — the architecture
@@ -2475,10 +2524,13 @@ pub async fn run_post_build_qc(
     // opened firmware-light (no JIT knowledge), so this is where a chat-build's fix gets
     // the standards + memory. Fail-open: empty recall = the byte-for-byte plain directive.
     let prefix = post_build_rework_context(options);
+    // The chat-build surface only needs the fix-turn reply; its caller does not gate a
+    // finalize on the gate's clean-ness (the `/run` step path does — see H1).
     run_final_gate(
         session, options, events, route, seed_reply, deadline, &prefix,
     )
     .await
+    .reply
 }
 
 /// Build the CONTEXT prefix front-loaded onto a chat-build's post-QC fix directives —
@@ -3571,9 +3623,20 @@ async fn run_auto_qc(
     // pure overhead over a .md. The governance scan above still ran (the moat is
     // kept); only the code-shaped half of QC is skipped. A real product (non-empty
     // source, non-document) is untouched.
-    if crate::planner::is_lean_build(&options.requirement)
-        || crate::planner::is_document_task(&options.requirement)
-        || crate::acceptance::source_files(&options.project_root).is_empty()
+    // M2: gate the lean short-circuit on the ROUTE's brain-decided `depth`, NOT a
+    // re-derived keyword `classify(requirement)`. A deliberate (Standard/Deep) build
+    // whose requirement happens to read "lean" must take the FULL gate (build/test +
+    // the acceptance floor + fork review) — keying off the keyword classifier could
+    // DISAGREE with the brain's depth and let a real build settle after only source-
+    // present + governance (which compounds H1). A deliberate empty build was already
+    // caught by the source-present floor above, so this only fast-paths a genuinely
+    // light/non-deliberate goal. Fail-open: no route in hand → keyword classify (the
+    // single-turn legacy behaviour) is retained.
+    let route_is_deliberate = route.map(|r| r.depth.is_deliberate()).unwrap_or(false);
+    if !route_is_deliberate
+        && (crate::planner::is_lean_build(&options.requirement)
+            || crate::planner::is_document_task(&options.requirement)
+            || crate::acceptance::source_files(&options.project_root).is_empty())
     {
         events.emit(EngineEvent::Note(
             "team · lean / document goal — source check done, skipping the duplicate build + fork review"
@@ -5390,7 +5453,9 @@ mod tests {
         let (events, rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = opts(tmp.path()); // "做一个登录系统" — non-lean, so it reaches the build read
-        let reply = "Implemented the login system end to end. Ran the suite — all tests pass and the build succeeded.";
+                                  // M3: the skip needs MACHINE evidence (a named runner / exit-code), not prose —
+                                  // so the reply names the commands it ran and reports an exit-code-0 result.
+        let reply = "Implemented the login system end to end. Ran `npm test` and `npm run build` — all tests pass and the build succeeded (exit code 0).";
         let qc = run_auto_qc(&mut sess, &o, &events, None, Some(reply)).await;
         assert!(
             qc.is_clean(),
@@ -5544,6 +5609,34 @@ mod tests {
             !qc2.blocking.iter().any(|b| b.contains("coverage gap")),
             "a lean goal does NOT pay the acceptance floor (speed): {:?}",
             qc2.blocking
+        );
+    }
+
+    #[tokio::test]
+    async fn deliberate_route_with_lean_reading_requirement_still_runs_full_gate() {
+        // M2 regression: the lean short-circuit must key off the ROUTE's brain-decided
+        // depth, NOT a re-derived keyword classify(requirement). A DELIBERATE route whose
+        // requirement happens to READ lean ("做一个简单的待办单页") must still run the
+        // FULL gate (the acceptance floor), not settle after source-present + governance.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        seed_coverage_gap(tmp.path());
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let mut o = opts(tmp.path());
+        // A requirement the keyword classifier would call LEAN…
+        o.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
+        assert!(
+            crate::planner::is_lean_build(&o.requirement),
+            "precondition: the requirement reads lean by the keyword classifier"
+        );
+        // …but the ROUTE is deliberate (Standard depth) → the full gate must run.
+        let route = build_route();
+        let qc = run_auto_qc(&mut sess, &o, &events, Some(&route), None).await;
+        assert!(
+            qc.blocking.iter().any(|b| b.contains("coverage gap")),
+            "a deliberate route runs the full gate even when the requirement reads lean: {:?}",
+            qc.blocking
         );
     }
 
@@ -7129,6 +7222,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evidence_malformed_is_an_unmet_gap_even_with_real_source() {
+        use crate::plan_state::EvidenceContract as E;
+        // M6 regression: a step whose ONLY declared evidence is an under-specified
+        // (Malformed) contract must NOT be accepted just because some source exists —
+        // it is held to a falsifiable bar (an explicit gap), never silently degraded to
+        // the coarse "any source exists" default.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/other.tsx"), "export const X = 1;").unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+        let step = evidence_step(vec![E::Malformed {
+            detail: "file-exists: missing a non-empty `path`".into(),
+        }]);
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        assert!(
+            !v.accepted,
+            "an under-specified evidence contract must leave the step NOT done despite source"
+        );
+        assert!(
+            v.evidence_line().contains("under-specified"),
+            "the gap names the under-specification: {}",
+            v.evidence_line()
+        );
+    }
+
+    #[tokio::test]
     async fn evidence_file_exists_absent_stays_not_done_with_a_typed_gap() {
         use crate::plan_state::EvidenceContract as E;
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7258,7 +7380,7 @@ mod tests {
         let step = evidence_step(vec![E::RouteResponds {
             method: "GET".into(),
             path: "/api/x".into(),
-            status: 200,
+            status: Some(200),
         }]);
         let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
         assert!(

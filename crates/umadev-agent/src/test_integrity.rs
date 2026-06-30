@@ -102,6 +102,12 @@ const HARNESS_FILES: &[&str] = &[
 struct FileMetrics {
     /// Number of assertion calls (`assert` / `expect` / `.should` …).
     assertions: usize,
+    /// Number of TRIVIALLY-TRUE assertions whose subject is a constant truth
+    /// (`expect(true)` / `assert(true)` / `assertTrue(true)` / `XCTAssertTrue(true)`
+    /// / Python `assert True` …). H2: assertion COUNTS alone can't catch a body
+    /// rewritten in place (`expect(add(1,2)).toEqual(3)` → `expect(true).toBe(true)`)
+    /// — the count is unchanged — so a RISE in this signal flags the neutering.
+    trivial_asserts: usize,
     /// Number of test declarations (`it(` / `test(` / `def test_` / `#[test]` …).
     test_fns: usize,
     /// Number of skip / xfail / focus markers (`skip` / `xfail` / `.only` /
@@ -192,18 +198,36 @@ pub fn check(project_root: &Path, before: Option<&TestSnapshot>) -> Vec<String> 
                         b = before_m.test_fns,
                         a = after_m.test_fns,
                     ));
-                } else if after_m.assertions < before_m.assertions {
-                    // Assertions dropped with NO test removed → the checks were
-                    // stripped out of kept tests (gaming), not justified by a
-                    // removed case. (When a test WAS removed the line above owns
-                    // it, so we don't double-report.)
+                }
+                // L5: an INDEPENDENT check (was an `else if` after the test-fn drop) — a
+                // step that BOTH removes a test function AND strips assertions out of a
+                // KEPT test would otherwise report only the function loss, hiding the
+                // stripping. Both findings fold into one rework directive; over-reporting
+                // a genuine reduction of test signal is safe (it only fires when the
+                // before>after counts prove signal was lost).
+                if after_m.assertions < before_m.assertions {
                     out.push(format!(
-                        "test-integrity: {path} lost {n} assertion(s) this step ({b}->{a}) with no \
-                         test removed — assertions were weakened/stripped from kept tests; restore \
-                         the checks instead of deleting them",
+                        "test-integrity: {path} lost {n} assertion(s) this step ({b}->{a}) — \
+                         assertions were weakened/stripped; restore the checks (or, if a test was \
+                         legitimately removed, the removal must be justified) instead of deleting them",
                         n = before_m.assertions - after_m.assertions,
                         b = before_m.assertions,
                         a = after_m.assertions,
+                    ));
+                }
+                // H2: assertion COUNTS can stay identical while bodies are rewritten in
+                // place to trivially-true (`expect(add(1,2)).toEqual(3)` →
+                // `expect(true).toBe(true)`). A RISE in the trivially-true signal is the
+                // tell the count check misses — the exact `assert(true)` gaming this
+                // module exists to stop.
+                if after_m.trivial_asserts > before_m.trivial_asserts {
+                    out.push(format!(
+                        "test-integrity: {path} added {n} trivially-true assertion(s) this step \
+                         ({b}->{a}) — expect(true)/assert(true)/assertTrue(true) always pass; assert \
+                         the real behavior/contract instead of neutering the checks to force a green",
+                        n = after_m.trivial_asserts - before_m.trivial_asserts,
+                        b = before_m.trivial_asserts,
+                        a = after_m.trivial_asserts,
                     ));
                 }
                 if after_m.skips > before_m.skips {
@@ -412,7 +436,18 @@ fn impl_surface(project_root: &Path) -> String {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let rel_lower = f.to_string_lossy().to_ascii_lowercase();
+        // M4: classify on the path RELATIVE to the project root — the same as `walk()`
+        // does. Using the ABSOLUTE path made `is_test_file`'s `by_dir` heuristic match a
+        // `/test/`, `/tests/`, or `/spec/` segment in the project ROOT itself (e.g.
+        // `/builds/test/app/...`), so EVERY file was misread as a test file → the impl
+        // surface came back empty → the hard-coded-literal anti-gaming check no-opped
+        // repo-wide. Strip the root first; fall back to the full path if not a prefix.
+        let rel_lower = f
+            .strip_prefix(project_root)
+            .unwrap_or(f.as_path())
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/")
+            .to_ascii_lowercase();
         let ext = f
             .extension()
             .and_then(|s| s.to_str())
@@ -484,6 +519,7 @@ fn file_metrics(content: &str) -> FileMetrics {
         + count_token(&lower, "expect")
         + count_token(&lower, ".should")
         + count_token(&lower, "verify(");
+    let trivial_asserts = count_trivial_true_asserts(&lower);
 
     // Test declarations — word-boundary for ambiguous short tokens (`it(`,
     // `test(`), plain substring for the punctuation-anchored ones.
@@ -557,11 +593,35 @@ fn file_metrics(content: &str) -> FileMetrics {
 
     FileMetrics {
         assertions,
+        trivial_asserts,
         test_fns,
         skips,
         commented,
         literals,
     }
+}
+
+/// Count TRIVIALLY-TRUE assertions — ones whose asserted SUBJECT is the literal
+/// `true` (or an `assert True`), so they pass no matter what the implementation does.
+/// These are the classic "neuter the test in place" form: rewrite
+/// `expect(add(1,2)).toEqual(3)` → `expect(true).toBe(true)` to force a green while
+/// keeping the assertion COUNT identical. Conservative on purpose: only the
+/// constant-subject forms are counted, so a legitimate `expect(isValid).toBe(true)`
+/// (subject is a VARIABLE) is NOT flagged. `lower` is the lowercased file body.
+fn count_trivial_true_asserts(lower: &str) -> usize {
+    // Each needle's asserted subject is a constant truth — `expect(true)` covers
+    // `expect(true).toBe(true)` / `.toEqual(true)` / `.toBeTruthy()`; `assert(true)`
+    // covers JS `assert(true)` and Swift/JUnit `XCTAssert(true)`; `asserttrue(true)`
+    // covers `assertTrue(true)` / `XCTAssertTrue(true)`; `assert!(true)` is Rust;
+    // `assert true` is Python `assert True`.
+    const TRIVIAL: &[&str] = &[
+        "expect(true)",
+        "assert(true)",
+        "assert!(true)",
+        "asserttrue(true)",
+        "assert true",
+    ];
+    TRIVIAL.iter().map(|n| lower.matches(n).count()).sum()
 }
 
 /// `true` when `s` (any case) mentions an assertion / test-declaration token —
@@ -794,6 +854,105 @@ mod tests {
         assert!(
             findings.iter().any(|f| f.contains("lost 1 assertion")),
             "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn rewriting_assertions_to_trivially_true_in_place_is_flagged() {
+        // H2 regression: a body rewritten in place to a trivially-true assertion
+        // (`expect(add(1,2)).toEqual(3)` → `expect(true).toBe(true)`) keeps the test-fn
+        // AND assertion COUNTS identical, so the count-based checks see no drop. The
+        // trivially-true signal must catch the neutering.
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "src/app.test.js",
+            "it('adds', () => { expect(add(1,2)).toEqual(3); });\n",
+        );
+        let before = snapshot(tmp.path());
+        // Same fn, same assertion COUNT — only the body is neutered to always-true.
+        write(
+            tmp.path(),
+            "src/app.test.js",
+            "it('adds', () => { expect(true).toBe(true); });\n",
+        );
+        let findings = check(tmp.path(), Some(&before));
+        // The count-based checks see no drop …
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.contains("lost") && f.contains("assertion")),
+            "the assertion COUNT is unchanged, so the drop check must not fire: {findings:?}"
+        );
+        // … but the trivially-true signal catches the in-place rewrite.
+        assert!(
+            findings.iter().any(|f| f.contains("trivially-true")),
+            "an in-place rewrite to expect(true) must be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn removing_a_test_and_stripping_a_kept_test_are_both_reported() {
+        // L5 regression: with the old `else if`, a step that BOTH removed a test fn AND
+        // stripped assertions from a KEPT test reported only the fn loss, hiding the
+        // stripping. The two checks are now INDEPENDENT.
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "src/app.test.js",
+            "it('one', () => { expect(a).toEqual(1); });\n\
+             it('two', () => { expect(b).toEqual(2); expect(c).toEqual(3); });\n",
+        );
+        let before = snapshot(tmp.path());
+        // Remove test #1 entirely AND strip one assertion out of kept test #2.
+        write(
+            tmp.path(),
+            "src/app.test.js",
+            "it('two', () => { expect(b).toEqual(2); });\n",
+        );
+        let findings = check(tmp.path(), Some(&before));
+        assert!(
+            findings.iter().any(|f| f.contains("lost 1 test function")),
+            "the removed test must be reported: {findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f.contains("assertion")),
+            "L5: the assertion-strip in the kept test must ALSO be reported: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn hardcoded_literal_check_runs_even_when_root_path_has_a_test_segment() {
+        // M4 regression: a project ROOT path containing a `/test/` segment must NOT make
+        // every file look like a test (which emptied the impl surface and no-opped the
+        // hard-coded-literal anti-gaming check repo-wide). Classification is done on the
+        // path RELATIVE to the root, so the impl file is still scanned.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("builds/test/app"); // root PATH carries a "/test/" segment
+        fs::create_dir_all(&root).unwrap();
+        // Impl source carrying a distinctive literal.
+        write(
+            &root,
+            "src/api.js",
+            "export function token() { return \"sk-live-abcdef123456\"; }\n",
+        );
+        // A test file that does NOT yet assert that literal.
+        write(
+            &root,
+            "src/api.test.js",
+            "it('x', () => { expect(ok()).toEqual(true); });\n",
+        );
+        let before = snapshot(&root);
+        // The step bakes the impl's EXACT literal into the test as the expected value.
+        write(
+            &root,
+            "src/api.test.js",
+            "it('x', () => { expect(token()).toEqual(\"sk-live-abcdef123456\"); });\n",
+        );
+        let findings = check(&root, Some(&before));
+        assert!(
+            findings.iter().any(|f| f.contains("hard-coded literal")),
+            "the hard-coded-literal check must still run when the ROOT path has a test segment: {findings:?}"
         );
     }
 

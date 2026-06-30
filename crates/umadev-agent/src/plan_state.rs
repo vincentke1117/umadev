@@ -216,16 +216,31 @@ pub enum EvidenceContract {
         name: Option<String>,
     },
     /// An HTTP route answers with the expected status (probed via the runtime
-    /// proof — boot the app + `curl` the path). `status == 0` means "any non-error
-    /// (`< 400`) response". `method` is recorded for the declaration/gap text; the
-    /// reused probe transport is path+status based.
+    /// proof — boot the app + `curl` the path). `status == None` means "any non-error
+    /// (`< 400`) response"; `Some(code)` requires that EXACT status — so a required
+    /// error status (e.g. `401` for an unauthenticated probe) is expressible, which
+    /// the old `u16` `0`-sentinel conflated with "unspecified". `method` is recorded
+    /// for the declaration/gap text; the reused probe transport is path+status based.
     RouteResponds {
         /// HTTP method (recorded for the contract/gap text), e.g. `GET`.
         method: String,
         /// Route path relative to the base URL, e.g. `/api/login`.
         path: String,
-        /// Expected HTTP status; `0` = any non-error (`< 400`) response.
-        status: u16,
+        /// Expected HTTP status; `None` = any non-error (`< 400`) response, `Some(c)`
+        /// = require exactly status `c` (including a required error code like `401`).
+        #[serde(default)]
+        status: Option<u16>,
+    },
+    /// A brain-declared evidence entry that named a KNOWN contract kind but was
+    /// UNDER-SPECIFIED (e.g. `{"kind":"file-exists","path":""}` — a missing/empty
+    /// required field). M6: such an entry is NOT silently dropped (which would let the
+    /// step fall back to the coarse `AcceptanceSpec` default — "accepted because ANY
+    /// source exists" — defeating the point of naming a specific file). It is retained
+    /// as an explicit GAP the verifier always reports unsatisfied, so the step is held
+    /// to a falsifiable bar. (A genuinely-unrecognised kind is still dropped.)
+    Malformed {
+        /// Why the declared evidence could not be formed (which kind, which field).
+        detail: String,
     },
 }
 
@@ -248,12 +263,12 @@ impl EvidenceContract {
                 method,
                 path,
                 status,
-            } => {
-                if *status == 0 {
-                    format!("{method} {path} responds OK")
-                } else {
-                    format!("{method} {path} responds {status}")
-                }
+            } => match status {
+                None => format!("{method} {path} responds OK"),
+                Some(s) => format!("{method} {path} responds {s}"),
+            },
+            Self::Malformed { detail } => {
+                format!("a required evidence contract is under-specified ({detail})")
             }
         }
     }
@@ -294,7 +309,13 @@ impl EvidenceContract {
             "contract-matches" | "contract" | "api-contract" | "api" => Some(Self::ContractMatches),
             "file-exists" | "file" => {
                 let path = str_field("path");
-                (!path.is_empty()).then_some(Self::FileExists { path })
+                // M6: a recognised kind with a missing required field is a GAP, not a
+                // silent drop (which would degrade the step to the coarse default).
+                if path.is_empty() {
+                    Some(Self::malformed("file-exists", "missing a non-empty `path`"))
+                } else {
+                    Some(Self::FileExists { path })
+                }
             }
             "file-contains" | "contains" => {
                 let path = str_field("path");
@@ -306,8 +327,14 @@ impl EvidenceContract {
                         n
                     }
                 };
-                (!path.is_empty() && !needle.is_empty())
-                    .then_some(Self::FileContains { path, needle })
+                if path.is_empty() || needle.is_empty() {
+                    Some(Self::malformed(
+                        "file-contains",
+                        "requires a non-empty `path` and `needle`",
+                    ))
+                } else {
+                    Some(Self::FileContains { path, needle })
+                }
             }
             "test-passes" | "test-present" | "named-test" => {
                 let n = str_field("name");
@@ -318,7 +345,10 @@ impl EvidenceContract {
             "route-responds" | "route" | "endpoint" | "http" => {
                 let path = str_field("path");
                 if path.is_empty() {
-                    return None;
+                    return Some(Self::malformed(
+                        "route-responds",
+                        "missing a non-empty `path`",
+                    ));
                 }
                 let method = {
                     let m = str_field("method").to_ascii_uppercase();
@@ -335,6 +365,13 @@ impl EvidenceContract {
                 })
             }
             _ => None,
+        }
+    }
+
+    /// Build a [`Self::Malformed`] gap from a recognised-but-under-specified entry.
+    fn malformed(kind: &str, why: &str) -> Self {
+        Self::Malformed {
+            detail: format!("{kind}: {why}"),
         }
     }
 
@@ -358,24 +395,29 @@ impl EvidenceContract {
     }
 }
 
-/// Read a JSON status value as a `u16`, accepting both a number (`200`) and a
-/// string (`"200"`); anything else / absent → `0` (interpreted as "any non-error
-/// response"). Clamps an out-of-range number to `u16::MAX`. Fail-open, never panics.
-fn value_to_status(v: Option<&serde_json::Value>) -> u16 {
-    match v {
-        Some(serde_json::Value::Number(n)) => n
-            .as_u64()
-            .map(|x| x.min(u64::from(u16::MAX)) as u16)
-            .unwrap_or(0),
-        Some(serde_json::Value::String(s)) => s.trim().parse::<u16>().unwrap_or(0),
-        _ => 0,
-    }
+/// Read a JSON status value as an `Option<u16>`, accepting both a number (`200`) and
+/// a string (`"200"`); anything else / absent / a non-status `0` → `None` (interpreted
+/// as "any non-error response"). Clamps an out-of-range number to `u16::MAX`.
+/// Fail-open, never panics. L2: an `Option` makes "unspecified" and a required status
+/// type-distinct, so a required error code like `401` is no longer conflated with the
+/// old `0` "any" sentinel.
+fn value_to_status(v: Option<&serde_json::Value>) -> Option<u16> {
+    let raw = match v {
+        Some(serde_json::Value::Number(n)) => n.as_u64().map(|x| x.min(u64::from(u16::MAX)) as u16),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<u16>().ok(),
+        _ => None,
+    };
+    // `0` is not a real HTTP status — treat it as "unspecified" (any non-error).
+    raw.filter(|c| *c != 0)
 }
 
 /// Parse + normalise a brain-supplied list of evidence values into owned typed
-/// contracts: drop anything unparseable/under-specified, then dedupe (preserving
-/// first-seen order). An empty result means the step carries NO typed contract and
-/// will fall back to its [`AcceptanceSpec`] at verify time (fail-open).
+/// contracts: drop a genuinely-unrecognised entry, but RETAIN a recognised-kind entry
+/// that was under-specified as an explicit [`EvidenceContract::Malformed`] GAP (M6 —
+/// so it cannot silently degrade the step to the coarse [`AcceptanceSpec`] default),
+/// then dedupe (preserving first-seen order). An empty result means the step carries
+/// NO typed contract and will fall back to its [`AcceptanceSpec`] at verify time
+/// (fail-open).
 fn parse_brain_evidence(values: &[serde_json::Value]) -> Vec<EvidenceContract> {
     let mut out: Vec<EvidenceContract> = Vec::new();
     for v in values {
@@ -577,7 +619,12 @@ impl Plan {
         if self.steps.is_empty() {
             return None;
         }
-        let ids: HashSet<String> = self.steps.iter().map(|s| s.id.clone()).collect();
+        // M5: build the id set from the TRIMMED id — the deps below are trimmed
+        // before the `ids.contains(d)` membership test, so an un-trimmed id here
+        // (a brain id with surrounding whitespace) would not match its dependents'
+        // trimmed refs, dropping a real edge as "dangling" and letting the dependent
+        // run BEFORE its prerequisite. Trim on both sides so the DAG stays intact.
+        let ids: HashSet<String> = self.steps.iter().map(|s| s.id.trim().to_string()).collect();
         for s in &mut self.steps {
             s.id = s.id.trim().to_string();
             s.title = s.title.trim().to_string();
@@ -1142,6 +1189,26 @@ mod tests {
     fn normalize_returns_none_when_nothing_usable() {
         let p = plan(vec![step("", &[])]).normalized();
         assert!(p.is_none());
+    }
+
+    #[test]
+    fn normalize_keeps_a_dep_edge_when_the_prereq_id_has_whitespace() {
+        // M5 regression: a brain step id with surrounding whitespace (" auth ") must
+        // still satisfy a dependent's (trimmed) ref to it. The id-set is built from the
+        // TRIMMED ids, so the edge is NOT dropped as dangling — otherwise the dependent
+        // would run BEFORE its prerequisite.
+        let p = plan(vec![step(" auth ", &[]), step("ui", &["auth"])])
+            .normalized()
+            .expect("a usable plan survives");
+        // Both ids are trimmed; the dependency edge survives.
+        assert_eq!(deps_of(&p, "ui"), &["auth".to_string()]);
+        // Only `auth` (no deps) is ready first; `ui` waits on it (edge intact).
+        let ready: Vec<_> = p.ready_steps().iter().map(|s| s.id.clone()).collect();
+        assert_eq!(
+            ready,
+            vec!["auth"],
+            "ui must NOT be ready before its prereq"
+        );
     }
 
     #[test]
@@ -1792,7 +1859,7 @@ mod tests {
                 needle: "/api/login".into()
             })
         );
-        // Method is upper-cased; numeric status is read.
+        // Method is upper-cased; numeric status is read into Some(_).
         assert_eq!(
             EvidenceContract::parse_value(
                 &json!({"kind":"route-responds","method":"post","path":"/api/login","status":200})
@@ -1800,7 +1867,7 @@ mod tests {
             Some(EvidenceContract::RouteResponds {
                 method: "POST".into(),
                 path: "/api/login".into(),
-                status: 200
+                status: Some(200)
             })
         );
         // A string status + a missing method (defaults to GET).
@@ -1809,7 +1876,25 @@ mod tests {
             Some(EvidenceContract::RouteResponds {
                 method: "GET".into(),
                 path: "/x".into(),
-                status: 201
+                status: Some(201)
+            })
+        );
+        // L2: an absent status means "any non-error response" → None (not the old
+        // `0` sentinel); a required error status like 401 is now expressible as Some(401).
+        assert_eq!(
+            EvidenceContract::parse_value(&json!({"kind":"route","path":"/secure"})),
+            Some(EvidenceContract::RouteResponds {
+                method: "GET".into(),
+                path: "/secure".into(),
+                status: None
+            })
+        );
+        assert_eq!(
+            EvidenceContract::parse_value(&json!({"kind":"route","path":"/secure","status":401})),
+            Some(EvidenceContract::RouteResponds {
+                method: "GET".into(),
+                path: "/secure".into(),
+                status: Some(401)
             })
         );
         assert_eq!(
@@ -1835,21 +1920,29 @@ mod tests {
             EvidenceContract::parse_value(&json!("contract-matches")),
             Some(EvidenceContract::ContractMatches)
         );
-        // Under-specified / unknown → None (the entry is dropped, never a panic).
-        assert!(EvidenceContract::parse_value(&json!({"kind":"file-exists"})).is_none());
-        assert!(
-            EvidenceContract::parse_value(&json!({"kind":"file-contains","path":"x"})).is_none()
-        );
+        // M6: a recognised kind that is under-specified (an empty/missing required
+        // field) is RETAINED as an explicit Malformed gap — NOT silently dropped (which
+        // would let the step fall back to the coarse "any source exists" default).
+        assert!(matches!(
+            EvidenceContract::parse_value(&json!({"kind":"file-exists"})),
+            Some(EvidenceContract::Malformed { .. })
+        ));
+        assert!(matches!(
+            EvidenceContract::parse_value(&json!({"kind":"file-contains","path":"x"})),
+            Some(EvidenceContract::Malformed { .. })
+        ));
+        // A genuinely-unrecognised kind / a wrong JSON type / a bareword that needs
+        // fields is still dropped (None) — never a panic.
         assert!(EvidenceContract::parse_value(&json!({"kind":"bogus"})).is_none());
         assert!(EvidenceContract::parse_value(&json!("file-exists")).is_none());
         assert!(EvidenceContract::parse_value(&json!(123)).is_none());
     }
 
     #[test]
-    fn brain_step_evidence_is_parsed_owned_and_malformed_dropped() {
+    fn brain_step_evidence_is_parsed_owned_and_underspecified_kept_as_gap() {
         // A brain step JSON whose evidence array mixes a good object, an under-specified
-        // object (dropped), a duplicate (deduped), and a bareword. UmaDev PARSES + OWNS
-        // the typed contracts — the base does not self-grade.
+        // object (M6: KEPT as a Malformed gap, not dropped), a duplicate (deduped), and a
+        // bareword. UmaDev PARSES + OWNS the typed contracts — the base does not self-grade.
         let raw: BrainStep = serde_json::from_str(
             r#"{
                 "id":"login","title":"login route","seat":"backend-engineer","kind":"build",
@@ -1864,14 +1957,21 @@ mod tests {
         .expect("brain step parses");
         let evidence = parse_brain_evidence(&raw.evidence);
         assert_eq!(
-            evidence,
-            vec![
-                EvidenceContract::FileExists {
-                    path: "src/login.ts".into()
-                },
-                EvidenceContract::BuildClean,
-            ],
-            "good entries are owned; the under-specified entry + the duplicate are dropped"
+            evidence.len(),
+            3,
+            "good + malformed-gap + build-clean (dup deduped)"
+        );
+        assert!(evidence.contains(&EvidenceContract::FileExists {
+            path: "src/login.ts".into()
+        }));
+        assert!(evidence.contains(&EvidenceContract::BuildClean));
+        // The under-specified `{"kind":"file-exists"}` is retained as an explicit gap, so
+        // the step is NOT silently degraded to "any source exists".
+        assert!(
+            evidence
+                .iter()
+                .any(|c| matches!(c, EvidenceContract::Malformed { .. })),
+            "an under-specified file-exists must be kept as a Malformed gap: {evidence:?}"
         );
     }
 
@@ -1900,7 +2000,7 @@ mod tests {
             EvidenceContract::RouteResponds {
                 method: "GET".into(),
                 path: "/".into(),
-                status: 0,
+                status: None,
             },
         ];
         let p = plan(vec![s]);

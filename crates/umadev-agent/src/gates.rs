@@ -264,6 +264,13 @@ pub fn claims_code_changes(text: &str) -> bool {
         "已修改",
         "写入",
         "创建",
+        // L4: the most common "I did the work" Chinese phrasings were missing, so
+        // "已完成登录功能" / "开发了支付模块" was NOT read as a code claim — the
+        // single-turn loop then skipped the honesty/QC read over a possibly-
+        // hallucinated "done". ("已完成" is a substring of "完成" so "完成" covers it.)
+        "完成",
+        "已完成",
+        "开发",
     ];
     let t = text.to_lowercase();
     if EN.iter().any(|k| t.contains(k)) {
@@ -304,7 +311,6 @@ pub fn base_ran_build_test_clean(text: &str) -> bool {
         "does not pass",
         "doesn't pass",
         "not passing",
-        "red",
         "exit code 1",
         "exit 1",
         "panic",
@@ -316,7 +322,11 @@ pub fn base_ran_build_test_clean(text: &str) -> bool {
         "没通过",
         "不通过",
     ];
-    if FAILURE.iter().any(|k| t.contains(k)) {
+    // L3: "red" must be matched as a WHOLE word — a plain `contains("red")` hits
+    // benign substrings ("requi**red**", "rende**red**", "cove**red**"), wrongly
+    // vetoing a clean self-run. Word-boundary it; the other failure tokens are
+    // distinctive enough as substrings.
+    if FAILURE.iter().any(|k| t.contains(k)) || contains_word(&t, "red") {
         return false;
     }
 
@@ -360,7 +370,119 @@ pub fn base_ran_build_test_clean(text: &str) -> bool {
         "全部通过",
         "校验通过",
     ];
-    PASS_EN.iter().any(|k| t.contains(k)) || PASS_ZH.iter().any(|k| text.contains(k))
+    let claims_pass =
+        PASS_EN.iter().any(|k| t.contains(k)) || PASS_ZH.iter().any(|k| text.contains(k));
+    // M3: a PASS phrase ALONE ("tests pass" / "构建成功") is just prose — trusting it
+    // to SKIP UmaDev's own objective build/test read lets a hallucinated "it passes"
+    // bypass the floor. Require, in addition, MACHINE EVIDENCE that a real run
+    // happened (an exit-code-0 signal or a named build/test command/output). Absent
+    // that, fall back to running our own read (slower, still correct) — we only ever
+    // skip on a corroborated green, never on prose.
+    claims_pass && reply_shows_machine_run_evidence(&t)
+}
+
+/// `true` when `t` (already lowercased) shows MACHINE evidence that a build/test
+/// actually RAN — an exit-code-0 signal, or a named build/test runner command /
+/// recognised runner output. This is the corroboration [`base_ran_build_test_clean`]
+/// requires before trusting a prose "it passes" enough to SKIP UmaDev's own
+/// objective read. Conservative: a reply that merely claims success in words (no
+/// command, no exit code, no runner output) returns `false`, so UmaDev runs its own
+/// check. Deterministic, fail-open (a false negative just re-runs a check).
+#[must_use]
+fn reply_shows_machine_run_evidence(t: &str) -> bool {
+    // (a) An exit-code-0 / clean-return signal — the unambiguous "a process ran and
+    //     returned success" tell.
+    const EXIT_OK: &[&str] = &[
+        "exit code 0",
+        "exit 0",
+        "exit status 0",
+        "exited 0",
+        "exited with 0",
+        "exited with code 0",
+        "status code 0",
+        "returned 0",
+        "return code 0",
+        "$? = 0",
+        "$?=0",
+        "退出码 0",
+        "退出码为 0",
+        "退出码:0",
+        "返回码 0",
+        "返回 0",
+    ];
+    if EXIT_OK.iter().any(|k| t.contains(k)) {
+        return true;
+    }
+    // (b) A named build/test/lint RUNNER command or its recognised result line — proof
+    //     a real tool was invoked, not just a prose claim. Substring-matched (the
+    //     command names are distinctive enough).
+    const RUNNER: &[&str] = &[
+        "cargo test",
+        "cargo build",
+        "cargo check",
+        "cargo clippy",
+        "npm test",
+        "npm run test",
+        "npm run build",
+        "npm ci",
+        "yarn test",
+        "yarn build",
+        "pnpm test",
+        "pnpm build",
+        "pnpm run",
+        "npx tsc",
+        "npx jest",
+        "npx vitest",
+        "tsc --",
+        "jest ",
+        "vitest ",
+        "pytest",
+        "python -m pytest",
+        "unittest",
+        "go test",
+        "go build",
+        "mvn ",
+        "gradle ",
+        "./gradlew",
+        "make test",
+        "make build",
+        "phpunit",
+        "rspec",
+        "dotnet test",
+        "dotnet build",
+        // Distinctive runner RESULT lines (a machine emitted these, not the author) —
+        // kept strict so prose alone never qualifies.
+        "test result: ok",
+        "0 failed",
+        "0 failures",
+        "0 errors",
+        "passing (",
+    ];
+    RUNNER.iter().any(|k| t.contains(k))
+}
+
+/// `true` when `word` occurs in `haystack` as a WHOLE token — the char on each side
+/// (if any) is NOT ASCII-alphanumeric. Used so a short failure token like `red` is
+/// not matched inside `requi**red**` / `rende**red**` / `cove**red**`. `haystack` is
+/// expected lowercased by the caller; `word` is ASCII.
+#[must_use]
+fn contains_word(haystack: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(idx) = haystack[from..].find(word) {
+        let abs = from + idx;
+        let before_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
+        let after = abs + word.len();
+        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        from = abs + 1;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -403,19 +525,81 @@ mod tests {
     }
 
     #[test]
-    fn base_ran_build_test_clean_detects_a_passed_run_bilingually() {
+    fn claims_code_changes_recognises_completion_phrasings_zh() {
+        // L4 regression: the most common Chinese "I did the work" phrasings — 完成 /
+        // 已完成 / 开发 — must register as a code claim, or the honesty/QC read is
+        // skipped over a possibly-hallucinated "done".
         for claim in [
-            "I implemented it and ran the tests — all tests pass.",
-            "Built the app; the build succeeded and lint passes.",
-            "Ran cargo test, the test suite passes cleanly.",
-            "构建成功,测试全部通过,可以交付了。",
-            "我跑了一遍,编译通过、测试通过。",
+            "已完成登录功能,接口都接好了。",
+            "开发了支付模块并联调通过。",
+            "这部分已经完成。",
+        ] {
+            assert!(
+                claims_code_changes(claim),
+                "should claim work done: {claim}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_ran_build_test_clean_detects_a_passed_run_bilingually() {
+        // M3: each positive case now carries a PASS phrase AND machine evidence (a named
+        // runner command, an exit-code-0 signal, or a runner result line) — only then is
+        // it safe to SKIP UmaDev's own objective read.
+        for claim in [
+            "I ran `npm test` and all tests pass.",
+            "Built the app; the build succeeded (exit code 0) and lint passes.",
+            "Ran cargo test, the test suite passes cleanly — test result: ok.",
+            "构建成功,测试全部通过 (cargo test 退出码 0),可以交付了。",
+            "我跑了一遍 pytest,编译通过、测试通过。",
         ] {
             assert!(
                 base_ran_build_test_clean(claim),
                 "should read as a clean self-run: {claim}"
             );
         }
+    }
+
+    #[test]
+    fn base_ran_build_test_clean_requires_machine_evidence_not_prose_alone() {
+        // M3 regression: a PASS phrase with NO machine evidence (no command, no exit
+        // code, no runner output) is prose only — it must NOT trigger the skip, so a
+        // hallucinated "it passes" can never bypass UmaDev's objective build/test read.
+        for prose_only in [
+            "I implemented it and all tests pass.",
+            "The build succeeded and lint passes.",
+            "构建成功,测试全部通过,可以交付了。",
+            "编译通过、测试通过。",
+        ] {
+            assert!(
+                !base_ran_build_test_clean(prose_only),
+                "a prose pass-claim with no run evidence must NOT skip the floor: {prose_only}"
+            );
+        }
+        // The SAME claims, now corroborated by machine evidence, DO qualify.
+        assert!(base_ran_build_test_clean(
+            "Ran `cargo test` — all tests pass."
+        ));
+        assert!(base_ran_build_test_clean(
+            "构建成功,测试全部通过(退出码 0)。"
+        ));
+    }
+
+    #[test]
+    fn base_ran_build_test_clean_red_is_word_boundaried() {
+        // L3 regression: a benign reply whose only "red" is inside a longer word
+        // ("required" / "rendered" / "covered") must NOT be vetoed as a failure. With
+        // machine evidence present, such a clean self-run still qualifies for the skip.
+        assert!(
+            base_ran_build_test_clean(
+                "Ran `npm test`; every required route is covered and the page rendered — all tests pass."
+            ),
+            "'required'/'covered'/'rendered' must not trip the 'red' failure veto"
+        );
+        // A real standalone "red" (tests are red) still vetoes.
+        assert!(!base_ran_build_test_clean(
+            "Ran `npm test` but the suite is red — all tests pass once I fix it."
+        ));
     }
 
     #[test]
