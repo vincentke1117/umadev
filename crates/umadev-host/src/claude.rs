@@ -514,7 +514,15 @@ fn parse_claude_stream_line(line: &str) -> Option<umadev_runtime::StreamEvent> {
                         .and_then(serde_json::Value::as_bool)
                         .is_none_or(|e| !e);
                     let content_str = block.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let summary: String = content_str.chars().take(200).collect();
+                    // Direction follows the process-log path: verbose (logs ON) keeps
+                    // the TAIL so a long build's failure verdict at the END survives;
+                    // OFF keeps the historical 200-char head clip (a summary/preview).
+                    let on = crate::process_logs::show_process_logs();
+                    let summary = crate::process_logs::truncate_preview(
+                        content_str,
+                        crate::process_logs::cap_for(on),
+                        on,
+                    );
                     return Some(umadev_runtime::StreamEvent::ToolResult { ok, summary });
                 }
             }

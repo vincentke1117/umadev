@@ -1278,7 +1278,13 @@ fn emit_command_execution(item: &Value, show_logs: bool, event_tx: &EventTx) {
         .unwrap_or(status);
     let _ = event_tx.try_send(SessionEvent::ToolResult {
         ok: status != "failed" && status != "declined" && exit_ok,
-        summary: truncate(summary, crate::process_logs::cap_for(show_logs)),
+        // Direction follows the path: verbose (process logs ON) keeps the TAIL so a
+        // long build's failure verdict at the END survives; OFF keeps the head clip.
+        summary: crate::process_logs::truncate_preview(
+            summary,
+            crate::process_logs::cap_for(show_logs),
+            show_logs,
+        ),
     });
 }
 
@@ -1327,9 +1333,16 @@ fn emit_updated_item(params: &Value, event_tx: &EventTx) {
     // Still running → a non-terminal progress frame is `ok: true`; the final
     // success/failure verdict lands on `item/completed`. Only reached when process
     // logs are ON, so the generous `cap_for(true)` carries the build log's tail.
+    // Each frame carries the CUMULATIVE output, so we keep the TAIL (`verbose=true`)
+    // — head-truncation would pin every past-cap frame to the same first 16 KiB and
+    // FREEZE the live stream.
     let _ = event_tx.try_send(SessionEvent::ToolResult {
         ok: true,
-        summary: truncate(output, crate::process_logs::cap_for(true)),
+        summary: crate::process_logs::truncate_preview(
+            output,
+            crate::process_logs::cap_for(true),
+            true,
+        ),
     });
 }
 
@@ -2518,6 +2531,39 @@ mod tests {
             panic!("ON: item/started must stream a running ToolCall, got {got:?}");
         };
         assert_eq!(name, "Bash");
+    }
+
+    #[test]
+    fn updated_item_streams_the_tail_of_a_past_cap_build_log() {
+        // The user's exact scenario: an `item/updated` whose CUMULATIVE
+        // `aggregatedOutput` blows past the verbose cap, failure verdict at the END.
+        // The streamed ToolResult must carry the TAIL (so the live log advances and
+        // the error survives), NOT the first 16 KiB (which would freeze the stream).
+        // A unique sentinel ONLY at the very start, then >16 KiB of filler, then the
+        // failure at the END. Past the cap the head sentinel must be GONE (not pinned)
+        // and the error tail present.
+        let filler = "[INFO] downloading dependency\n".repeat(4000); // ~120 KiB, >> 16 KiB
+        let output = format!(
+            "HEAD_SENTINEL_FIRST_LINE\n{filler}[INFO] BUILD FAILURE\n[ERROR] boom at Foo.java:42\n"
+        );
+        let item = json!({
+            "item": { "type": "commandExecution", "aggregatedOutput": output }
+        });
+        let (tx, mut rx) = chan();
+        emit_updated_item(&item, &tx);
+        let Ok(SessionEvent::ToolResult { ok, summary }) = rx.try_recv() else {
+            panic!("a non-empty item/updated must stream a progress ToolResult");
+        };
+        assert!(ok, "an in-flight progress frame is ok: true");
+        assert!(
+            summary.contains("BUILD FAILURE"),
+            "the error tail must survive"
+        );
+        assert!(summary.contains("boom at Foo.java:42"));
+        assert!(
+            !summary.contains("HEAD_SENTINEL"),
+            "the head must be dropped, not pinned to the first 16 KiB"
+        );
     }
 
     #[tokio::test]

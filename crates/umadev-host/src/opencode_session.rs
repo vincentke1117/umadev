@@ -901,14 +901,16 @@ fn translate_tool_part(part: &Value, tracker: &mut PartTracker) -> Vec<SessionEv
             // The cap widens to the full captured output when the user opts into
             // process logs (`UMADEV_SHOW_PROCESS_LOGS`), so a long-running command's
             // build log reaches the transcript; OFF keeps the tight 200-char clip.
-            let summary = state
+            // Direction follows the path: verbose keeps the TAIL (the build's failure
+            // verdict at the END survives); OFF keeps the head clip (a summary).
+            let on = crate::process_logs::show_process_logs();
+            let raw = state
                 .get("title")
                 .and_then(Value::as_str)
                 .or_else(|| state.get("output").and_then(Value::as_str))
-                .unwrap_or("")
-                .chars()
-                .take(crate::process_logs::tool_output_cap())
-                .collect();
+                .unwrap_or("");
+            let summary =
+                crate::process_logs::truncate_preview(raw, crate::process_logs::cap_for(on), on);
             backfilled_tool_events(
                 tracker,
                 &part_id,
@@ -918,13 +920,13 @@ fn translate_tool_part(part: &Value, tracker: &mut PartTracker) -> Vec<SessionEv
             )
         }
         "error" => {
-            let summary = state
+            let on = crate::process_logs::show_process_logs();
+            let raw = state
                 .get("error")
                 .and_then(Value::as_str)
-                .unwrap_or("tool error")
-                .chars()
-                .take(crate::process_logs::tool_output_cap())
-                .collect();
+                .unwrap_or("tool error");
+            let summary =
+                crate::process_logs::truncate_preview(raw, crate::process_logs::cap_for(on), on);
             backfilled_tool_events(
                 tracker,
                 &part_id,

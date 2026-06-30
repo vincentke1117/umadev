@@ -772,7 +772,11 @@ fn summarize_tool_content(content: Option<&Value>) -> String {
         Some(other) => other.to_string(),
         None => String::new(),
     };
-    truncate(&raw, crate::process_logs::tool_output_cap())
+    // Direction follows the path: verbose (process logs ON) keeps the TAIL so a long
+    // build's failure verdict at the END survives instead of being clipped; OFF
+    // keeps the tight head clip (a summary/preview), unchanged.
+    let on = crate::process_logs::show_process_logs();
+    crate::process_logs::truncate_preview(&raw, crate::process_logs::cap_for(on), on)
 }
 
 /// A short, human-readable target for an approval prompt (file path / command).
