@@ -246,7 +246,8 @@ export const i18n = {
         { name: "枫叶", role: "特别贡献者", avatarKey: "fengye" },
         { name: "海涛", role: "特别贡献者", avatarKey: "haitao" },
         { name: "眼睛", role: "特别贡献者", avatarKey: "yanjing" },
-        { name: "马辉", role: "特别贡献者", avatarKey: "mahui" }
+        { name: "马辉", role: "特别贡献者", avatarKey: "mahui" },
+        { name: "cxuan", role: "特别贡献者", avatarKey: "cxuan" }
       ]
     },
     contributorsPage: {
@@ -491,7 +492,8 @@ export const i18n = {
         { name: "FengYe", role: "Special Contributor", avatarKey: "fengye" },
         { name: "HaiTao", role: "Special Contributor", avatarKey: "haitao" },
         { name: "YanJing", role: "Special Contributor", avatarKey: "yanjing" },
-        { name: "MaHui", role: "Special Contributor", avatarKey: "mahui" }
+        { name: "MaHui", role: "Special Contributor", avatarKey: "mahui" },
+        { name: "cxuan", role: "Special Contributor", avatarKey: "cxuan" }
       ]
     },
     contributorsPage: {
