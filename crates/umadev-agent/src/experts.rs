@@ -533,6 +533,43 @@ pub fn lean_priming() -> &'static str {
      do NOT scaffold a large multi-module app for a small task."
 }
 
+/// The DEPS-BEFORE-TESTS directive — one-pass dependency hygiene for the
+/// build / verify path, so the base installs the project's deps (INCLUDING the
+/// dev/test extras) BEFORE it runs tests or lint instead of failing, syncing, and
+/// retrying.
+///
+/// User-reported recurring inefficiency: on an autonomous run the base fires a
+/// test/lint command (`uv run python -m pytest -q`, `uv run ruff check`) against
+/// an env that never had the dev/test extras installed, hits
+/// `No module named pytest`, THEN runs `uv sync --extra dev` and RETRIES — burning
+/// a whole round on a step it should have done first. The uv gotcha is specific:
+/// the DEFAULT `uv sync` does NOT install the `dev`/`test` extras, so
+/// `uv run pytest` / `uv run ruff` can't find the tools until you
+/// `uv sync --extra dev` (or `--all-extras` / `--group dev`).
+///
+/// This directive tells the base to sync/install deps + dev/test extras in ONE
+/// step BEFORE running tests, and to read a missing-tool error
+/// (`No module named pytest`, `ruff: command not found`) as a skipped dependency
+/// step — NOT a test failure — so it fixes the cause instead of blindly retrying.
+/// Injected ONLY on the build / verify path (the Quality directive + the full
+/// build framing), never a pure-chat turn, so it doesn't bloat a non-test turn.
+/// A STATIC string (no retrieval / no I/O), so carrying it costs nothing.
+#[must_use]
+pub fn deps_before_tests_directive() -> &'static str {
+    "DEPENDENCIES BEFORE TESTS (do this in ONE pass — don't waste a round): before you \
+     run tests OR lint, make sure the project's dependencies are installed, INCLUDING \
+     the dev/test extras, THEN run the tests. A `No module named pytest` / \
+     `ModuleNotFoundError` / `pytest: command not found` / `ruff: not found` is a \
+     dependency step you skipped — NOT a test failure — so install/sync first, don't \
+     blindly retry the same command. Per ecosystem:\n\
+     - uv: `uv sync --extra dev` (or `uv sync --all-extras`, or `--group dev`). The \
+       DEFAULT `uv sync` OMITS the dev/test extras, so `uv run pytest` / `uv run ruff` \
+       won't find the tools until you sync them — this is the usual trap.\n\
+     - pip: `pip install -e '.[dev]'` or `pip install -r requirements-dev.txt`.\n\
+     - poetry: `poetry install --with dev`.  pdm: `pdm install -G dev`.\n\
+     - npm / pnpm / yarn: `npm ci` (installs devDependencies too), then run the tests."
+}
+
 /// The explicit ROLE PERSONA line that opens a phase directive on the continuous
 /// path — "you are now working as a senior X; your remit is Y". Prepending it to
 /// each phase's imperative directive makes the base step into the matching seat
@@ -837,7 +874,9 @@ pub fn director_build_directive(requirement: &str) -> String {
          {prior}{app_runtime}\n\
          Build to your team's craft and taste, write real representative content \
          (never placeholders), and ground every \"done\" claim in the real files on \
-         disk and the project's real build/test — report only what actually works."
+         disk and the project's real build/test — report only what actually works.\n\n\
+         {deps}",
+        deps = deps_before_tests_directive()
     )
 }
 
@@ -1078,6 +1117,40 @@ mod tests {
         assert!(lower.contains("complete") && lower.contains("product"));
         // The full seat roster is named (the heavy path only).
         assert!(lower.contains("architect") && lower.contains("devops"));
+    }
+
+    #[test]
+    fn deps_before_tests_directive_covers_the_ecosystems_and_the_uv_gotcha() {
+        // The build/verify directive tells the base to install deps + dev/test
+        // extras BEFORE running tests, covering each ecosystem and — the reported
+        // failure — the uv `--extra dev` gotcha (default `uv sync` omits them).
+        let d = deps_before_tests_directive();
+        // The uv gotcha specifically.
+        assert!(d.contains("uv sync --extra dev"));
+        assert!(d.contains("--all-extras") || d.contains("--group dev"));
+        // The other ecosystems.
+        assert!(d.contains(".[dev]") || d.contains("requirements-dev.txt"));
+        assert!(d.contains("poetry install --with dev"));
+        assert!(d.contains("pdm install -G dev"));
+        assert!(d.contains("npm ci"));
+        // The core rule: a missing test tool is a skipped dep step, not a failure.
+        assert!(d.contains("No module named pytest"));
+        assert!(
+            d.to_lowercase().contains("not a test failure") || d.contains("NOT a test failure")
+        );
+    }
+
+    #[test]
+    fn full_build_directive_carries_deps_before_tests() {
+        // The full commercial build (the autonomous `/run` path where the base runs
+        // the project's real build/test) must carry the deps-before-tests guidance so
+        // it syncs dev/test extras first instead of failing + retrying.
+        let d = director_build_directive("做一个带邮箱登录的 SaaS 数据分析仪表盘,要能上线");
+        assert!(
+            d.contains("uv sync --extra dev"),
+            "full build directive carries the deps-before-tests guidance: {d}"
+        );
+        assert!(d.contains("DEPENDENCIES BEFORE TESTS"));
     }
 
     #[test]

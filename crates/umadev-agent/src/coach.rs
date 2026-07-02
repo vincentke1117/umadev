@@ -1380,6 +1380,8 @@ fn render_backend(slug: &str, req: &str) -> String {
 fn render_quality(slug: &str) -> String {
     format!(
         "## Role\n\nQuality lead + design critic.\n\n\
+         ## Dependencies before tests (do this FIRST)\n\n\
+         {deps}\n\n\
          ## Task\n\nTwo-part quality check:\n\n\
          ### Part 1 — Automated gate\n\n\
          UmaDev runs the quality gate automatically. Review \
@@ -1399,6 +1401,7 @@ fn render_quality(slug: &str) -> String {
          ## Required output\n\n\
          No new artifact — the gate report + your 5-dimension scores. Make sure \
          `quality_gate_passed: true` and all 5 dimensions ≥ minimum before delivery.\n",
+        deps = crate::experts::deps_before_tests_directive(),
     )
 }
 
@@ -1612,6 +1615,49 @@ mod tests {
     fn coach_filename_is_zero_padded_phase_ordered() {
         assert_eq!(coach_filename(Phase::Research), "01-research.md");
         assert_eq!(coach_filename(Phase::Delivery), "09-delivery.md");
+    }
+
+    #[test]
+    fn quality_coach_prompt_installs_deps_before_tests() {
+        // The methodology injection on the quality (build/verify) phase tells the
+        // base to install deps + dev/test extras BEFORE running tests — incl. the uv
+        // `--extra dev` gotcha — so it doesn't fail on `No module named pytest` and
+        // retry. Self-gated: only the test/lint phase carries it.
+        let tmp = TempDir::new().unwrap();
+        let body = render_coach_prompt(&opts(tmp.path()), Phase::Quality);
+        assert!(body.contains("uv sync --extra dev"), "{body}");
+        assert!(body.contains("DEPENDENCIES BEFORE TESTS"));
+        assert!(body.contains("No module named pytest"));
+        // A non-test phase (frontend) must NOT carry the deps-before-tests block.
+        let fe = render_coach_prompt(&opts(tmp.path()), Phase::Frontend);
+        assert!(!fe.contains("DEPENDENCIES BEFORE TESTS"), "{fe}");
+    }
+
+    #[test]
+    fn deps_before_tests_knowledge_standard_exists() {
+        // Prong 3: the curated standard "运行测试/lint 前先装依赖(含 dev/test extras)"
+        // ships in the bundled corpus, carries the house frontmatter + the uv gotcha,
+        // and has no emoji. Resolved relative to the crate manifest so the check runs
+        // under `-p umadev-agent`.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../knowledge/testing/01-standards/dependency-install-before-tests.md");
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("knowledge standard missing at {}: {e}", path.display()));
+        assert!(text.contains("quality_score: 95"), "house frontmatter");
+        assert!(text.contains("category: 01-standards"));
+        assert!(text.contains("uv sync --extra dev"), "the uv gotcha");
+        assert!(
+            text.contains("pip install -e") && text.contains("poetry install --with dev"),
+            "covers the ecosystems"
+        );
+        // No emoji as functional markers (governance floor: UD-CODE-001).
+        assert!(
+            !text.chars().any(|c| {
+                let u = c as u32;
+                (0x1F300..=0x1FAFF).contains(&u) || (0x2600..=0x27BF).contains(&u)
+            }),
+            "the standard must contain no emoji"
+        );
     }
 
     fn mk_chunk(path: &str, body: &str) -> umadev_knowledge::ScoredChunk {

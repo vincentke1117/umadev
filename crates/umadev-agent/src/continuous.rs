@@ -1373,7 +1373,8 @@ fn phase_directive(
         Phase::Quality => format!(
             "{role}Now run QUALITY for `{slug}`: run the project's real build + test + lint, fix \
              what fails, and do a security pass (no hardcoded secrets, input validation, \
-             safe error handling). Summarize results.\n\n{no_ask}"
+             safe error handling). Summarize results.\n\n{deps}\n\n{no_ask}",
+            deps = crate::experts::deps_before_tests_directive()
         ),
         Phase::Delivery => format!(
             "{role}Now produce the DELIVERY recipe for `{slug}`: verify the production build for \
@@ -1464,7 +1465,8 @@ fn lean_directive(
             format!(
                 "{prime}Now VERIFY `{slug}`: run the project's real build + test + lint \
                  and fix what fails. {focus}Do a quick security pass (no hardcoded \
-                 secrets, inputs validated). Summarize results in a few lines.\n\n{no_ask}"
+                 secrets, inputs validated). Summarize results in a few lines.\n\n{deps}\n\n{no_ask}",
+                deps = crate::experts::deps_before_tests_directive()
             )
         }
         // A lean plan never reaches Research / Docs / Delivery / the gates — but
@@ -3268,6 +3270,41 @@ mod tests {
             // No heavyweight doc anchoring on the lean path.
             assert!(!d.to_lowercase().contains("approved the three documents"));
         }
+    }
+
+    #[test]
+    fn quality_directives_carry_deps_before_tests_on_both_paths() {
+        // The build/verify (Quality) directive — heavyweight AND lean — must carry
+        // the deps-before-tests guidance (incl. the uv `--extra dev` gotcha), so the
+        // base syncs dev/test deps in one pass instead of failing on
+        // `No module named pytest` and retrying.
+        let options = opts(Path::new("/tmp"), "build a data API", TrustMode::Auto);
+        for k in [
+            crate::planner::TaskKind::Greenfield,
+            crate::planner::TaskKind::Bugfix,
+        ] {
+            let d = phase_directive(&options, Phase::Quality, false, k);
+            assert!(
+                d.contains("uv sync --extra dev"),
+                "{k:?} Quality directive carries the uv --extra dev guidance: {d}"
+            );
+            assert!(
+                d.contains("DEPENDENCIES BEFORE TESTS"),
+                "{k:?} Quality directive carries the deps-before-tests block: {d}"
+            );
+        }
+        // A NON-test phase (Frontend) must NOT carry it — self-gated to the
+        // build/verify path, so a non-test turn isn't bloated.
+        let fe = phase_directive(
+            &options,
+            Phase::Frontend,
+            false,
+            crate::planner::TaskKind::Greenfield,
+        );
+        assert!(
+            !fe.contains("DEPENDENCIES BEFORE TESTS"),
+            "the deps directive must not leak onto a non-test phase: {fe}"
+        );
     }
 
     #[test]

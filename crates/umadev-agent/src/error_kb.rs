@@ -100,6 +100,7 @@ pub fn looks_like_error(text: &str) -> bool {
         "rejected",
         "no such",
         "missing",
+        "no module named",
     ];
     if WEAK_MARKERS.iter().any(|m| lower.contains(m)) {
         return !looks_benign(&lower);
@@ -144,6 +145,7 @@ pub fn classify_error(text: &str) -> ErrorInsight {
 
     // Ordered, most-specific first. The first detector to fire wins.
     for detector in [
+        detect_missing_test_tool,
         detect_missing_module,
         detect_package_manager,
         detect_permission,
@@ -170,6 +172,74 @@ pub fn classify_error(text: &str) -> ErrorInsight {
 // ---------------------------------------------------------------------------
 // Detectors — each returns Some(insight) when its family matches.
 // ---------------------------------------------------------------------------
+
+/// A *test / lint* tool reported as missing — the reported recurring inefficiency.
+///
+/// On an autonomous run the base fires `uv run python -m pytest -q` /
+/// `uv run ruff check` against an env that never had the dev/test extras installed,
+/// hits `No module named pytest` / `ruff: command not found`, THEN syncs deps and
+/// RETRIES — wasting a whole round. This detector runs BEFORE the generic
+/// [`detect_missing_module`] so a missing *test tool* routes to the precise
+/// "sync dev deps first, don't blindly retry" avoidance (the uv `--extra dev`
+/// gotcha included) instead of the generic "install the dep" advice.
+///
+/// Fires only when the text BOTH names a known test/lint/type tool AND reports it
+/// as missing via a command/module-specific marker (`no module named`,
+/// `ModuleNotFoundError`, `command not found`, sh's `: not found`, Windows' `is not
+/// recognized`) — NOT a bare "not found", so an ordinary failing test that merely
+/// mentions the runner (`assert ... not found`) is never mis-classified. The
+/// signature is stable (`dependency/test-deps-missing`) regardless of which tool.
+fn detect_missing_test_tool(lower: &str, line: &str) -> Option<ErrorInsight> {
+    // High-signal test / lint / type-check tool names. Deliberately excludes
+    // ambiguous English words (e.g. "coverage") to avoid false positives.
+    const TOOLS: &[&str] = &[
+        "pytest",
+        "ruff",
+        "mypy",
+        "flake8",
+        "pylint",
+        "isort",
+        "tox",
+        "nox",
+        "pytest-cov",
+        "jest",
+        "vitest",
+        "eslint",
+        "playwright",
+        "phpunit",
+        "rspec",
+    ];
+    if !TOOLS.iter().any(|t| lower.contains(t)) {
+        return None;
+    }
+    // Command/module-specific "is missing" markers only — never a bare "not found".
+    const MISSING: &[&str] = &[
+        "no module named",
+        "modulenotfounderror",
+        "command not found",
+        ": not found",
+        "is not recognized",
+    ];
+    if !MISSING.iter().any(|m| lower.contains(m)) {
+        return None;
+    }
+    Some(build(
+        "dependency",
+        "test-deps-missing",
+        "",
+        "测试/lint 工具未安装(是漏装依赖,不是测试失败)",
+        "运行测试/lint 前没有先安装项目依赖(含 dev/test extras)。\
+         `No module named pytest` / `ruff: command not found` 是漏了装依赖这一步,\
+         不是测试真的挂了。尤其 uv:默认 `uv sync` 不装 dev extras。",
+        "先一步到位安装依赖(含 dev/test extras)再跑测试,不要盲目重试同一条命令:\
+         uv `uv sync --extra dev`(或 `--all-extras` / `--group dev`);\
+         pip `pip install -e '.[dev]'` 或 `-r requirements-dev.txt`;\
+         poetry `poetry install --with dev`;pdm `pdm install -G dev`;\
+         npm/pnpm/yarn `npm ci`。装好后再运行 pytest / ruff 等。",
+        line,
+        "",
+    ))
+}
 
 fn detect_missing_module(lower: &str, line: &str) -> Option<ErrorInsight> {
     const MARKERS: &[&str] = &[
@@ -765,6 +835,54 @@ mod tests {
         ));
         assert!(looks_like_error("ReferenceError: foo is not defined"));
         assert!(looks_like_error("EACCES: permission denied, mkdir '/usr'"));
+    }
+
+    #[test]
+    fn missing_test_tool_routes_to_sync_deps_first() {
+        // The reported pitfall: `No module named pytest` is recognised as a SKIPPED
+        // dependency install (dev/test extras), not a test failure — and the
+        // avoidance is "sync dev deps first", incl. the uv `--extra dev` gotcha.
+        let i = classify_error("ModuleNotFoundError: No module named 'pytest'");
+        assert_eq!(i.category, "dependency");
+        assert!(i.recognized);
+        assert_eq!(i.signature, "dependency/test-deps-missing");
+        assert!(i.fix.contains("uv sync --extra dev"));
+        assert!(i.fix.contains(".[dev]") || i.fix.contains("requirements-dev.txt"));
+        assert!(i.fix.contains("poetry install --with dev"));
+        // The recurring error is captured by the cheap pre-filter too.
+        assert!(looks_like_error(
+            "ModuleNotFoundError: No module named 'pytest'"
+        ));
+        assert!(looks_like_error("No module named pytest"));
+    }
+
+    #[test]
+    fn missing_test_tool_matches_command_not_found_forms() {
+        // The shell "command not found", busybox ": not found", and Windows
+        // "not recognized" forms all route to the same sync-deps-first family.
+        for t in [
+            "bash: pytest: command not found",
+            "sh: ruff: not found",
+            "'ruff' is not recognized as an internal or external command",
+            "No module named ruff",
+        ] {
+            let i = classify_error(t);
+            assert_eq!(i.signature, "dependency/test-deps-missing", "{t}");
+            assert!(i.recognized, "{t}");
+        }
+    }
+
+    #[test]
+    fn a_missing_application_module_is_not_the_test_deps_family() {
+        // A missing APPLICATION dependency (not a test/lint tool) still routes to the
+        // generic module-not-found family with its module in the signature — the new
+        // detector is scoped to test/lint tools only.
+        let i = classify_error("ModuleNotFoundError: No module named 'requests'");
+        assert_eq!(i.signature, "dependency/module-not-found/requests");
+        // And a real failing pytest run that merely mentions the tool must NOT be
+        // mis-read as a missing-tool error (no command/module "missing" marker).
+        let real = classify_error("pytest: 1 failed, 3 passed — AssertionError");
+        assert_ne!(real.signature, "dependency/test-deps-missing");
     }
 
     #[test]
