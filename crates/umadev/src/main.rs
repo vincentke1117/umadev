@@ -170,11 +170,6 @@ enum Command {
         /// omitted, the pipeline runs offline with deterministic templates.
         #[arg(long, value_enum)]
         backend: Option<BackendArg>,
-        /// Optional model override. Empty by default so the base CLI runs on its
-        /// OWN configured model (login default / connected third-party / local) —
-        /// UmaDev never imposes a model. Pass e.g. `--model opus` to override.
-        #[arg(long, default_value = "")]
-        model: String,
         /// Workspace root; defaults to current directory.
         #[arg(long)]
         project_root: Option<PathBuf>,
@@ -225,9 +220,6 @@ enum Command {
         /// omitted, the lean pipeline runs offline with deterministic templates.
         #[arg(long, value_enum)]
         backend: Option<BackendArg>,
-        /// Optional model override (empty by default — never imposed).
-        #[arg(long, default_value = "")]
-        model: String,
         /// Workspace root; defaults to current directory.
         #[arg(long)]
         project_root: Option<PathBuf>,
@@ -811,7 +803,6 @@ async fn main() -> Result<()> {
         Command::Run {
             requirement,
             backend,
-            model,
             project_root,
             slug,
             mode,
@@ -820,7 +811,6 @@ async fn main() -> Result<()> {
             cmd_run(RunArgs {
                 requirement,
                 backend,
-                model,
                 project_root,
                 slug,
                 mode,
@@ -831,7 +821,6 @@ async fn main() -> Result<()> {
         Command::Quick {
             task,
             backend,
-            model,
             project_root,
             slug,
             mode,
@@ -839,7 +828,6 @@ async fn main() -> Result<()> {
             cmd_quick(RunArgs {
                 requirement: task,
                 backend,
-                model,
                 project_root,
                 slug,
                 mode,
@@ -2148,7 +2136,6 @@ async fn cmd_tui() -> Result<()> {
 struct RunArgs {
     requirement: String,
     backend: Option<BackendArg>,
-    model: String,
     project_root: Option<PathBuf>,
     slug: String,
     /// Trust / autonomy tier string (`plan` / `guarded` / `auto`); parsed into
@@ -2689,7 +2676,9 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         project_root: project_root.clone(),
         requirement: args.requirement,
         slug: args.slug,
-        model: args.model,
+        // UmaDev never imposes a model — the base CLI runs on its own configured
+        // / logged-in model. Always empty so the host driver passes no `--model`.
+        model: String::new(),
         backend: args
             .backend
             .as_ref()
@@ -2966,7 +2955,9 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         project_root: project_root.clone(),
         requirement: args.requirement,
         slug: args.slug,
-        model: args.model,
+        // UmaDev never imposes a model — the base CLI runs on its own configured
+        // / logged-in model. Always empty so the host driver passes no `--model`.
+        model: String::new(),
         backend: args
             .backend
             .as_ref()

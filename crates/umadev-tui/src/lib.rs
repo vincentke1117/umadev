@@ -70,7 +70,10 @@ pub struct LaunchOptions {
     pub project_root: PathBuf,
     /// Project slug (empty → inferred from workspace dir name).
     pub slug: String,
-    /// Model identifier (host drivers may ignore).
+    /// Model slot handed to the session driver. **UmaDev never imposes a model**
+    /// — the base CLI runs on whatever model IT is configured / logged in with —
+    /// so the launcher always leaves this EMPTY and the driver passes no
+    /// `--model`. Kept only as the driver's model-slot source.
     pub model: String,
 }
 
@@ -2359,7 +2362,7 @@ fn fire_agentic(
     // A drained queued turn is light (never a director build) → no hand-back.
     app.director_run_in_flight = false;
     let mode = app.effective_trust_mode();
-    let fallback_model = app.effective_model();
+    let fallback_model = String::new();
     let project_root = app.project_root.clone();
     if host_cli {
         app.host_chat_session_active = true;
@@ -3485,10 +3488,11 @@ fn route_model_for_spec(_spec: &BrainSpec, fallback_model: String) -> String {
 }
 
 /// Read the model the BASE is configured to use, in the base's OWN resolution
-/// order, so UmaDev can adopt it as the Agent's driving model — UmaDev owns no
-/// model; the base's model IS the engine. Returns `None` when the base pins no
-/// explicit model in config (it then runs on its login / server default, which
-/// UmaDev does not override — see `App::effective_model`). Fail-open throughout.
+/// order, purely to DISPLAY which model the Agent runs on — UmaDev owns no
+/// model and never sets one; the base's model IS the engine. Returns `None` when
+/// the base pins no explicit model in config (it then runs on its login / server
+/// default, which UmaDev does not override). Read-only observation, never a
+/// write. Fail-open throughout.
 #[must_use]
 pub fn detect_base_model(backend_id: &str, project_root: &std::path::Path) -> Option<String> {
     let home = config::home_dir();
@@ -4651,7 +4655,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     if matches!(app.mode, crate::app::AppMode::Chat) {
         spawn_chat_session_preload(
             app.backend.as_deref(),
-            app.effective_model(),
+            String::new(),
             app.project_root.clone(),
             continuous_autonomous(app.effective_trust_mode()),
             // A relaunch that reopened a saved chat carries the base's OWN session id
@@ -5340,7 +5344,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     *pending_ask_holder.lock().await = None;
                                     spawn_chat_session_preload(
                                         app.backend.as_deref(),
-                                        app.effective_model(),
+                                        String::new(),
                                         app.project_root.clone(),
                                         continuous_autonomous(app.effective_trust_mode()),
                                         // A backend switch cleared `chat_session_id`
@@ -5528,7 +5532,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                             project_root: opts.project_root.clone(),
                                             requirement: req,
                                             slug: opts.slug.clone(),
-                                            model: app.effective_model(),
+                                            model: String::new(),
                                             backend: app.backend.clone().unwrap_or_default(),
                                             design_system: app.config.design_system.clone().unwrap_or_default(),
                                             seed_template: app.config.seed_template.clone().unwrap_or_default(),
@@ -5579,7 +5583,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         project_root: opts.project_root.clone(),
                                         requirement: task,
                                         slug: opts.slug.clone(),
-                                        model: app.effective_model(),
+                                        model: String::new(),
                                         backend: app.backend.clone().unwrap_or_default(),
                                         design_system: app.config.design_system.clone().unwrap_or_default(),
                                         seed_template: app.config.seed_template.clone().unwrap_or_default(),
@@ -5680,7 +5684,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         continue_session,
                                         session_id,
                                         resume_session_id,
-                                        fallback_model: app.effective_model(),
+                                        fallback_model: String::new(),
                                         project_root: app.project_root.clone(),
                                         mode: app.effective_trust_mode(),
                                     };
@@ -5722,7 +5726,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         project_root: opts.project_root.clone(),
                                         requirement: revised_requirement,
                                         slug: opts.slug.clone(),
-                                        model: app.effective_model(),
+                                        model: String::new(),
                                         backend: app.backend.clone().unwrap_or_default(),
                                         design_system: app.config.design_system.clone().unwrap_or_default(),
                                         seed_template: app.config.seed_template.clone().unwrap_or_default(),
@@ -5904,7 +5908,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 }
                                 spawn_chat_session_preload(
                                     app.backend.as_deref(),
-                                    app.effective_model(),
+                                    String::new(),
                                     app.project_root.clone(),
                                     continuous_autonomous(app.effective_trust_mode()),
                                     // `/clear` cleared `chat_session_id` (→ `None` →
@@ -6101,7 +6105,7 @@ fn current_run_options(app: &App, opts: &LaunchOptions) -> RunOptions {
         project_root: opts.project_root.clone(),
         requirement: app.requirement.clone(),
         slug: opts.slug.clone(),
-        model: app.effective_model(),
+        model: String::new(),
         backend: app.backend.clone().unwrap_or_default(),
         design_system: app.config.design_system.clone().unwrap_or_default(),
         seed_template: app.config.seed_template.clone().unwrap_or_default(),
@@ -6532,6 +6536,34 @@ mod tests {
             slug: "demo".into(),
             model: "claude-sonnet-4-6".into(),
         }
+    }
+
+    #[test]
+    fn run_path_passes_no_model_override_to_the_base() {
+        // UmaDev owns no model endpoint and never imposes one — the base CLI runs
+        // on its own configured / logged-in model. The run path must therefore
+        // hand the runner an EMPTY model, so the host drivers pass no `--model`.
+        // Proven even when the LaunchOptions fixture carries a stale id: the run
+        // options are pinned empty regardless (no config-derived override exists).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = App::new(
+            "demo".to_string(),
+            crate::config::UserConfig {
+                backend: Some("claude-code".into()),
+                ..Default::default()
+            },
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        let launch = opts(); // model: "claude-sonnet-4-6" — must NOT leak through
+        let run_opts = current_run_options(&app, &launch);
+        assert!(
+            run_opts.model.is_empty(),
+            "the base launch must carry no model override (got {:?})",
+            run_opts.model
+        );
+        // The Tier-0 floor route path is likewise model-free.
+        assert!(route_floor_options(tmp.path(), "任务").model.is_empty());
     }
 
     fn msg(role: &str, content: &str) -> Message {

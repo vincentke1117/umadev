@@ -402,13 +402,6 @@
 # /backend and /model
 "backend.switched" = "Switched worker to `{}` — the next run uses this backend."
 "backend.busy_no_switch" = "A run is in progress on the current base — /cancel it before switching the base, so the run and its session stay coherent."
-"model.base_default" = "(base default)"
-"model.menu.claude" = "  Claude (alias or full id both work):\n    · /model opus —— strongest  · /model sonnet —— balanced (default)  · /model haiku —— fastest\n    · full ids like claude-opus-4-8 / claude-sonnet-4-6"
-"model.menu.codex" = "  Codex (OpenAI model id):\n    · /model gpt-5.1-codex  · /model gpt-5  · /model o4-mini"
-"model.menu.opencode" = "  OpenCode (must be provider/model form):\n    · /model anthropic/claude-sonnet-4-6  · /model openai/gpt-5"
-"model.menu.external" = "  Running offline templates; /model only affects the base CLIs (claude-code/codex/opencode)."
-"model.current" = "Current model: {}\nSwitch: /model <id>\n{}\n  Note: you must use an id the base supports; a wrong id errors at the base on the next run."
-"model.switched" = "Model switched to `{}` — the next run uses this model."
 
 
 # /design and /template
@@ -527,27 +520,6 @@
 "rewind.failed" = "Rewind failed: {}"
 
 # /model per-phase tiers (plan / build)
-"model.tiers_current" = "Per-phase models — plan/docs: {} · code: {} (/model plan|build <model> to adjust, off to reset)"
-"model.tiers_hint" = "Tip: use /model plan <cheaper model> and /model build <stronger model> to assign models per phase — saves time and money."
-"model.tiers_busy" = "A run is in progress — model tiers can't be changed now; set them after the current run finishes."
-"model.tiers_default" = "default single model"
-"model.tiers_default_paren" = "(default single model)"
-"model.tiers_updated" = "Model tiers updated — plan/docs phase: {} · code phase: {}\nUse a cheap/fast model for planning and a strong one for code — saves time and money (more so with your own key / a third party)."
-"model.pick.title" = "pick a model · {} · {}"
-"model.pick.tier.worker" = "worker default"
-"model.pick.tier.plan" = "plan / docs"
-"model.pick.tier.build" = "code / build"
-"model.pick.desc.flagship" = "most capable"
-"model.pick.desc.balanced" = "balanced speed and capability"
-"model.pick.desc.fast" = "fastest, lowest cost"
-"model.pick.desc.previous" = "previous generation"
-"model.pick.desc.custom" = "type any model id the base supports"
-"model.pick.custom_label" = "custom / type an id"
-"model.pick.current" = "current"
-"model.pick.footer" = "↑↓ move · Enter select · Esc cancel"
-"model.pick.custom_prompt" = "Type the exact model id your base supports, then press Enter."
-"model.pick.applied" = "{} model set to `{}` — the next run uses it."
-"model.pick.cleared" = "{} model reset to the base default."
 
 # /deploy pre-confirm preflight
 "deploy.confirm_preflight" = "Ready to deploy (not run yet). Will run:\n  {}\n\nPre-deploy checklist: 1) build/tests passed  2) env vars and secrets configured on the target platform  3) target environment (prod/preview) correct  4) DB migration / rollback plan ready.\nWhen everything checks out, type /deploy confirm to actually deploy."
@@ -802,7 +774,6 @@
 "tui.help.nav.quit" = "quit"
 # Help overlay — worker group dynamic rows
 "tui.help.worker.offline" = "deterministic templates — internal fallback (demo / CI), not a real base"
-"tui.help.worker.model" = "pick the model — no arg opens a list; plan|build <id> per phase"
 # Help overlay — pipeline & gates
 "tui.help.pipe.enter" = "submit; non-slash = requirement (or revision at gate)"
 "tui.help.pipe.continue" = "approve the active gate"

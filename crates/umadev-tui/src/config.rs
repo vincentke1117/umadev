@@ -9,8 +9,8 @@
 //!
 //! ```toml
 //! # Drive a logged-in base CLI (umadev needs no API key of its own).
+//! # The base runs on ITS OWN configured model — UmaDev never sets one.
 //! backend = "claude-code"
-//! model = "claude-sonnet-4-6"
 //! ```
 //!
 //! All read/write is fail-soft: a corrupt or missing file just means
@@ -31,22 +31,6 @@ pub struct UserConfig {
     /// `None` triggers the first-launch picker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-
-    /// Model identifier passed to the worker.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-
-    /// Optional per-phase model TIERS — plan with a cheaper/faster model, write
-    /// code with a stronger one (the per-phase model assignment top agents use).
-    /// `model_plan` drives research/docs/spec/quality; `model_build` drives the
-    /// frontend/backend code phases. Unset → every phase uses [`Self::model`].
-    /// Applied via the runner's thread-safe shared tier state (see
-    /// [`Self::apply_model_tiers`]), so the worker path needs no extra plumbing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_plan: Option<String>,
-    /// Stronger model for the code phases — see [`Self::model_plan`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_build: Option<String>,
 
     /// Active design system name (e.g. `modern-minimal`, `tech-utility`).
     /// Saved to config so subsequent runs reuse the same visual direction.
@@ -110,9 +94,6 @@ pub const CURRENT_MIGRATION_VERSION: u32 = MIGRATIONS.len() as u32;
 fn migrate_empty_strings_to_none(cfg: &mut UserConfig) {
     for field in [
         &mut cfg.backend,
-        &mut cfg.model,
-        &mut cfg.model_plan,
-        &mut cfg.model_build,
         &mut cfg.design_system,
         &mut cfg.seed_template,
         &mut cfg.lang,
@@ -179,23 +160,6 @@ impl UserConfig {
     #[must_use]
     pub fn has_backend(&self) -> bool {
         self.backend.is_some()
-    }
-
-    /// Publish the per-phase model tiers ([`Self::model_plan`] /
-    /// [`Self::model_build`]) into the runner's **thread-safe shared tier state**
-    /// (`umadev_agent::runner::set_model_tiers`). Call once at startup and after
-    /// any `/model plan|build` change so the in-process worker loop picks them up.
-    /// An unset tier clears that tier so it cleanly falls back to the single model.
-    ///
-    /// Uses shared state, NOT the process env: the runner reads the tiers from
-    /// background tasks while a turn streams, so a runtime `set_var` would be a
-    /// `setenv`/`getenv` data race (UB). The env is only read once at startup to
-    /// seed the shared state, never mutated at runtime.
-    pub fn apply_model_tiers(&self) {
-        umadev_agent::runner::set_model_tiers(
-            self.model_plan.as_deref(),
-            self.model_build.as_deref(),
-        );
     }
 
     /// Publish the saved process-log preference into the host drivers' **thread-safe
@@ -373,7 +337,7 @@ mod tests {
         let path = tmp.path().join("config.toml");
         let original = UserConfig {
             backend: Some("claude-code".into()),
-            model: Some("claude-sonnet-4-6".into()),
+            lang: Some("en".into()),
             ..Default::default()
         };
         let written = save_to(&original, &path).unwrap();
@@ -427,7 +391,6 @@ mod tests {
         let deep = tmp.path().join("a/b/c/config.toml");
         let cfg = UserConfig {
             backend: Some("codex".into()),
-            model: None,
             ..Default::default()
         };
         save_to(&cfg, &deep).unwrap();
@@ -440,7 +403,6 @@ mod tests {
         assert_eq!(cfg.backend_or_default(), "offline");
         let cfg = UserConfig {
             backend: Some("claude-code".into()),
-            model: None,
             ..Default::default()
         };
         assert_eq!(cfg.backend_or_default(), "claude-code");
@@ -488,10 +450,10 @@ mod tests {
         fn boom(_: &mut UserConfig) {
             panic!("simulated bad migration");
         }
-        fn set_model(cfg: &mut UserConfig) {
-            cfg.model = Some("recovered".into());
+        fn set_lang(cfg: &mut UserConfig) {
+            cfg.lang = Some("recovered".into());
         }
-        let migrations: &[Migration] = &[boom, set_model];
+        let migrations: &[Migration] = &[boom, set_lang];
 
         // Silence the default panic hook so the deliberate panic doesn't spam the
         // test output; restore it right after.
@@ -508,7 +470,7 @@ mod tests {
         // The version advanced past BOTH steps — a bad migration can't wedge the
         // launch — and the later, good step still ran.
         assert_eq!(cfg.migration_version, 2);
-        assert_eq!(cfg.model.as_deref(), Some("recovered"));
+        assert_eq!(cfg.lang.as_deref(), Some("recovered"));
     }
 
     #[test]

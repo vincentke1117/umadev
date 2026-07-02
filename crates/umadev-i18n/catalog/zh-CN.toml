@@ -397,13 +397,6 @@
 # /backend and /model
 "backend.switched" = "已切换底座到 `{}` — 下一个 run 起用此 backend。"
 "backend.busy_no_switch" = "当前底座上有运行进行中 —— 请先 /cancel 再切换底座,以免运行与其会话错配。"
-"model.base_default" = "(底座默认)"
-"model.menu.claude" = "  Claude(别名或完整 id 均可):\n    · /model opus —— 最强  · /model sonnet —— 均衡(默认)  · /model haiku —— 最快\n    · 完整 id 如 claude-opus-4-8 / claude-sonnet-4-6"
-"model.menu.codex" = "  Codex(OpenAI 模型 id):\n    · /model gpt-5.1-codex  · /model gpt-5  · /model o4-mini"
-"model.menu.opencode" = "  OpenCode(必须 provider/model 形式):\n    · /model anthropic/claude-sonnet-4-6  · /model openai/gpt-5"
-"model.menu.external" = "  当前为离线模板模式;/model 只对底座 CLI(claude-code/codex/opencode)生效。"
-"model.current" = "当前 model:{}\n切换:/model <id>\n{}\n  注意:必须填该底座支持的 id,填错会在下次 run 时由底座报错。"
-"model.switched" = "model 切换为 `{}` — 下一个 run 起用此 model。"
 
 
 # /design and /template
@@ -522,27 +515,6 @@
 "rewind.failed" = "回滚失败:{}"
 
 # /model 分阶段模型（plan / build 分级)
-"model.tiers_current" = "分阶段模型 —— 规划/文档: {} · 写码: {}(/model plan|build <模型> 调整,off 还原)"
-"model.tiers_hint" = "提示:可用 /model plan <便宜模型> 与 /model build <强模型> 给规划/写码分别配模型,省时省钱。"
-"model.tiers_busy" = "运行进行中,不能修改模型分级 —— 等当前运行结束再设置。"
-"model.tiers_default" = "默认单模型"
-"model.tiers_default_paren" = "(默认单模型)"
-"model.tiers_updated" = "已更新模型分级 —— 规划/文档阶段: {} · 写码阶段: {}\n规划用便宜/快的、写码用强的,省时也省钱(对自带 key/第三方更明显)。"
-"model.pick.title" = "选择模型 · {} · {}"
-"model.pick.tier.worker" = "默认模型"
-"model.pick.tier.plan" = "规划 / 文档"
-"model.pick.tier.build" = "写码 / 构建"
-"model.pick.desc.flagship" = "最强"
-"model.pick.desc.balanced" = "速度与能力均衡"
-"model.pick.desc.fast" = "最快、最省"
-"model.pick.desc.previous" = "上一代"
-"model.pick.desc.custom" = "手动输入底座支持的任意模型 id"
-"model.pick.custom_label" = "自定义 / 手动输入 id"
-"model.pick.current" = "当前"
-"model.pick.footer" = "↑↓ 移动 · Enter 选择 · Esc 取消"
-"model.pick.custom_prompt" = "输入底座支持的确切模型 id,然后回车。"
-"model.pick.applied" = "{}模型已设为 `{}` —— 下次运行即用此模型。"
-"model.pick.cleared" = "{}模型已还原为底座默认。"
 
 # /deploy 确认前自检
 "deploy.confirm_preflight" = "准备部署(尚未执行)。将运行:\n  {}\n\n部署前自检:1) 构建/测试已过  2) 环境变量与密钥已在目标平台配好  3) 目标环境(prod/preview)正确  4) 数据库迁移/回滚预案就绪。\n确认无误后输入 /deploy confirm 才真正部署。"
@@ -785,7 +757,6 @@
 "tui.help.nav.quit" = "退出"
 # 帮助浮层 —— 底座组动态行
 "tui.help.worker.offline" = "确定性模板 — 内部兜底(demo / CI),非正式底座"
-"tui.help.worker.model" = "选择模型 —— 不带参数打开列表;plan|build <id> 分阶段设置"
 # 帮助浮层 —— 流水线与闸门
 "tui.help.pipe.enter" = "提交;非斜杠 = 需求(在闸门处则为修改意见)"
 "tui.help.pipe.continue" = "通过当前闸门"

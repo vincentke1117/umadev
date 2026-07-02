@@ -389,123 +389,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         AppMode::Picker => render_picker(frame, app),
         AppMode::Chat => render_chat(frame, app),
     }
-    // Overlay precedence: the `/model` picker card is the top modal (it owns
-    // the keyboard while open), then the scrollable content overlay, then help.
-    if let Some(mp) = &app.model_picker {
-        render_model_picker(frame, app, mp);
-    } else if let Some(ov) = &app.overlay {
+    // Overlay precedence: the scrollable content overlay, then help.
+    if let Some(ov) = &app.overlay {
         render_scroll_overlay(frame, ov);
     } else if app.show_help {
         render_help_overlay(frame, app);
     }
-}
-
-/// Render the interactive `/model` picker as a centered card over the chat.
-/// Mirrors the first-run picker's selected-row styling (brand left-bar + bold
-/// primary label) and the scroll-overlay's bordered-card chrome, all from theme
-/// tokens (no hardcoded colors, no emoji). The currently-pinned model is marked
-/// with a filled geometric circle built from a codepoint (never a pictograph).
-fn render_model_picker(frame: &mut Frame, app: &App, mp: &crate::app::ModelPicker) {
-    use crate::app::ModelTier;
-
-    let total = frame.area();
-    // Tiny-terminal guard: below this the bordered card + footer can't fit, so
-    // show the "make the window bigger" card instead of a clipped picker.
-    if total.height < 8 || total.width < 30 {
-        render_too_small(frame, total);
-        return;
-    }
-    let lang = app.lang;
-
-    // Geometric "current" mark (● U+25CF) — a codepoint, so the source carries
-    // no pictographic glyph; a blank keeps every row aligned.
-    let filled = char::from_u32(0x25CF).unwrap_or('*').to_string();
-    let current = app.model_tier_value(mp.tier).map(str::to_string);
-
-    let mut lines: Vec<Line> = Vec::new();
-    for (idx, item) in mp.items.iter().enumerate() {
-        let is_selected = idx == mp.selected;
-        let is_current = !item.custom && current.as_deref() == Some(item.id.as_str());
-        // Brand left-bar marks the highlighted row (Claude Code / first-run style).
-        let bar = if is_selected { "▌ " } else { "  " };
-        let mark = if is_current {
-            filled.clone()
-        } else {
-            " ".to_string()
-        };
-        let label = if item.custom {
-            umadev_i18n::t(lang, "model.pick.custom_label").to_string()
-        } else {
-            item.id.clone()
-        };
-        let label_style = if is_selected {
-            Style::default()
-                .fg(theme::PRIMARY())
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::TEXT())
-        };
-        let mut spans = vec![
-            Span::styled(bar.to_string(), Style::default().fg(theme::ACCENT())),
-            Span::styled(format!("{mark} "), Style::default().fg(theme::SUCCESS())),
-            Span::styled(label, label_style),
-            Span::raw("  "),
-            Span::styled(
-                item.description.clone(),
-                Style::default().fg(theme::TEXT_MUTED()),
-            ),
-        ];
-        if is_current {
-            spans.push(Span::styled(
-                format!("  · {}", umadev_i18n::t(lang, "model.pick.current")),
-                Style::default().fg(theme::SUCCESS()),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        umadev_i18n::t(lang, "model.pick.footer"),
-        Style::default().fg(theme::TEXT_MUTED()),
-    )));
-
-    // Title carries the base + the tier being set.
-    let tier_label = match mp.tier {
-        ModelTier::Worker => umadev_i18n::t(lang, "model.pick.tier.worker"),
-        ModelTier::Plan => umadev_i18n::t(lang, "model.pick.tier.plan"),
-        ModelTier::Build => umadev_i18n::t(lang, "model.pick.tier.build"),
-    };
-    let base_label = if mp.backend_id.is_empty() {
-        "offline"
-    } else {
-        mp.backend_id.as_str()
-    };
-    let title = format!(
-        " {} ",
-        umadev_i18n::tf(lang, "model.pick.title", &[base_label, tier_label])
-    );
-
-    // Center a card sized to the content (clamped to the terminal). The tiny
-    // guard above ensures width ≥ 30 and height ≥ 8, so both clamp ranges are
-    // well-ordered (min ≤ max) and never panic.
-    let rows = u16::try_from(lines.len()).unwrap_or(6);
-    let width = total.width.saturating_sub(4).clamp(24, 72);
-    let cap_h = total.height.saturating_sub(2).max(3);
-    let height = (rows + 2).clamp(3, cap_h);
-    let x = (total.width.saturating_sub(width)) / 2;
-    let y = (total.height.saturating_sub(height)) / 2;
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(theme::BORDER_ACTIVE()));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Render a scrollable, near-fullscreen overlay used by `/spec`,
@@ -6847,7 +6736,6 @@ mod tests {
             "demo",
             UserConfig {
                 backend: backend.map(str::to_string),
-                model: None,
                 ..Default::default()
             },
             std::env::temp_dir().join(format!("sd-ui-test-config-{id}.toml")),
@@ -7570,7 +7458,7 @@ mod tests {
         assert!(out.contains("/preview"));
         assert!(out.contains("/deploy"));
         // Surfaces live in the right groups.
-        assert!(out.contains("/model"));
+        assert!(out.contains("/sandbox"));
         assert!(out.contains("/version"));
         assert!(out.contains("Shift+Enter"));
     }
