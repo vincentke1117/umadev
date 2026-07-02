@@ -243,23 +243,48 @@ impl ClaudeSession {
 #[async_trait]
 impl BaseSession for ClaudeSession {
     async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-        // A read-only critic fork: a FRESH, INDEPENDENT session — a brand-new
-        // `--session-id`, NOT `--resume <main> --fork-session`. Branching the main
-        // line (resume + fork-session) re-loads the doer's FULL transcript into the
-        // critic's context (the self-preference / framing leak); a fresh session
-        // starts on a genuinely clean context at the HOST level and reviews only the
-        // on-disk artifact (the produced `output/*.md` + the source tree, read via
-        // `Read,Grep,Glob`) plus the judge directive it's handed. Spawned with
-        // `current_dir(workspace)`, so the clean session still sees the same on-disk
-        // blackboard the main line wrote. `--permission-mode plan` + the read-only
-        // allowlist fence it so it can READ the workspace but can NEVER write the
-        // blackboard (single-writer invariant — only the main session writes). This
-        // mirrors opencode's fresh-independent-session fork. Fail-open: a spawn
-        // failure surfaces as `Start`, which the caller treats like `ForkUnsupported`.
+        // A read-only critic fork that CARRIES THE BUILD CONVERSATION. `--resume
+        // <main> --fork-session` re-loads the doer's LIVE transcript into a NEW,
+        // isolated forked session, so the critic (QA / security / architect …) judges
+        // with everything the doer saw — not just the on-disk `output/*.md` + source
+        // tree. The fork is ISOLATED: `--fork-session` mints its OWN session id, so the
+        // critic's turns branch off and never touch the parent's writable main line
+        // (single-writer invariant). It is READ-ONLY: `--permission-mode plan` (never
+        // applies an edit) + the `Read,Grep,Glob` allowlist are two independent fences
+        // on that same invariant — only the main session ever writes the blackboard.
+        // The inherited maker reasoning is quarantined at the PROMPT boundary by
+        // `INDEPENDENT_REVIEW_FIREWALL` (see `umadev_agent::continuous`), so carrying
+        // the transcript does not leak the author's framing into the verdict. Spawned
+        // with `current_dir(workspace)`, so it also sees the same on-disk blackboard.
+        //
+        // FAIL-OPEN (critical — a broken fork must NEVER break the critic): when no
+        // live parent id is available (empty — no continuous session yet / single-shot
+        // path / offline base) we open TODAY's FRESH independent read-only session
+        // ([`fork_session_args`]) instead; and if the resume-fork spawn itself fails we
+        // degrade to that same fresh fork rather than deny the critic a session. A
+        // spawn failure ultimately still surfaces as `Start`, which the caller treats
+        // like `ForkUnsupported` (advisory-accept). The fork takes NO run-lock — critics
+        // run in parallel, read-only, off the single-writer lock (unchanged invariant).
         let fork_id = new_session_id();
-        let args = fork_session_args(&fork_id);
-        let s = Self::spawn_with_args(&self.program, &self.workspace, &args, &fork_id).await?;
-        Ok(Box::new(s))
+        let carries_transcript = !self.session_id.trim().is_empty();
+        let args = critic_fork_args(&self.session_id, &fork_id);
+        match Self::spawn_with_args(&self.program, &self.workspace, &args, &fork_id).await {
+            Ok(s) => Ok(Box::new(s)),
+            // A resume-fork that failed to SPAWN degrades to the fresh read-only fork
+            // (fail-open). When we already chose fresh, `carries_transcript` is false
+            // and the error propagates unchanged (there is no cleaner fallback left).
+            Err(e) if carries_transcript => {
+                tracing::debug!(
+                    error = %e,
+                    "resume-fork spawn failed; degrading to a fresh read-only critic fork"
+                );
+                let fresh = fork_session_args(&fork_id);
+                let s =
+                    Self::spawn_with_args(&self.program, &self.workspace, &fresh, &fork_id).await?;
+                Ok(Box::new(s))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
@@ -475,19 +500,20 @@ pub fn resume_session_args(
     args
 }
 
-/// The argument vector for a READ-ONLY critic fork: a FRESH, INDEPENDENT session
-/// pinned to `fork_session_id` with **NO** `--resume <main>` and **NO**
-/// `--fork-session`. Both of those branch the LIVE main conversation, so the
-/// critic would inherit the doer's full deliberation/transcript — the
-/// maker-checker reasoning leak this fixes at the HOST level. A fresh session
-/// starts on a genuinely clean context and reviews only the on-disk artifact (the
-/// produced `output/*.md` + the source tree, read via `Read,Grep,Glob`) plus the
-/// judge directive. It is spawned with `current_dir(workspace)` (see
-/// [`ClaudeSession::spawn_with_args`]), so the clean session still SEES the same
-/// on-disk blackboard the main line wrote. `--permission-mode plan` +
-/// `--allowedTools "Read,Grep,Glob"` are two independent fences on the
-/// single-writer invariant (read the workspace, never write a file). Mirrors
-/// opencode's fresh-independent-session fork. Exposed for tests.
+/// The argument vector for the FALLBACK read-only critic fork: a FRESH,
+/// INDEPENDENT session pinned to `fork_session_id` with **NO** `--resume <main>`
+/// and **NO** `--fork-session`. This is the FAIL-OPEN degrade of
+/// [`resume_fork_session_args`] — used when there is no live parent transcript to
+/// branch (no continuous session yet / single-shot path / offline base), or when
+/// the resume-fork spawn itself failed. A fresh session starts on a clean context
+/// and reviews only the on-disk artifact (the produced `output/*.md` + the source
+/// tree, read via `Read,Grep,Glob`) plus the judge directive. It is spawned with
+/// `current_dir(workspace)` (see [`ClaudeSession::spawn_with_args`]), so the clean
+/// session still SEES the same on-disk blackboard the main line wrote.
+/// `--permission-mode plan` + `--allowedTools "Read,Grep,Glob"` are two
+/// independent fences on the single-writer invariant (read the workspace, never
+/// write a file). Mirrors opencode's fresh-independent-session fork. Exposed for
+/// tests.
 #[must_use]
 pub fn fork_session_args(fork_session_id: &str) -> Vec<String> {
     vec![
@@ -514,6 +540,65 @@ pub fn fork_session_args(fork_session_id: &str) -> Vec<String> {
         "--allowedTools".to_string(),
         "Read,Grep,Glob".to_string(),
     ]
+}
+
+/// The argument vector for the DEFAULT read-only critic fork — the one that
+/// CARRIES THE BUILD CONVERSATION. `--resume <main_session_id> --fork-session`
+/// re-loads the doer's LIVE transcript into a NEW, isolated forked session, so the
+/// critic judges with everything the doer saw (QA/security/architect seats see the
+/// whole build, not just the on-disk `output/*.md`). `--fork-session` is what keeps
+/// the single-writer invariant: the fork mints its OWN session id, so the critic's
+/// turns branch off and never touch the parent's writable main line. It is
+/// READ-ONLY: `--permission-mode plan` (never applies an edit) + the `Read,Grep,Glob`
+/// allowlist are two independent fences on that invariant. The maker's inherited
+/// reasoning is quarantined at the PROMPT boundary by `INDEPENDENT_REVIEW_FIREWALL`
+/// (in `umadev_agent::continuous`), so carrying the transcript does not bias the
+/// verdict. When there is no live parent id, [`critic_fork_args`] degrades to the
+/// FRESH [`fork_session_args`] fallback instead. Exposed for tests.
+#[must_use]
+pub fn resume_fork_session_args(main_session_id: &str) -> Vec<String> {
+    vec![
+        "--print".to_string(),
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        // Stream the verdict text as deltas here too (see `fork_session_args` /
+        // `session_args`), so a critic's verdict renders token-by-token.
+        "--include-partial-messages".to_string(),
+        "--verbose".to_string(),
+        // Branch the LIVE build conversation: `--resume <main>` re-loads the doer's
+        // transcript; `--fork-session` writes it into a FRESH forked session id so the
+        // critic's turns never mutate the parent (the single-writer invariant). We do
+        // NOT also pin a fresh `--session-id` — that would start an empty conversation
+        // and drop the very transcript this fork exists to carry.
+        "--resume".to_string(),
+        main_session_id.to_string(),
+        "--fork-session".to_string(),
+        // Read-only: plan mode never applies an edit; the tool allowlist is read-only
+        // too. Two independent fences on the single-writer invariant.
+        "--permission-mode".to_string(),
+        "plan".to_string(),
+        "--allowedTools".to_string(),
+        "Read,Grep,Glob".to_string(),
+    ]
+}
+
+/// Choose the critic fork's argument vector. With a live parent `main_session_id`
+/// the fork BRANCHES the build conversation read-only ([`resume_fork_session_args`])
+/// so the critic judges with everything the doer saw; with NO parent id (empty /
+/// whitespace — no continuous session yet, the single-shot path, or an offline base)
+/// it degrades to TODAY's FRESH independent read-only session ([`fork_session_args`]
+/// pinned to `fresh_id`). Both shapes are read-only (plan mode + the read-only tool
+/// allowlist), so the single-writer invariant holds either way. Deterministic —
+/// exposed for tests.
+#[must_use]
+fn critic_fork_args(main_session_id: &str, fresh_id: &str) -> Vec<String> {
+    if main_session_id.trim().is_empty() {
+        fork_session_args(fresh_id)
+    } else {
+        resume_fork_session_args(main_session_id)
+    }
 }
 
 /// Build the stream-json `user` message line for a phase directive. This is the
@@ -967,32 +1052,78 @@ mod tests {
         assert!(!args[tools + 1].contains("Edit"));
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fork_spawns_a_fresh_read_only_session() {
-        // The fork is a real, independent BaseSession the critic can drive: the
-        // fake `claude` replies to a judge directive with a JSON verdict and ends
-        // the turn. Proves fork() spawns a usable FRESH session and the verdict
-        // streams (the fresh session never resumed the main line "sid-main").
-        let tmp = tempfile_dir();
-        let fake = write_fake_claude(
-            &tmp,
-            "#!/bin/sh\nread _line\n\
-             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"{\\\"accepts\\\":true}\"}}}'\n\
-             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}'\n\
-             cat >/dev/null\n",
+    #[test]
+    fn resume_fork_session_args_carries_the_build_conversation_read_only() {
+        // The DEFAULT critic fork carries the build conversation: `--resume <main>`
+        // re-loads the doer's transcript, `--fork-session` isolates it into a new id.
+        let args = resume_fork_session_args("sid-main");
+        let r = args
+            .iter()
+            .position(|a| a == "--resume")
+            .expect("--resume present");
+        assert_eq!(args[r + 1], "sid-main");
+        assert!(
+            args.contains(&"--fork-session".to_string()),
+            "must BRANCH the resumed conversation, not continue writing it: {args:?}"
         );
-        let mut main =
-            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "sid-main", true)
-                .await
-                .expect("start main");
-        let mut fork = main
-            .fork()
-            .await
-            .expect("fork must spawn a fresh read-only session");
-        fork.send_turn("review from the architect seat, return JSON".to_string())
-            .await
-            .expect("fork send");
+        // READ-ONLY: plan mode + a read-only tool allowlist (no Write / Edit).
+        let perm = args.iter().position(|a| a == "--permission-mode").unwrap();
+        assert_eq!(args[perm + 1], "plan");
+        let tools = args.iter().position(|a| a == "--allowedTools").unwrap();
+        assert_eq!(args[tools + 1], "Read,Grep,Glob");
+        assert!(!args[tools + 1].contains("Write"));
+        assert!(!args[tools + 1].contains("Edit"));
+        // It does NOT mint a fresh pinned `--session-id` — that would start an empty
+        // conversation and drop the transcript this fork exists to carry.
+        assert!(
+            !args.contains(&"--session-id".to_string()),
+            "a resume-fork carries context; it must not pin a fresh empty session: {args:?}"
+        );
+        // Streams the verdict token-by-token, like the other session shapes.
+        assert!(args.iter().any(|a| a == "--include-partial-messages"));
+    }
+
+    #[test]
+    fn critic_fork_args_resumes_with_a_live_id_and_falls_back_fresh_without_one() {
+        // A live parent id → the resume-fork that carries the build conversation.
+        let live = critic_fork_args("sid-main", "fresh-1");
+        assert!(live.windows(2).any(|w| w == ["--resume", "sid-main"]));
+        assert!(live.contains(&"--fork-session".to_string()));
+        // No parent id (empty / whitespace-only) → TODAY's FRESH independent read-only
+        // session (the fail-open fallback), pinned to the fresh id, never resuming.
+        for empty in ["", "   "] {
+            let fresh = critic_fork_args(empty, "fresh-1");
+            assert!(
+                !fresh.contains(&"--resume".to_string()),
+                "no live id → no resume (fresh fallback): {fresh:?}"
+            );
+            assert!(!fresh.contains(&"--fork-session".to_string()));
+            assert!(fresh.windows(2).any(|w| w == ["--session-id", "fresh-1"]));
+        }
+        // Both shapes are READ-ONLY (plan mode) — the single-writer invariant holds
+        // whichever branch is taken.
+        for a in [critic_fork_args("sid-main", "f"), critic_fork_args("", "f")] {
+            let p = a.iter().position(|x| x == "--permission-mode").unwrap();
+            assert_eq!(a[p + 1], "plan");
+        }
+    }
+
+    /// A fake `claude` that REPORTS whether it was launched with `--resume` (so a
+    /// test can tell a real resume-fork from the fresh fallback), then streams a
+    /// JSON verdict and ends the turn. Emits `resumed` or `fresh` as the first
+    /// text delta, followed by `{"accepts":true}`.
+    #[cfg(unix)]
+    const RESUME_REPORTING_FAKE: &str = "#!/bin/sh\n\
+         case \"$*\" in *--resume*) MODE=resumed ;; *) MODE=fresh ;; esac\n\
+         read _line\n\
+         printf '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"%s \"}}}\\n' \"$MODE\"\n\
+         printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"{\\\"accepts\\\":true}\"}}}'\n\
+         printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}'\n\
+         cat >/dev/null\n";
+
+    /// Drain a driven fork's events until its `TurnDone`, collecting the text.
+    #[cfg(unix)]
+    async fn drain_fork_text(fork: &mut Box<dyn BaseSession>) -> String {
         let mut text = String::new();
         while let Some(ev) = fork.next_event().await {
             match ev {
@@ -1001,9 +1132,69 @@ mod tests {
                 _ => {}
             }
         }
+        text
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fork_carries_the_build_conversation_via_resume_fork() {
+        // With a LIVE parent session id, fork() branches the BUILD CONVERSATION
+        // read-only: the fork process is launched with `--resume <main> --fork-session`
+        // so the critic inherits the doer's transcript (isolated: --fork-session mints
+        // a NEW session id, so the fork never writes the parent's main line). The fake
+        // `claude` reports it saw `--resume`, then streams a JSON verdict.
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(&tmp, RESUME_REPORTING_FAKE);
+        let mut main =
+            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "sid-main", true)
+                .await
+                .expect("start main");
+        let mut fork = main
+            .fork()
+            .await
+            .expect("fork must spawn a read-only session");
+        fork.send_turn("review from the architect seat, return JSON".to_string())
+            .await
+            .expect("fork send");
+        let text = drain_fork_text(&mut fork).await;
+        assert!(
+            text.contains("resumed"),
+            "the fork must carry the build conversation (launched with --resume): {text}"
+        );
         assert!(
             text.contains("accepts"),
             "fork relayed the verdict text: {text}"
+        );
+        let _ = fork.end().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fork_falls_back_to_fresh_when_no_live_session_id() {
+        // FAIL-OPEN: with NO live parent id (an empty session id — the not-yet-started
+        // / single-shot / offline case) fork() degrades to TODAY's FRESH independent
+        // read-only session — it does NOT `--resume`. The fake reports `fresh`.
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(&tmp, RESUME_REPORTING_FAKE);
+        let mut main =
+            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "", true)
+                .await
+                .expect("start main");
+        let mut fork = main
+            .fork()
+            .await
+            .expect("fork must spawn a fresh read-only session");
+        fork.send_turn("review, return JSON".to_string())
+            .await
+            .expect("fork send");
+        let text = drain_fork_text(&mut fork).await;
+        assert!(
+            text.contains("fresh"),
+            "no live id → the fresh fallback, never --resume: {text}"
+        );
+        assert!(
+            text.contains("accepts"),
+            "fork still relayed the verdict text: {text}"
         );
         let _ = fork.end().await;
     }
