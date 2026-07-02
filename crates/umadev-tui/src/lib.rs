@@ -42,8 +42,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
@@ -3812,6 +3813,15 @@ fn setup_terminal() -> Result<Term> {
     // (PageUp/PageDown, Home/End, Shift+↑/↓, Ctrl+Alt+U/D). Teardown + the panic
     // hook DisableMouseCapture regardless.
     stdout.execute(EnableMouseCapture).map_err(fail)?;
+    // Focus-change reporting (DEC private mode 1004, `\x1b[?1004h`). When the
+    // terminal window loses then regains focus (alt-tab to another window and
+    // back), some terminals — notably the Windows console / Windows Terminal —
+    // scroll or redraw their own buffer while unfocused, desyncing UmaDev's
+    // incremental-diff render so the UI comes back garbled. With 1004 on, the
+    // terminal emits a FocusGained event on return; the event loop forces a clean
+    // full repaint from a reset back buffer. Teardown, the panic hook, and the
+    // mid-setup failure path all DisableFocusChange symmetrically.
+    stdout.execute(EnableFocusChange).map_err(fail)?;
     // Show the terminal cursor so the user sees a blinking caret in the
     // input box (positioned via frame.set_cursor_position in render_prompt).
     stdout.execute(crossterm::cursor::Show).map_err(fail)?;
@@ -3833,12 +3843,15 @@ fn setup_terminal() -> Result<Term> {
 ///     editing while VT processing is still active.
 ///  2. `LeaveAlternateScreen` — back to the primary screen buffer.
 ///  3. `DisableMouseCapture` — stop SGR mouse reports leaking as `;…M` text.
-///  4. `DisableBracketedPaste` (`\x1b[?2004l`).
-///  5. `EndSynchronizedUpdate` (`\x1b[?2026l`) — defensively clear DEC-2026 even
+///  4. `DisableFocusChange` (`\x1b[?1004l`) — stop focus-in/out reports (`\x1b[I`
+///     / `\x1b[O`) leaking as text once we've left; the symmetric off for the
+///     `EnableFocusChange` setup turned on.
+///  5. `DisableBracketedPaste` (`\x1b[?2004l`).
+///  6. `EndSynchronizedUpdate` (`\x1b[?2026l`) — defensively clear DEC-2026 even
 ///     though every BSU is balanced by an ESU in the loop, so a process that
 ///     exits can never strand the terminal mid-update.
-///  6. `cursor::Show` (`\x1b[?25h`) — the caret must be visible at the shell.
-///  7. `ResetColor` (`\x1b[0m`) — drop any lingering SGR so the prompt isn't
+///  7. `cursor::Show` (`\x1b[?25h`) — the caret must be visible at the shell.
+///  8. `ResetColor` (`\x1b[0m`) — drop any lingering SGR so the prompt isn't
 ///     painted in the last frame's colors.
 ///
 /// Each step is best-effort (`let _ =`) so one failure can't short-circuit the
@@ -3847,6 +3860,7 @@ fn setup_terminal() -> Result<Term> {
 fn restore_sequence<W: std::io::Write>(out: &mut W) {
     let _ = out.execute(LeaveAlternateScreen);
     let _ = out.execute(DisableMouseCapture);
+    let _ = out.execute(DisableFocusChange);
     let _ = out.execute(DisableBracketedPaste);
     let _ = out.execute(EndSynchronizedUpdate);
     let _ = out.execute(crossterm::cursor::Show);
@@ -4124,11 +4138,34 @@ fn scrub_due(live: bool, elapsed: Duration, interval: Duration) -> bool {
     live && elapsed >= interval
 }
 
-/// Whether a resize event needs an atomic full-clear repaint (R4): `true` unless
-/// the new dimensions equal the last drawn ones (debounce a duplicate Resize so
-/// we don't double-clear). Pure, for unit-testing the debounce.
-fn resize_needs_repaint(new: (u16, u16), last: Option<(u16, u16)>) -> bool {
-    last != Some(new)
+/// Whether a resize event needs an atomic full-clear repaint (R4). ALWAYS
+/// `true` — every resize forces a clean repaint, INCLUDING one whose reported
+/// dimensions equal the last drawn frame. The old dimension debounce (skip a
+/// same-size Resize) was WRONG for the focus-return case: a bare window switch
+/// (alt-tab away and back) can deliver a SAME-SIZE resize on some terminals —
+/// notably the Windows console — AFTER the terminal has already scrolled or
+/// redrawn its own buffer, leaving UmaDev's incremental diff out of sync and the
+/// screen garbled. Debouncing that away meant nothing repainted, so the garble
+/// persisted. Repainting unconditionally heals it; the cost is at most one extra
+/// clear+repaint per resize, invisible under synchronized output and negligible
+/// otherwise (resize events are not bursty at the same size). Pure, so the
+/// always-repaint contract is unit-tested.
+fn resize_needs_repaint() -> bool {
+    true
+}
+
+/// Whether a terminal focus-change event needs an atomic full-clear repaint.
+/// `true` on focus GAINED (returning to the window), `false` on focus LOST.
+/// While the window was unfocused the terminal may have scrolled or redrawn its
+/// own buffer (the Windows console notably does), desyncing UmaDev's
+/// incremental-diff render — the reported "alt-tab away and back leaves the UI
+/// garbled". Returning forces one clean full repaint from a reset back buffer;
+/// losing focus needs no repaint. Drives BOTH the native-crossterm `FocusGained`
+/// (the Windows `EventStream` path) and the owned tokenizer's `\x1b[I` focus-in
+/// (which [`InputEvent::Focus(true)`] maps to `Event::FocusGained`). Pure, so the
+/// contract is unit-tested.
+fn focus_gain_needs_repaint(gained: bool) -> bool {
+    gained
 }
 
 /// Whether an input gap is long enough to look like a sleep/wake / re-attach,
@@ -4193,15 +4230,19 @@ fn app_is_live(app: &App, continuous_active: bool) -> bool {
 /// Re-emit the terminal-mode setup escapes (idempotent) after a long input gap
 /// or a job-control resume (R5), healing a dead mouse / stale alt-screen after a
 /// laptop sleep, tmux re-attach, or ssh reconnect. Re-enters the alternate
-/// screen (a no-op if already in alt), re-enables bracketed paste, and re-asserts
-/// the *current* intended mouse-capture state (so a `/mouse`-off preference is
-/// preserved). The caller also sets `force_full_repaint` so the next frame
+/// screen (a no-op if already in alt), re-enables bracketed paste + focus-change
+/// reporting, and re-asserts the *current* intended mouse-capture state (so a
+/// `/mouse`-off preference is preserved). The caller also sets `force_full_repaint` so the next frame
 /// repaints every cell. Writes go through the render's single backend writer,
 /// BETWEEN frames; every write is best-effort, never blocking the loop.
 fn reassert_terminal_modes(terminal: &mut Term, mouse_on: bool) {
     let backend = terminal.backend_mut();
     let _ = backend.execute(EnterAlternateScreen);
     let _ = backend.execute(EnableBracketedPaste);
+    // Re-assert focus-change reporting too — a sleep/wake or re-attach can drop
+    // DEC private mode 1004 alongside paste/mouse, and we rely on FocusGained to
+    // repaint on an alt-tab return.
+    let _ = backend.execute(EnableFocusChange);
     let _ = if mouse_on {
         backend.execute(EnableMouseCapture)
     } else {
@@ -4424,9 +4465,6 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // reader which parks a closed channel by design. The owned path never returns
     // `None` here, so this only ever trips on the legacy FD.
     let mut input_closed = false;
-    // R4 resize debounce — the (w, h) of the last frame we actually drew, so a
-    // duplicate same-dimension Resize event doesn't trigger a second clear.
-    let mut last_drawn_size: Option<(u16, u16)> = None;
     // Generic input-height-change guard. The rendered input-box height from the
     // previous iteration; when it changes (a multi-line history recall, a paste
     // chip expanding, a wrap/newline, a submit clearing a tall box) the prompt
@@ -4580,13 +4618,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             }
             // The scrub/resize/resume repaint (if any) has now been painted.
             force_full_repaint = false;
-            let drawn = draw_result?;
-            // Record the dimensions we just drew at for the R4 resize debounce. Only
-            // write on a real change (this also READS the prior value, so the initial
-            // `None` isn't a dead assignment).
-            if last_drawn_size != Some((drawn.width, drawn.height)) {
-                last_drawn_size = Some((drawn.width, drawn.height));
-            }
+            // Propagate a draw error; the drawn `Rect` is no longer needed (a resize
+            // now unconditionally repaints — see [`resize_needs_repaint`] — so there
+            // is no last-drawn-size debounce to feed).
+            draw_result?;
 
             // Feature A — completion notification. A turn/run that reached a terminal
             // state (finished / aborted / paused at a gate) in the PREVIOUS iteration
@@ -4813,7 +4848,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     }
                     last_input = now;
                 }
-                if let Some(Ok(Event::Resize(w, h))) = &maybe_key {
+                if let Some(Ok(Event::Resize(..))) = &maybe_key {
                     // R4 — atomic resize erase. DON'T `clear()` immediately (that
                     // blanks the screen for a frame → flicker). Instead request a
                     // full clear+repaint for the NEXT frame, which happens
@@ -4821,10 +4856,29 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // visible until the new-size frame swaps in atomically. This
                     // also heals the STALE cells some terminals (notably the
                     // Windows console) leave after a resize that ratatui's
-                    // incremental diff won't overwrite. Debounce a duplicate Resize
-                    // whose dimensions equal the last drawn size so we don't
-                    // double-clear. Fail-open.
-                    if resize_needs_repaint((*w, *h), last_drawn_size) {
+                    // incremental diff won't overwrite. A resize ALWAYS repaints,
+                    // INCLUDING a same-size resize: a window switch / focus return
+                    // can deliver a same-dimension Resize on some terminals after the
+                    // terminal has already scrolled/redrawn its buffer, so debouncing
+                    // it away would leave the garble on screen (see
+                    // [`resize_needs_repaint`]). Fail-open.
+                    if resize_needs_repaint() {
+                        force_full_repaint = true;
+                    }
+                } else if let Some(Ok(ev @ (Event::FocusGained | Event::FocusLost))) = &maybe_key {
+                    // Focus change (DEC mode 1004). While the window was unfocused the
+                    // terminal may have scrolled or redrawn its own buffer — the
+                    // Windows console notably does — desyncing UmaDev's incremental
+                    // diff so the UI comes back garbled (the reported "alt-tab away
+                    // and back messes up the TUI"). Force one clean full repaint on
+                    // focus GAIN so the next frame redraws every cell from a reset
+                    // back buffer. This single arm covers BOTH the native-crossterm
+                    // `FocusGained` (the Windows `EventStream` path) AND the owned
+                    // tokenizer's `\x1b[I` focus-in (mapped to `Event::FocusGained`).
+                    // Focus LOSS needs no repaint and falls through as a no-op.
+                    // Fail-open (harmless on unix: returning to a well-behaved xterm
+                    // just repaints one clean frame).
+                    if focus_gain_needs_repaint(matches!(ev, Event::FocusGained)) {
                         force_full_repaint = true;
                     }
                 } else if let Some(Ok(Event::Mouse(me))) = &maybe_key {
@@ -9637,27 +9691,88 @@ mod tests {
     }
 
     #[test]
-    fn r4_resize_debounce_skips_identical_dimensions() {
-        // First resize ever (no last-drawn size) → repaint.
+    fn r4_resize_always_repaints_even_same_size() {
+        // A resize ALWAYS forces a full-clear repaint — the old same-size debounce
+        // was removed because a bare window switch / focus return (alt-tab away and
+        // back) can deliver a SAME-SIZE resize on some terminals AFTER the terminal
+        // has already scrolled/redrawn its buffer; debouncing it left the garble on
+        // screen. There are no longer any dimensions to disagree on: every resize
+        // repaints.
         assert!(
-            resize_needs_repaint((120, 40), None),
-            "first resize forces a repaint"
+            resize_needs_repaint(),
+            "a resize — including a same-size window-switch/focus-return resize — \
+             forces a full repaint"
         );
-        // A real size change → repaint (heal stale cells some terminals leave).
+    }
+
+    #[test]
+    fn focus_gain_forces_a_full_repaint_but_focus_loss_does_not() {
+        // Returning to the window (FocusGained) forces one clean full repaint — the
+        // fix for "alt-tab away and back leaves the TUI garbled" on the Windows
+        // console. This drives BOTH the native-crossterm `FocusGained` and the owned
+        // tokenizer's `\x1b[I` focus-in (which maps to `Event::FocusGained`).
         assert!(
-            resize_needs_repaint((100, 30), Some((120, 40))),
-            "different dimensions force a repaint"
+            focus_gain_needs_repaint(true),
+            "focus gained (returning to the window) forces a full repaint"
         );
-        // A duplicate Resize with the SAME dimensions as the last drawn frame →
-        // debounced, no second clear.
+        // Losing focus does not need a repaint (the frame that's up is fine; only the
+        // return, after the terminal may have redrawn its buffer, must scrub).
         assert!(
-            !resize_needs_repaint((120, 40), Some((120, 40))),
-            "identical dimensions are debounced (no double-clear)"
+            !focus_gain_needs_repaint(false),
+            "focus lost needs no repaint"
         );
-        // Only one axis changing still counts as a change.
+    }
+
+    #[test]
+    fn owned_focus_in_sequence_drives_a_full_repaint() {
+        // End-to-end through the OWNED input pipeline (tokenizer → decoder): the
+        // focus-in escape `\x1b[I` must decode to a focus-in event, which the reader
+        // maps to `Event::FocusGained` and the event loop turns into a full repaint.
+        // This is the owned-path (non-Windows default) counterpart to the native
+        // `Event::FocusGained` the Windows `EventStream` delivers.
+        use crate::input::decode::{Decoder, InputEvent};
+        use crate::input::tokenize::Tokenizer;
+        let mut tk = Tokenizer::for_stdin();
+        let mut dec = Decoder::new();
+        let mut got_focus_in = false;
+        for token in tk.feed(b"\x1b[I") {
+            for ev in dec.feed_token(token) {
+                if ev == InputEvent::Focus(true) {
+                    got_focus_in = true;
+                }
+            }
+        }
         assert!(
-            resize_needs_repaint((120, 41), Some((120, 40))),
-            "a height-only change still forces a repaint"
+            got_focus_in,
+            "the owned tokenizer decodes CSI I (`\\x1b[I`) to a focus-in event"
+        );
+        // A focus-in (→ Event::FocusGained) forces a full repaint.
+        assert!(
+            focus_gain_needs_repaint(true),
+            "the owned focus-in must force a full repaint on return"
+        );
+    }
+
+    #[test]
+    fn setup_enables_and_restore_disables_focus_change_reporting() {
+        use crossterm::ExecutableCommand as _;
+        // Setup turns focus-change reporting ON via `EnableFocusChange`
+        // (DEC private mode 1004 = `\x1b[?1004h`), the exact escape `setup_terminal`
+        // writes so the terminal reports focus in/out.
+        let mut enable_buf: Vec<u8> = Vec::new();
+        let _ = enable_buf.execute(EnableFocusChange);
+        assert!(
+            String::from_utf8_lossy(&enable_buf).contains("\x1b[?1004h"),
+            "setup must enable focus-change reporting (mode 1004h)"
+        );
+        // Teardown / panic hook / mid-setup failure all route through
+        // `restore_sequence`, which must turn it back OFF symmetrically so focus
+        // reports never leak as `\x1b[I` / `\x1b[O` text at the restored shell.
+        let mut restore_buf: Vec<u8> = Vec::new();
+        restore_sequence(&mut restore_buf);
+        assert!(
+            String::from_utf8_lossy(&restore_buf).contains("\x1b[?1004l"),
+            "restore must disable focus-change reporting (mode 1004l)"
         );
     }
 
