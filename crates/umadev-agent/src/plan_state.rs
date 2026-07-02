@@ -151,6 +151,16 @@ impl AcceptanceSpec {
             }
         }
     }
+
+    /// Whether this acceptance criterion is a STRONGER bar than the bare
+    /// source-present / turn-settled floor — i.e. it names a real, checkable outcome
+    /// (a green build/test, a matching FE↔BE contract, the design-tokens deliverable,
+    /// a clean review) rather than merely "some source exists". The per-seat evidence
+    /// floor reads this to tell an already-contracted step (leave it) from an
+    /// under-specified one (augment it).
+    fn is_strong(&self) -> bool {
+        !matches!(self, Self::SourcePresent | Self::TurnSettled)
+    }
 }
 
 /// A TYPED EVIDENCE CONTRACT for one plan step — an explicit, machine-checkable
@@ -393,6 +403,16 @@ impl EvidenceContract {
             _ => None,
         }
     }
+
+    /// Whether this contract is a STRONGER falsifiable bar than the bare
+    /// source-present honesty floor — i.e. it names a specific checkable fact (a named
+    /// file/route/test, a green build, a matching contract, or a retained
+    /// [`Self::Malformed`] held-gap) beyond "some source exists". Only
+    /// [`Self::SourcePresent`] is non-strong. The per-seat evidence floor uses this to
+    /// decide whether a step already carries a real per-step contract.
+    fn is_strong(&self) -> bool {
+        !matches!(self, Self::SourcePresent)
+    }
 }
 
 /// Read a JSON status value as an `Option<u16>`, accepting both a number (`200`) and
@@ -430,6 +450,15 @@ fn parse_brain_evidence(values: &[serde_json::Value]) -> Vec<EvidenceContract> {
     out
 }
 
+/// Push `c` onto a step's evidence list only when an EQUAL contract is not already
+/// present (dedupe, preserving first-seen order) — so a per-seat / falsifiability
+/// augmentation never duplicates a contract the brain volunteered.
+fn push_unique(evidence: &mut Vec<EvidenceContract>, c: EvidenceContract) {
+    if !evidence.contains(&c) {
+        evidence.push(c);
+    }
+}
+
 /// One node in the plan DAG. Owns its dependencies (`depends_on`) so independent
 /// nodes are parallelisable and the director can schedule by readiness, not a flat
 /// list.
@@ -461,6 +490,18 @@ pub struct PlanStep {
     pub evidence: Vec<EvidenceContract>,
     /// Lifecycle status (persisted, so the plan resumes).
     pub status: StepStatus,
+}
+
+impl PlanStep {
+    /// Whether this step already carries a falsifiable contract stronger than the bare
+    /// source-present floor — via a strong typed [`EvidenceContract`] OR a non-trivial
+    /// [`AcceptanceSpec`]. A BUILD step that does NOT is "under-specified":
+    /// [`Plan::enforce_seat_evidence_floor`] augments it with a seat-appropriate default
+    /// (it never touches a step that already has one, so a brain-volunteered contract is
+    /// never removed or downgraded).
+    fn has_strong_contract(&self) -> bool {
+        self.acceptance.is_strong() || self.evidence.iter().any(EvidenceContract::is_strong)
+    }
 }
 
 /// UmaDev's owned plan for a build — a DAG of steps plus the brain's surfaced risks
@@ -665,6 +706,16 @@ impl Plan {
         self.enforce_contract_first();
         self.enforce_test_authoring_independence();
         self.break_dependency_cycles();
+        // PER-SEAT DETERMINISTIC FLOOR (verification-level seat differentiation) —
+        // orthogonal to the DAG above: augment an UNDER-SPECIFIED build step with a
+        // seat-appropriate default evidence contract (backend → FE↔BE contract, QA →
+        // tests pass, frontend/security → build+lint clean), then a falsifiability
+        // backstop when the brain under-specified the plan wholesale. Augment-only +
+        // fail-open: a step already carrying a strong contract, or a seat with no floor,
+        // is left exactly as today. See [`Self::enforce_seat_evidence_floor`] /
+        // [`Self::enforce_falsifiability_floor`].
+        self.enforce_seat_evidence_floor();
+        self.enforce_falsifiability_floor();
         self.risks.retain(|r| !r.trim().is_empty());
         self.open_questions.retain(|q| !q.trim().is_empty());
         Some(self)
@@ -803,6 +854,78 @@ impl Plan {
             // A QA test-authoring step is a QA-seated step that BUILDS (writes tests).
             if s.kind == StepKind::Build && s.seat == Seat::QaEngineer {
                 s.depends_on.retain(|d| !code_ids.contains(d));
+            }
+        }
+    }
+
+    /// **Per-seat deterministic acceptance floor** — auto-attach a seat-appropriate
+    /// default [`EvidenceContract`] to a BUILD step the brain left UNDER-SPECIFIED, so
+    /// seats are mechanically differentiated at VERIFICATION time (a backend step is
+    /// judged by its FE↔BE contract / a real route registration, a QA step by tests
+    /// actually passing, a frontend/security step by a clean build+lint) rather than
+    /// only narratively. This AUGMENTS: it fires ONLY for a step carrying no contract
+    /// stronger than source-present ([`PlanStep::has_strong_contract`]), so a
+    /// brain-volunteered contract is never removed or downgraded. Every default is a
+    /// variant the existing deterministic floor already verifies — no new gate, no new
+    /// [`EvidenceContract`] variant. A REVIEW step, a seat with no floor, or an
+    /// already-contracted step is left exactly as today (fail-open). Bounded (one pass);
+    /// pure over `self`.
+    fn enforce_seat_evidence_floor(&mut self) {
+        for s in &mut self.steps {
+            // Only a BUILD step is judged by an evidence contract; a REVIEW step is
+            // judged by its reviewing seat's verdict (ReviewClean) and is left alone.
+            // An already-contracted step is never touched (augment, never downgrade).
+            if s.kind != StepKind::Build || s.has_strong_contract() {
+                continue;
+            }
+            let default = match s.seat {
+                // Backend: the FE↔BE contract must hold — the same backend-route
+                // registration check the deterministic floor runs, so the endpoint has
+                // something to verify (not just "some source exists").
+                Seat::BackendEngineer => EvidenceContract::ContractMatches,
+                // QA: a test-authoring step is meaningless unless tests actually pass.
+                Seat::QaEngineer => EvidenceContract::TestPasses { name: None },
+                // Frontend / Security: the real build/test/lint must pass — where the
+                // frontend craft-governance (banned patterns / a11y lint) runs and a
+                // security change's regressions surface.
+                Seat::FrontendEngineer | Seat::SecurityEngineer => EvidenceContract::BuildClean,
+                // Every other seat keeps today's behaviour (fail-open); the
+                // falsifiability backstop below still covers a wholesale-sloppy plan.
+                _ => continue,
+            };
+            push_unique(&mut s.evidence, default);
+        }
+    }
+
+    /// **Falsifiability backstop** — if, AFTER the per-seat floor, strictly MORE THAN
+    /// HALF the plan's BUILD steps STILL carry no contract stronger than source-present,
+    /// the brain under-specified the plan wholesale (falsifiability is brain-optional, so
+    /// a lazy plan ships build steps proven by nothing but "a file exists"). Synthesize a
+    /// sane deterministic default — [`EvidenceContract::BuildClean`], the project's real
+    /// build/test/lint — on each STILL-bare build step, so "done" stays falsifiable even
+    /// for a sloppy plan. (`PlanStep` carries no declared-files field to mint a
+    /// `FileExists` from, and there is no re-ask channel back to the coordinator that
+    /// stays inside this module, so a deterministic default is the bounded, fail-open
+    /// choice.) A step already carrying a strong contract is never touched; no build step
+    /// ⇒ a no-op. Pure over `self`.
+    fn enforce_falsifiability_floor(&mut self) {
+        let build_total = self
+            .steps
+            .iter()
+            .filter(|s| s.kind == StepKind::Build)
+            .count();
+        let bare = self
+            .steps
+            .iter()
+            .filter(|s| s.kind == StepKind::Build && !s.has_strong_contract())
+            .count();
+        // Trip only on STRICTLY more than half the build steps still bare.
+        if build_total == 0 || bare * 2 <= build_total {
+            return;
+        }
+        for s in &mut self.steps {
+            if s.kind == StepKind::Build && !s.has_strong_contract() {
+                push_unique(&mut s.evidence, EvidenceContract::BuildClean);
             }
         }
     }
@@ -2032,6 +2155,271 @@ mod tests {
         assert_eq!(
             loaded, p,
             "the typed evidence contract survives persistence"
+        );
+    }
+
+    // ── Per-seat deterministic acceptance floor ──────────────────────────────
+
+    /// Find a step's evidence by id (test helper).
+    fn ev_of<'a>(p: &'a Plan, id: &str) -> &'a [EvidenceContract] {
+        &p.steps.iter().find(|s| s.id == id).unwrap().evidence
+    }
+
+    #[test]
+    fn backend_build_step_gains_a_contract_floor_when_bare() {
+        // A backend build step the brain left with only the source-present floor gains a
+        // FE↔BE ContractMatches bar — so it is judged by a real route registration, the
+        // seat-appropriate mechanical check, not by "some source exists".
+        let p = plan(vec![step_seat(
+            "api",
+            &[],
+            Seat::BackendEngineer,
+            StepKind::Build,
+            AcceptanceSpec::SourcePresent,
+        )])
+        .normalized()
+        .expect("usable");
+        assert!(
+            ev_of(&p, "api").contains(&EvidenceContract::ContractMatches),
+            "a bare backend build step gains an endpoint/contract floor: {:?}",
+            ev_of(&p, "api")
+        );
+    }
+
+    #[test]
+    fn qa_build_step_gains_a_test_passes_floor_when_bare() {
+        // A bare QA build step is meaningless unless tests actually pass — it gains a
+        // TestPasses bar. (A frontend peer keeps the plan below the wholesale backstop.)
+        let p = plan(vec![
+            step_seat(
+                "qa",
+                &[],
+                Seat::QaEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "ui",
+                &[],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized()
+        .expect("usable");
+        assert!(
+            ev_of(&p, "qa")
+                .iter()
+                .any(|c| matches!(c, EvidenceContract::TestPasses { .. })),
+            "a bare QA build step is judged by tests passing: {:?}",
+            ev_of(&p, "qa")
+        );
+    }
+
+    #[test]
+    fn frontend_build_step_gains_a_build_governance_floor_when_bare() {
+        // A bare frontend build step gains a BuildClean bar — where the frontend
+        // craft-governance (banned patterns / a11y lint) actually runs.
+        let p = plan(vec![step_seat(
+            "ui",
+            &[],
+            Seat::FrontendEngineer,
+            StepKind::Build,
+            AcceptanceSpec::SourcePresent,
+        )])
+        .normalized()
+        .expect("usable");
+        assert!(
+            ev_of(&p, "ui").contains(&EvidenceContract::BuildClean),
+            "a bare frontend build step is judged by the build/lint governance floor: {:?}",
+            ev_of(&p, "ui")
+        );
+    }
+
+    #[test]
+    fn security_doing_step_gains_a_build_floor_when_bare() {
+        // A (rare) security BUILD step gains a BuildClean bar — a security change must at
+        // least keep the build/test green, a falsifiable bar stronger than source-present.
+        let p = plan(vec![step_seat(
+            "harden",
+            &[],
+            Seat::SecurityEngineer,
+            StepKind::Build,
+            AcceptanceSpec::SourcePresent,
+        )])
+        .normalized()
+        .expect("usable");
+        assert!(
+            ev_of(&p, "harden").contains(&EvidenceContract::BuildClean),
+            "a bare security doing step references a real build bar: {:?}",
+            ev_of(&p, "harden")
+        );
+    }
+
+    #[test]
+    fn a_strong_brain_contract_is_never_downgraded_by_the_seat_floor() {
+        // A backend build step the brain ALREADY gave a specific route probe. The
+        // per-seat floor must leave it EXACTLY as-is — augment only the under-specified,
+        // never weaken or bolt a redundant ContractMatches onto a volunteered contract.
+        let mut s = step_seat(
+            "login",
+            &[],
+            Seat::BackendEngineer,
+            StepKind::Build,
+            AcceptanceSpec::SourcePresent,
+        );
+        s.evidence = vec![EvidenceContract::RouteResponds {
+            method: "POST".into(),
+            path: "/api/login".into(),
+            status: Some(200),
+        }];
+        let p = plan(vec![s]).normalized().expect("usable");
+        assert_eq!(
+            ev_of(&p, "login"),
+            &[EvidenceContract::RouteResponds {
+                method: "POST".into(),
+                path: "/api/login".into(),
+                status: Some(200),
+            }],
+            "a strong brain contract is preserved unchanged"
+        );
+    }
+
+    #[test]
+    fn a_strong_acceptance_step_is_left_bare_of_added_evidence() {
+        // A designer build step whose acceptance IS the design-tokens deliverable already
+        // carries a falsifiable contract via its acceptance — the floor adds nothing.
+        let p = plan(vec![step_seat(
+            "tokens",
+            &[],
+            Seat::UiuxDesigner,
+            StepKind::Build,
+            AcceptanceSpec::DesignTokensPresent,
+        )])
+        .normalized()
+        .expect("usable");
+        assert!(
+            ev_of(&p, "tokens").is_empty(),
+            "a strong acceptance is already falsifiable; no evidence is bolted on: {:?}",
+            ev_of(&p, "tokens")
+        );
+    }
+
+    #[test]
+    fn unknown_seat_falls_open_to_todays_behavior() {
+        // A devops build step (no per-seat floor) alongside a frontend step so the
+        // wholesale backstop does NOT trip (only 1 of 2 build steps stays bare). The
+        // devops step keeps today's behaviour: no fabricated seat contract.
+        let p = plan(vec![
+            step_seat(
+                "deploy",
+                &[],
+                Seat::DevopsEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "ui",
+                &[],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized()
+        .expect("usable");
+        assert!(
+            ev_of(&p, "deploy").is_empty(),
+            "an unknown seat gets no per-seat contract and (below the >50% threshold) no backstop: {:?}",
+            ev_of(&p, "deploy")
+        );
+        // …while its frontend peer still got the per-seat floor.
+        assert!(ev_of(&p, "ui").contains(&EvidenceContract::BuildClean));
+    }
+
+    #[test]
+    fn review_step_is_never_given_an_evidence_floor() {
+        // A REVIEW step is judged by its reviewing seat's verdict, not an evidence
+        // contract — the floor must leave it untouched even when seated by a doer.
+        let p = plan(vec![step_seat(
+            "qa-review",
+            &[],
+            Seat::QaEngineer,
+            StepKind::Review,
+            AcceptanceSpec::ReviewClean,
+        )])
+        .normalized()
+        .expect("usable");
+        assert!(
+            ev_of(&p, "qa-review").is_empty(),
+            "a review step carries no synthesized evidence: {:?}",
+            ev_of(&p, "qa-review")
+        );
+    }
+
+    #[test]
+    fn falsifiability_backstop_fires_when_most_build_steps_are_bare() {
+        // A plan the brain left broadly under-specified: two PM build steps (no per-seat
+        // floor covers PM) with only the honesty floor. MORE THAN HALF the build steps
+        // are bare → the backstop synthesizes a deterministic BuildClean bar on each.
+        let p = plan(vec![
+            step_seat(
+                "prd",
+                &[],
+                Seat::ProductManager,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "scope",
+                &[],
+                Seat::ProductManager,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized()
+        .expect("usable");
+        for id in ["prd", "scope"] {
+            assert!(
+                ev_of(&p, id).contains(&EvidenceContract::BuildClean),
+                "{id} gains a falsifiability floor when the plan is broadly under-specified: {:?}",
+                ev_of(&p, id)
+            );
+        }
+    }
+
+    #[test]
+    fn falsifiability_backstop_does_not_fire_when_the_plan_is_well_specified() {
+        // When at most half the build steps are bare after the per-seat floor, the
+        // backstop stays quiet — one bare PM step alongside a contracted backend step is
+        // exactly half, below the STRICT >50% threshold, so the PM step stays as-is.
+        let p = plan(vec![
+            step_seat(
+                "api",
+                &[],
+                Seat::BackendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "prd",
+                &[],
+                Seat::ProductManager,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized()
+        .expect("usable");
+        // Backend got its per-seat contract; the lone bare PM step is exactly half →
+        // no wholesale backstop, so it keeps today's behaviour (empty evidence).
+        assert!(ev_of(&p, "api").contains(&EvidenceContract::ContractMatches));
+        assert!(
+            ev_of(&p, "prd").is_empty(),
+            "a single bare step at exactly half must NOT trip the >50% backstop: {:?}",
+            ev_of(&p, "prd")
         );
     }
 }
