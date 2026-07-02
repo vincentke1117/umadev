@@ -16,10 +16,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Build BOTH linux-gnu targets through `cross`, whose images are
+          # Ubuntu 20.04-based (glibc 2.31), so the shipped binaries run on any
+          # glibc >= 2.31. A plain `cargo build` on ubuntu-latest links against
+          # the runner's glibc (2.39 on Ubuntu 24.04), which fails on common
+          # distros (RHEL/Rocky 9, Ubuntu 22.04, etc.) with `GLIBC_2.39 not
+          # found`. cross is already proven here with --features vector-local
+          # (candle + esaxx C++) for aarch64, so x86_64 rides the same path.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             ext: ""
             npm_platform: linux-x64
+            cross: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             ext: ""
@@ -45,11 +53,14 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      # aarch64-unknown-linux-gnu needs `cross` (avoids the missing
-      # gcc-aarch64-linux-gnu sysroot on plain ubuntu-latest runners).
+      # Both linux-gnu targets build via `cross`: aarch64 needs it for the
+      # sysroot, and x86_64 uses it to link against an old glibc. Pin the
+      # version so the glibc floor is deterministic — cross 0.2.5's linux-gnu
+      # images are Ubuntu 20.04-based (glibc 2.31); an unpinned upgrade could
+      # silently raise that floor and re-break older distros.
       - name: Install cross
         if: matrix.cross == true
-        run: cargo install cross --locked
+        run: cargo install cross --version 0.2.5 --locked
 
       # --features vector-local bundles the candle local-embedding backend so the
       # shipped binary embeds offline (zero user setup). candle is pure Rust on
@@ -61,6 +72,23 @@ jobs:
       - name: Build (cross)
         if: matrix.cross == true
         run: cross build --release --bin umadev --features vector-local --target ${{ matrix.target }}
+
+      # Self-verify the glibc floor: a linux binary that requires a symbol
+      # newer than GLIBC_2.31 would break older distros (the GLIBC_2.39 report
+      # that motivated the cross switch). Built inside cross's Ubuntu 20.04
+      # image nothing should exceed 2.31 — fail the release loudly if it does,
+      # so this can never silently regress. objdump on the runner parses the
+      # ELF symbol table regardless of arch or the runner's own glibc.
+      - name: Verify glibc floor (linux)
+        if: contains(matrix.target, 'linux-gnu')
+        run: |
+          bin="target/${{ matrix.target }}/release/umadev"
+          max=$(objdump -T "$bin" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1)
+          echo "highest required glibc symbol: ${max:-none}"
+          if [ -n "$max" ] && [ "$(printf '%s\nGLIBC_2.31\n' "$max" | sort -V | tail -1)" != "GLIBC_2.31" ]; then
+            echo "::error::$bin requires $max (> GLIBC_2.31) — would break glibc 2.31–2.34 systems"
+            exit 1
+          fi
 
       - name: Stage binary into dist/ + npm/
         shell: bash
