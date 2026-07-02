@@ -1382,6 +1382,8 @@ fn render_quality(slug: &str) -> String {
         "## Role\n\nQuality lead + design critic.\n\n\
          ## Dependencies before tests (do this FIRST)\n\n\
          {deps}\n\n\
+         ## Windows shell invocation (environment gate — never blind-retry)\n\n\
+         {winshell}\n\n\
          ## Task\n\nTwo-part quality check:\n\n\
          ### Part 1 — Automated gate\n\n\
          UmaDev runs the quality gate automatically. Review \
@@ -1402,6 +1404,7 @@ fn render_quality(slug: &str) -> String {
          No new artifact — the gate report + your 5-dimension scores. Make sure \
          `quality_gate_passed: true` and all 5 dimensions ≥ minimum before delivery.\n",
         deps = crate::experts::deps_before_tests_directive(),
+        winshell = crate::experts::windows_shell_directive(),
     )
 }
 
@@ -1650,6 +1653,53 @@ mod tests {
             text.contains("pip install -e") && text.contains("poetry install --with dev"),
             "covers the ecosystems"
         );
+        // No emoji as functional markers (governance floor: UD-CODE-001).
+        assert!(
+            !text.chars().any(|c| {
+                let u = c as u32;
+                (0x1F300..=0x1FAFF).contains(&u) || (0x2600..=0x27BF).contains(&u)
+            }),
+            "the standard must contain no emoji"
+        );
+    }
+
+    #[test]
+    fn quality_coach_prompt_carries_windows_shell_invocation_guidance() {
+        // The build/verify phase teaches the Windows invocation up front: node CLIs
+        // through cmd (`cmd /c npm ...`), never `powershell.exe -Command 'npm ...'`
+        // — and an execution-policy error means CHANGE the invocation, not retry.
+        // Self-gated like deps-before-tests: only the quality phase carries it.
+        let tmp = TempDir::new().unwrap();
+        let body = render_coach_prompt(&opts(tmp.path()), Phase::Quality);
+        assert!(body.contains("WINDOWS SHELL INVOCATION"), "{body}");
+        assert!(body.contains("cmd /c npm"));
+        assert!(body.contains("ENVIRONMENT GATE"));
+        let fe = render_coach_prompt(&opts(tmp.path()), Phase::Frontend);
+        assert!(!fe.contains("WINDOWS SHELL INVOCATION"), "{fe}");
+    }
+
+    #[test]
+    fn windows_shell_knowledge_standard_exists() {
+        // Prong 3: the curated standard "Windows 上 node 工具链的 shell 调用规范"
+        // ships in the bundled corpus with the house frontmatter, the cmd /c
+        // pattern, the .ps1-shim trap in both languages, and the environment-gate
+        // rule — and carries no emoji.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../knowledge/development/01-standards/windows-node-cli-invocation.md");
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("knowledge standard missing at {}: {e}", path.display()));
+        assert!(text.contains("quality_score: 95"), "house frontmatter");
+        assert!(text.contains("category: 01-standards"));
+        // The correct invocation pattern.
+        assert!(text.contains("cmd /c npm") && text.contains("cmd /c npx"));
+        assert!(text.contains("npm.cmd") && text.contains("npx.cmd"));
+        // The trap, named in both languages so retrieval hits either transcript.
+        assert!(text.contains("禁止运行脚本"));
+        assert!(text.contains("running scripts is disabled"));
+        // Environment gate ≠ flaky failure: never blind-retry; bypass is fallback;
+        // the machine policy is the user's setting.
+        assert!(text.contains("环境闸门"));
+        assert!(text.contains("ExecutionPolicy Bypass"));
         // No emoji as functional markers (governance floor: UD-CODE-001).
         assert!(
             !text.chars().any(|c| {

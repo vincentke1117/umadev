@@ -570,6 +570,43 @@ pub fn deps_before_tests_directive() -> &'static str {
      - npm / pnpm / yarn: `npm ci` (installs devDependencies too), then run the tests."
 }
 
+/// The WINDOWS-SHELL directive — how to invoke node-ecosystem CLIs on Windows
+/// so a run never trips the PowerShell execution-policy gate, and how to react
+/// if it does (change the invocation — never blind-retry).
+///
+/// User-reported recurring dead loop: on Windows the base runs a node CLI
+/// through PowerShell (`powershell.exe -Command 'npm i'`); PowerShell resolves
+/// the `npm.ps1` shim, which the default Restricted execution policy refuses to
+/// load ("…cannot be loaded because running scripts is disabled on this system"
+/// / 「无法加载文件 …npm.ps1，因为在此系统上禁止运行脚本」, `PSSecurityException`)
+/// — and the base then RETRIES THE SAME COMMAND, again and again. An
+/// execution-policy refusal is a deterministic ENVIRONMENT GATE, not a flaky
+/// failure: the identical command can never succeed, so the only correct move
+/// is to change the invocation — go through `cmd` so the `.cmd` shim resolves
+/// (`cmd /c npm …`), or call `npm.cmd` / `npx.cmd` directly. A per-invocation
+/// `-ExecutionPolicy Bypass` is a fallback only; the machine-wide policy is the
+/// USER's security setting and is never changed.
+///
+/// Injected ONLY on the build / verify path (the Quality directive + the full
+/// build framing) — the same self-gating as [`deps_before_tests_directive`] —
+/// never a pure-chat turn. A STATIC string (no retrieval / no I/O / no OS
+/// probe), so carrying it costs nothing.
+#[must_use]
+pub fn windows_shell_directive() -> &'static str {
+    "WINDOWS SHELL INVOCATION (node tooling): on Windows, run node-ecosystem CLIs \
+     (npm / npx / pnpm / yarn / node-gyp) through cmd — `cmd /c npm install`, \
+     `cmd /c npx <tool>` — or call the `.cmd` shim directly (`npm.cmd`, `npx.cmd`). \
+     NEVER through `powershell.exe -Command 'npm ...'`: PowerShell resolves the \
+     `npm.ps1` shim, which the default execution policy blocks — \"cannot be loaded \
+     because running scripts is disabled on this system\" (about_Execution_Policies, \
+     PSSecurityException) / 「无法加载文件 …npm.ps1,因为在此系统上禁止运行脚本」. \
+     That error is an ENVIRONMENT GATE, not a flaky failure: retrying the identical \
+     command can NEVER succeed — when you see it, CHANGE the invocation to the cmd \
+     form and move on. A one-off `powershell -ExecutionPolicy Bypass -File ...` is a \
+     last-resort fallback only; do NOT change the user's machine execution policy \
+     (it is their security setting)."
+}
+
 /// The explicit ROLE PERSONA line that opens a phase directive on the continuous
 /// path — "you are now working as a senior X; your remit is Y". Prepending it to
 /// each phase's imperative directive makes the base step into the matching seat
@@ -875,8 +912,10 @@ pub fn director_build_directive(requirement: &str) -> String {
          Build to your team's craft and taste, write real representative content \
          (never placeholders), and ground every \"done\" claim in the real files on \
          disk and the project's real build/test — report only what actually works.\n\n\
-         {deps}",
-        deps = deps_before_tests_directive()
+         {deps}\n\n\
+         {winshell}",
+        deps = deps_before_tests_directive(),
+        winshell = windows_shell_directive()
     )
 }
 
@@ -1151,6 +1190,44 @@ mod tests {
             "full build directive carries the deps-before-tests guidance: {d}"
         );
         assert!(d.contains("DEPENDENCIES BEFORE TESTS"));
+    }
+
+    #[test]
+    fn windows_shell_directive_teaches_cmd_not_the_ps1_shim() {
+        // The Windows guidance leads with the correct invocation (cmd resolves the
+        // .cmd shim), forbids the powershell -Command form, names the error in both
+        // languages, and frames it as an environment gate — never a retry.
+        let d = windows_shell_directive();
+        assert!(d.contains("cmd /c npm"));
+        assert!(d.contains("cmd /c npx"));
+        assert!(d.contains("npm.cmd") && d.contains("npx.cmd"));
+        assert!(d.contains("powershell.exe -Command"));
+        // Both language forms of the error are named so the base recognises it.
+        assert!(d.contains("running scripts is disabled"));
+        assert!(d.contains("禁止运行脚本"));
+        // Environment gate ≠ flaky failure: never blind-retry the same command.
+        assert!(d.contains("ENVIRONMENT GATE"));
+        assert!(d.contains("NEVER succeed"));
+        // Bypass is a fallback only; the machine policy stays the user's setting.
+        assert!(d.contains("-ExecutionPolicy Bypass"));
+        assert!(d.contains("do NOT change the user's machine execution policy"));
+    }
+
+    #[test]
+    fn full_build_directive_carries_windows_shell_guidance() {
+        // The full commercial build (where the base installs deps + runs the real
+        // build/test itself) carries the Windows invocation guidance, so on a
+        // Windows box it goes through cmd instead of the blocked .ps1 shim.
+        let d = director_build_directive("做一个带邮箱登录的 SaaS 数据分析仪表盘,要能上线");
+        assert!(
+            d.contains("WINDOWS SHELL INVOCATION"),
+            "full build directive carries the windows-shell guidance: {d}"
+        );
+        assert!(d.contains("cmd /c npm"));
+        // The lean tier stays terse — it does not carry the block (same gating as
+        // deps-before-tests: build/verify surfaces only, never a small task's frame).
+        let lean = director_build_directive("帮我改个文案");
+        assert!(!lean.contains("WINDOWS SHELL INVOCATION"), "{lean}");
     }
 
     #[test]

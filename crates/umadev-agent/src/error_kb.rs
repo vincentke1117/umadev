@@ -25,7 +25,7 @@
 pub struct ErrorInsight {
     /// Coarse family bucket — also the `domain` the lesson sediments under
     /// (`dependency`, `type`, `runtime`, `network`, `api`, `config`, `build`,
-    /// `test`, `lint`, `general`).
+    /// `test`, `lint`, `windows`, `general`).
     pub category: String,
     /// Stable, volatility-stripped dedup key, e.g.
     /// `dependency/module-not-found/react-router-dom`. The same class of error
@@ -86,6 +86,14 @@ pub fn looks_like_error(text: &str) -> bool {
         "unexpected",
         "refused",
         "✕",
+        // PowerShell execution-policy refusals carry NO generic English error
+        // token on their first line ("File …npm.ps1 cannot be loaded because
+        // running scripts is disabled…" / "无法加载文件 …，因为在此系统上禁止
+        // 运行脚本"), so the precise policy phrasing itself must be a STRONG
+        // marker or capture sites drop the recurring pitfall before it ever
+        // reaches `classify_error`.
+        "running scripts is disabled",
+        "禁止运行脚本",
     ];
     if STRONG_MARKERS.iter().any(|m| lower.contains(m)) {
         return true;
@@ -145,6 +153,7 @@ pub fn classify_error(text: &str) -> ErrorInsight {
 
     // Ordered, most-specific first. The first detector to fire wins.
     for detector in [
+        detect_powershell_policy,
         detect_missing_test_tool,
         detect_missing_module,
         detect_package_manager,
@@ -172,6 +181,69 @@ pub fn classify_error(text: &str) -> ErrorInsight {
 // ---------------------------------------------------------------------------
 // Detectors — each returns Some(insight) when its family matches.
 // ---------------------------------------------------------------------------
+
+/// PowerShell refused to run a `.ps1` command shim under the machine's
+/// execution policy — the user-reported recurring dead loop on Windows.
+///
+/// The failure shape: the base invokes a node-ecosystem CLI through PowerShell
+/// (`powershell.exe -Command 'npm i'`); PowerShell resolves the `npm.ps1` shim,
+/// which the default Restricted execution policy refuses to load — English
+/// "…npm.ps1 cannot be loaded because running scripts is disabled on this
+/// system" (`about_Execution_Policies`, `PSSecurityException`,
+/// `UnauthorizedAccess`) or Chinese "无法加载文件 …npm.ps1，因为在此系统上禁止
+/// 运行脚本". Critically this is an **environment gate, not a flaky failure**:
+/// the policy is deterministic, so retrying the identical command can never
+/// succeed — yet the observed behavior is exactly that, retry after retry. The
+/// avoidance therefore leads with "change the invocation": go through `cmd`
+/// (`cmd /c npm …` resolves `npm.cmd`, which the policy never inspects) or call
+/// the `.cmd` shim directly; a per-invocation `-ExecutionPolicy Bypass` is a
+/// fallback only, and the user's machine-wide policy is never touched (it is a
+/// user security setting).
+///
+/// Runs FIRST in the cascade: the raw transcript also carries generic tokens
+/// (`SecurityError`, `UnauthorizedAccess`) that a later, more generic family
+/// (permissions) could mis-bucket into "check file ownership" advice — which
+/// would keep the retry loop spinning.
+fn detect_powershell_policy(lower: &str, line: &str) -> Option<ErrorInsight> {
+    // High-precision phrases only the execution-policy refusal emits (EN + ZH).
+    const STRONG: &[&str] = &[
+        "cannot be loaded because running scripts is disabled",
+        "about_execution_policies",
+        "因为在此系统上禁止运行脚本",
+        "禁止运行脚本",
+    ];
+    // Tokens that are ambiguous on their own (a 401 body can say
+    // "UnauthorizedAccess"); they only count alongside the `.ps1` shim context.
+    const WITH_SHIM: &[&str] = &[
+        "pssecurityexception",
+        "unauthorizedaccess",
+        "execution policy",
+        "executionpolicy",
+    ];
+    let strong = STRONG.iter().any(|m| lower.contains(m));
+    let shim = lower.contains(".ps1") && WITH_SHIM.iter().any(|m| lower.contains(m));
+    if !strong && !shim {
+        return None;
+    }
+    Some(build(
+        "windows",
+        "powershell-execution-policy",
+        "",
+        "PowerShell 执行策略拦截了 .ps1 shim(环境闸门,原样重试永远失败)",
+        "Windows 上经 PowerShell 调用 npm/npx/pnpm/yarn 时,解析到的是 `npm.ps1` \
+         这个 shim,而默认的 Restricted 执行策略禁止运行 .ps1 脚本,于是报\
+         「无法加载文件 …,因为在此系统上禁止运行脚本」/ PSSecurityException。\
+         这是确定性的环境闸门,不是偶发失败——命令不变,重试多少次都会以同样的\
+         方式失败。",
+        "换调用方式,不要原样重试:改走 cmd 让它解析 `npm.cmd`——\
+         `cmd /c npm install` / `cmd /c npx …`(pnpm/yarn/node-gyp 同理),\
+         或直接调用 `npm.cmd` / `npx.cmd`。兜底才用单次 \
+         `powershell -ExecutionPolicy Bypass -File …`;绝不要改用户机器的\
+         执行策略(那是用户的安全设置,不归本次任务动)。",
+        line,
+        "",
+    ))
+}
 
 /// A *test / lint* tool reported as missing — the reported recurring inefficiency.
 ///
@@ -835,6 +907,59 @@ mod tests {
         ));
         assert!(looks_like_error("ReferenceError: foo is not defined"));
         assert!(looks_like_error("EACCES: permission denied, mkdir '/usr'"));
+    }
+
+    #[test]
+    fn powershell_execution_policy_fires_on_both_languages_with_the_cmd_avoidance() {
+        // The EXACT user-reported Chinese form — path and all.
+        let zh = classify_error(
+            "无法加载文件 E:\\soft\\nodejs\\node-v24.18.0-win-x64\\npm.ps1，因为在此系统上禁止运行脚本",
+        );
+        assert!(zh.recognized);
+        assert_eq!(zh.category, "windows");
+        assert_eq!(zh.signature, "windows/powershell-execution-policy");
+        // The avoidance is "change the invocation": through cmd / the .cmd shim,
+        // bypass only as a fallback, never the machine policy — never a retry.
+        assert!(zh.fix.contains("cmd /c npm"), "{}", zh.fix);
+        assert!(zh.fix.contains("npm.cmd"), "{}", zh.fix);
+        assert!(zh.fix.contains("-ExecutionPolicy Bypass"), "{}", zh.fix);
+        assert!(zh.fix.contains("不要原样重试"), "{}", zh.fix);
+        // The English form (full PowerShell block) collapses to the SAME signature,
+        // so EN/ZH recurrences of one pitfall dedup into one lesson.
+        let en = classify_error(
+            "npm : File C:\\Program Files\\nodejs\\npm.ps1 cannot be loaded because running \
+             scripts is disabled on this system. For more information, see \
+             about_Execution_Policies at https:/go.microsoft.com/fwlink/?LinkID=135170.\n\
+             + CategoryInfo          : SecurityError: (:) [], PSSecurityException\n\
+             + FullyQualifiedErrorId : UnauthorizedAccess",
+        );
+        assert_eq!(en.signature, "windows/powershell-execution-policy");
+        // Both language forms pass the cheap pre-filter, so capture sites never
+        // drop the recurring pitfall before classification.
+        assert!(looks_like_error(
+            "无法加载文件 E:\\soft\\nodejs\\node-v24.18.0-win-x64\\npm.ps1，因为在此系统上禁止运行脚本"
+        ));
+        assert!(looks_like_error(
+            "File C:\\nodejs\\npx.ps1 cannot be loaded because running scripts is disabled on this system."
+        ));
+    }
+
+    #[test]
+    fn powershell_shim_context_fires_but_ordinary_failures_do_not() {
+        // The ambiguous tokens count WITH the .ps1 shim context even when the
+        // full policy sentence was truncated out of the transcript.
+        let i =
+            classify_error("pnpm.ps1 : SecurityError — PSSecurityException, UnauthorizedAccess");
+        assert_eq!(i.signature, "windows/powershell-execution-policy");
+        // Ordinary npm failures keep routing to their own families — never this one.
+        let resolve = classify_error("npm ERR! ERESOLVE unable to resolve dependency tree");
+        assert_eq!(resolve.signature, "dependency/package-manager");
+        let build_fail = classify_error("npm ERR! code ELIFECYCLE — build failed");
+        assert_ne!(build_fail.signature, "windows/powershell-execution-policy");
+        // A generic UnauthorizedAccess WITHOUT the shim (an HTTP 401 body) is
+        // not a policy gate either.
+        let http = classify_error("Request failed: 401 (Unauthorized) UnauthorizedAccess");
+        assert_ne!(http.signature, "windows/powershell-execution-policy");
     }
 
     #[test]
