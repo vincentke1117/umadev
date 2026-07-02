@@ -6683,6 +6683,17 @@ impl App {
         key: KeyCode,
         mods: crossterm::event::KeyModifiers,
     ) -> Action {
+        // Wave 2 P0 — ONE shared key mapping for both input paths. Any literal
+        // control-char key form a backend may surface (Windows/ConPTY Backspace
+        // as `Char('\u{8}')` / `Char('\u{7f}')`, a raw Ctrl-C as
+        // `Char('\u{3}')`, …) is folded here through the SAME
+        // `input::keymap::char_to_key` table the owned byte-decoder uses — so
+        // the per-arm duplicate catches this file used to carry are gone and
+        // the two paths cannot drift. `InputSource::next` already applies the
+        // same fold; this delegating call keeps direct callers (tests, future
+        // surfaces) on the identical contract (idempotent, so double
+        // normalization is a no-op).
+        let (key, mods) = crate::input::keymap::normalize_key(key, mods);
         // F1 toggles help in any mode.
         if let KeyCode::F(1) = key {
             self.show_help = !self.show_help;
@@ -7058,16 +7069,11 @@ impl App {
                 self.delete_word_back();
                 Action::None
             }
+            // The Windows/ConPTY literal BS/DEL control-char forms are folded
+            // to `KeyCode::Backspace` upstream by the ONE shared mapping
+            // (`input::keymap::normalize_key`, applied in `apply_key_with_mods`
+            // and in `InputSource::next`) — no per-arm duplicate catch here.
             KeyCode::Backspace => {
-                self.pending_quit_confirm = false;
-                self.pending_rewind = false;
-                self.backspace();
-                Action::None
-            }
-            // Some Windows/ConPTY paths surface Backspace as a literal BS/DEL
-            // control char instead of `KeyCode::Backspace`; treat both as the
-            // same editor command so the input box remains terminal-agnostic.
-            KeyCode::Char('\u{8}' | '\u{7f}') if !ctrl && !alt => {
                 self.pending_quit_confirm = false;
                 self.pending_rewind = false;
                 self.backspace();
@@ -12288,11 +12294,9 @@ impl App {
                 self.search_prev();
                 Action::None
             }
+            // Literal BS/DEL char forms are folded to `Backspace` upstream by
+            // the shared `input::keymap` mapping — one arm suffices.
             KeyCode::Backspace => {
-                self.search_backspace();
-                Action::None
-            }
-            KeyCode::Char('\u{8}' | '\u{7f}') if !ctrl && !alt => {
                 self.search_backspace();
                 Action::None
             }
@@ -12478,11 +12482,9 @@ impl App {
                 self.history_search_newer();
                 Action::None
             }
+            // Literal BS/DEL char forms are folded to `Backspace` upstream by
+            // the shared `input::keymap` mapping — one arm suffices.
             KeyCode::Backspace => {
-                self.history_search_backspace();
-                Action::None
-            }
-            KeyCode::Char('\u{8}' | '\u{7f}') if !ctrl && !alt => {
                 self.history_search_backspace();
                 Action::None
             }

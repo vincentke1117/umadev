@@ -3792,41 +3792,78 @@ fn setup_terminal() -> Result<Term> {
     // Enter raw mode FIRST so the OSC 11 response isn't echoed to the screen
     // (raw mode disables input echo + canonical processing — the response
     // bytes come back through stdin silently). Then probe the background
-    // color, cache the result in the theme module, then enter the alt screen.
+    // color, cache the result in the theme module, then apply the ONE shared
+    // enable block (raw mode itself stays out of it: a global console-input
+    // mode, not a writer command).
     enable_raw_mode()?;
     let is_light = detect_light_bg();
     ui::set_light_theme(is_light);
 
     let mut stdout = std::io::stdout();
-    stdout.execute(EnterAlternateScreen).map_err(fail)?;
-    // Turn on bracketed paste so multi-char bursts (clipboard paste AND CJK
-    // IME commits, which most terminals deliver as a paste) arrive as one
-    // atomic `Event::Paste` instead of a scrambled stream of `Char` events.
-    stdout.execute(EnableBracketedPaste).map_err(fail)?;
-    // Mouse capture is ON by default. We're on the alternate screen (no native
-    // scrollback), where the terminal can't give us BOTH wheel-scroll AND native
-    // click-drag copy — so UmaDev runs its OWN selection layer (the Claude Code
-    // approach): capture the mouse, page the transcript on the wheel, render the
-    // drag-selection highlight ourselves, and copy via OSC 52. `/mouse` toggles
-    // capture OFF (DisableMouseCapture) for users who prefer the terminal's native
-    // click-drag selection. The transcript also scrolls via the keyboard
-    // (PageUp/PageDown, Home/End, Shift+↑/↓, Ctrl+Alt+U/D). Teardown + the panic
-    // hook DisableMouseCapture regardless.
-    stdout.execute(EnableMouseCapture).map_err(fail)?;
-    // Focus-change reporting (DEC private mode 1004, `\x1b[?1004h`). When the
-    // terminal window loses then regains focus (alt-tab to another window and
-    // back), some terminals — notably the Windows console / Windows Terminal —
-    // scroll or redraw their own buffer while unfocused, desyncing UmaDev's
-    // incremental-diff render so the UI comes back garbled. With 1004 on, the
-    // terminal emits a FocusGained event on return; the event loop forces a clean
-    // full repaint from a reset back buffer. Teardown, the panic hook, and the
-    // mid-setup failure path all DisableFocusChange symmetrically.
-    stdout.execute(EnableFocusChange).map_err(fail)?;
-    // Show the terminal cursor so the user sees a blinking caret in the
-    // input box (positioned via frame.set_cursor_position in render_prompt).
-    stdout.execute(crossterm::cursor::Show).map_err(fail)?;
+    // Mouse capture starts ON (the `/mouse` toggle re-asserts a changed
+    // preference later through the same block via `reassert_terminal_modes`).
+    enable_terminal_modes(&mut stdout, true).map_err(fail)?;
     let terminal = Terminal::new(CrosstermBackend::new(stdout)).map_err(fail)?;
     Ok(terminal)
+}
+
+/// The ONE terminal-mode enable block (Wave 2 P2) — every writer-side mode
+/// UmaDev turns on, in setup order:
+///
+/// 1. `EnterAlternateScreen` — the app screen (a no-op if already in alt).
+/// 2. `EnableBracketedPaste` — multi-char bursts (clipboard paste AND CJK IME
+///    commits, which most terminals deliver as a paste) arrive as one atomic
+///    `Event::Paste` instead of a scrambled stream of `Char` events.
+/// 3. Mouse capture per the CURRENT `/mouse` preference. On by default: we're
+///    on the alternate screen (no native scrollback), where the terminal can't
+///    give us BOTH wheel-scroll AND native click-drag copy — so UmaDev runs its
+///    OWN selection layer (the Claude Code approach): capture the mouse, page
+///    the transcript on the wheel, render the drag-selection highlight
+///    ourselves, copy via OSC 52. `/mouse` toggles capture OFF for users who
+///    prefer the terminal's native click-drag selection.
+/// 4. `EnableFocusChange` (DEC private mode 1004). Some terminals — notably
+///    the Windows console / Windows Terminal — scroll or redraw their own
+///    buffer while unfocused, desyncing the incremental-diff render; with 1004
+///    on, the terminal emits a FocusGained event on return and the event loop
+///    forces a clean full repaint.
+/// 5. `cursor::Show` — the blinking caret in the input box (positioned via
+///    `frame.set_cursor_position` in `render_prompt`).
+///
+/// Shared by BOTH [`setup_terminal`] (startup) and [`reassert_terminal_modes`]
+/// (long-input-gap / SIGCONT resume), so a mode can never be enabled at
+/// startup yet missed on resume — the "focus reporting worked until a tmux
+/// re-attach" bug class. Add any future mode (e.g. kitty keyboard flags) HERE
+/// and both paths get it; then add its symmetric disable to
+/// [`restore_sequence`], which stays the single teardown (locked by
+/// `enable_and_restore_are_mode_symmetric`).
+///
+/// Every escape is level-triggered, so the block is IDEMPOTENT — safe to run
+/// on every resume. Every step is attempted even if an earlier one fails (a
+/// resume must re-assert as much as it can); the FIRST error is returned so
+/// startup can still abort and restore via its `fail` wrapper, while the
+/// resume path ignores it (best-effort, fail-open).
+fn enable_terminal_modes<W: std::io::Write>(out: &mut W, mouse_on: bool) -> std::io::Result<()> {
+    let mut first_err: Option<std::io::Error> = None;
+    let mut note = |res: std::io::Result<()>| {
+        if let Err(e) = res {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+    };
+    note(out.execute(EnterAlternateScreen).map(|_| ()));
+    note(out.execute(EnableBracketedPaste).map(|_| ()));
+    note(if mouse_on {
+        out.execute(EnableMouseCapture).map(|_| ())
+    } else {
+        out.execute(DisableMouseCapture).map(|_| ())
+    });
+    note(out.execute(EnableFocusChange).map(|_| ()));
+    note(out.execute(crossterm::cursor::Show).map(|_| ()));
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Emit the FULL terminal-restore sequence to `out`, in the reverse-of-setup
@@ -4235,27 +4272,19 @@ fn app_is_live(app: &App, continuous_active: bool) -> bool {
 
 /// Re-emit the terminal-mode setup escapes (idempotent) after a long input gap
 /// or a job-control resume (R5), healing a dead mouse / stale alt-screen after a
-/// laptop sleep, tmux re-attach, or ssh reconnect. Re-enters the alternate
-/// screen (a no-op if already in alt), re-enables bracketed paste + focus-change
-/// reporting, and re-asserts the *current* intended mouse-capture state (so a
-/// `/mouse`-off preference is preserved). These are OUT-OF-BAND writes (P3), so
-/// the caller marks the terminal contaminated ([`App::contaminate_terminal`])
-/// and the next frame repaints every cell. Writes go through the render's
-/// single backend writer, BETWEEN frames; every write is best-effort, never
-/// blocking the loop.
+/// laptop sleep, tmux re-attach, or ssh reconnect.
+///
+/// Delegates to [`enable_terminal_modes`] — the ONE enable block shared with
+/// [`setup_terminal`] (Wave 2 P2), so resume re-asserts EXACTLY what startup
+/// enabled (alt screen, bracketed paste, the *current* `/mouse` mouse-capture
+/// preference, focus-change reporting, cursor visibility) and a future mode
+/// can never be enabled at startup yet missed here. These are OUT-OF-BAND
+/// writes (P3), so the caller marks the terminal contaminated
+/// ([`App::contaminate_terminal`]) and the next frame repaints every cell.
+/// Writes go through the render's single backend writer, BETWEEN frames;
+/// best-effort (the first error is ignored), never blocking the loop.
 fn reassert_terminal_modes(terminal: &mut Term, mouse_on: bool) {
-    let backend = terminal.backend_mut();
-    let _ = backend.execute(EnterAlternateScreen);
-    let _ = backend.execute(EnableBracketedPaste);
-    // Re-assert focus-change reporting too — a sleep/wake or re-attach can drop
-    // DEC private mode 1004 alongside paste/mouse, and we rely on FocusGained to
-    // repaint on an alt-tab return.
-    let _ = backend.execute(EnableFocusChange);
-    let _ = if mouse_on {
-        backend.execute(EnableMouseCapture)
-    } else {
-        backend.execute(DisableMouseCapture)
-    };
+    let _ = enable_terminal_modes(terminal.backend_mut(), mouse_on);
 }
 
 /// Unix job-control resume signal (SIGCONT) the event loop selects on (R5). On
@@ -5860,6 +5889,99 @@ mod tests {
             "restore must run in reverse-of-setup order so conhost honours each step: \
              leave={leave} mouse={mouse} paste={paste} sync={sync} show={show} reset={reset}"
         );
+    }
+
+    /// Wave 2 P2 — the ONE enable block must turn on the complete mode set
+    /// (alt screen, bracketed paste, mouse capture, focus reporting, cursor
+    /// visibility). Both `setup_terminal` and `reassert_terminal_modes` emit
+    /// through this single function, so this is the whole enable surface.
+    #[test]
+    fn enable_terminal_modes_is_the_one_complete_enable_set() {
+        let mut buf: Vec<u8> = Vec::new();
+        enable_terminal_modes(&mut buf, true).expect("a Vec sink cannot fail");
+        let s = String::from_utf8_lossy(&buf);
+        for (esc, what) in [
+            ("\x1b[?1049h", "enter the alternate screen"),
+            ("\x1b[?2004h", "enable bracketed paste"),
+            ("\x1b[?1000h", "enable mouse capture"),
+            ("\x1b[?1004h", "enable focus-change reporting"),
+            ("\x1b[?25h", "show the cursor"),
+        ] {
+            assert!(s.contains(esc), "the enable block must {what} ({esc:?})");
+        }
+    }
+
+    /// Wave 2 P2 — the enable block respects the current `/mouse` preference:
+    /// with capture off it actively DISABLES mouse reporting (so a resume never
+    /// silently re-enables what the user turned off) and never enables it.
+    #[test]
+    fn enable_terminal_modes_respects_the_mouse_preference() {
+        let mut buf: Vec<u8> = Vec::new();
+        enable_terminal_modes(&mut buf, false).expect("a Vec sink cannot fail");
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            !s.contains("\x1b[?1000h"),
+            "mouse capture must NOT be enabled when the preference is off"
+        );
+        assert!(
+            s.contains("\x1b[?1000l"),
+            "mouse capture must be actively disabled when the preference is off"
+        );
+        // Everything else is still asserted.
+        assert!(s.contains("\x1b[?2004h") && s.contains("\x1b[?1004h"));
+    }
+
+    /// Wave 2 P2 — the enable block is IDEMPOTENT (every escape is
+    /// level-triggered): running it twice, as startup + a later resume do,
+    /// emits the identical byte sequence with no divergence.
+    #[test]
+    fn enable_terminal_modes_is_idempotent() {
+        let mut once: Vec<u8> = Vec::new();
+        enable_terminal_modes(&mut once, true).unwrap();
+        let mut twice: Vec<u8> = Vec::new();
+        enable_terminal_modes(&mut twice, true).unwrap();
+        enable_terminal_modes(&mut twice, true).unwrap();
+        assert_eq!(twice.len(), once.len() * 2);
+        assert_eq!(&twice[..once.len()], once.as_slice());
+        assert_eq!(&twice[once.len()..], once.as_slice());
+    }
+
+    /// Wave 2 P2 — enable/teardown symmetry: every DEC private mode the ONE
+    /// enable block sets high must be set low by `restore_sequence` (the single
+    /// teardown), so a future mode added to the enable block without a
+    /// matching disable fails HERE instead of leaving the user's shell wedged.
+    /// (Mode 25 — cursor visibility — is exempt: both sides SHOW the cursor,
+    /// because the restored shell needs a visible caret.)
+    #[test]
+    fn enable_and_restore_are_mode_symmetric() {
+        let mut enable: Vec<u8> = Vec::new();
+        enable_terminal_modes(&mut enable, true).unwrap();
+        let mut restore: Vec<u8> = Vec::new();
+        restore_sequence(&mut restore);
+        let enable_s = String::from_utf8_lossy(&enable).into_owned();
+        let restore_s = String::from_utf8_lossy(&restore).into_owned();
+        // Collect every `\x1b[?<n>h` the enable block emits.
+        let mut modes: Vec<String> = Vec::new();
+        for (idx, _) in enable_s.match_indices("\x1b[?") {
+            let digits: String = enable_s[idx + 3..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            let after = idx + 3 + digits.len();
+            if !digits.is_empty() && enable_s[after..].starts_with('h') && digits != "25" {
+                modes.push(digits);
+            }
+        }
+        assert!(
+            !modes.is_empty(),
+            "the enable block must set DEC private modes"
+        );
+        for mode in modes {
+            assert!(
+                restore_s.contains(&format!("\x1b[?{mode}l")),
+                "restore_sequence must disable DEC mode {mode} that the enable block set"
+            );
+        }
     }
 
     /// The sequence is IDEMPOTENT: running it twice (e.g. the panic hook fired,

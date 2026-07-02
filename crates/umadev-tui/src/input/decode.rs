@@ -10,17 +10,19 @@
 //!
 //! The decoder produces crossterm's own [`KeyEvent`] / [`MouseEvent`] types so
 //! the existing downstream handlers (`apply_key_with_mods`, the mouse-wheel /
-//! selection layer, paste insertion) consume the result unchanged. Byte→key and
-//! `Cb`→mouse mappings mirror crossterm's own parser so the owned-input path is
-//! behaviourally identical to the legacy `EventStream` path for ordinary keys.
+//! selection layer, paste insertion) consume the result unchanged. The char→key
+//! table lives in [`super::keymap`] — the ONE mapping shared with the legacy
+//! `EventStream` path (Wave 2 P0) — and the `Cb`→mouse mapping mirrors
+//! crossterm's own parser, so the owned-input path is behaviourally identical
+//! to the legacy path for ordinary keys (locked by the cross-path contract
+//! tests in `super`).
 //!
 //! Fail-open: an unrecognised or malformed sequence yields an empty result (it
 //! is dropped, never leaked as text, never a panic).
 
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
+use super::keymap::{char_to_key, key};
 use super::tokenize::Token;
 
 /// ESC introducer.
@@ -30,12 +32,13 @@ const PASTE_START: &[u8] = b"\x1b[200~";
 /// Bracketed-paste end marker (`CSI 201 ~`).
 const PASTE_END: &[u8] = b"\x1b[201~";
 /// Upper bound on an in-flight bracketed-paste body before it is force-closed.
-/// Any legitimate human paste is far below this; only a terminator that NEVER
-/// arrives (a disconnect, or a terminal that opened `CSI 200 ~` but never sent
-/// `CSI 201 ~`) grows the buffer unbounded. Without a ceiling `in_paste` would
-/// wedge `true` forever and silently swallow every later keystroke — the input
-/// box goes dead with no backstop. 8 MiB is generous headroom for a real paste
-/// yet bounds the failure. See [`Decoder::after_in_paste_append`].
+/// A pure MEMORY ceiling: a stream that keeps sending body bytes forever
+/// without a terminator (a misbehaving terminal) never goes fd-idle, so the
+/// reader's paste-window flush never fires — without a ceiling the buffer
+/// grows unbounded. 8 MiB is generous headroom for a real paste yet bounds the
+/// failure. (An end marker that never arrives on an IDLE fd is the reader's
+/// job: its paste-state-aware flush force-closes the paste — see
+/// `super::reader`.) Checked in [`Decoder::append_paste`].
 const PASTE_BUF_CAP: usize = 8 * 1024 * 1024;
 
 /// One decoded input event. Mirrors the surface the TUI event loop already
@@ -84,11 +87,7 @@ impl Decoder {
             Token::Sequence(bytes) => self.feed_sequence(&bytes),
             Token::Text(text) => {
                 if self.in_paste {
-                    self.paste_buf.push_str(&text);
-                    // A split end marker can arrive as plain text AFTER a flushed
-                    // partial (see `close_paste_if_terminated`), so re-check the
-                    // accumulated tail here — not only on a clean PASTE_END token.
-                    self.after_in_paste_append()
+                    self.append_paste(&text)
                 } else {
                     decode_text(&text)
                 }
@@ -109,62 +108,23 @@ impl Decoder {
             return vec![InputEvent::Paste(body)];
         }
         if self.in_paste {
-            // A sequence inside a paste is treated as literal body text — UNLESS
-            // it is (the start of) an end marker the reader's flush split apart,
-            // which `close_paste_if_terminated` recognises once the tail is whole.
-            self.paste_buf.push_str(&String::from_utf8_lossy(bytes));
-            return self.after_in_paste_append();
+            // A sequence inside a paste is literal body text (bracketed paste
+            // guarantees the terminal strips real markers from the body). The
+            // reader's paste-state-aware flush window guarantees an end marker
+            // is never force-split into here mid-paste (Wave 2 P1), so no
+            // marker-reassembly backstop is needed.
+            return self.append_paste(&String::from_utf8_lossy(bytes));
         }
         decode_sequence(bytes)
     }
 
-    /// Fail-open backstop for a bracketed-paste END marker that the reader's
-    /// lone-ESC flush SPLIT across reads.
-    ///
-    /// The clean case (`CSI 201 ~` arriving as one [`Token::Sequence`]) is caught
-    /// by the `bytes == PASTE_END` match in [`Self::feed_sequence`]. But if a read
-    /// boundary lands mid-marker and the ESC-flush timer fires before the
-    /// continuation arrives, the marker reaches the decoder as a force-flushed
-    /// partial sequence (e.g. `\x1b[20`) followed by plain text (`1~`) — the
-    /// explicit match never fires, so `in_paste` would wedge `true` FOREVER,
-    /// silently swallowing every later keystroke (the input box goes dead, a
-    /// fail-CLOSED trap). Bracketed paste guarantees the terminal strips a literal
-    /// `\x1b[201~` from the body, so a trailing end-marker byte string in the
-    /// accumulated buffer can ONLY be the real terminator: strip it and close the
-    /// paste. Returns the completed paste, or empty if not yet terminated.
-    fn close_paste_if_terminated(&mut self) -> Vec<InputEvent> {
-        if self.paste_buf.as_bytes().ends_with(PASTE_END) {
-            let keep = self.paste_buf.len() - PASTE_END.len();
-            // The marker bytes are all single-byte (ESC + ASCII), so `keep` is
-            // always a char boundary; guard anyway so this can never panic.
-            if self.paste_buf.is_char_boundary(keep) {
-                let mut body = std::mem::take(&mut self.paste_buf);
-                body.truncate(keep);
-                self.in_paste = false;
-                return vec![InputEvent::Paste(body)];
-            }
-        }
-        Vec::new()
-    }
-
-    /// Shared tail for both in-paste append branches (text + literal sequence):
-    /// first try to close on a recognised end marker (clean or flush-split via
-    /// [`Self::close_paste_if_terminated`]); failing that, FORCE-CLOSE when the
-    /// accumulated body has grown past [`PASTE_BUF_CAP`] with no terminator in
-    /// sight.
-    ///
-    /// This is the fail-open backstop for an unterminated bracketed paste: a
-    /// `CSI 200 ~` whose matching `CSI 201 ~` never arrives (a disconnect or a
-    /// misbehaving terminal) would otherwise wedge `in_paste = true` forever and
-    /// swallow every later keystroke into the buffer — the input box dead-ends
-    /// with no way out. Force-close delivers what was buffered as a `Paste` (no
-    /// input is lost) and returns the decoder to the normal state so keys flow
-    /// again. Returns the completed/forced paste, or empty if neither fired.
-    fn after_in_paste_append(&mut self) -> Vec<InputEvent> {
-        let closed = self.close_paste_if_terminated();
-        if !closed.is_empty() {
-            return closed;
-        }
+    /// Append body text to the open paste, enforcing the [`PASTE_BUF_CAP`]
+    /// memory ceiling: a body that grows past the cap with no terminator in
+    /// sight (a terminal streaming garbage forever) is force-closed, delivering
+    /// what was buffered as a `Paste` so no input is lost and memory stays
+    /// bounded. Returns the forced paste, or empty while the paste stays open.
+    fn append_paste(&mut self, s: &str) -> Vec<InputEvent> {
+        self.paste_buf.push_str(s);
         if self.paste_buf.len() > PASTE_BUF_CAP {
             let body = std::mem::take(&mut self.paste_buf);
             self.in_paste = false;
@@ -172,32 +132,33 @@ impl Decoder {
         }
         Vec::new()
     }
-}
 
-/// Build a `Press` key event.
-fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-    KeyEvent::new_with_kind(code, mods, KeyEventKind::Press)
-}
+    /// Whether the decoder is between a paste-start and paste-end marker.
+    ///
+    /// Exposed so the reader's flush timer can make a PASTE-STATE-AWARE
+    /// decision (Wave 2 P1): a buffered partial escape mid-paste is almost
+    /// certainly a split end marker whose continuation is in flight, so the
+    /// reader waits the longer paste window instead of force-flushing at the
+    /// lone-ESC timeout (the old paste-wedge).
+    #[must_use]
+    pub fn in_paste(&self) -> bool {
+        self.in_paste
+    }
 
-/// Map one char of a text token to a key event, mirroring crossterm's own
-/// single-byte mapping (so the owned path is identical for ordinary keys).
-fn char_to_key(c: char) -> KeyEvent {
-    match c {
-        '\r' => key(KeyCode::Enter, KeyModifiers::NONE),
-        '\t' => key(KeyCode::Tab, KeyModifiers::NONE),
-        '\u{8}' | '\u{7f}' => key(KeyCode::Backspace, KeyModifiers::NONE),
-        '\0' => key(KeyCode::Char(' '), KeyModifiers::CONTROL),
-        c if ('\u{1}'..='\u{1a}').contains(&c) => {
-            // Ctrl-A..Ctrl-Z (incl. \n=Ctrl-J, \b=Ctrl-H in raw mode).
-            let letter = (c as u8 - 1 + b'a') as char;
-            key(KeyCode::Char(letter), KeyModifiers::CONTROL)
+    /// Force-close an open paste, delivering the accumulated body and
+    /// returning the decoder to the normal state so keys flow again.
+    ///
+    /// Called by the reader when the fd has been genuinely idle past the paste
+    /// flush window while a paste is open — the end marker is not coming (a
+    /// disconnect or a misbehaving terminal), and waiting longer would wedge
+    /// `in_paste = true` forever, silently swallowing every later keystroke.
+    /// `None` when no paste is open.
+    pub fn force_close_paste(&mut self) -> Option<InputEvent> {
+        if !self.in_paste {
+            return None;
         }
-        c if ('\u{1c}'..='\u{1f}').contains(&c) => {
-            let d = (c as u8 - 0x1c + b'4') as char;
-            key(KeyCode::Char(d), KeyModifiers::CONTROL)
-        }
-        c if c.is_uppercase() => key(KeyCode::Char(c), KeyModifiers::SHIFT),
-        c => key(KeyCode::Char(c), KeyModifiers::NONE),
+        self.in_paste = false;
+        Some(InputEvent::Paste(std::mem::take(&mut self.paste_buf)))
     }
 }
 
@@ -621,6 +582,17 @@ mod tests {
     }
 
     #[test]
+    fn alt_backspace_decodes_for_both_backspace_bytes() {
+        // ESC DEL and ESC BS both mean Alt+Backspace (delete word back) — the
+        // same fold the legacy path reaches via `keymap::normalize_key`.
+        for bytes in [b"\x1b\x7f".as_slice(), b"\x1b\x08".as_slice()] {
+            let k = one_key(&seq(bytes));
+            assert_eq!(k.code, KeyCode::Backspace, "{bytes:?}");
+            assert!(k.modifiers.contains(KeyModifiers::ALT), "{bytes:?}");
+        }
+    }
+
+    #[test]
     fn focus_events_decode() {
         assert_eq!(seq(b"\x1b[I"), vec![InputEvent::Focus(true)]);
         assert_eq!(seq(b"\x1b[O"), vec![InputEvent::Focus(false)]);
@@ -713,28 +685,26 @@ mod tests {
     }
 
     #[test]
-    fn split_end_marker_via_flush_still_closes_the_paste() {
-        // Regression: the reader's lone-ESC flush can split the `\x1b[201~` end
-        // marker into a force-flushed partial sequence (`\x1b[20`) + trailing text
-        // (`1~`). The explicit PASTE_END match never fires for either fragment, so
-        // without the suffix backstop `in_paste` would wedge forever and swallow
-        // all later input. The backstop must still close the paste exactly once.
+    fn paste_state_is_visible_and_force_close_frees_input() {
+        // Wave 2 P1 — the reader's flush timer needs to SEE paste state
+        // (`in_paste`) to pick the paste window, and needs `force_close_paste`
+        // to resolve a genuinely dead paste (end marker never coming on an
+        // idle fd) without wedging input.
         let mut d = Decoder::new();
+        assert!(!d.in_paste(), "fresh decoder starts outside a paste");
         assert!(d
             .feed_token(Token::Sequence(PASTE_START.to_vec()))
             .is_empty());
+        assert!(d.in_paste(), "paste start opens the paste");
         assert!(d.feed_token(Token::Text("requirement".into())).is_empty());
-        // Flushed partial of the end marker — accumulated as literal, not yet whole.
-        assert!(d
-            .feed_token(Token::Sequence(b"\x1b[20".to_vec()))
-            .is_empty());
-        // The continuation arrives as plain text (tokenizer is back in Ground).
-        let out = d.feed_token(Token::Text("1~".into()));
-        match out.as_slice() {
-            [InputEvent::Paste(body)] => assert_eq!(body, "requirement"),
-            other => panic!("expected the paste to close with a clean body, got {other:?}"),
-        }
-        // And the decoder is no longer wedged: ordinary text decodes to keys again.
+        // The reader decides the paste is dead → force-close delivers the body.
+        assert_eq!(
+            d.force_close_paste(),
+            Some(InputEvent::Paste("requirement".into()))
+        );
+        assert!(!d.in_paste(), "force-close returns to the normal state");
+        assert_eq!(d.force_close_paste(), None, "no paste open → None");
+        // And the decoder is not wedged: ordinary text decodes to keys again.
         assert_eq!(
             one_key(&d.feed_token(Token::Text("x".into()))).code,
             KeyCode::Char('x')
@@ -743,11 +713,10 @@ mod tests {
 
     #[test]
     fn unterminated_paste_force_closes_past_the_cap_and_frees_input() {
-        // Suspect/Low: a bracketed paste whose `\x1b[201~` end marker NEVER arrives
-        // (disconnect / misbehaving terminal) would wedge `in_paste = true` forever
-        // and swallow every later keystroke into the buffer — the input box dead-ends
-        // with no backstop. The size-cap must force-close the paste (delivering the
-        // buffered body) so input can never wedge.
+        // A terminal that streams paste body forever without a terminator never
+        // goes fd-idle (so the reader's paste-window flush never fires) — the
+        // memory ceiling must force-close the paste (delivering the buffered
+        // body) so the buffer stays bounded and input can never wedge.
         let mut d = Decoder::new();
         assert!(d
             .feed_token(Token::Sequence(PASTE_START.to_vec()))
@@ -771,10 +740,8 @@ mod tests {
     }
 
     #[test]
-    fn split_end_marker_does_not_double_emit_when_clean() {
-        // The clean path (one PASTE_END token) must still emit exactly one paste —
-        // the suffix backstop only runs on the in-paste APPEND branches, which the
-        // explicit PASTE_END match returns before ever reaching.
+    fn clean_end_marker_emits_exactly_one_paste() {
+        // The clean path (one PASTE_END token) emits exactly one paste.
         let mut d = Decoder::new();
         assert!(d
             .feed_token(Token::Sequence(PASTE_START.to_vec()))

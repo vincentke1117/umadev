@@ -63,10 +63,14 @@ fn is_csi_final(b: u8) -> bool {
 }
 
 /// Whether `b` is an ESC-sequence final byte. ESC sequences have a wider final
-/// range (`0`..`~`) than CSI.
+/// range (`0`..`~`) than CSI. BS (`0x08`) and DEL (`0x7f`) are additionally
+/// accepted so `ESC BS` / `ESC DEL` — what terminals send for Alt+Backspace —
+/// tokenize as one two-byte sequence (decoded to Alt+Backspace by
+/// `super::decode`, converging with the legacy crossterm path; Wave 2 P0)
+/// instead of degrading to text.
 #[inline]
 fn is_esc_final(b: u8) -> bool {
-    (0x30..=0x7e).contains(&b)
+    (0x30..=0x7e).contains(&b) || b == 0x08 || b == 0x7f
 }
 
 /// Length of the longest prefix of `bytes` that is **complete** valid UTF-8.
@@ -583,6 +587,25 @@ mod tests {
     fn alt_letter_is_one_two_byte_sequence() {
         let mut tk = Tokenizer::for_stdin();
         assert_eq!(tk.feed(b"\x1bc"), vec![Token::Sequence(b"\x1bc".to_vec())]);
+    }
+
+    #[test]
+    fn alt_backspace_bytes_are_one_two_byte_sequence() {
+        // ESC DEL / ESC BS is what terminals send for Alt+Backspace — it must
+        // tokenize as ONE sequence (→ Alt+Backspace downstream), not degrade to
+        // text (Wave 2 P0 — convergence with the legacy crossterm path).
+        for bytes in [b"\x1b\x7f".as_slice(), b"\x1b\x08".as_slice()] {
+            let mut tk = Tokenizer::for_stdin();
+            assert_eq!(
+                tk.feed(bytes),
+                vec![Token::Sequence(bytes.to_vec())],
+                "{bytes:?} must be one atomic two-byte sequence"
+            );
+            // Split across reads → still one sequence, no leaked text.
+            let mut tk = Tokenizer::for_stdin();
+            assert!(tk.feed(&bytes[..1]).is_empty());
+            assert_eq!(tk.feed(&bytes[1..]), vec![Token::Sequence(bytes.to_vec())]);
+        }
     }
 
     #[test]

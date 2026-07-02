@@ -51,3 +51,8 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 async-trait = { workspace = true }
+# `test-util` unlocks tokio's PAUSED virtual clock (`start_paused`), so the
+# reader's paste-state-aware flush-window tests (Wave 2 P1) assert real timer
+# behaviour deterministically — no wall-clock sleeps, no flaky CI. Test builds
+# only; the shipped binary's tokio features are unchanged.
+tokio = { workspace = true, features = ["test-util"] }
