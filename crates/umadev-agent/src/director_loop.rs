@@ -1983,9 +1983,48 @@ async fn drive_review_step(
     // did. Fail-open: if the re-review can't fork it returns no-blocking (accept).
     let recheck = director::review_with_seats(session, options, events, &route.team).await;
     if recheck.has_blocking() {
+        // FLOOR-INTEGRITY (a corroborated residual must not silently pass). A residual
+        // blocking finding after the fix turn is, on its own, a critic OPINION —
+        // ADVISORY by invariant 2, never a hard-fail. But before letting the step tick
+        // Done as FULLY CLEAN, corroborate that residual against UmaDev's OWN
+        // deterministic floor: a content-governance hit, a failed
+        // contract/coverage/acceptance/runtime check, or a failed source verify (the
+        // SAME objective signals the final QC folds in). Deterministic + read-only +
+        // fail-open: an uncomputable / neutral floor yields NO corroboration and today's
+        // advisory behaviour stands (a Note, the step proceeds).
+        let corroboration = review_residual_floor_corroboration(options, events, route).await;
+        if !corroboration.is_empty() {
+            events.emit(EngineEvent::Note(format!(
+                "team · review step's residual finding(s) are CORROBORATED by the \
+                 deterministic floor ({}) — marking the step not-clean so the final gate \
+                 can't drop it (the FLOOR fails it; critics stay advisory)",
+                corroboration.join("; ")
+            )));
+            // Honest status via the EXISTING machinery: `made_progress = false` marks
+            // this step Blocked (NOT Done-clean) at the scheduler, which folds into the
+            // final `clean` computation (`all steps Done && final_gate.clean`) so the
+            // corroborated residual can't vanish. `accepted` STAYS true so the circuit
+            // breaker (`drove && !accepted`) is UNTOUCHED — a floor-corroborated residual
+            // is not a driven-verify failure, and a critic never trips loop control
+            // (invariant 2 / the deterministic floor governs). The team convened + a
+            // repair turn ran, so this is real (if not-clean) review work.
+            return StepOutcome {
+                accepted: true,
+                reply: String::new(),
+                drove,
+                made_progress: false,
+                // The corroborating floor lines — WHY this review step is not clean — so
+                // a bounded re-plan (only if it strands dependents) can route around it.
+                gap_evidence: corroboration,
+            };
+        }
+        // NOT corroborated — a bare critic opinion only. Invariant 2 holds: advisory,
+        // surface the honest Note and let the step proceed exactly as before (a critic's
+        // opinion never hard-fails a step; the objective hard-gate still owns reality).
         events.emit(EngineEvent::Note(format!(
             "team · review step repaired but {} finding(s) remain after the fix turn — \
-             left for the final gate (objective hard-gate owns reality)",
+             NOT corroborated by the deterministic floor, so advisory-only (left for the \
+             final gate; the objective hard-gate owns reality)",
             recheck.blocking.len()
         )));
     }
@@ -1998,6 +2037,63 @@ async fn drive_review_step(
         made_progress: true,
         gap_evidence: Vec::new(), // review accepted (advisory) → no gap to re-plan
     }
+}
+
+/// DETERMINISTIC floor corroboration for a review step's RESIDUAL blocking finding
+/// (the floor-integrity tightening). After a review step's bounded fix turn the
+/// cross-review team may STILL raise a blocking finding; on its own that is a critic
+/// OPINION — ADVISORY by invariant 2, and a bare opinion must NEVER hard-fail a step.
+/// So before a residual can hold the step back it must be CORROBORATED by UmaDev's OWN
+/// deterministic floor. This runs the SAME read-only, deterministic checks the final QC
+/// gate folds in and returns the corroborating lines:
+///
+/// 1. **content-governance scan** (`continuous::governance_scan`) — emoji-as-icon /
+///    hardcoded color / AI-slop / swallowed-error hits in what the base wrote,
+/// 2. **required acceptance floor** (`acceptance_floor_blocking`) — a coverage gap /
+///    an unimplemented planned endpoint / frontend↔backend contract drift / an
+///    unverified `runtime-proof.json`,
+/// 3. **source-present verify** (`director::verify` / [`VerifyKind::SourcePresent`]) —
+///    a claimed-done build with ZERO real source on disk is an objective floor failure.
+///
+/// An EMPTY result means NOT corroborated → the caller keeps today's advisory behaviour
+/// (a Note, the step proceeds). Read-only + fail-open + CHEAP by construction (disk
+/// reads only — no second full build, no fork): a build failure is already re-found
+/// INDEPENDENTLY by the final gate, so this closes the gap only for findings that could
+/// otherwise VANISH (governance / contract / coverage / runtime / source) without paying
+/// for a duplicate build. Every contributor degrades to a neutral skip when it can't run,
+/// so an uncomputable corroboration yields an empty result — never a spurious fail, never
+/// a crash. This does NOT change the advisory nature of critics: it only lets an
+/// independently-observed FLOOR signal — not the critic's opinion — mark the step honest.
+async fn review_residual_floor_corroboration(
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    route: &RoutePlan,
+) -> Vec<String> {
+    let mut corroborating: Vec<String> = Vec::new();
+    // 1. Content-governance scan (deterministic, read-only) — the same craft/quality
+    //    floor `run_auto_qc` folds in. A hit here is an objective, base-agnostic signal.
+    for v in crate::continuous::governance_scan(options) {
+        corroborating.push(format!("[governance] {v}"));
+    }
+    // 2. Required acceptance floor (coverage / acceptance / contract / runtime-proof) —
+    //    the SAME deterministic contract/acceptance checks the final QC folds in. Called
+    //    unconditionally: it is fail-open (no PRD / architecture / runtime-proof → empty),
+    //    so it can only ever add a REAL, machine-checked gap, never a fabricated one.
+    for line in acceptance_floor_blocking(options, Some(route)) {
+        corroborating.push(line);
+    }
+    // 3. Source-present verify (a failed verify) — a claimed-done build with no real
+    //    source on disk. Cheap: a disk read, never a build. A failing BUILD is left to
+    //    the final gate, which re-runs it independently (so it can't vanish anyway); we
+    //    corroborate here only with the signals that COULD otherwise be dropped.
+    let src = director::verify(options, events, VerifyKind::SourcePresent).await;
+    if src.available && !src.passed {
+        corroborating.push(format!(
+            "source-present: FAILED — {}",
+            src.evidence.first().cloned().unwrap_or_default()
+        ));
+    }
+    corroborating
 }
 
 /// The outcome of verifying one step against its declared acceptance.
@@ -8350,6 +8446,153 @@ mod tests {
             "an empty-team review is a neutral skip, NOT real progress that marks Done"
         );
         assert!(!outcome.drove, "no review team actually convened (0 seats)");
+    }
+
+    #[tokio::test]
+    async fn review_residual_corroboration_hits_a_floor_signal_and_is_silent_when_clean() {
+        // FLOOR-INTEGRITY (the corroboration primitive): the residual-review floor check
+        // is DETERMINISTIC + fail-open. A real governance violation on disk corroborates
+        // a residual review finding; a genuinely clean floor (source present, no
+        // violation, no doc gaps) corroborates NOTHING — so a bare critic opinion is
+        // never smuggled through as if it were a floor signal.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let route = build_route();
+
+        // Clean floor: a plain source file, no governance violation, no PRD/architecture
+        // docs → every deterministic check is a neutral pass → NOT corroborated (empty).
+        seed_source(tmp.path());
+        let o = opts(tmp.path());
+        let clean = review_residual_floor_corroboration(&o, &events, &route).await;
+        assert!(
+            clean.is_empty(),
+            "a clean floor corroborates nothing — a bare opinion stays advisory: {clean:?}"
+        );
+
+        // Governance violation on disk (emoji-as-icon in a UI source file) → the content
+        // scan hits → the residual is CORROBORATED (non-empty, floor-tagged).
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/Btn.tsx"),
+            "export const B = () => <button>🔍</button>;\n",
+        )
+        .unwrap();
+        let hit = review_residual_floor_corroboration(&o, &events, &route).await;
+        assert!(
+            hit.iter().any(|l| l.contains("[governance]")),
+            "an on-disk governance violation corroborates the residual: {hit:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn corroborated_residual_review_finding_marks_the_step_not_clean() {
+        // FLOOR-INTEGRITY: after a review step's fix turn the team STILL flags a blocking
+        // finding AND UmaDev's own deterministic floor (a governance violation on disk)
+        // independently bites → the residual is CORROBORATED. The step must NOT tick
+        // Done-clean: `made_progress=false` marks it Blocked (which folds into the final
+        // gate's `all steps Done` clean signal so it can't vanish), while `accepted`
+        // STAYS true so the circuit breaker (`drove && !accepted`) is untouched — a
+        // corroborated residual never trips loop control, and critics stay advisory.
+        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Source present (source-present passes) BUT it carries a governance violation, so
+        // the corroboration comes from the content scan, not an empty-tree floor.
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/Btn.tsx"),
+            "export const B = () => <button>🔍</button>;\n",
+        )
+        .unwrap();
+        let (events, _rec) = sink();
+        // can_fork=true + a blocking verdict → the review team raises a finding on the
+        // first pass AND on the recheck after the fix turn (the residual).
+        let mut sess = FakeSession::new(
+            vec![text_turn("fixed what I could")],
+            true,
+            r#"{"accepts": false, "blocking": ["按钮缺 loading 态"]}"#,
+        );
+        let o = opts(tmp.path());
+        let route = build_route(); // team = [FrontendEngineer] → a seat actually reviews
+        let step = PlanStep {
+            id: "review".into(),
+            title: "Cross-review".into(),
+            seat: crate::critics::Seat::QaEngineer,
+            kind: StepKind::Review,
+            depends_on: vec![],
+            acceptance: AcceptanceSpec::ReviewClean,
+            evidence: Vec::new(),
+            status: StepStatus::Active,
+        };
+        let outcome = drive_review_step(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &step,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(
+            !outcome.made_progress,
+            "a floor-corroborated residual must NOT tick Done-clean (it folds into the final gate)"
+        );
+        assert!(
+            outcome.accepted,
+            "`accepted` stays true so the circuit breaker is untouched — critics stay advisory"
+        );
+        assert!(
+            !outcome.gap_evidence.is_empty(),
+            "the corroborating floor lines are carried so they can't vanish"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncorroborated_residual_review_finding_stays_advisory() {
+        // The complement (invariant 2 + fail-open): a residual blocking finding with a
+        // CLEAN deterministic floor (source present, no governance violation, no doc
+        // gaps) is a bare critic OPINION. It must NOT hard-fail the step — `made_progress`
+        // stays true (the step proceeds, today's behaviour). This also IS the fail-open
+        // case: a neutral / uncomputable floor degrades to today's behaviour, never a
+        // spurious fail.
+        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path()); // clean source → source-present passes, no violation
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(
+            vec![text_turn("fixed what I could")],
+            true,
+            r#"{"accepts": false, "blocking": ["按钮缺 loading 态"]}"#,
+        );
+        let o = opts(tmp.path());
+        let route = build_route();
+        let step = PlanStep {
+            id: "review".into(),
+            title: "Cross-review".into(),
+            seat: crate::critics::Seat::QaEngineer,
+            kind: StepKind::Review,
+            depends_on: vec![],
+            acceptance: AcceptanceSpec::ReviewClean,
+            evidence: Vec::new(),
+            status: StepStatus::Active,
+        };
+        let outcome = drive_review_step(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &step,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(
+            outcome.made_progress,
+            "an uncorroborated critic opinion stays advisory — the step proceeds (never hard-fails)"
+        );
+        assert!(outcome.accepted, "review steps still accept (advisory)");
+        assert!(
+            outcome.gap_evidence.is_empty(),
+            "no floor corroboration → nothing to carry"
+        );
     }
 
     #[tokio::test]
