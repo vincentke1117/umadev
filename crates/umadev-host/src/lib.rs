@@ -1551,7 +1551,11 @@ pub async fn session_for(
             // injected NATIVELY via `--append-system-prompt`, so it pins the team
             // identity + craft + JIT knowledge/memory for the whole session; the
             // runner's per-phase directives still carry the step-specific framing.
-            let s = ClaudeSession::start(workspace, append_system, autonomous).await?;
+            // `None` → no `--max-turns`: the long-lived main session stays unbounded
+            // (today's behavior, fail-open). The optional per-run turn ceiling
+            // (`umadev_agent::router::Depth::max_turns`) is a caller-threaded backstop;
+            // the read-only critic fork is already capped LOW at the session layer.
+            let s = ClaudeSession::start(workspace, append_system, autonomous, None).await?;
             Ok(Box::new(s))
         }
         "codex" => {
@@ -1621,7 +1625,9 @@ pub async fn session_for_resume(
     }
     match backend_id {
         "claude-code" => {
-            let s = ClaudeSession::resume(workspace, append_system, resume_id, autonomous).await?;
+            // `None` → unbounded resumed main line (today's behavior); see `session_for`.
+            let s = ClaudeSession::resume(workspace, append_system, resume_id, autonomous, None)
+                .await?;
             Ok(Box::new(s))
         }
         "codex" => {

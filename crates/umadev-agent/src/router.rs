@@ -129,6 +129,26 @@ impl Depth {
         matches!(self, Self::Standard | Self::Deep)
     }
 
+    /// A **generous per-run turn ceiling** for a base session opened at this depth —
+    /// a RUNAWAY BACKSTOP, not a tight work budget. Deeper work earns more turns; the
+    /// caps are sized so a real build of this depth never truncates (the base reports
+    /// hitting it as `error_max_turns` → `TurnStatus::Truncated`, and the deterministic
+    /// floor is the real stop). A chat / quick-edit (`Fast`) gets the low cap, a
+    /// deliberate build (`Standard` / `Deep`) a much higher one. This is the source of
+    /// the optional `--max-turns` a caller threads into the claude session spawn; a
+    /// read-only critic consult is capped even lower at the host layer. Deterministic.
+    #[must_use]
+    pub const fn max_turns(self) -> u32 {
+        match self {
+            // Chat / quick-edit / a fast single-page build: a few tool loops, not a saga.
+            Self::Fast => 40,
+            // A deliberate build (plan + team + gates): generous headroom for a real feature.
+            Self::Standard => 150,
+            // The deepest greenfield play: the most headroom before the backstop trips.
+            Self::Deep => 400,
+        }
+    }
+
     const fn rank(self) -> u8 {
         match self {
             Self::Fast => 0,
@@ -229,6 +249,16 @@ impl RoutePlan {
                 self.depth.as_str()
             ),
         }
+    }
+
+    /// The **generous turn ceiling** for a base session driving this route — the
+    /// optional `--max-turns` runaway backstop a caller may thread into the session
+    /// spawn. Derived from the route's [`Depth`] (see [`Depth::max_turns`]): a
+    /// deliberate build gets a higher cap than a chat / quick-edit. Never a tight
+    /// leash — sized so real work never truncates. Deterministic; no model call.
+    #[must_use]
+    pub const fn max_turns(&self) -> u32 {
+        self.depth.max_turns()
     }
 }
 
@@ -1278,6 +1308,39 @@ mod tests {
         let offline = umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic);
         let p = route_via_brain(&offline, "做一个待办应用").await;
         assert_eq!(p.class, RouteClass::Chat, "no brain → pass-through chat");
+    }
+
+    #[test]
+    fn depth_turn_caps_are_ordered_generous_backstops() {
+        // Item 1 tiers: deeper work earns more turns. The caps are a RUNAWAY BACKSTOP,
+        // so each is comfortably above 1 (never a tight leash) and strictly ordered
+        // Fast < Standard < Deep.
+        assert!(Depth::Fast.max_turns() >= 1);
+        assert!(
+            Depth::Standard.max_turns() > Depth::Fast.max_turns(),
+            "a deliberate build earns more turns than a chat/quick-edit"
+        );
+        assert!(
+            Depth::Deep.max_turns() > Depth::Standard.max_turns(),
+            "the deepest play earns the most turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deliberate_build_gets_a_higher_turn_cap_than_a_chat() {
+        // The route's turn cap is derived from its depth: a real build (Standard/Deep)
+        // sits well above a chat/quick-edit (Fast). Proven end-to-end off the routed
+        // RoutePlan, not just the raw Depth mapping.
+        let build = route(None, &opts(), "做一个待办事项 SaaS 产品").await;
+        let chat = route(None, &opts(), "你好,在吗?").await;
+        assert!(build.depth.is_deliberate());
+        assert_eq!(chat.depth, Depth::Fast);
+        assert!(
+            build.max_turns() > chat.max_turns(),
+            "a deliberate build ({}) must out-budget a chat turn ({})",
+            build.max_turns(),
+            chat.max_turns()
+        );
     }
 
     fn opts() -> RunOptions {

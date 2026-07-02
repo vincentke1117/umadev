@@ -51,6 +51,16 @@ use crate::stderr_tail::{drain_stderr_into, StderrTail};
 /// How many events the stdout-reader task may buffer ahead of the consumer.
 const EVENT_CHANNEL_CAP: usize = 256;
 
+/// Turn ceiling for a read-only **critic-consult fork** — a RUNAWAY BACKSTOP, not a
+/// work budget. A critic seat reads the on-disk blackboard and returns ONE JSON
+/// verdict; it must never spin a long agentic loop, so its fork is spawned with a
+/// very low `--max-turns` — well below any real build's cap (the deliberate-build
+/// tiers live in `umadev_agent::router::Depth::max_turns`: Fast 40 / Standard 150 /
+/// Deep 400). claude reports hitting the ceiling as `error_max_turns` →
+/// [`TurnStatus::Truncated`], which the critic path already treats as "accept what
+/// landed", so a capped critic degrades fail-open, never a panic.
+const CRITIC_FORK_MAX_TURNS: u32 = 20;
+
 /// A live, long-lived `claude` stream-json session.
 pub struct ClaudeSession {
     /// The base child. Behind a [`std::sync::Mutex`] so the `&self`
@@ -87,10 +97,16 @@ impl ClaudeSession {
     /// `acceptEdits` (write unattended), `false` → `default` (claude asks before
     /// each tool, surfaced as a `NeedApproval` — the guarded human-in-the-loop
     /// tier). This mirrors the codex / opencode drivers' autonomy handling.
+    ///
+    /// `max_turns` is an OPTIONAL per-run turn ceiling (a runaway backstop): `Some(n)`
+    /// spawns claude with `--max-turns <n>`, `None` leaves it unbounded (today's
+    /// behavior). The cap is derived by the caller from the route depth
+    /// (`umadev_agent::router::Depth::max_turns`); see [`session_args`].
     pub async fn start(
         workspace: &Path,
         append_system: Option<&str>,
         autonomous: bool,
+        max_turns: Option<u32>,
     ) -> Result<Self, SessionError> {
         let program = std::env::var("UMADEV_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
         Self::start_with_program(
@@ -99,24 +115,27 @@ impl ClaudeSession {
             append_system,
             &new_session_id(),
             autonomous,
+            max_turns,
         )
         .await
     }
 
     /// Start a session against an explicit `program` + pinned `session_id`
     /// (mainly for tests, where `program` is a fake stream-json emitter).
-    /// `autonomous` chooses the permission mode (see [`session_args`]).
+    /// `autonomous` chooses the permission mode (see [`session_args`]); `max_turns`
+    /// is the optional `--max-turns` runaway backstop (`None` → unbounded).
     pub async fn start_with_program(
         program: &str,
         workspace: &Path,
         append_system: Option<&str>,
         session_id: &str,
         autonomous: bool,
+        max_turns: Option<u32>,
     ) -> Result<Self, SessionError> {
         Self::spawn_with_args(
             program,
             workspace,
-            &session_args(session_id, append_system, autonomous),
+            &session_args(session_id, append_system, autonomous, max_turns),
             session_id,
         )
         .await
@@ -140,12 +159,13 @@ impl ClaudeSession {
         append_system: Option<&str>,
         session_id: &str,
         autonomous: bool,
+        max_turns: Option<u32>,
     ) -> Result<Self, SessionError> {
         let program = std::env::var("UMADEV_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
         Self::spawn_with_args(
             &program,
             workspace,
-            &resume_session_args(session_id, append_system, autonomous),
+            &resume_session_args(session_id, append_system, autonomous, max_turns),
             session_id,
         )
         .await
@@ -410,11 +430,20 @@ fn spawn_err(program: &str, e: &std::io::Error) -> String {
 /// the orchestrator answers — keeping the human-in-the-loop / irreversible-action
 /// floor live). `UMADEV_CLAUDE_PERMISSION_MODE`, when set, overrides the derived
 /// default for both tiers.
+///
+/// `max_turns` is the OPTIONAL per-run turn ceiling (a runaway backstop): `Some(n)`
+/// appends `--max-turns <n>`, `None` omits the flag entirely — leaving claude's
+/// default unbounded agentic loop (today's behavior). The caller derives the cap from
+/// the route depth (`umadev_agent::router::Depth::max_turns` — Fast 40 / Standard 150
+/// / Deep 400); hitting it is reported as `error_max_turns` → [`TurnStatus::Truncated`]
+/// (already handled by [`parse_result`]), so no new parsing is needed. Fail-open: no
+/// cap → no flag → unchanged behavior.
 #[must_use]
 pub fn session_args(
     session_id: &str,
     append_system: Option<&str>,
     autonomous: bool,
+    max_turns: Option<u32>,
 ) -> Vec<String> {
     let permission_mode = claude_permission_mode(autonomous);
     let mut args = vec![
@@ -440,11 +469,23 @@ pub fn session_args(
         "--allowedTools".to_string(),
         "Read,Edit,Write,Bash".to_string(),
     ];
+    push_max_turns(&mut args, max_turns);
     if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
         args.push("--append-system-prompt".to_string());
         args.push(sys.to_string());
     }
     args
+}
+
+/// Append `--max-turns <n>` to `args` when a cap is set; a `None` cap appends
+/// NOTHING (fail-open by omission → claude's default unbounded loop, today's
+/// behavior). Shared by the main-session, resume, and critic-fork arg builders so the
+/// optional turn ceiling is shaped identically everywhere. Deterministic.
+fn push_max_turns(args: &mut Vec<String>, max_turns: Option<u32>) {
+    if let Some(n) = max_turns {
+        args.push("--max-turns".to_string());
+        args.push(n.to_string());
+    }
 }
 
 /// Resolve claude's `--permission-mode` for an autonomy tier. `autonomous` →
@@ -467,12 +508,15 @@ fn claude_permission_mode(autonomous: bool) -> String {
 /// continuing the existing conversation, not pinning a new one). All the other
 /// stream-json + permission + allowed-tools flags mirror [`session_args`] exactly,
 /// so a resumed session writes files identically to a fresh one — it just inherits
-/// the base's accumulated transcript. Exposed for tests.
+/// the base's accumulated transcript. `max_turns` shapes the optional `--max-turns`
+/// runaway backstop exactly like [`session_args`] (`None` → unbounded). Exposed for
+/// tests.
 #[must_use]
 pub fn resume_session_args(
     session_id: &str,
     append_system: Option<&str>,
     autonomous: bool,
+    max_turns: Option<u32>,
 ) -> Vec<String> {
     let permission_mode = claude_permission_mode(autonomous);
     let mut args = vec![
@@ -493,6 +537,7 @@ pub fn resume_session_args(
         "--allowedTools".to_string(),
         "Read,Edit,Write,Bash".to_string(),
     ];
+    push_max_turns(&mut args, max_turns);
     if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
         args.push("--append-system-prompt".to_string());
         args.push(sys.to_string());
@@ -516,7 +561,7 @@ pub fn resume_session_args(
 /// tests.
 #[must_use]
 pub fn fork_session_args(fork_session_id: &str) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "--print".to_string(),
         "--input-format".to_string(),
         "stream-json".to_string(),
@@ -539,7 +584,11 @@ pub fn fork_session_args(fork_session_id: &str) -> Vec<String> {
         "plan".to_string(),
         "--allowedTools".to_string(),
         "Read,Grep,Glob".to_string(),
-    ]
+    ];
+    // A read-only verdict consult is turn-capped LOW — a runaway backstop so a critic
+    // can never spin a long agentic loop (see `CRITIC_FORK_MAX_TURNS`).
+    push_max_turns(&mut args, Some(CRITIC_FORK_MAX_TURNS));
+    args
 }
 
 /// The argument vector for the DEFAULT read-only critic fork — the one that
@@ -557,7 +606,7 @@ pub fn fork_session_args(fork_session_id: &str) -> Vec<String> {
 /// FRESH [`fork_session_args`] fallback instead. Exposed for tests.
 #[must_use]
 pub fn resume_fork_session_args(main_session_id: &str) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "--print".to_string(),
         "--input-format".to_string(),
         "stream-json".to_string(),
@@ -581,7 +630,11 @@ pub fn resume_fork_session_args(main_session_id: &str) -> Vec<String> {
         "plan".to_string(),
         "--allowedTools".to_string(),
         "Read,Grep,Glob".to_string(),
-    ]
+    ];
+    // Same low turn ceiling as the fresh fork — a carried-transcript critic is still a
+    // one-verdict consult, never a long agentic loop (see `CRITIC_FORK_MAX_TURNS`).
+    push_max_turns(&mut args, Some(CRITIC_FORK_MAX_TURNS));
+    args
 }
 
 /// Choose the critic fork's argument vector. With a live parent `main_session_id`
@@ -636,8 +689,65 @@ pub fn parse_stdout_line(line: &str) -> Vec<SessionEvent> {
         Some("user") => parse_user_tool_results(&v),
         Some("result") => vec![parse_result(&v)],
         Some("control_request") => parse_control_request(&v),
-        // system/init, keep_alive, status, tool_progress, … → not events.
+        // Item 2 — observability: an inbound `control_response` (claude's ACK to our
+        // `interrupt` / other control acks) and the session `system`/init frame used
+        // to fall through the `_ => vec![]` arm and be silently dropped. Surface them
+        // to the tracing log so they're OBSERVABLE, but emit NO `SessionEvent` — the
+        // control FLOW (`can_use_tool` → `NeedApproval` → `respond`) is untouched; these
+        // still produce zero events. Fail-open: the describers never panic on a
+        // malformed frame.
+        Some("control_response") => {
+            tracing::debug!(
+                control = %describe_control_response(&v),
+                "inbound base control ack (no event)"
+            );
+            vec![]
+        }
+        Some("system") => {
+            tracing::debug!(
+                system = %describe_system_event(&v),
+                "inbound base system message (no event)"
+            );
+            vec![]
+        }
+        // keep_alive, status, tool_progress, … → not events.
         _ => vec![],
+    }
+}
+
+/// A short, fail-open one-line description of an inbound `control_response` (claude's
+/// ACK to a `control_request` we sent — e.g. the reply to our `interrupt`) for the
+/// tracing log. Reads the ack `subtype` + the `request_id` it answers, tolerating
+/// both the nested (`response.request_id`) and top-level shapes. NEVER panics: a
+/// missing / wrong-typed field degrades to `"?"`. Pure; drives NO control flow.
+/// Exposed for tests.
+#[must_use]
+fn describe_control_response(v: &Value) -> String {
+    let resp = v.get("response");
+    let subtype = resp
+        .and_then(|r| r.get("subtype"))
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let request_id = resp
+        .and_then(|r| r.get("request_id"))
+        .and_then(Value::as_str)
+        .or_else(|| v.get("request_id").and_then(Value::as_str))
+        .unwrap_or("?");
+    format!("subtype={subtype} request_id={request_id}")
+}
+
+/// A short, fail-open one-line description of an inbound `system` frame (claude's
+/// session `init` + status messages) for the tracing log. Reads the `subtype` and,
+/// when present, the `session_id`. NEVER panics on a malformed frame. Pure; produces
+/// NO `SessionEvent` (kept off the event stream exactly as before). Exposed for tests.
+#[must_use]
+fn describe_system_event(v: &Value) -> String {
+    let subtype = v.get("subtype").and_then(Value::as_str).unwrap_or("?");
+    let session = v.get("session_id").and_then(Value::as_str).unwrap_or("");
+    if session.is_empty() {
+        format!("subtype={subtype}")
+    } else {
+        format!("subtype={subtype} session_id={session}")
     }
 }
 
@@ -946,7 +1056,7 @@ mod tests {
 
     #[test]
     fn session_args_use_append_not_replace_system_prompt() {
-        let args = session_args("sid-1", Some("be terse"), true);
+        let args = session_args("sid-1", Some("be terse"), true, None);
         assert!(args.contains(&"--input-format".to_string()));
         assert!(args.contains(&"stream-json".to_string()));
         assert!(args.contains(&"sid-1".to_string()));
@@ -964,11 +1074,11 @@ mod tests {
         // Guard against the env override leaking in from a sibling process.
         let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
 
-        let auto = session_args("sid-a", None, true);
+        let auto = session_args("sid-a", None, true, None);
         let auto_idx = auto.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(auto[auto_idx + 1], "acceptEdits", "auto → acceptEdits");
 
-        let guarded = session_args("sid-g", None, false);
+        let guarded = session_args("sid-g", None, false, None);
         let g_idx = guarded
             .iter()
             .position(|a| a == "--permission-mode")
@@ -981,7 +1091,7 @@ mod tests {
 
         // The explicit override beats the derived default for either tier.
         std::env::set_var("UMADEV_CLAUDE_PERMISSION_MODE", "plan");
-        let overridden = session_args("sid-o", None, true);
+        let overridden = session_args("sid-o", None, true, None);
         let o_idx = overridden
             .iter()
             .position(|a| a == "--permission-mode")
@@ -997,7 +1107,7 @@ mod tests {
         // so the resumed session writes files identically — it just inherits context.
         let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
 
-        let args = resume_session_args("sid-resume", Some("be terse"), true);
+        let args = resume_session_args("sid-resume", Some("be terse"), true, None);
         // Resumes the SAME conversation id.
         let r = args
             .iter()
@@ -1145,10 +1255,16 @@ mod tests {
         // `claude` reports it saw `--resume`, then streams a JSON verdict.
         let tmp = tempfile_dir();
         let fake = write_fake_claude(&tmp, RESUME_REPORTING_FAKE);
-        let mut main =
-            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "sid-main", true)
-                .await
-                .expect("start main");
+        let mut main = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-main",
+            true,
+            None,
+        )
+        .await
+        .expect("start main");
         let mut fork = main
             .fork()
             .await
@@ -1177,7 +1293,7 @@ mod tests {
         let tmp = tempfile_dir();
         let fake = write_fake_claude(&tmp, RESUME_REPORTING_FAKE);
         let mut main =
-            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "", true)
+            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "", true, None)
                 .await
                 .expect("start main");
         let mut fork = main
@@ -1237,7 +1353,7 @@ mod tests {
         let arg = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{"}}}"#;
         assert!(parse_stdout_line(arg).is_empty());
         // The session is actually launched with the flag (both main + fork).
-        assert!(session_args("sid", None, false)
+        assert!(session_args("sid", None, false, None)
             .iter()
             .any(|a| a == "--include-partial-messages"));
         assert!(fork_session_args("f")
@@ -1440,10 +1556,16 @@ mod tests {
              printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}'\n\
              cat >/dev/null\n",
         );
-        let mut s =
-            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "sid-test", true)
-                .await
-                .expect("start");
+        let mut s = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-test",
+            true,
+            None,
+        )
+        .await
+        .expect("start");
         s.send_turn("build a todo page".to_string())
             .await
             .expect("send");
@@ -1488,6 +1610,7 @@ mod tests {
             None,
             "sid-stderr",
             true,
+            None,
         )
         .await
         .expect("start");
@@ -1534,10 +1657,16 @@ mod tests {
              printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}'\n\
              cat >/dev/null\n",
         );
-        let mut s =
-            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "sid-env", true)
-                .await
-                .expect("start");
+        let mut s = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-env",
+            true,
+            None,
+        )
+        .await
+        .expect("start");
         s.send_turn("go".to_string()).await.expect("send");
         let mut text = String::new();
         while let Some(ev) = s.next_event().await {
@@ -1569,6 +1698,7 @@ mod tests {
             None,
             "sid-crash",
             true,
+            None,
         )
         .await
         .expect("start");
@@ -1584,5 +1714,196 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // ── Item 1: `--max-turns` per-run execution shaping (arg construction) ──
+
+    #[test]
+    fn session_args_omit_max_turns_when_no_cap() {
+        // Fail-open: `None` → NO `--max-turns` flag → claude's default unbounded loop
+        // (today's behavior), on both a fresh start and a writable resume.
+        let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
+        let fresh = session_args("sid", None, true, None);
+        assert!(
+            !fresh.iter().any(|a| a == "--max-turns"),
+            "no cap → no flag: {fresh:?}"
+        );
+        let resumed = resume_session_args("sid", None, true, None);
+        assert!(
+            !resumed.iter().any(|a| a == "--max-turns"),
+            "no cap on resume → no flag: {resumed:?}"
+        );
+    }
+
+    #[test]
+    fn session_args_include_max_turns_when_capped() {
+        // A cap appends `--max-turns <n>` (the runaway backstop) on both shapes.
+        let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
+        let fresh = session_args("sid", None, false, Some(150));
+        let i = fresh
+            .iter()
+            .position(|a| a == "--max-turns")
+            .expect("--max-turns present when capped");
+        assert_eq!(fresh[i + 1], "150");
+        let resumed = resume_session_args("sid", None, false, Some(150));
+        let ri = resumed.iter().position(|a| a == "--max-turns").unwrap();
+        assert_eq!(resumed[ri + 1], "150");
+    }
+
+    #[test]
+    fn a_critic_fork_is_turn_capped_low_below_a_deliberate_build() {
+        // Per-tier caps: a read-only critic consult fork carries a VERY LOW turn ceiling
+        // (a runaway backstop), and a deliberate build session's cap is much higher. Both
+        // fork shapes (fresh + carried-transcript) are capped identically.
+        // A Depth::Standard build tier (see `umadev_agent::router::Depth::max_turns`).
+        let build_cap: u32 = 150;
+        let build = session_args("sid", None, true, Some(build_cap));
+        let bi = build.iter().position(|a| a == "--max-turns").unwrap();
+        let build_n: u32 = build[bi + 1].parse().unwrap();
+
+        for fork in [fork_session_args("f"), resume_fork_session_args("main")] {
+            let fi = fork
+                .iter()
+                .position(|a| a == "--max-turns")
+                .expect("a read-only critic fork is turn-capped");
+            let fork_n: u32 = fork[fi + 1].parse().unwrap();
+            assert_eq!(
+                fork_n, CRITIC_FORK_MAX_TURNS,
+                "critic fork uses the low const"
+            );
+            assert!(
+                build_n > fork_n,
+                "a deliberate build cap ({build_n}) must exceed the critic consult cap ({fork_n})"
+            );
+        }
+    }
+
+    // ── Item 2: inbound control_response / system:init are observed, not dropped ──
+
+    #[test]
+    fn inbound_control_response_is_observed_but_produces_no_event() {
+        // claude's ACK to our `interrupt` (an inbound control_response) used to fall
+        // through `_ => vec![]` and vanish. It is now described for the tracing log, but
+        // STILL emits no SessionEvent — the approval loop is untouched.
+        let line =
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"int-1"}}"#;
+        assert!(
+            parse_stdout_line(line).is_empty(),
+            "a control ack emits no event"
+        );
+        let v: Value = serde_json::from_str(line).unwrap();
+        let desc = describe_control_response(&v);
+        assert!(
+            desc.contains("success"),
+            "ack subtype is observable: {desc}"
+        );
+        assert!(
+            desc.contains("int-1"),
+            "acked request id is observable: {desc}"
+        );
+    }
+
+    #[test]
+    fn inbound_system_init_is_observed_but_produces_no_event() {
+        let line = r#"{"type":"system","subtype":"init","session_id":"sid-x"}"#;
+        assert!(
+            parse_stdout_line(line).is_empty(),
+            "system init emits no event"
+        );
+        let v: Value = serde_json::from_str(line).unwrap();
+        let desc = describe_system_event(&v);
+        assert!(
+            desc.contains("init"),
+            "system subtype is observable: {desc}"
+        );
+        assert!(desc.contains("sid-x"), "session id is observable: {desc}");
+    }
+
+    #[test]
+    fn malformed_control_and_system_frames_fail_open_no_panic_no_event() {
+        // Fail-open: a control_response / system frame missing (or mistyping) its inner
+        // fields is described WITHOUT panicking and STILL emits no event — never a
+        // disturbance to the can_use_tool → NeedApproval → respond loop.
+        for line in [
+            r#"{"type":"control_response"}"#,
+            r#"{"type":"control_response","response":{}}"#,
+            r#"{"type":"control_response","response":42}"#,
+            r#"{"type":"system"}"#,
+            r#"{"type":"system","subtype":null}"#,
+        ] {
+            assert!(parse_stdout_line(line).is_empty(), "no event for: {line}");
+            let v: Value = serde_json::from_str(line).unwrap();
+            // Neither describer panics on the malformed shape (both fall back to "?").
+            let _ = describe_control_response(&v);
+            let _ = describe_system_event(&v);
+        }
+        // A control ack must NEVER be misread as a can_use_tool approval prompt.
+        let ack =
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"x"}}"#;
+        assert!(
+            !parse_stdout_line(ack)
+                .iter()
+                .any(|e| matches!(e, SessionEvent::NeedApproval { .. })),
+            "a control ack must never become a NeedApproval"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inbound_control_response_and_system_do_not_disturb_the_turn_stream() {
+        // Item 2 over the fake peer: a `system` init line AND an inbound `control_response`
+        // (claude's interrupt ack) interleaved in the stream are observed (logged) but
+        // surface NO events — the turn still relays its tool call and completes cleanly,
+        // and no spurious NeedApproval is raised by the control ack.
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            "#!/bin/sh\nread _line\n\
+             printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"x\"}'\n\
+             printf '%s\\n' '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"int-1\"}}'\n\
+             printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Write\",\"input\":{\"file_path\":\"a.txt\"}}]}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}'\n\
+             cat >/dev/null\n",
+        );
+        let mut s = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-ctrl",
+            true,
+            None,
+        )
+        .await
+        .expect("start");
+        s.send_turn("go".to_string()).await.expect("send");
+        let mut got = Vec::new();
+        while let Some(ev) = s.next_event().await {
+            let done = matches!(ev, SessionEvent::TurnDone { .. });
+            got.push(ev);
+            if done {
+                break;
+            }
+        }
+        assert!(
+            got.iter()
+                .any(|e| matches!(e, SessionEvent::ToolCall { name, .. } if name == "Write")),
+            "the tool call still surfaces past the control/system frames: {got:?}"
+        );
+        assert!(
+            !got.iter()
+                .any(|e| matches!(e, SessionEvent::NeedApproval { .. })),
+            "the control ack is not an approval prompt: {got:?}"
+        );
+        assert!(
+            matches!(
+                got.last(),
+                Some(SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    ..
+                })
+            ),
+            "the turn completes cleanly: {got:?}"
+        );
+        let _ = s.end().await;
     }
 }
