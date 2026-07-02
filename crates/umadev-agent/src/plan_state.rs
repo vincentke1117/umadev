@@ -988,7 +988,8 @@ pub async fn synthesize_plan(
     // fixed 180s-per-event timeout that left planning unattributed to the budget.
     deadline: std::time::Instant,
 ) -> Option<Plan> {
-    let _ = options; // reserved (model/trust already live on the session)
+    // `options.project_root` feeds the success-recipe fingerprint recall below;
+    // model/trust already live on the session.
     let team: Vec<&str> = route.team.iter().map(|s| s.role_id()).collect();
     let team_line = if team.is_empty() {
         "(no standing team — keep the plan minimal)".to_string()
@@ -1038,6 +1039,20 @@ pub async fn synthesize_plan(
     );
     let user = format!("Requirement:\n{requirement}");
 
+    // SUCCESS-RECIPE RECALL (a PRIOR, never a template): look up the closest past
+    // CLEAN build of a similar stack/kind/feature in the cross-project recipe store
+    // and inject its proven plan SHAPE as an adaptable hint the brain may reuse or
+    // ignore. Fail-open at every step — no home dir, no match, or a read error yields
+    // an empty prior, and the plan is synthesised exactly as before. Bounded to one
+    // best recipe within [`crate::recipes::RECIPE_PRIOR_BUDGET`].
+    let recipe_prior = crate::recipes::recipes_dir()
+        .and_then(|dir| {
+            let fp = crate::recipes::fingerprint_for(&options.project_root, route, requirement);
+            crate::recipes::recall_prior_block(&dir, &fp, crate::recipes::RECIPE_PRIOR_BUDGET)
+        })
+        .map(|block| format!("{block}\n\n"))
+        .unwrap_or_default();
+
     // Run the planning turn on the MAIN session — NOT a fork. claude cannot
     // `--resume` a session that has not had its first turn yet, so a pre-build
     // planning FORK fails silently and the user never sees a plan. Running it here
@@ -1045,7 +1060,7 @@ pub async fn synthesize_plan(
     // so later QC forks work, and the base keeps the plan in its own context when it
     // then builds. JSON-only, tools forbidden this turn.
     let directive = format!(
-        "{system}\n\nReturn EXACTLY ONE JSON object and nothing else — no markdown, \
+        "{system}\n\n{recipe_prior}Return EXACTLY ONE JSON object and nothing else — no markdown, \
          no code fence, no prose. Do NOT write any files or run any commands in this \
          turn; this is the PLAN only.\n\n{user}"
     );

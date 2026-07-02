@@ -66,6 +66,7 @@ pub mod plan_state;
 pub mod planner;
 pub mod pr;
 pub mod project_facts;
+pub mod recipes;
 pub mod review;
 pub mod router;
 pub mod run_lock;
@@ -165,6 +166,10 @@ pub use pr::{
     assess_readiness, ensure_isolation_branch, feature_branch_name, is_isolation_branch,
     latest_proof_pack, manual_steps, plan_branches, pr_body_rel_path, proof_pack_summary,
     render_pr_body, BranchIsolation, PrPlan, PrReadiness, ReadinessCheck,
+};
+pub use recipes::{
+    capture_recipe, fingerprint_for, load_recipes, recall_best, recall_prior_block,
+    recipe_prior_block, recipes_dir, Fingerprint, OutcomeStats, Recipe, RECIPE_PRIOR_BUDGET,
 };
 pub use review::{
     build_review_report, render_review_md, review_report_rel_path, scan_ci_weakening,

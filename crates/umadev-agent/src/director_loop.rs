@@ -1401,6 +1401,22 @@ async fn drive_plan_steps(
     // degrades to a no-op. Runs next to finalize where the session is still live.
     if clean && route.depth.is_deliberate() {
         crate::self_evolve::reconcile_at_delivery(session, &options.project_root, events).await;
+        // SUCCESS-RECIPE CAPTURE (the WIN sibling of the pitfall pipeline): distil the
+        // plan shape this CLEAN deliberate build actually executed — the ordered
+        // step titles/seats that reached Done, the scaffold its evidence named, the
+        // detected stack + requirement shape — into a reusable cross-project recipe,
+        // so the next similar build gets it as a plan-time PRIOR. One optional
+        // read-only fork enriches patterns; everything is best-effort + fail-open, so
+        // a capture error NEVER affects the just-finished delivery.
+        crate::recipes::capture_at_delivery(
+            session,
+            &options.project_root,
+            route,
+            plan,
+            &options.requirement,
+            events,
+        )
+        .await;
     }
     // SIZING calibration: a step-driven build is ALWAYS a deliberate route (predicted
     // HEAVY). Measure the ACTUAL heaviness by how many Build steps did real work — a
