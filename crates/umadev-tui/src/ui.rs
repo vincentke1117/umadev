@@ -389,12 +389,123 @@ pub fn render(frame: &mut Frame, app: &App) {
         AppMode::Picker => render_picker(frame, app),
         AppMode::Chat => render_chat(frame, app),
     }
-    // Overlay precedence: scrollable content overlay wins over help.
-    if let Some(ov) = &app.overlay {
+    // Overlay precedence: the `/model` picker card is the top modal (it owns
+    // the keyboard while open), then the scrollable content overlay, then help.
+    if let Some(mp) = &app.model_picker {
+        render_model_picker(frame, app, mp);
+    } else if let Some(ov) = &app.overlay {
         render_scroll_overlay(frame, ov);
     } else if app.show_help {
         render_help_overlay(frame, app);
     }
+}
+
+/// Render the interactive `/model` picker as a centered card over the chat.
+/// Mirrors the first-run picker's selected-row styling (brand left-bar + bold
+/// primary label) and the scroll-overlay's bordered-card chrome, all from theme
+/// tokens (no hardcoded colors, no emoji). The currently-pinned model is marked
+/// with a filled geometric circle built from a codepoint (never a pictograph).
+fn render_model_picker(frame: &mut Frame, app: &App, mp: &crate::app::ModelPicker) {
+    use crate::app::ModelTier;
+
+    let total = frame.area();
+    // Tiny-terminal guard: below this the bordered card + footer can't fit, so
+    // show the "make the window bigger" card instead of a clipped picker.
+    if total.height < 8 || total.width < 30 {
+        render_too_small(frame, total);
+        return;
+    }
+    let lang = app.lang;
+
+    // Geometric "current" mark (● U+25CF) — a codepoint, so the source carries
+    // no pictographic glyph; a blank keeps every row aligned.
+    let filled = char::from_u32(0x25CF).unwrap_or('*').to_string();
+    let current = app.model_tier_value(mp.tier).map(str::to_string);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (idx, item) in mp.items.iter().enumerate() {
+        let is_selected = idx == mp.selected;
+        let is_current = !item.custom && current.as_deref() == Some(item.id.as_str());
+        // Brand left-bar marks the highlighted row (Claude Code / first-run style).
+        let bar = if is_selected { "▌ " } else { "  " };
+        let mark = if is_current {
+            filled.clone()
+        } else {
+            " ".to_string()
+        };
+        let label = if item.custom {
+            umadev_i18n::t(lang, "model.pick.custom_label").to_string()
+        } else {
+            item.id.clone()
+        };
+        let label_style = if is_selected {
+            Style::default()
+                .fg(theme::PRIMARY())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::TEXT())
+        };
+        let mut spans = vec![
+            Span::styled(bar.to_string(), Style::default().fg(theme::ACCENT())),
+            Span::styled(format!("{mark} "), Style::default().fg(theme::SUCCESS())),
+            Span::styled(label, label_style),
+            Span::raw("  "),
+            Span::styled(
+                item.description.clone(),
+                Style::default().fg(theme::TEXT_MUTED()),
+            ),
+        ];
+        if is_current {
+            spans.push(Span::styled(
+                format!("  · {}", umadev_i18n::t(lang, "model.pick.current")),
+                Style::default().fg(theme::SUCCESS()),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        umadev_i18n::t(lang, "model.pick.footer"),
+        Style::default().fg(theme::TEXT_MUTED()),
+    )));
+
+    // Title carries the base + the tier being set.
+    let tier_label = match mp.tier {
+        ModelTier::Worker => umadev_i18n::t(lang, "model.pick.tier.worker"),
+        ModelTier::Plan => umadev_i18n::t(lang, "model.pick.tier.plan"),
+        ModelTier::Build => umadev_i18n::t(lang, "model.pick.tier.build"),
+    };
+    let base_label = if mp.backend_id.is_empty() {
+        "offline"
+    } else {
+        mp.backend_id.as_str()
+    };
+    let title = format!(
+        " {} ",
+        umadev_i18n::tf(lang, "model.pick.title", &[base_label, tier_label])
+    );
+
+    // Center a card sized to the content (clamped to the terminal). The tiny
+    // guard above ensures width ≥ 30 and height ≥ 8, so both clamp ranges are
+    // well-ordered (min ≤ max) and never panic.
+    let rows = u16::try_from(lines.len()).unwrap_or(6);
+    let width = total.width.saturating_sub(4).clamp(24, 72);
+    let cap_h = total.height.saturating_sub(2).max(3);
+    let height = (rows + 2).clamp(3, cap_h);
+    let x = (total.width.saturating_sub(width)) / 2;
+    let y = (total.height.saturating_sub(height)) / 2;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(theme::BORDER_ACTIVE()));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Render a scrollable, near-fullscreen overlay used by `/spec`,
@@ -1749,12 +1860,23 @@ fn emit_code_block(state: &mut MdState, lang: Option<&str>, body: &str) {
         Span::raw(" ".repeat(indent + 2)),
         role_span(format!("┌── {label} "), SynRole::Muted, Modifier::empty()),
     ]));
-    for raw in body.lines() {
+    // Try the multi-language grammar highlighter first: it colors the WHOLE
+    // block at once, so multi-line strings / block comments / template literals
+    // read correctly (the per-line tinter cannot see across a newline). It
+    // returns one span-vec per `body.lines()` line, or `None` for a language it
+    // does not cover (diff/patch, dockerfile, …) or on any fault — in which case
+    // each line falls back to the lightweight per-line keyword tinter.
+    let grammar = lang.and_then(|l| highlight_block_synoptic(l, body));
+    for (idx, raw) in body.lines().enumerate() {
         let mut spans: Vec<Span<'static>> = vec![Span::styled(
             gutter.clone(),
             Style::default().bg(theme::CODE_BG()),
         )];
-        for mut s in highlight_code_line(raw, lang) {
+        let line_spans = grammar
+            .as_ref()
+            .and_then(|rows| rows.get(idx).cloned())
+            .unwrap_or_else(|| highlight_code_line(raw, lang));
+        for mut s in line_spans {
             s.style = s.style.bg(theme::CODE_BG());
             spans.push(s);
         }
@@ -1859,6 +1981,107 @@ fn highlight_code_line(line: &str, lang: Option<&str>) -> Vec<Span<'static>> {
         }
     });
     spans
+}
+
+/// Map a fenced-code language label to the `synoptic` grammar key, for the
+/// languages that ship a real built-in grammar. Returns `None` for labels we
+/// deliberately keep on the hand-rolled path — `diff`/`patch` (the `+`/`-`
+/// gutter colorer in [`highlight_code_line_uncached`]) — or that `synoptic`
+/// does not cover (e.g. `dockerfile`), so the caller falls back to the
+/// lightweight per-line keyword tinter. The label is already lower-cased and
+/// reduced to its first word by the fenced-block reader.
+fn syntax_ext_for(lang: &str) -> Option<&'static str> {
+    Some(match lang {
+        "rust" | "rs" => "rs",
+        "python" | "py" | "py3" | "python3" => "py",
+        "javascript" | "js" | "mjs" | "cjs" | "jsx" | "node" => "js",
+        "typescript" | "ts" | "tsx" => "ts",
+        "go" | "golang" => "go",
+        "java" => "java",
+        "kotlin" | "kt" | "kts" => "kt",
+        "c" | "h" => "c",
+        "cpp" | "c++" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "csharp" | "cs" | "c#" => "cs",
+        "ruby" | "rb" => "rb",
+        "php" => "php",
+        "swift" => "swift",
+        "scala" => "scala",
+        "dart" => "dart",
+        "lua" => "lua",
+        "r" => "r",
+        "haskell" | "hs" => "hs",
+        "json" | "json5" | "jsonc" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "sql" => "sql",
+        "bash" | "sh" | "shell" | "zsh" | "shellscript" => "sh",
+        "html" | "htm" | "xhtml" => "html",
+        "xml" | "svg" => "xml",
+        "css" => "css",
+        "markdown" | "md" => "md",
+        _ => return None,
+    })
+}
+
+/// Map a `synoptic` token group name to one of our semantic [`SynRole`] tokens,
+/// so every highlighted span still resolves its color through the theme table
+/// (`theme::syn_color`) — never a naked or grammar-supplied color. An unknown /
+/// future group name degrades to plain [`SynRole::Text`] rather than guessing.
+fn syn_role_for_group(group: &str) -> SynRole {
+    match group {
+        "keyword" | "boolean" | "attribute" | "tag" | "global" => SynRole::Keyword,
+        "string" | "character" => SynRole::StringLit,
+        "comment" => SynRole::Comment,
+        "digit" | "number" => SynRole::Number,
+        "function" | "macro" => SynRole::Function,
+        "type" | "struct" | "namespace" | "reference" => SynRole::Type,
+        "operator" => SynRole::Punctuation,
+        "header" => SynRole::Heading,
+        "link" => SynRole::Link,
+        _ => SynRole::Text,
+    }
+}
+
+/// Multi-language block highlighter: run the `synoptic` grammar for `lang` over
+/// the WHOLE `body` at once and return one span-vec per `body.lines()` line
+/// (1:1 index alignment), each span tagged via the theme [`SynRole`] table.
+/// Highlighting the whole block (not line-by-line) is what lets multi-line
+/// constructs — block comments, multi-line / raw / template strings — color
+/// correctly, which the per-line tinter fundamentally cannot do.
+///
+/// **Fail-open by contract.** An unsupported language ([`syntax_ext_for`] →
+/// `None`) or ANY panic inside the grammar (`catch_unwind`, sound because the
+/// workspace pins `panic = "unwind"`) returns `None`, and the caller falls back
+/// to the per-line keyword tinter — never a panic, never a garbled block.
+/// Partial / still-streaming code (an unterminated string, an open block
+/// comment, a half-typed fence) is fine: `synoptic` is line-oriented and needs
+/// no balanced constructs, so it colors what it can and leaves the rest plain.
+fn highlight_block_synoptic(lang: &str, body: &str) -> Option<Vec<Vec<Span<'static>>>> {
+    let ext = syntax_ext_for(lang)?;
+    let lines: Vec<String> = body.lines().map(str::to_string).collect();
+    let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut hl = synoptic::from_extension(ext, 4)?;
+        hl.run(&lines);
+        let rows: Vec<Vec<Span<'static>>> = lines
+            .iter()
+            .enumerate()
+            .map(|(y, raw)| {
+                hl.line(y, raw)
+                    .into_iter()
+                    .map(|tok| match tok {
+                        synoptic::TokOpt::Some(text, name) => {
+                            role_span(text, syn_role_for_group(&name), Modifier::empty())
+                        }
+                        synoptic::TokOpt::None(text) => {
+                            role_span(text, SynRole::Text, Modifier::empty())
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        Some(rows)
+    }));
+    computed.ok().flatten()
 }
 
 /// Per-language lightweight tokenizer → semantic-role spans. NOT a parser: a
@@ -5886,6 +6109,10 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                 umadev_i18n::t(lang, "tui.help.group.editing"),
                 &[
                     ("Enter", umadev_i18n::t(lang, "tui.help.pipe.enter")),
+                    (
+                        "Ctrl+J",
+                        umadev_i18n::t(lang, "tui.help.edit.newline_ctrlj"),
+                    ),
                     ("Shift+Enter", umadev_i18n::t(lang, "tui.help.edit.newline")),
                     ("↑ / ↓", umadev_i18n::t(lang, "tui.help.edit.recall")),
                     ("Tab", umadev_i18n::t(lang, "tui.help.edit.autocomplete")),
@@ -9425,6 +9652,187 @@ mod tests {
         assert!(
             !out.chars().any(|c| c.is_control() && c != '\n'),
             "no control chars in the diff card"
+        );
+    }
+
+    // ---- multi-language code-block syntax highlighting (synoptic grammar) ----
+
+    /// Flatten a grammar-highlighted block into a flat span list. Panics via
+    /// `.expect` only if the language is unexpectedly unsupported — the point of
+    /// these tests is that the covered languages DO highlight.
+    fn block_spans(lang: &str, body: &str) -> Vec<Span<'static>> {
+        highlight_block_synoptic(lang, body)
+            .expect("a covered language should highlight")
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Does any span carry the live theme color for `role`? (Colors are resolved
+    /// through `theme::syn_color`, so this proves the span uses the token layer,
+    /// not a hardcoded value.)
+    fn spans_have_role(spans: &[Span<'static>], role: SynRole) -> bool {
+        let want = theme::syn_color(role);
+        spans.iter().any(|s| s.style.fg == Some(want))
+    }
+
+    #[test]
+    fn syntax_highlight_covers_core_languages() {
+        // rust / python / ts / go / bash: each snippet carries a keyword, a
+        // string literal, a line comment and a number — all four must land on
+        // their distinct theme tokens (not plain Text).
+        let cases = [
+            (
+                "rust",
+                "fn main() {\n    let x = 42; // note\n    let s = \"hi\";\n}",
+            ),
+            ("python", "def f():\n    # c\n    return \"x\" + 3"),
+            (
+                "typescript",
+                "const x: number = 1; // t\nfunction g() { return \"hi\"; }",
+            ),
+            ("go", "func main() {\n    n := 7 // c\n    s := \"a\"\n}"),
+            ("bash", "echo \"hi\" # comment\nx=1"),
+        ];
+        let text_fg = theme::syn_color(SynRole::Text);
+        for (lang, body) in cases {
+            let spans = block_spans(lang, body);
+            assert!(spans_have_role(&spans, SynRole::Keyword), "{lang}: keyword");
+            assert!(
+                spans_have_role(&spans, SynRole::StringLit),
+                "{lang}: string"
+            );
+            assert!(spans_have_role(&spans, SynRole::Comment), "{lang}: comment");
+            assert!(spans_have_role(&spans, SynRole::Number), "{lang}: number");
+            // Real highlighting happened: not every span is default Text.
+            assert!(
+                spans.iter().any(|s| s.style.fg != Some(text_fg)),
+                "{lang}: at least one non-default span"
+            );
+        }
+        // JSON has no comments/keywords, but strings + numbers + booleans color.
+        let j = block_spans("json", "{\n  \"a\": 1,\n  \"b\": true\n}");
+        assert!(spans_have_role(&j, SynRole::StringLit), "json: string");
+        assert!(spans_have_role(&j, SynRole::Number), "json: number");
+    }
+
+    #[test]
+    fn syntax_highlight_colors_come_from_theme_tokens() {
+        // Proof the highlighter routes every color through the `SynRole`
+        // token table (`theme::syn_color`) rather than any hardcoded value —
+        // WITHOUT mutating the process-global light/dark flag (no existing test
+        // does, and flipping it here would race parallel color-sensitive tests).
+        let spans = block_spans("rust", "fn main() { let x = 42; let s = \"hi\"; } // c");
+        // Each recognised token lands on its own role's live theme color.
+        let kw = spans
+            .iter()
+            .find(|s| s.content.trim() == "fn")
+            .expect("`fn` tokenized");
+        assert_eq!(
+            kw.style.fg,
+            Some(theme::syn_color(SynRole::Keyword)),
+            "keyword span uses the Keyword theme token"
+        );
+        assert!(
+            spans.iter().any(|s| s.content.contains("\"hi\"")
+                && s.style.fg == Some(theme::syn_color(SynRole::StringLit))),
+            "string span uses the StringLit theme token"
+        );
+        assert!(
+            spans.iter().any(|s| s.content.contains("42")
+                && s.style.fg == Some(theme::syn_color(SynRole::Number))),
+            "number span uses the Number theme token"
+        );
+        // The tokens are genuinely DISTINCT colors (a hardcoded single palette
+        // could not produce per-role separation), and every one resolves through
+        // the same theme function the rest of the UI uses.
+        let roles = [
+            SynRole::Keyword,
+            SynRole::StringLit,
+            SynRole::Number,
+            SynRole::Function,
+            SynRole::Text,
+        ];
+        for (i, a) in roles.iter().enumerate() {
+            for b in &roles[i + 1..] {
+                assert_ne!(
+                    theme::syn_color(*a),
+                    theme::syn_color(*b),
+                    "distinct roles resolve to distinct theme colors"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn syntax_highlight_spans_multiline_constructs() {
+        // A block comment straddling two lines: BOTH rows must carry the Comment
+        // color. The per-line tinter fundamentally cannot do this — it is the
+        // headline win of whole-block grammar highlighting.
+        let rows = highlight_block_synoptic("rust", "/* line one\n   line two */\nlet x = 1;")
+            .expect("rust highlights");
+        let comment = theme::syn_color(SynRole::Comment);
+        assert!(
+            rows[0].iter().any(|s| s.style.fg == Some(comment)),
+            "row 0 of the block comment is colored"
+        );
+        assert!(
+            rows[1].iter().any(|s| s.style.fg == Some(comment)),
+            "row 1 of the block comment is colored across the newline"
+        );
+    }
+
+    #[test]
+    fn syntax_highlight_unknown_language_falls_back() {
+        // A language synoptic ships no grammar for → None, so the caller uses the
+        // per-line keyword tinter instead.
+        assert!(highlight_block_synoptic("cobol", "IDENTIFICATION DIVISION.").is_none());
+        assert!(highlight_block_synoptic("dockerfile", "FROM alpine").is_none());
+        // diff/patch stay on the +/- gutter colorer, not the grammar path.
+        assert!(syntax_ext_for("diff").is_none());
+        assert!(syntax_ext_for("patch").is_none());
+        // The fallback tinter still returns spans for an unknown language.
+        assert!(!highlight_code_line("x = 1", Some("cobol")).is_empty());
+        // And the +/- diff coloring is intact on the fallback path.
+        let add = highlight_code_line("+added line", Some("diff"));
+        assert!(add
+            .iter()
+            .any(|s| s.style.fg == Some(theme::syn_color(SynRole::DiffAdd))));
+    }
+
+    #[test]
+    fn syntax_highlight_partial_stream_does_not_panic() {
+        // The half-open states the markdown compiler feeds mid-delta: an
+        // unterminated string, an open block comment, a half-typed call, an
+        // incomplete object. None may panic or garble (fail-open contract).
+        let _ = highlight_block_synoptic("rust", "fn main() {\n    let s = \"unterм");
+        let _ = highlight_block_synoptic("rust", "/* open comment\nlet x = 1;");
+        let _ = highlight_block_synoptic("python", "def f(\n    x");
+        let _ = highlight_block_synoptic("json", "{ \"a\": ");
+        let _ = highlight_block_synoptic("go", "");
+        let _ = highlight_block_synoptic("bash", "   ");
+        // End-to-end: an unclosed fence still renders (pulldown-cmark closes it
+        // at EOF; the block highlights what it can).
+        let lines = markdown_to_lines("```rust\nfn main() {\n    let x = \"open", theme::TEXT());
+        assert!(!lines.is_empty(), "a partial fenced block still renders");
+    }
+
+    #[test]
+    fn syntax_highlight_end_to_end_through_markdown() {
+        // The whole pipeline: a fenced block → markdown_to_lines → emit_code_block
+        // → grammar highlighter → theme tokens. Keyword + number colors (which do
+        // NOT collide with the box-border Muted color) must appear on screen.
+        let lines = markdown_to_lines("```rust\nfn main() { let x = 42; }\n```", theme::TEXT());
+        let kw = theme::syn_color(SynRole::Keyword);
+        let num = theme::syn_color(SynRole::Number);
+        let flat: Vec<&Span<'static>> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        assert!(
+            flat.iter().any(|s| s.style.fg == Some(kw)),
+            "keyword colored in the rendered fenced block"
+        );
+        assert!(
+            flat.iter().any(|s| s.style.fg == Some(num)),
+            "number colored in the rendered fenced block"
         );
     }
 }

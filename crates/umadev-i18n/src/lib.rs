@@ -293,6 +293,23 @@ mod tests {
             "model.tiers_default",
             "model.tiers_default_paren",
             "model.tiers_updated",
+            // Interactive `/model` picker overlay (title, tier labels, curated
+            // model descriptions, footer/help hint, and the apply/clear confirms).
+            "model.pick.title",
+            "model.pick.tier.worker",
+            "model.pick.tier.plan",
+            "model.pick.tier.build",
+            "model.pick.desc.flagship",
+            "model.pick.desc.balanced",
+            "model.pick.desc.fast",
+            "model.pick.desc.previous",
+            "model.pick.desc.custom",
+            "model.pick.custom_label",
+            "model.pick.current",
+            "model.pick.footer",
+            "model.pick.custom_prompt",
+            "model.pick.applied",
+            "model.pick.cleared",
             "deploy.confirm_preflight",
             "worker.init_failed",
             "pipeline.start_failed",
@@ -395,6 +412,7 @@ mod tests {
             "tui.help.ship.preview",
             "tui.help.inspect.design",
             "tui.help.edit.newline",
+            "tui.help.edit.newline_ctrlj",
             // P2 polish: the keyboard-shortcut cheatsheet rows added to the
             // /help overlay's "Keys" group (real bindings only), plus the
             // `!`-prefixed local convenience-shell runtime strings.

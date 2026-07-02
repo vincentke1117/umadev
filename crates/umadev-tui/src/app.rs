@@ -191,6 +191,96 @@ impl PickerStep {
     }
 }
 
+/// Which model slot the interactive `/model` picker assigns. UmaDev keeps a
+/// worker-default model plus optional per-phase tiers (a cheaper/faster model
+/// for planning, a stronger one for the code phases — see
+/// [`crate::config::UserConfig::model_plan`] / `model_build`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTier {
+    /// The worker default ([`crate::config::UserConfig::model`]) — the driving
+    /// model forwarded to the base when the user pins one explicitly.
+    Worker,
+    /// The planning/docs-phase model ([`crate::config::UserConfig::model_plan`]).
+    Plan,
+    /// The code/build-phase model ([`crate::config::UserConfig::model_build`]).
+    Build,
+}
+
+impl ModelTier {
+    /// i18n key for this tier's short, localized label (worker / plan / build).
+    #[must_use]
+    pub fn label_key(self) -> &'static str {
+        match self {
+            ModelTier::Worker => "model.pick.tier.worker",
+            ModelTier::Plan => "model.pick.tier.plan",
+            ModelTier::Build => "model.pick.tier.build",
+        }
+    }
+}
+
+/// One selectable row in the interactive `/model` picker overlay.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ModelChoice {
+    /// The model id to persist when chosen (empty for the trailing custom row).
+    pub id: String,
+    /// A short, localized one-line description shown next to the id.
+    pub description: String,
+    /// `true` for the "custom / type an id" row, which drops back to free-text
+    /// entry so any id the base supports stays reachable.
+    pub custom: bool,
+}
+
+/// Modal state for the interactive `/model` picker (opened by `/model` with no
+/// id, or `/model plan|build` with no id). Mirrors the first-run picker's
+/// selection UX (↑↓ to move, Enter to select, Esc to cancel) but appears as a
+/// centered card over the chat. Fail-open: an unknown base yields only the
+/// "type an id" row, so the picker never dead-ends.
+#[derive(Debug, Clone)]
+pub struct ModelPicker {
+    /// Which slot the chosen model is written to.
+    pub tier: ModelTier,
+    /// The base the curated list is for (label only; empty/unknown → custom row).
+    pub backend_id: String,
+    /// The selectable rows: the base's well-known ids plus the custom row.
+    pub items: Vec<ModelChoice>,
+    /// Cursor into [`Self::items`].
+    pub selected: usize,
+}
+
+/// A curated, versioned table of well-known model ids per base, with an i18n
+/// description key for each. UmaDev owns no model endpoint — the list is
+/// per-BASE (the base decides which ids are valid), so this is a convenience
+/// shortlist, NOT an exhaustive enumeration: the picker always appends a
+/// "type an id" row so any id the base supports (incl. a third-party / local
+/// model wired into the base) stays reachable. Unknown / offline bases return
+/// an empty slice → only the custom row shows (fail-open).
+fn well_known_models(backend_id: &str) -> &'static [(&'static str, &'static str)] {
+    match backend_id {
+        // Claude Code — the current Claude family (aliases the base accepts).
+        "claude-code" => &[
+            ("claude-opus-4-8", "model.pick.desc.flagship"),
+            ("claude-sonnet-5", "model.pick.desc.balanced"),
+            ("claude-haiku-4-5", "model.pick.desc.fast"),
+            ("claude-opus-4-7", "model.pick.desc.previous"),
+            ("claude-sonnet-4-6", "model.pick.desc.previous"),
+        ],
+        // Codex — OpenAI model ids the codex CLI accepts.
+        "codex" => &[
+            ("gpt-5.1-codex", "model.pick.desc.flagship"),
+            ("gpt-5", "model.pick.desc.balanced"),
+            ("o4-mini", "model.pick.desc.fast"),
+        ],
+        // OpenCode — must be `provider/model` form; a sensible shortlist only.
+        "opencode" => &[
+            ("anthropic/claude-opus-4-8", "model.pick.desc.flagship"),
+            ("anthropic/claude-sonnet-4-6", "model.pick.desc.balanced"),
+            ("openai/gpt-5", "model.pick.desc.balanced"),
+        ],
+        // offline / unknown → no shortlist; the picker still offers the custom row.
+        _ => &[],
+    }
+}
+
 /// A spawned token-budgeted compaction job — everything the async summary task
 /// needs, snapshotted off `&mut App` so the task never touches app state. The
 /// task forks the base, summarises [`Self::folded`], and reports the outcome
@@ -1837,6 +1927,11 @@ pub struct App {
     /// so rejecting an un-ready host gives visible feedback ON the picker.
     pub picker_notice: Option<String>,
 
+    /// Modal state for the interactive `/model` picker (see [`ModelPicker`]).
+    /// `Some` while the picker card is open over the chat; it then owns
+    /// ↑↓/Enter/Esc ahead of the scroll overlay and everything else.
+    pub model_picker: Option<ModelPicker>,
+
     /// Chat input buffer (UTF-8 String — mutate via cursor helpers,
     /// never via raw push/pop, so multi-byte chars stay intact).
     pub input: String,
@@ -2614,6 +2709,7 @@ impl App {
             picker_items: step_items(PickerStep::Language, lang, &[]),
             picker_selected: lang as usize,
             picker_notice: None,
+            model_picker: None,
             input: String::new(),
             input_cursor: 0,
             attachments: Vec::new(),
@@ -2778,21 +2874,32 @@ impl App {
         crate::BrainSpec::Offline
     }
 
-    /// The model the Agent runs on. UmaDev owns NO model — the base's model IS
-    /// the engine. Precedence: an explicit `/model` override > the model SYNCED
-    /// from the selected base's own config (`detect_base_model`) > empty (the
-    /// base then uses its login / server default, which we never override). The
-    /// resolved value is what the drivers receive; empty makes them skip
-    /// `--model`, so the base is driven on exactly its own model.
+    /// The model the Agent runs on. UmaDev owns NO model endpoint — the base's
+    /// model IS the engine. Precedence: an explicit user pick
+    /// ([`crate::config::UserConfig::model`], set via `/model <id>` or the
+    /// `/model` picker) > empty (the base then uses whatever it is configured /
+    /// logged in with — its own login / server default, or a third-party / local
+    /// model wired into the base — which we never override). The resolved value
+    /// is what the drivers receive; empty makes them skip `--model`, so the base
+    /// is driven on exactly its own model.
+    ///
+    /// Picking a model here only chooses WHICH of the base's models to drive
+    /// (its native `--model` flag) — it never brokers or configures an endpoint,
+    /// so the "UmaDev injects no endpoint" contract holds: an unset model
+    /// forwards nothing.
     #[must_use]
     pub fn effective_model(&self) -> String {
-        // UmaDev manages NO model: it forwards nothing to the base, so the base
-        // ALWAYS runs whatever it is configured / logged in with (an official
-        // subscription OR a third-party / local-model routing the user set up in
-        // the base itself) — UmaDev just calls it. Returning empty makes every
-        // session start omit the `model` field; `detect_base_model` is still used
-        // purely to SHOW the user which model their base runs (never to impose one).
-        String::new()
+        // An explicit user pick is forwarded as the base's driving model; unset
+        // → empty, so the session start omits `--model` and the base runs its
+        // own model. `detect_base_model` is used purely to SHOW which model the
+        // base runs when the user has pinned none (never to impose one).
+        self.config
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_default()
     }
 
     fn history_path(&self) -> std::path::PathBuf {
@@ -5104,7 +5211,7 @@ impl App {
         Self::cmd(
             "model",
             &[],
-            Some("<id>"),
+            Some("[plan|build] [<id>]"),
             CmdGroup::Worker,
             "tui.help.worker.model",
         ),
@@ -7023,6 +7130,12 @@ impl App {
         }
     }
     fn chat_key(&mut self, key: KeyCode, mods: crossterm::event::KeyModifiers) -> Action {
+        // The `/model` picker is a modal card: while open it owns ↑↓/Enter/Esc
+        // (and j/k/digits) ahead of the scroll overlay and everything else, so a
+        // keypress never leaks to the hidden input box behind it.
+        if self.model_picker.is_some() {
+            return self.model_picker_key(key);
+        }
         // Overlay routing first — when an overlay is open, everything
         // is scroll / close.
         if self.overlay.is_some() {
@@ -7377,6 +7490,25 @@ impl App {
                 }
                 Action::None
             }
+            // ---- Ctrl+J: the UNIVERSAL newline (works on EVERY terminal) ----
+            // Ctrl+J is a literal LF (0x0A) on every terminal — the owned
+            // decoder folds that byte to `Char('j')` + CONTROL — so this arm
+            // ALWAYS inserts a newline regardless of the keyboard protocol.
+            // Shift+Enter only reaches the newline path where the terminal
+            // reports it via the kitty CSI-u protocol (enabled in
+            // `setup_terminal`); on terminals that don't, a bare Shift+Enter
+            // arrives as a plain CR and would SUBMIT mid-thought — so Ctrl+J is
+            // the terminal-agnostic way to build a multi-line prompt. It is
+            // unconditional (never shadowed by the mention popover / slash
+            // palette, which own `Enter`, not `Ctrl+J`).
+            KeyCode::Char('j') if ctrl => {
+                self.pending_quit_confirm = false;
+                self.pending_rewind = false;
+                self.input_history_idx = None;
+                self.insert_at_cursor('\n');
+                Action::None
+            }
+
             // ---- enter: accept the highlighted @-mention (popover open) ----
             // Wins over submit so Enter on the file typeahead inserts the path
             // instead of sending the half-typed `@partial`. Shift+Enter still
@@ -9163,17 +9295,211 @@ impl App {
         Action::BackendChanged
     }
 
-    fn slash_model(&mut self, _arg: &str) -> Action {
-        // UmaDev does NOT manage the model. It forwards nothing to the base,
-        // which runs whatever it is configured / logged in with — so switching
-        // the model here would have no effect. Tell the user where the model
-        // actually lives (the base) instead of pretending to change it.
-        self.push(
-            ChatRole::System,
-            umadev_i18n::t(self.lang, "model.unmanaged").to_string(),
-        );
+    /// `/model [plan|build] [<id>]` — pick which model the base is driven with.
+    ///
+    /// - `/model` (no id) opens a selectable overlay of the base's well-known
+    ///   models (↑↓/Enter/Esc) plus a "type an id" row; `/model plan` /
+    ///   `/model build` open the same overlay targeting that per-phase tier.
+    /// - `/model <id>` sets the worker default directly (scripting-friendly);
+    ///   `/model plan <id>` / `/model build <id>` set a per-phase tier.
+    /// - `off` / `none` / `default` / `reset` as the id clears the slot back to
+    ///   the base's own model.
+    ///
+    /// The choice persists through the same config path as before
+    /// (`config::save_to`) and, for tiers, publishes into the runner's live tier
+    /// state ([`crate::config::UserConfig::apply_model_tiers`]). Fail-open: an
+    /// unknown base still opens the picker, which offers only the custom row.
+    fn slash_model(&mut self, arg: &str) -> Action {
+        let arg = arg.trim();
+        // A leading `plan` / `build` token selects the per-phase tier; the rest
+        // (if any) is the model id. Everything else is a worker-default id.
+        let first = arg.split_whitespace().next().unwrap_or("");
+        let (tier, id) = match first.to_ascii_lowercase().as_str() {
+            "plan" | "docs" => (ModelTier::Plan, arg[first.len()..].trim()),
+            "build" | "code" => (ModelTier::Build, arg[first.len()..].trim()),
+            _ => (ModelTier::Worker, arg),
+        };
+        if id.is_empty() {
+            // No id → open the interactive picker for this tier.
+            self.open_model_picker(tier);
+            return Action::None;
+        }
+        self.apply_model_choice(tier, id);
         Action::None
     }
+
+    /// Value currently pinned for `tier` (worker default / plan / build), if any.
+    #[must_use]
+    pub fn model_tier_value(&self, tier: ModelTier) -> Option<&str> {
+        match tier {
+            ModelTier::Worker => self.config.model.as_deref(),
+            ModelTier::Plan => self.config.model_plan.as_deref(),
+            ModelTier::Build => self.config.model_build.as_deref(),
+        }
+    }
+
+    /// Build the picker rows for `tier`: the base's well-known ids (with
+    /// localized descriptions) followed by the always-present "custom / type an
+    /// id" row. Marks the currently-pinned id as the initial selection.
+    fn build_model_picker(&self, tier: ModelTier) -> ModelPicker {
+        let backend = self
+            .config
+            .backend
+            .clone()
+            .unwrap_or_else(|| "offline".to_string());
+        let current = self.model_tier_value(tier).map(str::to_string);
+        let mut items: Vec<ModelChoice> = well_known_models(&backend)
+            .iter()
+            .map(|(id, desc_key)| ModelChoice {
+                id: (*id).to_string(),
+                description: umadev_i18n::t(self.lang, desc_key).to_string(),
+                custom: false,
+            })
+            .collect();
+        // Trailing free-text affordance — reachable for any base (incl. unknown /
+        // offline, where it is the ONLY row), so no id is ever unreachable.
+        items.push(ModelChoice {
+            id: String::new(),
+            description: umadev_i18n::t(self.lang, "model.pick.desc.custom").to_string(),
+            custom: true,
+        });
+        // Start the cursor on the currently-pinned model when it is in the list.
+        let selected = current
+            .as_deref()
+            .and_then(|c| items.iter().position(|it| !it.custom && it.id == c))
+            .unwrap_or(0);
+        ModelPicker {
+            tier,
+            backend_id: backend,
+            items,
+            selected,
+        }
+    }
+
+    /// Open the interactive `/model` picker overlay for `tier`.
+    fn open_model_picker(&mut self, tier: ModelTier) {
+        self.model_picker = Some(self.build_model_picker(tier));
+        // The card is a fixed overlay; force a clean repaint so no chat rows bleed
+        // through on flaky consoles (mirrors the other modal openers).
+        self.request_full_repaint();
+    }
+
+    /// Key handling while the `/model` picker is open: ↑↓/j/k move (wrapping),
+    /// Home/End jump, `1`-`9` quick-select, Enter confirms, Esc cancels.
+    fn model_picker_key(&mut self, key: KeyCode) -> Action {
+        // Esc / Enter change or drop the modal, so handle them before taking the
+        // long-lived `&mut` borrow the movement arms need.
+        match key {
+            KeyCode::Esc => {
+                self.model_picker = None;
+                self.request_full_repaint();
+                return Action::None;
+            }
+            KeyCode::Enter => return self.confirm_model_picker(),
+            _ => {}
+        }
+        if let Some(mp) = self.model_picker.as_mut() {
+            let len = mp.items.len();
+            match key {
+                KeyCode::Up | KeyCode::Char('k' | 'K') => {
+                    mp.selected = if mp.selected == 0 {
+                        len.saturating_sub(1)
+                    } else {
+                        mp.selected - 1
+                    };
+                }
+                KeyCode::Down | KeyCode::Char('j' | 'J') => {
+                    // `len` is always ≥ 1 (the custom row) — the `== 0` guard just
+                    // keeps the modulo panic-free defensively.
+                    mp.selected = if len == 0 { 0 } else { (mp.selected + 1) % len };
+                }
+                KeyCode::Home | KeyCode::PageUp => mp.selected = 0,
+                KeyCode::End | KeyCode::PageDown => mp.selected = len.saturating_sub(1),
+                KeyCode::Char(c @ '1'..='9') => {
+                    // Guaranteed ASCII digit → `to_digit` never returns None.
+                    let n = c.to_digit(10).unwrap_or(0) as usize;
+                    if n >= 1 && n <= len {
+                        mp.selected = n - 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Action::None
+    }
+
+    /// Confirm the highlighted `/model` picker row: apply + persist a concrete
+    /// id, or (for the custom row) drop back to free-text `/model …` entry so
+    /// the user can type any id the base supports.
+    fn confirm_model_picker(&mut self) -> Action {
+        let Some(mp) = self.model_picker.take() else {
+            return Action::None;
+        };
+        self.request_full_repaint();
+        let tier = mp.tier;
+        let selected = mp.selected;
+        // Fail-open: a stale index past a now-shorter list is just a no-op.
+        let Some(choice) = mp.items.into_iter().nth(selected) else {
+            return Action::None;
+        };
+        if choice.custom {
+            // Re-open the command in the input box, tier-prefixed, so the next
+            // Enter routes back through `slash_model` with the typed id.
+            let prefix = match tier {
+                ModelTier::Worker => "/model ",
+                ModelTier::Plan => "/model plan ",
+                ModelTier::Build => "/model build ",
+            };
+            self.input = prefix.to_string();
+            self.input_cursor = self.input_len();
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "model.pick.custom_prompt").to_string(),
+            );
+        } else {
+            self.apply_model_choice(tier, &choice.id);
+        }
+        Action::None
+    }
+
+    /// Persist a model choice for `tier` and confirm it. An empty / reset id
+    /// (`off` / `none` / `default` / `reset`) clears the slot back to the base's
+    /// own model. Writes through `config::save_to` (same path as before) and
+    /// republishes the per-phase tiers so an in-flight worker loop picks them up.
+    fn apply_model_choice(&mut self, tier: ModelTier, id: &str) {
+        let id = id.trim();
+        let clear = id.is_empty()
+            || ["off", "none", "default", "reset"]
+                .iter()
+                .any(|k| id.eq_ignore_ascii_case(k));
+        let value = if clear { None } else { Some(id.to_string()) };
+        match tier {
+            ModelTier::Worker => self.config.model = value,
+            ModelTier::Plan => self.config.model_plan = value,
+            ModelTier::Build => self.config.model_build = value,
+        }
+        if let Err(e) = crate::config::save_to(&self.config, &self.config_path) {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(
+                    self.lang,
+                    "config.write_failed",
+                    &[&self.config_path.display().to_string(), &e.to_string()],
+                ),
+            );
+        }
+        // Per-phase tiers are consumed live by the runner; republish them.
+        self.config.apply_model_tiers();
+        let tier_label = umadev_i18n::t(self.lang, tier.label_key());
+        let msg = if clear {
+            umadev_i18n::tf(self.lang, "model.pick.cleared", &[tier_label])
+        } else {
+            umadev_i18n::tf(self.lang, "model.pick.applied", &[tier_label, id])
+        };
+        self.push(ChatRole::UmaDev, msg);
+        self.refresh_status();
+    }
+
     fn slash_design(&mut self, arg: &str) -> Action {
         let available = self.list_design_systems();
         if arg.is_empty() {
@@ -10407,7 +10733,21 @@ impl App {
             self.config
                 .model
                 .as_deref()
-                .unwrap_or("(default for worker)")
+                .unwrap_or("(base default — /model to pick)")
+        ));
+        body.push_str(&format!(
+            "  plan model:    {}\n",
+            self.config
+                .model_plan
+                .as_deref()
+                .unwrap_or("(worker default)")
+        ));
+        body.push_str(&format!(
+            "  build model:   {}\n",
+            self.config
+                .model_build
+                .as_deref()
+                .unwrap_or("(worker default)")
         ));
         body.push_str(&format!(
             "design system:   {}\n",
@@ -10477,6 +10817,8 @@ impl App {
 
         body.push_str("\n## How to change\n\n");
         body.push_str("  /claude /codex /opencode      switch base CLI (or /offline)\n");
+        body.push_str("  /model                        pick a model (opens a selectable list)\n");
+        body.push_str("  /model plan|build <id>        set the per-phase model (off to reset)\n");
         body.push_str("  /manual  /auto                review mode: pause vs autonomous\n");
         body.push_str("  /design <name>                switch design system\n");
         body.push_str("  /template <name>              switch seed template\n");
@@ -18469,43 +18811,120 @@ mod tests {
     }
 
     #[test]
-    fn slash_model_explains_the_base_owns_the_model() {
+    fn slash_model_no_arg_opens_picker_with_current_marked() {
+        let mut a = fresh_app(Some("claude-code"));
+        // Pin a current model so the picker starts on it (not the first row).
+        a.config.model = Some("claude-sonnet-5".into());
+        for c in "/model".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Enter);
+        let mp = a.model_picker.as_ref().expect("/model opens the picker");
+        assert_eq!(mp.tier, crate::app::ModelTier::Worker);
+        // The cursor lands on the currently-pinned model, not row 0.
+        assert_eq!(mp.items[mp.selected].id, "claude-sonnet-5");
+        // Curated Claude family + a trailing custom row.
+        assert!(mp.items.iter().any(|it| it.id == "claude-opus-4-8"));
+        assert!(mp.items.last().unwrap().custom);
+        // No message leaked and config is untouched until the user selects.
+        assert_eq!(a.config.model.as_deref(), Some("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn slash_model_picker_enter_selects_and_persists() {
+        let mut a = fresh_app(Some("claude-code"));
+        for c in "/model".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Enter); // open (cursor on row 0)
+        let _ = a.apply_key(KeyCode::Down); // → row 1 (claude-sonnet-5)
+        let chosen = a.model_picker.as_ref().unwrap().items[1].id.clone();
+        let _ = a.apply_key(KeyCode::Enter); // select
+        assert!(a.model_picker.is_none(), "Enter closes the picker");
+        assert_eq!(a.config.model.as_deref(), Some(chosen.as_str()));
+        // Persisted to disk through the existing config path.
+        let loaded = crate::config::load_from(&a.config_path);
+        assert_eq!(loaded.model.as_deref(), Some(chosen.as_str()));
+        // effective_model now forwards the picked model to the base.
+        assert_eq!(a.effective_model(), chosen);
+    }
+
+    #[test]
+    fn slash_model_picker_esc_cancels() {
+        let mut a = fresh_app(Some("claude-code"));
+        for c in "/model".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Enter);
+        assert!(a.model_picker.is_some());
+        let _ = a.apply_key(KeyCode::Esc);
+        assert!(a.model_picker.is_none(), "Esc closes the picker");
+        // Cancelled → nothing persisted.
+        assert_eq!(a.config.model, None);
+    }
+
+    #[test]
+    fn slash_model_picker_custom_row_returns_to_free_text() {
+        let mut a = fresh_app(Some("claude-code"));
+        for c in "/model".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Enter);
+        let _ = a.apply_key(KeyCode::End); // jump to the trailing custom row
+        assert!(
+            a.model_picker.as_ref().unwrap().items[a.model_picker.as_ref().unwrap().selected]
+                .custom
+        );
+        let _ = a.apply_key(KeyCode::Enter); // select custom
+        assert!(a.model_picker.is_none());
+        // Drops back to free-text entry so any id stays reachable.
+        assert_eq!(a.input, "/model ");
+        assert_eq!(a.config.model, None);
+    }
+
+    #[test]
+    fn slash_model_with_arg_sets_and_persists() {
+        let mut a = fresh_app(Some("claude-code"));
+        for c in "/model claude-opus-4-7".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Enter);
+        // `/model <id>` still works directly (scripting) — no picker, sets + persists.
+        assert!(a.model_picker.is_none());
+        assert_eq!(a.config.model.as_deref(), Some("claude-opus-4-7"));
+        let loaded = crate::config::load_from(&a.config_path);
+        assert_eq!(loaded.model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn slash_model_plan_tier_sets_and_clears() {
+        let mut a = fresh_app(Some("claude-code"));
+        for c in "/model plan claude-haiku-4-5".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Enter);
+        assert_eq!(a.config.model_plan.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(a.config.model, None, "the worker default is untouched");
+        // `off` resets the tier back to the base default.
+        for c in "/model plan off".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Enter);
+        assert_eq!(a.config.model_plan, None);
+    }
+
+    #[test]
+    fn slash_model_unknown_base_falls_back_to_custom_only() {
+        // `offline` (and any unknown base) has no curated list → the picker still
+        // opens, offering only the "type an id" row. Never a crash, never empty.
         let mut a = fresh_app(Some("offline"));
         for c in "/model".chars() {
             let _ = a.apply_key(KeyCode::Char(c));
         }
         let _ = a.apply_key(KeyCode::Enter);
-        // /model no longer switches anything — it explains the base owns the model
-        // (the message names the bases, lang-agnostic check).
-        assert!(a
-            .history
-            .iter()
-            .any(|m| m.body().contains("codex") && m.body().contains("opencode")));
-        // It never touches config.model.
-        assert!(a.config.model.is_none());
-    }
-
-    #[test]
-    fn slash_model_with_arg_does_not_set_a_model() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cfg_path = tmp.path().join("config.toml");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        let cfg = UserConfig {
-            backend: Some("offline".into()),
-            model: None,
-            ..Default::default()
-        };
-        let mut app = App::new("demo", cfg, cfg_path.clone(), workspace);
-        for c in "/model claude-opus-4-7".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let _ = app.apply_key(KeyCode::Enter);
-        // UmaDev no longer manages the model: `/model <arg>` does NOT set or persist
-        // a model — the base owns it. So config.model stays None, on disk too.
-        assert_eq!(app.config.model, None);
-        let loaded = crate::config::load_from(&cfg_path);
-        assert_eq!(loaded.model, None);
+        let mp = a.model_picker.as_ref().expect("picker opens for any base");
+        assert_eq!(mp.items.len(), 1);
+        assert!(mp.items[0].custom);
     }
     // ---- backend / brain-spec selection ----
 
@@ -19222,6 +19641,105 @@ mod tests {
             action,
             Action::Route("build a login app\nwith email authentication".to_string())
         );
+    }
+
+    // ---- Ctrl+J universal newline (works on EVERY terminal) ----
+
+    #[test]
+    fn ctrl_j_inserts_newline_and_does_not_submit_on_the_owned_path() {
+        // The owned byte tokenizer surfaces a Ctrl+J press as the raw LF byte
+        // 0x0A; `keymap::normalize_key` (applied by `apply_key_with_mods`) folds
+        // that to `Char('j')` + CONTROL, exactly like the decoder. Feeding the
+        // raw form exercises the whole owned path end-to-end.
+        let mut a = fresh_app(Some("offline"));
+        for c in "line1".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let action = a.apply_key_with_mods(
+            KeyCode::Char('\u{0a}'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(action, Action::None, "Ctrl+J must NOT submit");
+        assert!(
+            a.input.contains("line1\n"),
+            "Ctrl+J inserts a literal newline"
+        );
+        assert!(a.input_cursor >= 6, "cursor advances past the newline");
+    }
+
+    #[test]
+    fn ctrl_j_post_decode_form_also_inserts_a_newline() {
+        // The already-decoded form (`Char('j')` + CONTROL) — what the dispatch
+        // actually matches — must reach the same newline-insert arm.
+        let mut a = fresh_app(Some("offline"));
+        for c in "abc".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let action =
+            a.apply_key_with_mods(KeyCode::Char('j'), crossterm::event::KeyModifiers::CONTROL);
+        assert_eq!(action, Action::None);
+        assert_eq!(a.input, "abc\n");
+    }
+
+    #[test]
+    fn plain_enter_still_submits_the_common_case() {
+        // The daily-common path: a bare Enter (a plain CR on every terminal) must
+        // keep SUBMITTING, never regress to a newline.
+        let mut a = fresh_app(Some("offline"));
+        for c in "just ship it".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let action = a.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::Route("just ship it".to_string()));
+    }
+
+    #[test]
+    fn shift_enter_via_kitty_csi_u_inserts_a_newline() {
+        // On a kitty-capable terminal (protocol enabled in `setup_terminal`),
+        // Shift+Enter arrives as the CSI-u sequence `\x1b[13;2u`. Drive the FULL
+        // owned pipeline (tokenizer → decoder) over those bytes and feed the
+        // resulting key to the app — it must insert a newline, not submit.
+        let mut tk = crate::input::tokenize::Tokenizer::for_stdin();
+        let mut dec = crate::input::decode::Decoder::new();
+        let mut keyed: Option<(KeyCode, crossterm::event::KeyModifiers)> = None;
+        for token in tk.feed(b"\x1b[13;2u") {
+            for ev in dec.feed_token(token) {
+                if let crate::input::decode::InputEvent::Key(k) = ev {
+                    keyed = Some((k.code, k.modifiers));
+                }
+            }
+        }
+        let (code, mods) = keyed.expect("CSI-u Shift+Enter must decode to one key");
+        assert_eq!(code, KeyCode::Enter);
+        assert!(mods.contains(crossterm::event::KeyModifiers::SHIFT));
+
+        let mut a = fresh_app(Some("offline"));
+        for c in "line1".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let action = a.apply_key_with_mods(code, mods);
+        assert_eq!(action, Action::None, "Shift+Enter (CSI-u) must NOT submit");
+        assert!(a.input.contains("line1\n"));
+    }
+
+    #[test]
+    fn no_kitty_terminal_still_submits_enter_and_newlines_on_ctrl_j() {
+        // A terminal that does NOT report kitty support gets no protocol push, so
+        // Shift+Enter can't be distinguished — but the daily pain is still fixed:
+        // plain Enter submits (a bare CR), and Ctrl+J (a literal LF) newlines.
+        let mut a = fresh_app(Some("offline"));
+        for c in "draft".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        // Ctrl+J newlines mid-draft.
+        let nl = a.apply_key_with_mods(KeyCode::Char('j'), crossterm::event::KeyModifiers::CONTROL);
+        assert_eq!(nl, Action::None);
+        for c in "more".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        // Plain Enter submits the whole multi-line draft.
+        let action = a.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::Route("draft\nmore".to_string()));
     }
 
     // ---- palette ----

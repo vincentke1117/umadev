@@ -33,6 +33,20 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # Pure-Rust line-level text diff for the Write/Edit diff card (P1). Lightweight,
 # no transitive ICU/parser trees — fits the pure-Rust / dependency-light bar.
 similar = { workspace = true }
+# Multi-language code-block syntax highlighter. Pure-Rust, regex-based (the same
+# `regex` crate the workspace already compiles for contract/governance/knowledge,
+# plus `unicode-width` which the TUI already depends on) — so the NET new tree is
+# just `synoptic` + three tiny leaf crates (`char_index`, `if_chain`,
+# `nohash-hasher`). Ships built-in grammars for ~25 languages (rust/py/js/ts/go/
+# java/c/cpp/cs/ruby/php/json/yaml/toml/sql/bash/html/css/xml/md/…) with real
+# string / comment / number / keyword tokenization incl. multi-line constructs —
+# a genuine step up from the old ~5-language per-line keyword tinter, at a
+# fraction of syntect's footprint (no flate2/bincode/walkdir + embedded dump).
+# Its group names map onto our own `SynRole` theme tokens (see `syn_role_for_group`)
+# so colors stay in the theme layer, and every call is wrapped fail-open so an
+# unknown language or a highlighter fault falls back to the keyword tinter.
+# No `unsafe` is forced on us: our crate keeps `#![forbid(unsafe_code)]`.
+synoptic = "2"
 tokio = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }

@@ -45,11 +45,12 @@ use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
+    KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
-    EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, BeginSynchronizedUpdate,
+    EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
@@ -3772,6 +3773,30 @@ fn copy_to_clipboard_native(text: &str) -> bool {
     }
 }
 
+/// Set true by [`setup_terminal`] ONCE it has confirmed the terminal supports
+/// the kitty keyboard protocol AND successfully pushed the enhancement flags, so
+/// [`restore_sequence`] (called from the normal teardown, the panic hook, the
+/// signal teardown, and the mid-setup failure path — all context-free) only pops
+/// what was actually pushed. A terminal that never got the push must not be sent
+/// a stray pop that could disturb another program's kitty stack, and a terminal
+/// with no kitty support gets neither escape — it degrades to the universal
+/// Ctrl+J newline with zero protocol bytes on the wire.
+static KITTY_KEYBOARD_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Emit the kitty keyboard-protocol enable — push the enhancement flags with at
+/// least `DISAMBIGUATE_ESCAPE_CODES`, so modified keys the legacy encoding can't
+/// tell apart (Shift+Enter vs a bare CR, Ctrl+Enter, …) arrive as unambiguous
+/// `CSI u` sequences that the owned decoder ([`input::decode`]) already parses.
+/// Split from the support QUERY ([`supports_keyboard_enhancement`]) so it stays
+/// a pure, deterministic writer command that can be unit-tested without a TTY.
+fn push_kitty_keyboard<W: std::io::Write>(out: &mut W) -> std::io::Result<()> {
+    out.execute(PushKeyboardEnhancementFlags(
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+    ))
+    .map(|_| ())
+}
+
 fn setup_terminal() -> Result<Term> {
     // Best-effort teardown for a MID-SETUP failure. If raw mode is already on
     // and a LATER step (alt screen, mouse capture, …) fails, a bare `?` would
@@ -3804,6 +3829,20 @@ fn setup_terminal() -> Result<Term> {
     // Mouse capture starts ON (the `/mouse` toggle re-asserts a changed
     // preference later through the same block via `reassert_terminal_modes`).
     enable_terminal_modes(&mut stdout, true).map_err(fail)?;
+    // Kitty keyboard protocol — GUARDED behind the terminal's own support query
+    // (a DA1-backed round-trip, safe in the raw mode we're already in, same as
+    // the OSC 11 probe above), so ONLY a terminal that reports support gets the
+    // push. An unsupported terminal degrades cleanly — no flags on the wire, no
+    // pop on exit — and Ctrl+J still delivers the universal newline. Pushing
+    // here (once at startup), not in the resume-shared enable block, keeps the
+    // kitty stack from growing on every reassert; the symmetric pop lives in
+    // `restore_sequence`. Best-effort: a failed query/push just skips the
+    // enhancement (fail-open).
+    if matches!(supports_keyboard_enhancement(), Ok(true))
+        && push_kitty_keyboard(&mut stdout).is_ok()
+    {
+        KITTY_KEYBOARD_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let terminal = Terminal::new(CrosstermBackend::new(stdout)).map_err(fail)?;
     Ok(terminal)
 }
@@ -3831,12 +3870,18 @@ fn setup_terminal() -> Result<Term> {
 ///    `frame.set_cursor_position` in `render_prompt`).
 ///
 /// Shared by BOTH [`setup_terminal`] (startup) and [`reassert_terminal_modes`]
-/// (long-input-gap / SIGCONT resume), so a mode can never be enabled at
-/// startup yet missed on resume — the "focus reporting worked until a tmux
-/// re-attach" bug class. Add any future mode (e.g. kitty keyboard flags) HERE
-/// and both paths get it; then add its symmetric disable to
+/// (long-input-gap / SIGCONT resume), so a level-triggered DEC private mode can
+/// never be enabled at startup yet missed on resume — the "focus reporting
+/// worked until a tmux re-attach" bug class. Add any future *level-triggered*
+/// mode HERE and both paths get it; then add its symmetric disable to
 /// [`restore_sequence`], which stays the single teardown (locked by
 /// `enable_and_restore_are_mode_symmetric`).
+///
+/// The kitty keyboard protocol is the deliberate exception: it is a *stack*
+/// push (`CSI > flags u`), not a level-triggered set, so re-pushing on every
+/// resume would grow the terminal's stack unboundedly. It is therefore pushed
+/// ONCE in [`setup_terminal`] (guarded by [`supports_keyboard_enhancement`])
+/// and popped once in [`restore_sequence`], NOT re-asserted here.
 ///
 /// Every escape is level-triggered, so the block is IDEMPOTENT — safe to run
 /// on every resume. Every step is attempted even if an earlier one fails (a
@@ -3896,6 +3941,25 @@ fn enable_terminal_modes<W: std::io::Write>(out: &mut W, mouse_on: bool) -> std:
 /// rest, and the whole sequence is IDEMPOTENT (every mode is level-triggered),
 /// so running it from several exit paths is harmless.
 fn restore_sequence<W: std::io::Write>(out: &mut W) {
+    // Pop kitty ONLY if `setup_terminal` actually pushed it (the global flag),
+    // so the context-free teardown paths never emit a stray pop.
+    restore_sequence_inner(
+        out,
+        KITTY_KEYBOARD_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
+
+/// The restore body, with the kitty-pop decision passed IN so it can be
+/// unit-tested for both branches without touching the process-global flag (which
+/// would race the parallel test runner). `kitty_on` mirrors
+/// [`KITTY_KEYBOARD_ENABLED`]; the public [`restore_sequence`] reads that flag.
+fn restore_sequence_inner<W: std::io::Write>(out: &mut W, kitty_on: bool) {
+    // Kitty pop FIRST — it was the LAST thing setup enabled (after the enable
+    // block), so a reverse-of-setup teardown undoes it first. Harmless CSI on a
+    // terminal that ignores it, but we only reach it when we truly pushed.
+    if kitty_on {
+        let _ = out.execute(PopKeyboardEnhancementFlags);
+    }
     let _ = out.execute(LeaveAlternateScreen);
     let _ = out.execute(DisableMouseCapture);
     let _ = out.execute(DisableFocusChange);
@@ -6192,6 +6256,65 @@ mod tests {
         // wedges or diverges (the property we care about is "complete every time").
         assert!(twice.windows(once.len()).any(|w| w == once.as_slice()));
         assert!(String::from_utf8_lossy(&twice).contains("\x1b[?1049l"));
+    }
+
+    /// The kitty keyboard-protocol setup emits a `CSI > … u` push with the
+    /// disambiguate flag set (so Shift+Enter is distinguishable from a bare CR),
+    /// and the teardown emits the symmetric `CSI < u` pop — the escape-level
+    /// mirror of `enable_and_restore_are_mode_symmetric`, for the one mode that
+    /// is a stack push rather than a level-triggered DEC private mode.
+    #[test]
+    fn kitty_keyboard_push_and_pop_are_symmetric() {
+        let mut push: Vec<u8> = Vec::new();
+        push_kitty_keyboard(&mut push).expect("a Vec sink cannot fail");
+        let s = String::from_utf8_lossy(&push);
+        // Push is a private CSI ending in `u`: `\x1b[>{flags}u`. The
+        // DISAMBIGUATE_ESCAPE_CODES bit (1) must be set in the flags param.
+        assert!(
+            s.starts_with("\x1b[>") && s.ends_with('u'),
+            "kitty push must be a `CSI > … u` sequence, got {s:?}"
+        );
+        let flags: String = s
+            .trim_start_matches("\x1b[>")
+            .trim_end_matches('u')
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let bits: u32 = flags.parse().expect("kitty push must carry a flags param");
+        assert!(
+            bits & 0b1 != 0,
+            "kitty push must set DISAMBIGUATE_ESCAPE_CODES (bit 1), got flags {bits}"
+        );
+
+        // The pop only fires when we actually pushed (kitty_on = true), and is
+        // the `CSI < 1 u` form. It leads the teardown (reverse-of-setup order).
+        let mut restore_on: Vec<u8> = Vec::new();
+        restore_sequence_inner(&mut restore_on, true);
+        let r = String::from_utf8_lossy(&restore_on);
+        let pop = r
+            .find("\x1b[<1u")
+            .expect("restore must pop kitty when it was pushed");
+        let leave = r
+            .find("\x1b[?1049l")
+            .expect("restore must leave the alt screen");
+        assert!(pop < leave, "kitty pop must precede the alt-screen leave");
+    }
+
+    /// A terminal WITHOUT kitty support (the guard skipped the push, so
+    /// `kitty_on = false`) must get ZERO kitty bytes on teardown — no stray
+    /// `CSI < u` pop that could disturb another program's kitty stack — while
+    /// the rest of the restore sequence is emitted exactly as before.
+    #[test]
+    fn restore_emits_no_kitty_pop_when_it_was_never_pushed() {
+        let mut restore_off: Vec<u8> = Vec::new();
+        restore_sequence_inner(&mut restore_off, false);
+        let r = String::from_utf8_lossy(&restore_off);
+        assert!(
+            !r.contains("\x1b[<1u"),
+            "no kitty pop may be emitted when kitty was never pushed"
+        );
+        // The unconditional restore steps are still all present.
+        assert!(r.contains("\x1b[?1049l") && r.contains("\x1b[?1000l"));
     }
 
     /// Wave 3 P1 — the termination-signal teardown: ONE synchronous call must

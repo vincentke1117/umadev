@@ -155,6 +155,36 @@ mod contract {
     }
 
     #[test]
+    fn ctrl_j_universal_newline_converges() {
+        // Ctrl+J is a literal LF (0x0A) on every terminal — the terminal-agnostic
+        // newline. The owned path tokenizes it as text and folds it to
+        // `Char('j')` + CONTROL; the legacy path delivers either the decoded
+        // combo or the ConPTY literal-char form. All must converge, so the app's
+        // single `Char('j') if ctrl` newline arm fires identically on both.
+        assert_converges(
+            "ctrl+j (newline)",
+            b"\x0a",
+            &[
+                vec![press(KeyCode::Char('j'), KeyModifiers::CONTROL)],
+                vec![press(KeyCode::Char('\u{a}'), KeyModifiers::NONE)],
+            ],
+        );
+    }
+
+    #[test]
+    fn shift_enter_via_kitty_csi_u_converges() {
+        // With the kitty keyboard protocol enabled (see `setup_terminal`),
+        // Shift+Enter is reported as `CSI 13 ; 2 u`. The owned decoder parses it;
+        // crossterm's native parser delivers the same Enter+SHIFT — so the
+        // app's Shift+Enter newline path is reachable on both input paths.
+        assert_converges(
+            "shift+enter (CSI-u)",
+            b"\x1b[13;2u",
+            &[vec![press(KeyCode::Enter, KeyModifiers::SHIFT)]],
+        );
+    }
+
+    #[test]
     fn arrows_converge_in_csi_and_ss3_forms() {
         let none = KeyModifiers::NONE;
         for (name, bytes, code) in [
