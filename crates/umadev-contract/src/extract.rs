@@ -297,7 +297,8 @@ fn rewrite_interpolations_in_segment(seg: &str) -> String {
 
 /// Scan frontend source under `project_root` and return every API call
 /// found, deduped by `(file, method, path)`. Walks the tree (skipping
-/// vendored / generated dirs) to depth 8.
+/// vendored / generated dirs), bounded by `MAX_FRONTEND_DEPTH` +
+/// `MAX_FRONTEND_FILES`.
 ///
 /// Returns an empty vec when no frontend source is present (fail-open —
 /// the quality gate reports "no frontend calls to validate").
@@ -452,20 +453,29 @@ fn extract_from_file(file: &str, content: &str) -> Vec<FrontendCall> {
 /// Maximum directory depth for the frontend-source walk. Enterprise admin
 /// frontends commonly place real views under deep trees such as
 /// `src/views/biz/app/page/component/widgets/...`; keep this high enough to scan
-/// those while file count + skip dirs still bound pathological trees.
+/// those while the file-count cap + skip dirs still bound pathological trees.
 const MAX_FRONTEND_DEPTH: usize = 16;
 
+/// Maximum number of frontend source files collected before the walk stops.
+/// Mirrors the sibling walkers (`acceptance.rs` `MAX_SOURCE_FILES = 600`,
+/// `backend.rs` `MAX_FILES = 800`) so a deep + wide enterprise frontend can't
+/// make contract extraction read + multi-regex an unbounded file set.
+const MAX_FRONTEND_FILES: usize = 800;
+
 fn collect_frontend_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > MAX_FRONTEND_DEPTH {
+    if depth > MAX_FRONTEND_DEPTH || out.len() >= MAX_FRONTEND_FILES {
         // Library code must never write directly to stdout/stderr: the TUI owns
-        // the terminal. A deep tree is bounded silently here and higher-level
-        // verification remains fail-open.
+        // the terminal. A deep or wide tree is bounded silently here and
+        // higher-level verification remains fail-open.
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in rd.flatten() {
+        if out.len() >= MAX_FRONTEND_FILES {
+            return;
+        }
         let p = entry.path();
         // Do NOT follow symlinks: `p.is_dir()` stats the symlink TARGET, so a
         // symlinked directory was recursed into — it could point outside the
@@ -647,6 +657,28 @@ mod tests {
         assert!(
             calls.iter().any(|c| c.path == "/api/customer/profile"),
             "deep frontend calls must be scanned: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn frontend_scan_stops_at_file_cap() {
+        // A deep + wide enterprise frontend must not make the walk collect an
+        // unbounded file set: collection stops at MAX_FRONTEND_FILES.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("src/views");
+        std::fs::create_dir_all(&dir).unwrap();
+        let over = MAX_FRONTEND_FILES + 50;
+        for i in 0..over {
+            std::fs::write(dir.join(format!("view{i}.ts")), "fetch('/api/x')").unwrap();
+        }
+
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_frontend_sources(tmp.path(), &mut files, 0);
+        assert_eq!(
+            files.len(),
+            MAX_FRONTEND_FILES,
+            "collection must be bounded by MAX_FRONTEND_FILES, got {}",
+            files.len()
         );
     }
 

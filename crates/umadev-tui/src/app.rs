@@ -11364,8 +11364,12 @@ impl App {
             return false;
         };
         let cmd = cmd.to_ascii_lowercase().replace('\\', "/");
+        // Mirror `verify::looks_like_root_acceptance_harness`: require a STRONG
+        // harness marker (UmaDev's generated backend entrypoint or its static
+        // frontend index). A bare `src/frontend` reference is too broad — a
+        // normal app may legitimately record `cd src/frontend && npm run dev`.
         let looks_like_harness =
-            cmd.contains("src/backend/server.mjs") || cmd.contains("src/frontend");
+            cmd.contains("src/backend/server.mjs") || cmd.contains("src/frontend/index.html");
         if !looks_like_harness {
             return false;
         }

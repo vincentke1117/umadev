@@ -237,24 +237,36 @@ pub struct DevServer {
 /// Detect the best dev-server command for the workspace. Checks Node
 /// frameworks (Vite / Next / Astro / CRA) by dependencies + scripts, then
 /// static-serve for plain HTML, then returns None.
+///
+/// When the root dev server looks like UmaDev's own acceptance harness, a real
+/// framework subproject (e.g. `jeecgboot-vue3/`) is preferred. A working root
+/// dev server is NEVER dropped, though: if the subproject search finds nothing
+/// usable, the root dev server is returned as the fallback rather than `None`.
 #[must_use]
 pub fn detect_dev_server(workspace: &Path) -> Option<DevServer> {
-    if let Some(root) = detect_dev_server_in_dir(workspace) {
+    let root = detect_dev_server_in_dir(workspace);
+    if let Some(root) = &root {
         if !looks_like_root_acceptance_harness(workspace) {
-            return Some(root);
+            return Some(root.clone());
         }
     }
 
+    // Root is UmaDev's own acceptance harness (or absent): prefer a real
+    // framework subproject's dev server.
     for subdir in preferred_frontend_dirs(workspace) {
         if let Some(mut ds) = detect_dev_server_in_dir(&subdir) {
-            let rel = subdir.strip_prefix(workspace).ok()?;
+            let Ok(rel) = subdir.strip_prefix(workspace) else {
+                continue;
+            };
             let rel = rel.to_string_lossy().replace('\\', "/");
             ds.command = format!("cd {rel} && {}", ds.command);
             return Some(ds);
         }
     }
 
-    None
+    // Never drop a working root preview: fall back to the root dev server when
+    // the subproject search yielded nothing usable.
+    root
 }
 
 fn detect_dev_server_in_dir(workspace: &Path) -> Option<DevServer> {
@@ -336,9 +348,12 @@ fn looks_like_root_acceptance_harness(workspace: &Path) -> bool {
         return false;
     }
 
+    // Require a STRONG harness marker: UmaDev's generated backend entrypoint, or
+    // its static-frontend index file. A bare `src/frontend` DIRECTORY is NOT
+    // enough — a normal full-stack app keeps its own source there and must keep
+    // its own root dev server rather than be mis-routed to a subproject.
     workspace.join("src/backend/server.mjs").is_file()
         || workspace.join("src/frontend/index.html").is_file()
-        || workspace.join("src/frontend").is_dir()
 }
 
 fn preferred_frontend_dirs(workspace: &Path) -> Vec<std::path::PathBuf> {
@@ -1538,6 +1553,49 @@ mod tests {
         assert_eq!(ds.label, "Vite dev server");
         assert_eq!(ds.command, "cd jeecgboot-vue3 && pnpm dev");
         assert_eq!(ds.default_url, "http://localhost:5173");
+    }
+
+    #[test]
+    fn detect_legit_fullstack_keeps_root_dev_server() {
+        // A normal full-stack app: root `package.json` with a `dev` script, a
+        // `src/frontend/` source directory, and a generic `web/` dir. It is NOT
+        // UmaDev's acceptance harness (no `src/backend/server.mjs`, no
+        // `src/frontend/index.html`), so the ROOT dev server must be kept — not
+        // mis-routed to a subproject and never dropped to None.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/frontend")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("web")).unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"app","scripts":{"dev":"node server.js"}}"#,
+        )
+        .unwrap();
+
+        let ds = detect_dev_server(tmp.path()).expect("root dev server must be kept");
+        assert_eq!(ds.label, "Node dev server");
+        assert_eq!(ds.command, "npm run dev");
+    }
+
+    #[test]
+    fn detect_harness_falls_back_to_root_when_no_usable_subproject() {
+        // UmaDev's real acceptance harness (root `dev` script +
+        // `src/backend/server.mjs`) with a subproject dir that has NO usable
+        // dev server (no package.json). The subproject search yields nothing, so
+        // the working root dev server must be returned as the fallback — never
+        // dropped to None.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/backend")).unwrap();
+        std::fs::write(tmp.path().join("src/backend/server.mjs"), "listen()").unwrap();
+        std::fs::create_dir_all(tmp.path().join("frontend")).unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"local-acceptance-harness","scripts":{"dev":"node src/backend/server.mjs"}}"#,
+        )
+        .unwrap();
+
+        let ds = detect_dev_server(tmp.path()).expect("root dev server fallback");
+        assert_eq!(ds.label, "Node dev server");
+        assert_eq!(ds.command, "npm run dev");
     }
 
     #[test]
