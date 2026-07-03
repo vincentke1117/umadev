@@ -2533,7 +2533,9 @@ fn render_picker(frame: &mut Frame, app: &App) {
         };
         items.push(ListItem::new(Line::from(vec![
             Span::styled(format!(" {bar} "), Style::default().fg(theme::PRIMARY())),
-            Span::styled(format!("{:<26}", item.label), label_style),
+            // Pad by DISPLAY width (not char count) so a CJK label like `简体中文`
+            // (4 chars / 8 columns) still lines the detail column up — see fix 6.
+            Span::styled(pad_to_width(&item.label, 26), label_style),
             Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
             Span::styled(state_detail, Style::default().fg(theme::TEXT_MUTED())),
         ])));
@@ -4717,6 +4719,21 @@ fn disp_width(s: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(s)
 }
 
+/// Left-align `s` and pad with spaces to at least `width` DISPLAY columns (CJK
+/// glyphs are 2 columns wide). Rust's `format!("{:<width$}")` pads by `char`
+/// count, so a CJK label under-pads — `简体中文` is 4 chars but 8 columns — and
+/// the following column (the picker's detail text) is pushed out of alignment on
+/// the very first screen. Already at/over `width` → returned unchanged.
+fn pad_to_width(s: &str, width: usize) -> String {
+    let w = disp_width(s);
+    let mut out = String::with_capacity(s.len() + width.saturating_sub(w));
+    out.push_str(s);
+    for _ in w..width {
+        out.push(' ');
+    }
+    out
+}
+
 /// Truncate `s` to at most `max` display columns (CJK = 2), char-aligned so a
 /// wide glyph is never split. Returns the kept prefix; the caller decides
 /// whether to add an ellipsis. Used by the status row so a long CJK phase
@@ -5188,18 +5205,44 @@ fn coalesce_combining_marks(spans: &mut Vec<Span<'static>>) {
 ///   subtracts it) and paint the highlight on the DECORATED line (whose char
 ///   indices are shifted right by exactly this much).
 ///
-/// The gutter is detected by the spine glyph: a leading `▎` plus the run of
-/// spaces immediately after it. A row with no spine glyph has gutter 0 and only
-/// its trailing whitespace trimmed. Pure + fail-open.
+/// The gutter is detected by its leading glyph: the role spine `▎`, OR — on the
+/// FIRST row of a turn — the assistant seat marker (`⏺`/`●`), OR — on a tool row
+/// — a status glyph (`●`/`○`/spinner), followed by an optional zero-width VS15
+/// pin and the run of hang spaces after it. A row with no such glyph has gutter 0
+/// and only its trailing whitespace trimmed. Pure + fail-open.
 fn logical_row_and_gutter(line: &Line<'static>) -> (String, usize) {
     let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let spine = spine_glyph();
     let mut chars = full.chars().peekable();
     let mut gutter = 0usize;
-    if chars.peek() == Some(&spine) {
-        // Drop the spine glyph and the hang-indent spaces that follow it.
-        chars.next();
-        gutter += char_width(spine);
+    // A 2-column left gutter leads with a gutter glyph, an OPTIONAL zero-width
+    // VS15 (`U+FE0E`) text-presentation pin the assistant marker carries, then AT
+    // LEAST one hang space. Requiring the trailing space keeps a content line that
+    // merely starts with such a glyph (a bare `●text` with no space) from being
+    // mistaken for a gutter. Previously only the spine `▎` was recognized, so the
+    // first row of every Host/UmaDev turn (leading `⏺`/`●`) and every tool row
+    // (leading status glyph) copied WITH that stray glyph and reported gutter 0,
+    // which also mis-shifted the selection columns on that row.
+    let leads_with_gutter = {
+        let mut probe = full.chars();
+        match probe.next() {
+            Some(g) if is_gutter_glyph(g) => {
+                let mut nxt = probe.next();
+                if nxt == Some('\u{FE0E}') {
+                    nxt = probe.next();
+                }
+                nxt == Some(' ')
+            }
+            _ => false,
+        }
+    };
+    if leads_with_gutter {
+        // Drop the gutter glyph, the optional VS15 (zero display width — no gutter
+        // cost), and the hang-indent spaces that follow.
+        let g = chars.next().unwrap_or(' ');
+        gutter += char_width(g);
+        if chars.peek() == Some(&'\u{FE0E}') {
+            chars.next();
+        }
         while chars.peek() == Some(&' ') {
             chars.next();
             gutter += 1;
@@ -5210,6 +5253,25 @@ fn logical_row_and_gutter(line: &Line<'static>) -> (String, usize) {
     // trailing spaces) — never copied.
     let logical = logical.trim_end().to_string();
     (logical, gutter)
+}
+
+/// True for the single-column glyphs that can lead a transcript row's 2-column
+/// left gutter and are NOT real content: the role spine `▎`, the row-0 assistant
+/// seat markers (`⏺` macOS / `●`), and the tool-row status glyphs (`●` ok/fail,
+/// `○` queued/aborted, and the braille / `⋯` spinner frames). Anchored on the
+/// known codepoints — kept in lockstep with [`assistant_marker`],
+/// [`tool_status_glyph`], [`spine_glyph`], and `app::SPINNER_FRAMES` — so a
+/// content line that merely starts with an ordinary character is never mistaken
+/// for a gutter.
+fn is_gutter_glyph(c: char) -> bool {
+    matches!(
+        c,
+        '\u{258E}' // ▎ role spine (U+258E)
+        | '\u{23FA}' // ⏺ assistant seat marker, macOS (U+23FA)
+        | '\u{25CF}' // ● assistant seat marker, other / tool ok|fail (U+25CF)
+        | '\u{25CB}' // ○ tool queued|aborted (U+25CB)
+        | '\u{22EF}' // ⋯ spinner static / animations off (U+22EF)
+    ) || ('\u{2800}'..='\u{28FF}').contains(&c) // ⠋… braille spinner frames
 }
 
 /// Paint the in-app text-selection highlight onto the already-folded transcript
@@ -7935,6 +7997,38 @@ mod tests {
     }
 
     #[test]
+    fn pad_to_width_pads_by_display_columns_not_char_count() {
+        // Fix 6 — the first-run picker's label column must align by DISPLAY width.
+        // A CJK label is 2 columns per glyph, so `format!("{:<width$}")`'s char-count
+        // padding under-pads it and jogs the detail column.
+        assert_eq!(
+            disp_width(&pad_to_width("简体中文", 26)),
+            26,
+            "CJK label padded to width"
+        );
+        assert_eq!(
+            disp_width(&pad_to_width("English", 26)),
+            26,
+            "ASCII label padded to width"
+        );
+        // Both labels end at the SAME display column, so the next column lines up.
+        assert_eq!(
+            disp_width(&pad_to_width("简体中文", 26)),
+            disp_width(&pad_to_width("English", 26)),
+            "CJK and ASCII labels share the column boundary"
+        );
+        // The char-count formatter does NOT (the bug): a CJK label lands wider.
+        assert_ne!(
+            disp_width(&format!("{:<26}", "简体中文")),
+            disp_width(&format!("{:<26}", "English")),
+            "the old char-count pad misaligns CJK vs ASCII"
+        );
+        // Already over the target width → returned unchanged (no truncation, no
+        // underflow panic on the `w..width` range).
+        assert_eq!(pad_to_width("繁體中文", 2), "繁體中文");
+    }
+
+    #[test]
     fn status_renders_cjk_right_aligned_without_overflow() {
         // The live state now rides the bottom-RIGHT of the meta row (no more
         // standalone status line). A Chinese status (`就绪`, 4 display cols / 6
@@ -8413,6 +8507,60 @@ mod tests {
         let plain = Line::from(Span::raw("plain content   "));
         let (logical, gutter) = logical_row_and_gutter(&plain);
         assert_eq!(logical, "plain content");
+        assert_eq!(gutter, 0);
+    }
+
+    #[test]
+    fn logical_row_strips_the_row0_seat_marker_and_tool_glyph() {
+        // Fix 4 — the FIRST row of a Host/UmaDev turn leads with the assistant seat
+        // marker (`⏺`/`●` + VS15 + space), and a tool row with a status glyph
+        // (`●`/`○`/spinner + space). Neither is real content, so a copied AI reply
+        // must not begin with a stray `⏺`/`●`, and the gutter width must match so
+        // the selection columns line up.
+        // The exact row-0 marker span shape (see `assistant_marker`): glyph + VS15
+        // + space, then the reply content.
+        let (marker, _) = assistant_marker(crate::app::ChatRole::Host);
+        let first = Line::from(vec![
+            Span::raw(marker.clone()),
+            Span::raw("标准MES平台设计"),
+        ]);
+        let (logical, gutter) = logical_row_and_gutter(&first);
+        assert_eq!(
+            logical, "标准MES平台设计",
+            "the reply copies without the marker"
+        );
+        assert_eq!(gutter, GUTTER_W, "the marker gutter is the standard width");
+        assert!(
+            !logical.starts_with('\u{23FA}') && !logical.starts_with('\u{25CF}'),
+            "no stray seat-marker glyph leaks into the copy: {logical:?}"
+        );
+
+        // A tool row: `● Read (src/main.rs)` — the leading status glyph + space is
+        // gutter, not content.
+        let tool = Line::from(vec![
+            Span::raw("\u{25CF} "),
+            Span::raw("Read (src/main.rs)"),
+        ]);
+        let (logical, gutter) = logical_row_and_gutter(&tool);
+        assert_eq!(logical, "Read (src/main.rs)", "the tool name copies clean");
+        assert_eq!(gutter, GUTTER_W);
+
+        // A spinner (running) tool glyph is also gutter.
+        let running = Line::from(vec![
+            Span::raw(format!("{} ", crate::app::SPINNER_FRAMES[0])),
+            Span::raw("Bash (cargo build)"),
+        ]);
+        let (logical, _gutter) = logical_row_and_gutter(&running);
+        assert_eq!(logical, "Bash (cargo build)");
+
+        // Guard against a FALSE positive: real prose that starts with a `●` glyph
+        // with NO following space is content, not a gutter — it must be kept.
+        let content = Line::from(Span::raw("\u{25CF}bullet-jammed text"));
+        let (logical, gutter) = logical_row_and_gutter(&content);
+        assert_eq!(
+            logical, "\u{25CF}bullet-jammed text",
+            "no-space glyph stays content"
+        );
         assert_eq!(gutter, 0);
     }
 

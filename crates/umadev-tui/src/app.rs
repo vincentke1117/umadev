@@ -2942,6 +2942,16 @@ impl App {
         }
     }
 
+    /// Remove this chat's persisted file (best-effort, **fail-open**). Used when a
+    /// transcript that was previously saved becomes EMPTY (a rewind of the first
+    /// user turn): [`Self::persist_chat`] deliberately skips an empty transcript to
+    /// avoid empty-file litter, so without an explicit delete the stale, un-rewound
+    /// chat would survive on disk and a relaunch `/resume` would restore the very
+    /// conversation the rewind dropped. A missing file / IO error is swallowed.
+    fn discard_persisted_chat(&self) {
+        let _ = std::fs::remove_file(self.chat_path(&self.chat_id));
+    }
+
     /// List persisted chats for this project, most-recently-updated first (Wave 5).
     /// Returns `(id, updated_at, turn_count, preview)` tuples. Fail-open: a missing
     /// dir / unreadable / corrupt file yields an empty list (never an error).
@@ -4819,6 +4829,17 @@ impl App {
             let mut any = false;
             for l in &lines {
                 let p = unquote_unescape(l.trim());
+                // Reserve room for the WHOLE chip BEFORE attaching. Near INPUT_CAP
+                // `insert_str_at_cursor` would insert nothing (or a partial token),
+                // leaving the pushed attachment with no intact `[图片 N]` chip in the
+                // buffer — so `expand_attachments` finds no chip and SILENTLY DROPS
+                // the image on submit (an orphaned attachment). If the chip can't fit
+                // whole, skip this image rather than orphan it (the box is at cap —
+                // nothing more can be typed either).
+                let need = self.image_chip(self.attachments.len() + 1).chars().count();
+                if INPUT_CAP.saturating_sub(self.input_len()) < need {
+                    continue;
+                }
                 if let Some(n) = self.attach_image(&p) {
                     let chip = self.image_chip(n);
                     self.insert_str_at_cursor(&chip);
@@ -4826,7 +4847,11 @@ impl App {
                     any = true;
                 }
             }
+            // Belt-and-suspenders: re-sync `attachments` to the chips actually in the
+            // buffer (mirrors every edit path), so no image can leave an orphaned
+            // backing ref even if a chip failed to land whole. Fail-open bookkeeping.
             if any {
+                self.reconcile_attachments();
                 return;
             }
         }
@@ -6840,18 +6865,40 @@ impl App {
                         self.stream_tool_batch = None;
                         self.open_thinking_block();
                         if let Some(idx) = self.thinking_block_idx {
-                            if let Some(text) =
-                                self.history.get_mut(idx).and_then(ChatMessage::text_mut)
-                            {
-                                // The reasoning lives BELOW the `[thinking] …` header
-                                // line, so the first chunk starts a fresh line. Bound
-                                // the block so a runaway stream can't grow unbounded.
-                                if text.len() < THINKING_REASONING_MAX {
-                                    if !text.contains('\n') {
-                                        text.push('\n');
+                            // Re-validate the stored index still points at OUR live
+                            // placeholder before appending. `thinking_block_idx` is an
+                            // ABSOLUTE `history` index; while the block stays open, a
+                            // non-collapsing push at `HISTORY_CAP` `pop_front`s the
+                            // front row and shifts every index down by one — the stored
+                            // idx would then point at an UNRELATED row, and appending
+                            // this reasoning delta would corrupt it. Mirror the
+                            // collapse path's guard: only append when the row is still
+                            // the System `[thinking]` placeholder we pushed.
+                            let still_placeholder = matches!(
+                                self.history.get(idx),
+                                Some(m) if m.role == ChatRole::System
+                                    && m.body().trim_start().starts_with(THINKING_PLACEHOLDER_TAG)
+                            );
+                            if still_placeholder {
+                                if let Some(text) =
+                                    self.history.get_mut(idx).and_then(ChatMessage::text_mut)
+                                {
+                                    // The reasoning lives BELOW the `[thinking] …`
+                                    // header line, so the first chunk starts a fresh
+                                    // line. Bound the block so a runaway stream can't
+                                    // grow unbounded.
+                                    if text.len() < THINKING_REASONING_MAX {
+                                        if !text.contains('\n') {
+                                            text.push('\n');
+                                        }
+                                        text.push_str(&delta);
                                     }
-                                    text.push_str(&delta);
                                 }
+                            } else {
+                                // The row rolled off / shifted under a cap eviction —
+                                // forget the stale index so the NEXT delta re-opens a
+                                // fresh block instead of writing into a moved row.
+                                self.thinking_block_idx = None;
                             }
                         }
                     }
@@ -7719,7 +7766,17 @@ impl App {
         if let Some(t_idx) = self.full_transcript.iter().rposition(|m| m.role == "user") {
             self.full_transcript.truncate(t_idx);
         }
-        self.persist_chat();
+        // Mirror the rewind to disk. When the rewound turn was the FIRST one the
+        // transcript is now EMPTY, and `persist_chat` early-returns on an empty
+        // transcript (to avoid empty-file litter) — which would leave the OLD,
+        // un-rewound chat on disk, so a relaunch `/resume` would restore the
+        // conversation we just dropped. Delete the persisted chat in that case;
+        // otherwise rewrite it to the truncated transcript.
+        if self.full_transcript.is_empty() {
+            self.discard_persisted_chat();
+        } else {
+            self.persist_chat();
+        }
         self.input = text;
         self.input_cursor = self.input_len();
         // Leave history recall + the quit/rewind arms in a clean state, and
@@ -8090,11 +8147,19 @@ impl App {
         if reply.is_empty() {
             // The base produced only tool calls / a side-effect with no closing
             // prose. Still a clean finish — leave the streamed activity as the
-            // record, but drop a short marker so the turn reads as completed.
-            self.push(
-                ChatRole::System,
-                umadev_i18n::t(self.lang, "agentic.done").to_string(),
-            );
+            // record, and drop a short marker so the turn reads as completed.
+            let marker = umadev_i18n::t(self.lang, "agentic.done").to_string();
+            self.push(ChatRole::System, marker.clone());
+            // Durability: a tool-only final turn must still be recorded + persisted.
+            // Previously this branch early-returned BEFORE `record_turn` /
+            // `persist_chat`, so the exchange (the user turn + this tool-only
+            // completion) was never re-saved after the user turn's own persist — a
+            // close before any later prose turn silently lost it from the on-disk
+            // chat. Record the completion marker as the assistant turn (keeps the
+            // user↔assistant pairing in durable memory) and persist the transcript
+            // + display snapshot so a relaunch restores the turn.
+            self.record_turn("assistant", marker);
+            self.persist_chat();
             return;
         }
         self.record_turn("assistant", reply);
@@ -15109,6 +15174,52 @@ mod tests {
     }
 
     #[test]
+    fn image_paste_near_input_cap_never_orphans_the_attachment() {
+        // Fix 5 — dragging an image when the input box is within a chip-width of
+        // INPUT_CAP must not push an attachment whose `[图片 N]` chip can't fit
+        // whole: that orphaned ref is silently dropped by `expand_attachments` on
+        // submit. Either the chip lands whole (attached) or the image is skipped
+        // (not attached) — never a pushed attachment with no chip in the buffer.
+        let dir = tempfile::TempDir::new().unwrap();
+        let img = dir.path().join("shot.png");
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n").unwrap();
+        let path = img.to_str().unwrap().to_string();
+
+        // Invariant: every backing image attachment has an intact chip in `input`.
+        let no_orphan =
+            |a: &App| (0..a.attachments.len()).all(|i| a.input.contains(&a.image_chip(i + 1)));
+
+        // Case 1: NO room for the whole chip → the image is skipped, not orphaned.
+        let mut a = fresh_app(Some("offline"));
+        a.input = "x".repeat(INPUT_CAP - 2); // room = 2 < chip width
+        a.input_cursor = a.input_len();
+        a.handle_paste(&path);
+        assert!(
+            a.attachments.is_empty(),
+            "no room for the chip → the image is skipped, not orphaned"
+        );
+        assert!(no_orphan(&a), "no attachment left without its chip");
+
+        // Case 2: room for the chip (+ its space) → the image attaches with a real
+        // chip and expands to its `@path` mention on submit.
+        let mut b = fresh_app(Some("offline"));
+        let chip_width = b.image_chip(1).chars().count();
+        b.input = "y".repeat(INPUT_CAP - chip_width - 1); // room = chip + space
+        b.input_cursor = b.input_len();
+        b.handle_paste(&path);
+        assert_eq!(b.attachments.len(), 1, "the chip fits → the image attaches");
+        assert!(
+            no_orphan(&b),
+            "the attached image has its chip in the buffer"
+        );
+        assert!(
+            b.expand_attachments(&b.input)
+                .contains(&format!("@{}", b.attachments[0].display())),
+            "the attached image expands to its @path on submit (not dropped)"
+        );
+    }
+
+    #[test]
     fn backspace_after_a_chip_removes_the_whole_chip_and_drops_its_ref() {
         let mut app = fresh_app(Some("offline"));
         let _dir = attach_one_image(&mut app);
@@ -20236,6 +20347,37 @@ mod tests {
     }
 
     #[test]
+    fn rewinding_the_first_user_turn_clears_the_on_disk_chat() {
+        // Fix 8 — rewinding the FIRST user turn empties `full_transcript`, and
+        // `persist_chat` early-returns on an empty transcript, so without an
+        // explicit delete the OLD, un-rewound chat survives on disk and a relaunch
+        // `/resume` would restore the conversation the rewind dropped. The rewind
+        // must clear the persisted chat instead.
+        let mut a = fresh_app(Some("offline"));
+        // One complete first turn; `record_user_turn` persists it to disk.
+        a.push(ChatRole::You, "only turn");
+        a.record_user_turn("only turn");
+        a.record_chat_reply("a reply".to_string());
+        let path = a.chat_path(&a.chat_id);
+        assert!(path.exists(), "the first turn was persisted to disk");
+
+        // Double-Esc rewind of the (only) user turn (idle, empty box).
+        let _ = a.apply_key(KeyCode::Esc);
+        let _ = a.apply_key(KeyCode::Esc);
+        assert_eq!(
+            a.input, "only turn",
+            "the first user turn reloaded for editing"
+        );
+        assert!(a.full_transcript.is_empty(), "the transcript is now empty");
+
+        // The on-disk chat is gone → a relaunch cannot restore the un-rewound convo.
+        assert!(
+            !path.exists(),
+            "a first-turn rewind that empties the transcript must delete the stale on-disk chat"
+        );
+    }
+
+    #[test]
     fn double_esc_rewind_is_a_noop_without_a_prior_user_message() {
         let mut a = fresh_app(Some("offline"));
         // No user turn has been spoken yet → there is nothing to rewind, so the
@@ -21146,6 +21288,65 @@ mod tests {
             "the reasoning survives collapse so it can be expanded: {after_body:?}"
         );
         assert!(after.collapsed, "still collapsed (expand with Ctrl+O)");
+    }
+
+    #[test]
+    fn thinking_delta_at_history_cap_never_corrupts_a_shifted_row() {
+        // Fix 3 — `thinking_block_idx` is an ABSOLUTE `history` index. While a
+        // reasoning block is open, a non-collapsing push at `HISTORY_CAP`
+        // `pop_front`s the front row and shifts every index down by one, so the
+        // stored idx lands on an UNRELATED row. The delta-append must re-validate
+        // the placeholder tag (like the collapse path) and never write reasoning
+        // into that shifted-onto row.
+        let mut a = fresh_app(Some("offline"));
+        // Fill history to exactly the cap so the NEXT push evicts a front row.
+        for i in 0..HISTORY_CAP {
+            a.push(ChatRole::System, format!("filler {i}"));
+        }
+        assert_eq!(a.history.len(), HISTORY_CAP);
+        // Open a reasoning block + accumulate one delta (opening pushes the
+        // placeholder at the back, evicting one filler).
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ThinkingDelta("first reasoning".into()),
+        });
+        let stale_idx = a.thinking_block_idx.expect("a reasoning block is open");
+        // A non-collapsing push AT cap shifts every index down by one, so
+        // `stale_idx` now points at THIS new (unrelated) row.
+        a.push(ChatRole::You, "a new user line");
+        let shifted = a.history.get(stale_idx).unwrap();
+        assert_eq!(
+            shifted.role,
+            ChatRole::You,
+            "the stored index was shifted onto an unrelated row"
+        );
+        let before = shifted.body().into_owned();
+        // A further reasoning delta must NOT be appended into that unrelated row.
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ThinkingDelta("STRAY".into()),
+        });
+        let after = a.history.get(stale_idx).unwrap().body().into_owned();
+        assert_eq!(
+            before, after,
+            "a reasoning delta must not corrupt the shifted-onto row"
+        );
+        assert!(
+            !after.contains("STRAY"),
+            "no reasoning leaked into the user row"
+        );
+        // Self-heal: the stale index was dropped, and the NEXT delta re-opens a
+        // fresh reasoning block rather than chasing the moved row.
+        assert!(a.thinking_block_idx.is_none(), "the stale index is dropped");
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ThinkingDelta("fresh".into()),
+        });
+        let new_idx = a
+            .thinking_block_idx
+            .expect("a fresh reasoning block re-opened");
+        let new_body = a.history.get(new_idx).unwrap().body().into_owned();
+        assert!(
+            new_body.starts_with(THINKING_PLACEHOLDER_TAG) && new_body.contains("fresh"),
+            "the next delta re-opens a fresh reasoning block: {new_body:?}"
+        );
     }
 
     #[test]

@@ -4837,6 +4837,30 @@ async fn drain_cancelled_task(
     let _ = tokio::time::timeout_at(deadline, handle).await;
 }
 
+/// Close a resident chat session OFF the render-loop thread. `end()` awaits the
+/// base subprocess actually exiting, which a wedged/slow claude/codex/opencode
+/// can stall on for the full shutdown budget — awaiting it inline on the event
+/// loop (the `/backend` switch, an idle `Cancel`, `/clear`, quit teardown)
+/// froze draw + input for that whole time. Detaching the close onto the runtime
+/// (the same off-render-path discipline as `cancel_drain`) keeps teardown
+/// correctness — the task still runs `end()`, and every base `Child` is
+/// `kill_on_drop`, so even a task dropped at runtime shutdown still kills the
+/// process — while the UI stays live. Best-effort, fail-open.
+fn detach_resident_close(session: ResidentChat) {
+    tokio::spawn(async move {
+        session.end().await;
+    });
+}
+
+/// Close a director-run base session OFF the render-loop thread — same rationale
+/// as [`detach_resident_close`], for the `Box<dyn BaseSession>` parked in a
+/// [`SessionHolder`]. Best-effort, fail-open.
+fn detach_session_close(mut session: Box<dyn umadev_runtime::BaseSession>) {
+    tokio::spawn(async move {
+        let _ = session.end().await;
+    });
+}
+
 /// R3 — the per-loop draw decision (pure, so it is unit-tested directly). Draw
 /// when a self-heal repaint is forced (`force_full_repaint`), when a latency-
 /// sensitive source asked for an immediate frame (`draw_now` — input / the
@@ -4853,6 +4877,36 @@ fn frame_budget_allows_draw(
     budget: Duration,
 ) -> bool {
     force_full_repaint || draw_now || (needs_redraw && since_last_draw >= budget)
+}
+
+/// How many CONSECUTIVE legacy-input errors park the input arm. A single
+/// transient `Some(Err(_))` from `crossterm::EventStream` (the Windows default)
+/// must NOT disable the keyboard — only a sustained run of errors (a genuinely
+/// dead FD) does. Reset on any successful read.
+const MAX_CONSECUTIVE_INPUT_ERRORS: u32 = 8;
+
+/// Legacy-input liveness decision (pure, so it is unit-tested directly). The
+/// `crossterm::EventStream` path (Windows default / `UMADEV_LEGACY_INPUT=1`) can
+/// surface a TRANSIENT `Some(Err(_))` and keep working, so parking on the first
+/// error disables the keyboard for the whole session. Given the current
+/// consecutive-error `streak` and whether the latest poll was a successful read
+/// (`ok`) or real EOF (`eof` — `None`), returns the UPDATED streak and whether to
+/// PARK the input arm: park immediately on EOF, or once the error streak reaches
+/// `threshold`; a successful read resets the streak to 0. (`ok` and `eof` are
+/// never both true — the caller derives them from the same `Option<Result<_>>`.)
+fn legacy_input_park_decision(streak: u32, ok: bool, eof: bool, threshold: u32) -> (u32, bool) {
+    if eof {
+        // Real stdin EOF — the FD is closed. Park immediately (mirrors the owned
+        // reader parking a closed channel).
+        (streak, true)
+    } else if ok {
+        // A successful read — the stream is alive; clear any error streak.
+        (0, false)
+    } else {
+        // A `Some(Err(_))`: count it; park only once a sustained run accrues.
+        let next = streak.saturating_add(1);
+        (next, next >= threshold)
+    }
 }
 
 async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> Result<()> {
@@ -4997,6 +5051,11 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // reader which parks a closed channel by design. The owned path never returns
     // `None` here, so this only ever trips on the legacy FD.
     let mut input_closed = false;
+    // Consecutive legacy-input error count. A transient `Some(Err(_))` from the
+    // legacy `EventStream` (the Windows default) must NOT latch `input_closed` —
+    // only a sustained run of errors does (see `legacy_input_park_decision`). Any
+    // successful read resets it to 0. Inert on the owned path (never errors here).
+    let mut input_err_streak: u32 = 0;
     // Generic input-height-change guard. The rendered input-box height from the
     // previous iteration; when it changes (a multi-line history recall, a paste
     // chip expanding, a wrap/newline, a submit clearing a tall box) the prompt
@@ -5076,8 +5135,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             // we react to that here, mirroring the cancel path's cleanup.
             if continuous_run_active && (app.finished || app.aborted) {
                 if let Ok(mut g) = session_holder.try_lock() {
-                    if let Some(mut s) = g.take() {
-                        let _ = s.end().await;
+                    if let Some(s) = g.take() {
+                        // Off the render path — a wedged director session must not
+                        // freeze the loop while it winds down.
+                        detach_session_close(s);
                     }
                 }
                 continuous_run_active = false;
@@ -5383,12 +5444,23 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 // draw the next frame immediately rather than waiting on the
                 // streaming budget, so keystrokes and scrolling never feel laggy.
                 draw_now = true;
-                // Legacy path: a `None` (stdin EOF) or repeated `Err` means the
-                // stream is dead. Park this arm so we don't busy-spin re-polling a
-                // closed FD (the owned reader never returns `None`, so this is a
-                // legacy-only guard). The frame already drew once; the rest of the
+                // Legacy path: a `None` (stdin EOF) or a SUSTAINED run of `Err`
+                // means the stream is dead — park this arm so we don't busy-spin
+                // re-polling a closed FD (the owned reader never returns `None`, so
+                // this is a legacy-only guard). A single transient `Some(Err(_))`
+                // (the `EventStream` on Windows can surface one and keep working)
+                // must NOT park input for the whole session — only `None` (EOF) or
+                // `MAX_CONSECUTIVE_INPUT_ERRORS` back-to-back errors do; a good read
+                // resets the streak. The frame already drew once; the rest of the
                 // loop keeps running on the tick + engine events.
-                if !matches!(&maybe_key, Some(Ok(_))) {
+                let (new_streak, park) = legacy_input_park_decision(
+                    input_err_streak,
+                    matches!(&maybe_key, Some(Ok(_))),
+                    maybe_key.is_none(),
+                    MAX_CONSECUTIVE_INPUT_ERRORS,
+                );
+                input_err_streak = new_streak;
+                if park {
                     input_closed = true;
                 }
                 // R5 — sleep-wake / stdin-gap self-heal. A key/mouse/resize/paste
@@ -5630,7 +5702,9 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     if let Some(stale) =
                                         chat_session_holder.lock().await.take()
                                     {
-                                        stale.end().await;
+                                        // Off the render path — a wedged base's
+                                        // shutdown must not freeze the switch.
+                                        detach_resident_close(stale);
                                     }
                                     // The old session is gone — drop any pending base
                                     // question pinned to it so the next message on the
@@ -5702,8 +5776,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         // events so a buffered reply can't resurrect state).
                                         if continuous_run_active {
                                             if let Ok(mut g) = session_holder.try_lock() {
-                                                if let Some(mut s) = g.take() {
-                                                    let _ = s.end().await;
+                                                if let Some(s) = g.take() {
+                                                    // Off the render path — never
+                                                    // block the reset on a wedged base.
+                                                    detach_session_close(s);
                                                 }
                                             }
                                             continuous_run_active = false;
@@ -5713,7 +5789,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                             .ok()
                                             .and_then(|mut g| g.take());
                                         if let Some(s) = parked {
-                                            s.end().await;
+                                            detach_resident_close(s);
                                         }
                                         while engine_rx.try_recv().is_ok() {}
                                         while route_rx.try_recv().is_ok() {}
@@ -6198,7 +6274,9 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     .ok()
                                     .and_then(|mut g| g.take());
                                 if let Some(s) = parked {
-                                    s.end().await;
+                                    // Off the render path — `/clear` must not
+                                    // freeze on a wedged base's shutdown.
+                                    detach_resident_close(s);
                                 }
                                 spawn_chat_session_preload(
                                     app.backend.as_deref(),
@@ -6256,8 +6334,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 // session so the NEXT run opens a fresh brain.
                 if continuous_run_active {
                     if let Ok(mut g) = session_holder.try_lock() {
-                        if let Some(mut s) = g.take() {
-                            let _ = s.end().await;
+                        if let Some(s) = g.take() {
+                            // Off the render path — the post-cancel reset must not
+                            // re-freeze on a wedged base's shutdown.
+                            detach_session_close(s);
                         }
                     }
                     continuous_run_active = false;
@@ -6271,7 +6351,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     .ok()
                     .and_then(|mut g| g.take());
                 if let Some(s) = parked {
-                    s.end().await;
+                    detach_resident_close(s);
                 }
                 // Drain any events the aborted task already queued (a buffered
                 // PipelineStarted / GateOpened) so they can't resurrect run state.
@@ -6389,13 +6469,21 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // is a no-op) — and NOT a hot-loop write: this runs exactly once per quit.
     app.persist_chat();
     // Quit / app teardown: close the resident chat session so its base subprocess
-    // doesn't outlive the TUI. Best-effort; fail-open — never block the exit.
+    // doesn't outlive the TUI. Best-effort; fail-open — never block the exit. The
+    // close runs on a spawned task, bound-WAITED (not awaited inline): a wedged
+    // base can no longer hang the quit past the drain budget, while a healthy base
+    // still shuts down gracefully within it (e.g. opencode reaps its `serve`
+    // child rather than leaving `kill_on_drop` to orphan it). Same off-render-path
+    // discipline as `cancel_drain`, applied to teardown.
     let parked = chat_session_holder
         .try_lock()
         .ok()
         .and_then(|mut g| g.take());
     if let Some(s) = parked {
-        s.end().await;
+        let closer = tokio::spawn(async move {
+            s.end().await;
+        });
+        let _ = tokio::time::timeout(CANCEL_DRAIN_BUDGET, closer).await;
     }
     Ok(())
 }
@@ -6825,6 +6913,125 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "drain should return when the handle resolves, not wait the full budget: {elapsed:?}"
         );
+    }
+
+    /// A base session whose `end()` HANGS forever (a wedged/slow base that never
+    /// exits its shutdown). It flips `started` when `end()` is entered so a test
+    /// can confirm the close was actually attempted on the spawned task.
+    struct HangEndSession {
+        started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl umadev_runtime::BaseSession for HangEndSession {
+        async fn send_turn(&mut self, _d: String) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            None
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// Fix 1 — closing a wedged base session must be DETACHED off the render path:
+    /// `detach_resident_close` / `detach_session_close` return immediately even when
+    /// the base's `end()` hangs forever, while the close still runs on the spawned
+    /// task (teardown correctness). A regression that awaited `end()` inline would
+    /// wedge here for the whole hang instead of returning.
+    #[tokio::test]
+    async fn detached_close_never_awaits_a_hanging_end() {
+        use std::sync::atomic::Ordering;
+        let resident_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Both helpers are synchronous: they must return promptly (they only spawn),
+        // never blocking on the hanging `end()`.
+        let call = tokio::time::timeout(Duration::from_secs(2), async {
+            detach_resident_close(ResidentChat::Primed(Box::new(HangEndSession {
+                started: resident_started.clone(),
+            })));
+            detach_session_close(Box::new(HangEndSession {
+                started: session_started.clone(),
+            }));
+        })
+        .await;
+        assert!(
+            call.is_ok(),
+            "detaching a close must not block on a hanging end()"
+        );
+
+        // The close still gets attempted on the spawned task — yield so it can enter
+        // `end()` (sets the flag) before it parks on the hang.
+        for _ in 0..50 {
+            if resident_started.load(Ordering::SeqCst) && session_started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            resident_started.load(Ordering::SeqCst),
+            "the resident close still runs on the spawned task (process still ended)"
+        );
+        assert!(
+            session_started.load(Ordering::SeqCst),
+            "the director-session close still runs on the spawned task (process still ended)"
+        );
+    }
+
+    // --- Fix 2: legacy-input transient-error tolerance ----------------------
+
+    /// A single transient `Some(Err(_))` must NOT park input — only real EOF or a
+    /// sustained error run does; any successful read resets the streak.
+    #[test]
+    fn legacy_input_tolerates_a_single_transient_error() {
+        let threshold = MAX_CONSECUTIVE_INPUT_ERRORS;
+        // One transient error: streak advances to 1, does NOT park.
+        let (streak, park) = legacy_input_park_decision(0, false, false, threshold);
+        assert_eq!(streak, 1, "one error advances the streak");
+        assert!(!park, "a single transient error must not park input");
+
+        // A good read after the error resets the streak and never parks.
+        let (streak, park) = legacy_input_park_decision(streak, true, false, threshold);
+        assert_eq!(streak, 0, "a successful read resets the error streak");
+        assert!(!park, "a successful read never parks");
+    }
+
+    /// A SUSTAINED run of errors (a genuinely dead FD) parks exactly at the
+    /// threshold — not before.
+    #[test]
+    fn legacy_input_parks_after_threshold_consecutive_errors() {
+        let threshold = MAX_CONSECUTIVE_INPUT_ERRORS;
+        let mut streak = 0u32;
+        for i in 1..threshold {
+            let (s, park) = legacy_input_park_decision(streak, false, false, threshold);
+            streak = s;
+            assert!(!park, "must not park before the threshold (error {i})");
+        }
+        // The threshold-th consecutive error parks.
+        let (_s, park) = legacy_input_park_decision(streak, false, false, threshold);
+        assert!(park, "the threshold-th consecutive error parks input");
+    }
+
+    /// Real EOF (`None`) parks immediately, regardless of the streak.
+    #[test]
+    fn legacy_input_parks_immediately_on_eof() {
+        let (_s, park) = legacy_input_park_decision(0, false, true, MAX_CONSECUTIVE_INPUT_ERRORS);
+        assert!(park, "stdin EOF parks input immediately");
     }
 
     // --- R3 event coalescing + frame budget ---------------------------------
