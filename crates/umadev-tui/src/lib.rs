@@ -4888,19 +4888,32 @@ fn frame_needs_clear(sync_output: bool, heal_requested: bool) -> bool {
 /// prev-vs-next diff never reconciles against terminal reality — drift
 /// accumulates and is never wiped (the reported Windows 界面错乱 after a while).
 /// This forces ONE full clear+repaint on a bounded `cadence` *while the app is
-/// live*, so accumulated drift can never outlive the heartbeat.
+/// live* OR *while the prompt was edited recently*, so accumulated drift can
+/// never outlive the heartbeat.
+///
+/// `editing_recently` closes the idle-edit heal gap: on classic conhost a
+/// same-line backspace/insert on an IDLE prompt (the app is not "live") heals via
+/// none of the other triggers — the every-frame clear needs sync output, the
+/// contamination flag is not raised on a plain edit, and the input-height guard
+/// only fires on a height change — so ratatui's incremental diff drifts and only
+/// a manual resize recovers. Treating a recent edit as a heartbeat reason
+/// generalizes the resize heal to idle edits: an idle backspace self-heals within
+/// one `cadence` instead of requiring a resize. The `cadence` still throttles it,
+/// so it fires at most ~1x/sec while editing — never a per-keystroke clear.
 ///
 /// Gated to the non-sync path: under confirmed sync output every frame already
 /// clears+repaints (P0), so adding heartbeat clears there is pointless and would
-/// only cost bytes; and an IDLE screen has nothing to drift, so it never pays a
-/// clear (no flicker on a settled chat). Pure, so the truth table is unit-tested.
+/// only cost bytes; and an IDLE, un-edited screen has nothing to drift, so it
+/// never pays a clear (no flicker on a settled chat). Pure, so the truth table is
+/// unit-tested.
 fn periodic_repaint_due(
     sync_output: bool,
     live: bool,
+    editing_recently: bool,
     since_last_full_repaint: Duration,
     cadence: Duration,
 ) -> bool {
-    !sync_output && live && since_last_full_repaint >= cadence
+    !sync_output && (live || editing_recently) && since_last_full_repaint >= cadence
 }
 
 /// P2 — the DECRQM query asking the terminal whether DEC private mode 2026
@@ -5202,6 +5215,17 @@ const FRAME_MIN: Duration = Duration::from_millis(16);
 /// [`periodic_repaint_due`].
 const REPAINT_HEARTBEAT: Duration = Duration::from_secs(1);
 
+/// P4b — how long after the last input-buffer edit the non-sync repaint
+/// heartbeat treats the prompt as "editing recently" and keeps healing. On
+/// classic conhost a same-line edit on an idle prompt drifts under ratatui's
+/// incremental diff; this window lets the [`REPAINT_HEARTBEAT`] fire a bounded
+/// full clear+repaint (throttled by the cadence to ~1x/sec — never per
+/// keystroke) so an idle backspace self-heals within ~1s instead of requiring a
+/// manual resize. Kept a little wider than the cadence so the SETTLED line after
+/// the final keystroke still gets one healing repaint; then it lapses and the
+/// idle screen goes quiet again (no ongoing flicker). See [`periodic_repaint_due`].
+const INPUT_EDIT_HEAL_WINDOW: Duration = Duration::from_secs(2);
+
 /// M1 — the bounded budget the cancel-drain branch waits for an aborting task to
 /// wind down before forcing the post-cancel cleanup. Captured ONCE as an
 /// ABSOLUTE deadline when the drain starts (see `cancel_deadline`) so the wait is
@@ -5474,6 +5498,15 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // clear+repaint per `REPAINT_HEARTBEAT` while live. Reset on every real
     // clear below. Inert on the sync path (which clears every frame anyway).
     let mut last_full_repaint = Instant::now();
+    // P4b — the last time a keystroke/paste actually EDITED the input buffer
+    // (insert / backspace / kill / paste / recall — a pure caret move does not
+    // count). On the non-sync path (classic conhost) a same-line edit on an idle
+    // prompt drifts under ratatui's incremental diff and only a resize recovers;
+    // `periodic_repaint_due` consults this so the repaint heartbeat also fires
+    // while the prompt was edited within `INPUT_EDIT_HEAL_WINDOW`, healing the
+    // drift within one cadence. `None` until the first edit. Recorded only on the
+    // non-sync path (sync-output terminals clear every frame anyway).
+    let mut last_input_edit: Option<Instant> = None;
     // R5 resume-gap threshold + the last time any input event arrived. A long
     // gap before the next event looks like a sleep/wake / re-attach.
     let resume_threshold = resume_gap();
@@ -5708,13 +5741,21 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
         // synchronized output (classic conhost) nothing forces a full repaint
         // during a long steady streaming run, so incremental-diff drift would
         // accumulate unwiped (the Windows 界面错乱 after a while). Force ONE full
-        // clear+repaint on a bounded cadence while live; gated to the non-sync
-        // path so sync-output terminals (which already clear every frame — P0)
-        // and idle screens (nothing to drift) are untouched. Fail-open: it only
-        // sets the existing heal flag, so it can never wedge the loop.
+        // clear+repaint on a bounded cadence while live OR while the prompt was
+        // edited recently (P4b — the idle-edit heal gap: a same-line
+        // backspace/insert on an idle prompt drifts under the incremental diff
+        // and otherwise only a resize recovers). Gated to the non-sync path so
+        // sync-output terminals (which already clear every frame — P0) and idle,
+        // un-edited screens (nothing to drift) are untouched. The cadence still
+        // throttles it to ~1x/sec, so editing never triggers a per-keystroke
+        // clear. Fail-open: it only sets the existing heal flag, so it can never
+        // wedge the loop.
+        let editing_recently =
+            last_input_edit.is_some_and(|t| t.elapsed() <= INPUT_EDIT_HEAL_WINDOW);
         if periodic_repaint_due(
             sync_output,
             now_live,
+            editing_recently,
             last_full_repaint.elapsed(),
             REPAINT_HEARTBEAT,
         ) {
@@ -6150,7 +6191,14 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // `handle_paste` also detects a dragged-in image PATH and turns
                     // it into an `[图片 N]` attachment chip (forwarded to the base as
                     // an `@<path>` mention on submit); plain text is inserted as-is.
+                    let paste_before = app.input.len();
                     app.handle_paste(pasted);
+                    // P4b — a paste that changed the buffer is a same-line edit; on
+                    // the non-sync path record it so the repaint heartbeat heals
+                    // conhost incremental-diff drift within one cadence.
+                    if !sync_output && app.input.len() != paste_before {
+                        last_input_edit = Some(Instant::now());
+                    }
                 } else if let Some(Ok(Event::Key(key))) = maybe_key {
                     // Accept Press AND Repeat. On terminals that negotiate the
                     // kitty / enhanced-keyboard protocol (Ghostty, recent iTerm2,
@@ -6196,7 +6244,24 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 needs_redraw = true;
                                 continue;
                             }
-                            match app.apply_key_with_mods(replay_key.code, replay_key.modifiers) {
+                            // P4b — snapshot the buffer so an actual edit
+                            // (insert / backspace / kill / recall) can be told apart
+                            // from a pure caret move. Only on the non-sync path — the
+                            // idle-edit heal only matters on classic conhost, so
+                            // mac/Linux/Windows-Terminal pay no clone.
+                            let edit_probe = (!sync_output).then(|| app.input.clone());
+                            let action =
+                                app.apply_key_with_mods(replay_key.code, replay_key.modifiers);
+                            // P4b — a key that CHANGED the input buffer is a same-line
+                            // edit; record the time so the non-sync repaint heartbeat
+                            // heals conhost incremental-diff drift within one cadence.
+                            // A pure caret move (arrows / home / end) leaves the buffer
+                            // unchanged and is intentionally not counted — no idle
+                            // flicker on a settled prompt.
+                            if edit_probe.is_some_and(|before| before != app.input) {
+                                last_input_edit = Some(Instant::now());
+                            }
+                            match action {
                                 // Quit sets `app.should_quit`; the loop-bottom check
                                 // breaks. (No bare `break` here — it would only exit
                                 // the inner replay loop, not the event loop.) None is
@@ -12101,37 +12166,67 @@ mod tests {
     #[test]
     fn non_sync_live_run_gets_a_bounded_repaint_heartbeat() {
         // P4 — the classic-conhost drift wipe. The heartbeat fires ONLY on the
-        // non-sync path, ONLY while live, and ONLY once the cadence has elapsed.
+        // non-sync path, ONLY while live OR recently edited, and ONLY once the
+        // cadence has elapsed. Signature: (sync, live, editing_recently, elapsed,
+        // cadence).
         let cadence = Duration::from_secs(1);
         // Non-sync + live + past the cadence → force one full repaint.
         assert!(
-            periodic_repaint_due(false, true, Duration::from_millis(1200), cadence),
+            periodic_repaint_due(false, true, false, Duration::from_millis(1200), cadence),
             "non-sync live run past the cadence must force a full repaint"
         );
         // At the boundary (>=) it counts.
         assert!(
-            periodic_repaint_due(false, true, cadence, cadence),
+            periodic_repaint_due(false, true, false, cadence, cadence),
             "the cadence boundary itself is due"
         );
         // Within the cadence → not yet (bounded, never a per-frame clear).
         assert!(
-            !periodic_repaint_due(false, true, Duration::from_millis(200), cadence),
+            !periodic_repaint_due(false, true, false, Duration::from_millis(200), cadence),
             "within the cadence the heartbeat must not fire (no per-frame clear)"
         );
-        // Idle → never (an idle screen can't drift; no flicker on a settled chat).
+        // Idle + not edited → never (an idle screen can't drift; no flicker on a
+        // settled chat).
         assert!(
-            !periodic_repaint_due(false, false, Duration::from_secs(10), cadence),
-            "an idle non-sync screen never pays a heartbeat clear"
+            !periodic_repaint_due(false, false, false, Duration::from_secs(10), cadence),
+            "an idle, un-edited non-sync screen never pays a heartbeat clear"
+        );
+
+        // --- P4b: the idle-edit heal gap -------------------------------------
+        // THE FIX — non-sync + NOT live but the prompt was edited recently + past
+        // the cadence → DUE. This is the classic-conhost same-line backspace heal:
+        // an idle edit self-heals within one cadence instead of needing a resize.
+        assert!(
+            periodic_repaint_due(false, false, true, Duration::from_millis(1200), cadence),
+            "non-sync recently-edited idle prompt past the cadence must heal (the fix)"
+        );
+        // Editing still respects the cadence throttle: edited but within the
+        // cadence → NOT yet due, so a burst of keystrokes never forces a per-key
+        // clear (the crucial no-flicker guarantee).
+        assert!(
+            !periodic_repaint_due(false, false, true, Duration::from_millis(200), cadence),
+            "an edit within the cadence must not fire — the cadence still throttles"
+        );
+        // Live AND editing recently → still due (existing live behavior unchanged).
+        assert!(
+            periodic_repaint_due(false, true, true, Duration::from_millis(1200), cadence),
+            "non-sync live + recently edited past the cadence is still due"
         );
         // Sync output → NEVER on this path — every frame already repaints (P0),
-        // so the heartbeat must add no clears there, live or idle.
+        // so the heartbeat must add no clears there, live / idle / editing.
         assert!(
-            !periodic_repaint_due(true, true, Duration::from_secs(10), cadence),
+            !periodic_repaint_due(true, true, false, Duration::from_secs(10), cadence),
             "sync output must not take the heartbeat path (already clears every frame)"
         );
         assert!(
-            !periodic_repaint_due(true, false, Duration::from_secs(10), cadence),
+            !periodic_repaint_due(true, false, false, Duration::from_secs(10), cadence),
             "sync output idle must not take the heartbeat path either"
+        );
+        // Sync output + recently edited → STILL never (the edit signal must not
+        // leak a clear onto a sync-output terminal — it clears every frame anyway).
+        assert!(
+            !periodic_repaint_due(true, false, true, Duration::from_secs(10), cadence),
+            "sync output + recent edit must not take the heartbeat path"
         );
     }
 
