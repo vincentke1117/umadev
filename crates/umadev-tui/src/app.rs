@@ -196,50 +196,6 @@ impl PickerStep {
 /// fails with a "prompt too long" (the reactive `BaseFailure::Context` remedy).
 pub(crate) const CONTEXT_NUDGE_PCT: u16 = 80;
 
-/// Legacy model-window lookup kept only as a narrow compatibility helper for
-/// callers that explicitly ask "do we know this model family?". The TUI no
-/// longer uses it as a live context-gauge denominator: UmaDev does not own the
-/// base model routing, and a hardcoded model table is worse than silence when it
-/// drifts. The rendered gauge uses only an exact `base_context_window` read from
-/// base configuration.
-#[must_use]
-pub(crate) fn context_window_estimate(backend_id: &str, model: &str) -> Option<u64> {
-    // Normalize so a DOTTED table key (`claude-sonnet-4.5`) and the base's REAL
-    // DASHED id (`claude-sonnet-4-5-20250929`, the exact string the init frame
-    // reports) resolve to the SAME rule: fold every `.` to `-`, then match on
-    // dashed substrings. Without this fold a real id fell through to the generic
-    // 200K bucket and the gauge could not tell 200K from 1M.
-    let m = model.to_ascii_lowercase().replace('.', "-");
-    // Model-id substring match wins (most specific). Ordered so a `gpt-5` hit
-    // beats the generic `gpt-4` bucket.
-    if m.contains("gemini-1-5") || m.contains("gemini-2") || m.contains("gemini-3") {
-        return Some(1_000_000);
-    }
-    if m.contains("glm-4-5") || m.contains("glm-5") {
-        return Some(128_000);
-    }
-    // 1M is RESERVED for the Sonnet 4.x 1M-context beta: a Claude id that carries
-    // the explicit `-1m` / `[1m]` marker (opencode's `…[1m]`, or a `-1m` alias).
-    // The marker is the ONLY thing that lifts a Claude model out of the 200K
-    // family — Opus included (Opus is 200K, NOT 1M; the old table wrongly put
-    // `claude-opus-4.1` in the 1M bucket), and a bare Sonnet 4.5 (default 200K).
-    if m.contains("claude") && (m.contains("-1m") || m.contains("[1m]")) {
-        return Some(1_000_000);
-    }
-    if m.contains("claude") {
-        return Some(200_000);
-    }
-    // GPT-5.x (incl. GPT-5-codex) → 400K.
-    if m.contains("gpt-5") {
-        return Some(400_000);
-    }
-    if m.contains("o4-mini") || m.contains("o3") || m.contains("gpt-4") {
-        return Some(128_000);
-    }
-    let _ = backend_id;
-    None
-}
-
 /// Round `used / total` to a whole percent for the context-usage gauge. Clamped to
 /// `0..=100` (the conservative denominator can under-count a larger real window, so
 /// a raw ratio may exceed 100 — showing a capped `100%` reads as "full", never an
@@ -8602,24 +8558,18 @@ impl App {
         None
     }
 
-    /// The context-window DENOMINATOR for the active base/model, or `None` when
-    /// neither the base config nor the base-reported model yields a precise value.
-    /// Pure read, fail-open.
+    /// The context-window DENOMINATOR for the active base/model, or `None` when the
+    /// base does not expose an EXACT window in its own configuration. Pure read.
     #[must_use]
     pub(crate) fn context_window_tokens(&self) -> Option<u64> {
-        // Tier 1 — an EXACT window the base's own config exposes (today: OpenCode
-        // provider metadata). Most precise; use it verbatim.
-        if let Some(w) = self.base_context_window {
-            return Some(w);
-        }
-        // Tier 2 — map the base-REPORTED model to its window. `base_model` now comes
-        // from the base itself (the session `init` frame, see `EngineEvent::BaseModel`),
-        // so it is authoritative — not a UmaDev guess — which makes a model→window
-        // table precise rather than a heuristic. An unknown / not-yet-reported model
-        // yields `None` (gauge stays hidden until the base reports it) instead of a
-        // wrong number: wrong precision is worse than no gauge.
-        let backend = self.backend.as_deref()?;
-        context_window_estimate(backend, self.base_model.as_deref().unwrap_or(""))
+        // The gauge denominator is shown ONLY when the base's own config exposes an
+        // exact context window (today: OpenCode provider metadata). UmaDev owns no
+        // model and cannot read a claude-code / codex window, and inferring one from
+        // a model-name table would drift and mislead when a base routes to a
+        // third-party / local model — so for those bases the window stays hidden and
+        // only the real model NAME is shown (see `model_meta_text`). Honest over
+        // decorative: no fabricated or guessed denominator, ever.
+        self.base_context_window
     }
 
     /// Current context occupancy as a whole percent (`used / window`), or `None`
@@ -14623,79 +14573,19 @@ mod tests {
     // ---- Context-usage gauge + proactive compaction nudge --------------------
 
     #[test]
-    fn context_window_table_has_no_backend_defaults() {
-        // A bare Sonnet 4.x (dotted OR the base's real dashed id) is the DEFAULT
-        // 200K family — 1M is the opt-in beta, reserved for the explicit marker.
-        assert_eq!(
-            context_window_estimate("claude-code", "claude-sonnet-4.5"),
-            Some(200_000)
-        );
-        assert_eq!(
-            context_window_estimate("claude-code", "claude-sonnet-4-5-20250929"),
-            Some(200_000)
-        );
-        // The 1M-context beta marker (`[1m]` / `-1m`) lifts Sonnet 4.x to 1M.
-        assert_eq!(
-            context_window_estimate("claude-code", "claude-sonnet-4-5-20250929[1m]"),
-            Some(1_000_000)
-        );
-        assert_eq!(
-            context_window_estimate("opencode", "anthropic/claude-sonnet-4-5-1m"),
-            Some(1_000_000)
-        );
-        // Opus is 200K, NOT 1M — dotted key AND the real dashed id both resolve to
-        // the 200K family (this was the headline bug: Opus mis-bucketed at 1M).
-        assert_eq!(
-            context_window_estimate("claude-code", "claude-opus-4.1"),
-            Some(200_000)
-        );
-        assert_eq!(
-            context_window_estimate("claude-code", "claude-opus-4-1-20250805"),
-            Some(200_000)
-        );
-        // Other Claude variants (incl. opencode's `provider/model` form) → 200K.
-        assert_eq!(
-            context_window_estimate("opencode", "anthropic/claude-sonnet-4-6"),
-            Some(200_000)
-        );
-        // GPT-5 family → 400k; older o-series / gpt-4 → 128k.
-        assert_eq!(
-            context_window_estimate("codex", "gpt-5.5-codex"),
-            Some(400_000)
-        );
-        assert_eq!(
-            context_window_estimate("opencode", "zhipuai/glm-5"),
-            Some(128_000)
-        );
-        assert_eq!(context_window_estimate("codex", "o4-mini"), Some(128_000));
-        // Unset/unknown model → no denominator. The live TUI must not fabricate a
-        // per-backend context window when the base runs on its login/default model.
-        assert_eq!(context_window_estimate("claude-code", ""), None);
-        assert_eq!(context_window_estimate("opencode", ""), None);
-        assert_eq!(context_window_estimate("codex", ""), None);
-        assert_eq!(
-            context_window_estimate("claude-code", "totally-unknown-model"),
-            None
-        );
-        // Unknown / offline base with no usable model → nothing (fail-open).
-        assert_eq!(context_window_estimate("offline", ""), None);
-        assert_eq!(context_window_estimate("", "some-unknown-model"), None);
-    }
-
-    #[test]
-    fn base_model_engine_event_drives_display_and_context_window() {
+    fn base_model_engine_event_updates_display_not_context_window() {
         // The base reports its resolved model at session init (`EngineEvent::BaseModel`)
-        // → the UI records the real model for display AND maps it to that model's real
-        // context window. The reported id is authoritative (the base tells us exactly
-        // what it resolved), so the window is precise, not a guess.
+        // → the UI records the real model for DISPLAY only (see `model_meta_text`). It
+        // must NOT infer a context window from that id: a hardcoded model table drifts
+        // and a base may route to a third-party/local model, so only an EXACT
+        // base-config window is ever a denominator — honest over decorative.
         let mut app = fresh_app(Some("claude-code"));
         app.last_turn_input_tokens = 100_000;
         // Pin "user pinned nothing" deterministically — `fresh_app` would otherwise
         // inherit the dev host's ambient `~/.claude/settings.json` model.
         app.base_model = None;
-        // Before the init frame: no model reported, no exact configured window.
         assert_eq!(app.context_window_tokens(), None);
-        // A dashed real Sonnet id WITH the 1M-beta marker → 1M window, live.
+        // A dashed real Sonnet id updates the display model but proves no window.
         app.apply_engine(EngineEvent::BaseModel {
             id: "claude-sonnet-4-5-20250929[1m]".to_string(),
         });
@@ -14703,15 +14593,15 @@ mod tests {
             app.base_model.as_deref(),
             Some("claude-sonnet-4-5-20250929[1m]")
         );
-        assert_eq!(app.context_window_tokens(), Some(1_000_000));
-        // A dashed real Opus id → 200K (Opus is NOT 1M).
-        app.apply_engine(EngineEvent::BaseModel {
-            id: "claude-opus-4-1-20250805".to_string(),
-        });
-        assert_eq!(app.context_window_tokens(), Some(200_000));
-        // Fail-open: an empty id is ignored, keeping the last good model + window.
+        assert_eq!(app.context_window_tokens(), None);
+        // Fail-open: an empty id is ignored, keeping the last good display model.
         app.apply_engine(EngineEvent::BaseModel { id: String::new() });
-        assert_eq!(app.base_model.as_deref(), Some("claude-opus-4-1-20250805"));
+        assert_eq!(
+            app.base_model.as_deref(),
+            Some("claude-sonnet-4-5-20250929[1m]")
+        );
+        // ONLY an exact base-config window unlocks the denominator.
+        app.base_context_window = Some(200_000);
         assert_eq!(app.context_window_tokens(), Some(200_000));
     }
 
@@ -14749,12 +14639,10 @@ mod tests {
     }
 
     #[test]
-    fn context_gauge_infers_window_from_the_base_reported_model() {
-        // The base's model is authoritative (config-pinned here, or reported live
-        // via the session init frame → EngineEvent::BaseModel), so the gauge maps
-        // it to its real window instead of hiding — this is the whole point of the
-        // model-aware denominator: a codex login on a gpt-5.x model is 400K, so a
-        // 100K turn reads as 25%, not "unknown".
+    fn context_gauge_does_not_infer_window_from_a_config_pinned_model() {
+        // A codex config pinning a gpt-5 model sets the DISPLAY model, but the gauge
+        // must NOT fabricate a window from it — only an exact base-config window is a
+        // denominator, so codex (which exposes none) shows the model name and no bar.
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
         std::fs::write(
@@ -14773,15 +14661,8 @@ mod tests {
         );
         app.last_turn_input_tokens = 100_000;
         assert_eq!(app.base_model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(app.context_window_tokens(), Some(400_000));
-        assert_eq!(app.context_usage_pct(), Some(25));
-        // A live init-frame model report overrides it (e.g. base resolved a Claude
-        // model) and the window follows immediately, no pin required.
-        app.base_model = Some("claude-sonnet-4-5-20250929".to_string());
-        assert_eq!(app.context_window_tokens(), Some(200_000));
-        // …and the 1M-context beta marker lifts it out of the 200K family.
-        app.base_model = Some("claude-sonnet-4-5-20250929[1m]".to_string());
-        assert_eq!(app.context_window_tokens(), Some(1_000_000));
+        assert_eq!(app.context_window_tokens(), None);
+        assert_eq!(app.context_usage_pct(), None);
     }
 
     #[test]

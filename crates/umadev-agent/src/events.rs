@@ -128,12 +128,11 @@ pub enum EngineEvent {
     },
     /// The base reported the EXACT model it resolved for the live session (from
     /// the session `init` frame — see `umadev_runtime::SessionEvent::SessionModel`).
-    /// The UI shows it as the live display model AND maps it to that model's real
-    /// context window for the gauge denominator — the id is authoritative (the base
-    /// tells us exactly what it resolved), so the mapped window is precise; an
-    /// unrecognised model simply leaves the window unknown (no fabricated number).
-    /// Emitted at most once per session, before any `TurnUsage`. Fail-open: a base
-    /// that reports no model simply never emits this.
+    /// The UI uses it ONLY as the live display model. It deliberately does NOT infer
+    /// context-window capacity from this id: a hardcoded model table drifts and a base
+    /// may route to a third-party/local model, so only an exact base-config window is
+    /// ever a gauge denominator. Emitted at most once per session, before any
+    /// `TurnUsage`. Fail-open: a base that reports no model simply never emits this.
     BaseModel {
         /// The base-reported model id (e.g. `claude-sonnet-4-5-20250929`).
         id: String,

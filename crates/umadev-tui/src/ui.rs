@@ -4044,9 +4044,9 @@ fn token_gauge_text(app: &App) -> Option<String> {
 /// context is *right now* (distinct from the cumulative-spend gauge above), so
 /// the user can see when `/compact` is due instead of only learning it when the
 /// base fails. NUMERATOR: the base's real last-turn input tokens (the context it
-/// just read). DENOMINATOR: an exact context window from the base's own config when
-/// it exposes one (OpenCode), else the window mapped from the base-REPORTED model
-/// (`EngineEvent::BaseModel`, authoritative). Renders `ctx 34k/200k · 17%`.
+/// just read). DENOMINATOR: an exact context window read from the base's own
+/// configuration, when the base exposes one (OpenCode) — never inferred from a model
+/// name, which would drift/mislead. Renders `ctx 34k/200k · 17%`.
 ///
 /// Fail-open: `None` (show nothing) when there is no usage/transcript yet or the
 /// model/window is unknown, so a fresh session or an unrecognised base never shows
@@ -8233,7 +8233,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_row_shows_model_and_the_model_derived_context_window() {
+    fn meta_row_shows_model_but_hides_unproven_context_window() {
         let mut app = app_with(Some("claude-code"));
         app.lang = umadev_i18n::Lang::ZhCn;
         app.base_model = Some("claude-sonnet-4-5-20250929".to_string());
@@ -8244,9 +8244,12 @@ mod tests {
         let compact = out.replace(' ', "");
         // The real base-reported model name is shown…
         assert!(compact.contains("模型claude-sonnet-4-5-20250929"), "{out}");
-        // …and that authoritative id maps to its real 200K window (Sonnet 4.5 with
-        // no 1M-beta marker), so the gauge renders a precise denominator (2.5K/200K).
-        assert!(compact.contains("上下文2.5K/200K"), "{out}");
+        // …but with no exact base-config window there is NO context gauge — a model
+        // table would be a guess, and honest-over-decorative shows nothing instead.
+        assert!(
+            !compact.contains("上下文"),
+            "no exact context window means no context gauge at all: {out}"
+        );
     }
 
     // --- Pre-fold de-scramble fix ---
