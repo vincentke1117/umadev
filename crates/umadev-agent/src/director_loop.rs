@@ -3683,7 +3683,7 @@ async fn drive_one_turn_with_backoff(
                     detail = surface.detail;
                     events.emit(EngineEvent::Note(surface.note));
                 }
-                record_tool_call_audit(options, &name, &detail);
+                record_tool_call_audit(options, &name, &detail, &input);
                 // P1: forward the structured before/after for a Write/Edit so the
                 // TUI can draw a live diff card on the DEFAULT loop (the user hit
                 // "no real-time feedback when writing code"). Fail-open: a
@@ -3876,21 +3876,78 @@ fn record_turn_usage(
 }
 
 /// Record one base tool call to the audit trail (UD-EVID-002) on the default loop.
-/// Records the call + target with an `allow` verdict (the real-time governance is the
-/// claude hook + the QC content scan; this is the AUDIT record, present for every
-/// base so the trail isn't empty on a codex/opencode run). Fail-open: any error is
-/// swallowed. Mirrors `continuous::govern_tool_call`'s audit write.
-fn record_tool_call_audit(options: &RunOptions, name: &str, target: &str) {
+///
+/// Records the call + target with the REAL governance verdict — the same policy +
+/// project-context + rule evaluation the continuous path applies (see
+/// [`tool_call_governance_verdict`]), not a hardcoded `allow`. Previously this
+/// loop always wrote `allow`, so the SAME base got inconsistent audit semantics
+/// across the two loops (a secret/dangerous write recorded as `block` in the
+/// continuous path but `allow` here). Now both agree. Fail-open: verdict
+/// computation degrades to a passing decision and any record error is swallowed —
+/// the turn is never blocked.
+fn record_tool_call_audit(
+    options: &RunOptions,
+    name: &str,
+    target: &str,
+    input: &serde_json::Value,
+) {
+    let decision = tool_call_governance_verdict(options, name, input);
+    let decision_word = if decision.block { "block" } else { "allow" };
     let _ = umadev_governance::record_tool_call(
         &options.project_root,
         name,
         target,
-        "allow",
-        "",
-        "",
+        decision_word,
+        &decision.clause,
+        &decision.reason,
         &options.effective_slug(),
         None,
     );
+}
+
+/// Compute the governance verdict for one base tool call — the SAME policy +
+/// project-context + rule evaluation `continuous::govern_tool_call` runs (bash →
+/// `check_dangerous_bash`; a file-mutating tool → content scan; everything else →
+/// pass), so the DEFAULT loop's audit records the true allow/deny instead of a
+/// hardcoded `allow`. Kept in lockstep with `continuous::evaluate_tool_call`.
+///
+/// Fully fail-open + deterministic given the on-disk policy/context: it emits no
+/// event and never blocks a turn — it is pure evaluation feeding only the audit
+/// record.
+fn tool_call_governance_verdict(
+    options: &RunOptions,
+    name: &str,
+    input: &serde_json::Value,
+) -> umadev_governance::Decision {
+    let policy = umadev_governance::Policy::load(&options.project_root);
+    let ctx = crate::planner::derive_project_context(
+        &options.requirement,
+        &options.project_root,
+        &options.effective_slug(),
+    );
+    let lname = name.to_ascii_lowercase();
+    if lname == "bash" || lname == "shell" || lname == "run" {
+        let cmd = input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| input.get("cmd").and_then(serde_json::Value::as_str))
+            .unwrap_or_default();
+        return umadev_governance::check_dangerous_bash(cmd);
+    }
+    // File-mutating tools (aligned with the continuous path + the hook's `is_write`
+    // matcher): scan the proposed content. Any other tool is observe-only → pass.
+    if lname == "write"
+        || lname == "edit"
+        || lname == "multiedit"
+        || lname == "notebookedit"
+        || lname == "update"
+        || lname == "create"
+    {
+        let path = umadev_runtime::write_scan_path(input);
+        let content = umadev_runtime::write_scan_content(input);
+        return umadev_governance::scan_content_with_context(&path, &content, &policy, ctx);
+    }
+    umadev_governance::Decision::pass()
 }
 
 /// Best-effort human-readable target of a base tool call (a file path / command)
@@ -4395,6 +4452,39 @@ mod tests {
     fn sink() -> (Arc<dyn EventSink>, RecordingSink) {
         let rec = RecordingSink::default();
         (Arc::new(rec.clone()), rec)
+    }
+
+    #[test]
+    fn default_loop_audit_records_the_real_verdict_not_hardcoded_allow() {
+        // P2: the default director loop used to record every tool call as `allow`,
+        // inconsistent with the continuous path's real governance verdict. Now the
+        // audit computes the SAME verdict: a dangerous bash → `block`, a benign
+        // read → `allow`.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let options = opts(tmp.path());
+
+        // Dangerous command → the verdict blocks (not a hardcoded allow).
+        let danger = serde_json::json!({ "command": "rm -rf /" });
+        let d = tool_call_governance_verdict(&options, "Bash", &danger);
+        assert!(d.block, "a root-wipe must produce a blocking verdict");
+
+        // A benign read → pass.
+        let benign = serde_json::json!({ "file_path": "src/main.rs" });
+        let r = tool_call_governance_verdict(&options, "Read", &benign);
+        assert!(!r.block, "an observe-only read passes");
+
+        // The audit record carries the REAL decision word, not `allow`.
+        record_tool_call_audit(&options, "Bash", "rm -rf /", &danger);
+        let log = tmp
+            .path()
+            .join(".umadev")
+            .join("audit")
+            .join("tool-calls.jsonl");
+        let recorded = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            recorded.contains("\"decision\":\"block\""),
+            "the audit trail records the real `block` verdict, not a hardcoded allow: {recorded}"
+        );
     }
 
     // ── A scripted fake BaseSession: each `send_turn` loads the next scripted

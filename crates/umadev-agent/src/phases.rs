@@ -2484,12 +2484,12 @@ tr:last-child td{{border-bottom:none}}.num{{font-variant-numeric:tabular-nums;fo
 .hash{{font:12px/1.5 ui-monospace,'Geist Mono',monospace;color:var(--muted);word-break:break-all;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:12px 14px}}\
 .foot{{margin-top:40px;color:var(--muted);font-size:13px;border-top:1px solid var(--line);padding-top:16px}}\
 </style></head><body><div class=\"wrap\">\
-<div class=\"head\"><span class=\"brand\">Super <b>Dev</b> · 交付成绩单</span><span class=\"date\">{date} · {run_id}</span></div>\
+<div class=\"head\"><span class=\"brand\">Uma<b>Dev</b> · 交付成绩单</span><span class=\"date\">{date} · {run_id}</span></div>\
 <h1>{slug}</h1><p class=\"sub\">由 UmaDev 独立验证的商业级交付成绩单 — 可分享给团队、客户或审计方作为交付证明。</p>\
 <div class=\"hero\"><div class=\"score {score_hue}\">{score}<small>/100</small></div>\
 <div><div class=\"verdict {verdict_class}\">{verdict}</div><div class=\"muted\">质量门综合分(分层/安全/设计/契约/无障碍等多维加权)</div></div></div>\
 <h2>质量门 · 逐项</h2><table><thead><tr><th>检查项</th><th>分</th><th>状态</th><th>说明</th></tr></thead><tbody>{rows}</tbody></table>\
-<h2>实时治理</h2><p class=\"muted\">全程拦截:emoji 图标 · 硬编码颜色 · AI-slop · 敏感路径 · 危险命令 · 设计 token 漂移 — fail-open,从不阻断宿主。</p>\
+<h2>实时治理</h2><p class=\"muted\">全程巡检并留痕:emoji 图标 · 硬编码颜色 · AI-slop · 敏感路径 · 危险命令 · 设计 token 漂移 — fail-open 咨询式治理,只标记提示、不因治理自身故障阻断宿主。</p>\
 <h2>合规证据链</h2>{compliance_block}\
 <h2>交付文档 · Delivery docs</h2><table><thead><tr><th>文档</th><th>路径</th><th>状态</th></tr></thead><tbody>{doc_rows}</tbody></table>\
 <h2>防篡改 · proof-pack SHA-256</h2><div class=\"hash\">{zip_sha}</div>\

@@ -34,6 +34,56 @@ const SHADOW_EXCLUDES: &[&str] = &[
     "*.log",
 ];
 
+/// The same heavy/dangerous paths as [`SHADOW_EXCLUDES`], expressed as git
+/// **exclude pathspecs** for the staging `git add`.
+///
+/// TRADE-OFF (P1/P2): the shadow `add` is now `-A --force` so it captures files
+/// the project `.gitignore` hides — an AI-written `.env.local`, ignored generated
+/// config, ignored snapshots — otherwise a "roll the whole run back" would
+/// silently leave those behind (the base wrote them, but a plain `git add -A`
+/// skips ignored paths, so they were never in a checkpoint to restore). `--force`
+/// overrides BOTH the project `.gitignore` and the shadow `info/exclude`, so to
+/// keep the shadow commit BOUNDED we re-assert the heavy set here as pathspecs:
+/// the real `.git`, dependency trees (`node_modules`, `.venv`), Python caches,
+/// build output (`target`/`dist`/`build`/`.next`/`.nuxt`/`.output`), log spew,
+/// and UmaDev's own `.umadev/` (which holds THIS shadow repo — force-adding it
+/// would be recursive). A user with some OTHER giant ignored artifact (a
+/// multi-GB dataset) is out of scope — the common heavy offenders are covered.
+const SHADOW_ADD_EXCLUDE_PATHSPECS: &[&str] = &[
+    ":(exclude,glob).git/**",
+    ":(exclude,glob)**/.git/**",
+    ":(exclude,glob)node_modules/**",
+    ":(exclude,glob)**/node_modules/**",
+    ":(exclude,glob)target/**",
+    ":(exclude,glob)**/target/**",
+    ":(exclude,glob)dist/**",
+    ":(exclude,glob)**/dist/**",
+    ":(exclude,glob)build/**",
+    ":(exclude,glob)**/build/**",
+    ":(exclude,glob).next/**",
+    ":(exclude,glob).nuxt/**",
+    ":(exclude,glob).output/**",
+    ":(exclude,glob).venv/**",
+    ":(exclude,glob)**/__pycache__/**",
+    ":(exclude,glob).umadev/**",
+    ":(exclude,glob)**/.umadev/**",
+    ":(exclude,glob)*.log",
+];
+
+/// Stage the whole work-tree into the shadow index — INCLUDING files the project
+/// `.gitignore` hides (`--force`), so a rollback can restore an AI-written
+/// `.env.local` / ignored config — while still excluding the heavy/dangerous
+/// paths in [`SHADOW_ADD_EXCLUDE_PATHSPECS`] so the checkpoint stays bounded and
+/// never pulls in `node_modules` / build output / the real `.git` / this shadow
+/// repo. A leading positive `.` guards the "exclude-only pathspec" edge across
+/// git versions. Fail-open: `None` when `git` can't spawn (the caller
+/// `?`-propagates, exactly as the old `git add -A` did).
+fn stage_all_including_ignored(project_root: &Path) -> Option<std::process::Output> {
+    let mut args: Vec<&str> = vec!["add", "-A", "--force", "--", "."];
+    args.extend_from_slice(SHADOW_ADD_EXCLUDE_PATHSPECS);
+    git(project_root, &args)
+}
+
 /// One checkpoint entry, newest-first in [`list_checkpoints`].
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Checkpoint {
@@ -100,7 +150,7 @@ pub fn create_checkpoint(project_root: &Path, label: &str) -> Option<String> {
     if !ensure_init(project_root) {
         return None;
     }
-    git(project_root, &["add", "-A"])?;
+    stage_all_including_ignored(project_root)?;
     git(
         project_root,
         &[
@@ -140,11 +190,12 @@ pub fn create_phase_checkpoint(project_root: &Path, label: &str) -> Option<Strin
     if !ensure_init(project_root) {
         return None;
     }
-    // Stage everything, then ask whether the index differs from HEAD. `git
-    // diff --cached --quiet` exits 0 = no staged changes, 1 = changes. When
-    // there is no HEAD yet (fresh repo) the diff reports changes (or errors),
-    // so the baseline checkpoint is taken.
-    git(project_root, &["add", "-A"])?;
+    // Stage everything (including .gitignore'd product files, minus the heavy
+    // set — see `stage_all_including_ignored`), then ask whether the index
+    // differs from HEAD. `git diff --cached --quiet` exits 0 = no staged changes,
+    // 1 = changes. When there is no HEAD yet (fresh repo) the diff reports changes
+    // (or errors), so the baseline checkpoint is taken.
+    stage_all_including_ignored(project_root)?;
     let has_head = has_checkpoints(project_root);
     if has_head {
         let clean =
@@ -307,6 +358,57 @@ pub fn run_baseline(project_root: &Path) -> Option<Checkpoint> {
     list_checkpoints(project_root)
         .into_iter()
         .find(|c| c.label.starts_with(RUN_BASELINE_PREFIX))
+}
+
+/// Ensure THIS run has its own fresh run-baseline — the pre-run snapshot
+/// `rollback` rewinds to — so a rollback only ever reverts the CURRENT run's
+/// changes, never a prior run's (P1/P2).
+///
+/// The old logic took a baseline only when `run_baseline().is_none()`, i.e. once
+/// per WORKSPACE: a second run in the same workspace reused the first run's
+/// baseline, so rolling back the second run over-reverted everything since the
+/// first run started. Here we instead take a **fresh** baseline at each new run's
+/// start, while staying idempotent WITHIN a single run:
+///
+/// - If the newest run-baseline is ALSO the shadow repo's current HEAD, we are
+///   still sitting at this run's start — no phase checkpoint has been committed
+///   since the baseline was taken (e.g. the legacy `run_clarify` → `run_initial_block`
+///   hand-off calls this twice at the Research boundary). Re-use it; do NOT stack
+///   a second baseline that would move `rollback`'s target to mid-run state.
+/// - Otherwise (no baseline yet, OR HEAD has advanced past the last baseline
+///   because a prior run committed phase checkpoints) this is a NEW run's start:
+///   snapshot fresh so `rollback` targets only this run.
+///
+/// Fail-open: `git` unavailable → `None`, never blocks the run. `slug` only
+/// flavours the label; the baseline is identified by [`RUN_BASELINE_PREFIX`].
+#[must_use]
+pub fn ensure_run_baseline(project_root: &Path, slug: &str) -> Option<String> {
+    if let Some(existing) = run_baseline(project_root) {
+        if baseline_is_current_head(project_root, &existing.id) {
+            // Still at this run's start (nothing checkpointed since) → keep it.
+            return Some(existing.id);
+        }
+    }
+    create_run_baseline(project_root, slug)
+}
+
+/// `true` when `baseline_id` names the shadow repo's current HEAD commit — i.e.
+/// no checkpoint has been committed since that baseline was taken, so we are
+/// still at the run's start rather than mid-run. Prefix-tolerant in either
+/// direction (short-id abbreviations, like [`id_is_known_checkpoint`]).
+///
+/// Fail-open: an unreadable HEAD reads as "not current" so [`ensure_run_baseline`]
+/// takes a fresh baseline — the safe direction (never silently reuse a stale one).
+fn baseline_is_current_head(project_root: &Path, baseline_id: &str) -> bool {
+    let Some(head) = git(project_root, &["rev-parse", "--short", "HEAD"])
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let id = baseline_id.trim();
+    !id.is_empty() && (id == head || id.starts_with(&head) || head.starts_with(id))
 }
 
 /// Roll the workspace back to the most recent **run baseline** — a true,
@@ -528,6 +630,109 @@ mod tests {
         assert!(target.label.contains("second-run"));
         assert!(
             second.starts_with(&target.id) || target.id.starts_with(&second) || second == target.id
+        );
+    }
+
+    #[test]
+    fn ensure_run_baseline_is_fresh_per_run_and_deduped_within_a_run() {
+        // P1/P2: a 2nd run must take its OWN baseline (not reuse the 1st run's), so
+        // `rollback` reverts ONLY the current run's changes — while staying
+        // idempotent within one run (a re-entry block at the same start does not
+        // stack a second baseline).
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        std::fs::write(root.join("src.rs"), "pre-run-1").unwrap();
+
+        // Run 1 start → the first baseline.
+        let b1 = ensure_run_baseline(root, "run1").expect("run1 baseline");
+        // A SECOND setup call at the same run's start (no phase checkpoint yet) must
+        // NOT stack a new baseline — it reuses b1 (still sitting at the run start).
+        let b1_again = ensure_run_baseline(root, "run1").expect("dedup within run");
+        assert!(
+            b1_again == b1 || b1.starts_with(&b1_again) || b1_again.starts_with(&b1),
+            "within one run the baseline is re-used, not re-taken"
+        );
+
+        // Run 1 writes + checkpoints a phase → shadow HEAD moves past the baseline.
+        std::fs::write(root.join("src.rs"), "run-1-output").unwrap();
+        std::fs::write(root.join("run1_file.rs"), "added by run 1").unwrap();
+        let _ = create_phase_checkpoint(root, "phase: frontend");
+
+        // Run 2 start → a FRESH baseline (not run 1's), capturing run 1's output.
+        let b2 = ensure_run_baseline(root, "run2").expect("run2 baseline");
+        assert!(
+            !(b2 == b1 || b1.starts_with(&b2) || b2.starts_with(&b1)),
+            "a 2nd run takes its OWN baseline, not run 1's"
+        );
+        assert!(
+            run_baseline(root).unwrap().label.contains("run2"),
+            "the newest run baseline is run 2's"
+        );
+
+        // Run 2 writes.
+        std::fs::write(root.join("src.rs"), "run-2-output").unwrap();
+        std::fs::write(root.join("run2_file.rs"), "added by run 2").unwrap();
+        let _ = create_phase_checkpoint(root, "phase: backend");
+
+        // Rollback reverts ONLY run 2 (back to run 1's output), never run 1.
+        let _ = rollback_run(root).expect("rollback run 2");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).unwrap(),
+            "run-1-output",
+            "rollback reverts run 2 to run 1's output, not to before run 1"
+        );
+        assert!(
+            !root.join("run2_file.rs").exists(),
+            "run 2's added file is removed by the rollback"
+        );
+        assert!(
+            root.join("run1_file.rs").exists(),
+            "run 1's file SURVIVES — only the current run was reverted"
+        );
+    }
+
+    #[test]
+    fn checkpoint_captures_and_restores_gitignored_files() {
+        // P1/P2: the shadow checkpoint force-adds the project's .gitignore'd product
+        // files (an AI-written `.env.local`) so a rollback RESTORES them — but still
+        // excludes heavy dirs so the shadow commit can't balloon.
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        // A project .gitignore that hides .env.local AND node_modules.
+        std::fs::write(root.join(".gitignore"), "node_modules/\n.env.local\n").unwrap();
+        std::fs::write(root.join("app.js"), "v1").unwrap();
+        std::fs::write(root.join(".env.local"), "SECRET=original").unwrap();
+        std::fs::create_dir_all(root.join("node_modules").join("pkg")).unwrap();
+        std::fs::write(root.join("node_modules").join("pkg").join("i.js"), "heavy").unwrap();
+
+        let c1 = create_checkpoint(root, "baseline").expect("checkpoint");
+        // The ignored .env.local WAS captured; the heavy node_modules was NOT.
+        let tracked = git(root, &["ls-files"])
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        assert!(
+            tracked.lines().any(|l| l == ".env.local"),
+            "the .gitignore'd .env.local is captured in the checkpoint"
+        );
+        assert!(
+            !tracked.lines().any(|l| l.contains("node_modules")),
+            "the heavy node_modules dir stays out of the checkpoint"
+        );
+
+        // The base overwrites the ignored file, then we roll back to c1.
+        std::fs::write(root.join(".env.local"), "SECRET=rewritten-by-ai").unwrap();
+        let _c2 = create_checkpoint(root, "after edit");
+        restore_checkpoint(root, &c1).expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".env.local")).unwrap(),
+            "SECRET=original",
+            "rollback restored the .gitignore'd file the base had overwritten"
         );
     }
 

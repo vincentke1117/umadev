@@ -247,7 +247,10 @@ pub fn manual_steps(readiness: &PrReadiness, slug: &str, body_path_rel: &str) ->
         ));
     }
     out.push_str(&format!(
-        "  git add -A && git commit -m \"{slug}: UmaDev pipeline output\"\n  \
+        "  git add -- output release <your changed source paths>   \
+         # stage the run's evidence + your code explicitly (never the whole tree — \
+         a blanket stage can sweep in .env / temp / build junk)\n  \
+         git commit -m \"{slug}: UmaDev pipeline output\"\n  \
          git push -u origin {head}\n  \
          gh pr create --base {base} --head {head} --title \"{slug}\" --body-file {body}\n",
         slug = slug,
@@ -440,22 +443,44 @@ pub fn ensure_isolation_branch(project_root: &Path, slug: &str) -> BranchIsolati
         };
     }
     let target = feature_branch_name(slug);
-    // If that exact branch already exists (a prior run's branch), just switch to
-    // it — never recreate / force. `git switch` with no `-c` only succeeds on an
-    // existing branch and refuses if the switch would clobber local changes, so
-    // it is inherently safe.
+    // If that exact branch already exists (a prior run's branch) we only REUSE it
+    // when it still descends from (or equals) the current HEAD — otherwise a new
+    // run would base its work on the prior run's STALE history (the user has since
+    // advanced their branch, or the old isolation branch diverged). A safe reuse
+    // switches with no `-c` (which refuses to clobber local changes); a stale one
+    // gets a FRESH, uniquely-suffixed sibling derived from the real current HEAD.
     if git_branch_exists(project_root, &target) {
-        if run_git(project_root, &["switch", &target]).is_some()
-            || run_git(project_root, &["checkout", &target]).is_some()
-        {
-            return BranchIsolation::Isolated {
-                branch: target,
-                from: current,
-                created: false,
-            };
+        if branch_descends_from_head(project_root, &target) {
+            if run_git(project_root, &["switch", &target]).is_some()
+                || run_git(project_root, &["checkout", &target]).is_some()
+            {
+                return BranchIsolation::Isolated {
+                    branch: target,
+                    from: current,
+                    created: false,
+                };
+            }
+            // Couldn't switch (dirty tree / git refused) → fail-open, stay in place.
+            return BranchIsolation::Skipped("dirty-tree");
         }
-        // Couldn't switch (dirty tree / git refused) → fail-open, stay in place.
-        return BranchIsolation::Skipped("dirty-tree");
+        // Stale branch (diverged from HEAD). Only branch fresh from a CLEAN tree
+        // (same conservative guard as the create path below); a dirty tree → skip
+        // rather than risk carrying the user's uncommitted edits onto a new branch.
+        if git_has_changes(project_root) {
+            return BranchIsolation::Skipped("dirty-tree");
+        }
+        let fresh = unique_branch_name(project_root, &target);
+        let created = run_git(project_root, &["switch", "-c", &fresh]).is_some()
+            || run_git(project_root, &["checkout", "-b", &fresh]).is_some();
+        return if created {
+            BranchIsolation::Isolated {
+                branch: fresh,
+                from: current,
+                created: true,
+            }
+        } else {
+            BranchIsolation::Skipped("error")
+        };
     }
     // A dirty tree + a real branch switch risks the user's uncommitted edits.
     // Be conservative: do not isolate, run in place. (A clean tree carries
@@ -477,6 +502,41 @@ pub fn ensure_isolation_branch(project_root: &Path, slug: &str) -> BranchIsolati
     } else {
         BranchIsolation::Skipped("error")
     }
+}
+
+/// `true` when `branch` descends from (or exactly matches) the current HEAD —
+/// i.e. HEAD is an ancestor of `branch`, so reusing `branch` builds this run on
+/// the CURRENT history, not a prior run's stale snapshot. Uses
+/// `git merge-base --is-ancestor HEAD <branch>` (exit 0 = ancestor; `run_git`
+/// maps a non-zero exit to `None`). Fail-open: a probe error reads as "does NOT
+/// descend" so the caller branches fresh rather than risk reusing a stale branch
+/// (the safe direction).
+fn branch_descends_from_head(project_root: &Path, branch: &str) -> bool {
+    run_git(
+        project_root,
+        &["merge-base", "--is-ancestor", "HEAD", branch],
+    )
+    .is_some()
+}
+
+/// A fresh isolation-branch name that does NOT already exist, derived by suffixing
+/// `-2`, `-3`, … onto `base`. Used when the natural `umadev/<slug>` branch already
+/// exists but has DIVERGED from the current HEAD (a stale prior-run branch), so a
+/// new run gets its own branch off the real HEAD instead of reusing stale history.
+/// Bounded (never spins); the extremely unlikely all-taken case falls back to a
+/// wall-clock suffix.
+fn unique_branch_name(project_root: &Path, base: &str) -> String {
+    for n in 2..=99 {
+        let candidate = format!("{base}-{n}");
+        if !git_branch_exists(project_root, &candidate) {
+            return candidate;
+        }
+    }
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{base}-{suffix}")
 }
 
 /// `true` iff a local branch named `branch` already exists. Fail-open: a probe
@@ -706,6 +766,17 @@ mod tests {
         assert!(!steps.contains("--force"));
         assert!(!steps.contains("push -f"));
         assert!(steps.contains("--body-file output/demo-pr-body.md"));
+        // Consistent with the auto path (`pr --create` stages ONLY output/+release/,
+        // never the whole tree): the manual recipe must NOT recommend a blanket
+        // `git add -A`, which can sweep in .env / temp / build junk.
+        assert!(
+            !steps.contains("git add -A"),
+            "manual steps must not recommend a blanket `git add -A`"
+        );
+        assert!(
+            steps.contains("git add -- output release"),
+            "manual steps stage the run's evidence explicitly"
+        );
     }
 
     #[test]
@@ -879,6 +950,94 @@ mod tests {
             }
         );
         assert_eq!(git_current_branch(root), "umadev/x");
+    }
+
+    #[test]
+    fn isolation_does_not_reuse_a_stale_branch_that_diverged_from_head() {
+        // A same-name `umadev/<slug>` branch left by a PRIOR run that no longer
+        // descends from the current HEAD (the user advanced their branch since)
+        // must NOT be switched to — that would base new work on stale history.
+        // Instead a fresh, uniquely-suffixed sibling is derived from the real HEAD.
+        if !git_available() {
+            return;
+        }
+        let tmp = init_repo("main");
+        let root = tmp.path();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+        };
+        // First run makes umadev/app from the seed commit.
+        let first = ensure_isolation_branch(root, "app");
+        assert!(matches!(
+            first,
+            BranchIsolation::Isolated { created: true, .. }
+        ));
+        // Back to main and ADVANCE it with a new commit, so umadev/app no longer
+        // contains main's latest history → it is now STALE.
+        run(&["switch", "main"]);
+        fs::write(root.join("advance.txt"), "new main work").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "advance main"]);
+
+        // A new run with the same slug must create a FRESH unique branch off the
+        // advanced HEAD, never switch to the stale umadev/app.
+        let again = ensure_isolation_branch(root, "app");
+        match &again {
+            BranchIsolation::Isolated {
+                branch,
+                from,
+                created,
+            } => {
+                assert_ne!(branch, "umadev/app", "must not reuse the stale branch");
+                assert!(
+                    branch.starts_with("umadev/app-"),
+                    "a fresh uniquely-suffixed sibling is derived: {branch}"
+                );
+                assert!(created, "the fresh branch was created this call");
+                assert_eq!(from, "main");
+            }
+            BranchIsolation::Skipped(r) => panic!("expected a fresh isolation branch, got {r}"),
+        }
+        // The fresh branch descends from the advanced main (contains its new commit).
+        assert_eq!(git_current_branch(root), again.branch());
+        assert!(
+            branch_descends_from_head(root, "main"),
+            "the fresh branch was cut from the CURRENT HEAD, not stale history"
+        );
+    }
+
+    #[test]
+    fn isolation_reuses_a_branch_that_still_descends_from_head() {
+        // The safe-reuse path: a same-name branch that is at (or ahead of, but
+        // still contains) the current HEAD is reused as-is — no stale-history risk.
+        if !git_available() {
+            return;
+        }
+        let tmp = init_repo("main");
+        let root = tmp.path();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+        };
+        let _ = ensure_isolation_branch(root, "x");
+        run(&["switch", "main"]); // main and umadev/x are at the same commit here
+        let again = ensure_isolation_branch(root, "x");
+        assert_eq!(
+            again,
+            BranchIsolation::Isolated {
+                branch: "umadev/x".to_string(),
+                from: "main".to_string(),
+                created: false,
+            },
+            "an up-to-date same-name branch is reused, not duplicated"
+        );
     }
 
     #[test]

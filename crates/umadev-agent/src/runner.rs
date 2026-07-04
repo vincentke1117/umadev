@@ -569,11 +569,14 @@ pub fn strict_coverage_from_env() -> bool {
 ///    can undo the entire run later.
 ///
 /// Idempotent across the blocks of one run: a continue/resume block already on
-/// `umadev/<slug>` re-enters cleanly, and the baseline is taken only when none
-/// exists yet (a continue block must not reset the rollback target to mid-run
-/// state). Returns `Some((branch, from))` ONLY when this call freshly created an
-/// isolation branch (so the caller emits a single advisory note); every other
-/// outcome — re-entered, skipped, error — returns `None` and stays silent.
+/// `umadev/<slug>` re-enters cleanly, and the run baseline is FRESH per run but
+/// deduped within a run — [`crate::checkpoint::ensure_run_baseline`] takes a new
+/// baseline at each new run's start (so `rollback` reverts only the current run)
+/// yet re-uses it for a re-entry block at the same start (a continue block must
+/// not reset the rollback target to mid-run state). Returns `Some((branch, from))`
+/// ONLY when this call freshly created an isolation branch (so the caller emits a
+/// single advisory note); every other outcome — re-entered, skipped, error —
+/// returns `None` and stays silent.
 #[must_use]
 pub fn setup_run_isolation(project_root: &Path, slug: &str) -> Option<(String, String)> {
     let announce = match crate::pr::ensure_isolation_branch(project_root, slug) {
@@ -586,10 +589,12 @@ pub fn setup_run_isolation(project_root: &Path, slug: &str) -> Option<(String, S
         // / error): the run proceeds exactly as before, no note.
         _ => None,
     };
-    // Run baseline for `rollback`, only once per run. Best-effort, fail-open.
-    if crate::checkpoint::run_baseline(project_root).is_none() {
-        let _ = crate::checkpoint::create_run_baseline(project_root, slug);
-    }
+    // Run baseline for `rollback`: a FRESH baseline at each new run's start (so a
+    // rollback reverts only THIS run's changes, never a prior run's), deduped
+    // WITHIN a single run so a continue/re-entry block at the same start doesn't
+    // reset the rollback target to mid-run state. Best-effort, fail-open — see
+    // `checkpoint::ensure_run_baseline`.
+    let _ = crate::checkpoint::ensure_run_baseline(project_root, slug);
     announce
 }
 
@@ -693,7 +698,8 @@ impl<R: Runtime> AgentRunner<R> {
     ///
     /// Idempotent across the blocks of one run: a continue/resume block already
     /// sitting on `umadev/<slug>` re-enters cleanly and does NOT take a second
-    /// baseline (a fresh baseline is only taken when none exists yet). Every step
+    /// baseline (a FRESH baseline is taken at each new run's start, but re-used
+    /// for a re-entry block at that same start — see `ensure_run_baseline`). Every step
     /// is best-effort and emits at most a single advisory note; a failure NEVER
     /// blocks or errors the run — this is the most irreversible-leaning piece, so
     /// it leans hard toward "do nothing" over "risk the user's work".
