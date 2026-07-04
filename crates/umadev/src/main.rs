@@ -577,13 +577,17 @@ enum Command {
         long_about = "Install the UmaDev pre-write governance hook into a base CLI.\n\
                       \n\
                       Supported bases:\n  \
-                      claude-code   writes .claude/settings.json PreToolUse hook\n\
+                      claude-code   writes .claude/settings.json PreToolUse hook\n  \
+                      pre-commit    writes .git/hooks/pre-commit (runs `umadev ci --changed-only`)\n\
                       \n\
-                      The hook intercepts every Write/Edit tool call and refuses\n\
-                      emoji-as-icon / hardcoded-color / AI-slop code in real time\n\
-                      (UD-CODE-001/002/005). Codex lacks\n\
-                      a PreToolUse hook surface — they rely on the quality-gate\n\
-                      hard block instead."
+                      The hook checks every Write/Edit tool call, but HARD-BLOCKS only the\n\
+                      irreversible-if-written floor: hardcoded secrets/credentials in source\n\
+                      (UD-SEC-003) and sensitive-path writes to .git/.env/.ssh (UD-SEC-001,\n\
+                      bypass-immune). Craft/quality findings — emoji-as-icon (UD-CODE-001),\n\
+                      hardcoded colors and AI-slop (UD-CODE-002) — are FLAGGED, not blocked:\n\
+                      the post-write QC loop repairs them, so a single nit never stops the\n\
+                      base mid-write. Codex lacks a PreToolUse hook surface — use\n\
+                      `--base pre-commit` there instead."
     )]
     Install {
         /// Base to install into: `claude-code` (default) or `pre-commit`.
@@ -1046,7 +1050,7 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
                 println!();
                 println!("Every Write/Edit tool call is checked. Only the irreversible-if-written");
                 println!("floor is HARD-BLOCKED at write time:");
-                println!("  • hardcoded secrets / credentials in source  (UD-SEC-001)");
+                println!("  • hardcoded secrets / credentials in source  (UD-SEC-003)");
                 println!(
                     "  • sensitive-path writes (.git/.env/.ssh)     (UD-SEC-001) — bypass-immune"
                 );
@@ -1079,7 +1083,14 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
             }
         }
         "pre-commit" => {
-            let path = install_pre_commit_hook(&root)?;
+            // Resolve the git repo ROOT by walking UP for `.git`, so
+            // `umadev install --base pre-commit` works from any subdirectory of
+            // the repo — the hook must land in `<repo-root>/.git/hooks/`, never a
+            // phantom `<subdir>/.git`. Fall back to the resolved root if no
+            // ancestor is a git repo, so `install_pre_commit_hook` still reports
+            // the honest "not a git repository" error.
+            let repo_root = find_git_root_from(&root).unwrap_or_else(|| root.clone());
+            let path = install_pre_commit_hook(&repo_root)?;
             println!("[ok] Installed UmaDev pre-commit git hook.");
             println!("  → {}", path.display());
             println!();
@@ -4662,21 +4673,56 @@ fn cmd_report(slug: Option<String>, project_root: Option<PathBuf>, review: bool)
 /// Fail-open throughout: any failing precondition or external-command error
 /// prints the manual recipe and returns Ok — never a crash, never a force-push,
 /// never a rewrite of the user's existing commits.
-/// The allowlist of the run's OWN deliverable paths (workspace-relative) that
-/// `pr --create` stages — the docs UmaDev wrote under `output/` and any
-/// proof-pack under `release/`, each only when it exists on disk.
+/// The allowlist of the CURRENT run's OWN deliverable paths (workspace-relative)
+/// that `pr --create` stages — the docs UmaDev wrote under `output/` named
+/// `<slug>-*` and this run's delivery bundle `release/proof-pack-<slug>-*.zip`,
+/// each only when it exists on disk.
+///
+/// Scoped to THIS run's `slug`, never the whole `output/`/`release/` dirs: those
+/// accumulate artifacts across runs, so staging the entire dir would sweep a
+/// PRIOR run's (or a different feature's) leftovers into this PR. The sanitized
+/// slug is derived from the public [`pr_body_rel_path`] (`output/<slug>-pr-body.md`),
+/// so it matches the on-disk names for any slug without re-implementing a
+/// drift-prone sanitizer here.
 ///
 /// `pr --create` stages EXACTLY these, NEVER `git add -A`: sweeping the whole
 /// dirty tree would commit and PUSH unrelated WIP, a stray secret, or build junk
 /// into the published PR branch — and under `--yes` there is no prompt to catch
-/// it (UD-FLOW-008 reversibility floor). Returns the existing subset, so an empty
-/// result means there is nothing of the run's to commit.
-fn pr_artifact_paths(project_root: &Path) -> Vec<String> {
-    ["output", "release"]
-        .iter()
-        .filter(|rel| project_root.join(rel).exists())
-        .map(|rel| (*rel).to_string())
-        .collect()
+/// it (UD-FLOW-008 reversibility floor). Returns the existing subset (sorted,
+/// deterministic), so an empty result means there is nothing of this run's to
+/// commit.
+fn pr_artifact_paths(project_root: &Path, slug: &str) -> Vec<String> {
+    // Derive the sanitized slug the run actually used from the pr-body path:
+    // `pr_body_rel_path` renders `output/<sane>-pr-body.md`, so stripping the
+    // constant `-pr-body.md` suffix off its file name yields exactly `<sane>`.
+    let body_rel = umadev_agent::pr_body_rel_path(slug);
+    let Some(sane) = Path::new(&body_rel)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix("-pr-body.md"))
+    else {
+        // Fail-SAFE: if the slug can't be derived, stage nothing (the caller
+        // falls back to the manual recipe) rather than the whole tree.
+        return Vec::new();
+    };
+    // Output docs are `<slug>-*`; the release proof-pack is `proof-pack-<slug>-*`.
+    let doc_prefix = format!("{sane}-");
+    let pack_prefix = format!("proof-pack-{sane}-");
+    let mut out = Vec::new();
+    for dir in ["output", "release"] {
+        let Ok(entries) = std::fs::read_dir(project_root.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&doc_prefix) || name.starts_with(&pack_prefix) {
+                out.push(format!("{dir}/{name}"));
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 fn cmd_pr(
@@ -4693,14 +4739,23 @@ fn cmd_pr(
     let lang = umadev_i18n::current();
     println!("{}", umadev_i18n::t(lang, "pr.scanning"));
 
-    // 1. Always (re)run the pre-PR security scan so the review report folds in a
-    //    fresh verdict, then render + persist the PR body. Fail-open: a write
-    //    error is reported, not fatal.
+    // 1. Re-run the pre-PR security scan so the review report folds in a fresh
+    //    verdict. It persists to `.umadev/` (gitignored), so running it before
+    //    the readiness check cannot pollute the change judgment.
     let scan = umadev_agent::run_security_scan(&project_root);
     let _ = umadev_agent::write_security_scan(&project_root, &scan);
+
+    // 2. Assess readiness + the branch plan BEFORE writing the PR body. Writing
+    //    `output/<slug>-pr-body.md` first would let our own just-generated file
+    //    read as an existing change when `assess_readiness` runs `git status`,
+    //    so we render (pure read) and assess first, THEN persist the body — which
+    //    every downstream path (manual recipe, dry run, create) references on
+    //    disk. Fail-open: a body-write error is reported, not fatal.
     let body = umadev_agent::render_pr_body(&project_root, &slug);
     let body_rel = umadev_agent::pr_body_rel_path(&slug);
     let body_path = project_root.join(&body_rel);
+    let readiness = umadev_agent::assess_readiness(&project_root);
+    let plan = umadev_agent::plan_branches(&readiness, &slug);
     if let Some(parent) = body_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -4714,10 +4769,6 @@ fn cmd_pr(
             umadev_i18n::tf(lang, "pr.body_write_failed", &[&e.to_string()])
         ),
     }
-
-    // 2. Assess readiness + compute the branch plan (pure).
-    let readiness = umadev_agent::assess_readiness(&project_root);
-    let plan = umadev_agent::plan_branches(&readiness, &slug);
     println!("\n{}", umadev_i18n::t(lang, "pr.readiness"));
     for c in &readiness.checks {
         let mark = if c.ok { "[x]" } else { "[ ]" };
@@ -4762,7 +4813,7 @@ fn cmd_pr(
     // script/CI bypass; the push + PR-create are audited regardless.
     // The EXACT artifact set this PR will stage + commit (never the whole tree).
     // If nothing of the run's exists, there's nothing to publish → manual recipe.
-    let artifacts = pr_artifact_paths(&project_root);
+    let artifacts = pr_artifact_paths(&project_root, &slug);
     if artifacts.is_empty() {
         println!(
             "No run artifacts (output/ or release/) to stage — nothing to commit for a PR. \
@@ -5020,6 +5071,23 @@ fn find_workspace_root_from(start: &Path) -> PathBuf {
     start.to_path_buf()
 }
 
+/// Walk UP from `start` to the nearest ancestor that holds a `.git` entry,
+/// returning that repo root, or `None` if no ancestor is a git repo. Mirrors
+/// [`find_workspace_root_from`] but keyed strictly on `.git` — the pre-commit
+/// hook must install into the real repo root's `.git/hooks/`, so running
+/// `umadev install --base pre-commit` from a subdirectory resolves upward
+/// instead of reporting a phantom `<subdir>/.git`. Pure (takes the start dir
+/// explicitly) so it's testable without mutating the process-global cwd.
+fn find_git_root_from(start: &Path) -> Option<PathBuf> {
+    let mut dir = start;
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+}
+
 /// Resolve a command's project root: an explicit `--project-root` wins, else the
 /// process cwd, else `.`. Never panics — a deleted/unreadable cwd falls back to
 /// `.` (matching the other call sites) instead of the old `.expect("cwd")`,
@@ -5134,34 +5202,96 @@ mod tests {
     fn pr_artifact_paths_is_an_allowlist_never_the_whole_tree() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
-        // The run's deliverables...
+        // THIS run's deliverables (slug = "app")...
         std::fs::create_dir_all(root.join("output")).unwrap();
         std::fs::write(root.join("output/app-pr-body.md"), "# body").unwrap();
+        std::fs::write(root.join("output/app-prd.md"), "# prd").unwrap();
         std::fs::create_dir_all(root.join("release")).unwrap();
-        // ...alongside unrelated WIP / a stray secret / build junk in the tree.
+        std::fs::write(root.join("release/proof-pack-app-001.zip"), vec![0u8; 8]).unwrap();
+        // ...alongside a PRIOR run's leftovers under the same dirs (different slug),
+        // plus unrelated WIP / a stray secret / build junk in the tree.
+        std::fs::write(root.join("output/other-prd.md"), "# old").unwrap();
+        std::fs::write(root.join("release/proof-pack-other-999.zip"), vec![0u8; 8]).unwrap();
         std::fs::write(root.join(".env"), "SECRET=hunter2").unwrap();
         std::fs::write(root.join("scratch.tmp"), "junk").unwrap();
         std::fs::create_dir_all(root.join("node_modules")).unwrap();
 
-        let staged = pr_artifact_paths(root);
-        // ONLY the run's artifact dirs are staged — never `-A`, `.`, or the junk.
-        assert!(staged.contains(&"output".to_string()));
-        assert!(staged.contains(&"release".to_string()));
+        let staged = pr_artifact_paths(root, "app");
+        // ONLY this run's slug-scoped artifacts are staged.
+        assert!(staged.contains(&"output/app-pr-body.md".to_string()));
+        assert!(staged.contains(&"output/app-prd.md".to_string()));
+        assert!(staged.contains(&"release/proof-pack-app-001.zip".to_string()));
+        // NEVER the whole dir, a prior run's leftovers, `-A`/`.`, or the junk.
+        assert!(!staged.iter().any(|p| p == "output" || p == "release"));
         assert!(!staged.iter().any(|p| p == "-A" || p == "."));
+        assert!(!staged.iter().any(|p| p.contains("other")));
         assert!(!staged.iter().any(|p| p.contains(".env")));
         assert!(!staged.iter().any(|p| p.contains("scratch.tmp")));
         assert!(!staged.iter().any(|p| p.contains("node_modules")));
     }
 
     #[test]
-    fn pr_artifact_paths_lists_only_existing_dirs() {
+    fn pr_artifact_paths_lists_only_existing_slug_files() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         // No output/ or release/ → empty (nothing of the run's to commit).
-        assert!(pr_artifact_paths(root).is_empty());
-        // Only output/ present → exactly that.
+        assert!(pr_artifact_paths(root, "app").is_empty());
+        // Only output/ present but no slug-matching files → still empty.
         std::fs::create_dir_all(root.join("output")).unwrap();
-        assert_eq!(pr_artifact_paths(root), vec!["output".to_string()]);
+        assert!(pr_artifact_paths(root, "app").is_empty());
+        // A file for a DIFFERENT slug is not this run's → still empty.
+        std::fs::write(root.join("output/other-prd.md"), "x").unwrap();
+        assert!(pr_artifact_paths(root, "app").is_empty());
+        // This run's file → exactly that, and deterministically sorted.
+        std::fs::write(root.join("output/app-prd.md"), "x").unwrap();
+        assert_eq!(
+            pr_artifact_paths(root, "app"),
+            vec!["output/app-prd.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn pr_body_lives_under_the_change_ignored_output_dir() {
+        // Fix (a) invariant: the PR body we generate lands under `output/`, which
+        // the readiness has_changes judgment ignores — and we now assess readiness
+        // BEFORE writing it — so our own generated file can never make the tree
+        // read as the user's uncommitted work. It is, however, staged as one of
+        // THIS run's own slug-scoped artifacts once written.
+        let rel = umadev_agent::pr_body_rel_path("demo");
+        assert!(
+            rel.starts_with("output/"),
+            "pr-body must live under the change-ignored output/ dir: {rel}"
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(root.join(&rel), "# body").unwrap();
+        assert!(
+            pr_artifact_paths(root, "demo").contains(&rel),
+            "the written pr-body is one of this run's staged artifacts"
+        );
+    }
+
+    #[test]
+    fn pre_commit_install_resolves_git_root_from_a_subdir() {
+        // Fix (2): `umadev install --base pre-commit` from a subdirectory must
+        // resolve the real repo root by walking UP for `.git`, not report a
+        // phantom `<subdir>/.git`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let nested = root.join("crates/umadev/src");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        // From deep inside the repo, the git root is found by walking UP.
+        assert_eq!(find_git_root_from(&nested).as_deref(), Some(root));
+        // From the root itself, it returns the root.
+        assert_eq!(find_git_root_from(root).as_deref(), Some(root));
+        // And installing from the subdir lands the hook in <root>/.git/hooks.
+        let repo_root = find_git_root_from(&nested).unwrap();
+        let hook = install_pre_commit_hook(&repo_root).unwrap();
+        assert_eq!(hook, root.join(".git/hooks/pre-commit"));
+        assert!(hook.exists());
     }
 
     /// The JSON key the base reports a tool's target path under. Built at runtime

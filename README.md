@@ -59,7 +59,7 @@ npm install -g umadev
 
 The npm package is a distribution shim. The actual program is a Rust binary. Prebuilt binaries ship for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64), and Windows (x86_64).
 
-The install also pulls a small local embedding model (`multilingual-e5-small`, f16, ~224 MB) as an optional dependency and wires it up automatically — it powers the offline vector search with no API key and no runtime network, no manual download step. If your registry or network skips the optional download, umadev still works: retrieval falls back to BM25-only, and re-running `npm install -g umadev` restores the vector channel.
+The binary and the curated knowledge corpus install from npm and work fully offline. The optional local embedding model (`multilingual-e5-small`, f16, ~224 MB) is **not** bundled in the npm package — it is fetched on first run to `~/.umadev/embed-model` (a one-time download), then powers offline vector search locally with no API key and no runtime network. If that first-run download is unavailable (offline install, restricted network), umadev still works: retrieval falls back to BM25-only until the model is present, and it self-heals — a later run re-downloads it (a corrupt cache is re-fetched, not trusted).
 
 Build from source:
 

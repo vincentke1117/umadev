@@ -1104,25 +1104,32 @@ fn command_of(value: &Value) -> String {
         .to_string()
 }
 
-/// The target file path of a fileChange approval / item payload
-/// (`filePath`, else the first `changes[].path`).
+/// The target file path(s) of a fileChange approval / item payload. A single
+/// `filePath` (the common approval shape) is returned verbatim — unchanged. When
+/// only a `changes[]` array is present, EVERY affected `changes[].path` is
+/// surfaced (joined by `, `) so a multi-file change lets the approval / audit /
+/// display see every file, not just `changes[0]`. Fail-open: a malformed shape
+/// yields `""` (the caller still surfaces the request).
 fn file_change_path(params: &Value) -> String {
     if let Some(p) = params.get("filePath").and_then(Value::as_str) {
         return p.to_string();
     }
-    first_change_field(params, "path")
+    all_change_paths(params).join(", ")
 }
 
-/// Pull a field off the first entry of a `changes[]` array.
-fn first_change_field(value: &Value, field: &str) -> String {
+/// Every `changes[].path` string, in order (entries without a string path are
+/// skipped). Empty when there is no `changes[]` array — fail-open.
+fn all_change_paths(value: &Value) -> Vec<String> {
     value
         .get("changes")
         .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        .and_then(|c| c.get(field))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.get("path").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Translate a notification (no id) into zero or more [`SessionEvent`]s.
@@ -1398,27 +1405,57 @@ fn emit_updated_item(params: &Value, event_tx: &EventTx) {
     });
 }
 
-/// Translate a completed `fileChange` item → Write/Edit `ToolCall` + result.
+/// Translate a completed `fileChange` item → per-file Write/Edit `ToolCall` +
+/// result. A codex fileChange item can touch MULTIPLE files (`changes: [{path,
+/// kind, diff}]`; kind `add`/`create` = new file → Write, else Edit — codex
+/// `PatchChangeKind` serializes add/update/delete). Each entry is emitted as its
+/// OWN `ToolCall` so the orchestrator classifies + scans EVERY affected path
+/// against its own content — not just `changes[0]` while folding the rest's
+/// content under the first file's path (which would mis-gate the extension-scoped
+/// content rules and leave a sensitive path past the first invisible). A
+/// single-file item is unchanged: exactly one `ToolCall` + one `ToolResult`.
+/// Fail-open: an item with no readable `changes[]` degrades to a single event off
+/// the item itself (never a panic).
 fn emit_file_change(item: &Value, event_tx: &EventTx) {
-    // changes: [{path, kind, diff}]. kind `add` = new file → Write, else Edit.
-    // (codex `PatchChangeKind` serializes add/update/delete.)
-    let path = first_change_field(item, "path");
-    let kind = first_change_kind(item);
+    let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+    let ok = status != "failed" && status != "declined";
+    match item.get("changes").and_then(Value::as_array) {
+        Some(changes) if !changes.is_empty() => {
+            for change in changes {
+                emit_one_change(change, item, ok, event_tx);
+            }
+        }
+        // No usable `changes[]` — surface the item as a single write off its own
+        // top-level fields (the legacy path-only / top-level-diff shape).
+        _ => emit_one_change(item, item, ok, event_tx),
+    }
+}
+
+/// Emit ONE affected file of a `fileChange` item: its Write/Edit `ToolCall`
+/// (path + reconstructed content for content-governance) then its `ToolResult`.
+/// `item` is the enclosing item, consulted only as a fallback content source.
+fn emit_one_change(change: &Value, item: &Value, ok: bool, event_tx: &EventTx) {
+    let path = change
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // `add`/`create` = new file → Write; anything else (update/delete/absent) → Edit.
+    let kind = change.get("kind").and_then(Value::as_str).unwrap_or("");
     let name = if kind == "add" || kind == "create" {
         "Write"
     } else {
         "Edit"
     };
     // CONTENT for content-governance (emoji / hardcoded color / secret / AI-slop).
-    // codex's `fileChange` item does NOT carry the new file text in a `content`
-    // field — it carries a unified `diff`. The orchestrator's `evaluate_tool_call`
-    // scans `input.content` / `input.new_string`, which would be EMPTY for codex,
-    // so codex writes would dodge the content scan entirely (and codex has no
-    // PreToolUse hook to backstop it). We extract the ADDED lines from the diff
-    // and surface them as `content` so the same scanner sees the real written text.
-    // Best-effort: when no diff is present the field is simply absent (the scanner
-    // then degrades to path-only, exactly as before — fail-open, never a panic).
-    let added = first_change_added_content(item);
+    // codex's `fileChange` does NOT carry the new text in a `content` field — it
+    // carries a unified `diff`; the orchestrator scans `input.content`, which would
+    // be EMPTY for codex, so a codex write would dodge the content scan (and codex
+    // has no PreToolUse hook to backstop it). We reconstruct THIS file's added
+    // lines and surface them as `content` so the scanner sees the real written text.
+    // Best-effort: no diff/content → the field is absent (scanner degrades to
+    // path-only, exactly as before — fail-open, never a panic).
+    let added = change_added_content(change, item);
     let input = if added.is_empty() {
         json!({ "file_path": path })
     } else {
@@ -1428,69 +1465,43 @@ fn emit_file_change(item: &Value, event_tx: &EventTx) {
         name: name.to_string(),
         input,
     });
-    let status = item.get("status").and_then(Value::as_str).unwrap_or("");
     let _ = event_tx.try_send(SessionEvent::ToolResult {
-        ok: status != "failed" && status != "declined",
+        ok,
         summary: truncate(&path, 200),
     });
 }
 
-/// The `kind` of the first `changes[]` entry (defaults to `update`).
-fn first_change_kind(item: &Value) -> String {
-    let k = first_change_field(item, "kind");
-    if k.is_empty() {
-        "update".to_string()
-    } else {
-        k
+/// The added CONTENT of a SINGLE `changes[]` entry, recovered for content
+/// governance. Prefers the entry's own explicit `content`, else reconstructs the
+/// ADDED text from its own unified `diff` (the `+`-prefixed lines, minus the
+/// `+++` header) — exactly what the emoji / color / secret / AI-slop scanner needs
+/// to see for THIS file. Falls back to the item-level `content`/`diff` only when
+/// the entry itself carries neither (single-change shapes that put the body at the
+/// top level). Pure + fail-open: an absent/odd shape yields `String::new()` (the
+/// scanner then degrades to path-only), never a panic.
+fn change_added_content(change: &Value, item: &Value) -> String {
+    if let Some(c) = change.get("content").and_then(Value::as_str) {
+        if !c.is_empty() {
+            return c.to_string();
+        }
     }
-}
-
-/// The new file CONTENT a `fileChange` item wrote, recovered for content
-/// governance. codex's item does not expose a plain `content` field — it exposes
-/// either a `content` (some shapes do), a unified `diff` string, or `changes[]`
-/// entries each carrying their own `content`/`diff`. We prefer an explicit
-/// `content`, else reconstruct the ADDED text from the diff(s): the lines a
-/// unified diff prefixes with `+` (excluding the `+++` file header) ARE the new
-/// content, which is exactly what the emoji / color / secret / AI-slop scanner
-/// needs to see. Pure + fail-open: an absent/odd shape yields `String::new()`
-/// (the scanner then degrades to path-only), never a panic.
-fn first_change_added_content(item: &Value) -> String {
-    // An explicit top-level `content` (rare but cheapest) wins.
+    if let Some(diff) = change.get("diff").and_then(Value::as_str) {
+        let added = added_lines_of_diff(diff);
+        if !added.is_empty() {
+            return added;
+        }
+    }
+    // The entry carried nothing usable — fall back to the item-level body (a
+    // single-change item sometimes puts `content`/`diff` at the top level).
     if let Some(c) = item.get("content").and_then(Value::as_str) {
         if !c.is_empty() {
             return c.to_string();
         }
     }
-    // Otherwise reconstruct from every `changes[]` entry's content/diff. We fold
-    // ALL entries (a single item can touch multiple hunks) so nothing escapes.
-    let mut out = String::new();
-    if let Some(changes) = item.get("changes").and_then(Value::as_array) {
-        for ch in changes {
-            if let Some(c) = ch.get("content").and_then(Value::as_str) {
-                push_block(&mut out, c);
-            } else if let Some(diff) = ch.get("diff").and_then(Value::as_str) {
-                push_block(&mut out, &added_lines_of_diff(diff));
-            }
-        }
+    if let Some(diff) = item.get("diff").and_then(Value::as_str) {
+        return added_lines_of_diff(diff);
     }
-    // A top-level `diff` (some item shapes put it there) as a final fallback.
-    if out.is_empty() {
-        if let Some(diff) = item.get("diff").and_then(Value::as_str) {
-            out = added_lines_of_diff(diff);
-        }
-    }
-    out
-}
-
-/// Append `block` to `acc` separated by a newline (skips empties).
-fn push_block(acc: &mut String, block: &str) {
-    if block.is_empty() {
-        return;
-    }
-    if !acc.is_empty() {
-        acc.push('\n');
-    }
-    acc.push_str(block);
+    String::new()
 }
 
 /// Extract the ADDED lines from a unified diff: every line starting with a single
@@ -2335,6 +2346,70 @@ mod tests {
             input.get("content").is_none(),
             "no recoverable content → no content key: {input}"
         );
+    }
+
+    #[tokio::test]
+    async fn file_change_with_multiple_changes_surfaces_every_path() {
+        // P2: a codex fileChange item can touch MULTIPLE files. Each must surface
+        // as its OWN Write/Edit ToolCall so the orchestrator classifies + scans
+        // every path against its OWN content — not just `changes[0]` while the
+        // rest's content is folded under the first file's path. Previously files
+        // after the first never entered target classification / audit / display.
+        let (tx, mut rx) = chan();
+        emit_item(
+            &json!({
+                "type": "fileChange",
+                "status": "completed",
+                "changes": [
+                    { "path": "src/a.ts", "kind": "add",
+                      "diff": "+++ b/src/a.ts\n@@ -0,0 +1 @@\n+const A = 1;\n" },
+                    { "path": "config/prod.env", "kind": "update",
+                      "content": "SECRET_TOKEN=surface-me" },
+                ],
+            }),
+            false,
+            &tx,
+        );
+        // First file: src/a.ts as a Write, carrying its OWN reconstructed content.
+        let SessionEvent::ToolCall { name, input } = rx.recv().await.unwrap() else {
+            panic!("expected first ToolCall");
+        };
+        assert_eq!(name, "Write", "kind=add → Write");
+        assert_eq!(input["file_path"], "src/a.ts");
+        assert!(
+            input["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("const A = 1;"),
+            "first file's own content must reach the scanner: {input}"
+        );
+        // Drain the first file's ToolResult, then read the SECOND file's ToolCall:
+        // config/prod.env surfaces too (was invisible past changes[0]), as an Edit
+        // (kind=update), with its OWN content — the whole point of the fix.
+        let _ = rx.recv().await;
+        let SessionEvent::ToolCall { name, input } = rx.recv().await.unwrap() else {
+            panic!("expected second ToolCall");
+        };
+        assert_eq!(name, "Edit", "kind=update → Edit");
+        assert_eq!(input["file_path"], "config/prod.env");
+        assert!(
+            input["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SECRET_TOKEN"),
+            "second file's own content must reach the scanner: {input}"
+        );
+    }
+
+    #[test]
+    fn file_change_path_surfaces_all_paths_for_multi_file_approval() {
+        // A single-file `filePath` approval is byte-identical to before.
+        let single = v(r#"{"filePath":"/etc/hosts"}"#);
+        assert_eq!(file_change_path(&single), "/etc/hosts");
+        // A multi-file `changes[]` approval surfaces EVERY path, not just changes[0],
+        // so the approval / audit / display sees all affected files.
+        let multi = v(r#"{"changes":[{"path":"a.ts"},{"path":"b.ts"}]}"#);
+        assert_eq!(file_change_path(&multi), "a.ts, b.ts");
     }
 
     #[tokio::test]

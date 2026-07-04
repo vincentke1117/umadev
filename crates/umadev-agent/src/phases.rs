@@ -2715,7 +2715,12 @@ const SECRET_LEAK_SKIP_DIRS: &[&str] = &[
 ];
 
 /// Scan the delivered application source for hardcoded secrets (UD-SEC-003).
-/// Returns `(files_scanned, sorted relative paths of offending files)`. Skips
+/// Returns `(files_scanned, sorted relative paths of offending files)`. Covers
+/// both code source AND the #1 real-world leak locations — `.env`, config / IaC,
+/// and no-extension secret-bearing files (`Dockerfile`, `.env.local`) — so the
+/// quality gate's secret surface matches the write-time governance FLOOR
+/// (`is_config_secret_path` / `check_hardcoded_secret`): a secret in a `.env` or
+/// config file is HARD-blocked here, not merely a delivery-phase advisory. Skips
 /// dependency / build / state / docs dirs and hidden dirs. Fail-open: an
 /// unreadable file is simply not scanned.
 fn scan_secret_leaks(project_root: &Path) -> (usize, Vec<String>) {
@@ -2744,7 +2749,10 @@ fn scan_secret_leaks(project_root: &Path) -> (usize, Vec<String>) {
     (scanned, offenders)
 }
 
-/// Recursively collect source-code files under `dir`, skipping noise dirs.
+/// Recursively collect files the secret scan must read: source code AND the
+/// config / env / no-extension surface where secrets most often leak. Skips noise
+/// dirs. A `.env` FILE starts with a dot too, but the dot rule only skips DIRS,
+/// so `.env` is still collected below.
 fn collect_code_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     if depth > 8 {
         return;
@@ -2763,10 +2771,22 @@ fn collect_code_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
                 collect_code_files(&p, out, depth + 1);
             }
             EntryKind::File => {
-                if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                    if SECRET_LEAK_CODE_EXT.contains(&ext) {
-                        out.push(p);
-                    }
+                let code_ext = p
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|ext| SECRET_LEAK_CODE_EXT.contains(&ext));
+                // Broaden past code files to the #1 real-world leak locations —
+                // `.env`, config / IaC, and no-extension secret-bearing files
+                // (`Dockerfile`, `.env.local`) — using the SAME governance
+                // predicate the write-time floor uses, so the quality gate's
+                // secret surface matches the floor's. `check_hardcoded_secret`
+                // (via its `is_secret_scanned_path` gate) then scans these and a
+                // leak HARD-blocks the "No leaked secrets" gate — instead of the
+                // file being invisible because the collector only walked code.
+                // Fail-open: the predicate never errors; a non-match is skipped.
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if code_ext || umadev_governance::is_config_secret_path(name) {
+                    out.push(p);
                 }
             }
             EntryKind::Skip => {}
@@ -4390,6 +4410,42 @@ mod tests {
         let (scanned, offenders) = scan_secret_leaks(tmp.path());
         assert!(scanned >= 2, "should scan app source, got {scanned}");
         assert_eq!(offenders, vec!["web/src/db.ts".to_string()]);
+    }
+
+    #[test]
+    fn secret_leak_scan_covers_env_and_config_paths() {
+        // P2: the quality-gate secret scan must ALSO cover `.env` / config /
+        // no-extension paths, matching the write-time governance floor — a leaked
+        // key in a `.env` HARD-blocks the "No leaked secrets" gate, not merely a
+        // delivery-phase advisory. (The Stripe key value is split across a
+        // `concat!` boundary so this source file carries no whole live-looking key.)
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // A real key leaked in a `.env` file (no code extension).
+        fs::write(
+            root.join(".env"),
+            concat!(
+                "STRIPE_SECRET_KEY=sk_live_4eC39H",
+                "qLyjWDarjtT1zdp7dcABCDEFGH\n"
+            ),
+        )
+        .unwrap();
+        // A clean YAML config → collected + scanned, but NOT flagged.
+        fs::write(root.join("app.yaml"), "server:\n  port: 8080\n").unwrap();
+
+        let (scanned, offenders) = scan_secret_leaks(root);
+        assert!(
+            scanned >= 2,
+            "the .env + config must be collected and scanned, got {scanned}"
+        );
+        assert!(
+            offenders.iter().any(|o| o == ".env"),
+            "a leaked secret in a .env must HARD-block the gate: {offenders:?}"
+        );
+        assert!(
+            !offenders.iter().any(|o| o == "app.yaml"),
+            "a clean config must not be flagged: {offenders:?}"
+        );
     }
 
     #[test]
