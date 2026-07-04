@@ -2131,6 +2131,52 @@ pub struct App {
     /// turns a screen row into a content row. Published every frame.
     pub transcript_first_visible: std::cell::Cell<usize>,
 
+    /// **In-app text selection over the INPUT COMPOSER box** — a SEPARATE layer
+    /// from the transcript-scoped [`Self::selection`] so the two highlights never
+    /// collide (a down in either region clears the other). `Some` while a drag
+    /// inside the input box is live or just-copied. Coordinates are `(visual_row,
+    /// char_col)` into [`Self::input_rows`]; extraction resolves each endpoint to
+    /// an absolute char index in [`Self::input`] (via `ui::offset_at_wrapped`) and
+    /// slices, so a soft-wrapped line copies without spurious newlines and a hard
+    /// `Ctrl+J` newline is preserved. This is what makes drag-select+copy work
+    /// INSIDE the input box (Claude Code parity) without toggling `/mouse`.
+    pub input_selection: Option<crate::selection::Selection>,
+
+    /// `true` while a left-button drag-selection inside the INPUT box is in
+    /// progress — set on a mouse-down that landed inside the published input rect,
+    /// cleared on mouse-up (or when the input text changes under a keystroke, which
+    /// invalidates the cached row coordinates). Distinguishes an input-box drag
+    /// from a transcript drag in the event loop.
+    pub input_selection_dragging: bool,
+
+    /// The **input-box text rectangle** `(left, top, width, height)` published by
+    /// `ui::render_prompt` every frame — the wrapped text rows ONLY (the underline
+    /// border row is excluded), so a click on the border never maps onto text. The
+    /// event loop maps a mouse `(col, row)` against this to decide inside/outside
+    /// the input box. `(0,0,0,0)` until the first render.
+    pub input_area: std::cell::Cell<(u16, u16, u16, u16)>,
+
+    /// **Per-frame cache of the wrapped input rows** (the logical text, no leading
+    /// mode-prefix gutter) — one `String` per visual row, in render order, the
+    /// same `wrap_input_rows` fold the box paints. The input-box selection maps a
+    /// screen column onto these and the highlight repaints them. `RefCell` because
+    /// the renderer borrows `&App`.
+    pub input_rows: std::cell::RefCell<Vec<String>>,
+
+    /// The **uniform leading-gutter width** (display columns) stripped from every
+    /// cached input row — the `>_ ` / `[run] ` / `[gate] ` mode prefix. Row 0 and
+    /// the continuation-indent rows share the same width (see `mode_prefix_width`),
+    /// so one value covers all rows: the mouse mapping subtracts it and the
+    /// highlight adds it back. Published every frame.
+    pub input_gutter: std::cell::Cell<usize>,
+
+    /// The vertical **scroll offset** the input box applies once it grows past
+    /// `INPUT_MAX_ROWS` — the index of the first visible wrapped row. Combined with
+    /// [`Self::input_area`] this turns a screen row into an absolute input visual
+    /// row (the analogue of [`Self::transcript_first_visible`]). Published every
+    /// frame.
+    pub input_scroll: std::cell::Cell<usize>,
+
     /// **Conversation memory** — the multi-turn transcript handed to the base
     /// on every routed turn so chat is a real conversation, not a sequence of
     /// amnesiac one-shots. Holds ONLY genuine chat turns (user message + base
@@ -2760,6 +2806,12 @@ impl App {
             transcript_row_wraps: std::cell::RefCell::new(Vec::new()),
             transcript_area: std::cell::Cell::new((0, 0, 0, 0)),
             transcript_first_visible: std::cell::Cell::new(0),
+            input_selection: None,
+            input_selection_dragging: false,
+            input_area: std::cell::Cell::new((0, 0, 0, 0)),
+            input_rows: std::cell::RefCell::new(Vec::new()),
+            input_gutter: std::cell::Cell::new(0),
+            input_scroll: std::cell::Cell::new(0),
             conversation: Vec::new(),
             full_transcript: Vec::new(),
             compaction_breaker: umadev_agent::compaction::Breaker::new(),
@@ -2898,11 +2950,19 @@ impl App {
     }
 
     fn load_history(&mut self) {
-        if let Ok(body) = std::fs::read_to_string(self.history_path()) {
-            for line in body.lines().rev().take(50) {
-                if !line.is_empty() {
-                    self.input_history.push_front(line.to_string());
-                }
+        let Ok(body) = std::fs::read_to_string(self.history_path()) else {
+            return;
+        };
+        // Prefer the JSON-array form so a MULTI-LINE submitted entry (a wrapped
+        // requirement built with Ctrl+J) survives a restart as ONE entry. The old
+        // newline-joined format split such an entry into several one-line entries
+        // on load. Fail open to the legacy line-delimited form so an existing
+        // history file — or a hand-edited one — still loads (each line an entry).
+        let entries: Vec<String> = serde_json::from_str::<Vec<String>>(&body)
+            .unwrap_or_else(|_| body.lines().map(str::to_string).collect());
+        for entry in entries.into_iter().rev().take(50) {
+            if !entry.is_empty() {
+                self.input_history.push_front(entry);
             }
         }
     }
@@ -2912,8 +2972,14 @@ impl App {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let lines: Vec<&str> = self.input_history.iter().map(String::as_str).collect();
-        let _ = std::fs::write(path, lines.join("\n"));
+        // Serialize the ring as a JSON array so a multi-line entry round-trips as
+        // a single entry (the newline-join would otherwise re-split it on load).
+        // Fail-open: a serialize error skips the write rather than corrupting the
+        // file. The ring is already capped at `HISTORY_CAP_PROMPTS` on submit.
+        let entries: Vec<&String> = self.input_history.iter().collect();
+        if let Ok(json) = serde_json::to_string(&entries) {
+            let _ = std::fs::write(path, json);
+        }
     }
 
     /// Directory holding this project's persisted chats (Wave 5 / G11):
@@ -4028,6 +4094,10 @@ impl App {
     /// (`selection_dragging`) and records the position, so a wheel notch before
     /// the first drag move can already extend the selection past the viewport.
     pub fn selection_begin(&mut self, col: u16, row: u16) {
+        // A transcript down retires any INPUT-box selection so the two highlight
+        // layers never coexist (clear the other when one begins).
+        self.input_selection = None;
+        self.input_selection_dragging = false;
         if let Some(p) = self.map_mouse_point(col, row) {
             self.selection = Some(crate::selection::Selection::at(p));
             self.selection_dragging = true;
@@ -4113,6 +4183,130 @@ impl App {
             // newline-per-row extract when empty/short.
             crate::selection::extract_wrapped(&rows, &wraps, &sel)
         };
+        if text.is_empty() {
+            return None;
+        }
+        let count = text.chars().count();
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(self.lang, "tui.copied", &[&count.to_string()]),
+        );
+        Some(text)
+    }
+
+    // ---- in-app text selection INSIDE the input composer box -------------
+    //
+    // A SEPARATE layer from the transcript selection above so a drag over the
+    // text the user is composing selects + copies it too (Claude Code parity),
+    // without `/mouse`. The geometry (`input_area` / `input_rows` /
+    // `input_gutter` / `input_scroll`) is published every frame by
+    // `ui::render_prompt`. All three entry points are fail-open: a point outside
+    // the input rect, an empty selection, or stale/empty cached rows no-ops.
+
+    /// Map a screen point against the last frame's published input-box geometry,
+    /// reusing the transcript mapper with the input rect, `input_scroll` as the
+    /// first-visible row, and the uniform mode-prefix gutter. Returns a
+    /// `(visual_row, char_col)` point into [`Self::input_rows`], or `None` when the
+    /// point is outside the input box (or there is nothing cached yet).
+    fn map_input_point(&self, col: u16, row: u16) -> Option<crate::selection::Point> {
+        let rows = self.input_rows.borrow();
+        if rows.is_empty() {
+            return None;
+        }
+        // The gutter is uniform across rows (mode prefix on row 0, an equal-width
+        // indent on continuation rows), so one value fills the per-row slice.
+        let gutters = vec![self.input_gutter.get(); rows.len()];
+        crate::selection::screen_to_content(
+            col,
+            row,
+            self.input_area.get(),
+            self.input_scroll.get(),
+            &rows,
+            &gutters,
+        )
+    }
+
+    /// Resolve an input-selection `(visual_row, char_col)` point to an absolute
+    /// char index into [`Self::input`]. `offset_at_wrapped(row, 0)` gives the char
+    /// index of the row's first glyph; adding `col` (a char count within that row,
+    /// where no hard newline is consumed mid-row) lands on the exact char. Clamped
+    /// to the buffer length — fail-open.
+    fn input_char_index(&self, row: usize, col: usize) -> usize {
+        let w = self.input_text_cols.get();
+        let row16 = u16::try_from(row).unwrap_or(u16::MAX);
+        let row_start = crate::ui::offset_at_wrapped(&self.input, row16, 0, w);
+        row_start.saturating_add(col).min(self.input_len())
+    }
+
+    /// Extract the selected input text for `sel`. Both endpoints resolve to
+    /// absolute char indices in [`Self::input`] and the substring between them is
+    /// taken — so a soft-wrapped line copies as one unbroken line (the wrap points
+    /// aren't chars in the buffer) while a real `Ctrl+J` newline is kept. Char
+    /// indexing throughout is CJK-safe. Fail-open: a collapsed/empty range → `""`.
+    fn input_selection_text(&self, sel: &crate::selection::Selection) -> String {
+        let ((sr, sc), (er, ec)) = sel.normalized();
+        let start = self.input_char_index(sr, sc);
+        let end = self.input_char_index(er, ec);
+        if end <= start {
+            return String::new();
+        }
+        self.input.chars().skip(start).take(end - start).collect()
+    }
+
+    /// Mouse-down (left button) at screen `(col, row)`: if the point is inside the
+    /// published input box, begin a fresh input selection anchored there and return
+    /// `true`; otherwise leave the input layer untouched and return `false` (the
+    /// caller then routes to the transcript layer). Beginning an input selection
+    /// retires any TRANSCRIPT selection so the two highlights never coexist.
+    pub fn input_selection_begin(&mut self, col: u16, row: u16) -> bool {
+        let Some(p) = self.map_input_point(col, row) else {
+            return false;
+        };
+        // Clear the other layer (don't fight the transcript selection).
+        self.selection = None;
+        self.selection_dragging = false;
+        self.last_drag_mouse = None;
+        self.input_selection = Some(crate::selection::Selection::at(p));
+        self.input_selection_dragging = true;
+        true
+    }
+
+    /// Mouse-drag (left button held) at screen `(col, row)`: extend the live
+    /// input selection's cursor toward the point, CLAMPING it into the input rect
+    /// first so a drag off an edge pins to the nearest visible cell. No-op without
+    /// an active input drag.
+    pub fn input_selection_extend(&mut self, col: u16, row: u16) {
+        if !self.input_selection_dragging {
+            return;
+        }
+        let (left, top, width, height) = self.input_area.get();
+        if width == 0 || height == 0 {
+            return;
+        }
+        let cc = col.clamp(left, left.saturating_add(width).saturating_sub(1));
+        let cr = row.clamp(top, top.saturating_add(height).saturating_sub(1));
+        if let Some(p) = self.map_input_point(cc, cr) {
+            if let Some(sel) = self.input_selection.as_mut() {
+                sel.cursor = p;
+            }
+        }
+    }
+
+    /// Mouse-up (left button) — finish an input-box selection and copy it. Mirrors
+    /// [`Self::selection_finish_copy`]: extracts the dragged text, pushes the
+    /// "copied N chars" toast and returns `Some(text)` for the caller's clipboard
+    /// path (OSC 52 / native). The span stays highlighted so the user sees what was
+    /// copied; a later down elsewhere clears it. Returns `None` when nothing was
+    /// selected — fail-open.
+    #[must_use]
+    pub fn input_selection_finish_copy(&mut self) -> Option<String> {
+        // The button released: the drag is over (the span stays highlighted).
+        self.input_selection_dragging = false;
+        let sel = self.input_selection?;
+        if sel.is_empty() {
+            return None;
+        }
+        let text = self.input_selection_text(&sel);
         if text.is_empty() {
             return None;
         }
@@ -6982,7 +7176,25 @@ impl App {
         }
         match self.mode {
             AppMode::Picker => self.picker_key(key),
-            AppMode::Chat => self.chat_key(key, mods),
+            AppMode::Chat => {
+                // A mouse-made input-box selection (see `input_selection`) caches
+                // `(visual_row, char_col)` coordinates against the CURRENT wrapped
+                // text. A keystroke that EDITS the buffer reflows those rows, so the
+                // cached coordinates — and the highlight painted from them — go
+                // stale. Snapshot only when a selection is actually live (rare, so
+                // no per-keystroke clone cost otherwise) and retire it when the text
+                // changed; a pure caret move / scroll leaves the still-valid
+                // highlight in place.
+                let before = self.input_selection.is_some().then(|| self.input.clone());
+                let action = self.chat_key(key, mods);
+                if let Some(before) = before {
+                    if before != self.input {
+                        self.input_selection = None;
+                        self.input_selection_dragging = false;
+                    }
+                }
+                action
+            }
         }
     }
 
@@ -7491,13 +7703,13 @@ impl App {
                 {
                     return Action::None;
                 }
-                // Caret is on the first row — recall history if we have any to
-                // recall (an empty box, or we're already paging history). An
-                // un-recalled, non-empty single-line draft is left alone so a stray
-                // ↑ at the start of a fresh draft can't clobber it.
-                if self.input.is_empty() || self.input_history_idx.is_some() {
-                    self.input_history_back();
-                }
+                // Caret is on the first row — recall history (Claude Code parity).
+                // Even a NON-EMPTY partial draft recalls: `input_history_back`
+                // stashes the draft when recall begins (idx `None`) and ↓ past the
+                // newest entry restores it, so ↑ never destroys in-progress text —
+                // it parks it. (The old gate required an empty box, so ↑ on a
+                // first-row caret with leftover text did nothing — the CC mismatch.)
+                self.input_history_back();
                 Action::None
             }
             // ↓ mirrors ↑: move the caret DOWN a visual row first; only recall
@@ -20721,6 +20933,139 @@ mod tests {
         assert!(!a.native_copy_hint_shown, "and it does not latch");
     }
 
+    // ── in-app drag-select+copy INSIDE the input composer box ─────────────
+    //
+    // The renderer publishes the input geometry every frame; a test seeds it
+    // directly (the same seam `ui::render_prompt` writes) then drives the same
+    // begin/extend/finish methods the event loop calls. A uniform 3-cell mode
+    // prefix (`>_ `) is the gutter, so screen col N maps to logical col N-3.
+
+    /// Seed the published input-box geometry for `input` at `text_cols` text
+    /// columns, wrapped exactly as the renderer would. Prefix gutter = 3, pinned
+    /// to the top (no scroll).
+    fn seed_input_geometry(a: &App, input: &str, text_cols: u16) {
+        a.input_text_cols.set(text_cols);
+        let rows = crate::ui::wrap_input_rows(input, text_cols);
+        let visible = u16::try_from(rows.len().min(6)).unwrap_or(1);
+        *a.input_rows.borrow_mut() = rows;
+        a.input_gutter.set(3);
+        a.input_scroll.set(0);
+        // width = gutter + text columns; height = the visible (capped) row count.
+        a.input_area.set((0, 0, 3 + text_cols, visible));
+    }
+
+    #[test]
+    fn dragging_over_input_box_selects_and_copies_the_substring() {
+        let mut a = fresh_app(Some("offline"));
+        a.input = "hello world".to_string();
+        seed_input_geometry(&a, "hello world", 40);
+        // Down on the first content cell (screen col 3 = gutter) → logical col 0.
+        assert!(
+            a.input_selection_begin(3, 0),
+            "a down inside the input box begins an input selection"
+        );
+        assert!(a.input_selection_dragging);
+        assert_eq!(a.input_selection.unwrap().anchor, (0, 0));
+        // Drag to screen col 8 (gutter 3 + 5) → logical col 5, the end of "hello".
+        a.input_selection_extend(8, 0);
+        assert_eq!(a.input_selection.unwrap().cursor, (0, 5));
+        // Mouse-up copies the dragged substring.
+        let copied = a.input_selection_finish_copy();
+        assert_eq!(copied.as_deref(), Some("hello"));
+        assert!(!a.input_selection_dragging, "mouse-up ends the input drag");
+    }
+
+    #[test]
+    fn input_drag_preserves_a_hard_newline_but_not_a_soft_wrap() {
+        // A hard `Ctrl+J` newline is a real char in the buffer → copied. A
+        // soft-wrap boundary is NOT a char → the wrapped line copies unbroken.
+        let mut a = fresh_app(Some("offline"));
+        // Hard newline: "abc\ndef" wraps into two rows at a wide width.
+        a.input = "abc\ndef".to_string();
+        seed_input_geometry(&a, "abc\ndef", 40);
+        a.input_selection_begin(3, 0); // logical (0,0)
+        a.input_selection_extend(6, 1); // row 1, logical col 3 (end of "def")
+        assert_eq!(
+            a.input_selection_finish_copy().as_deref(),
+            Some("abc\ndef"),
+            "the hard newline survives the copy"
+        );
+        // Soft wrap: "abcdefgh" folded at 4 columns → ["abcd","efgh"], no newline.
+        let mut b = fresh_app(Some("offline"));
+        b.input = "abcdefgh".to_string();
+        seed_input_geometry(&b, "abcdefgh", 4);
+        b.input_selection_begin(3, 0); // logical (0,0)
+        b.input_selection_extend(6, 1); // row 1, logical col 3 → char index 7
+        assert_eq!(
+            b.input_selection_finish_copy().as_deref(),
+            Some("abcdefg"),
+            "a soft-wrapped span copies as one line — no spurious newline"
+        );
+    }
+
+    #[test]
+    fn input_selection_and_transcript_selection_do_not_coexist() {
+        let mut a = fresh_app(Some("offline"));
+        seed_transcript_geometry(&a);
+        a.input = "typed text".to_string();
+        seed_input_geometry(&a, "typed text", 40);
+        // Begin a transcript selection, then a down inside the input box: the
+        // transcript highlight is retired so the two layers never collide.
+        a.selection_begin(9, 3);
+        assert!(a.selection.is_some());
+        assert!(a.input_selection_begin(3, 0));
+        assert!(
+            a.selection.is_none(),
+            "the input down cleared the transcript span"
+        );
+        assert!(a.input_selection.is_some());
+        // And the reverse: a transcript down clears the input selection.
+        a.selection_begin(0, 0);
+        assert!(
+            a.input_selection.is_none(),
+            "the transcript down cleared the input span"
+        );
+    }
+
+    #[test]
+    fn a_down_outside_the_input_box_falls_through_to_the_transcript() {
+        let mut a = fresh_app(Some("offline"));
+        // Input box occupies rows 10..=10; the transcript occupies rows 0..4.
+        seed_transcript_geometry(&a); // area (0,0,10,4)
+        a.input = "x".to_string();
+        a.input_text_cols.set(40);
+        *a.input_rows.borrow_mut() = vec!["x".to_string()];
+        a.input_gutter.set(3);
+        a.input_scroll.set(0);
+        a.input_area.set((0, 10, 43, 1)); // far below the transcript
+                                          // A down at a transcript cell is NOT inside the input box.
+        assert!(
+            !a.input_selection_begin(2, 1),
+            "point is outside the input box"
+        );
+    }
+
+    #[test]
+    fn typing_after_an_input_selection_clears_the_stale_highlight() {
+        let mut a = fresh_app(Some("offline"));
+        a.input = "hello world".to_string();
+        a.input_cursor = a.input_len();
+        seed_input_geometry(&a, "hello world", 40);
+        a.input_selection_begin(3, 0);
+        a.input_selection_extend(8, 0);
+        let _ = a.input_selection_finish_copy();
+        assert!(
+            a.input_selection.is_some(),
+            "the copied span stays highlighted"
+        );
+        // A keystroke that EDITS the buffer retires the now-stale highlight…
+        let _ = a.apply_key(KeyCode::Char('!'));
+        assert!(
+            a.input_selection.is_none(),
+            "an edit invalidates the cached selection coords"
+        );
+    }
+
     // ── Ctrl+click → open URL / file under the cursor ─────────────────────
 
     /// Seed a wide viewport whose row 0 holds a URL mid-sentence, pinned to
@@ -23846,6 +24191,78 @@ mod tests {
             "cursor lands at the draft end"
         );
         assert!(a.input_history_idx.is_none(), "recall is over");
+    }
+
+    #[test]
+    fn up_on_first_row_with_a_nonempty_draft_recalls_and_down_restores_it() {
+        // Claude Code parity: ↑ on a first-visual-row caret recalls history EVEN
+        // when the box holds a non-empty partial draft (the old gate required an
+        // empty box, so ↑ did nothing). The draft is stashed and ↓ restores it.
+        let mut a = fresh_app(Some("offline"));
+        a.remember_submission("earlier prompt");
+        // A non-empty, un-recalled single-line draft; the caret is on the first
+        // (only) visual row, so `caret_move_up_wrapped` returns false and the key
+        // handler falls through to history recall.
+        a.input = "partial draft".to_string();
+        a.input_cursor = a.input_len();
+        a.input_text_cols.set(40);
+        let act = a.apply_key(KeyCode::Up);
+        assert_eq!(act, Action::None);
+        assert_eq!(
+            a.input, "earlier prompt",
+            "↑ recalls history even over a non-empty draft"
+        );
+        assert!(a.input_history_idx.is_some(), "now paging history");
+        // ↓ steps forward past the newest entry → the stashed partial returns.
+        let _ = a.apply_key(KeyCode::Down);
+        assert_eq!(
+            a.input, "partial draft",
+            "↓ restores the stashed partial draft"
+        );
+        assert!(a.input_history_idx.is_none(), "recall is over");
+    }
+
+    #[test]
+    fn multiline_submitted_entry_round_trips_through_persist_load_as_one_entry() {
+        // A multi-line requirement (built with Ctrl+J) must survive a restart as a
+        // SINGLE history entry. The old newline-joined format re-split it into one
+        // entry per physical line; the JSON format keeps it whole.
+        let mut a = fresh_app(Some("offline"));
+        let entry = "build a login page\n- email + password\n- remember me";
+        a.remember_submission(entry); // writes the ring to disk (JSON)
+                                      // Simulate a fresh launch: drop the in-memory ring and reload from disk.
+        a.input_history.clear();
+        a.load_history();
+        assert_eq!(
+            a.input_history.len(),
+            1,
+            "the multi-line entry loads as ONE entry, not three lines"
+        );
+        assert_eq!(
+            a.input_history.back().map(String::as_str),
+            Some(entry),
+            "the multi-line body round-trips verbatim"
+        );
+    }
+
+    #[test]
+    fn legacy_newline_history_file_still_loads_fail_open() {
+        // An existing pre-JSON history file (newline-delimited) must still load —
+        // each physical line an entry — rather than being dropped.
+        let mut a = fresh_app(Some("offline"));
+        let path = a.history_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&path, "alpha\nbeta\ngamma").unwrap();
+        a.load_history();
+        assert_eq!(
+            a.input_history.len(),
+            3,
+            "three legacy lines → three entries"
+        );
+        assert_eq!(a.input_history.back().map(String::as_str), Some("gamma"));
+        assert_eq!(a.input_history.front().map(String::as_str), Some("alpha"));
     }
 
     #[test]

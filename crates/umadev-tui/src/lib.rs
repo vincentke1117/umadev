@@ -5786,10 +5786,19 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     {
                                         app.link_click_open(col, row);
                                     }
-                                    // Left-down: begin a selection at this point (or
-                                    // clear it if the click is outside the transcript).
+                                    // Left-down: begin a selection at this point.
+                                    // Try the INPUT composer box first (drag-copy
+                                    // inside the box, CC parity); only when the down
+                                    // lands outside it does the transcript layer take
+                                    // over (which also clears any input selection, so
+                                    // the two highlights never coexist). A down in
+                                    // neither region clears both.
                                     MouseEventKind::Down(MouseButton::Left) => {
-                                        app.selection_begin(col, row);
+                                        let in_input_box =
+                                            app.input_selection_begin(col, row);
+                                        if !in_input_box {
+                                            app.selection_begin(col, row);
+                                        }
                                     }
                                     // Left-drag: extend the live selection's cursor.
                                     // (A drag inside a Ctrl+click gesture is ignored —
@@ -5798,13 +5807,21 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     MouseEventKind::Drag(MouseButton::Left)
                                         if !app.link_click_pending =>
                                     {
-                                        app.selection_extend(col, row);
-                                        // A drag that began OUTSIDE the transcript
-                                        // (the input box / padding) never opened a
-                                        // selection, so nothing highlights or copies
-                                        // — that reads as "copy is broken". Surface
-                                        // the native-selection / `/mouse` hint once.
-                                        app.hint_native_copy_once();
+                                        if app.input_selection_dragging {
+                                            // A drag that began inside the input box
+                                            // extends the composer selection (no copy
+                                            // hint — the in-app layer covers it now).
+                                            app.input_selection_extend(col, row);
+                                        } else {
+                                            app.selection_extend(col, row);
+                                            // A drag that began OUTSIDE both the
+                                            // transcript AND the input box (padding /
+                                            // meta row) opened no selection, so nothing
+                                            // highlights or copies — that reads as
+                                            // "copy is broken". Surface the
+                                            // native-selection / `/mouse` hint once.
+                                            app.hint_native_copy_once();
+                                        }
                                     }
                                     // Left-up closing a Ctrl+click gesture: just disarm.
                                     // Without this the release would re-copy whatever
@@ -5820,7 +5837,16 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     // copied; a later Down elsewhere clears it. Fail-open:
                                     // a write error is ignored, never blocking the loop.
                                     MouseEventKind::Up(MouseButton::Left) => {
-                                        if let Some(text) = app.selection_finish_copy() {
+                                        // Pick the finisher by which drag was live: an
+                                        // input-box selection copies through the exact
+                                        // same clipboard path (OSC 52 / native) as the
+                                        // transcript one.
+                                        let copied = if app.input_selection_dragging {
+                                            app.input_selection_finish_copy()
+                                        } else {
+                                            app.selection_finish_copy()
+                                        };
+                                        if let Some(text) = copied {
                                             if clipboard_is_remote() {
                                                 // SSH: a native command would target the
                                                 // FAR host, so OSC 52 is the only path the

@@ -4756,7 +4756,7 @@ fn truncate_to_width(s: &str, max: usize) -> String {
 /// like a terminal), honoring explicit `\n`. Always returns at least one row.
 /// This is what lets the input box GROW with content and put the underline
 /// right under the last line.
-fn wrap_input_rows(text: &str, width: u16) -> Vec<String> {
+pub(crate) fn wrap_input_rows(text: &str, width: u16) -> Vec<String> {
     let w = (width.max(1)) as usize;
     let mut rows: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -5531,6 +5531,28 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         theme::PRIMARY()
     };
 
+    // ── In-app input-box selection layer (drag-to-copy INSIDE the composer) ──
+    // Publish this frame's input geometry so the event loop can map a mouse
+    // `(col, row)` onto the composed text, exactly as the transcript layer does.
+    // `input_rows` is the logical wrapped text (no mode-prefix gutter), the
+    // published rect is the TEXT rows only (the underline border is excluded so a
+    // click on it never maps onto text), the gutter is the uniform mode prefix,
+    // and `input_scroll` is the first visible wrapped row past the 6-row cap.
+    {
+        let mut rows = app.input_rows.borrow_mut();
+        rows.clear();
+        rows.reserve(all_rows.len());
+        rows.extend(all_rows.iter().cloned());
+    }
+    app.input_gutter.set(prefix_w);
+    app.input_scroll.set(usize::from(scroll));
+    app.input_area.set((
+        prompt_chunks[0].x,
+        prompt_chunks[0].y,
+        prompt_chunks[0].width,
+        visible_rows,
+    ));
+
     // Placeholder (Claude Code style: dim hint when empty). Localized. `Cow` so
     // the state hints stay borrowed from the static catalog while the I9
     // first-run example tip (an owned, file-substituted String) can slot in.
@@ -5564,7 +5586,7 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
 
     // Build the wrapped input: row 0 carries the `>_ ` mode prefix; wrapped
     // continuation rows are indented 3 cols so they align under the text.
-    let lines: Vec<Line> = if app.input.is_empty() {
+    let mut lines: Vec<Line<'static>> = if app.input.is_empty() {
         // Empty input: the terminal cursor sits at column `prefix_w` (where the first
         // typed char will land). The placeholder used to start at that SAME column, so
         // the cursor block overlapped its first character. Shift the placeholder one
@@ -5595,6 +5617,30 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
             })
             .collect()
     };
+
+    // Paint the in-app input-box selection over the just-built rows (only when
+    // there IS composed text — an empty box shows a placeholder, nothing to
+    // select). The selection columns are LOGICAL (gutter-stripped), so each is
+    // shifted right by the uniform mode-prefix width to index the decorated line —
+    // the same shift the transcript highlight applies. Rows are indexed by
+    // ABSOLUTE visual row (the `.scroll` below handles the viewport offset), which
+    // is exactly the coordinate space the selection stores. The real terminal
+    // caret is set AFTER this, so the highlight and the caret coexist in the box.
+    // Fail-open: an out-of-range row is skipped, never a panic.
+    if !app.input.is_empty() {
+        if let Some(sel) = app.input_selection {
+            if !sel.is_empty() {
+                let ((sr, sc), (er, ec)) = sel.normalized();
+                apply_selection_highlight_cols(
+                    &mut lines,
+                    sr,
+                    sc.saturating_add(prefix_w),
+                    er,
+                    ec.saturating_add(prefix_w),
+                );
+            }
+        }
+    }
 
     // Bottom-only border = the underline. With the input area sized to the
     // content (visible_rows + 1), the border sits directly under the last line.
