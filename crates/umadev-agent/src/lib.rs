@@ -102,7 +102,7 @@ pub use ask_question::{
     prefers_text_questions as prefers_text_questions_flag,
     relay_directive as ask_question_relay_directive,
     relay_or_passthrough as ask_question_relay_or_passthrough, set_prefer_text_questions,
-    surface as ask_question_surface, AskQuestionSurface, ExitPlanSurface,
+    should_wait_for_question, surface as ask_question_surface, AskQuestionSurface, ExitPlanSurface,
 };
 pub use checkpoint::{
     create_run_baseline, rollback_run, run_baseline, Checkpoint, RUN_BASELINE_PREFIX,
@@ -215,10 +215,10 @@ pub use test_integrity::{
     check as check_test_integrity, snapshot as snapshot_test_surface, TestSnapshot,
 };
 pub use trust::{
-    capability_class, capability_requires_confirmation, remember_project_approval,
-    requires_confirmation, requires_confirmation_with_ledger, reversibility_class, Capability,
-    CapabilityPolicy, CircuitBreaker, ConsecutiveFailureBreaker, GateTrust, Reversibility,
-    TrustLedger, TrustMode, TrustSuggestion, CIRCUIT_THRESHOLD, CIRCUIT_WINDOW_SECS,
-    CONSECUTIVE_FAILURE_THRESHOLD,
+    capability_class, capability_requires_confirmation, guarded_should_pause_item,
+    remember_project_approval, requires_confirmation, requires_confirmation_with_ledger,
+    reversibility_class, Capability, CapabilityPolicy, CircuitBreaker, ConsecutiveFailureBreaker,
+    GateTrust, Reversibility, TrustLedger, TrustMode, TrustSuggestion, CIRCUIT_THRESHOLD,
+    CIRCUIT_WINDOW_SECS, CONSECUTIVE_FAILURE_THRESHOLD,
 };
 pub use verify::{detect_project, run_verify, ProjectKind, VerifyOutcome};

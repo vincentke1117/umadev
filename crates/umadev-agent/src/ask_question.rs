@@ -197,6 +197,21 @@ pub fn relay_or_passthrough(pending: Option<&AskUserQuestion>, reply: &str) -> S
     }
 }
 
+/// INTERACTIVE-ONLY decision (Fix ⑤): when the base calls its OWN `AskUserQuestion`
+/// (or `ExitPlanMode`), should the turn STOP draining, PARK the live session, and
+/// WAIT for the user's reply — rather than the HEADLESS behaviour of merely observing
+/// the call, stashing the question, and letting the turn auto-continue?
+///
+/// Returns `true` only when a live user is present on an interactive surface
+/// (`interactive && has_user`). A HEADLESS / `/run` / autonomous / non-TTY turn ALWAYS
+/// returns `false` and MUST keep today's observe-stash-and-continue behaviour — a run
+/// with no user to answer must never block. Pure + deterministic so the "headless
+/// never blocks" contract is a structural property of the caller, not a runtime guess.
+#[must_use]
+pub fn should_wait_for_question(interactive: bool, has_user: bool) -> bool {
+    interactive && has_user
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +345,22 @@ mod tests {
         // user's words (free-text is honored, never dropped).
         let free = relay_or_passthrough(Some(&q), "use whatever is simplest");
         assert!(free.contains("use whatever is simplest"), "free: {free}");
+    }
+
+    #[test]
+    fn should_wait_for_question_only_with_a_live_interactive_user() {
+        // The pause is INTERACTIVE-ONLY: only a live user on an interactive surface
+        // parks + waits. Every other combination (headless / non-TTY / no user) keeps
+        // today's observe-stash-and-continue behaviour so a userless run never blocks.
+        assert!(should_wait_for_question(true, true));
+        assert!(
+            !should_wait_for_question(false, true),
+            "a non-interactive (headless / /run) turn must never wait"
+        );
+        assert!(
+            !should_wait_for_question(true, false),
+            "no user present ⇒ never wait"
+        );
+        assert!(!should_wait_for_question(false, false));
     }
 }

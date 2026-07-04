@@ -704,6 +704,45 @@ pub fn remember_project_approval(project_root: &Path, command: &str, target_path
     }
 }
 
+/// INTERACTIVE-ONLY decision (Fix ③): should a **Guarded** turn PAUSE and ask the
+/// live user to approve THIS specific base action, instead of silently
+/// auto-deciding it on the per-tool floor?
+///
+/// This is the finer, per-item review the guarded tier gains **only when a real
+/// user is present to answer**. It returns `true` iff ALL hold:
+///
+/// - `interactive && has_user` — a live user is present on an interactive surface.
+///   A HEADLESS / `/run` / autonomous / non-TTY turn ALWAYS returns `false` and
+///   keeps today's auto-decide-and-continue behaviour, so this can only ever ADD a
+///   pause where a human can actually answer — it can never wedge a headless run.
+/// - `mode == Guarded` — `Auto` auto-approves and `Plan` is read-only; both are
+///   unchanged (they never route through this pause).
+/// - `capability != Read` — the action is genuinely CONSEQUENTIAL (a write / shell
+///   / network), not a trivial read. Reads never pause.
+/// - `!already_remembered` — the user has NOT already approved this action class for
+///   this project (the trust ledger), so an approved kind is remembered and never
+///   re-asked (no nagging).
+///
+/// Pure + deterministic; the async pause MECHANISM (surface the item, block on the
+/// user's y/n, respond to the base) lives in the interactive TUI. Fail-safe: every
+/// non-guarded / non-interactive / read / already-remembered case returns `false`
+/// (auto-continue), so the "headless never blocks" contract is structural, not a
+/// runtime check that could rot.
+#[must_use]
+pub fn guarded_should_pause_item(
+    mode: TrustMode,
+    interactive: bool,
+    has_user: bool,
+    capability: Capability,
+    already_remembered: bool,
+) -> bool {
+    interactive
+        && has_user
+        && matches!(mode, TrustMode::Guarded)
+        && !matches!(capability, Capability::Read)
+        && !already_remembered
+}
+
 // ---------------------------------------------------------------------------
 // Graduated, per-capability trust (Wave 6 deliverable 1)
 // ---------------------------------------------------------------------------
@@ -1242,6 +1281,19 @@ impl TrustLedger {
     #[must_use]
     pub fn remembers(&self, command: &str, target_path: &str) -> bool {
         remembered_class(command, target_path).is_some_and(|k| self.allow_rules.contains(k))
+    }
+
+    /// Root-aware [`Self::remembers`]: classifies a write as in/out-of-tree using the
+    /// REAL `project_root` (MEDIUM M4), so a remembered IN-tree approval can never
+    /// silently cover an OUT-of-tree write. Always `false` for an irreversible-floor
+    /// action (its class is `None`), so the floor can never be skipped via a remembered
+    /// rule. This is the check the interactive guarded pause consults so the "an
+    /// approved kind is not re-asked" suppression keys the same way approvals are
+    /// recorded ([`remember_project_approval`]).
+    #[must_use]
+    pub fn remembers_rooted(&self, command: &str, target_path: &str, project_root: &Path) -> bool {
+        remembered_class_rooted(command, target_path, Some(project_root))
+            .is_some_and(|k| self.allow_rules.contains(k))
     }
 
     /// Record that `gate_id` was approved (auto or manual) without a revision.
@@ -2296,5 +2348,81 @@ mod tests {
         b.reset();
         assert!(!b.is_open());
         assert!(b.diagnosis().is_none());
+    }
+
+    #[test]
+    fn guarded_pause_is_interactive_guarded_and_consequential_only() {
+        use Capability::{Read, Shell, Write};
+        // The happy path: Guarded + interactive + a live user + a consequential action
+        // the ledger hasn't remembered → PAUSE and ask.
+        assert!(guarded_should_pause_item(
+            TrustMode::Guarded,
+            true,
+            true,
+            Write,
+            false
+        ));
+        assert!(guarded_should_pause_item(
+            TrustMode::Guarded,
+            true,
+            true,
+            Shell,
+            false
+        ));
+        // HEADLESS never blocks — the core safety contract. Either flag off ⇒ no pause,
+        // regardless of mode / capability. A run with no user auto-continues as today.
+        assert!(
+            !guarded_should_pause_item(TrustMode::Guarded, false, true, Write, false),
+            "a non-interactive (headless) turn must NEVER pause"
+        );
+        assert!(
+            !guarded_should_pause_item(TrustMode::Guarded, true, false, Shell, false),
+            "no live user present ⇒ never pause"
+        );
+        // Auto / Plan are unchanged — they never route through the guarded pause.
+        assert!(!guarded_should_pause_item(
+            TrustMode::Auto,
+            true,
+            true,
+            Write,
+            false
+        ));
+        assert!(!guarded_should_pause_item(
+            TrustMode::Plan,
+            true,
+            true,
+            Shell,
+            false
+        ));
+        // A trivial read never pauses even in guarded interactive.
+        assert!(!guarded_should_pause_item(
+            TrustMode::Guarded,
+            true,
+            true,
+            Read,
+            false
+        ));
+        // The ledger suppresses a re-ask (no nagging): an already-remembered class
+        // auto-continues.
+        assert!(
+            !guarded_should_pause_item(TrustMode::Guarded, true, true, Write, true),
+            "an already-approved class must not be re-asked"
+        );
+    }
+
+    #[test]
+    fn remembers_rooted_keys_writes_in_vs_out_of_tree() {
+        let root = real_root();
+        let mut ledger = TrustLedger::default();
+        // Approve an IN-tree write for this project.
+        assert!(remembered_class_rooted("", "src/app.rs", Some(root)).is_some());
+        ledger.allow_rules.insert("write_in_tree".to_string());
+        // The remembered in-tree rule covers an in-tree write…
+        assert!(ledger.remembers_rooted("", "src/app.rs", root));
+        // …but NOT an out-of-tree write (a distinct class), so the floor-adjacent
+        // escape still re-asks.
+        assert!(!ledger.remembers_rooted("", out_of_tree_abs(), root));
+        // An irreversible-floor action is never remembered (its class is None).
+        assert!(!ledger.remembers_rooted("git push origin main", "", root));
     }
 }

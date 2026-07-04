@@ -767,6 +767,142 @@ type ChatSessionHolder = Arc<tokio::sync::Mutex<Option<ResidentChat>>>;
 /// holder means the line is sent verbatim.
 type PendingAskHolder = Arc<tokio::sync::Mutex<Option<umadev_runtime::AskUserQuestion>>>;
 
+/// The user's verdict on a paused Guarded consequential-action approval (Fix ③).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ApprovalReply {
+    /// Let the action run (and remember its class so it is not re-asked).
+    Allow,
+    /// Skip the action. The default on ANY fail-open path (Esc / cancel / the wait
+    /// budget elapsed / a dropped channel) so the base is never left hanging.
+    Deny,
+}
+
+/// A resident chat turn PAUSED on a Guarded consequential-action approval (Fix ③),
+/// waiting for the live user's `y` / `n` / Esc keypress. The drain task registers one
+/// (its `reply_tx`), the event loop routes the user's decision into it, and the drain
+/// then `respond`s to the base's `req_id`.
+///
+/// **Interactive-only, by construction:** a [`PendingApproval`] is registered ONLY on
+/// the interactive resident-chat drain when [`umadev_agent::guarded_should_pause_item`]
+/// says so — a HEADLESS / `/run` / non-TTY turn never creates one and never blocks.
+struct PendingApproval {
+    /// One-shot channel the event loop sends the user's [`ApprovalReply`] through.
+    /// Dropping it (cancel / quit / a cleared holder) makes the drain's `await`
+    /// fail-open to [`ApprovalReply::Deny`] — the "no hang" guarantee.
+    reply_tx: tokio::sync::oneshot::Sender<ApprovalReply>,
+}
+
+/// Shared slot for the single in-flight [`PendingApproval`]. A plain `std::sync::Mutex`
+/// (not tokio) because it is locked only for the nanoseconds it takes to store / take /
+/// send — never held across an `.await` — so the sync event-loop key handler can poke it
+/// without an async lock. `None` = no approval pending (the common case).
+type ApprovalHolder = Arc<std::sync::Mutex<Option<PendingApproval>>>;
+
+/// Upper bound on how long an interactive guarded approval blocks the drain waiting
+/// for the user, after which it fail-open DENIES (safe: the base just doesn't run that
+/// action) and surfaces a note. Generous — a present user answers in seconds — but
+/// bounded so a walked-away user can never hold the resident session open forever.
+const APPROVAL_WAIT_BUDGET: Duration = Duration::from_secs(300);
+
+/// Whether a live user is present at an interactive terminal — the `has_user` /
+/// `interactive` signal threaded into the pause decisions. The TUI event loop only
+/// runs under a real TTY (raw mode is on), so this is `true` in normal use and `false`
+/// for a piped / non-TTY invocation — in which case the pauses stay OFF and the turn
+/// keeps today's headless auto-decide behaviour (fail-open toward never-blocking).
+fn interactive_user_present() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// Event-loop hook (runs on the UI thread, before the normal key→`Action` pipeline):
+/// if the resident chat drain is BLOCKED on a guarded approval, consume this keypress
+/// as the decision so it can never leak into the input line or spawn a second turn on
+/// the one session. Returns `true` when the key was consumed (the caller then skips the
+/// normal action dispatch for it).
+///
+/// - No approval pending → returns `false` immediately (the key flows normally).
+/// - A **modified** key (Ctrl-C cancel, Ctrl-O, …) is NEVER intercepted, so hard-cancel
+///   still works mid-pause.
+/// - `y`/`Y` → [`ApprovalReply::Allow`]; `n`/`N`/Esc → [`ApprovalReply::Deny`]; any other
+///   BARE key is swallowed (kept pending) so a stray Enter can't fire a fresh turn.
+///
+/// Fail-open: a poisoned lock returns `false` (the key flows normally, nothing hangs).
+fn resolve_pending_approval(holder: &ApprovalHolder, code: KeyCode, mods: KeyModifiers) -> bool {
+    // A modified chord (Ctrl-C / Alt-… / Super-…) is left for the normal pipeline so the
+    // user can always hard-cancel the paused turn. A bare Shift is still "unmodified".
+    if mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) {
+        return false;
+    }
+    let Ok(mut guard) = holder.lock() else {
+        return false;
+    };
+    if guard.is_none() {
+        return false; // no pause active — the key flows through untouched
+    }
+    let decision = match code {
+        KeyCode::Char('y' | 'Y') => Some(ApprovalReply::Allow),
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(ApprovalReply::Deny),
+        _ => None,
+    };
+    if let Some(d) = decision {
+        if let Some(p) = guard.take() {
+            let _ = p.reply_tx.send(d); // a dropped receiver (task gone) is harmless
+        }
+    }
+    // Every bare key is consumed while a pause is active — only y/n/Esc resolve it, but
+    // a stray Enter / character must never reach the action pipeline and start a turn.
+    true
+}
+
+/// Clear any pending approval (dropping its `reply_tx` so the drain's `await` fail-opens
+/// to DENY). Called when a turn is cancelled / a terminal decision lands, so a stale
+/// wait can never linger. Fail-open on a poisoned lock (nothing to clear / no hang).
+fn clear_pending_approval(holder: &ApprovalHolder) {
+    if let Ok(mut g) = holder.lock() {
+        *g = None;
+    }
+}
+
+/// INTERACTIVE pause (Fix ③): register a [`PendingApproval`], surface the item, and
+/// block until the user answers — bounded by [`APPROVAL_WAIT_BUDGET`] and cancellable
+/// (Esc / a cleared holder). Returns the user's [`ApprovalReply`], failing open to
+/// [`ApprovalReply::Deny`] on EVERY error path (can't register, the channel dropped, or
+/// the budget elapsed) so the base is never left hanging and the drain never wedges.
+async fn await_user_approval(
+    holder: &ApprovalHolder,
+    sink: &Arc<ChannelSink>,
+    action: &str,
+    target: &str,
+) -> ApprovalReply {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // Register the pause so the event loop routes the user's keypress here. If the lock
+    // is poisoned we can't register → fail-open DENY (never block on an unroutable wait).
+    match holder.lock() {
+        Ok(mut g) => *g = Some(PendingApproval { reply_tx: tx }),
+        Err(_) => return ApprovalReply::Deny,
+    }
+    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+        "trust.pause.approve",
+        &[action, target],
+    )));
+    // Bounded wait. A dropped sender (cancel / quit / a cleared holder / a dead session)
+    // resolves the inner `rx` to `Err` → DENY; the outer timeout is the walked-away-user
+    // backstop → DENY. Either way the drain resumes promptly and never hangs.
+    let reply = match tokio::time::timeout(APPROVAL_WAIT_BUDGET, rx).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(_)) => ApprovalReply::Deny, // channel dropped → fail-open deny
+        Err(_) => {
+            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "trust.pause.timeout",
+                &[action, target],
+            )));
+            ApprovalReply::Deny
+        }
+    };
+    clear_pending_approval(holder);
+    reply
+}
+
 /// Decide whether the TUI's `run` intent flows through the **continuous
 /// long-session path** (one persistent director session) or the legacy per-phase
 /// single-shot path. The continuous path is now the DEFAULT (mirrors
@@ -2373,6 +2509,7 @@ fn fire_agentic(
     app: &mut App,
     chat_session: &ChatSessionHolder,
     pending_ask: &PendingAskHolder,
+    approval_holder: &ApprovalHolder,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
     task: String,
@@ -2436,6 +2573,10 @@ fn fire_agentic(
             pending_ask: pending_ask.clone(),
             sink: sink.clone(),
             route_tx: route_tx.clone(),
+            // A drained queued turn is still a resident interactive chat turn (a user
+            // is at the terminal) — same interactive gate for the two pauses.
+            interactive: interactive_user_present(),
+            approval_holder: approval_holder.clone(),
         }))
     } else {
         spawn_agentic(
@@ -2545,6 +2686,7 @@ async fn run_routed_turn(
     inputs: RoutedTurnInputs,
     chat_session: ChatSessionHolder,
     pending_ask: PendingAskHolder,
+    approval_holder: ApprovalHolder,
     sink: Arc<ChannelSink>,
     route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
 ) {
@@ -2583,6 +2725,11 @@ async fn run_routed_turn(
             pending_ask,
             sink,
             route_tx,
+            // A real resident chat turn dispatched from the TUI: a live user is present
+            // (interactive gate for BOTH pauses — Fix ⑤ / Fix ③). A piped / non-TTY
+            // invocation resolves `false` and keeps the headless auto-continue path.
+            interactive: interactive_user_present(),
+            approval_holder,
         })
         .await;
         return;
@@ -2652,6 +2799,15 @@ struct ChatSessionTurn {
     sink: Arc<ChannelSink>,
     /// Terminal-decision channel back to the event loop.
     route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    /// Whether a live user is present at an interactive terminal (the resident chat
+    /// surface). Gates BOTH interactive pauses: a base `AskUserQuestion` parks + waits
+    /// (Fix ⑤) and a Guarded consequential action asks the user (Fix ③) ONLY when this
+    /// is `true`. A HEADLESS / non-TTY turn keeps today's observe-and-auto-continue
+    /// behaviour and NEVER blocks (see [`interactive_user_present`]).
+    interactive: bool,
+    /// Shared slot the drain registers a guarded approval pause in (Fix ③); the event
+    /// loop routes the user's y/n/Esc into it. Never registered on the headless path.
+    approval_holder: ApprovalHolder,
 }
 
 /// The path token of a tool call's raw input — the human-readable target shown in
@@ -3079,6 +3235,8 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
         pending_ask,
         sink,
         route_tx,
+        interactive,
+        approval_holder,
     } = turn;
 
     // RELAY a pending base `AskUserQuestion`: if a PRIOR turn surfaced a structured
@@ -3308,11 +3466,17 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     // (the reply flows into THIS same session — the base kept the question
                     // in its own context). Fail-open: a non-question / unreadable call →
                     // None → the plain tool row, nothing stored.
+                    // Fix ⑤: on the INTERACTIVE surface a base question must STOP the turn
+                    // and WAIT for the user (parked below), instead of the headless
+                    // observe-stash-and-continue. Flag it here; the park happens after the
+                    // tool row is emitted so the user SEES the pending question first.
+                    let mut park_for_question = false;
                     if let Some(q) = umadev_runtime::AskUserQuestion::from_tool_input(&name, &input)
                     {
                         detail = q.summary();
                         sink.emit(EngineEvent::Note(umadev_agent::ask_question_note(&q)));
                         *pending_ask.lock().await = Some(q);
+                        park_for_question = true;
                     } else if let Some(surface) = umadev_agent::exit_plan_surface(&name, &input) {
                         // The base called its OWN `ExitPlanMode` — render the full plan
                         // markdown as a Note labeled as the BASE's plan mode (not
@@ -3321,6 +3485,7 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                         // session. Fail-open: no readable plan → None → the plain row.
                         detail = surface.detail;
                         sink.emit(EngineEvent::Note(surface.note));
+                        park_for_question = true;
                     }
                     // P1: forward the structured before/after for a Write/Edit so the
                     // TUI draws a live diff card on the reactive session path too.
@@ -3329,6 +3494,29 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     sink.emit(EngineEvent::WorkerStream {
                         event: umadev_runtime::StreamEvent::ToolUse { name, detail, edit },
                     });
+                    // Fix ⑤ (INTERACTIVE-ONLY): STOP draining so the base does NOT barrel
+                    // ahead on its own auto-cancelled picker (or re-emit the question).
+                    // Interrupt to settle the base's turn, PARK the live session (the SAME
+                    // Interrupted park path the Esc arm uses), and return — the user's NEXT
+                    // line is relayed into THIS parked session as the framed answer (see the
+                    // relay at the top of this fn). HEADLESS keeps observing + stashing +
+                    // continuing (the code below), so a userless run never blocks.
+                    if park_for_question
+                        && umadev_agent::should_wait_for_question(interactive, interactive)
+                    {
+                        // Best-effort interrupt (a control request — it does NOT kill the
+                        // base); fail-open if it errors. Then park + settle this turn so
+                        // `thinking` clears and the user can type their answer.
+                        let _ = session.interrupt().await;
+                        let base_session_id = session.session_id().map(str::to_string);
+                        *chat_session.lock().await = Some(ResidentChat::Primed(session));
+                        let _ = route_tx.send(RouteDecision::AgenticDone {
+                            reply: String::new(),
+                            director_build: false,
+                            base_session_id,
+                        });
+                        return;
+                    }
                 }
                 umadev_runtime::SessionEvent::ToolResult { ok, summary } => {
                     sink.emit(EngineEvent::WorkerStream {
@@ -3340,10 +3528,51 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     action,
                     target,
                 } => {
-                    // Always-on irreversible floor — the SAME gate the director loop
-                    // applies: deny an irreversible action (with a note), allow the rest
-                    // so a guarded chat turn isn't wedged waiting on a human headlessly.
-                    let decision = if umadev_agent::requires_confirmation(mode, &action, &target) {
+                    // Fix ③ (INTERACTIVE-ONLY): in Guarded, PAUSE and ask the live user to
+                    // approve a genuinely consequential action the policy would otherwise
+                    // auto-decide — backed by the trust ledger so an approved kind is NOT
+                    // re-asked. HEADLESS / Auto / Plan / a read all fall through to the
+                    // always-on floor auto-decide below (deny irreversible, allow the rest),
+                    // so a userless guarded run is never wedged waiting on a human.
+                    let cap = umadev_agent::capability_class(&action, &target);
+                    let ledger = umadev_agent::TrustLedger::load(&project_root);
+                    let already = ledger.remembers_rooted(&action, &target, &project_root);
+                    let decision = if umadev_agent::guarded_should_pause_item(
+                        mode,
+                        interactive,
+                        interactive,
+                        cap,
+                        already,
+                    ) {
+                        // Block on the user's y/n (bounded + cancellable; fail-open DENY on
+                        // Esc / cancel / a dead session / the wait budget — never a hang).
+                        match await_user_approval(&approval_holder, &sink, &action, &target).await {
+                            ApprovalReply::Allow => {
+                                // Remember this reversible class so it is not re-asked (an
+                                // irreversible-floor action records nothing → always re-asks).
+                                umadev_agent::remember_project_approval(
+                                    &project_root,
+                                    &action,
+                                    &target,
+                                );
+                                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                    "trust.pause.allowed",
+                                    &[&action, &target],
+                                )));
+                                umadev_runtime::ApprovalDecision::Allow
+                            }
+                            ApprovalReply::Deny => {
+                                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                    "trust.pause.denied",
+                                    &[&action, &target],
+                                )));
+                                umadev_runtime::ApprovalDecision::Deny
+                            }
+                        }
+                    } else if umadev_agent::requires_confirmation(mode, &action, &target) {
+                        // Always-on irreversible floor (headless / non-guarded / non-paused):
+                        // deny an irreversible action, allow the rest so a guarded chat turn
+                        // isn't wedged waiting on a human headlessly.
                         sink.emit(EngineEvent::Note(umadev_i18n::tlf(
                             "continuous.dangerous_action_denied",
                             &[&action, &target],
@@ -3566,6 +3795,7 @@ fn drain_next_queued_chat(
     app: &mut App,
     chat_session: &ChatSessionHolder,
     pending_ask: &PendingAskHolder,
+    approval_holder: &ApprovalHolder,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -3574,6 +3804,7 @@ fn drain_next_queued_chat(
         app,
         chat_session,
         pending_ask,
+        approval_holder,
         sink,
         route_tx,
         text,
@@ -5159,6 +5390,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // surfaces a structured question, consumed by the NEXT turn to frame the user's
     // reply as a resolved answer. Shared with every spawned chat-turn task.
     let pending_ask_holder: PendingAskHolder = Arc::new(tokio::sync::Mutex::new(None));
+    // Fix ③: the single in-flight Guarded consequential-action approval pause. Shared
+    // between the spawned chat-turn drain (which registers a pause + blocks on it) and
+    // this event loop (which routes the user's y/n/Esc into it). `None` = no pause.
+    let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
     // Pre-load the resident chat session NOW if we launched straight into chat with a
     // host CLI already configured (a returning user — first launch lands on the
     // picker, which fires the pre-load on `Action::BackendChanged` once a base is
@@ -5617,7 +5852,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         if was_run {
                             refresh_resident_chat_after_run(app, &chat_session_holder, &pending_ask_holder).await;
                         }
-                        run_task = drain_next_queued_chat(app, &chat_session_holder, &pending_ask_holder, &sink, &route_tx);
+                        run_task = drain_next_queued_chat(app, &chat_session_holder, &pending_ask_holder, &approval_holder, &sink, &route_tx);
                         // The exchange just landed — if the working transcript has
                         // crossed the token budget, fold the older turns into one
                         // structured summary on a forked base (the recent tail stays
@@ -5639,7 +5874,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         if was_run {
                             refresh_resident_chat_after_run(app, &chat_session_holder, &pending_ask_holder).await;
                         }
-                        run_task = drain_next_queued_chat(app, &chat_session_holder, &pending_ask_holder, &sink, &route_tx);
+                        run_task = drain_next_queued_chat(app, &chat_session_holder, &pending_ask_holder, &approval_holder, &sink, &route_tx);
                     }
                     None => {}
                 }
@@ -5944,6 +6179,20 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                             mouse_seq_filter.feed(key)
                         };
                         for replay_key in replay_keys {
+                            // Fix ③ — interactive guarded approval pause. If the resident
+                            // chat drain is BLOCKED awaiting the user's y/n on a consequential
+                            // action, this keypress IS that decision: consume it here so it
+                            // can't leak into the input line or spawn a second turn on the one
+                            // session. A modified chord (Ctrl-C, …) is never intercepted, so
+                            // hard-cancel still works. No pause active → a no-op passthrough.
+                            if resolve_pending_approval(
+                                &approval_holder,
+                                replay_key.code,
+                                replay_key.modifiers,
+                            ) {
+                                needs_redraw = true;
+                                continue;
+                            }
                             match app.apply_key_with_mods(replay_key.code, replay_key.modifiers) {
                                 // Quit sets `app.should_quit`; the loop-bottom check
                                 // breaks. (No bare `break` here — it would only exit
@@ -6014,6 +6263,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     });
                                 }
                                 Action::Cancel => {
+                                    // A cancel abandons any in-flight guarded approval pause
+                                    // cleanly: drop its sender so the drain's `await` fail-opens
+                                    // to DENY (Fix ③ — no hang) before we tear the task down.
+                                    clear_pending_approval(&approval_holder);
                                     if let Some(h) = run_task.take() {
                                         // Schedule cancellation, then get the WAIT off the
                                         // render path: park the aborting handle and let the
@@ -6334,6 +6587,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         inputs,
                                         chat_session_holder.clone(),
                                         pending_ask_holder.clone(),
+                                        approval_holder.clone(),
                                         sink.clone(),
                                         route_tx.clone(),
                                     )));
@@ -6663,7 +6917,9 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     {
                         // Mirror the Esc/Ctrl-C cancel path: abort the in-flight task
                         // off the render path (drained by `cancel_drain`), else an
-                        // immediate reset.
+                        // immediate reset. Abandon any guarded approval pause first so
+                        // the drain fail-opens to DENY (Fix ③ — no lingering wait).
+                        clear_pending_approval(&approval_holder);
                         if let Some(h) = run_task.take() {
                             h.abort();
                             cancel_drain = Some(h);
@@ -9785,6 +10041,10 @@ mod tests {
         /// case); `Some(_)` via [`Self::with_exit_status`] → the base has DIED, so a
         /// transient-failure path tears the session down instead of parking it.
         exit_status: Option<std::process::ExitStatus>,
+        /// Every `respond` decision this fake received, in order — the probe the Fix ③
+        /// approval-pause tests assert on (Allow / Deny). Shared with the test via
+        /// [`Self::with_responses`].
+        responded: Arc<std::sync::Mutex<Vec<umadev_runtime::ApprovalDecision>>>,
     }
 
     impl FakeChatSession {
@@ -9805,10 +10065,21 @@ mod tests {
                     ended: Arc::clone(&ended),
                     id: None,
                     exit_status: None,
+                    responded: Arc::new(std::sync::Mutex::new(Vec::new())),
                 },
                 sent,
                 ended,
             )
+        }
+
+        /// Share the fake's `respond`-decision probe with the caller so a Fix ③ test can
+        /// assert the base was answered Allow / Deny after the interactive approval pause.
+        fn with_responses(
+            mut self,
+            probe: Arc<std::sync::Mutex<Vec<umadev_runtime::ApprovalDecision>>>,
+        ) -> Self {
+            self.responded = probe;
+            self
         }
 
         /// Give the fake a resumable session id so [`BaseSession::session_id`] returns
@@ -9853,8 +10124,9 @@ mod tests {
         async fn respond(
             &mut self,
             _req_id: &str,
-            _decision: umadev_runtime::ApprovalDecision,
+            decision: umadev_runtime::ApprovalDecision,
         ) -> Result<(), umadev_runtime::SessionError> {
+            self.responded.lock().unwrap().push(decision);
             Ok(())
         }
         async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
@@ -10061,6 +10333,11 @@ mod tests {
             pending_ask: Arc::new(tokio::sync::Mutex::new(None)),
             sink,
             route_tx,
+            // Default the test turn to the INTERACTIVE surface (a live user present), so
+            // the Fix ⑤ / Fix ③ pauses engage; the headless-never-blocks tests override
+            // this to `false` via struct-update to prove a userless turn auto-continues.
+            interactive: true,
+            approval_holder: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -10691,6 +10968,358 @@ mod tests {
             "thanks, what's next?",
             "with no pending question the reply is sent raw (fail-open passthrough)"
         );
+    }
+
+    /// Fix ⑤ (INTERACTIVE): when the base asks its OWN `AskUserQuestion`, the resident
+    /// chat drain STOPS the turn and PARKS the live session (it interrupts the base so
+    /// it can't barrel ahead on the auto-cancelled picker or re-emit the question), and
+    /// stores the question so the user's NEXT line relays into the SAME parked session.
+    /// The base is driven exactly ONCE (no 3x re-emit) and the session is reused, not
+    /// torn down.
+    #[tokio::test]
+    async fn interactive_askuserquestion_parks_and_waits_same_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ask = umadev_runtime::SessionEvent::ToolCall {
+            name: "AskUserQuestion".into(),
+            input: serde_json::json!({"questions": [{
+                "header": "Auth", "question": "Which auth method?",
+                "options": [{"label": "Email"}, {"label": "OAuth"}]
+            }]}),
+        };
+        // The batch also carries a TurnDone the drain must NEVER reach (it parks first).
+        let (fake, sent, ended) = FakeChatSession::new(vec![vec![
+            ask,
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+        let pending: PendingAskHolder = Arc::new(tokio::sync::Mutex::new(None));
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_chat_session_turn(chat_turn_with_pending(
+                "set up auth",
+                holder.clone(),
+                pending.clone(),
+                sink.clone(),
+                route_tx.clone(),
+                tmp.path().to_path_buf(),
+            )),
+        )
+        .await
+        .expect("an interactive question must PARK, never block");
+
+        // Parked, not torn down: the interrupt fired, the session is back in the holder,
+        // and the question is stored for the relay.
+        assert!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            "the base's turn is interrupted (settled) so it can't barrel ahead"
+        );
+        assert!(
+            holder.lock().await.is_some(),
+            "the session is parked for reuse"
+        );
+        assert!(
+            pending.lock().await.is_some(),
+            "the base question is stored so the next line relays into the SAME session"
+        );
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "the base is driven exactly once — no re-emit of the question"
+        );
+        assert!(
+            matches!(route_rx.try_recv(), Ok(RouteDecision::AgenticDone { .. })),
+            "the parked turn settles (thinking clears), awaiting the user's reply"
+        );
+    }
+
+    /// Fix ⑤ (HEADLESS never blocks): the SAME `AskUserQuestion` on a NON-interactive
+    /// turn must NOT park — it keeps today's observe-stash-and-continue behaviour and
+    /// runs through to `TurnDone`. A run with no user to answer can never wedge.
+    #[tokio::test]
+    async fn headless_askuserquestion_does_not_park_auto_continues() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ask = umadev_runtime::SessionEvent::ToolCall {
+            name: "AskUserQuestion".into(),
+            input: serde_json::json!({"questions": [{
+                "header": "Auth", "question": "Which auth method?",
+                "options": [{"label": "Email"}]
+            }]}),
+        };
+        let (fake, _sent, ended) = FakeChatSession::new(vec![vec![
+            ask,
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+
+        // HEADLESS: interactive = false via struct-update.
+        let turn = ChatSessionTurn {
+            interactive: false,
+            ..chat_turn(
+                "set up auth",
+                holder.clone(),
+                sink.clone(),
+                route_tx.clone(),
+                tmp.path().to_path_buf(),
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(5), drive_chat_session_turn(turn))
+            .await
+            .expect("a headless question turn must auto-continue, never block");
+
+        assert!(
+            !ended.load(std::sync::atomic::Ordering::SeqCst),
+            "headless must NOT interrupt/park — it observes + continues to TurnDone"
+        );
+        assert!(
+            matches!(route_rx.try_recv(), Ok(RouteDecision::AgenticDone { .. })),
+            "the headless turn ran through to its own TurnDone"
+        );
+    }
+
+    /// Fix ③ (INTERACTIVE): a Guarded consequential action (a shell command the floor
+    /// would otherwise auto-allow) PAUSES and asks the user. On approval the base is
+    /// answered `Allow` and the class is remembered — so the SAME action on a later turn
+    /// is auto-allowed with NO second pause (the ledger suppresses the re-ask).
+    #[tokio::test]
+    async fn guarded_interactive_pauses_then_ledger_suppresses_reask() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let responded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let approve = || umadev_runtime::SessionEvent::NeedApproval {
+            req_id: "r1".into(),
+            action: "npm run build".into(), // a local shell → consequential, not a read
+            target: String::new(),
+        };
+        let done = || umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        };
+        let (fake, _sent, _ended) =
+            FakeChatSession::new(vec![vec![approve(), done()], vec![approve(), done()]]);
+        let fake = fake.with_responses(responded.clone());
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+        let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+
+        // Turn 1: PAUSES. Drive it as a task; the event loop's role (routing the user's
+        // decision) is played by the test: poll for the pause, then approve.
+        let t1 = tokio::spawn(drive_chat_session_turn(ChatSessionTurn {
+            approval_holder: approval_holder.clone(),
+            ..chat_turn(
+                "build it",
+                holder.clone(),
+                sink.clone(),
+                route_tx.clone(),
+                tmp.path().to_path_buf(),
+            )
+        }));
+        // Wait for the drain to register the pause, then answer Allow.
+        let mut waited = 0;
+        loop {
+            if let Some(p) = approval_holder.lock().unwrap().take() {
+                p.reply_tx.send(ApprovalReply::Allow).unwrap();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            waited += 1;
+            assert!(waited < 400, "the guarded consequential action must PAUSE");
+        }
+        tokio::time::timeout(Duration::from_secs(5), t1)
+            .await
+            .expect("turn 1 must resume after approval")
+            .unwrap();
+        assert_eq!(
+            *responded.lock().unwrap(),
+            vec![umadev_runtime::ApprovalDecision::Allow],
+            "the approved action is answered Allow to the base"
+        );
+        assert!(
+            umadev_agent::TrustLedger::load(tmp.path()).remembers_rooted(
+                "npm run build",
+                "",
+                tmp.path()
+            ),
+            "the approved class is remembered for this project"
+        );
+        assert!(matches!(
+            route_rx.try_recv(),
+            Ok(RouteDecision::AgenticDone { .. })
+        ));
+
+        // Turn 2: the SAME action must NOT pause (ledger suppresses). If it blocked, this
+        // timeout would fire — no one is injecting a decision this time.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_chat_session_turn(ChatSessionTurn {
+                approval_holder: approval_holder.clone(),
+                ..chat_turn(
+                    "build again",
+                    holder.clone(),
+                    sink.clone(),
+                    route_tx.clone(),
+                    tmp.path().to_path_buf(),
+                )
+            }),
+        )
+        .await
+        .expect("a remembered class must auto-allow with NO second pause");
+        assert!(
+            approval_holder.lock().unwrap().is_none(),
+            "no pause was registered on the remembered-class turn"
+        );
+        assert_eq!(
+            *responded.lock().unwrap(),
+            vec![
+                umadev_runtime::ApprovalDecision::Allow,
+                umadev_runtime::ApprovalDecision::Allow
+            ],
+            "turn 2 auto-allowed the remembered class"
+        );
+    }
+
+    /// Fix ③ (HEADLESS never blocks): the SAME Guarded consequential `NeedApproval` on a
+    /// NON-interactive turn must NOT pause — it auto-decides on the floor (a reversible
+    /// local shell is allowed) and runs straight through. A userless guarded run can
+    /// never wedge waiting on a human.
+    #[tokio::test]
+    async fn guarded_headless_needapproval_does_not_pause() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let responded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (fake, _sent, _ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::NeedApproval {
+                req_id: "r1".into(),
+                action: "npm run build".into(),
+                target: String::new(),
+            },
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]]);
+        let fake = fake.with_responses(responded.clone());
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+        let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_chat_session_turn(ChatSessionTurn {
+                interactive: false,
+                approval_holder: approval_holder.clone(),
+                ..chat_turn(
+                    "build it",
+                    holder.clone(),
+                    sink.clone(),
+                    route_tx.clone(),
+                    tmp.path().to_path_buf(),
+                )
+            }),
+        )
+        .await
+        .expect("a headless guarded turn must auto-decide, never block");
+
+        assert!(
+            approval_holder.lock().unwrap().is_none(),
+            "headless must NEVER register an approval pause"
+        );
+        assert_eq!(
+            *responded.lock().unwrap(),
+            vec![umadev_runtime::ApprovalDecision::Allow],
+            "the reversible local shell is auto-allowed on the floor (unchanged headless)"
+        );
+        assert!(matches!(
+            route_rx.try_recv(),
+            Ok(RouteDecision::AgenticDone { .. })
+        ));
+    }
+
+    /// Fix ③ fail-open: if the pause is abandoned while blocked — Esc / cancel / a dead
+    /// session drops the reply channel (here: the holder is cleared, as the Cancel arm
+    /// and `interactive_user_present`-off paths do) — the drain must fail-open to DENY
+    /// and resume, NEVER hang.
+    #[tokio::test]
+    async fn approval_pause_fails_open_to_deny_when_abandoned() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let responded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (fake, _sent, _ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::NeedApproval {
+                req_id: "r1".into(),
+                action: "npm run build".into(),
+                target: String::new(),
+            },
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]]);
+        let fake = fake.with_responses(responded.clone());
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+        let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+
+        let t = tokio::spawn(drive_chat_session_turn(ChatSessionTurn {
+            approval_holder: approval_holder.clone(),
+            ..chat_turn(
+                "build it",
+                holder.clone(),
+                sink.clone(),
+                route_tx.clone(),
+                tmp.path().to_path_buf(),
+            )
+        }));
+        // Wait for the pause, then ABANDON it (drop the sender) — the cancel / dead-session
+        // fail-open path.
+        let mut waited = 0;
+        loop {
+            if approval_holder.lock().unwrap().is_some() {
+                clear_pending_approval(&approval_holder);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            waited += 1;
+            assert!(waited < 400, "the guarded consequential action must PAUSE");
+        }
+        tokio::time::timeout(Duration::from_secs(5), t)
+            .await
+            .expect("abandoning the wait must fail-open, never hang")
+            .unwrap();
+        assert_eq!(
+            *responded.lock().unwrap(),
+            vec![umadev_runtime::ApprovalDecision::Deny],
+            "an abandoned approval fails open to DENY (the base is never left hanging)"
+        );
+        assert!(matches!(
+            route_rx.try_recv(),
+            Ok(RouteDecision::AgenticDone { .. })
+        ));
     }
 
     /// Fix A: a `TurnStatus::Failed` whose base process ACTUALLY died
