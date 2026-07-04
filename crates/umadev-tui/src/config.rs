@@ -54,6 +54,16 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub show_process_logs: bool,
 
+    /// How approval questions (both UmaDev's own gate checkpoints and the base's
+    /// `AskUserQuestion`) are presented: `"picker"` (default) renders a numbered
+    /// multiple-choice picker; `"text"` frames the question + its options as prose
+    /// the user answers in natural language. The free-text reply path already works
+    /// either way — only the presentation changes. Toggled live via `/questions`;
+    /// published into the agent's shared flag (see [`Self::apply_question_form`]).
+    /// `None`/unset means the default picker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_form: Option<String>,
+
     /// Schema/migration version of this persisted config. Bumped by the ordered
     /// startup migration runner ([`run_migrations`]), which applies idempotent,
     /// fail-soft upgrade steps **once** per upgrade and then saves the new
@@ -97,6 +107,7 @@ fn migrate_empty_strings_to_none(cfg: &mut UserConfig) {
         &mut cfg.design_system,
         &mut cfg.seed_template,
         &mut cfg.lang,
+        &mut cfg.question_form,
     ] {
         if field.as_deref().is_some_and(str::is_empty) {
             *field = None;
@@ -201,6 +212,26 @@ impl UserConfig {
         self.backend
             .clone()
             .unwrap_or_else(|| "offline".to_string())
+    }
+
+    /// `true` when the user prefers free-text (prose) approval questions over the
+    /// numbered multiple-choice picker — i.e. `question_form = "text"`. Any other
+    /// value (or unset) is the default picker. Case-insensitive.
+    #[must_use]
+    pub fn prefers_text_questions(&self) -> bool {
+        self.question_form
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("text"))
+    }
+
+    /// Publish THIS config's approval-question presentation preference into the
+    /// agent crate's process-global flag (see
+    /// [`umadev_agent::set_prefer_text_questions`]), so the base `AskUserQuestion`
+    /// notes — emitted deep in the run pumps with no config in hand — honor it.
+    /// Call at startup and after a live `/questions` toggle. Deterministic; the
+    /// TUI-side gate picker reads [`Self::prefers_text_questions`] directly.
+    pub fn apply_question_form(&self) {
+        umadev_agent::set_prefer_text_questions(self.prefers_text_questions());
     }
 }
 
@@ -395,6 +426,45 @@ mod tests {
         };
         save_to(&cfg, &deep).unwrap();
         assert!(deep.is_file());
+    }
+
+    #[test]
+    fn question_form_defaults_to_picker_and_opts_into_text() {
+        // Unset → the default numbered picker (existing users unaffected).
+        let picker = UserConfig::default();
+        assert!(!picker.prefers_text_questions());
+        // `"text"` (case-insensitive) → free-text prose questions.
+        let text = UserConfig {
+            question_form: Some("text".into()),
+            ..Default::default()
+        };
+        assert!(text.prefers_text_questions());
+        let text_caps = UserConfig {
+            question_form: Some("TEXT".into()),
+            ..Default::default()
+        };
+        assert!(text_caps.prefers_text_questions());
+        // Any other value is the picker (fail-safe to the default).
+        let other = UserConfig {
+            question_form: Some("picker".into()),
+            ..Default::default()
+        };
+        assert!(!other.prefers_text_questions());
+    }
+
+    #[test]
+    fn question_form_round_trips_through_disk() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = UserConfig {
+            backend: Some("claude-code".into()),
+            question_form: Some("text".into()),
+            ..Default::default()
+        };
+        save_to(&original, &path).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.question_form.as_deref(), Some("text"));
+        assert!(loaded.prefers_text_questions());
     }
 
     #[test]

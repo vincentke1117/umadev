@@ -649,6 +649,13 @@ fn govern_tool_call(
     if let Some(surface) = crate::ask_question::surface(name, input) {
         target = surface.detail;
         events.emit(EngineEvent::Note(surface.note));
+    } else if let Some(surface) = crate::ask_question::exit_plan_surface(name, input) {
+        // The base called its OWN `ExitPlanMode` to propose a plan and ask to leave
+        // ITS plan mode. Render the full plan markdown as a Note labeled clearly as
+        // the base's plan mode (never UmaDev's guarded banner). Fail-open: a call
+        // with no readable plan → None → the plain tool row.
+        target = surface.detail;
+        events.emit(EngineEvent::Note(surface.note));
     }
 
     // TUI tool row — "正在写 src/App.tsx…". This is the SOURCE OF TRUTH for what

@@ -467,6 +467,44 @@ impl AskUserQuestion {
         out
     }
 
+    /// Like [`prompt_block`](Self::prompt_block) but WITHOUT the numbered
+    /// "reply with a number" framing: each question's options are listed as plain
+    /// bullets. A text-question surface (the user set `question_form = "text"`)
+    /// uses this so it can still show what the base is weighing while inviting a
+    /// free-text answer instead of a numeric pick. Neutral structural text only
+    /// (no localized words) so a localized framing can wrap it.
+    #[must_use]
+    pub fn prose_block(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let multi = self.questions.len() > 1;
+        for (qi, q) in self.questions.iter().enumerate() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            let title = match (q.header.is_empty(), q.question.is_empty()) {
+                (false, false) => format!("{}: {}", q.header, q.question),
+                (true, false) => q.question.clone(),
+                (false, true) => q.header.clone(),
+                (true, true) => String::new(),
+            };
+            if multi {
+                let _ = write!(out, "Q{}. {title}", qi + 1);
+            } else {
+                out.push_str(&title);
+            }
+            for opt in &q.options {
+                out.push('\n');
+                if opt.description.is_empty() {
+                    let _ = write!(out, "  - {}", opt.label);
+                } else {
+                    let _ = write!(out, "  - {} — {}", opt.label, opt.description);
+                }
+            }
+        }
+        out
+    }
+
     /// Resolve a user's free-text reply to the answer to relay back to the base.
     ///
     /// - A bare option **number** (1-based, against the FIRST question's options
@@ -492,6 +530,83 @@ impl AskUserQuestion {
             }
         }
         trimmed.to_string()
+    }
+}
+
+/// The parsed input of a base's **`ExitPlanMode`** tool call — the plan the base
+/// proposes and asks the user to approve before it LEAVES its OWN plan mode and
+/// starts executing.
+///
+/// This is the **base CLI's** plan mode (claude-code's `ExitPlanMode`), which is
+/// **distinct** from UmaDev's own `TrustMode::Guarded` / `TrustMode::Plan` tiers:
+/// the base decided, inside its turn, to draft a plan and pause for approval.
+/// UmaDev drives the base non-interactively, so — exactly like [`AskUserQuestion`]
+/// — the base cannot pop up its own approval UI and the call auto-cancels
+/// mid-turn. UmaDev only observes the tool-call event, so without this parser the
+/// `plan` markdown is never shown (the tool row read as a bare "ExitPlanMode"
+/// stub). This type lifts the `plan` text out of the raw tool input so a surface
+/// layer can render it under a note that clearly labels it as the base's plan
+/// mode — never conflated with UmaDev's own guarded banner.
+///
+/// **Fail-open by construction:** [`from_tool_input`](Self::from_tool_input)
+/// returns `None` for a non-`ExitPlanMode` call or an input with no `plan` text —
+/// never a panic, never a fabricated plan.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExitPlanMode {
+    /// The plan markdown the base wants approved before it starts executing.
+    pub plan: String,
+}
+
+impl ExitPlanMode {
+    /// Whether `name` is the base's exit-plan-mode tool. Case-insensitive and
+    /// separator-insensitive so a normalized (`exit_plan_mode`) or canonical
+    /// (`ExitPlanMode`) name both match — mirrors [`AskUserQuestion::is_tool_name`].
+    #[must_use]
+    pub fn is_tool_name(name: &str) -> bool {
+        let n = name.replace(['_', '-', ' '], "").to_ascii_lowercase();
+        n == "exitplanmode"
+    }
+
+    /// Parse a base `ExitPlanMode` tool-call input. Returns `None` when the call
+    /// is not an `ExitPlanMode` or carries no readable `plan` text, so the caller
+    /// keeps its existing (non-plan) tool-row rendering.
+    #[must_use]
+    pub fn from_tool_input(name: &str, input: &serde_json::Value) -> Option<Self> {
+        if !Self::is_tool_name(name) {
+            return None;
+        }
+        Self::parse_value(input)
+    }
+
+    /// Parse just the input value (no tool-name guard) — the shared body of
+    /// [`from_tool_input`], handy when the name was already matched upstream.
+    #[must_use]
+    pub fn parse_value(input: &serde_json::Value) -> Option<Self> {
+        let plan = input
+            .get("plan")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if plan.is_empty() {
+            return None;
+        }
+        Some(Self {
+            plan: plan.to_string(),
+        })
+    }
+
+    /// A compact, single-line summary for the tool-row `detail` (never multi-line):
+    /// the first non-empty line of the plan, whitespace-collapsed and clipped, so
+    /// the tool row shows what's being approved instead of a bare "ExitPlanMode".
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let first = self
+            .plan
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        one_line_clip(first, 72)
     }
 }
 
@@ -839,12 +954,11 @@ pub enum SessionEvent {
     /// The base reported the EXACT model it resolved for this session, read from
     /// the session `init` frame (claude's stream-json `system`/`init` line carries
     /// a `model` field like `claude-sonnet-4-5-20250929`). Emitted at most once,
-    /// at session start, BEFORE any turn. The consumer threads it to the
-    /// context-usage gauge so the denominator is the base's REAL window instead of
-    /// a per-backend guess (a static default couldn't tell 200K from 1M).
+    /// at session start, BEFORE any turn. Consumers may display this model id, but
+    /// must not treat it as proof of a context-window size: that requires explicit
+    /// base configuration/provider metadata.
     /// **Fail-open:** a base whose init frame carries no model id simply never
-    /// emits this — the gauge falls back to its static estimate exactly as before;
-    /// an unparseable frame is skipped, never a panic.
+    /// emits this; an unparseable frame is skipped, never a panic.
     SessionModel(String),
     /// The base invoked a tool — `name` is the tool id (`Write`/`Edit`/`Bash`/
     /// `Read`/…), `input` the raw tool input (e.g. `{"file_path": "..."}`).
@@ -1297,5 +1411,66 @@ mod tests {
             q.resolve_reply("  use whichever is cheaper "),
             "use whichever is cheaper"
         );
+    }
+
+    #[test]
+    fn ask_user_question_prose_block_drops_the_numbered_pick_framing() {
+        let input = serde_json::json!({
+            "question": "Which database should the API use?",
+            "options": [
+                {"label": "Postgres", "description": "Relational"},
+                {"label": "MongoDB"}
+            ]
+        });
+        let q = AskUserQuestion::parse_value(&input).expect("parses");
+        let prose = q.prose_block();
+        // Options are still listed (so the user knows what's being weighed) but as
+        // plain bullets — NO "1. " / "2. " numbering that implies a numeric pick.
+        assert!(prose.contains("Which database"), "prose: {prose}");
+        assert!(prose.contains("- Postgres"), "bulleted option: {prose}");
+        assert!(prose.contains("- MongoDB"), "bulleted option: {prose}");
+        assert!(
+            !prose.contains("1. Postgres") && !prose.contains("2. MongoDB"),
+            "text mode must drop the numbered picker framing: {prose}"
+        );
+    }
+
+    // ── ExitPlanMode (the BASE's plan mode — distinct from UmaDev Guarded) ───
+
+    #[test]
+    fn exit_plan_mode_parses_plan_text_and_summarizes() {
+        let input = serde_json::json!({
+            "plan": "## Plan\n1. Scaffold the API\n2. Add auth\n3. Wire the UI"
+        });
+        let p = ExitPlanMode::from_tool_input("ExitPlanMode", &input)
+            .expect("ExitPlanMode input must parse");
+        assert!(
+            p.plan.contains("Scaffold the API"),
+            "full plan kept: {}",
+            p.plan
+        );
+        // The one-line detail is the first non-empty plan line, never multi-line.
+        let summary = p.summary();
+        assert!(!summary.is_empty());
+        assert!(!summary.contains('\n'));
+    }
+
+    #[test]
+    fn exit_plan_mode_name_match_and_fail_open() {
+        assert!(ExitPlanMode::is_tool_name("ExitPlanMode"));
+        assert!(ExitPlanMode::is_tool_name("exit_plan_mode"));
+        assert!(!ExitPlanMode::is_tool_name("AskUserQuestion"));
+        assert!(!ExitPlanMode::is_tool_name("Write"));
+        // A non-plan tool / an empty-or-absent plan fails open to None (the caller
+        // keeps its plain tool row; never a panic, never a fabricated plan).
+        assert!(
+            ExitPlanMode::from_tool_input("Write", &serde_json::json!({"file_path": "a"}))
+                .is_none()
+        );
+        assert!(
+            ExitPlanMode::from_tool_input("ExitPlanMode", &serde_json::json!({"plan": "   "}))
+                .is_none()
+        );
+        assert!(ExitPlanMode::from_tool_input("ExitPlanMode", &serde_json::json!({})).is_none());
     }
 }

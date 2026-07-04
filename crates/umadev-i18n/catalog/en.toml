@@ -142,6 +142,18 @@
 # reply is relayed back to the base on the next turn of the same session.
 "ask.prompt.header" = "[question] The base is asking you to choose:"
 "ask.prompt.relay_hint" = "Reply with the option number (or text) and I'll pass your choice to the base in this same conversation — it could not pop up its own picker, so it's waiting on your answer, not cancelled."
+# Text-question mode (`question_form = text`): the base asked a question, framed as
+# prose the user answers in their own words rather than by picking a number.
+"ask.prompt.text_hint" = "Answer in your own words — just tell me what you want and I'll pass it to the base in this same conversation (no need to pick a number)."
+
+# The base CLI's OWN plan mode (claude-code's ExitPlanMode) — the base drafted a
+# plan and is asking to leave ITS plan mode and start executing. This is the BASE's
+# plan mode, distinct from UmaDev's own guarded tier, so it must be labeled clearly.
+"plan_mode.base_exit" = "[plan] The base CLI's plan mode: it drafted this plan and is asking to exit plan mode and start executing. (This is the base's own plan mode, not UmaDev's guarded tier — confirm to let it proceed.)"
+
+# Text-question mode: the hint appended when a UmaDev gate is framed as prose
+# instead of a numbered picker (the free-text reply already drives the decision).
+"question.text_hint" = "Answer in your own words — just tell me how to proceed (approve, request changes, or add more); no need to pick a number."
 
 # Runtime narration
 "run.started" = "Pipeline started: {}\nDelivering in 9 phases; it pauses at key checkpoints for your review."
@@ -745,9 +757,10 @@
 # Persistent token/cost gauge in the meta row (Feature A). `{}` is the compact
 # token count; the cost is the flat blended reference rate (estimate only).
 "tui.gauge.tokens" = "▍ {} tok"
+"tui.meta.model" = "model {}"
 "tui.gauge.cost" = "≈${}"
 # Live context-window occupancy gauge (Feature: ctx usage). `{}` are the current
-# context size, the per-model context-window estimate, and the rounded percent —
+# context size, the exact configured context window, and the rounded percent —
 # renders as "ctx 34k/200k · 17%". Both counts pass through the compact humaniser.
 "tui.gauge.context" = "ctx {}/{} · {}%"
 # Idle double-Esc rewind hint (Feature B): first Esc arms it, a second edits +
@@ -865,6 +878,7 @@
 "tui.cmd.animations" = "toggle spinner animation on / off"
 "tui.cmd.mouse" = "toggle mouse-wheel scrolling (off = native text selection)"
 "tui.cmd.logs" = "show the base's long-running build/process logs as they run"
+"tui.cmd.questions" = "how approvals are presented: text (prose, answer in your own words) or picker (numbered menu, default)"
 "tui.cmd.redraw" = "force a full repaint (clear stale / garbled cells)"
 # Event-stream render (app.rs apply_engine)
 "event.phase_done" = "[ok] {}"
@@ -889,6 +903,8 @@
 "slash.mouse_off" = "mouse-wheel scrolling off — native text selection restored"
 "slash.logs_on" = "process logs on — the base's long-running build/command output now streams into the transcript as it runs (codex streams live; all bases show the full log on completion)"
 "slash.logs_off" = "process logs off — long-running command output collapses back to a short result preview"
+"slash.questions_text" = "questions: text mode — approvals are now framed as prose you answer in your own words (no numbered picker)"
+"slash.questions_picker" = "questions: picker mode — approvals show the numbered multiple-choice picker (the default)"
 # Shown once when the user drags to select OUTSIDE the transcript (e.g. the input box) while mouse capture is on (which suppresses native selection) — points at the copy escape hatch.
 "tui.copy_hint" = "To copy text (including this input line): hold Shift and drag for your terminal's native selection, or run /mouse to turn mouse capture off. Pasting works as usual — the text is inserted as one block."
 "slash.redraw" = "screen repainted — cleared any stale or garbled cells"

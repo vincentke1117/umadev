@@ -2655,12 +2655,13 @@ struct ChatSessionTurn {
 }
 
 /// The path token of a tool call's raw input — the human-readable target shown in
-/// the tool row (file path / command / url / pattern). A self-contained mirror of
-/// the agent crate's internal `tool_call_target` (kept local so this TUI boundary
-/// does not reach into `umadev-agent` internals). Pure + fail-open: an input with
-/// none of the known keys renders an empty target.
+/// the tool row (file path / command / url / pattern / plan). A self-contained
+/// mirror of the agent crate's internal `tool_call_target` (kept local so this TUI
+/// boundary does not reach into `umadev-agent` internals). `plan` is included so an
+/// `ExitPlanMode` call's proposed plan text reaches the row instead of an empty
+/// target. Pure + fail-open: an input with none of the known keys renders empty.
 fn session_tool_target(input: &serde_json::Value) -> String {
-    for key in ["file_path", "path", "command", "url", "pattern"] {
+    for key in ["file_path", "path", "command", "url", "pattern", "plan"] {
         if let Some(s) = input.get(key).and_then(serde_json::Value::as_str) {
             return s.to_string();
         }
@@ -3312,6 +3313,14 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                         detail = q.summary();
                         sink.emit(EngineEvent::Note(umadev_agent::ask_question_note(&q)));
                         *pending_ask.lock().await = Some(q);
+                    } else if let Some(surface) = umadev_agent::exit_plan_surface(&name, &input) {
+                        // The base called its OWN `ExitPlanMode` — render the full plan
+                        // markdown as a Note labeled as the BASE's plan mode (not
+                        // UmaDev guarded). No relay/pending state: the user's next line
+                        // is a free-text approval that already flows through this same
+                        // session. Fail-open: no readable plan → None → the plain row.
+                        detail = surface.detail;
+                        sink.emit(EngineEvent::Note(surface.note));
                     }
                     // P1: forward the structured before/after for a Write/Edit so the
                     // TUI draws a live diff card on the reactive session path too.

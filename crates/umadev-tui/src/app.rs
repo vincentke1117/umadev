@@ -196,14 +196,12 @@ impl PickerStep {
 /// fails with a "prompt too long" (the reactive `BaseFailure::Context` remedy).
 pub(crate) const CONTEXT_NUDGE_PCT: u16 = 80;
 
-/// Estimate of the active base/model's context budget, used purely as the
-/// DENOMINATOR of the context-usage gauge — UmaDev owns no model, so this is
-/// never a hard limit it enforces (the base owns the real window).
-///
-/// Matched by lowercased substring so a version suffix or a `provider/model`
-/// prefix (opencode's `anthropic/claude-opus-4-8`) still resolves. `None` when
-/// nothing matches AND the backend has no safe default (offline / unknown) → the
-/// gauge then shows nothing rather than a fabricated denominator (fail-open).
+/// Legacy model-window lookup kept only as a narrow compatibility helper for
+/// callers that explicitly ask "do we know this model family?". The TUI no
+/// longer uses it as a live context-gauge denominator: UmaDev does not own the
+/// base model routing, and a hardcoded model table is worse than silence when it
+/// drifts. The rendered gauge uses only an exact `base_context_window` read from
+/// base configuration.
 #[must_use]
 pub(crate) fn context_window_estimate(backend_id: &str, model: &str) -> Option<u64> {
     // Normalize so a DOTTED table key (`claude-sonnet-4.5`) and the base's REAL
@@ -238,18 +236,8 @@ pub(crate) fn context_window_estimate(backend_id: &str, model: &str) -> Option<u
     if m.contains("o4-mini") || m.contains("o3") || m.contains("gpt-4") {
         return Some(128_000);
     }
-    // No usable model id (unset → the base runs its own default) → a safe
-    // per-backend default budget; unknown / offline base → nothing.
-    match backend_id {
-        // claude-code, and opencode (which commonly drives a Claude model), share
-        // the conservative Claude-family 200K floor — never regress it to 128K.
-        "claude-code" | "opencode" => Some(200_000),
-        // codex's login default is a GPT-5-codex model (400K window), so a codex
-        // session with no detected model id defaults to 400K rather than the old
-        // 128K guess (which under-counted the real window by >3x).
-        "codex" => Some(400_000),
-        _ => None,
-    }
+    let _ = backend_id;
+    None
 }
 
 /// Round `used / total` to a whole percent for the context-usage gauge. Clamped to
@@ -2749,6 +2737,10 @@ impl App {
         // surfaced from the first turn. Off by default; an external env override
         // (seeded into the flag at launch) wins.
         config.apply_process_logs();
+        // Publish the approval-question presentation preference (`/questions`) into
+        // the agent crate's shared flag, so the base `AskUserQuestion` notes honor
+        // it from the first turn. Default picker; opt into text via config/`/questions`.
+        config.apply_question_form();
         // Publish the project's Codex launch-sandbox choice (`.umadevrc`
         // `[codex] sandbox_mode`) into the codex driver's thread-safe shared
         // override so the driver honors it, mirroring the model-tier publish above.
@@ -5688,6 +5680,13 @@ impl App {
         Self::cmd("mouse", &[], None, CmdGroup::System, "tui.cmd.mouse"),
         Self::cmd("logs", &[], None, CmdGroup::System, "tui.cmd.logs"),
         Self::cmd(
+            "questions",
+            &[],
+            Some("text|picker"),
+            CmdGroup::System,
+            "tui.cmd.questions",
+        ),
+        Self::cmd(
             "redraw",
             &["repaint"],
             None,
@@ -6630,7 +6629,20 @@ impl App {
                 // flow). Stored alongside the gate card; the live panel renders it
                 // with a moving highlight, ↑↓/number keys drive it, and free-text
                 // stays available (typing a custom response still works).
-                self.gate_choice = resolved_choice;
+                //
+                // Text-question mode (`question_form = "text"`): suppress the numbered
+                // picker and instead frame the decision as prose the user answers in
+                // natural language. The free-text reply path (`classify_reply`) already
+                // turns their words into the decision, so nothing else changes.
+                if self.config.prefers_text_questions() {
+                    self.gate_choice = None;
+                    if let Some(choice) = resolved_choice.as_ref() {
+                        let prose = gate_choice_prose(choice, self.lang);
+                        self.push(ChatRole::UmaDev, prose);
+                    }
+                } else {
+                    self.gate_choice = resolved_choice;
+                }
                 self.gate_choice_sel = 0;
                 // Plan (read-only) tier: tell the user the run stops here by
                 // design and how to execute the plan once they're happy with it.
@@ -6883,11 +6895,10 @@ impl App {
             }
             EngineEvent::BaseModel { id } => {
                 // The base reported the EXACT model it resolved for this session (its
-                // `init` frame). Adopt it as the LIVE source of the context-gauge
-                // denominator so `context_window_tokens()` uses the real model window
-                // immediately — even when the user pinned nothing and the static
-                // config detection guessed a per-backend default. Fail-open: an empty
-                // id is ignored (keep whatever detection already found).
+                // `init` frame). Adopt it as the live display model. It is NOT used to
+                // infer the context window: a model-id table drifts, and the base may
+                // route to a third-party/local model whose real window UmaDev cannot
+                // prove. Fail-open: an empty id is ignored.
                 if !id.is_empty() {
                     self.base_model = Some(id);
                 }
@@ -8577,41 +8588,38 @@ impl App {
         }
     }
 
-    /// Best available estimate of the CURRENT context size (tokens the base is
-    /// carrying) — the NUMERATOR of the context-usage gauge. Prefers the base's
-    /// REAL last-turn input-token count (that IS roughly the context it just read);
-    /// falls back to a chars/4 estimate of the tracked working transcript (the
-    /// project-wide heuristic, via [`umadev_agent::compaction::transcript_tokens`])
-    /// before any usage has landed; `None` when there is nothing to show yet.
-    /// Pure read, fail-open.
+    /// Best available measurement of the CURRENT context size (tokens the base
+    /// just read) — the NUMERATOR of the context-usage gauge. This deliberately
+    /// uses only the base's real last-turn input-token report. A chars/4
+    /// transcript estimate is useful for compaction internals, but too indirect
+    /// for a UI gauge labelled "context", so the gauge stays hidden until usage
+    /// lands. Pure read, fail-open.
     #[must_use]
     pub(crate) fn context_used_tokens(&self) -> Option<u64> {
         if self.last_turn_input_tokens > 0 {
             return Some(self.last_turn_input_tokens);
         }
-        let est = umadev_agent::compaction::transcript_tokens(&self.conversation);
-        if est == 0 {
-            return None;
-        }
-        Some(u64::try_from(est).unwrap_or(u64::MAX))
+        None
     }
 
-    /// The context-window DENOMINATOR for the active base/model, or `None` when the
-    /// base is offline / unknown (the gauge then shows nothing). Pure read.
+    /// The context-window DENOMINATOR for the active base/model, or `None` when
+    /// neither the base config nor the base-reported model yields a precise value.
+    /// Pure read, fail-open.
     #[must_use]
     pub(crate) fn context_window_tokens(&self) -> Option<u64> {
-        // UmaDev owns no model and never pins one — the base runs its own. So the
-        // gauge denominator uses the exact base-configured window when present,
-        // then the detected model-name estimate, then the active backend's
-        // conservative default when the base runs on its login default. Pure read,
-        // no per-frame IO.
-        if let Some(total) = self.base_context_window {
-            return Some(total);
+        // Tier 1 — an EXACT window the base's own config exposes (today: OpenCode
+        // provider metadata). Most precise; use it verbatim.
+        if let Some(w) = self.base_context_window {
+            return Some(w);
         }
-        context_window_estimate(
-            self.backend.as_deref().unwrap_or(""),
-            self.base_model.as_deref().unwrap_or(""),
-        )
+        // Tier 2 — map the base-REPORTED model to its window. `base_model` now comes
+        // from the base itself (the session `init` frame, see `EngineEvent::BaseModel`),
+        // so it is authoritative — not a UmaDev guess — which makes a model→window
+        // table precise rather than a heuristic. An unknown / not-yet-reported model
+        // yields `None` (gauge stays hidden until the base reports it) instead of a
+        // wrong number: wrong precision is worse than no gauge.
+        let backend = self.backend.as_deref()?;
+        context_window_estimate(backend, self.base_model.as_deref().unwrap_or(""))
     }
 
     /// Current context occupancy as a whole percent (`used / window`), or `None`
@@ -9403,6 +9411,7 @@ impl App {
             "animations" => self.slash_toggle_animations(),
             "mouse" => self.slash_toggle_mouse(),
             "logs" => self.slash_logs(),
+            "questions" => self.slash_questions(rest),
             "redraw" => {
                 // Force a full repaint to recover from any accumulated render
                 // desync (stale cells / bled long lines). The event loop owns the
@@ -12458,6 +12467,35 @@ impl App {
         Action::None
     }
 
+    /// `/questions [text|picker]` — choose how approval questions (UmaDev's own
+    /// gate checkpoints AND the base's `AskUserQuestion`) are presented: `text`
+    /// frames the question + options as prose the user answers in natural language;
+    /// `picker` (the default) renders the numbered multiple-choice picker. With no
+    /// argument it TOGGLES between the two. The free-text reply path already works
+    /// either way — only the presentation changes. Persists so it survives a
+    /// restart, and publishes the agent-side flag live (picked up on the next turn).
+    fn slash_questions(&mut self, rest: &str) -> Action {
+        let arg = rest.trim().to_ascii_lowercase();
+        let to_text = match arg.as_str() {
+            "text" | "prose" | "free" => true,
+            "picker" | "menu" | "choice" => false,
+            // No / unknown argument → toggle the current preference.
+            _ => !self.config.prefers_text_questions(),
+        };
+        self.config.question_form = Some(if to_text { "text" } else { "picker" }.to_string());
+        // Publish the agent-side shared flag live (base AskUserQuestion notes) and
+        // persist so the choice survives a restart (fail-open on a write error).
+        self.config.apply_question_form();
+        let _ = crate::config::save_to(&self.config, &self.config_path);
+        let key = if to_text {
+            "slash.questions_text"
+        } else {
+            "slash.questions_picker"
+        };
+        self.push(ChatRole::System, umadev_i18n::t(self.lang, key));
+        Action::None
+    }
+
     fn slash_toggle_animations(&mut self) -> Action {
         let path = std::env::var("HOME")
             .map(|h| {
@@ -14064,6 +14102,24 @@ fn lev(a: &str, b: &str) -> usize {
     prev[m]
 }
 
+/// Render a structured gate [`GateChoice`] as PROSE for text-question mode: the
+/// localized question, its options as plain bullets (no numbered "pick a number"
+/// framing), and a hint to answer in natural language. Used when the user set
+/// `question_form = "text"` so the gate reads as a conversational question instead
+/// of a picker. The free-text reply path (`classify_reply`) already maps their
+/// words to the decision, so no picker is needed. Labels are localized via `t()`
+/// (an i18n key resolves; a literal passes through verbatim).
+fn gate_choice_prose(choice: &GateChoice, lang: umadev_i18n::Lang) -> String {
+    let mut s = umadev_i18n::t(lang, &choice.question).to_string();
+    for opt in &choice.options {
+        s.push_str("\n  - ");
+        s.push_str(umadev_i18n::t(lang, &opt.label));
+    }
+    s.push('\n');
+    s.push_str(umadev_i18n::t(lang, "question.text_hint"));
+    s
+}
+
 /// Build the multi-line card shown in chat history when a UmaDev gate
 /// pauses the pipeline. Lists exactly which artifacts are waiting for the
 /// user's eyes and which slash commands move it forward — so the user
@@ -14559,7 +14615,7 @@ mod tests {
     // ---- Context-usage gauge + proactive compaction nudge --------------------
 
     #[test]
-    fn context_window_table_returns_sane_denominators() {
+    fn context_window_table_has_no_backend_defaults() {
         // A bare Sonnet 4.x (dotted OR the base's real dashed id) is the DEFAULT
         // 200K family — 1M is the opt-in beta, reserved for the explicit marker.
         assert_eq!(
@@ -14604,15 +14660,14 @@ mod tests {
             Some(128_000)
         );
         assert_eq!(context_window_estimate("codex", "o4-mini"), Some(128_000));
-        // Unset model → the per-backend default budget: claude-code/opencode keep
-        // the 200K floor (never 128K); codex defaults to the GPT-5-codex 400K.
-        assert_eq!(context_window_estimate("claude-code", ""), Some(200_000));
-        assert_eq!(context_window_estimate("opencode", ""), Some(200_000));
-        assert_eq!(context_window_estimate("codex", ""), Some(400_000));
-        // An UNKNOWN model on claude-code falls back to the 200K floor, not 128K.
+        // Unset/unknown model → no denominator. The live TUI must not fabricate a
+        // per-backend context window when the base runs on its login/default model.
+        assert_eq!(context_window_estimate("claude-code", ""), None);
+        assert_eq!(context_window_estimate("opencode", ""), None);
+        assert_eq!(context_window_estimate("codex", ""), None);
         assert_eq!(
             context_window_estimate("claude-code", "totally-unknown-model"),
-            Some(200_000)
+            None
         );
         // Unknown / offline base with no usable model → nothing (fail-open).
         assert_eq!(context_window_estimate("offline", ""), None);
@@ -14620,17 +14675,18 @@ mod tests {
     }
 
     #[test]
-    fn base_model_engine_event_drives_context_gauge_live() {
+    fn base_model_engine_event_drives_display_and_context_window() {
         // The base reports its resolved model at session init (`EngineEvent::BaseModel`)
-        // → the gauge denominator switches to the REAL model window immediately, even
-        // when the user pinned nothing (fresh app: no detected model).
+        // → the UI records the real model for display AND maps it to that model's real
+        // context window. The reported id is authoritative (the base tells us exactly
+        // what it resolved), so the window is precise, not a guess.
         let mut app = fresh_app(Some("claude-code"));
         app.last_turn_input_tokens = 100_000;
         // Pin "user pinned nothing" deterministically — `fresh_app` would otherwise
         // inherit the dev host's ambient `~/.claude/settings.json` model.
         app.base_model = None;
-        // Before the init frame: the claude-code 200K per-backend floor.
-        assert_eq!(app.context_window_tokens(), Some(200_000));
+        // Before the init frame: no model reported, no exact configured window.
+        assert_eq!(app.context_window_tokens(), None);
         // A dashed real Sonnet id WITH the 1M-beta marker → 1M window, live.
         app.apply_engine(EngineEvent::BaseModel {
             id: "claude-sonnet-4-5-20250929[1m]".to_string(),
@@ -14640,14 +14696,15 @@ mod tests {
             Some("claude-sonnet-4-5-20250929[1m]")
         );
         assert_eq!(app.context_window_tokens(), Some(1_000_000));
-        // A dashed real Opus id resolves to 200K (NOT 1M) — the corrected bucket.
+        // A dashed real Opus id → 200K (Opus is NOT 1M).
         app.apply_engine(EngineEvent::BaseModel {
             id: "claude-opus-4-1-20250805".to_string(),
         });
         assert_eq!(app.context_window_tokens(), Some(200_000));
-        // Fail-open: an empty id is ignored, keeping the last good model.
+        // Fail-open: an empty id is ignored, keeping the last good model + window.
         app.apply_engine(EngineEvent::BaseModel { id: String::new() });
         assert_eq!(app.base_model.as_deref(), Some("claude-opus-4-1-20250805"));
+        assert_eq!(app.context_window_tokens(), Some(200_000));
     }
 
     #[test]
@@ -14664,22 +14721,32 @@ mod tests {
     #[test]
     fn context_gauge_computes_pct_from_last_turn_input_tokens() {
         let mut app = fresh_app(Some("claude-code"));
-        // Pin "no detected model" so this exercises the claude-code 200K default
-        // deterministically — `fresh_app` would otherwise inherit the dev host's
-        // ambient `~/.claude/settings.json` model (test isolation).
+        // Pin "no detected model/window" deterministically — `fresh_app` would
+        // otherwise inherit the dev host's ambient `~/.claude/settings.json` model
+        // (test isolation).
         app.base_model = None;
         // No usage and an empty transcript → nothing to show (fail-open).
         assert!(app.context_used_tokens().is_none());
         assert!(app.context_usage_pct().is_none());
-        // A known last-turn input count against the 200k Claude estimate → a sane %.
+        // A known last-turn input count alone is not enough: without an exact
+        // configured context window, the UI must hide the context gauge.
         app.last_turn_input_tokens = 50_000;
         assert_eq!(app.context_used_tokens(), Some(50_000));
+        assert_eq!(app.context_window_tokens(), None);
+        assert_eq!(app.context_usage_pct(), None);
+        // Exact provider/config metadata unlocks the denominator.
+        app.base_context_window = Some(200_000);
         assert_eq!(app.context_window_tokens(), Some(200_000));
         assert_eq!(app.context_usage_pct(), Some(25));
     }
 
     #[test]
-    fn context_gauge_uses_detected_base_model_window() {
+    fn context_gauge_infers_window_from_the_base_reported_model() {
+        // The base's model is authoritative (config-pinned here, or reported live
+        // via the session init frame → EngineEvent::BaseModel), so the gauge maps
+        // it to its real window instead of hiding — this is the whole point of the
+        // model-aware denominator: a codex login on a gpt-5.x model is 400K, so a
+        // 100K turn reads as 25%, not "unknown".
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
         std::fs::write(
@@ -14700,6 +14767,13 @@ mod tests {
         assert_eq!(app.base_model.as_deref(), Some("gpt-5.5"));
         assert_eq!(app.context_window_tokens(), Some(400_000));
         assert_eq!(app.context_usage_pct(), Some(25));
+        // A live init-frame model report overrides it (e.g. base resolved a Claude
+        // model) and the window follows immediately, no pin required.
+        app.base_model = Some("claude-sonnet-4-5-20250929".to_string());
+        assert_eq!(app.context_window_tokens(), Some(200_000));
+        // …and the 1M-context beta marker lifts it out of the 200K family.
+        app.base_model = Some("claude-sonnet-4-5-20250929[1m]".to_string());
+        assert_eq!(app.context_window_tokens(), Some(1_000_000));
     }
 
     #[test]
@@ -14748,9 +14822,10 @@ mod tests {
     #[test]
     fn compaction_nudge_fires_once_on_crossing_and_not_below() {
         let mut app = fresh_app(Some("claude-code"));
-        // Pin the deterministic 200K default (not the dev host's ambient `~/.claude`
-        // model) — the 80% crossing math below is written against a 200K denominator.
+        // Pin an exact configured 200K window — the nudge must not use backend/model
+        // defaults, but it should still work when the base exposes a real limit.
         app.base_model = None;
+        app.base_context_window = Some(200_000);
         let before = app.history.len();
         // Below the 80% threshold (100k/200k = 50%) → no nudge.
         app.last_turn_input_tokens = 100_000;
@@ -18938,6 +19013,42 @@ mod tests {
         let action = a.apply_key(KeyCode::Enter);
         assert_eq!(action, Action::Continue(Gate::DocsConfirm));
         assert!(a.gate_choice.is_none() && a.active_gate.is_none());
+    }
+
+    #[test]
+    fn text_question_mode_suppresses_gate_picker_default_still_shows_it() {
+        // Default (picker) mode: the numbered picker is armed (existing behavior,
+        // so users who never opt in are unaffected).
+        let mut picker = fresh_app(Some("offline"));
+        picker.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
+        assert!(
+            picker.gate_choice.is_some(),
+            "picker mode (the default) still arms the numbered picker"
+        );
+
+        // Text-question mode: the picker is SUPPRESSED and the gate is framed as
+        // prose the user answers in natural language (the free-text reply path is
+        // unchanged — only the presentation differs).
+        let mut text = fresh_app(Some("offline"));
+        text.config.question_form = Some("text".into());
+        let lang = text.lang;
+        let before = text.history.len();
+        text.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
+        assert_eq!(text.active_gate, Some(Gate::DocsConfirm));
+        assert!(
+            text.gate_choice.is_none(),
+            "text mode suppresses the numbered picker"
+        );
+        let hint = umadev_i18n::t(lang, "question.text_hint");
+        let framed = text
+            .history
+            .iter()
+            .skip(before)
+            .any(|m| m.body().contains(hint));
+        assert!(
+            framed,
+            "text mode frames the gate as prose with the answer-in-words hint"
+        );
     }
 
     #[test]

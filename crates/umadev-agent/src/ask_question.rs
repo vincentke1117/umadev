@@ -25,7 +25,33 @@
 //! Fail-open throughout: a non-question tool call, or an input shape we can't
 //! read, yields `None` and the caller keeps its existing tool-row rendering.
 
-use umadev_runtime::AskUserQuestion;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use umadev_runtime::{AskUserQuestion, ExitPlanMode};
+
+/// Process-global "the user prefers free-text (prose) approval questions over the
+/// numbered multiple-choice picker" flag. Published once at startup (and on a live
+/// `/questions` toggle) by the TUI from `UserConfig::question_form`, and read here
+/// when a base `AskUserQuestion` note is built — the note's three emit sites live
+/// deep in the run pumps (continuous / director loops) with no config in hand, so
+/// a set-once shared flag threads the preference the same way the process-log flag
+/// does. Deterministic given the flag; defaults `false` (the numbered picker), so
+/// existing users are unaffected until they opt in.
+static PREFER_TEXT_QUESTIONS: AtomicBool = AtomicBool::new(false);
+
+/// Publish the user's approval-question presentation preference: `true` = frame
+/// questions as free-text prose, `false` (default) = the numbered picker. Called
+/// by the TUI at startup and on the `/questions` toggle.
+pub fn set_prefer_text_questions(on: bool) {
+    PREFER_TEXT_QUESTIONS.store(on, Ordering::Relaxed);
+}
+
+/// Whether the user prefers free-text (prose) approval questions over the numbered
+/// picker (see [`set_prefer_text_questions`]). Default `false`.
+#[must_use]
+pub fn prefers_text_questions() -> bool {
+    PREFER_TEXT_QUESTIONS.load(Ordering::Relaxed)
+}
 
 /// The user-facing surface of a base `AskUserQuestion` call: the one-line
 /// tool-row `detail`, and a localized multi-line `note` that shows the question
@@ -36,6 +62,19 @@ pub struct AskQuestionSurface {
     /// One-line summary for the tool row's `(arg)` (never multi-line).
     pub detail: String,
     /// The prominent, localized multi-line prompt to emit as a `Note`.
+    pub note: String,
+}
+
+/// The user-facing surface of a base `ExitPlanMode` call: the one-line tool-row
+/// `detail` (the plan's first line, clipped) and a localized multi-line `note`
+/// that renders the full plan markdown under a header labeling it clearly as the
+/// **base's** plan mode — never conflated with UmaDev's own guarded banner.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExitPlanSurface {
+    /// One-line summary for the tool row's `(arg)` (never multi-line).
+    pub detail: String,
+    /// The prominent, localized multi-line note to emit (base-plan-mode header +
+    /// the full plan markdown).
     pub note: String,
 }
 
@@ -51,15 +90,60 @@ pub fn surface(name: &str, input: &serde_json::Value) -> Option<AskQuestionSurfa
     })
 }
 
-/// The localized prompt note: a header line + the neutral question/option block
-/// + a relay hint. Pure given the process locale.
+/// The localized prompt note: a header line + the question/option block + a hint.
+/// Presentation follows the user's [`prefers_text_questions`] preference — this
+/// thin wrapper reads the shared flag, then delegates to the pure
+/// [`note_for_with`].
 #[must_use]
 pub fn note_for(q: &AskUserQuestion) -> String {
+    note_for_with(q, prefers_text_questions())
+}
+
+/// The pure body of [`note_for`], parameterized on `prefer_text` so the framing is
+/// testable without the process-global flag.
+///
+/// - `false` (the default picker): header + the NUMBERED option block +
+///   "reply with the option number" relay hint.
+/// - `true` (text-question mode): header + the BULLETED option block (no numbered
+///   pick framing) + an "answer in your own words" hint. The reply still flows
+///   through the same relay path — only the presentation changes.
+#[must_use]
+pub fn note_for_with(q: &AskUserQuestion, prefer_text: bool) -> String {
     let mut s = umadev_i18n::tlf("ask.prompt.header", &[]);
     s.push('\n');
-    s.push_str(&q.prompt_block());
+    if prefer_text {
+        s.push_str(&q.prose_block());
+        s.push('\n');
+        s.push_str(&umadev_i18n::tlf("ask.prompt.text_hint", &[]));
+    } else {
+        s.push_str(&q.prompt_block());
+        s.push('\n');
+        s.push_str(&umadev_i18n::tlf("ask.prompt.relay_hint", &[]));
+    }
+    s
+}
+
+/// Build the [`ExitPlanSurface`] for a base tool call, or `None` when the call is
+/// not an `ExitPlanMode` / carries no readable `plan` text. Mirrors [`surface`]:
+/// fail-open, and the caller keeps its existing tool-row rendering on `None`.
+#[must_use]
+pub fn exit_plan_surface(name: &str, input: &serde_json::Value) -> Option<ExitPlanSurface> {
+    let p = ExitPlanMode::from_tool_input(name, input)?;
+    Some(ExitPlanSurface {
+        detail: p.summary(),
+        note: exit_plan_note(&p),
+    })
+}
+
+/// The localized note for a base `ExitPlanMode`: a header that labels it as the
+/// **base CLI's** plan mode (distinct from UmaDev's guarded banner) followed by
+/// the full plan markdown, so the user SEES the plan being approved. Pure given
+/// the process locale.
+#[must_use]
+pub fn exit_plan_note(p: &ExitPlanMode) -> String {
+    let mut s = umadev_i18n::tlf("plan_mode.base_exit", &[]);
     s.push('\n');
-    s.push_str(&umadev_i18n::tlf("ask.prompt.relay_hint", &[]));
+    s.push_str(&p.plan);
     s
 }
 
@@ -164,6 +248,51 @@ mod tests {
     fn surface_fails_open_for_non_question_tools() {
         let input = serde_json::json!({"file_path": "src/app.rs"});
         assert!(surface("Write", &input).is_none());
+    }
+
+    #[test]
+    fn note_for_with_text_mode_drops_numbers_and_invites_free_text() {
+        let q = sample();
+        // Picker (default): numbered options + the numeric relay hint.
+        let picker = note_for_with(&q, false);
+        assert!(picker.contains("1. Email + password"), "picker: {picker}");
+        // Text mode: bulleted options (no numeric pick framing) + a distinct hint.
+        let text = note_for_with(&q, true);
+        assert!(text.contains("- Email + password"), "text: {text}");
+        assert!(
+            !text.contains("1. Email + password"),
+            "text mode must drop the numbered picker framing: {text}"
+        );
+        assert_ne!(picker, text, "the two framings differ");
+    }
+
+    #[test]
+    fn exit_plan_surface_renders_the_plan_and_labels_it_base_plan_mode() {
+        let input = serde_json::json!({
+            "plan": "## Plan\n- Scaffold the API\n- Add auth\n- Wire the UI"
+        });
+        let s = exit_plan_surface("ExitPlanMode", &input).expect("ExitPlanMode has a surface");
+        // The tool-row detail is a real one-line summary, not a bare name.
+        assert!(!s.detail.is_empty());
+        assert!(!s.detail.contains('\n'));
+        // The note carries the ACTUAL plan text (not a bare "ExitPlanMode" stub).
+        assert!(s.note.contains("Scaffold the API"), "note: {}", s.note);
+        assert!(s.note.contains("Add auth"), "note: {}", s.note);
+        // It is labeled as the BASE's plan mode (the dedicated i18n key), so it is
+        // never conflated with UmaDev's own guarded banner.
+        let label = umadev_i18n::tl("plan_mode.base_exit");
+        assert!(
+            !label.is_empty(),
+            "the base-plan-mode label must be catalogued"
+        );
+        assert!(
+            s.note.contains(label),
+            "note must carry the base-plan-mode label: {}",
+            s.note
+        );
+        // Fail-open: a non-plan / empty-plan call has no dedicated surface.
+        assert!(exit_plan_surface("Write", &serde_json::json!({"file_path": "a"})).is_none());
+        assert!(exit_plan_surface("ExitPlanMode", &serde_json::json!({"plan": "  "})).is_none());
     }
 
     #[test]

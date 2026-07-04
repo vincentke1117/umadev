@@ -597,14 +597,30 @@ fn push_max_turns(args: &mut Vec<String>, max_turns: Option<u32>) {
 /// `acceptEdits` (write unattended); otherwise `default` (claude asks before
 /// each tool → a `NeedApproval` the orchestrator answers, the guarded
 /// human-in-the-loop tier). `UMADEV_CLAUDE_PERMISSION_MODE` overrides both.
+///
+/// **Guarded-tier awareness guard (labeling fix, not a lifecycle change).**
+/// UmaDev's Guarded tier drives the base through per-tool `NeedApproval` prompts
+/// and does NOT model the base's OWN plan mode. A stale or explicit
+/// `UMADEV_CLAUDE_PERMISSION_MODE=plan` on the guarded path would silently open the
+/// base in a plan mode UmaDev can't track — the base's `ExitPlanMode` would then
+/// surface under the wrong "guarded" framing. So a `plan` override is IGNORED for
+/// the guarded tier: Guarded always opens with the tracked `default`. Every other
+/// override, and the autonomous tier (including a `plan` override), is honored
+/// unchanged — this does not alter what UmaDev's `TrustMode::Plan` does (that tier
+/// stops the run at the docs/plan gate and is a separate mechanism entirely).
 fn claude_permission_mode(autonomous: bool) -> String {
-    std::env::var("UMADEV_CLAUDE_PERMISSION_MODE").unwrap_or_else(|_| {
-        if autonomous {
-            "acceptEdits".to_string()
-        } else {
-            "default".to_string()
+    let derived = if autonomous { "acceptEdits" } else { "default" };
+    match std::env::var("UMADEV_CLAUDE_PERMISSION_MODE") {
+        Ok(over) if !over.is_empty() => {
+            if !autonomous && over.eq_ignore_ascii_case("plan") {
+                // Guarded must never silently enter the base's untracked plan mode.
+                derived.to_string()
+            } else {
+                over
+            }
         }
-    })
+        _ => derived.to_string(),
+    }
 }
 
 /// The argument vector for a WRITABLE cross-session resume: re-open `session_id`
@@ -814,9 +830,9 @@ pub fn parse_stdout_line(line: &str) -> Vec<SessionEvent> {
                 "inbound base system message"
             );
             // The session `init` frame carries the EXACT model claude resolved for
-            // this session (e.g. `claude-sonnet-4-5-20250929`) — the authoritative
-            // denominator for the context-usage gauge. Surface it ONCE as a
-            // `SessionModel` event so the TUI stops guessing a per-backend default;
+            // this session (e.g. `claude-sonnet-4-5-20250929`). Surface it ONCE as a
+            // `SessionModel` event so the TUI can display the real driving model;
+            // context-window capacity still requires explicit base/provider config.
             // the control flow is untouched (still no event for any other system
             // frame). Fail-open: a missing / non-string / empty `model`, or any
             // non-init system frame, yields no event exactly as before.
@@ -1096,8 +1112,10 @@ fn summarize_tool_content(content: Option<&Value>) -> String {
 }
 
 /// A short, human-readable target for an approval prompt (file path / command).
+/// Includes `plan` so an `ExitPlanMode` approval shows the proposed plan text
+/// instead of a bare "ExitPlanMode" / truncated JSON blob.
 fn summarize_input(input: &Value) -> String {
-    for key in ["file_path", "path", "command", "pattern", "url"] {
+    for key in ["file_path", "path", "command", "pattern", "url", "plan"] {
         if let Some(s) = input.get(key).and_then(Value::as_str) {
             return s.to_string();
         }
@@ -1141,6 +1159,13 @@ fn new_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the tests that MUTATE `UMADEV_CLAUDE_PERMISSION_MODE` against the
+    /// ones that ASSERT the env-derived permission mode. The process env is global,
+    /// so without this a concurrent test could observe another's mid-test `set_var`
+    /// and read the wrong permission mode. Held only by the setter test and the
+    /// env-dependent reader tests (others don't assert the derived value).
+    static PERM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvRestore {
         key: &'static str,
@@ -1280,6 +1305,11 @@ mod tests {
     /// answers, so the human-in-the-loop / irreversible-action floor is live).
     #[test]
     fn session_args_permission_mode_tracks_autonomy() {
+        // This test MUTATES the shared permission-mode env; serialize it against the
+        // env-dependent reader tests so a concurrent read can't see a mid-test value.
+        let _lock = PERM_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Guard against the env override leaking in from a sibling process.
         let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
 
@@ -1298,14 +1328,45 @@ mod tests {
             "guarded → default (claude asks → NeedApproval, human in the loop)"
         );
 
-        // The explicit override beats the derived default for either tier.
+        // The explicit override beats the derived default for the AUTONOMOUS tier.
         std::env::set_var("UMADEV_CLAUDE_PERMISSION_MODE", "plan");
         let overridden = session_args("sid-o", None, true, None);
         let o_idx = overridden
             .iter()
             .position(|a| a == "--permission-mode")
             .unwrap();
-        assert_eq!(overridden[o_idx + 1], "plan", "env override wins");
+        assert_eq!(
+            overridden[o_idx + 1],
+            "plan",
+            "env override wins (autonomous)"
+        );
+
+        // Guarded-tier awareness guard: a `plan` override on the GUARDED tier is
+        // ignored so UmaDev's Guarded never silently enters the base's untracked
+        // plan mode — it opens with the tracked `default` instead.
+        let guarded_plan = session_args("sid-gp", None, false, None);
+        let plan_pos = guarded_plan
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .unwrap();
+        assert_eq!(
+            guarded_plan[plan_pos + 1],
+            "default",
+            "guarded ignores a `plan` override (base plan mode is untracked in guarded)"
+        );
+
+        // A non-`plan` override still wins on the guarded tier (only `plan` is guarded).
+        std::env::set_var("UMADEV_CLAUDE_PERMISSION_MODE", "acceptEdits");
+        let guarded_accept = session_args("sid-ga", None, false, None);
+        let accept_pos = guarded_accept
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .unwrap();
+        assert_eq!(
+            guarded_accept[accept_pos + 1],
+            "acceptEdits",
+            "a non-plan override is honored on the guarded tier"
+        );
     }
 
     #[test]
@@ -1314,6 +1375,10 @@ mod tests {
         // `--resume <id>` and must NOT branch it (`--fork-session`) nor mint a fresh
         // `--session-id`. The write toolset + stream-json flags match a fresh start,
         // so the resumed session writes files identically — it just inherits context.
+        // Asserts the env-derived permission mode → serialize against the setter test.
+        let _lock = PERM_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
 
         let args = resume_session_args("sid-resume", Some("be terse"), true, None);
@@ -1545,7 +1610,7 @@ mod tests {
     #[test]
     fn init_frame_yields_session_model_and_is_fail_open() {
         // The session `init` frame carries the EXACT resolved model — surfaced ONCE
-        // as a `SessionModel` event so the context gauge stops guessing a default.
+        // as a `SessionModel` event so the UI can display the real driving model.
         let init = r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-sonnet-4-5-20250929","tools":["Bash"]}"#;
         assert_eq!(
             parse_stdout_line(init),
@@ -1554,8 +1619,8 @@ mod tests {
             )],
             "init frame's model id flows through to a SessionModel event"
         );
-        // Fail-open: an init frame with no `model` field yields no event (the gauge
-        // then falls back to its static estimate exactly as before).
+        // Fail-open: an init frame with no `model` field yields no event (the UI
+        // simply keeps its prior display model, if any).
         let no_model = r#"{"type":"system","subtype":"init","session_id":"s1"}"#;
         assert!(
             parse_stdout_line(no_model).is_empty(),

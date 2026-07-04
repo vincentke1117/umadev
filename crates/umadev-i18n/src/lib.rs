@@ -454,6 +454,7 @@ mod tests {
             "slash.logs_on",
             "slash.logs_off",
             "tui.cmd.logs",
+            "tui.cmd.questions",
             "spec.overlay_title",
             "doctor.heading",
             "doctor.binary",
@@ -656,6 +657,16 @@ mod tests {
             // surfaced (not a bare stub) and the user's reply is relayed back.
             "ask.prompt.header",
             "ask.prompt.relay_hint",
+            // Text-question mode (`question_form = text`): the base question + a
+            // UmaDev gate are framed as prose the user answers in natural language.
+            "ask.prompt.text_hint",
+            "question.text_hint",
+            // The base CLI's OWN plan mode (ExitPlanMode) — labeled distinctly from
+            // UmaDev's guarded tier so the two approval systems aren't conflated.
+            "plan_mode.base_exit",
+            // `/questions text|picker` toggle confirmations.
+            "slash.questions_text",
+            "slash.questions_picker",
             // Blocked-run resolution: the per-blocker suggested fix (the seat's "how
             // to fix" surfaced to the user) and the what-to-do-next hint rendered in
             // the team-review panel when the team raised must-fix findings.

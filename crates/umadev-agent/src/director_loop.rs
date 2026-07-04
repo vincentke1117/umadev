@@ -3675,6 +3675,13 @@ async fn drive_one_turn_with_backoff(
                 if let Some(surface) = crate::ask_question::surface(&name, &input) {
                     detail = surface.detail;
                     events.emit(EngineEvent::Note(surface.note));
+                } else if let Some(surface) = crate::ask_question::exit_plan_surface(&name, &input)
+                {
+                    // The base called its OWN `ExitPlanMode` — surface the full plan
+                    // markdown as a Note labeled as the BASE's plan mode (distinct
+                    // from UmaDev guarded). Fail-open: no readable plan → plain row.
+                    detail = surface.detail;
+                    events.emit(EngineEvent::Note(surface.note));
                 }
                 record_tool_call_audit(options, &name, &detail);
                 // P1: forward the structured before/after for a Write/Edit so the
@@ -3888,8 +3895,10 @@ fn record_tool_call_audit(options: &RunOptions, name: &str, target: &str) {
 
 /// Best-effort human-readable target of a base tool call (a file path / command)
 /// for the live tool row — fail-open to an empty string on any unexpected shape.
+/// Includes `plan` so an `ExitPlanMode` call's proposed plan text reaches the row
+/// instead of an empty target (the dedicated surface then supersedes it).
 fn tool_call_target(input: &serde_json::Value) -> String {
-    for key in ["file_path", "path", "command", "url", "pattern"] {
+    for key in ["file_path", "path", "command", "url", "pattern", "plan"] {
         if let Some(s) = input.get(key).and_then(serde_json::Value::as_str) {
             return s.to_string();
         }

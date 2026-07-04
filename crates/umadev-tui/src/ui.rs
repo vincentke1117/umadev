@@ -4044,13 +4044,13 @@ fn token_gauge_text(app: &App) -> Option<String> {
 /// context is *right now* (distinct from the cumulative-spend gauge above), so
 /// the user can see when `/compact` is due instead of only learning it when the
 /// base fails. NUMERATOR: the base's real last-turn input tokens (the context it
-/// just read), or a chars/4 transcript estimate before any usage lands.
-/// DENOMINATOR: a conservative per-base/per-model context-window estimate — see
-/// [`crate::app::context_window_estimate`]. Renders `ctx 34k/200k · 17%`.
+/// just read). DENOMINATOR: an exact context window from the base's own config when
+/// it exposes one (OpenCode), else the window mapped from the base-REPORTED model
+/// (`EngineEvent::BaseModel`, authoritative). Renders `ctx 34k/200k · 17%`.
 ///
 /// Fail-open: `None` (show nothing) when there is no usage/transcript yet or the
-/// model is unknown, so a fresh session or an unrecognised base never shows a
-/// fabricated or wrong number — honest over decorative, matching the spend gauge.
+/// model/window is unknown, so a fresh session or an unrecognised base never shows
+/// a fabricated or wrong number — honest over decorative, matching the spend gauge.
 fn context_gauge_text(app: &App) -> Option<String> {
     let used = app.context_used_tokens()?;
     let total = app.context_window_tokens()?;
@@ -4064,6 +4064,15 @@ fn context_gauge_text(app: &App) -> Option<String> {
             &pct.to_string(),
         ],
     ))
+}
+
+fn model_meta_text(app: &App) -> Option<String> {
+    let model = app.base_model.as_deref()?.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let shown = truncate_to_width(model, 36);
+    Some(umadev_i18n::tf(app.lang, "tui.meta.model", &[&shown]))
 }
 
 /// Build ONE transcript message into its [`RenderedRow`]s — the per-message
@@ -5680,24 +5689,23 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     } else if app.input.starts_with('/') {
         umadev_i18n::t(app.lang, "tui.hint.palette").into()
     } else if let Some(gate) = app.active_gate {
-        return meta_row(
-            frame,
-            prompt_chunks[1],
-            border_color,
-            &[
-                (
-                    umadev_i18n::tf(app.lang, "tui.hint.gate_tag", &[gate.id_str()]),
-                    theme::WARNING(),
-                ),
-                (
-                    umadev_i18n::t(app.lang, "tui.hint.gate_action").into(),
-                    theme::TEXT_MUTED(),
-                ),
-                ("· ".into(), theme::BORDER()),
-                (backend.into(), theme::TEXT_MUTED()),
-            ],
-            status,
-        );
+        let mut gate_parts = vec![
+            (
+                umadev_i18n::tf(app.lang, "tui.hint.gate_tag", &[gate.id_str()]),
+                theme::WARNING(),
+            ),
+            (
+                umadev_i18n::t(app.lang, "tui.hint.gate_action").into(),
+                theme::TEXT_MUTED(),
+            ),
+            ("· ".into(), theme::BORDER()),
+            (backend.into(), theme::TEXT_MUTED()),
+        ];
+        if let Some(model) = model_meta_text(app) {
+            gate_parts.push(("·".into(), theme::BORDER()));
+            gate_parts.push((model, theme::TEXT_MUTED()));
+        }
+        return meta_row(frame, prompt_chunks[1], border_color, &gate_parts, status);
     } else if app.input.contains('\n') {
         umadev_i18n::t(app.lang, "tui.hint.multiline").into()
     } else if !app.input.is_empty() {
@@ -5735,6 +5743,10 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         ("·".into(), theme::BORDER()),
         (mode_chip.into(), mode_color),
     ];
+    if let Some(model) = model_meta_text(app) {
+        parts.push(("·".into(), theme::BORDER()));
+        parts.push((model, theme::TEXT_MUTED()));
+    }
     // Compact background-run chip — the active mutating run surfaced as a
     // manageable task, so a `/run` reads as a steerable background task (`/tasks`
     // to manage) rather than a modal lock-out. `[run X/Y]` once a plan posts, else
@@ -8218,6 +8230,23 @@ mod tests {
             token_gauge_text(&app).is_none(),
             "no gauge before any usage"
         );
+    }
+
+    #[test]
+    fn meta_row_shows_model_and_the_model_derived_context_window() {
+        let mut app = app_with(Some("claude-code"));
+        app.lang = umadev_i18n::Lang::ZhCn;
+        app.base_model = Some("claude-sonnet-4-5-20250929".to_string());
+        app.base_context_window = None;
+        app.last_turn_input_tokens = 2_500;
+
+        let out = render_chat_to_string(&app, 110, 16);
+        let compact = out.replace(' ', "");
+        // The real base-reported model name is shown…
+        assert!(compact.contains("模型claude-sonnet-4-5-20250929"), "{out}");
+        // …and that authoritative id maps to its real 200K window (Sonnet 4.5 with
+        // no 1M-beta marker), so the gauge renders a precise denominator (2.5K/200K).
+        assert!(compact.contains("上下文2.5K/200K"), "{out}");
     }
 
     // --- Pre-fold de-scramble fix ---
