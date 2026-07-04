@@ -13,7 +13,8 @@
 //! clauses = ["UD-ARCH-002"]   # e.g. allow console.log in this project
 //!
 //! # Paths the host may write even though a rule would otherwise block them.
-//! # Globs supported via simple suffix/substring match (see PathExclusion).
+//! # Anchored, segment-aware globs: `**` = any path segments, `*` = any chars
+//! # within one segment, and a bare suffix like `.test.ts` matches by ends_with.
 //! [exclusions]
 //! paths = ["src/legacy/**", "**/*.test.ts"]
 //!
@@ -23,13 +24,32 @@
 //! ```
 //!
 //! ## Resolution
-//! - Missing file → all defaults (everything on, no exclusions).
-//! - Unparseable file → fail-open (all defaults) so a typo never blocks work.
+//! - Missing file → all defaults (everything on, no exclusions); silent.
+//! - Unparseable file → falls back to defaults (all rules ON) **and emits a
+//!   loud stderr diagnostic**. This is safe-by-default, but note it is STRICTER
+//!   than a user who had disabled clauses / excluded paths intended — so we
+//!   never do it silently. A bare fall-back would silently re-enable rules the
+//!   user turned off (fail-closed vs their on-disk intent) with no signal; the
+//!   warning tells the user their overrides were ignored until they fix the
+//!   TOML. Governance itself stays fail-open — `load` never returns an error
+//!   that could block the host, and the honest, visible default is to enforce.
 //! - The policy is loaded once per hook invocation (it's a short-lived
 //!   process); the agent runner caches it for the pipeline lifetime.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+/// Why a policy load did not yield a parsed user policy. Lets the loader tell a
+/// missing file (silent default) apart from a present-but-broken file (default
+/// + loud diagnostic, so the user's ignored overrides are never invisible).
+#[derive(Debug)]
+enum PolicyLoadError {
+    /// The file could not be read (absent or unreadable) — a silent default is
+    /// the correct, expected behavior.
+    Missing,
+    /// The file was read but is not valid TOML; the string is the parser error.
+    Parse(String),
+}
 
 /// Per-project governance policy loaded from `.umadev/rules.toml`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -72,20 +92,56 @@ pub struct ExtraSection {
 impl Policy {
     /// Load the policy from `<project_root>/.umadev/rules.toml`.
     /// Fail-open: a missing or unparseable file returns the default policy
-    /// (everything enabled) so the host is never blocked by a config error.
+    /// (everything enabled) so the host is never blocked by a config error. A
+    /// present-but-unparseable file additionally emits a loud stderr diagnostic
+    /// (see [`Policy::load_from`]) so the user's overrides are never silently
+    /// dropped.
     #[must_use]
     pub fn load(project_root: &Path) -> Self {
         let path = project_root.join(".umadev").join("rules.toml");
         Self::load_from(&path)
     }
 
-    /// Load from an explicit path. Fail-open on any error.
+    /// Load from an explicit path. Fail-open on any error, but **honest** about
+    /// a broken file: a missing file returns the default policy silently, while
+    /// a file that exists but does not parse falls back to the default policy
+    /// (all rules ON) AND writes a warning to stderr naming the file and the
+    /// parse error. That matters because the default is STRICTER than a user who
+    /// disabled clauses / excluded paths — silently swapping their relaxed
+    /// policy for the strict default on a TOML typo would be fail-closed against
+    /// their intent, with no way to notice. The warning makes the ignore
+    /// visible so they can fix it; governance never blocks the host on this.
     #[must_use]
     pub fn load_from(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_default(),
-            Err(_) => Self::default(),
+        match Self::try_load_from(path) {
+            Ok(policy) => policy,
+            Err(PolicyLoadError::Missing) => Self::default(),
+            Err(PolicyLoadError::Parse(msg)) => {
+                eprintln!(
+                    "UmaDev governance: could not parse {} ({msg}); IGNORING your \
+                     rules.toml overrides and enforcing ALL default rules. Any \
+                     disabled clauses / path exclusions are OFF until you fix the \
+                     TOML.",
+                    path.display()
+                );
+                Self::default()
+            }
         }
+    }
+
+    /// Read + parse the policy file, distinguishing "no file" (a legitimate,
+    /// silent default) from "file present but unparseable" (the honest signal
+    /// that the user's on-disk intent is being ignored, so the caller can warn).
+    /// The public [`Policy::load_from`] wraps this; it is split out so the
+    /// distinction is unit-testable without capturing stderr.
+    ///
+    /// # Errors
+    /// [`PolicyLoadError::Missing`] when the file can't be read (absent /
+    /// unreadable); [`PolicyLoadError::Parse`] when it reads but is not valid
+    /// TOML (message carries the parser error).
+    fn try_load_from(path: &Path) -> Result<Self, PolicyLoadError> {
+        let text = std::fs::read_to_string(path).map_err(|_| PolicyLoadError::Missing)?;
+        toml::from_str(&text).map_err(|e| PolicyLoadError::Parse(e.to_string()))
     }
 
     /// Write the default policy template to `<project_root>/.umadev/rules.toml`
@@ -142,42 +198,84 @@ impl Policy {
     }
 }
 
-/// Simple glob matcher supporting `**` (any segments) and `*` (any chars
-/// within a path). Falls back to `ends_with` for bare suffix patterns.
-/// Conservative: `*` here is treated like `**` (match any substring) — the
-/// distinction between "one segment" and "any segments" rarely matters for
-/// governance exclusions and the lenient match avoids false negatives that
-/// would surprise users.
+/// Anchored, segment-aware glob matcher. Matching happens over `/`-split path
+/// segments so a pattern only excludes what it structurally targets — NOT any
+/// path that merely CONTAINS the fragment:
+/// - `**` matches zero or more whole path segments.
+/// - `*` matches any run of characters within a SINGLE segment (never `/`).
+/// - all other characters match literally, and the pattern is anchored to the
+///   FULL path (so `src/legacy/**` matches `src/legacy/x` but NOT
+///   `other/src/legacy/x`, `x/src/legacy`, or `src/legacy-ish/x`).
+///
+/// A bare pattern with no `/` and no `*` (a plain suffix like `.test.ts`) keeps
+/// the historical `ends_with` semantics, so `.test.ts` still excludes
+/// `src/foo.test.ts`. Everything else goes through the anchored segment match.
 fn glob_match(pattern: &str, path: &str) -> bool {
-    let mut pat = pattern.replace('\\', "/");
-    // `**/` means "zero or more leading path segments" — so `**/*.test.ts`
-    // matches both `src/foo.test.ts` AND `foo.test.ts`. Drop it entirely.
-    while pat.contains("**/") {
-        pat = pat.replace("**/", "");
+    let pat = pattern.replace('\\', "/");
+    let path = path.replace('\\', "/");
+    // Bare suffix pattern (no slash, no wildcard): historical ends_with match.
+    if !pat.contains('/') && !pat.contains('*') {
+        return path == pat || path.ends_with(&pat);
     }
-    // `/**` means "zero or more trailing segments" — drop the suffix match.
-    while pat.contains("/**") {
-        pat = pat.replace("/**", "");
-    }
-    // Remaining `**` → `*`.
-    while pat.contains("**") {
-        pat = pat.replace("**", "*");
-    }
-    if pat.contains('*') {
-        let parts: Vec<&str> = pat.split('*').collect();
-        let mut search_from = 0;
-        for part in parts {
-            if part.is_empty() {
-                continue;
-            }
-            match path[search_from..].find(part) {
-                Some(idx) => search_from += idx + part.len(),
-                None => return false,
-            }
+    let pattern_segments: Vec<&str> = pat.split('/').collect();
+    let target_segments: Vec<&str> = path.split('/').collect();
+    glob_match_segments(&pattern_segments, &target_segments)
+}
+
+/// Match `/`-split pattern segments against `/`-split path segments, honoring
+/// `**` (zero or more whole segments) anchored to the full path. Recursion is
+/// bounded by the segment counts (short, fixed exclusion lists), so this is
+/// cheap and terminates.
+fn glob_match_segments(pat: &[&str], path: &[&str]) -> bool {
+    let Some((&seg, rest)) = pat.split_first() else {
+        // Pattern exhausted → match iff the path is also exhausted (anchored).
+        return path.is_empty();
+    };
+    if seg == "**" {
+        // `**` matches zero or more whole segments: trailing `**` matches
+        // anything remaining; otherwise try consuming 0..=path.len() segments.
+        if rest.is_empty() {
+            return true;
         }
-        return true;
+        return (0..=path.len()).any(|skip| glob_match_segments(rest, &path[skip..]));
     }
-    path == pat || path.ends_with(&pat) || path.contains(&pat)
+    match path.split_first() {
+        Some((&first, path_rest)) if segment_match(seg, first) => {
+            glob_match_segments(rest, path_rest)
+        }
+        _ => false,
+    }
+}
+
+/// Match a single path segment against a single pattern segment where `*` is a
+/// wildcard for any run of characters WITHIN the segment (it never crosses a
+/// `/`, since segments are already split). Anchored: the whole segment must be
+/// consumed. Standard iterative wildcard match with backtracking.
+fn segment_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0_usize, 0_usize);
+    let (mut star, mut mark) = (None, 0_usize);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// The default `.umadev/rules.toml` template written by `init`.
@@ -227,6 +325,50 @@ mod tests {
     }
 
     #[test]
+    fn try_load_distinguishes_missing_parse_and_ok() {
+        // Missing file → Missing (silent default), NOT a parse error.
+        assert!(matches!(
+            Policy::try_load_from(Path::new("/nonexistent/rules.toml")),
+            Err(PolicyLoadError::Missing)
+        ));
+
+        // Present-but-broken file → Parse (so the loader can warn, honest about
+        // ignoring the user's on-disk intent).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bad = tmp.path().join("bad.toml");
+        std::fs::write(&bad, "this is not {{{ valid toml").unwrap();
+        assert!(matches!(
+            Policy::try_load_from(&bad),
+            Err(PolicyLoadError::Parse(_))
+        ));
+
+        // Valid file → Ok with the parsed overrides intact.
+        let good = tmp.path().join("good.toml");
+        std::fs::write(&good, "[disabled]\nclauses=[\"UD-ARCH-002\"]\n").unwrap();
+        let parsed = Policy::try_load_from(&good).expect("valid toml parses");
+        assert!(parsed.is_disabled("UD-ARCH-002"));
+    }
+
+    #[test]
+    fn broken_file_falls_back_to_strict_default_not_user_intent() {
+        // A user who disabled a clause but then introduced a TOML typo must NOT
+        // silently keep the disable (that would be fail-closed against the rest
+        // of their intent in a confusing way): the broken file yields the strict
+        // default (rule ON) — the accompanying stderr warning is what keeps this
+        // honest. Here we assert the resolved policy is the strict default.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("rules.toml");
+        std::fs::write(
+            &path,
+            "[disabled]\nclauses = [\"UD-ARCH-002\"   # missing closing bracket\n",
+        )
+        .unwrap();
+        let p = Policy::load_from(&path);
+        assert!(!p.is_disabled("UD-ARCH-002"));
+        assert!(!p.is_excluded("src/whatever.ts"));
+    }
+
+    #[test]
     fn disables_clause_case_insensitive() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("rules.toml");
@@ -272,6 +414,59 @@ mod tests {
             ..Default::default()
         };
         assert!(p.is_excluded("src/foo.test.ts"));
+    }
+
+    #[test]
+    fn glob_does_not_over_exclude_unrelated_paths() {
+        // The old `contains()` glob excluded ANY path that merely contained the
+        // fragment — turning governance silently OFF for unrelated files. The
+        // anchored, segment-aware match must exclude ONLY what `src/legacy/**`
+        // structurally targets.
+        let p = Policy {
+            exclusions: ExclusionsSection {
+                paths: vec!["src/legacy/**".into()],
+            },
+            ..Default::default()
+        };
+        // Genuinely under src/legacy → excluded.
+        assert!(p.is_excluded("src/legacy/old.ts"));
+        assert!(p.is_excluded("src/legacy/a/b/c.ts"));
+        // Merely CONTAIN the fragment but are NOT under src/legacy → NOT excluded.
+        assert!(!p.is_excluded("other/src/legacy/x.ts"));
+        assert!(!p.is_excluded("x/src/legacy"));
+        assert!(!p.is_excluded("src/legacy-ish/x.ts"));
+        assert!(!p.is_excluded("app/src/legacyfoo.ts"));
+        assert!(!p.is_excluded("prefix-src/legacy/x.ts"));
+    }
+
+    #[test]
+    fn glob_single_star_stays_within_one_segment() {
+        // `*` matches within a single path segment and must NOT cross `/`.
+        let p = Policy {
+            exclusions: ExclusionsSection {
+                paths: vec!["src/*.ts".into()],
+            },
+            ..Default::default()
+        };
+        assert!(p.is_excluded("src/app.ts"));
+        assert!(p.is_excluded("src/deep.component.ts"));
+        // A nested file is a different structure — a single `*` must not match.
+        assert!(!p.is_excluded("src/sub/app.ts"));
+        assert!(!p.is_excluded("src/app.tsx"));
+    }
+
+    #[test]
+    fn glob_double_star_matches_zero_leading_segments() {
+        // `**/…` must match with zero leading segments too (regression guard).
+        let p = Policy {
+            exclusions: ExclusionsSection {
+                paths: vec!["**/node_modules/**".into()],
+            },
+            ..Default::default()
+        };
+        assert!(p.is_excluded("node_modules/x/index.js"));
+        assert!(p.is_excluded("packages/a/node_modules/x/index.js"));
+        assert!(!p.is_excluded("src/node_modules_helper.ts"));
     }
 
     #[test]

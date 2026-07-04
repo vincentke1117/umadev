@@ -1177,6 +1177,16 @@ pub fn check_sensitive_path(file_path: &str, _content: &str) -> Decision {
 /// can confidently identify as dangerous.
 #[must_use]
 pub fn check_dangerous_bash(command: &str) -> Decision {
+    // Equivalent-form-robust structured floor FIRST. The fixed substring table
+    // below only matches ONE spelling of each verb, so alternate flag
+    // orders/spellings (`rm -fr /`, `rm -rf -- /`, `rm --recursive --force /`),
+    // a `git -C <dir>` global-option prefix before `push`, or `git clean -fdx`
+    // slip straight past it. Tokenize + match on intent so those equivalents
+    // can't bypass the floor. Fail-open: `None` → fall through to the table.
+    if let Some(decision) = check_dangerous_bash_structured(command) {
+        return decision;
+    }
+
     // Normalize: collapse runs of whitespace so `rm  -rf` and `rm\t-rf` match.
     let collapsed: String = command.split_whitespace().collect::<Vec<_>>().join(" ");
     let lower = collapsed.to_ascii_lowercase();
@@ -1284,6 +1294,278 @@ fn rm_target_is_catastrophic(lower: &str, trigger: &str) -> bool {
         // A continuing path char (`/tmp`, `~bar`) — a subpath, not root.
         _ => false,
     }
+}
+
+/// **UD-SEC-002** (equivalent-form-robust floor): match destructive INTENT for
+/// the highest-risk verbs so alternate spellings/flag orders can't bypass the
+/// fixed [`DESTRUCTIVE_BASH_PATTERNS`] substring table. Tokenizes each shell
+/// segment and matches:
+/// - a recursive+force `rm` at a catastrophic root — any flag order/spelling
+///   (`-rf`, `-fr`, `-r -f`, `-f -r`, `--recursive --force`), a `--`
+///   end-of-options separator, targeting `/`, `~`, `$HOME`, or a wildcard
+///   directly under one;
+/// - `git push` even behind a `git -C <dir>` / `-c k=v` / `--git-dir=…`
+///   global-option prefix that the `git push` substring can't see;
+/// - a forced `git clean` (`-fd`/`-fdx`/`-xdf`/`--force -d`) in any flag order.
+///
+/// In-tree targets (`./build`, `target/`) stay allowed — this only closes the
+/// ROOT / equivalent-form bypass, preserving the existing in-tree-vs-root
+/// policy. Returns `Some(block)` on a catastrophic match, else `None` (fall
+/// through to the substring table). Fail-open: any parse ambiguity yields
+/// `None` and never blocks a benign command.
+fn check_dangerous_bash_structured(command: &str) -> Option<Decision> {
+    for segment in shell_segments(command) {
+        let tokens = tokenize_segment(&segment);
+        if tokens.is_empty() {
+            continue;
+        }
+        if catastrophic_rm(&tokens) {
+            return Some(Decision::block(
+                "UD-SEC-002",
+                "UmaDev: destructive command blocked (UD-SEC-002). This is a \
+                 recursive, forced `rm` targeting the filesystem root or the \
+                 home directory — every equivalent form is caught (`-rf`, \
+                 `-fr`, `-r -f`, `--recursive --force`, and `--` separators). \
+                 fix: scope the deletion to a project-local directory, e.g. \
+                 `rm -rf ./build` or `rm -rf target/`.",
+            ));
+        }
+        if git_push_behind_globals(&tokens) {
+            return Some(Decision::block(
+                "UD-SEC-002",
+                "UmaDev: destructive command blocked (UD-SEC-002). `git push` \
+                 reaches a remote and (per UmaDev's trust contract) UmaDev never \
+                 auto-pushes — this holds even behind a `git -C <dir>` or other \
+                 global-option prefix. fix: let the user run the push, or use \
+                 `git push --dry-run` to inspect.",
+            ));
+        }
+        if git_force_clean(&tokens) {
+            return Some(Decision::block(
+                "UD-SEC-002",
+                "UmaDev: destructive command blocked (UD-SEC-002). `git clean \
+                 -f…` irreversibly deletes untracked files (and with `-d`/`-x`, \
+                 whole untracked directories and ignored files) in any flag \
+                 order. fix: inspect first with `git clean -n` (dry run), then \
+                 remove only what you mean to.",
+            ));
+        }
+    }
+    None
+}
+
+/// Split a command line into top-level segments on the common shell separators
+/// (`;`, `&&`, `||`, `|`, `&`, newline, and `(`/`)` subshell boundaries). This
+/// isolates each invocation so a dangerous verb chained after a benign one
+/// (`echo hi && rm -rf /`) is still seen, and a benign subpath rm in one
+/// segment (`cd /tmp && rm -rf build`) is judged on its own. Lightweight: it
+/// does not fully honour quoting, which is fine for the intent match — the
+/// substring table still backstops any odd split.
+fn shell_segments(command: &str) -> Vec<String> {
+    let mut normalized = command.replace("&&", "\n").replace("||", "\n");
+    for sep in [';', '|', '&', '(', ')'] {
+        normalized = normalized.replace(sep, "\n");
+    }
+    normalized
+        .split('\n')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Whitespace-tokenize a single shell segment, stripping a pair of matching
+/// surrounding quotes from each token. Enough to read a command name, its
+/// flags, and its path arguments for the intent match.
+fn tokenize_segment(segment: &str) -> Vec<String> {
+    segment
+        .split_whitespace()
+        .map(|tok| {
+            let bytes = tok.as_bytes();
+            if bytes.len() >= 2
+                && (bytes[0] == b'"' || bytes[0] == b'\'')
+                && bytes[bytes.len() - 1] == bytes[0]
+            {
+                tok[1..tok.len() - 1].to_string()
+            } else {
+                tok.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Drop leading privilege/exec wrappers (`sudo`, `env FOO=bar`, `nohup`, …) so
+/// the intent matcher sees the real command (`sudo rm -rf /` → `rm -rf /`).
+fn strip_command_wrappers(tokens: &[String]) -> &[String] {
+    let mut i = 0;
+    while i < tokens.len() {
+        let word = tokens[i].to_ascii_lowercase();
+        let base = word.rsplit('/').next().unwrap_or(word.as_str());
+        match base {
+            "sudo" | "doas" | "nohup" | "exec" | "command" | "time" | "stdbuf" | "nice" => i += 1,
+            "env" | "xargs" => {
+                i += 1;
+                // Skip any `VAR=value` assignments before the real command.
+                while i < tokens.len() && tokens[i].contains('=') && !tokens[i].starts_with('-') {
+                    i += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    &tokens[i..]
+}
+
+/// Is this segment a recursive+force `rm` aimed at a catastrophic root? Accepts
+/// every flag order/spelling — combined (`-rf`/`-fr`), separated (`-r -f`),
+/// long (`--recursive --force`), and a `--` end-of-options separator — and
+/// treats `/`, `~`, `$HOME`, or a wildcard directly under one as catastrophic.
+fn catastrophic_rm(tokens: &[String]) -> bool {
+    let tokens = strip_command_wrappers(tokens);
+    let Some((cmd, rest)) = tokens.split_first() else {
+        return false;
+    };
+    let cmd = cmd.to_ascii_lowercase();
+    if cmd.rsplit('/').next().unwrap_or(cmd.as_str()) != "rm" {
+        return false;
+    }
+    let mut recursive = false;
+    let mut force = false;
+    let mut end_of_opts = false;
+    let mut dangerous_target = false;
+    for tok in rest {
+        if !end_of_opts && tok == "--" {
+            end_of_opts = true;
+            continue;
+        }
+        if !end_of_opts && tok.len() > 1 && tok.starts_with('-') {
+            if let Some(long) = tok.strip_prefix("--") {
+                match long {
+                    "recursive" => recursive = true,
+                    "force" => force = true,
+                    _ => {}
+                }
+            } else {
+                for c in tok.chars().skip(1) {
+                    match c {
+                        'r' | 'R' => recursive = true,
+                        'f' => force = true,
+                        _ => {}
+                    }
+                }
+            }
+            continue;
+        }
+        if is_dangerous_rm_target(tok) {
+            dangerous_target = true;
+        }
+    }
+    recursive && force && dangerous_target
+}
+
+/// A deletion target that means "the whole filesystem root or home dir", which
+/// makes a recursive+force `rm` catastrophic. In-tree targets (`./build`,
+/// `target/`, `node_modules`) are deliberately NOT dangerous — that preserves
+/// the existing in-tree-vs-root policy; only the root / equivalent forms fire.
+fn is_dangerous_rm_target(target: &str) -> bool {
+    let trimmed = target.trim_matches(|c| c == '"' || c == '\'');
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "/" | "/*"
+            | "/."
+            | "~"
+            | "~/"
+            | "~/*"
+            | "$home"
+            | "$home/"
+            | "$home/*"
+            | "${home}"
+            | "${home}/"
+            | "${home}/*"
+    )
+}
+
+/// Extract `(subcommand, args_after_it)` from a `git …` segment, skipping any
+/// global options between `git` and the subcommand — including the ones that
+/// consume a following argument (`-C <dir>`, `-c <k=v>`, `--git-dir <p>`, …).
+/// Returns `None` when the segment is not a git invocation. This is what lets
+/// the floor see the real subcommand behind a `git -C <dir>` prefix.
+fn git_subcommand(tokens: &[String]) -> Option<(String, Vec<String>)> {
+    let tokens = strip_command_wrappers(tokens);
+    let (cmd, rest) = tokens.split_first()?;
+    let cmd = cmd.to_ascii_lowercase();
+    if cmd.rsplit('/').next().unwrap_or(cmd.as_str()) != "git" {
+        return None;
+    }
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = &rest[i];
+        if tok.starts_with('-') {
+            // Global options taking a SEPARATE argument (space-form) must skip
+            // that argument too, so we don't mistake it for the subcommand.
+            let takes_arg = matches!(
+                tok.as_str(),
+                "-C" | "-c"
+                    | "--git-dir"
+                    | "--work-tree"
+                    | "--namespace"
+                    | "--super-prefix"
+                    | "--config-env"
+            );
+            i += if takes_arg { 2 } else { 1 };
+            continue;
+        }
+        return Some((tok.to_ascii_lowercase(), rest[i + 1..].to_vec()));
+    }
+    None
+}
+
+/// Is this segment a `git push` — even behind a global-option prefix the fixed
+/// `git push` substring can't see? Mirrors the substring table's allow-list:
+/// `--dry-run` (inspection) and `--force-with-lease` still pass.
+fn git_push_behind_globals(tokens: &[String]) -> bool {
+    let Some((sub, args)) = git_subcommand(tokens) else {
+        return false;
+    };
+    if sub != "push" {
+        return false;
+    }
+    let allowed = args.iter().any(|a| {
+        a == "--dry-run" || a == "--force-with-lease" || a.starts_with("--force-with-lease=")
+    });
+    !allowed
+}
+
+/// Is this segment a forced `git clean` (irreversible untracked-file wipe) in
+/// any flag order — `-fd`, `-fdx`, `-xdf`, `--force -d`? A dry run (`-n` /
+/// `--dry-run`) passes.
+fn git_force_clean(tokens: &[String]) -> bool {
+    let Some((sub, args)) = git_subcommand(tokens) else {
+        return false;
+    };
+    if sub != "clean" {
+        return false;
+    }
+    let mut force = false;
+    let mut dry_run = false;
+    for arg in &args {
+        if let Some(long) = arg.strip_prefix("--") {
+            match long {
+                "force" => force = true,
+                "dry-run" => dry_run = true,
+                _ => {}
+            }
+        } else if arg.len() > 1 && arg.starts_with('-') {
+            for c in arg.chars().skip(1) {
+                match c {
+                    'f' => force = true,
+                    'n' => dry_run = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    force && !dry_run
 }
 
 /// **UD-SEC-003**: block hardcoded secrets in source files.
@@ -9282,6 +9564,118 @@ const x = 1;",
         // actionable half of the feedback loop).
         let d = check_dangerous_bash("rm -rf /");
         assert!(d.reason.contains("fix:") || d.reason.contains("e.g."));
+    }
+
+    #[test]
+    fn bash_blocks_rm_equivalent_forms_at_root() {
+        // Equivalent-form bypass (was ALLOW under the fixed substring table):
+        // any flag order/spelling of recursive+force `rm` at the root / home
+        // must DENY.
+        for cmd in [
+            "rm -fr /",
+            "rm -rf -- /",
+            "rm -r -f /",
+            "rm -f -r /",
+            "rm --recursive --force /",
+            "rm --force --recursive /",
+            "rm -rf --no-preserve-root /",
+            "rm -Rf /",
+            "rm -rfv /",
+            "rm -rf /*",
+            "rm -fr ~",
+            "rm -rf -- ~",
+            "rm --recursive --force ~/",
+            "rm -rf ~/*",
+            "rm -rf $HOME",
+            "rm -rf ${HOME}/*",
+            "sudo rm -fr /",
+            "env FOO=bar rm -rf /",
+            "echo hi && rm -fr /",
+            "rm -rf / home", // the infamous stray-space wipe
+        ] {
+            assert!(
+                check_dangerous_bash(cmd).block,
+                "equivalent-form rm bypass must DENY: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_still_allows_in_tree_rm_equivalent_forms() {
+        // Preserve the in-tree-vs-root distinction: recursive+force rm scoped
+        // to a project-local path stays ALLOW regardless of flag spelling.
+        for cmd in [
+            "rm -fr ./build",
+            "rm -rf -- target/",
+            "rm --recursive --force node_modules",
+            "rm -r -f dist",
+            "rm -rf ~/.cache/umadev",
+            "rm -fr /tmp/umadev-smoke",
+            "cd /tmp && rm -fr build",
+        ] {
+            assert!(
+                !check_dangerous_bash(cmd).block,
+                "in-tree rm must stay ALLOW: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_blocks_git_push_behind_global_options() {
+        // `git push` behind a `-C <dir>` / `-c k=v` / `--git-dir` prefix dodged
+        // the `git push` substring — the structured floor must still DENY.
+        for cmd in [
+            "git -C /tmp/repo push origin main",
+            "git -c user.name=x push",
+            "git --git-dir=/tmp/repo/.git push",
+            "git --git-dir /tmp/repo/.git push origin main",
+            "git -C /tmp/repo -c a=b push",
+            "sudo git -C /repo push",
+        ] {
+            assert!(
+                check_dangerous_bash(cmd).block,
+                "git push behind global options must DENY: {cmd}"
+            );
+        }
+        // Inspection / lease forms behind a prefix still pass.
+        for cmd in [
+            "git -C /tmp/repo push --dry-run origin main",
+            "git -C /tmp/repo status",
+            "git -C /tmp/repo log --oneline",
+        ] {
+            assert!(
+                !check_dangerous_bash(cmd).block,
+                "read-only / dry-run git behind a prefix must NOT be blocked: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_blocks_git_clean_force() {
+        // `git clean -fdx` and its flag permutations irreversibly wipe
+        // untracked files — DENY in any order.
+        for cmd in [
+            "git clean -fdx",
+            "git clean -fd",
+            "git clean -xdf",
+            "git clean -df",
+            "git clean --force -d",
+            "git clean -f",
+            "git -C /tmp/repo clean -fdx",
+            "git clean -ffdx",
+        ] {
+            assert!(
+                check_dangerous_bash(cmd).block,
+                "forced git clean must DENY: {cmd}"
+            );
+        }
+        // A dry run is inspection-only — must pass.
+        for cmd in ["git clean -n", "git clean --dry-run", "git clean -nfd"] {
+            assert!(
+                !check_dangerous_bash(cmd).block,
+                "git clean dry-run must NOT be blocked: {cmd}"
+            );
+        }
     }
 
     // --- hardcoded secrets (UD-SEC-003) --------------------------------
