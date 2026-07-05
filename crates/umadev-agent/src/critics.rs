@@ -252,6 +252,24 @@ impl Seat {
     }
 }
 
+impl Seat {
+    /// The declared contract inputs ([`SeatCard::reads`]) this seat is MISSING
+    /// given the artifacts currently present - the per-hop hand-off check. Empty =
+    /// the seat has everything its card promises it reads. A non-empty result is a
+    /// contract gap (a seat asked to act/review without its declared inputs) that
+    /// the director can surface BEFORE the seat runs, catching a bad hand-off at
+    /// the hop instead of downstream. Advisory + fail-open; never blocks the loop.
+    #[must_use]
+    pub fn missing_inputs(self, present: &[ArtifactKind]) -> Vec<ArtifactKind> {
+        self.card()
+            .reads
+            .iter()
+            .copied()
+            .filter(|r| !present.contains(r))
+            .collect()
+    }
+}
+
 /// One role's structured opinion on the shared artifacts — the team layer's
 /// unit of cross-review. Aligns with the runner's existing ad-hoc verdicts
 /// (`AcceptanceVerdict` / `DocsVerdict` / `DesignVerdict`) but generalises them
@@ -385,6 +403,47 @@ pub struct CriticArtifacts<'a> {
     /// runs (governance scan / any `security-scan.json`). Same role as
     /// `qa_floor` for the security-critic.
     pub security_floor: &'a str,
+}
+
+impl CriticArtifacts<'_> {
+    /// Which [`ArtifactKind`]s are actually PRESENT (non-empty) in this bundle -
+    /// the input side of a per-hop hand-off check ([`Seat::missing_inputs`]). The
+    /// derived typed contracts are INFERRED from the document that carries them
+    /// until they are separately materialized (see the P0 two-layer-artifact plan):
+    /// a present architecture doc implies the API contract + data model are
+    /// derivable; a present UIUX doc implies design tokens; a present PRD implies
+    /// the acceptance map. Conservative + deterministic.
+    #[must_use]
+    pub fn present(&self) -> Vec<ArtifactKind> {
+        use ArtifactKind as A;
+        let mut v = Vec::new();
+        if !self.requirement.trim().is_empty() {
+            v.push(A::Requirement);
+        }
+        if !self.prd.trim().is_empty() {
+            v.push(A::Prd);
+            v.push(A::Acceptance);
+        }
+        if !self.architecture.trim().is_empty() {
+            v.push(A::Architecture);
+            v.push(A::ApiContract);
+            v.push(A::DataModel);
+        }
+        if !self.uiux.trim().is_empty() {
+            v.push(A::Uiux);
+            v.push(A::DesignTokens);
+        }
+        if !self.code.trim().is_empty() {
+            v.push(A::Code);
+        }
+        if !self.qa_floor.trim().is_empty() {
+            v.push(A::QaFloor);
+        }
+        if !self.security_floor.trim().is_empty() {
+            v.push(A::SecurityFloor);
+        }
+        v
+    }
 }
 
 /// A read-only role on the cross-review team. A critic does NOT act — it reads
@@ -1089,6 +1148,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn missing_inputs_is_the_per_hop_handoff_check() {
+        use ArtifactKind as A;
+        let docs = CriticArtifacts {
+            requirement: "build X",
+            prd: "prd body",
+            architecture: "arch body",
+            uiux: "uiux body",
+            ..CriticArtifacts::default()
+        };
+        let present = docs.present();
+        for s in [
+            Seat::ProductManager,
+            Seat::Architect,
+            Seat::UiuxDesigner,
+            Seat::FrontendEngineer,
+            Seat::BackendEngineer,
+        ] {
+            assert!(
+                s.missing_inputs(&present).is_empty(),
+                "{s:?} should have its inputs at docs stage: missing {:?}",
+                s.missing_inputs(&present)
+            );
+        }
+        let qa_missing = Seat::QaEngineer.missing_inputs(&present);
+        assert!(qa_missing.contains(&A::Code) && qa_missing.contains(&A::QaFloor));
+        let empty = CriticArtifacts::default();
+        assert_eq!(
+            Seat::ProductManager.missing_inputs(&empty.present()),
+            vec![A::Requirement]
+        );
     }
 
     #[test]
