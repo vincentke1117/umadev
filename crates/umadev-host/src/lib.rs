@@ -1979,6 +1979,9 @@ mod tests {
             Self { key, prior }
         }
 
+        // Only the `#[cfg(unix)]` env-mutating tests call this; on Windows it is
+        // dead code (a hard error under `-D warnings`). Gate to unix.
+        #[cfg(unix)]
         fn remove(key: &'static str) -> Self {
             let prior = std::env::var_os(key);
             std::env::remove_var(key);

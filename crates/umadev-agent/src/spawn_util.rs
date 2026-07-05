@@ -133,7 +133,12 @@ pub fn kill_process_group(child: &tokio::process::Child) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{detach_from_controlling_terminal, detach_kind, kill_process_group, DetachKind};
+    use super::{detach_kind, DetachKind};
+    // Only the `#[cfg(unix)]` tests below exercise these (the Windows detach path is
+    // a no-op), so an unconditional import is an unused-import error under
+    // `-D warnings` on Windows. Gate the import to match the usage.
+    #[cfg(unix)]
+    use super::{detach_from_controlling_terminal, kill_process_group};
 
     #[test]
     fn detach_kind_matches_the_platform() {
