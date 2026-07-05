@@ -319,3 +319,41 @@ dependencies. Therefore:
   exposing a UmaDev seat to *another vendor's* agent (publish an Agent Card), or
   consuming an external tool/data source (MCP). Borrow A2A's *shape* internally
   (a typed "seat card" + typed Task handoff) without the transport, per §5 P2.
+
+
+## 9. Executable handoff for the remaining items (P1/P2)
+
+Delivered (phases 1-5, tested + clippy-clean + committed): Seat Cards
+(ArtifactKind + SeatCard + Seat::card), the bidirectional per-hop contract
+(Seat::missing_inputs / missing_outputs + CriticArtifacts::present, wired live in
+run_critics_concurrently), and the versioning primitive (artifact_version /
+is_stale). The four remaining items + their EXACT approach:
+
+### A. Two-layer artifact materialization (largest; direction 1)
+Extend the umadev-contract pattern (architecture API table -> typed ApiSpec ->
+OpenAPI + cross-validate) to the data model, design tokens, acceptance map: a
+section parser -> typed struct -> validator, emitted to .umadev/contracts/. Then
+feed the materialized contracts into CriticArtifacts as first-class fields so
+present() stops INFERRING them from the source doc. Test: a frontend referencing an
+absent data-model field fails the cross-check.
+
+### B. Verdict provenance (medium; constructor refactor first)
+A Provenance { seat, artifact, note } + a provenance field on RoleVerdict, populated
+Rust-side. BLOCKER (a first attempt was reverted): RoleVerdict is built via ~24 full
+struct literals with no ..Default::default(). Do the refactor FIRST (append
+..Default::default() to every literal, one commit, verify green), THEN add the field.
+
+### C. Artifact versioning -> DAG staleness (medium)
+Primitive exists. Store consumed versions WITHOUT touching PlanStep (no Default): a
+side file .umadev/artifact-versions.json (step_id -> {artifact -> version}), written
+on step completion. On re-plan, a done step whose recorded upstream is_stale vs the
+current artifact flips back to Pending (cascade the reverse depends_on closure).
+
+### D. Blackboard public/private lanes (medium)
+A private scratch lane .umadev/scratch/<seat>-<topic>.md (never under output/),
+visible only to the two seats in a conflict, NOT part of CriticArtifacts, GC'd on run
+end.
+
+Sequencing: A -> C -> B -> D. Each a tested, clippy-clean, committed increment. The
+two Default-less struct refactors (B, and the PlanStep side-step in C) are exactly
+where a fatigued session introduces regressions - do them fresh.
