@@ -571,12 +571,17 @@ pub struct CriticArtifacts<'a> {
 
 impl CriticArtifacts<'_> {
     /// Which [`ArtifactKind`]s are actually PRESENT (non-empty) in this bundle -
-    /// the input side of a per-hop hand-off check ([`Seat::missing_inputs`]). The
-    /// derived typed contracts are INFERRED from the document that carries them
-    /// until they are separately materialized (see the P0 two-layer-artifact plan):
-    /// a present architecture doc implies the API contract + data model are
-    /// derivable; a present UIUX doc implies design tokens; a present PRD implies
-    /// the acceptance map. Conservative + deterministic.
+    /// the input side of a per-hop hand-off check ([`Seat::missing_inputs`]). A
+    /// present source doc implies its DERIVED typed contracts are available to
+    /// derive: architecture => API contract + data model, UIUX => design tokens, PRD
+    /// => acceptance map. Those contracts ARE now materialized by
+    /// [`crate::materialize`] (emitted to `.umadev/contracts/`), but this method
+    /// stays deliberately CONSERVATIVE - it maps doc-presence, not section-detection.
+    /// That is by design: the per-hop check is an ADVISORY layer, so it must never
+    /// false-positive on a non-standard heading; the AUTHORITATIVE gap-checking
+    /// (requirement coverage, API-contract + acceptance conformance) is the
+    /// deterministic floor's job (`coverage` / `acceptance`), which this never
+    /// duplicates. Deterministic + fail-open.
     #[must_use]
     pub fn present(&self) -> Vec<ArtifactKind> {
         use ArtifactKind as A;
