@@ -162,6 +162,20 @@ endorses what we have.**
 
 ## 5. Enhancement plan (prioritized) — how to make it *stronger*
 
+> **Delivery status.** Phase 1 (Seat Cards — the typed self-describing capability
+> card + `ArtifactKind` vocabulary) and Phase 2 (the per-hop hand-off check:
+> `Seat::missing_inputs` / `CriticArtifacts::present`) are **DONE** — tested +
+> clippy-clean — and Phase 3 **wires the per-hop check into the live critic review
+> flow** (a seat that reviews without its declared `reads` gets a diagnosed
+> advisory folded into its verdict). Together that is the complete *typed-contract
+> → per-hop-validation* vertical (the highest-leverage recommendation), live. The
+> remaining items below are larger and touch core parsing / the plan DAG / verdict
+> shape — do them deliberately, one tested increment each. (Note: a first attempt
+> to add a structured `provenance` field directly to `RoleVerdict` was reverted —
+> it broke ~24 struct-literal constructors; the right path is a `..Default::default()`
+> refactor of those sites or a side-channel, done in a focused pass, not at a
+> session tail.)
+
 ### P0 — the two-layer artifact (the operational answer to "docs vs transmission")
 - **Give every blackboard artifact TWO layers: a schema-typed *contract* block
   (the *what*) + a natural-language *trace* block (the *why*).** A validated
