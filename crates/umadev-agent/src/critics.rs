@@ -178,6 +178,33 @@ pub enum ArtifactKind {
     SecurityFloor,
 }
 
+/// A stable content-version tag for a blackboard artifact - a deterministic FNV-1a
+/// hash of its bytes. Detects when an upstream artifact CHANGED so the director can
+/// invalidate downstream steps that consumed the OLD version (the blackboard
+/// "silent poisoning by a stale board" failure mode - see
+/// `docs/AGENT_TEAM_INTERACTION_DESIGN.md` P1). Deterministic across runs (unlike
+/// `DefaultHasher`), so a persisted version compares correctly. Trims first so
+/// trailing-whitespace churn is not a false change.
+#[must_use]
+pub fn artifact_version(content: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in content.trim().as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Whether a consumer's recorded upstream version differs from the current one -
+/// the upstream changed since the consumer was produced, so the consumer (and
+/// everything downstream) is STALE and should be re-derived. An empty recorded
+/// version (a consumer produced before versioning existed) is treated as FRESH:
+/// fail-open, never spuriously invalidate.
+#[must_use]
+pub fn is_stale(recorded_upstream: &str, current_upstream: &str) -> bool {
+    !recorded_upstream.is_empty() && recorded_upstream != current_upstream
+}
+
 /// A seat's self-describing capability card - the internal analogue of an A2A
 /// "Agent Card": who the seat is, whether it DOES or only REVIEWS, what it OWNS,
 /// and - the load-bearing part - which shared artifacts it READS as its contract
@@ -1232,6 +1259,20 @@ mod tests {
         for s in [Seat::QaEngineer, Seat::SecurityEngineer, Seat::DevopsEngineer] {
             assert!(s.missing_outputs(&present).is_empty(), "{s:?} owns no doc");
         }
+    }
+
+    #[test]
+    fn artifact_version_is_stable_and_change_sensitive() {
+        assert_eq!(
+            artifact_version("# PRD\nbuild X"),
+            artifact_version("# PRD\nbuild X   ")
+        );
+        assert_ne!(artifact_version("v1"), artifact_version("v2"));
+        let a = artifact_version("arch v1");
+        let b = artifact_version("arch v2");
+        assert!(is_stale(&a, &b), "changed upstream must be stale");
+        assert!(!is_stale(&a, &a), "unchanged upstream is fresh");
+        assert!(!is_stale("", &b), "no recorded version fails open to fresh");
     }
 
     #[test]
