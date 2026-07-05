@@ -66,6 +66,7 @@ pub mod gates;
 pub mod knowledge_feedback;
 pub mod lessons;
 pub mod manifest;
+pub mod materialize;
 pub mod open_decisions;
 pub mod phases;
 pub mod plan_state;

@@ -3628,6 +3628,11 @@ impl<R: Runtime> AgentRunner<R> {
             .unwrap_or_default()
         };
         let (prd, arch, uiux) = (read("prd"), read("architecture"), read("uiux"));
+        // Two-layer artifact materialization (item A): derive the typed contracts
+        // (data model / design tokens / acceptance) out of the prose docs and emit
+        // them to `.umadev/contracts/` next to the API contract — the typed "what"
+        // layer alongside the prose "why" layer. Additive + fail-open.
+        let _ = crate::materialize::materialize(&self.options.project_root, slug);
         // Nothing substantive to review → skip (deterministic floor stands).
         if prd.trim().is_empty() && arch.trim().is_empty() {
             return Vec::new();
