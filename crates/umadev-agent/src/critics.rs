@@ -255,6 +255,53 @@ pub fn stale_artifacts(
         .collect()
 }
 
+/// A PRIVATE scratch lane for a two-seat conflict resolution - kept OUT of the
+/// public `output/*.md` blackboard so a focused back-and-forth never pollutes
+/// global context (docs/AGENT_TEAM_INTERACTION_DESIGN.md P1). Stored under
+/// `.umadev/scratch/<key>.md`; NOT part of `CriticArtifacts`; GC'd on run end.
+/// The key is sanitised to a single safe filename (no path traversal).
+fn scratch_path(project_root: &std::path::Path, key: &str) -> std::path::PathBuf {
+    let safe: String = key
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() {
+        "scratch".to_string()
+    } else {
+        safe
+    };
+    project_root
+        .join(".umadev")
+        .join("scratch")
+        .join(format!("{safe}.md"))
+}
+
+/// Write a private scratch note for `key`. Best-effort + fail-open.
+pub fn write_scratch(project_root: &std::path::Path, key: &str, content: &str) {
+    let path = scratch_path(project_root, key);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, content);
+}
+
+/// Read a private scratch note for `key`. `None` if absent/unreadable.
+#[must_use]
+pub fn read_scratch(project_root: &std::path::Path, key: &str) -> Option<String> {
+    std::fs::read_to_string(scratch_path(project_root, key)).ok()
+}
+
+/// GC the whole private scratch lane (call at run end). Best-effort.
+pub fn clear_scratch(project_root: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(project_root.join(".umadev").join("scratch"));
+}
+
 /// A seat's self-describing capability card - the internal analogue of an A2A
 /// "Agent Card": who the seat is, whether it DOES or only REVIEWS, what it OWNS,
 /// and - the load-bearing part - which shared artifacts it READS as its contract
@@ -1344,6 +1391,24 @@ mod tests {
         assert_eq!(read_artifact_versions(tmp.path()).get("prd"), m.get("prd"));
         let empty = tempfile::TempDir::new().unwrap();
         assert!(stale_artifacts(empty.path(), &current).is_empty());
+    }
+
+    #[test]
+    fn private_scratch_lane_round_trips_and_stays_off_the_public_board() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_scratch(tmp.path(), "architect-vs-frontend", "use a union type here");
+        assert_eq!(
+            read_scratch(tmp.path(), "architect-vs-frontend").as_deref(),
+            Some("use a union type here")
+        );
+        assert!(tmp.path().join(".umadev").join("scratch").exists());
+        assert!(!tmp.path().join("output").exists());
+        write_scratch(tmp.path(), "../../etc/passwd", "x");
+        assert_eq!(read_scratch(tmp.path(), "../../etc/passwd").as_deref(), Some("x"));
+        assert!(scratch_path(tmp.path(), "../../etc/passwd")
+            .starts_with(tmp.path().join(".umadev").join("scratch")));
+        clear_scratch(tmp.path());
+        assert!(read_scratch(tmp.path(), "architect-vs-frontend").is_none());
     }
 
     #[test]
