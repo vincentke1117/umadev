@@ -793,7 +793,16 @@ mod tests {
             .iter()
             .find(|r| r.name == "Claude Code hook")
             .unwrap();
-        assert_eq!(hook_check.status, Status::Passed);
+        // The hook IS registered. Whether the bare `umadev` command resolves
+        // depends on the environment: a dev machine has it on PATH -> Passed; CI
+        // does not -> a "registered but command does not resolve" Warning. Both are
+        // correct outcomes; the only real bug is failing to RECOGNIZE the hook.
+        assert!(
+            hook_check.status == Status::Passed || hook_check.detail.contains("does not resolve"),
+            "a registered hook must be recognized, got {:?}: {}",
+            hook_check.status,
+            hook_check.detail
+        );
     }
 
     #[tokio::test]
