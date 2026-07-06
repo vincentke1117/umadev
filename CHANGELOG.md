@@ -2,6 +2,18 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.34] - init 像 Claude Code /init 一样理解项目 - spec 阶段"写文档被当成写代码"误判修复
+
+两处体验修复。全部改动确定性、fail-open、非破坏。
+
+### 修复
+
+- spec 阶段不再误报 "build claimed done but no source":此前底座在 docs/spec 阶段写 PRD/架构/UIUX/SRS 文档时,任何工作区写入都被当成"写代码构建",触发源码 QC 却没代码,误报"声称构建完成却没源码",每回合重复。现在写文档(output/、.md、.umadev/)不再翻成代码构建;只有真写代码文件才触发,后续真写代码仍会触发,空/未知路径当代码处理(绝不放过真幻觉),源码诚实地板本身不动。
+
+### 新增
+
+- umadev init 现在像 Claude Code 的 /init 一样理解项目:重执行时检测技术栈 + build/test/lint 命令 + 索引源码(经 adopt),把一个受管的 Project 段写进 CLAUDE.md(标记包裹);重跑只刷新该段,治理前言和你的手改都保留。此前 init 只写死模板、重跑什么都不更新,现在真正做到"分析项目 + 刷新详细索引/进度"。
+
 ## [1.0.33] - 第三方底座零配置可用 - 底座并发闸根治 GLM 529 限流
 
 这一版专修一个「接入即用」的适配硬伤:把底座 CLI 指向第三方低并发网关(如 GLM / open.bigmodel.cn)的用户,直连底座一切正常,但用 UmaDev 每一条消息(哪怕只是「你还能用吗」)都被 529「访问量过大」打回。这不是网关的问题,是我们的适配缺陷 -- 现已根治。全部改动确定性、fail-open、非破坏;3700+ 测试全绿、clippy 净。
