@@ -98,6 +98,15 @@ pub fn validate_frontend_vs_contract(
             .iter()
             .any(|e| path_matches_ignoring_method(&e.path, &call.path));
         if !path_known {
+            // A frontend path with NO checkable segment (e.g. `/api/` captured from a
+            // string-concat `fetch('/api/' + id)`, where the regex stopped at the closing
+            // quote) cannot be matched against any real 3+-segment endpoint - raising it as
+            // an UndeclaredCall is a systematic false alarm -> false UD-CODE-003 rework. Skip
+            // it (mirrors the backend path_has_checkable_segment guard on the
+            // unregistered-endpoint side).
+            if !crate::backend::path_has_checkable_segment(&call.path) {
+                continue;
+            }
             violations.push(ContractViolation::undeclared_call(call));
             continue;
         }
@@ -332,6 +341,21 @@ mod tests {
         let v = validate_frontend_vs_contract(&calls, &spec);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, ViolationKind::UndeclaredCall);
+    }
+
+    #[test]
+    fn concat_url_with_no_checkable_segment_is_not_a_false_undeclared_call() {
+        // `fetch('/api/' + id)` captures only the short static prefix `/api/` (the regex
+        // stops at the closing quote) - it has no checkable segment to match a real
+        // endpoint, so raising an UndeclaredCall was a systematic false alarm (-> false
+        // UD-CODE-003 rework). It must be skipped; a genuinely unknown FULL path still flags.
+        let spec = spec();
+        assert!(
+            validate_frontend_vs_contract(&[call(HttpVerb::Get, "/api/")], &spec).is_empty(),
+            "a no-checkable-segment concat prefix is not a false UndeclaredCall"
+        );
+        let v = validate_frontend_vs_contract(&[call(HttpVerb::Get, "/api/nonexistent")], &spec);
+        assert_eq!(v.len(), 1, "a real unknown path is still flagged");
     }
 
     #[test]

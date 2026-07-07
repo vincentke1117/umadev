@@ -394,14 +394,14 @@ mod codex {
 
         // Ensure `[mcp_servers]` is a table (create it implicit-of-dotted so the
         // serialized form is the idiomatic `[mcp_servers.<name>]`).
-        if !doc.get("mcp_servers").is_some_and(Item::is_table) {
+        if !doc.get("mcp_servers").is_some_and(Item::is_table_like) {
             let mut t = Table::new();
             t.set_implicit(true);
             doc["mcp_servers"] = Item::Table(t);
         }
         let servers = doc["mcp_servers"]
-            .as_table_mut()
-            .expect("just ensured table");
+            .as_table_like_mut()
+            .expect("just ensured table-like");
 
         let mut srv = Table::new();
         if let Some(url) = &entry.url {
@@ -423,7 +423,7 @@ mod codex {
             }
             srv["env"] = value(env_tbl);
         }
-        servers[name] = Item::Table(srv);
+        servers.insert(name, Item::Table(srv));
 
         atomic_write(&path, &doc.to_string())?;
         Ok(path)
@@ -437,7 +437,7 @@ mod codex {
         let mut doc = load_doc(&path)?;
         let removed = doc
             .get_mut("mcp_servers")
-            .and_then(Item::as_table_mut)
+            .and_then(Item::as_table_like_mut)
             .is_some_and(|t| t.remove(name).is_some());
         if removed {
             atomic_write(&path, &doc.to_string())?;
@@ -451,11 +451,11 @@ mod codex {
             return Ok(vec![]);
         }
         let doc = load_doc(&path)?;
-        let Some(servers) = doc.get("mcp_servers").and_then(Item::as_table) else {
+        let Some(servers) = doc.get("mcp_servers").and_then(Item::as_table_like) else {
             return Ok(vec![]);
         };
         let mut out = Vec::new();
-        for (name, item) in servers {
+        for (name, item) in servers.iter() {
             let detail = item.as_table().map_or_else(
                 || "(configured)".to_string(),
                 |t| {

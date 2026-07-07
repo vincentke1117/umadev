@@ -89,7 +89,11 @@ impl Lang {
             .to_ascii_lowercase();
         // An explicit Chinese locale wins immediately.
         if raw.starts_with("zh") {
-            return if raw.contains("tw") || raw.contains("hk") || raw.contains("hant") {
+            return if raw.contains("tw")
+                || raw.contains("hk")
+                || raw.contains("mo")
+                || raw.contains("hant")
+            {
                 Lang::ZhTw
             } else {
                 Lang::ZhCn
@@ -168,9 +172,15 @@ pub fn tl(key: &str) -> &'static str {
 #[must_use]
 pub fn tlf(key: &str, args: &[&str]) -> String {
     let mut out = tl(key).to_string();
+    // Track the search offset so we resume PAST each inserted arg: an arg value that itself
+    // contains a literal "{}" must NOT swallow the next positional slot (which shifted every
+    // later substitution + left a real "{}" unfilled).
+    let mut from = 0;
     for a in args {
-        if let Some(pos) = out.find("{}") {
+        if let Some(rel) = out[from..].find("{}") {
+            let pos = from + rel;
             out.replace_range(pos..pos + 2, a);
+            from = pos + a.len();
         } else {
             break;
         }
@@ -213,9 +223,15 @@ pub fn t(lang: Lang, key: &str) -> &str {
 #[must_use]
 pub fn tf(lang: Lang, key: &str, args: &[&str]) -> String {
     let mut out = t(lang, key).to_string();
+    // Track the search offset so we resume PAST each inserted arg: an arg value that itself
+    // contains a literal "{}" must NOT swallow the next positional slot (which shifted every
+    // later substitution + left a real "{}" unfilled).
+    let mut from = 0;
     for a in args {
-        if let Some(pos) = out.find("{}") {
+        if let Some(rel) = out[from..].find("{}") {
+            let pos = from + rel;
             out.replace_range(pos..pos + 2, a);
+            from = pos + a.len();
         } else {
             break;
         }

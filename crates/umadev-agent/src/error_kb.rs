@@ -158,7 +158,6 @@ pub fn classify_error(text: &str) -> ErrorInsight {
         detect_missing_module,
         detect_package_manager,
         detect_permission,
-        detect_type_mismatch,
         detect_undefined_access,
         detect_panic,
         detect_port_in_use,
@@ -168,6 +167,10 @@ pub fn classify_error(text: &str) -> ErrorInsight {
         detect_env_missing,
         detect_syntax,
         detect_test_failure,
+        // AFTER syntax + test: a rustc "expected `;`, found `}`" is a SYNTAX error and a
+        // test assertion "expected X ... found Y" is a TEST failure - running the loose
+        // expected+found type-mismatch heuristic first mis-bucketed both.
+        detect_type_mismatch,
         detect_build_tool,
     ] {
         if let Some(insight) = detector(&lower, &line) {

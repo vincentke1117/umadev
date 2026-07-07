@@ -20,7 +20,6 @@
 //! "show me every unresolved TODO introduced in the last 3 runs".
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -165,26 +164,32 @@ fn classify_line(line: &str, lower: &str) -> Option<DebtKind> {
     None
 }
 
-/// Append `items` to `.umadev/tech-debt.jsonl`. One JSON object per line.
-/// Returns the path written. Best-effort: a write failure returns the path
-/// anyway (the quality gate already has the in-memory items).
+/// Write `items` to `.umadev/tech-debt.jsonl` as the CURRENT snapshot - one JSON object per
+/// line, OVERWRITING the prior run's. Returns the path. Best-effort: a write failure returns
+/// the path anyway (the quality gate already has the in-memory items).
+///
+/// A SNAPSHOT, not an append-only history: `diff_against_ledger` reads this back as the PRIOR
+/// run's state to compute the per-run delta. Appending made the "ledger" the union of EVERY
+/// run, so resolved_count/net_change re-reported every ever-resolved item on every `umadev
+/// report` (two identical reports printed the same large "resolved" count).
 pub fn write_ledger(project_root: &Path, items: &[DebtItem]) -> PathBuf {
     let path = project_root.join(DEBT_LEDGER);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        for item in items {
-            if let Ok(line) = serde_json::to_string(item) {
-                let _ = writeln!(f, "{line}");
-            }
+    let mut body = String::new();
+    for item in items {
+        if let Ok(line) = serde_json::to_string(item) {
+            body.push_str(&line);
+            body.push('\n');
         }
     }
+    let _ = fs::write(&path, body);
     path
 }
 
-/// Read the full debt ledger history. Returns an empty vec when missing or
-/// malformed (fail-open).
+/// Read the debt ledger snapshot (the PRIOR run's items). Returns an empty vec when missing
+/// or malformed (fail-open).
 #[must_use]
 pub fn read_ledger(project_root: &Path) -> Vec<DebtItem> {
     let path = project_root.join(DEBT_LEDGER);
@@ -375,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn write_appends_across_calls() {
+    fn write_overwrites_prior_snapshot() {
         let tmp = TempDir::new().unwrap();
         write_ledger(
             tmp.path(),
@@ -401,7 +406,12 @@ mod tests {
                 resolved_at: String::new(),
             }],
         );
-        assert_eq!(read_ledger(tmp.path()).len(), 2);
+        // OVERWRITE, not append: the second write_ledger replaces the first, so the ledger
+        // holds only the LATEST snapshot (item "b"). This is what makes diff_against_ledger a
+        // per-run delta instead of a cumulative history.
+        let back = read_ledger(tmp.path());
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].file, "b");
     }
 
     #[test]

@@ -8130,6 +8130,15 @@ impl App {
     /// gate is the documented shortcut for "approve / continue" — match
     /// the gate card so users don't have to type `/continue` every time.
     fn submit_text(&mut self, text: String) -> Action {
+        // A cancel is DRAINING ("stopping…"): a submit here would push a You bubble + queue
+        // into queued_chat, which cancel_run then CLEARS -> the message shows as sent but is
+        // silently dropped. Refuse during the drain and RESTORE the text to the input box (+
+        // caret at end) so the user resends the instant the stop settles - no lost input.
+        if self.cancelling {
+            self.input = text;
+            self.input_cursor = self.input_len();
+            return Action::None;
+        }
         // Fix (dedup): a failed chat turn armed a ONE-SHOT guard with its exact text.
         // If the user's very next submit is that same text — a reflexive re-send, or a
         // double-Enter that outran the failure note — swallow it ONCE so a failed turn
@@ -8891,6 +8900,11 @@ impl App {
         self.run_started = false;
         self.active_gate = None;
         self.gate_choice = None;
+        // A fresh run starts UNARMED: interrupt_armed_at is only cleared by the confirming
+        // second Esc, so without this a stale arm from a PREVIOUS run (still inside its 3s
+        // window) made a single Esc on the new run cancel it immediately - defeating the
+        // deliberate double-press guard.
+        self.interrupt_armed_at = None;
         // P5c: a reset ends any open reasoning block (collapse its placeholder).
         self.collapse_thinking_block();
         // Drop any not-yet-fired queued steers so they can't bleed into a later
@@ -9270,6 +9284,15 @@ impl App {
                 self.critic_verdicts.clear();
                 self.handoffs.clear();
                 self.last_intent_class = None;
+                // A cleared transcript also ABANDONS any paused run gate: without this the
+                // active_gate/gate_choice stay armed (now invisible), so the NEXT plain
+                // message is taken as a gate reply / revise and silently RE-DRIVES the
+                // workspace run the user just cleared. Reset the run/gate state to idle.
+                self.active_gate = None;
+                self.gate_choice = None;
+                self.gate_choice_sel = 0;
+                self.run_started = false;
+                self.run_started_at = None;
                 // A cleared transcript means the base should start a fresh
                 // session on the next turn, not resume the old one.
                 self.host_chat_session_active = false;
@@ -9676,6 +9699,17 @@ impl App {
     /// point the base at its own session for that chat. Fail-open: a missing id or
     /// a corrupt file leaves the current conversation untouched and explains why.
     fn slash_resume(&mut self, arg: &str) -> Action {
+        // Refuse mid-run / mid-turn (mirrors slash_backend): load_chat swaps in ANOTHER
+        // chat's conversation + session while an in-flight build/turn still streams — the
+        // finishing turn then overwrites the resumed session's holder (orphaning a base
+        // subprocess with no end()) and appends its reply into the WRONG chat's transcript.
+        if self.is_pipeline_active() || self.agentic_in_flight {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
+            );
+            return Action::None;
+        }
         let id = arg.trim();
         if id.is_empty() {
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "resume.usage"));
@@ -9715,6 +9749,15 @@ impl App {
     /// ([`Action::Compact`]); the event loop drives the fork and applies the result
     /// ([`App::apply_compaction`]), falling back to FIFO if the base is unreachable.
     fn slash_compact(&mut self) -> Action {
+        // Refuse mid-run / mid-turn for consistency with /resume + /backend: a compaction
+        // that folds the transcript while a turn is streaming races the generation guard.
+        if self.is_pipeline_active() || self.agentic_in_flight {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
+            );
+            return Action::None;
+        }
         if self.compaction_in_flight {
             self.push(
                 ChatRole::System,

@@ -290,10 +290,8 @@ pub fn for_run(requirement: &str) -> RoutePlan {
     if r.class != RouteClass::Build {
         r.class = RouteClass::Build;
         // A bare/odd requirement under an explicit run still builds — never below
-        // Fast, and ensure a real build team rather than a chat one.
-        if matches!(r.depth, Depth::Fast) && r.team.is_empty() {
-            // keep Fast (proportional) but give it a build team
-        }
+        // Fast (the depth is left proportional), but ensure a real build team rather
+        // than a chat one.
         r.team = tier0_team(r.kind, RouteClass::Build, r.depth, requirement);
         r.est_budget = Budget::for_route(RouteClass::Build, r.depth);
     }
@@ -688,6 +686,23 @@ where
     })
 }
 
+/// Tolerant deserializer for confidence: accepts a JSON number, a quoted number
+/// ("0.9" - LLMs routinely quote numbers), or an absent/other value -> 0.0. Without this,
+/// one quoted confidence would fail the WHOLE BrainRoute parse (serde default only covers
+/// an ABSENT field, not a present wrong-typed one) and silently degrade a real build to
+/// Chat - the same class the array-field tolerance already guards against.
+fn de_lenient_f32<'de, D>(d: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0) as f32,
+        serde_json::Value::String(s) => s.trim().parse::<f32>().unwrap_or(0.0),
+        _ => 0.0,
+    })
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct BrainRoute {
     /// `chat | explain | quick_edit | debug | build` (free text; mapped tolerantly).
@@ -715,7 +730,7 @@ struct BrainRoute {
     #[serde(default, deserialize_with = "de_string_or_vec")]
     clarify_options: Vec<String>,
     /// The brain's confidence `0.0..=1.0` (tolerant: out-of-range is clamped).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_f32")]
     confidence: f32,
 }
 
@@ -906,11 +921,19 @@ fn brain_to_route(brain: &BrainRoute, requirement: &str) -> RoutePlan {
     // the roster. A chat-surface build then gets the identical review roster as `/run`
     // for the same input. The brain's explicit `needs` may only WIDEN it (never shrink).
     let mut team = tier0_team(kind, class, depth, requirement);
-    let mut seen: HashSet<Seat> = team.iter().copied().collect();
-    for n in &brain.needs {
-        if let Some(s) = Seat::from_alias(n) {
-            if seen.insert(s) {
-                team.push(s);
+    // The brain's explicit `needs` may only WIDEN a real review roster — never seat a
+    // team on a turn that convenes none. A Chat/Explain turn (and any Fast-depth
+    // quick-edit/debug) has an EMPTY floor team on purpose, and widening it would
+    // mis-frame the firmware persona (`context.rs` reads `route.team.first()` to inject a
+    // seat persona) and could convene an unwanted critic. Guard the widening exactly like
+    // the fork path's `reconcile_team` does, so both router surfaces agree.
+    if !matches!(class, RouteClass::Chat | RouteClass::Explain) && depth != Depth::Fast {
+        let mut seen: HashSet<Seat> = team.iter().copied().collect();
+        for n in &brain.needs {
+            if let Some(s) = Seat::from_alias(n) {
+                if seen.insert(s) {
+                    team.push(s);
+                }
             }
         }
     }

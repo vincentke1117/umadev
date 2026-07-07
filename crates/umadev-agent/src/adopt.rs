@@ -262,9 +262,17 @@ fn index_project_source(project_root: &Path) -> Result<(u32, u32, String), Strin
         return Ok((0, 0, String::new()));
     }
 
+    // A source file over this byte cap is skipped BEFORE it is read whole into memory: a
+    // committed lockfile (`package-lock.json` / `pnpm-lock.yaml` - both at root with indexable
+    // extensions), a big `.sql` dump, or a minified bundle would otherwise blow memory and
+    // flood the source index with noise.
+    const MAX_SOURCE_BYTES: u64 = 512 * 1024;
     let mut chunks = Vec::new();
     let mut file_count: u32 = 0;
     for abs in &files {
+        if std::fs::metadata(abs).map(|m| m.len()).unwrap_or(0) > MAX_SOURCE_BYTES {
+            continue;
+        }
         let Ok(body) = std::fs::read_to_string(abs) else {
             continue; // unreadable / binary → skip (fail-open)
         };

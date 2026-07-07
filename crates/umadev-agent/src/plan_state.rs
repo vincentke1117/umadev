@@ -884,7 +884,6 @@ impl Plan {
         // is left exactly as today. See [`Self::enforce_seat_evidence_floor`] /
         // [`Self::enforce_falsifiability_floor`].
         self.enforce_seat_evidence_floor();
-        self.enforce_falsifiability_floor();
         // CORE-DOC EVIDENCE FLOOR (deliberate builds only) — when the plan convened a
         // PM/architect, bind that seat to actually PRODUCE its core doc via a
         // FileContains evidence contract, so the PRD/architecture is a VERIFIED build
@@ -892,9 +891,16 @@ impl Plan {
         // instead of a template stub retro-fitted at finalize. `None` (lean / quick /
         // re-plan / test) skips it. Augment-only + fail-open. See
         // [`Self::enforce_doc_evidence_floor`].
+        //
+        // Runs BEFORE the falsifiability backstop (F3): binding a PM/architect doc step to
+        // its FileContains contract makes it non-bare, so falsifiability no longer wrongly
+        // pins BuildClean onto a doc-authoring step (which can NEVER make the project build -
+        // the plan would stall at its first doc step, reworking "make the build clean" at a
+        // PM who writes no code).
         if let Some(slug) = doc_slug {
             self.enforce_doc_evidence_floor(slug);
         }
+        self.enforce_falsifiability_floor();
         self.risks.retain(|r| !r.trim().is_empty());
         self.open_questions.retain(|q| !q.trim().is_empty());
         Some(self)
@@ -1088,22 +1094,30 @@ impl Plan {
     /// choice.) A step already carrying a strong contract is never touched; no build step
     /// ⇒ a no-op. Pure over `self`.
     fn enforce_falsifiability_floor(&mut self) {
-        let build_total = self
-            .steps
-            .iter()
-            .filter(|s| s.kind == StepKind::Build)
-            .count();
+        use crate::critics::Seat;
+        // A DOC-authoring seat (PM / architect / designer) produces a doc, NOT a build, so it
+        // is excluded from the falsifiability heuristic entirely (F3): otherwise a bare doc
+        // step got BuildClean and could never pass - it writes no code that could make the
+        // project build. Its OWN doc-evidence floor governs it.
+        let is_code_build = |s: &PlanStep| {
+            s.kind == StepKind::Build
+                && !matches!(
+                    s.seat,
+                    Seat::ProductManager | Seat::Architect | Seat::UiuxDesigner
+                )
+        };
+        let build_total = self.steps.iter().filter(|s| is_code_build(s)).count();
         let bare = self
             .steps
             .iter()
-            .filter(|s| s.kind == StepKind::Build && !s.has_strong_contract())
+            .filter(|s| is_code_build(s) && !s.has_strong_contract())
             .count();
-        // Trip only on STRICTLY more than half the build steps still bare.
+        // Trip only on STRICTLY more than half the code-build steps still bare.
         if build_total == 0 || bare * 2 <= build_total {
             return;
         }
         for s in &mut self.steps {
-            if s.kind == StepKind::Build && !s.has_strong_contract() {
+            if is_code_build(s) && !s.has_strong_contract() {
                 push_unique(&mut s.evidence, EvidenceContract::BuildClean);
             }
         }
@@ -2740,21 +2754,23 @@ mod tests {
 
     #[test]
     fn falsifiability_backstop_fires_when_most_build_steps_are_bare() {
-        // A plan the brain left broadly under-specified: two PM build steps (no per-seat
-        // floor covers PM) with only the honesty floor. MORE THAN HALF the build steps
-        // are bare → the backstop synthesizes a deterministic BuildClean bar on each.
+        // A plan the brain left broadly under-specified: two bare CODE build steps with
+        // only the honesty floor. MORE THAN HALF the code-build steps are bare → the
+        // backstop synthesizes a deterministic BuildClean bar on each. (Doc-authoring seats
+        // — PM/architect/designer — are excluded from this heuristic: they write no code, so
+        // BuildClean is unpassable for them; F3.)
         let p = plan(vec![
             step_seat(
                 "prd",
                 &[],
-                Seat::ProductManager,
+                Seat::DevopsEngineer,
                 StepKind::Build,
                 AcceptanceSpec::SourcePresent,
             ),
             step_seat(
                 "scope",
                 &[],
-                Seat::ProductManager,
+                Seat::DevopsEngineer,
                 StepKind::Build,
                 AcceptanceSpec::SourcePresent,
             ),

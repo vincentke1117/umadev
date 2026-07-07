@@ -99,7 +99,17 @@ pub fn plan_branches(readiness: &PrReadiness, slug: &str) -> PrPlan {
     } else {
         readiness.default_branch.clone()
     };
-    let on_default = readiness.current_branch == base || readiness.current_branch.is_empty();
+    // Never commit ONTO a well-known default branch, even when default_branch detection
+    // missed the repo real default (a master-default repo with no origin/HEAD and no
+    // init.defaultBranch falls back to "main"): without this guard current="master" !=
+    // base="main" would take the else arm and commit straight to master, ESCAPING branch
+    // isolation. A checkout on any conventional default forces a fresh feature branch.
+    let on_default = readiness.current_branch == base
+        || readiness.current_branch.is_empty()
+        || matches!(
+            readiness.current_branch.as_str(),
+            "main" | "master" | "trunk" | "develop" | "development"
+        );
     if on_default {
         PrPlan {
             needs_new_branch: true,
@@ -736,6 +746,20 @@ mod tests {
         assert!(plan.needs_new_branch);
         assert_eq!(plan.head_branch, "umadev/my-app");
         assert_eq!(plan.base_branch, "main");
+    }
+
+    #[test]
+    fn a_master_default_repo_never_commits_onto_master_even_if_base_misdetected() {
+        // D-H1: git_default_branch fell back to "main" (no origin/HEAD), but the repo real
+        // default is "master" and HEAD is on master. Committing there would ESCAPE branch
+        // isolation, so a checkout on any conventional default forces a fresh branch.
+        let r = readiness("main", "master", true);
+        let plan = plan_branches(&r, "my-app");
+        assert!(
+            plan.needs_new_branch,
+            "on master must branch even if base=main"
+        );
+        assert_eq!(plan.head_branch, "umadev/my-app");
     }
 
     #[test]

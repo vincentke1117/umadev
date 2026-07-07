@@ -60,6 +60,22 @@ fn is_sensitive_scan_path(rel: &str) -> bool {
 }
 
 /// Directories to skip during the scan (deps, build output, VCS).
+/// Dot-directories the FULL scan DESCENDS into anyway (a leading `.` normally skips a dir).
+/// These legitimately carry secrets / CI config a commit could leak, so a full `umadev ci`
+/// must see them (the changed-only git path already lists their tracked files, so this keeps
+/// the two scopes in sync). Kept small so the walk stays fast (no descent into arbitrary
+/// dot-dirs).
+const SCAN_DOT_DIRS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".docker",
+    ".config",
+    ".github",
+    ".circleci",
+    ".env.d",
+];
+
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
     ".git",
@@ -166,7 +182,13 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
     // UD-SEC-016: run `npm audit` if a package-lock.json is present, to catch
     // known-vulnerable dependencies (OWASP A06). Best-effort: if npm isn't
     // installed or the audit fails, skip silently (the file scan still ran).
-    if opts.project_root.join("package-lock.json").exists() {
+    //
+    // NOT in `--changed-only` mode (the pre-commit gate): a dependency audit judges the
+    // WHOLE lockfile, so a PRE-EXISTING transitive CVE - unrelated to the staged change -
+    // would fail-CLOSE every commit until it is patched upstream (possibly never),
+    // contradicting the changed-only contract ("judge only the staged change"). The full
+    // `umadev ci` still runs it.
+    if !opts.changed_only && opts.project_root.join("package-lock.json").exists() {
         if let Ok(audit_result) = npm_audit(&opts.project_root) {
             if audit_result.critical + audit_result.high > 0 {
                 result.violations += audit_result.critical + audit_result.high;
@@ -351,7 +373,13 @@ fn walk_dir(dir: &Path, files: &mut Vec<PathBuf>) {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            if SKIP_DIRS.contains(&name) || name.starts_with('.') {
+            // Skip build/VCS dirs and dot-dirs BY DEFAULT, but DESCEND into a small
+            // allowlist of security-relevant dot-dirs (.ssh / .aws / .github / ...) so a
+            // committed secret or a weakened workflow there is scanned (it was silently
+            // skipped by the blanket dot-prefix rule).
+            if SKIP_DIRS.contains(&name)
+                || (name.starts_with('.') && !SCAN_DOT_DIRS.contains(&name))
+            {
                 continue;
             }
             walk_dir(&path, files);

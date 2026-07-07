@@ -229,12 +229,26 @@ pub fn create_phase_checkpoint(project_root: &Path, label: &str) -> Option<Strin
 /// missing.
 #[must_use]
 pub fn list_checkpoints(project_root: &Path) -> Vec<Checkpoint> {
+    list_checkpoints_limited(project_root, 50)
+}
+
+/// [`list_checkpoints`] with an explicit cap. The 50-cap public form is for DISPLAY; the
+/// restore/rollback VALIDATION uses a much larger cap so an older-but-valid checkpoint (a
+/// long run with >50 commits) is still resettable-to - the display cap must never shrink the
+/// set of ids a user is allowed to rewind to.
+fn list_checkpoints_limited(project_root: &Path, limit: usize) -> Vec<Checkpoint> {
     // `--all` so checkpoints that a rewind moved off the linear HEAD history
     // (the pre-rewind snapshot + any forward checkpoints, preserved under a
     // `umadev-saved-*` ref by restore_checkpoint) are still listed.
     let Some(out) = git(
         project_root,
-        &["log", "--all", "--pretty=%h%x1f%cI%x1f%s", "-n", "50"],
+        &[
+            "log",
+            "--all",
+            "--pretty=%h%x1f%cI%x1f%s",
+            "-n",
+            &limit.to_string(),
+        ],
     ) else {
         return Vec::new();
     };
@@ -295,7 +309,11 @@ pub fn restore_checkpoint(project_root: &Path, id: &str) -> Result<(), String> {
     // branch, a random SHA), so without this gate a bad handle would silently
     // rewind the work-tree to an unintended commit and drop files. We only allow
     // ids that `list_checkpoints` actually surfaced.
-    let known = list_checkpoints(project_root);
+    // Validate against a MUCH larger set than the 50 we DISPLAY: a long run can create >50
+    // checkpoints, and a user must still be able to rewind to an older valid one (the display
+    // cap is cosmetic, not a security boundary - the id must still be a real UmaDev-reachable
+    // commit, just not necessarily in the newest 50).
+    let known = list_checkpoints_limited(project_root, 1000);
     if !id_is_known_checkpoint(id, &known) {
         return Err(format!(
             "未知的检查点 id「{id}」—— 它不在可回滚的检查点列表中"

@@ -129,6 +129,11 @@ pub fn add_knowledge(
 
     safe_component(&entry_name)?;
     let dest_dir = project_root.join(CUSTOM_DIR).join(&entry_name);
+    // Track whether THIS call created the dest dir: on a failure path we must only clean
+    // up a dir we ourselves created, never remove_dir_all a PRE-EXISTING same-named
+    // entry already-indexed files (which would delete the user prior add and leave a
+    // phantom registry entry with no files on disk).
+    let dest_pre_existed = dest_dir.exists();
     std::fs::create_dir_all(&dest_dir)?;
 
     let mut files_copied = 0;
@@ -167,7 +172,9 @@ pub fn add_knowledge(
             // Don't leave an empty registered entry (or a stray dest dir) that the
             // base will never index — clean up and tell the user plainly what was
             // skipped (non-markdown and/or symlinked files).
-            let _ = std::fs::remove_dir_all(&dest_dir);
+            if !dest_pre_existed {
+                let _ = std::fs::remove_dir_all(&dest_dir);
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
@@ -180,7 +187,9 @@ pub fn add_knowledge(
         }
     } else if source.is_file() {
         if !is_markdown(source) {
-            let _ = std::fs::remove_dir_all(&dest_dir);
+            if !dest_pre_existed {
+                let _ = std::fs::remove_dir_all(&dest_dir);
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(

@@ -163,6 +163,23 @@ pub enum RunOutcome {
 /// continuous driver returns a [`RunOutcome`], not a `Result`, so we degrade to
 /// "best-effort persisted" rather than aborting an otherwise-healthy run.
 fn persist_state(options: &RunOptions, phase: Phase, active_gate: &str) {
+    persist_state_impl(options, phase, active_gate, None);
+}
+
+/// [`persist_state`] but stamping the distinct CLEAN-completion note ("Pipeline complete.")
+/// instead of the per-block "Advanced to ..." note, so `continue` recognizes a genuinely-
+/// finished continuous run (and ONLY a finished one - a mid-block delivery-phase write keeps
+/// "Advanced to ...", never mistaken for done). Mirrors the director loop H1 fix.
+fn persist_state_complete(options: &RunOptions, phase: Phase) {
+    persist_state_impl(options, phase, "", Some("Pipeline complete."));
+}
+
+fn persist_state_impl(
+    options: &RunOptions,
+    phase: Phase,
+    active_gate: &str,
+    note_override: Option<&str>,
+) {
     // Carry the base session id (if any) forward across transitions so a
     // phase-transition write never erases a cross-session resume pointer.
     let prior_base_session_id =
@@ -173,7 +190,10 @@ fn persist_state(options: &RunOptions, phase: Phase, active_gate: &str) {
         slug: options.effective_slug(),
         requirement: options.requirement.clone(),
         last_transition_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        note: format!("Advanced to {} (continuous session)", phase.id()),
+        note: note_override.map_or_else(
+            || format!("Advanced to {} (continuous session)", phase.id()),
+            str::to_string,
+        ),
         backend: options.backend.clone(),
         base_session_id: prior_base_session_id,
         spec_version: umadev_spec::SPEC_VERSION.to_string(),
@@ -411,10 +431,16 @@ pub async fn run_block(
     }
 
     let final_phase = phases.last().copied().unwrap_or(Phase::Delivery);
-    // P0-A: persist the terminal phase with NO open gate so a `continue` after a
-    // completed block sees "no active gate" (the honest "pipeline is done / nothing
-    // to approve") instead of a stale gate, mirroring the single-shot done-state.
-    persist_state(options, final_phase, "");
+    // P0-A: persist the terminal phase with NO open gate so a `continue` after a completed
+    // block sees "no active gate" (the honest "pipeline is done / nothing to approve")
+    // instead of a stale gate, mirroring the single-shot done-state. When the terminal
+    // phase is Delivery this block finished the whole run, so stamp the distinct completion
+    // note (H1) - a non-delivery block end keeps the per-phase note.
+    if final_phase == Phase::Delivery {
+        persist_state_complete(options, final_phase);
+    } else {
+        persist_state(options, final_phase, "");
+    }
     events.emit(EngineEvent::BlockCompleted {
         final_phase,
         paused_at: None,

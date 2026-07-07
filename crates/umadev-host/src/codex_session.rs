@@ -965,14 +965,33 @@ async fn reader_loop(
     }
     // EOF or a read error → the app-server is gone. Tell any in-flight turn it
     // failed (fail-open) and wake every pending request so no caller hangs.
-    let _ = event_tx.try_send(SessionEvent::TurnDone {
-        status: TurnStatus::Failed("codex app-server stdout closed".to_string()),
-        usage: None,
-    });
-    let mut guard = pending.lock().await;
-    for (_, tx) in guard.drain() {
-        let _ = tx.send(Err("codex app-server closed".to_string()));
+    //
+    // ORDER MATTERS: wake the PENDING request callers FIRST, THEN block to enqueue the
+    // terminal event. A consumer awaiting a `send_turn` RPC response is parked inside this
+    // `pending` map; if we blocked on `event_tx.send().await` while the event channel was
+    // full BEFORE draining `pending`, that consumer would never be woken (its `send_turn`
+    // never returns) → it would never drain the event channel → the blocking send would
+    // wait forever = a DEADLOCK. Draining `pending` first releases the consumer's task so
+    // it either resumes draining the channel or drops the receiver — either way the
+    // subsequent blocking send completes (a dropped receiver → `Err` → ignored).
+    {
+        let mut guard = pending.lock().await;
+        for (_, tx) in guard.drain() {
+            let _ = tx.send(Err("codex app-server closed".to_string()));
+        }
     }
+    // BLOCKING `send().await`, not `try_send`: the reader loop has EXITED and pending
+    // callers are freed, so awaiting to enqueue this FINAL event GUARANTEES delivery — a
+    // `try_send` here silently DROPPED the terminal event whenever the 256-slot channel
+    // was momentarily full (more likely under V2's chattier reasoning/outputDelta/
+    // tokenUsage stream), leaving the consumer to settle only on the idle watchdog with a
+    // slow, cause-less `Failed` instead of this immediate, correctly-attributed one.
+    let _ = event_tx
+        .send(SessionEvent::TurnDone {
+            status: TurnStatus::Failed("codex app-server stdout closed".to_string()),
+            usage: None,
+        })
+        .await;
 }
 
 /// Map UmaDev's pipeline model id onto a codex-acceptable one, or `None`.
@@ -1075,11 +1094,17 @@ async fn handle_server_request(v: &Value, approvals: &ApprovalMap, event_tx: &Ev
     let params = v.get("params").cloned().unwrap_or(Value::Null);
     let (action, target) = approval_action_target(method, &params);
     approvals.lock().await.insert(req_id.clone(), raw_id);
-    let _ = event_tx.try_send(SessionEvent::NeedApproval {
-        req_id,
-        action,
-        target,
-    });
+    // BLOCKING send (not try_send): a dropped NeedApproval under channel backpressure
+    // would leave the turn waiting on an approval that never surfaces -> a headless hang
+    // (V1). An approval only occurs during a LIVE turn where the consumer is draining
+    // next_event, so the send resolves as soon as the 256-slot buffer frees.
+    let _ = event_tx
+        .send(SessionEvent::NeedApproval {
+            req_id,
+            action,
+            target,
+        })
+        .await;
 }
 
 /// Derive the `(action, target)` pair for a `requestApproval` method.
@@ -1150,13 +1175,16 @@ async fn handle_notification(
         // Streamed assistant text.
         "item/agentMessage/delta" => emit_text_delta(&params, event_tx),
         // Process-log visibility (opt-in): a long-running command's lifecycle.
-        // codex emits `item/started` when the command BEGINS and `item/updated`
-        // as its captured output grows — surfacing those turns a multi-minute,
-        // silent build into a live, progressing log (the `commandExecution` item
-        // only `item/completed`s when it FINISHES, so without this the user sees
-        // nothing until the build is over). Gated so OFF behaviour is unchanged.
+        // codex emits `item/started` when the command BEGINS and streams its captured
+        // output through `item/commandExecution/outputDelta` as it grows — surfacing
+        // those turns a multi-minute, silent build into a live, progressing log (the
+        // `commandExecution` item only `item/completed`s when it FINISHES, so without
+        // this the user sees nothing until the build is over). Gated so OFF behaviour is
+        // unchanged. (The older `item/updated` name is NOT emitted by codex V2.)
         "item/started" if show_logs => emit_started_item(&params, event_tx),
-        "item/updated" if show_logs => emit_updated_item(&params, event_tx),
+        "item/commandExecution/outputDelta" if show_logs => {
+            emit_output_delta(&params, event_tx);
+        }
         // A completed item — the SOURCE OF TRUTH for produced work.
         "item/completed" => emit_completed_item(&params, show_logs, event_tx),
         // F3: codex streams per-turn token usage in this dedicated notification
@@ -1166,8 +1194,8 @@ async fn handle_notification(
         // The turn ended — the authoritative phase-done boundary.
         "turn/completed" => emit_turn_done(&params, turn_id, latest_usage, event_tx).await,
         // turn/diff/updated, thread/started, fs/changed, an `item/started` /
-        // `item/updated` while process logs are OFF, … carry no event we surface —
-        // ignored (fail-open).
+        // `item/commandExecution/outputDelta` while process logs are OFF, … carry no
+        // event we surface — ignored (fail-open).
         _ => {}
     }
 }
@@ -1368,39 +1396,29 @@ fn emit_started_item(params: &Value, event_tx: &EventTx) {
     });
 }
 
-/// Process-log visibility: an `item/updated` notification for a running
-/// `commandExecution` → surface its growing `aggregatedOutput` as a streamed
-/// [`SessionEvent::ToolResult`], so the live build log reaches the transcript as
-/// it is produced (the consumer renders this as the in-progress command's body).
-/// Only the `commandExecution` lifecycle is surfaced. Called only when process
-/// logs are ON. Fail-open: a non-command item, or one with no output yet, is a
-/// no-op (no empty progress line).
-fn emit_updated_item(params: &Value, event_tx: &EventTx) {
-    let Some(item) = params.get("item") else {
-        return;
-    };
-    if item.get("type").and_then(Value::as_str) != Some("commandExecution") {
-        return;
-    }
-    let output = item
-        .get("aggregatedOutput")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if output.trim().is_empty() {
+/// Process-log visibility: an `item/commandExecution/outputDelta` notification carries
+/// an INCREMENTAL chunk of a running command's output (`{threadId, turnId, itemId,
+/// delta}`). codex V2 streams live command output through THIS notification — it does
+/// NOT emit the older whole-`aggregatedOutput` `item/updated` frame this code used to
+/// listen for (that name is never sent, so the mid-command live stream silently never
+/// fired). Surface each delta as a streamed [`SessionEvent::ToolResult`] so the build
+/// log reaches the transcript as it is produced; the final verdict still lands on
+/// `item/completed`. Called only when process logs are ON. Fail-open: an empty delta is
+/// a no-op (no blank progress line).
+fn emit_output_delta(params: &Value, event_tx: &EventTx) {
+    let delta = params.get("delta").and_then(Value::as_str).unwrap_or("");
+    if delta.trim().is_empty() {
         return;
     }
-    // Still running → a non-terminal progress frame is `ok: true`; the final
-    // success/failure verdict lands on `item/completed`. Only reached when process
-    // logs are ON, so the generous `cap_for(true)` carries the build log's tail.
-    // Each frame carries the CUMULATIVE output, so we keep the TAIL (`verbose=true`)
-    // — head-truncation would pin every past-cap frame to the same first 16 KiB and
-    // FREEZE the live stream.
+    // A DELTA (incremental new text), not the cumulative output, so keep the HEAD of the
+    // chunk (`verbose=false`): there is no past-cap "freeze" risk here because each frame
+    // is fresh text rather than a re-sent cumulative buffer. Still running → `ok: true`.
     let _ = event_tx.try_send(SessionEvent::ToolResult {
         ok: true,
         summary: crate::process_logs::truncate_preview(
-            output,
+            delta,
             crate::process_logs::cap_for(true),
-            true,
+            false,
         ),
     });
 }
@@ -1565,10 +1583,16 @@ async fn emit_turn_done(
         let streamed = guard.take();
         inline.or(streamed)
     };
-    let _ = event_tx.try_send(SessionEvent::TurnDone {
-        status: map_turn_status(status, params),
-        usage,
-    });
+    // BLOCKING send (not try_send): the TERMINAL TurnDone must never be dropped under
+    // backpressure, else the turn never ends and the run blocks to its wall-clock deadline
+    // (V1 - the same fix already applied to the EOF terminal). Safe here: turn/completed
+    // only arrives during a live turn the consumer is draining.
+    let _ = event_tx
+        .send(SessionEvent::TurnDone {
+            status: map_turn_status(status, params),
+            usage,
+        })
+        .await;
 }
 
 /// Map a codex turn `status` string to a [`TurnStatus`].
@@ -1684,10 +1708,15 @@ impl BaseSession for CodexSession {
                 // carrying the real error so the loop renders it (fail-open: a closed
                 // channel send is a no-op).
                 Ok(Err(e)) => {
-                    let _ = event_tx.try_send(SessionEvent::TurnDone {
-                        status: TurnStatus::Failed(e),
-                        usage: None,
-                    });
+                    // BLOCKING send (not try_send): this terminal Failed is the ONLY signal
+                    // the turn ended, so it must not be dropped under backpressure (V1). In
+                    // a spawned task, never the reader loop, so blocking is safe.
+                    let _ = event_tx
+                        .send(SessionEvent::TurnDone {
+                            status: TurnStatus::Failed(e),
+                            usage: None,
+                        })
+                        .await;
                 }
                 // The sender was dropped → the session died; the reader's EOF path
                 // already emits a terminal Failed, so nothing to do here.
@@ -1777,14 +1806,19 @@ fn interrupt_params(thread_id: &str, turn_id: &str) -> Value {
     json!({ "threadId": thread_id, "turnId": turn_id })
 }
 
-/// Build the `{id, result:{approved[, reason]}}` reply to a `requestApproval`.
+/// Build the `{id, result:{decision}}` reply to a `requestApproval`.
+///
+/// Current codex (app-server V2) requires the `decision` ENUM — camelCase
+/// `accept` / `decline` / `cancel` / `acceptForSession` (see
+/// `codex-rs/app-server-protocol/src/protocol/v2/item.rs`). The old
+/// `{approved: bool}` shape has NO `decision` field and fails to deserialize, so on the
+/// DEFAULT guarded tier — where codex escalates on network / out-of-workspace actions
+/// (`approvalPolicy: "on-request"`) — the reply was silently unusable and those
+/// approvals could never be answered. `accept`/`decline` are the allow/deny mapping;
+/// `cancel` (abort the turn) is intentionally not used here.
 fn approval_reply(raw_id: &Value, approved: bool) -> Value {
-    let result = if approved {
-        json!({ "approved": true })
-    } else {
-        json!({ "approved": false, "reason": "declined by umadev governance" })
-    };
-    json!({ "id": raw_id, "result": result })
+    let decision = if approved { "accept" } else { "decline" };
+    json!({ "id": raw_id, "result": { "decision": decision } })
 }
 
 #[cfg(test)]
@@ -2090,12 +2124,17 @@ mod tests {
 
     #[test]
     fn approval_reply_shapes_accept_and_decline() {
+        // Current codex requires the `decision` enum (camelCase accept/decline), NOT the
+        // old `{approved: bool}` shape (which had no `decision` field → deserialize fail).
         let accept = approval_reply(&json!(5), true);
         assert_eq!(accept["id"], 5);
-        assert_eq!(accept["result"]["approved"], true);
+        assert_eq!(accept["result"]["decision"], "accept");
+        assert!(
+            accept["result"].get("approved").is_none(),
+            "no stale `approved` field"
+        );
         let decline = approval_reply(&json!("abc"), false);
-        assert_eq!(decline["result"]["approved"], false);
-        assert!(decline["result"]["reason"].is_string());
+        assert_eq!(decline["result"]["decision"], "decline");
     }
 
     #[test]
@@ -2184,19 +2223,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn updated_command_streams_growing_output_to_transcript() {
-        // The core toggle behaviour: a running command's growing `aggregatedOutput`
-        // reaches the transcript as a streamed ToolResult, so a multi-minute build's
-        // log lines are visible AS they are produced.
+    async fn output_delta_streams_running_command_output_to_transcript() {
+        // The core toggle behaviour: codex V2 streams a running command's output through
+        // `item/commandExecution/outputDelta` (`{delta}`), and each incremental chunk
+        // reaches the transcript as a streamed ToolResult — so a multi-minute build's log
+        // lines are visible AS they are produced.
         let (tx, mut rx) = chan();
-        emit_updated_item(
+        emit_output_delta(
             &json!({
-                "item": {
-                    "type": "commandExecution",
-                    "command": "mvn -q install",
-                    "status": "running",
-                    "aggregatedOutput": "[INFO] Building project 1/7\n[INFO] Compiling 42 sources",
-                }
+                "threadId": "t1",
+                "turnId": "u1",
+                "itemId": "i1",
+                "delta": "[INFO] Building project 1/7\n[INFO] Compiling 42 sources",
             }),
             &tx,
         );
@@ -2208,12 +2246,9 @@ mod tests {
             summary.contains("[INFO] Building project"),
             "the live build log line reached the transcript: {summary}"
         );
-        // An update with no output yet streams nothing (no empty progress line).
-        emit_updated_item(
-            &json!({ "item": { "type": "commandExecution", "aggregatedOutput": "   " } }),
-            &tx,
-        );
-        assert!(rx.try_recv().is_err(), "an empty-output frame is a no-op");
+        // A delta with no text streams nothing (no empty progress line).
+        emit_output_delta(&json!({ "delta": "   " }), &tx);
+        assert!(rx.try_recv().is_err(), "an empty-delta frame is a no-op");
     }
 
     #[tokio::test]
@@ -2694,35 +2729,26 @@ mod tests {
     }
 
     #[test]
-    fn updated_item_streams_the_tail_of_a_past_cap_build_log() {
-        // The user's exact scenario: an `item/updated` whose CUMULATIVE
-        // `aggregatedOutput` blows past the verbose cap, failure verdict at the END.
-        // The streamed ToolResult must carry the TAIL (so the live log advances and
-        // the error survives), NOT the first 16 KiB (which would freeze the stream).
-        // A unique sentinel ONLY at the very start, then >16 KiB of filler, then the
-        // failure at the END. Past the cap the head sentinel must be GONE (not pinned)
-        // and the error tail present.
+    fn output_delta_bounds_a_large_chunk_to_its_head() {
+        // codex V2 streams INCREMENTAL deltas (not a re-sent cumulative buffer), so a
+        // single large delta is bounded to its HEAD (`verbose=false`) and each subsequent
+        // delta continues the stream — there is no cumulative "error buried at the end"
+        // frame to preserve a tail for. A past-cap delta must be bounded, keeping the head.
         let filler = "[INFO] downloading dependency\n".repeat(4000); // ~120 KiB, >> 16 KiB
-        let output = format!(
-            "HEAD_SENTINEL_FIRST_LINE\n{filler}[INFO] BUILD FAILURE\n[ERROR] boom at Foo.java:42\n"
-        );
-        let item = json!({
-            "item": { "type": "commandExecution", "aggregatedOutput": output }
-        });
+        let params = json!({ "delta": format!("DELTA_HEAD_SENTINEL\n{filler}") });
         let (tx, mut rx) = chan();
-        emit_updated_item(&item, &tx);
+        emit_output_delta(&params, &tx);
         let Ok(SessionEvent::ToolResult { ok, summary }) = rx.try_recv() else {
-            panic!("a non-empty item/updated must stream a progress ToolResult");
+            panic!("a non-empty delta must stream a progress ToolResult");
         };
         assert!(ok, "an in-flight progress frame is ok: true");
         assert!(
-            summary.contains("BUILD FAILURE"),
-            "the error tail must survive"
+            summary.contains("DELTA_HEAD_SENTINEL"),
+            "the head of the delta is kept"
         );
-        assert!(summary.contains("boom at Foo.java:42"));
         assert!(
-            !summary.contains("HEAD_SENTINEL"),
-            "the head must be dropped, not pinned to the first 16 KiB"
+            summary.len() <= crate::process_logs::cap_for(true) + 64,
+            "a large delta is bounded to the cap, not streamed whole"
         );
     }
 

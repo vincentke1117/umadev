@@ -1118,7 +1118,12 @@ fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>)
                 println!("[ok] Removed UmaDev PreToolUse hook from Claude Code settings.");
             }
             "pre-commit" => {
-                uninstall_pre_commit_hook(&root)?;
+                // Resolve the GIT ROOT (walk up) - the same root `install --base
+                // pre-commit` uses - so uninstall from a SUBDIR actually finds the hook at
+                // <gitroot>/.git/hooks/pre-commit instead of falsely reporting "Removed"
+                // while the real hook stays active.
+                let git_root = find_git_root_from(&root).unwrap_or_else(|| root.clone());
+                uninstall_pre_commit_hook(&git_root)?;
                 println!("[ok] Removed UmaDev pre-commit git hook.");
             }
             other => anyhow::bail!("uninstall not applicable for base '{other}'"),
@@ -1153,7 +1158,8 @@ fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>)
     }
     // 2. This project's governance hooks (best-effort; fail-open).
     let _ = hook::uninstall_claude_hook(&root);
-    let _ = uninstall_pre_commit_hook(&root);
+    let git_root = find_git_root_from(&root).unwrap_or_else(|| root.clone());
+    let _ = uninstall_pre_commit_hook(&git_root);
     println!("[ok] Removed this project's governance hooks (if present).");
     // 3. The binary LAST (so the steps above ran on a live binary). An npm
     //    install is removed via npm so the package metadata is cleaned too; a
@@ -1792,7 +1798,25 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
     // that section (everything else — the governance preamble + any hand edits — is
     // preserved). Fail-open: `run_adopt` never errors, so an empty / sparse project
     // just yields a minimal section.
+    // init is NOT adopt: it must not brand a fresh workspace brownfield. run_adopt writes
+    // the .umadev/adopt.json marker + UMADEV.md brief as a side effect, and the marker makes
+    // the NEXT `umadev run` see is_adopted()==true and inject "work incrementally, never
+    // regenerate" into what should be a greenfield build. So keep run_adopt ANALYSIS
+    // (stack/commands/index) for the CLAUDE.md Project refresh, but UNDO the brownfield
+    // branding when THIS init created it (a pre-existing real adopt is left intact).
+    let was_adopted = umadev_agent::is_adopted(&workspace);
+    // Capture whether a UMADEV.md ALREADY existed (a hand-authored one) before run_adopt so
+    // init only ever removes the brief it ITSELF wrote - is_adopted keys on adopt.json, so a
+    // user UMADEV.md with no marker would otherwise be destroyed by a plain init (L2).
+    let umadev_md = workspace.join("UMADEV.md");
+    let umadev_md_pre_existed = umadev_md.exists();
     let report = umadev_agent::run_adopt(&workspace);
+    if !was_adopted {
+        let _ = std::fs::remove_file(workspace.join(".umadev").join("adopt.json"));
+        if !umadev_md_pre_existed {
+            let _ = std::fs::remove_file(&umadev_md);
+        }
+    }
     let existing = std::fs::read_to_string(&claude_md).unwrap_or_default();
     let refreshed = upsert_managed_section(&existing, &generate_project_index_section(&report));
     if std::fs::write(&claude_md, refreshed).is_ok() {
@@ -3637,11 +3661,23 @@ const PIPELINE_COMPLETE_NOTE: &str = "Pipeline complete.";
 /// gate-pause (non-empty gate) or a mid-delivery kill (different note) is never
 /// mistaken for completion.
 fn is_pipeline_complete(state: &umadev_agent::WorkflowState) -> bool {
-    state.active_gate.is_empty()
-        && state
+    if !state.active_gate.is_empty()
+        || !state
             .phase
             .eq_ignore_ascii_case(umadev_spec::Phase::Delivery.id())
-        && state.note.trim() == PIPELINE_COMPLETE_NOTE
+    {
+        return false;
+    }
+    // A cleanly-finished run stamps a DISTINCT completion note: the legacy single-shot
+    // sentinel "Pipeline complete." (also written now by the director-loop + continuous
+    // CLEAN finalize, DIRECTOR_COMPLETE_NOTE), or the light path "Light pipeline complete.".
+    // We must NOT match the per-phase "Advanced to delivery ..." note: the director loop +
+    // continuous session write it on EVERY delivery-phase sync (mid-run and on a NON-clean
+    // finalize), so matching it made `continue` refuse to resume an INCOMPLETE build that
+    // merely reached the delivery phase (H1). Delivery-phase + no gate + a genuine
+    // completion note = done.
+    let note = state.note.trim();
+    note == PIPELINE_COMPLETE_NOTE || note == "Light pipeline complete."
 }
 
 /// Infer which gate block to re-run when the pipeline was interrupted
@@ -4281,6 +4317,40 @@ async fn cmd_verify(project_root: Option<PathBuf>, runtime: bool) -> Result<()> 
         println!("  <no .umadev/workflow-state.json — run `umadev run \"<requirement>\"`>");
     }
 
+    // --- verify: actually RUN the project's real test / build / lint sequence (H2). The
+    // sections above are read-only status; CLAUDE.md promises `umadev verify` also EXECUTES
+    // the conformance sequence, so run it here, print each step, persist the outcomes for
+    // the quality gate, and fail the command (non-zero exit) if a non-skipped step failed,
+    // so it is usable as a CI gate.
+    println!("\n## Verify (test / build / lint)");
+    let outcomes = umadev_agent::run_verify(&project_root).await;
+    let mut verify_failed = false;
+    if outcomes.is_empty() {
+        println!("  <no recognized project to verify (no package.json / Cargo.toml / …)>");
+    } else {
+        for o in &outcomes {
+            let tag = if o.skipped {
+                "skip"
+            } else if o.passed {
+                "ok"
+            } else {
+                verify_failed = true;
+                "FAIL"
+            };
+            println!(
+                "  [{tag}] {} — `{}` ({} ms)",
+                o.step, o.command, o.duration_ms
+            );
+            if !o.passed && !o.skipped {
+                let tail: Vec<&str> = o.stderr.lines().rev().take(3).collect();
+                for line in tail.into_iter().rev() {
+                    println!("      {line}");
+                }
+            }
+            let _ = umadev_agent::record_verify_outcome(&project_root, "verify", o);
+        }
+    }
+
     // --- evidence chain ---
     println!("\n## Evidence chain");
     let audit = project_root.join(".umadev/audit");
@@ -4417,6 +4487,11 @@ async fn cmd_verify(project_root: Option<PathBuf>, runtime: bool) -> Result<()> 
         print_runtime_proof(lang, &proof);
     }
 
+    if verify_failed {
+        anyhow::bail!(
+            "verify: one or more test/build/lint steps failed (see the Verify section above)"
+        );
+    }
     Ok(())
 }
 
@@ -4636,9 +4711,11 @@ fn cmd_report(slug: Option<String>, project_root: Option<PathBuf>, review: bool)
         let scan = umadev_agent::run_security_scan(&project_root);
         let _ = umadev_agent::write_security_scan(&project_root, &scan);
         println!("  {}", scan.summary_line());
+        let mut blocked = false;
         match umadev_agent::write_review_report(&project_root, &slug) {
             Ok(path) => {
                 let report = umadev_agent::build_review_report(&project_root, &slug);
+                blocked = !report.mergeable();
                 println!(
                     "{}",
                     umadev_i18n::tf(lang, "review.written", &[&path.display().to_string()])
@@ -4665,6 +4742,14 @@ fn cmd_report(slug: Option<String>, project_root: Option<PathBuf>, review: bool)
                 "{}",
                 umadev_i18n::tf(lang, "review.write_failed", &[&e.to_string()])
             ),
+        }
+        // Non-zero exit when the review has a blocking (Fail) claim, so `umadev report
+        // --review` is usable as a CI merge gate (mirrors verify/ci) instead of always
+        // exiting 0 while printing "BLOCKED".
+        if blocked {
+            anyhow::bail!(
+                "review: the report has a blocking claim — not mergeable (see the [XX] items)"
+            );
         }
         return Ok(());
     }
@@ -6147,20 +6232,36 @@ mod tests {
     }
 
     #[test]
-    fn is_pipeline_complete_only_for_the_finished_sentinel() {
-        // The exact finished state the runner persists.
+    fn is_pipeline_complete_recognizes_every_finished_finalize_note() {
+        // The legacy single-shot sentinel.
         assert!(is_pipeline_complete(&state_with(
             "delivery",
             "",
             "Pipeline complete."
         )));
-        // A mid-`delivery` interruption shares phase+empty-gate but NOT the note.
-        assert!(!is_pipeline_complete(&state_with("delivery", "", "")));
+        // The light single-shot path.
+        assert!(is_pipeline_complete(&state_with(
+            "delivery",
+            "",
+            "Light pipeline complete."
+        )));
+        // H1: the per-phase "Advanced to delivery (...)" note is written on EVERY
+        // delivery-phase sync (mid-run + non-clean finalize), so it must NOT read as
+        // complete - else `continue` refuses to resume an INCOMPLETE build that merely
+        // reached the delivery phase. A CLEAN finalize instead stamps "Pipeline complete."
+        // (handled by the first assertion), which IS recognized.
         assert!(!is_pipeline_complete(&state_with(
             "delivery",
             "",
-            "Advanced to delivery"
+            "Advanced to delivery (director loop)"
         )));
+        assert!(!is_pipeline_complete(&state_with(
+            "delivery",
+            "",
+            "Advanced to delivery (continuous session)"
+        )));
+        // A mid-`delivery` interruption shares phase+empty-gate but has NO finalize note.
+        assert!(!is_pipeline_complete(&state_with("delivery", "", "")));
         // A genuine gate-pause has a non-empty gate — never "complete".
         assert!(!is_pipeline_complete(&state_with(
             "preview_confirm",
@@ -6201,10 +6302,13 @@ mod tests {
 
     #[test]
     fn resolve_active_gate_still_recovers_a_mid_delivery_interrupt() {
-        // A kill DURING delivery (phase="delivery", empty gate, but NOT the
-        // completion note) is a real interruption — it must still recover by
-        // inferring the preview_confirm block, not be mistaken for "complete".
-        let state = state_with("delivery", "", "Advanced to delivery");
+        // A kill DURING delivery (phase="delivery", empty gate, and NO finalize note)
+        // is a real interruption — it must still recover by inferring the preview_confirm
+        // block, not be mistaken for "complete". A run that reached the FINALIZE writes an
+        // "Advanced to delivery (…)" note and IS correctly treated as complete now (see
+        // `is_pipeline_complete_recognizes_every_finished_finalize_note`), so the genuine
+        // interrupt is the one with no such note.
+        let state = state_with("delivery", "", "");
         let gate = resolve_active_gate(&state).expect("mid-delivery interrupt must recover");
         assert_eq!(gate, Gate::PreviewConfirm);
     }

@@ -963,6 +963,16 @@ fn resolve_pending_approval(holder: &ApprovalHolder, code: KeyCode, mods: KeyMod
     if guard.is_none() {
         return false; // no pause active — the key flows through untouched
     }
+    // shift+Tab (BackTab) must FALL THROUGH even while a pause is active so it reaches the
+    // trust-mode cycle (`cycle_approval_mode`): the advertised "shift+Tab 转手动 / flip to
+    // Auto to release the paused action" only works if this keystroke is NOT swallowed
+    // here. The mode-cycle handler then republishes the live tier and, when it lands on
+    // Auto, resolves THIS pending approval as Allow (see the `allow_pending_approval` call
+    // after `apply_key_with_mods`). Every OTHER bare key stays consumed below so a stray
+    // Enter/character can never start a turn on the one paused session.
+    if matches!(code, KeyCode::BackTab) {
+        return false;
+    }
     let decision = match code {
         KeyCode::Char('y' | 'Y') => Some(ApprovalReply::Allow),
         KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(ApprovalReply::Deny),
@@ -5174,6 +5184,17 @@ enum MouseSeqState {
     /// Saw `Esc [ <` — confirmed an SGR mouse report; swallow the numeric body
     /// until the `M`/`m` terminator.
     Body,
+    /// Saw `Esc [ M` — a LEGACY X10 mouse report (Windows conhost / any terminal
+    /// without SGR 1006). It carries EXACTLY three raw payload bytes (button+32,
+    /// x+32, y+32, which may be ANY char incl. non-digits like `#`/diamonds), so
+    /// swallow the next `n` keys unconditionally, then return to Idle. Without this
+    /// the whole `Esc[M…` run leaked into the input box as garbage on every mouse
+    /// MOVE under Windows.
+    X10Payload(u8),
+    /// Saw `Esc [ ?` — a private-mode CSI reply (e.g. the DEC-2026 sync-probe reply
+    /// `Esc [ ? 2026 ; 1 $ y`). Swallow the body until the final letter terminator so it
+    /// can't leak as `[?…` text on the Windows legacy input path.
+    CsiQuery,
 }
 
 /// Defensive filter for **leaked SGR mouse sequences**.
@@ -5258,9 +5279,61 @@ impl MouseSeqFilter {
                     self.buf.push(key);
                     self.state = MouseSeqState::Body;
                     Vec::new()
+                } else if plain && key.code == KeyCode::Char('M') {
+                    // LEGACY X10 mouse report `Esc [ M b x y`: drop the marker + its next
+                    // three raw payload bytes (Windows/conhost emit this, not SGR).
+                    self.buf.clear();
+                    self.state = MouseSeqState::X10Payload(3);
+                    Vec::new()
+                } else if plain && matches!(key.code, KeyCode::Char('I' | 'O')) {
+                    // A mis-split FOCUS event `Esc [ I` (focus-in) / `Esc [ O` (focus-out):
+                    // a complete sequence with NO payload - drop it (else `[I`/`[O` + a stray
+                    // Esc leaked, firing the false "press Esc again to interrupt").
+                    self.buf.clear();
+                    self.state = MouseSeqState::Idle;
+                    Vec::new()
+                } else if plain && key.code == KeyCode::Char('?') {
+                    // A private-mode CSI reply `Esc [ ? ... <letter>` (e.g. the sync-probe
+                    // reply): swallow the body until its terminator.
+                    self.buf.clear();
+                    self.state = MouseSeqState::CsiQuery;
+                    Vec::new()
                 } else {
                     self.flush_with(key)
                 }
+            }
+            MouseSeqState::CsiQuery => {
+                // Swallow the private-mode reply body until a FINAL byte (an ASCII letter),
+                // then reset. Bounded - a runaway fails open and flushes as text.
+                match key.code {
+                    KeyCode::Char(ch) if ch.is_ascii_alphabetic() => {
+                        self.buf.clear();
+                        self.state = MouseSeqState::Idle;
+                        Vec::new()
+                    }
+                    KeyCode::Char(ch)
+                        if plain && (ch.is_ascii_digit() || ch == ';' || ch == '$') =>
+                    {
+                        self.buf.push(key);
+                        if self.buf.len() > Self::MAX_BUF {
+                            self.state = MouseSeqState::Idle;
+                            std::mem::take(&mut self.buf)
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    _ => self.flush_with(key),
+                }
+            }
+            MouseSeqState::X10Payload(remaining) => {
+                // Swallow exactly the three raw X10 payload bytes (any char), then reset.
+                let left = remaining.saturating_sub(1);
+                self.state = if left == 0 {
+                    MouseSeqState::Idle
+                } else {
+                    MouseSeqState::X10Payload(left)
+                };
+                Vec::new()
             }
             MouseSeqState::Body => {
                 // Confirmed `Esc [ <` — swallow the numeric body; the `M`/`m`
@@ -8416,6 +8489,12 @@ mod tests {
 
     static OPENCODE_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Serializes the resolve_goal_mode tests: they all read/write the process-global
+    /// UMADEV_NO_GOAL_MODE env var, so without this the opt-out test set_var leaked into a
+    /// concurrent sibling reader and flipped its expected Some(true) to None (a load-only
+    /// flake). Poison-robust so a panic in one never cascades.
+    static GOAL_MODE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn isolate_opencode_config_env() -> Vec<EnvRestore> {
         [
             "OPENCODE_CONFIG",
@@ -8529,6 +8608,38 @@ mod tests {
             f.flush().is_empty(),
             "nothing buffered after the terminator"
         );
+    }
+
+    #[test]
+    fn mouse_seq_filter_swallows_a_legacy_x10_report() {
+        // Windows / conhost emit the LEGACY X10 mouse form `Esc [ M b x y` (three raw payload
+        // bytes, ANY char incl. non-ASCII) instead of SGR - on every mouse MOVE. Every byte
+        // must be swallowed so it never leaks into the input box (the `[M#` garbage reported).
+        let mut f = MouseSeqFilter::default();
+        let burst = [
+            KeyCode::Esc,
+            KeyCode::Char('['),
+            KeyCode::Char('M'),
+            KeyCode::Char('#'),
+            KeyCode::Char('\u{2666}'),
+            KeyCode::Char('6'),
+        ];
+        for code in burst {
+            assert!(
+                f.feed(k(code)).is_empty(),
+                "every byte of a leaked X10 report is swallowed: {code:?}"
+            );
+        }
+        assert!(
+            f.flush().is_empty(),
+            "nothing buffered after the 3 payload bytes"
+        );
+        let out: Vec<KeyCode> = f
+            .feed(k(KeyCode::Char('a')))
+            .iter()
+            .map(|e| e.code)
+            .collect();
+        assert_eq!(out, vec![KeyCode::Char('a')]);
     }
 
     #[test]
@@ -8733,6 +8844,9 @@ mod tests {
 
     #[test]
     fn resolve_goal_mode_reads_the_brain_capability_per_backend() {
+        let _env_lock = GOAL_MODE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // GOAL MODE wiring: a director build with `goal_mode` on resolves the
         // borrowed brain's `persistent_goal` capability from the backend id. ALL
         // THREE first-class bases (claude-code / codex / opencode) support a native
@@ -8744,6 +8858,9 @@ mod tests {
 
     #[test]
     fn resolve_goal_mode_is_fail_open_off() {
+        let _env_lock = GOAL_MODE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // `goal_mode == false` (a build that did not opt in) → no framing.
         assert_eq!(resolve_goal_mode("claude-code", false), None);
         // An unknown / offline backend has no driver → no capability, no framing
@@ -8754,6 +8871,9 @@ mod tests {
 
     #[test]
     fn resolve_goal_mode_honors_the_no_goal_opt_out() {
+        let _env_lock = GOAL_MODE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // `UMADEV_NO_GOAL_MODE=1` suppresses goal framing on EVERY path (shared
         // verbatim with the legacy pipeline's `with_goal_mode`). The env guard is
         // global, so scope the mutation tightly and restore it.
@@ -11610,21 +11730,23 @@ mod tests {
             "the same turn was re-driven once on the fresh recovery session"
         );
         // The recovery surfaced the new `chat.turn_failed_retrying` i18n key so it reads
-        // as an intentional retry, not a silent stall. Compute the key's fixed lead in
-        // the SAME (system) locale the note is rendered in, so the check is locale-safe.
-        let retry_lead = umadev_i18n::tlf("chat.turn_failed_retrying", &["\u{1}", "\u{1}"]);
-        let retry_lead = retry_lead.split('\u{1}').next().unwrap().to_string();
+        // as an intentional retry, not a silent stall. Assert on the BACKEND argument
+        // ("claude-code"), which the note carries VERBATIM regardless of locale - matching
+        // the locale-RENDERED lead instead was flaky, because a sibling test in the parallel
+        // suite can mutate the LANG/LC_ALL env between the note tlf render and this check
+        // tlf, so the two resolved different locales and the lead mismatched. The retry note
+        // is the only Note naming the backend in a successful recovery flow.
         let mut saw_retry_note = false;
         while let Ok(ev) = engine_rx.try_recv() {
             if let EngineEvent::Note(s) = ev {
-                if s.contains(&retry_lead) {
+                if s.contains("claude-code") {
                     saw_retry_note = true;
                 }
             }
         }
         assert!(
             saw_retry_note,
-            "a 'retrying once on a fresh session' note is surfaced"
+            "a 'retrying once on a fresh session' note (naming the backend) is surfaced"
         );
     }
 

@@ -1198,7 +1198,9 @@ fn append_reflection(project_root: &Path, r: &Reflection) {
             buf.push('\n');
         }
     }
-    let _ = fs::write(&path, buf);
+    // Atomic (temp+rename): a crash/kill between a plain truncate-write's truncate and
+    // its flush would leave this learned-KB file EMPTY/torn - every recorded pitfall lost.
+    let _ = write_atomic(&path, &buf);
 }
 
 /// Merge `incoming` tokens into `dst` (deduped), capping at `max`.
@@ -1227,7 +1229,9 @@ fn write_raw_lessons(project_root: &Path, filename: &str, lessons: &[Lesson]) {
             buf.push('\n');
         }
     }
-    let _ = fs::write(&path, buf);
+    // Atomic (temp+rename): a crash/kill between a plain truncate-write's truncate and
+    // its flush would leave this learned-KB file EMPTY/torn - every recorded pitfall lost.
+    let _ = write_atomic(&path, &buf);
 }
 
 /// Atomically write `body` to `path` via a unique temp file + rename, so a
@@ -2565,6 +2569,12 @@ pub fn sediment_lessons_with_judge(project_root: &Path, judge: Option<ReconcileJ
         let _ = fold_beliefs(project_root);
     }
 
+    // Capture EVERY domain this run's raw lessons touch BEFORE dropping invalidated ones,
+    // so the sediment-clean pass below still wipes a domain whose ONLY lesson was just
+    // invalidated (it is about to vanish from `lessons`/`by_key`, but its stale `lesson-*.md`
+    // must still be removed or it keeps being retrieved - the ghost-sediment bug).
+    let touched_domains: std::collections::HashSet<String> =
+        lessons.iter().map(|l| l.domain.clone()).collect();
     // Drop invalidated lessons from the sediment candidate set (they stay on
     // disk for provenance but never become retrievable markdown). No-op for the
     // no-base path, where nothing is ever marked invalid.
@@ -2621,13 +2631,16 @@ pub fn sediment_lessons_with_judge(project_root: &Path, judge: Option<ReconcileJ
     // each file by a STABLE content hash of its `(domain, title)` key, so a
     // re-sediment of the same lesson is idempotent (same file, updated in place)
     // and a vanished lesson leaves no ghost. Mirrors the skill index discipline.
-    let mut cleaned: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for lesson in by_key.values() {
-        if cleaned.insert(lesson.domain.clone()) {
-            let domain_dir = learned_root.join(&lesson.domain);
-            let _ = fs::create_dir_all(&domain_dir);
-            clear_auto_sediment_files(&domain_dir);
-        }
+    // Clear the sediment files of EVERY domain touched this run (captured in touched_domains
+    // BEFORE the invalidated-drop) - INCLUDING a domain whose only lesson was invalidated and
+    // so is absent from lessons/by_key. Iterating the post-retain lessons (or by_key) alone
+    // left that domain stale lesson-*.md on disk, and it kept being RETRIEVED (the ghost). The
+    // re-write below recreates files only for the SURVIVING lessons, so an all-invalidated
+    // domain ends up correctly empty.
+    for domain in &touched_domains {
+        let domain_dir = learned_root.join(domain);
+        let _ = fs::create_dir_all(&domain_dir);
+        clear_auto_sediment_files(&domain_dir);
     }
 
     for (key, lesson) in &by_key {
@@ -2764,7 +2777,19 @@ fn promote_to_global(_project_root: &Path, lessons: &[Lesson]) -> usize {
             // (identical key) hashes the same → it updates in place, never
             // duplicates. The hash is deterministic across processes (fixed-key
             // SipHash), so cross-run promotions stay stable.
-            let slug = key.replace("::", "-").replace(' ', "-");
+            // Slugify to a SINGLE safe filename component: the key embeds a DevError
+            // SIGNATURE like `dependency/module-not-found/react-router-dom` (with `/`) and a
+            // user-controlled Revision title, so `/`, backslash, `:` and `..` must ALL be
+            // neutralized. The old `.replace("::","-").replace(' ',"-")` left `/` intact, so
+            // `dir.join(slug)` became a MULTI-component path into never-created subdirs ->
+            // write_atomic failed -> the pitfall NEVER promoted (the whole cross-project
+            // learning feature was silently DEAD), and a `..` title could escape the learned
+            // dir. Map every non-alphanumeric char to `-`; the -{hash} suffix keeps distinct
+            // keys in distinct files despite the coarser slug.
+            let slug: String = key
+                .chars()
+                .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+                .collect();
             let slug = truncate(&slug, 80);
             let path = dir.join(format!("{slug}-{:016x}.md", stable_str_hash(key)));
             let body = render_lesson_markdown(lesson);
@@ -4071,6 +4096,41 @@ pub fn pitfall_efficacy_summary(project_root: &Path) -> PitfallEfficacySummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Isolate $HOME (hence global_learned_dir()) to a throwaway temp dir for a test, so a
+    /// real sediment/promotion can't READ or POLLUTE the developer actual ~/.umadev/learned
+    /// (now that promote_to_global actually works). $HOME is process-global, so serialize via
+    /// HOME_ENV_LOCK; HOME is restored on drop.
+    struct TempHome {
+        _tmp: TempDir,
+        prior: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl TempHome {
+        fn new() -> Self {
+            let lock = HOME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let tmp = TempDir::new().unwrap();
+            let prior = std::env::var_os("HOME");
+            std::env::set_var("HOME", tmp.path());
+            Self {
+                _tmp: tmp,
+                prior,
+                _lock: lock,
+            }
+        }
+    }
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
     use crate::phases::QualityCheck;
     use tempfile::TempDir;
 
@@ -5103,6 +5163,7 @@ mod tests {
 
     #[test]
     fn capture_tech_debt_feeds_significant_debt_into_kb() {
+        let _home = TempHome::new();
         use crate::tech_debt::{DebtItem, DebtKind, DebtStatus};
         let tmp = TempDir::new().unwrap();
         let mk = |kind: DebtKind, line: u32| DebtItem {
@@ -5317,6 +5378,7 @@ mod tests {
 
     #[test]
     fn sediment_creates_markdown_files() {
+        let _home = TempHome::new();
         let tmp = TempDir::new().unwrap();
         let checks = vec![
             check("API URL consistency", "failed", 30),
@@ -5332,6 +5394,7 @@ mod tests {
 
     #[test]
     fn sediment_dedupes_by_domain_title() {
+        let _home = TempHome::new();
         let tmp = TempDir::new().unwrap();
         let checks = vec![check("API URL consistency", "failed", 30)];
         // Capture the same failure twice.
@@ -5343,6 +5406,7 @@ mod tests {
 
     #[test]
     fn sediment_markdown_has_correct_structure() {
+        let _home = TempHome::new();
         let tmp = TempDir::new().unwrap();
         capture_quality_failures(
             tmp.path(),
@@ -5368,6 +5432,7 @@ mod tests {
 
     #[test]
     fn sediment_invalidates_kb_index_cache() {
+        let _home = TempHome::new();
         let tmp = TempDir::new().unwrap();
         // Pre-seed a stale kb-index signature file (as if an index was already
         // built+cached BEFORE this run learned anything new).
@@ -5395,6 +5460,7 @@ mod tests {
 
     #[test]
     fn sediment_empty_raw_writes_nothing() {
+        let _home = TempHome::new();
         let tmp = TempDir::new().unwrap();
         assert_eq!(sediment_lessons(tmp.path()), 0);
         assert!(list_sedimented_lessons(tmp.path()).is_empty());
@@ -5402,6 +5468,7 @@ mod tests {
 
     #[test]
     fn list_sedimented_skips_raw_dir() {
+        let _home = TempHome::new();
         let tmp = TempDir::new().unwrap();
         capture_quality_failures(tmp.path(), &[check("X", "failed", 0)], "d", "r");
         let _ = sediment_lessons(tmp.path());
@@ -5527,6 +5594,7 @@ mod tests {
 
     #[test]
     fn reconcile_noop_and_no_base_keep_pure_append() {
+        let _home = TempHome::new();
         let tmp = TempDir::new().unwrap();
         let (_old, _fresh) = seed_two_similar(tmp.path());
 
@@ -5611,6 +5679,7 @@ mod tests {
 
     #[test]
     fn reconcile_decay_drops_ancient_unreinforced_lesson() {
+        let _home = TempHome::new();
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         // One ancient lesson (well past 5 half-lives) with a unique domain so it

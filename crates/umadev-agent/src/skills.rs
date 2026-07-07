@@ -601,8 +601,33 @@ fn slug(title: &str) -> String {
             prev_dash = true;
         }
     }
-    let s = out.trim_matches('-').to_string();
-    truncate(&s, 80)
+    let s = truncate(out.trim_matches('-'), 80);
+    if s.is_empty() {
+        // A CJK-only title has no ASCII alphanumerics -> an empty slug, and graduate_skill
+        // then silently DROPS the skill. Fall back to a stable hash of the full title so the
+        // id is never empty.
+        format!("skill-{:016x}", stable_title_hash(title))
+    } else if !title.is_ascii() {
+        // A title mixing CJK + Latin collapses to just its Latin run, colliding with any
+        // other mixed title sharing that run. Append a short stable hash to keep them
+        // distinct. (A pure-ASCII title keeps its existing readable id, so already-graduated
+        // skills are unaffected.)
+        format!("{s}-{:08x}", stable_title_hash(title) as u32)
+    } else {
+        s
+    }
+}
+
+/// A deterministic, cross-process FNV-1a hash of a title - used to keep a CJK / mixed-language
+/// skill id non-empty and collision-free (the default hasher is process-seeded, so it can't
+/// give a stable on-disk id).
+fn stable_title_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Recover a skill id from a mirror chunk path (`skills/<id>.md`, possibly with a

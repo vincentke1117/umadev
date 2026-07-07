@@ -584,13 +584,25 @@ impl HttpCtx {
             .ok_or_else(|| "POST /session: response missing `id`".to_string())
     }
 
-    /// `POST /session` with a DENY ruleset — a READ-ONLY session for a critic
-    /// fork. `*`/`*`/`deny` rejects every tool call that would mutate the
-    /// workspace, so the seat can read the blackboard but never writes it (the
-    /// single-writer invariant). Returns the created `session.id`.
+    /// `POST /session` with a READ-ONLY ruleset for a critic fork: allow the
+    /// read/inspect surface (`read`/`grep`/`glob`/`list`/`webfetch`) but DENY every
+    /// MUTATING tool (`edit`/`write`/`bash`) — so the seat can actually READ the
+    /// blackboard it judges while the single-writer invariant still holds. A blanket
+    /// `*/*/deny` (the old form) also rejected reads, leaving the critic unable to open
+    /// the very artifacts it reviews. Also deny `question`/`plan_enter`/`plan_exit` so a
+    /// forked critic can't wedge the read-only session on an unanswerable prompt either.
+    /// More-specific rules win over the `*` allow floor. Returns the created `session.id`.
     async fn create_readonly_session(&self) -> Result<String, String> {
         let body = json!({
-            "permission": [{ "permission": "*", "pattern": "*", "action": "deny" }],
+            "permission": [
+                { "permission": "*", "pattern": "*", "action": "allow" },
+                { "permission": "edit", "pattern": "*", "action": "deny" },
+                { "permission": "write", "pattern": "*", "action": "deny" },
+                { "permission": "bash", "pattern": "*", "action": "deny" },
+                { "permission": "question", "pattern": "*", "action": "deny" },
+                { "permission": "plan_enter", "pattern": "*", "action": "deny" },
+                { "permission": "plan_exit", "pattern": "*", "action": "deny" },
+            ],
             "agent": "build",
         });
         let resp = self
@@ -1272,14 +1284,33 @@ fn split_provider_model(id: &str) -> Option<(&str, &str)> {
 #[must_use]
 pub fn session_ruleset(autonomous: bool) -> Value {
     if autonomous {
-        // The whole loop runs silently (audited, not gated).
-        return json!([{ "permission": "*", "pattern": "*", "action": "allow" }]);
+        // The whole loop runs silently (audited, not gated) — EXCEPT the base must not
+        // be allowed to ask a clarifying `question` or toggle plan mode
+        // (`plan_enter`/`plan_exit`): UmaDev drives opencode NON-interactively, so there
+        // is no channel to answer such a prompt, and a permitted question makes the base
+        // block forever waiting on a reply → the session never reaches `session.status
+        // {idle}` → the phase HANGS (the reported "调用工具… 8684s"). Deny them exactly as
+        // opencode's OWN `run.ts` seeds for every non-interactive run; more-specific
+        // rules win over the `*` allow floor.
+        return json!([
+            { "permission": "*", "pattern": "*", "action": "allow" },
+            { "permission": "question", "pattern": "*", "action": "deny" },
+            { "permission": "plan_enter", "pattern": "*", "action": "deny" },
+            { "permission": "plan_exit", "pattern": "*", "action": "deny" },
+        ]);
     }
     // Guarded: allow by default, but ASK before a write / a dangerous shell verb.
     // Order matters only for human readability — opencode resolves by specificity,
     // not array order — so the broad allow comes first as the floor.
     json!([
         { "permission": "*", "pattern": "*", "action": "allow" },
+        // Non-interactive driving has no channel to answer a clarifying `question` or a
+        // plan-mode toggle, so a permitted one wedges the session (never reaches idle →
+        // the phase hangs). Deny them in EVERY tier, exactly as opencode's own `run.ts`
+        // does for non-interactive runs. More-specific than the `*` allow floor → wins.
+        { "permission": "question", "pattern": "*", "action": "deny" },
+        { "permission": "plan_enter", "pattern": "*", "action": "deny" },
+        { "permission": "plan_exit", "pattern": "*", "action": "deny" },
         { "permission": "edit", "pattern": "*", "action": "ask" },
         { "permission": "write", "pattern": "*", "action": "ask" },
         // Destructive / irreversible shell verbs the orchestrator must vet. The
@@ -1976,14 +2007,31 @@ mod tests {
     }
 
     #[test]
-    fn session_ruleset_autonomous_is_wildcard_allow() {
-        // The `auto` tier: one wildcard `allow` rule — the loop runs silently.
+    fn session_ruleset_autonomous_allows_all_but_denies_interactive_prompts() {
+        // The `auto` tier runs the loop silently — a broad `allow` floor — EXCEPT it
+        // must DENY the interactive prompts (`question`/`plan_enter`/`plan_exit`), which
+        // would wedge a non-interactive session (no channel to answer → never idle → the
+        // phase hangs). Mirrors opencode's own `run.ts` for non-interactive runs.
         let r = session_ruleset(true);
         let arr = r.as_array().expect("ruleset is an array");
-        assert_eq!(arr.len(), 1, "autonomous = a single wildcard rule");
-        assert_eq!(arr[0]["permission"], "*");
-        assert_eq!(arr[0]["pattern"], "*");
-        assert_eq!(arr[0]["action"], "allow");
+        assert!(
+            arr.iter()
+                .any(|x| x["permission"] == "*" && x["action"] == "allow"),
+            "autonomous keeps the broad allow floor: {arr:?}"
+        );
+        for perm in ["question", "plan_enter", "plan_exit"] {
+            assert!(
+                arr.iter()
+                    .any(|x| x["permission"] == perm && x["action"] == "deny"),
+                "autonomous must DENY the interactive prompt {perm}: {arr:?}"
+            );
+        }
+        // Nothing else is denied — the loop is otherwise fully autonomous.
+        assert_eq!(
+            arr.iter().filter(|x| x["action"] == "deny").count(),
+            3,
+            "autonomous denies ONLY the three interactive prompts: {arr:?}"
+        );
     }
 
     #[test]
@@ -2013,11 +2061,22 @@ mod tests {
                 .any(|x| x["permission"] == "bash" && x["action"] == "ask"),
             "guarded must ASK before a dangerous bash verb: {arr:?}"
         );
-        // No rule silently DENIES (the floor is allow/ask, never a blanket deny —
-        // that's the read-only fork's posture, not the main writer's).
+        // The ONLY denies are the interactive prompts (`question`/`plan_enter`/
+        // `plan_exit`) that would wedge a non-interactive session — the writer surface
+        // itself is never blanket-denied (writes route to `ask`, reads/bash to `allow`).
+        for perm in ["question", "plan_enter", "plan_exit"] {
+            assert!(
+                arr.iter()
+                    .any(|x| x["permission"] == perm && x["action"] == "deny"),
+                "guarded must DENY the interactive prompt {perm}: {arr:?}"
+            );
+        }
         assert!(
-            !arr.iter().any(|x| x["action"] == "deny"),
-            "the guarded main session never blanket-denies: {arr:?}"
+            !arr.iter().any(|x| x["action"] == "deny"
+                && x["permission"] != "question"
+                && x["permission"] != "plan_enter"
+                && x["permission"] != "plan_exit"),
+            "guarded never blanket-denies a real tool (only the interactive prompts): {arr:?}"
         );
     }
 

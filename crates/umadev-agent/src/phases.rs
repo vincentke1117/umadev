@@ -208,6 +208,13 @@ pub fn agentic_knowledge_digest(
     // turn isn't bound to one pipeline phase.
     let hits = umadev_knowledge::retrieve(&base, &base, &rcfg, requirement, Phase::Research);
     if hits.is_empty() {
+        // "Clear on empty" invariant: on the build path, an empty surfacing must still
+        // write an EMPTY snapshot, else a PREVIOUS step snapshot lingers and THIS step
+        // later PASS/FAIL is mis-attributed to chunks it never surfaced (corrupting their
+        // cross-project usefulness prior). Fail-open + bounded.
+        if record_feedback {
+            crate::knowledge_feedback::record_surfaced_chunks(project_root, &[]);
+        }
         return String::new();
     }
     // Retrieval-quality feedback: snapshot the chunks actually injected so the
@@ -333,9 +340,12 @@ pub fn seat_scoped_knowledge_digest(
                 .iter()
                 .any(|d| path == *d || path.starts_with(&format!("{d}/")))
     };
+    // PRIMARY signal is the index-time is_learned flag (catches a promoted GLOBAL lesson
+    // whose slug filename lacks the `lesson-` marker - knowledge #1); the path heuristic is
+    // the domain-subdir match + a fallback for any pre-is_learned cached blob.
     let mut chosen: Vec<&umadev_knowledge::ScoredChunk> = hits
         .iter()
-        .filter(|h| in_domain(&h.chunk.meta.path))
+        .filter(|h| h.chunk.meta.is_learned || in_domain(&h.chunk.meta.path))
         .take(max_chunks)
         .collect();
     if chosen.is_empty() {

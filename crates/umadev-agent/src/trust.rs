@@ -186,13 +186,17 @@ const DESTRUCTIVE_TOKENS: &[&str] = &[
     "rm -fr",
     "rmdir",
     "mkfs",
-    "dd ",
+    // NB: `dd` is a BARE_DESTRUCTIVE_VERB (token-matched), not a substring — the old
+    // `"dd "` substring false-matched `git add `/`cargo add ` (…a-d-d-space…) and
+    // force-confirmed every staging command, wedging Auto runs.
     ":(){",
     "shutdown",
     "reboot",
     "chmod -r 777",
     "truncate",
-    "> /dev",
+    // NB: a redirect to a REAL block device is handled with a targeted check in
+    // `reversibility_class`; the old `"> /dev"` substring false-matched the benign
+    // `> /dev/null` / `2>/dev/null` that appears in ordinary commands everywhere.
     "sudo ",
 ];
 
@@ -222,6 +226,7 @@ const BARE_DESTRUCTIVE_VERBS: &[&str] = &[
     "rm",
     "mv",
     "unlink",
+    "dd",
     // Windows / PowerShell (case-insensitive; the command is lower-cased first).
     "del",
     "erase",
@@ -277,7 +282,26 @@ const NETWORK_TOKENS: &[&str] = &[
     "npm publish",
     "cargo publish",
     "npm install",
+    "npm ci",
     "pip install",
+    // Other package managers that reach the network AND run install/build/postinstall
+    // scripts - treated like `npm install` (already listed) for consistency, so the Network
+    // floor gates them in EVERY mode instead of letting them auto-run under Guarded.
+    "yarn add",
+    "yarn install",
+    "pnpm add",
+    "pnpm install",
+    "cargo install",
+    "go get",
+    "go install",
+    "gem install",
+    "brew install",
+    "pip3 install",
+    "pipx install",
+    "bundle install",
+    "apt install",
+    "apt-get install",
+    "apk add",
     "http://",
     "https://",
 ];
@@ -384,6 +408,35 @@ pub fn reversibility_class(command: &str, target_path: &str) -> Reversibility {
     {
         return Reversibility::Destructive;
     }
+    // `find … -delete` / `-exec` / `-execdir` / `-ok` / `-okdir` runs a RECURSIVE
+    // mutation even though `find` is otherwise a read verb (so it evades the
+    // read-only classification) — escalate as Destructive in EVERY mode incl. Plan.
+    // A bare `find … -name …` search carries none of these flags and stays reversible.
+    // The action flags are whitespace-led so `-delete` inside a path can't false-positive.
+    if verb_at_command_position(&cmd, "find")
+        && [" -delete", " -exec", " -execdir", " -ok", " -okdir"]
+            .iter()
+            .any(|f| cmd.contains(f))
+    {
+        return Reversibility::Destructive;
+    }
+    // A redirect (`>`/`>>`) to a REAL block device overwrites a disk — destructive. The
+    // benign char devices (`/dev/null`, `/dev/stdout|stderr`, `/dev/tty`, `/dev/zero`,
+    // `/dev/random`) are NOT, so we match only the real disk prefixes rather than the
+    // whole `/dev` tree (which the old `"> /dev"` substring over-matched).
+    if [
+        "/dev/sd",
+        "/dev/nvme",
+        "/dev/disk",
+        "/dev/hd",
+        "/dev/vd",
+        "/dev/mmcblk",
+    ]
+    .iter()
+    .any(|dev| cmd.contains(&format!("> {dev}")) || cmd.contains(&format!(">{dev}")))
+    {
+        return Reversibility::Destructive;
+    }
     if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) {
         return Reversibility::Network;
     }
@@ -482,6 +535,67 @@ pub fn requires_confirmation(mode: TrustMode, command: &str, target_path: &str) 
     requires_confirmation_rooted(mode, command, target_path, None)
 }
 
+/// Whether a SHELL command writes OUTSIDE the workspace via a redirect (`>`/`>>`), a
+/// `tee`/`cp`/`install`/`mv` destination, or `dd of=` - the escaping write the
+/// Capability::Write + target_path check misses for a bare shell command (e.g.
+/// `echo x >> ~/.ssh/authorized_keys`, which auto-ran under Guarded/Auto). Only an
+/// ESCAPING destination counts; an in-tree redirect stays automatic. Dependency-free +
+/// conservative: an unparsed form simply does not match (fail-safe toward not-escaping).
+fn shell_write_escapes_workspace(command: &str, root: Option<&std::path::Path>) -> bool {
+    let toks: Vec<&str> = command.split_whitespace().collect();
+    let mut dests: Vec<String> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if let Some(rest) = t.strip_prefix(">>").or_else(|| t.strip_prefix('>')) {
+            if !rest.is_empty() {
+                dests.push(rest.to_string());
+            } else if let Some(next) = toks.get(i + 1) {
+                dests.push((*next).to_string());
+            }
+        } else if let Some(gt) = t.find('>') {
+            let after = t[gt + 1..].trim_start_matches('>');
+            if !after.is_empty() {
+                dests.push(after.to_string());
+            } else if let Some(next) = toks.get(i + 1) {
+                dests.push((*next).to_string());
+            }
+        } else if *t == "tee" {
+            if let Some(f) = toks[i + 1..].iter().find(|a| !a.starts_with('-')) {
+                dests.push((*f).to_string());
+            }
+        } else if *t == "cp" || *t == "install" || *t == "mv" {
+            if let Some(d) = toks[i + 1..].iter().rev().find(|a| !a.starts_with('-')) {
+                dests.push((*d).to_string());
+            }
+        } else if let Some(of) = t.strip_prefix("of=") {
+            dests.push(of.to_string());
+        }
+    }
+    dests.iter().any(|d| {
+        // The benign CHAR devices (/dev/null, /dev/stdout|stderr|stdin, /dev/tty,
+        // /dev/zero, /dev/random, /dev/fd/N) are NOT workspace escapes - a redirect to them
+        // is the ubiquitous `> /dev/null` / `2>/dev/null` idiom that must stay automatic in
+        // Guarded (a redirect to a real BLOCK device is caught as Destructive by
+        // reversibility_class upstream, so it is already handled).
+        !is_benign_char_device(d) && target_escapes_workspace(d, root)
+    })
+}
+
+/// The character devices a shell redirect legitimately targets - never a workspace escape.
+fn is_benign_char_device(path: &str) -> bool {
+    matches!(
+        path,
+        "/dev/null"
+            | "/dev/zero"
+            | "/dev/full"
+            | "/dev/random"
+            | "/dev/urandom"
+            | "/dev/stdout"
+            | "/dev/stderr"
+            | "/dev/stdin"
+            | "/dev/tty"
+    ) || path.starts_with("/dev/fd/")
+}
+
 /// Root-aware core of [`requires_confirmation`]. When `workspace_root` is `Some`, an
 /// absolute write target is "out of tree" iff it does NOT lie under that real root
 /// (MEDIUM M4 — the precise escape check); when `None`, the legacy conservative
@@ -502,8 +616,9 @@ fn requires_confirmation_rooted(
     //    DENY's every edit and spins); the modes differ only on the riskier
     //    reversible actions below.
     let cap = capability_class(command, target_path);
-    let out_of_tree_write =
-        matches!(cap, Capability::Write) && target_escapes_workspace(target_path, workspace_root);
+    let out_of_tree_write = (matches!(cap, Capability::Write)
+        && target_escapes_workspace(target_path, workspace_root))
+        || shell_write_escapes_workspace(command, workspace_root);
     match mode {
         // Fully autonomous: only the hard floor (handled above) escalates.
         TrustMode::Auto => false,
@@ -1397,6 +1512,91 @@ mod tests {
         assert!(!TrustMode::Plan.gates_auto_approve());
         assert!(!TrustMode::Guarded.gates_auto_approve());
         assert!(TrustMode::Auto.gates_auto_approve());
+    }
+
+    #[test]
+    fn recursive_find_delete_escalates_but_git_add_and_dev_null_do_not() {
+        use Reversibility as R;
+        // T1: `find … -delete`/`-exec` is a recursive mutation → Destructive → confirmed
+        // in EVERY mode incl. read-only Plan (find is otherwise a read verb).
+        assert_eq!(
+            reversibility_class("find . -name '*.rs' -delete", ""),
+            R::Destructive
+        );
+        assert_eq!(
+            reversibility_class("find /tmp -exec rm {} +", ""),
+            R::Destructive
+        );
+        assert!(requires_confirmation(TrustMode::Plan, "find . -delete", ""));
+        assert!(requires_confirmation(TrustMode::Auto, "find . -delete", ""));
+        // A bare `find` SEARCH stays reversible.
+        assert_eq!(
+            reversibility_class("find . -name '*.rs'", ""),
+            R::Reversible
+        );
+        // T3: `dd` is destructive at a command position, but the old `"dd "` substring
+        // false-matched `git add`/`cargo add` — those must NOT confirm under Auto now.
+        assert_eq!(
+            reversibility_class("dd if=/dev/zero of=/dev/sda", ""),
+            R::Destructive
+        );
+        assert!(!requires_confirmation(TrustMode::Auto, "git add .", ""));
+        assert!(!requires_confirmation(
+            TrustMode::Auto,
+            "cargo add serde",
+            ""
+        ));
+        // T3: `> /dev/null` (benign) must NOT confirm; a real block device must.
+        assert!(!requires_confirmation(
+            TrustMode::Auto,
+            "echo hi > /dev/null",
+            ""
+        ));
+        assert_eq!(reversibility_class("cat x > /dev/sda", ""), R::Destructive);
+    }
+
+    #[test]
+    fn shell_redirect_out_of_tree_write_confirms_but_in_tree_does_not() {
+        // T2: a shell redirect / tee / dd-of to an OUT-OF-TREE path is a workspace escape
+        // the bare-command classifier used to miss, so it auto-ran under Guarded.
+        assert!(requires_confirmation(
+            TrustMode::Guarded,
+            "echo pwn >> ~/.ssh/authorized_keys",
+            ""
+        ));
+        assert!(requires_confirmation(
+            TrustMode::Guarded,
+            "tee ~/.bashrc",
+            ""
+        ));
+        assert!(requires_confirmation(
+            TrustMode::Guarded,
+            "cat data | dd of=/etc/hosts",
+            ""
+        ));
+        // An IN-TREE redirect stays automatic (no confirm) in Guarded.
+        assert!(!requires_confirmation(
+            TrustMode::Guarded,
+            "echo hi > output/log.txt",
+            ""
+        ));
+        assert!(!requires_confirmation(
+            TrustMode::Guarded,
+            "npm run build > build.log 2>&1",
+            ""
+        ));
+        // M1 regression: a redirect to a benign CHAR device (/dev/null etc) is NOT a
+        // workspace escape and must stay automatic in Guarded (the ubiquitous idiom).
+        assert!(!requires_confirmation(
+            TrustMode::Guarded,
+            "echo hi > /dev/null",
+            ""
+        ));
+        assert!(!requires_confirmation(
+            TrustMode::Guarded,
+            "npm test 2>/dev/null",
+            ""
+        ));
     }
 
     #[test]

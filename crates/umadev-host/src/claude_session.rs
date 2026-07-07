@@ -571,7 +571,19 @@ pub fn session_args(
         "--permission-mode".to_string(),
         permission_mode,
         "--allowedTools".to_string(),
-        "Read,Edit,Write,Bash".to_string(),
+        if autonomous {
+            // AUTO: pre-approve the full working set so no per-tool prompt interrupts.
+            "Read,Edit,Write,Bash".to_string()
+        } else {
+            // GUARDED / plan: pre-approve ONLY the read-only Read. Edit/Write/Bash are the
+            // MUTATING tools guarded must GATE - leaving them off the allowlist makes claude
+            // raise a `can_use_tool` control request for each, which UmaDev's always-on trust
+            // floor answers (allow a reversible in-tree edit, DENY an irreversible action).
+            // The old unconditional allowlist pre-approved them, so under Guarded a Write /
+            // Bash ran WITHOUT ever hitting UmaDev's per-tool floor - the guarded gate was
+            // silently bypassed (P1). Read stays auto so file reads never prompt.
+            "Read".to_string()
+        },
     ];
     push_max_turns(&mut args, max_turns);
     if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
@@ -655,7 +667,19 @@ pub fn resume_session_args(
         "--permission-mode".to_string(),
         permission_mode,
         "--allowedTools".to_string(),
-        "Read,Edit,Write,Bash".to_string(),
+        if autonomous {
+            // AUTO: pre-approve the full working set so no per-tool prompt interrupts.
+            "Read,Edit,Write,Bash".to_string()
+        } else {
+            // GUARDED / plan: pre-approve ONLY the read-only Read. Edit/Write/Bash are the
+            // MUTATING tools guarded must GATE - leaving them off the allowlist makes claude
+            // raise a `can_use_tool` control request for each, which UmaDev's always-on trust
+            // floor answers (allow a reversible in-tree edit, DENY an irreversible action).
+            // The old unconditional allowlist pre-approved them, so under Guarded a Write /
+            // Bash ran WITHOUT ever hitting UmaDev's per-tool floor - the guarded gate was
+            // silently bypassed (P1). Read stays auto so file reads never prompt.
+            "Read".to_string()
+        },
     ];
     push_max_turns(&mut args, max_turns);
     if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
@@ -1302,6 +1326,24 @@ mod tests {
     /// codex / opencode): autonomous → `acceptEdits` (write unattended), guarded
     /// → `default` (claude asks per tool → a NeedApproval the orchestrator
     /// answers, so the human-in-the-loop / irreversible-action floor is live).
+    #[test]
+    fn guarded_gates_mutating_tools_but_auto_pre_approves_all() {
+        // P1: under GUARDED (autonomous=false) the allowlist pre-approves ONLY the read-only
+        // Read, so Edit/Write/Bash each raise a `can_use_tool` control request that UmaDev
+        // trust floor gates (they were unconditionally pre-approved before, silently BYPASSING
+        // the guarded gate). AUTO pre-approves the full set (no prompts).
+        let guarded = session_args("sid", None, false, None);
+        let t = guarded.iter().position(|a| a == "--allowedTools").unwrap();
+        assert_eq!(
+            guarded[t + 1],
+            "Read",
+            "guarded pre-approves only the read-only Read; mutating tools hit the gate"
+        );
+        let auto = session_args("sid", None, true, None);
+        let t = auto.iter().position(|a| a == "--allowedTools").unwrap();
+        assert_eq!(auto[t + 1], "Read,Edit,Write,Bash");
+    }
+
     #[test]
     fn session_args_permission_mode_tracks_autonomy() {
         // This test MUTATES the shared permission-mode env; serialize it against the
@@ -2068,6 +2110,13 @@ mod tests {
     fn session_args_omit_max_turns_when_no_cap() {
         // Fail-open: `None` → NO `--max-turns` flag → claude's default unbounded loop
         // (today's behavior), on both a fresh start and a writable resume.
+        // Hold PERM_ENV_LOCK: this test MUTATES the shared permission-mode env
+        // (`EnvRestore::remove`), so it must serialize against the other env-touching
+        // tests — else its remove clobbers a sibling's `set_var("plan")` mid-flight and
+        // flakes the autonomy-override test.
+        let _lock = PERM_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
         let fresh = session_args("sid", None, true, None);
         assert!(
@@ -2084,6 +2133,11 @@ mod tests {
     #[test]
     fn session_args_include_max_turns_when_capped() {
         // A cap appends `--max-turns <n>` (the runaway backstop) on both shapes.
+        // Hold PERM_ENV_LOCK for the same reason as the sibling above: this test mutates
+        // the shared permission-mode env, so it serializes with every env-touching test.
+        let _lock = PERM_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
         let fresh = session_args("sid", None, false, Some(150));
         let i = fresh

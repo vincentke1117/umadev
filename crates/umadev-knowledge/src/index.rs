@@ -37,7 +37,7 @@ const B: f64 = 0.75;
 /// is folded into [`corpus_signature`], so an old `.sig` can no longer match).
 /// Bump it whenever `tokenizer::tokenize`, the chunker, or the `Bm25Index`
 /// layout changes in a way that alters indexed tokens.
-const INDEX_SCHEMA_VERSION: u32 = 1;
+const INDEX_SCHEMA_VERSION: u32 = 2;
 
 /// One inverted-index entry: the term, and the chunks that contain it with
 /// per-chunk term frequency.
@@ -467,7 +467,17 @@ pub fn load_or_build_index_multi(project_root: &Path, knowledge_dirs: &[PathBuf]
             .find(|d| abs.starts_with(d))
             .cloned()
             .unwrap_or_else(|| knowledge_dirs[0].clone());
-        let file_chunks = crate::chunker::chunk_file(&root, abs);
+        // A file from any corpus dir PAST the curated knowledge dir (index 0) is learned
+        // SEDIMENT (.umadev/learned + ~/.umadev/learned from corpus_dirs). Stamp its chunks
+        // so the phase/seat filter always lets them through - including a promoted GLOBAL
+        // lesson whose slug filename lacks the `lesson-` marker (knowledge #1).
+        let is_learned = knowledge_dirs.first().is_none_or(|k| &root != k);
+        let mut file_chunks = crate::chunker::chunk_file(&root, abs);
+        if is_learned {
+            for ch in &mut file_chunks {
+                ch.meta.is_learned = true;
+            }
+        }
         chunks.extend(file_chunks);
     }
     let index = Bm25Index::from_chunks(chunks);

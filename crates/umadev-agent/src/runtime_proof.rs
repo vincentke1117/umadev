@@ -289,7 +289,11 @@ pub async fn run_runtime_proof(workspace: &Path) -> RuntimeProof {
     // Track our own PID so a crash mid-boot can't orphan the dev server: the next
     // run's `reclaim_tracked_preview` will find and kill it.
     if let Some(pid) = child.id() {
-        write_preview_pid(workspace, pid);
+        // Record the ACTUAL spawned program (plan.program - resolve_spawn_plan already
+        // stripped a `cd <dir> &&` prefix), NOT split_command(&dev.command).0 which for a
+        // subdir frontend (`cd web && pnpm dev`) is literally "cd" - reclaim's cmdline match
+        // would then never find "cd" in the pnpm/node process and the orphan would survive.
+        write_preview_pid(workspace, pid, &plan.program);
     }
 
     // Drain + scan the child's output on dedicated tasks. Readers stay alive until
@@ -411,6 +415,26 @@ async fn finish_proof(
     };
     for path in &probe_paths {
         proof.routes.push(probe_route(&base_url, path).await);
+    }
+
+    // Downgrade to NotVerified if NO probed route returned a 2xx/3xx: the server booted and
+    // "answered" its base URL, but a 404/500 on EVERY route is not a VERIFIED runtime - the
+    // top-line verdict (is_verified(), the proof-pack headline) must not claim success when
+    // every route errored. A single ok route keeps Verified.
+    // Downgrade only when NO probed route proves the server is even UP: every probe was a
+    // 5xx or got NO response (status 0). A 4xx (401/405 on a GET-probed auth-gated / POST-only
+    // contract route) STILL proves the server booted + is routing, so it keeps Verified -
+    // downgrading on `!ok` (which includes 4xx) wrongly failed working auth/POST-only backends.
+    // A 500 on every route (booted-but-broken) is the case this correctly catches.
+    if !proof.routes.is_empty()
+        && proof
+            .routes
+            .iter()
+            .all(|r| r.status == 0 || r.status >= 500)
+    {
+        proof.status = RuntimeStatus::NotVerified(
+            "the app booted but every probed route returned a 5xx or no response".to_string(),
+        );
     }
 
     // Optional e2e suite.
@@ -856,18 +880,30 @@ fn preview_pid_path(workspace: &Path) -> PathBuf {
 
 /// Record `pid` as our live preview server. Fail-open: a write error is ignored
 /// (the pidfile is a best-effort cleanup aid, never a correctness dependency).
-fn write_preview_pid(workspace: &Path, pid: u32) {
+fn write_preview_pid(workspace: &Path, pid: u32, program: &str) {
     let path = preview_pid_path(workspace);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, pid.to_string());
+    // Record the spawned PROGRAM name alongside the pid so reclaim can verify the live
+    // process is still OURS (not a foreign process the OS handed the recycled pid to).
+    let _ = std::fs::write(path, format!("{pid}\n{program}"));
 }
 
-/// Read the tracked preview PID, if a valid non-zero one is recorded.
-fn read_preview_pid(workspace: &Path) -> Option<u32> {
+/// Read the tracked preview `(pid, program)`, if a valid non-zero pid is recorded. The
+/// program line may be absent in a legacy pidfile (then it is empty -> reclaim stays
+/// conservative and does not kill).
+fn read_preview_pid(workspace: &Path) -> Option<(u32, String)> {
     let body = std::fs::read_to_string(preview_pid_path(workspace)).ok()?;
-    body.trim().parse::<u32>().ok().filter(|p| *p != 0)
+    let mut lines = body.lines();
+    let pid = lines
+        .next()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|p| *p != 0)?;
+    let program = lines.next().unwrap_or("").trim().to_string();
+    Some((pid, program))
 }
 
 /// Remove the pidfile (best-effort).
@@ -881,10 +917,18 @@ fn clear_preview_pid(workspace: &Path) {
 /// is confirmed alive — a foreign process is never killed, and an unknown-liveness
 /// PID is left running. The pidfile is cleared either way.
 fn reclaim_tracked_preview(workspace: &Path) -> bool {
-    let Some(pid) = read_preview_pid(workspace) else {
+    let Some((pid, program)) = read_preview_pid(workspace) else {
         return false;
     };
-    let killed = if pid_is_alive(pid) == Some(true) {
+    // Kill only a LIVE pid whose current command line still contains the PROGRAM we
+    // recorded. A crash can leave a stale pidfile; if the OS recycled that pid to an
+    // UNRELATED process, its cmdline won't match, so we leave it alone (leaking a stray
+    // process is far better than SIGTERM-ing the user's editor/browser on a recycled pid).
+    // An empty recorded program (legacy pidfile) or an unreadable cmdline -> do NOT kill.
+    let killed = if !program.is_empty()
+        && pid_is_alive(pid) == Some(true)
+        && pid_cmdline_contains(pid, &program)
+    {
         kill_pid(pid);
         true
     } else {
@@ -892,6 +936,28 @@ fn reclaim_tracked_preview(workspace: &Path) -> bool {
     };
     clear_preview_pid(workspace);
     killed
+}
+
+/// Best-effort: does the LIVE process at `pid` have `needle` in its command line? Used to
+/// confirm a tracked pid is still the process we spawned (vs a recycled-pid foreigner).
+/// Conservative: unreadable -> `false` (do NOT kill). Unix: `ps`; other platforms: `false`.
+#[cfg(unix)]
+fn pid_cmdline_contains(pid: u32, needle: &str) -> bool {
+    let Ok(out) = std::process::Command::new("ps")
+        .arg("-o")
+        .arg("command=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout).contains(needle)
+}
+
+#[cfg(not(unix))]
+fn pid_cmdline_contains(_pid: u32, _needle: &str) -> bool {
+    false
 }
 
 /// `Some(true)` alive, `Some(false)` provably gone, `None` could-not-determine.
@@ -1879,8 +1945,11 @@ mod tests {
     fn preview_pid_roundtrips() {
         let tmp = TempDir::new().unwrap();
         assert!(read_preview_pid(tmp.path()).is_none());
-        write_preview_pid(tmp.path(), 4242);
-        assert_eq!(read_preview_pid(tmp.path()), Some(4242));
+        write_preview_pid(tmp.path(), 4242, "sleep");
+        assert_eq!(
+            read_preview_pid(tmp.path()),
+            Some((4242, "sleep".to_string()))
+        );
         clear_preview_pid(tmp.path());
         assert!(read_preview_pid(tmp.path()).is_none());
     }
@@ -1912,7 +1981,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        write_preview_pid(tmp.path(), pid);
+        write_preview_pid(tmp.path(), pid, "sleep");
         assert_eq!(pid_is_alive(pid), Some(true));
 
         let killed = reclaim_tracked_preview(tmp.path());
@@ -1962,7 +2031,7 @@ mod tests {
             .unwrap();
         let pid = child.id();
         let _ = child.wait(); // reap → the PID is now gone
-        write_preview_pid(tmp.path(), pid);
+        write_preview_pid(tmp.path(), pid, "sleep");
 
         let killed = reclaim_tracked_preview(tmp.path());
         assert!(!killed, "a dead tracked pid is not a kill");

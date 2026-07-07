@@ -88,6 +88,9 @@ struct Owner {
     host: String,
     /// UNIX-seconds creation timestamp (`0` if absent / corrupt).
     ts: u64,
+    /// A per-BOOT identifier (empty if unavailable). Lets a lock left by a PRE-REBOOT run be
+    /// told apart from a live run that merely reused the same recycled PID after a reboot.
+    boot: String,
 }
 
 impl RunLock {
@@ -154,10 +157,11 @@ impl RunLock {
                     // machine's process table (a shared/NFS workspace).
                     let _ = writeln!(
                         file,
-                        "pid={} host={} ts={}",
+                        "pid={} host={} ts={} boot={}",
                         std::process::id(),
                         hostname(),
-                        now_secs()
+                        now_secs(),
+                        boot_id()
                     );
                     // Flush + drop the handle so the read-back below sees our
                     // bytes (and any clobber by a racing reclaimer).
@@ -268,7 +272,52 @@ fn holder_is_self(path: &Path) -> bool {
         return false;
     };
     let same_host = owner.host.is_empty() || owner.host == hostname();
-    owner.pid == std::process::id() && same_host
+    // A recorded boot-id that differs from THIS boot means the lock predates a reboot, so a
+    // matching PID is a RECYCLED pid, not us - never treat that as self (else the routing
+    // layer queues input into a run that no longer exists).
+    let same_boot = owner.boot.is_empty() || owner.boot == boot_id();
+    owner.pid == std::process::id() && same_host && same_boot
+}
+
+/// A best-effort identifier that CHANGES on every reboot (whitespace-stripped to a single
+/// token). Linux: `/proc/sys/kernel/random/boot_id`. macOS: the `kern.boottime` sysctl. Empty
+/// when neither is available (reboot-detection then simply doesn't apply). Lets an abandoned
+/// pre-reboot lock be reclaimed even when its PID was recycled by a live process.
+fn boot_id() -> String {
+    #[cfg(target_os = "linux")]
+    if let Ok(id) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+        return id.split_whitespace().collect();
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(out) = std::process::Command::new("sysctl")
+        .args(["-n", "kern.boottime"])
+        .output()
+    {
+        if out.status.success() {
+            return String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .collect();
+        }
+    }
+    // Windows: the OS last-boot-up timestamp is stable within a boot and changes on every
+    // reboot, so it works as a boot-id. wmic is present on essentially all current Windows;
+    // when it is absent we fall through to empty (the age fallback still frees a stale lock).
+    #[cfg(windows)]
+    if let Ok(out) = std::process::Command::new("wmic")
+        .args(["os", "get", "lastbootuptime", "/value"])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if let Some(v) = s.split('=').nth(1) {
+                let tok: String = v.split_whitespace().collect();
+                if !tok.is_empty() {
+                    return tok;
+                }
+            }
+        }
+    }
+    String::new()
 }
 
 /// `true` when the lock at `path` belongs to a crashed/abandoned run and may be
@@ -293,6 +342,11 @@ fn is_stale(path: &Path) -> bool {
         return older_than_stale(&Owner::default(), path);
     };
 
+    // A lock from a PRIOR boot (its boot-id differs from ours) is definitively abandoned -
+    // the reboot killed its holder - regardless of whether its PID is now alive (recycled).
+    if !owner.boot.is_empty() && owner.boot != boot_id() {
+        return true;
+    }
     let same_host = !owner.host.is_empty() && owner.host == hostname();
     if same_host && owner.pid != 0 {
         // Primary path: probe the actual holder. Dead → stale; alive → live.
@@ -343,6 +397,7 @@ impl Owner {
         let mut pid: Option<u32> = None;
         let mut host = String::new();
         let mut ts: u64 = 0;
+        let mut boot = String::new();
         for tok in line.split_whitespace() {
             if let Some(v) = tok.strip_prefix("pid=") {
                 pid = v.parse().ok();
@@ -350,9 +405,16 @@ impl Owner {
                 host = v.to_string();
             } else if let Some(v) = tok.strip_prefix("ts=") {
                 ts = v.parse().unwrap_or(0);
+            } else if let Some(v) = tok.strip_prefix("boot=") {
+                boot = v.to_string();
             }
         }
-        pid.map(|pid| Owner { pid, host, ts })
+        pid.map(|pid| Owner {
+            pid,
+            host,
+            ts,
+            boot,
+        })
     }
 }
 

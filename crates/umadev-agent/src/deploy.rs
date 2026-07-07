@@ -68,11 +68,40 @@ pub enum DeployTarget {
     /// A `Dockerfile` present — container image build (no auto-push target, so
     /// the command just builds the image; pushing is the user's choice).
     Docker,
-    /// A pre-built static bundle (`dist/` / `out/` / `build/` / `public/`) with
-    /// no platform config — deployable to any static host via a generic CLI.
-    StaticHost,
+    /// A pre-built static bundle with no platform config — deployable to any static host
+    /// via a generic CLI. Carries the DETECTED output dir (`dist`/`out`/`build`/`public`) so
+    /// the deploy command targets the real bundle, not a hardcoded `./dist`.
+    StaticHost(StaticDir),
     /// No recognised target. Deploy is skipped (fail-open).
     None,
+}
+
+/// The detected static-bundle output dir for [`DeployTarget::StaticHost`]. A small enum
+/// (not a `&'static str`) so `DeployTarget` stays `Copy` AND round-trips through serde (a
+/// borrowed `&'static str` field can't be deserialized).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StaticDir {
+    /// `dist/`
+    Dist,
+    /// `out/` (e.g. a Next.js static export)
+    Out,
+    /// `build/` (e.g. Create React App)
+    Build,
+    /// `public/`
+    Public,
+}
+
+impl StaticDir {
+    /// The on-disk directory name.
+    #[must_use]
+    pub const fn as_dir(self) -> &'static str {
+        match self {
+            Self::Dist => "dist",
+            Self::Out => "out",
+            Self::Build => "build",
+            Self::Public => "public",
+        }
+    }
 }
 
 impl DeployTarget {
@@ -85,7 +114,7 @@ impl DeployTarget {
             Self::Fly => "fly",
             Self::CloudflarePages => "cloudflare-pages",
             Self::Docker => "docker",
-            Self::StaticHost => "static-host",
+            Self::StaticHost(_) => "static-host",
             Self::None => "none",
         }
     }
@@ -99,7 +128,7 @@ impl DeployTarget {
             Self::Fly => "Fly.io",
             Self::CloudflarePages => "Cloudflare Pages",
             Self::Docker => "Docker image",
-            Self::StaticHost => "static host",
+            Self::StaticHost(_) => "static host",
             Self::None => "none",
         }
     }
@@ -114,7 +143,7 @@ impl DeployTarget {
             Self::Fly => Some("flyctl"),
             Self::CloudflarePages => Some("wrangler"),
             Self::Docker => Some("docker"),
-            Self::StaticHost => Some("npx"),
+            Self::StaticHost(_) => Some("npx"),
             Self::None => None,
         }
     }
@@ -134,9 +163,10 @@ impl DeployTarget {
             // Docker: build the image. Pushing/running is the user's choice — we
             // do not assume a registry. Tag is a stable local name.
             Self::Docker => "docker build -t app:latest .",
-            // Static host: a zero-config global deploy of the built bundle via
-            // a widely-available static-deploy CLI.
-            Self::StaticHost => "npx surge ./dist",
+            // Static host: a zero-config global deploy of the DETECTED built bundle dir
+            // (dist/out/build/public) via a widely-available static-deploy CLI - NOT a
+            // hardcoded ./dist, which would ship a Next.js out/ or CRA build/ wrong.
+            Self::StaticHost(dir) => return Some(format!("npx surge ./{}", dir.as_dir())),
             Self::None => return None,
         };
         Some(cmd.to_string())
@@ -253,11 +283,15 @@ pub fn detect_deploy_target(workspace: &Path) -> DeployTarget {
         return DeployTarget::Docker;
     }
     // 3. A pre-built static bundle with no platform config — any static host.
-    if ["dist", "out", "build", "public"]
-        .iter()
-        .any(|d| workspace.join(d).is_dir())
-    {
-        return DeployTarget::StaticHost;
+    for (name, dir) in [
+        ("dist", StaticDir::Dist),
+        ("out", StaticDir::Out),
+        ("build", StaticDir::Build),
+        ("public", StaticDir::Public),
+    ] {
+        if workspace.join(name).is_dir() {
+            return DeployTarget::StaticHost(dir);
+        }
     }
     DeployTarget::None
 }
@@ -662,7 +696,10 @@ mod tests {
     fn detect_static_host_from_dist() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir(tmp.path().join("dist")).unwrap();
-        assert_eq!(detect_deploy_target(tmp.path()), DeployTarget::StaticHost);
+        assert_eq!(
+            detect_deploy_target(tmp.path()),
+            DeployTarget::StaticHost(StaticDir::Dist)
+        );
     }
 
     #[test]
@@ -697,7 +734,7 @@ mod tests {
             DeployTarget::Fly,
             DeployTarget::CloudflarePages,
             DeployTarget::Docker,
-            DeployTarget::StaticHost,
+            DeployTarget::StaticHost(StaticDir::Dist),
         ] {
             assert!(t.deploy_command().is_some(), "{t:?} must have a command");
             assert!(t.cli_binary().is_some(), "{t:?} must name a CLI binary");
@@ -713,7 +750,10 @@ mod tests {
         assert_eq!(DeployTarget::Fly.as_str(), "fly");
         assert_eq!(DeployTarget::CloudflarePages.as_str(), "cloudflare-pages");
         assert_eq!(DeployTarget::Docker.as_str(), "docker");
-        assert_eq!(DeployTarget::StaticHost.as_str(), "static-host");
+        assert_eq!(
+            DeployTarget::StaticHost(StaticDir::Dist).as_str(),
+            "static-host"
+        );
         assert_eq!(DeployTarget::None.as_str(), "none");
     }
 

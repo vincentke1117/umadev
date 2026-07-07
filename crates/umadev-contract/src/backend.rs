@@ -262,7 +262,7 @@ fn js_method_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"\b(?:app|router|fastify|server)\s*\.\s*(?P<method>get|post|put|delete|patch|head|options|all)\s*\(\s*[\x27\x22\x60](?P<path>/[^\x27\x22\x60\s]*)",
+            r"\b(?:app|router|fastify|server|[A-Za-z_$][A-Za-z0-9_$]*[Rr]out(?:er|es?))\s*\.\s*(?P<method>get|post|put|delete|patch|head|options|all)\s*\(\s*[\x27\x22\x60](?P<path>/[^\x27\x22\x60\s]*)",
         )
         .expect("js method regex well-formed")
     })
@@ -1013,6 +1013,37 @@ mod tests {
             method: Some(HttpVerb::Delete),
             path: "/api/todos/:id".into(),
         }));
+    }
+
+    #[test]
+    fn custom_router_names_extracted_but_frontend_receivers_excluded() {
+        // C1: a route on a CUSTOM-named router (apiRouter/usersRoute/authRoutes) must be
+        // extracted, else the contract check reports a FALSE backend gap -> false rework.
+        // Frontend receivers (axios/api/http/client/fetch) must STILL be excluded.
+        let routes = extract_from_file(
+            "routes.ts",
+            "apiRouter.get('/users', list); usersRoute.post('/users', create); \
+             authRoutes.delete('/session/:id', out); axios.get('/api/x'); api.get('/api/y');",
+            Lang::JsTs,
+        );
+        assert!(routes.contains(&BackendRoute {
+            file: "routes.ts".into(),
+            method: Some(HttpVerb::Get),
+            path: "/users".into(),
+        }));
+        assert!(routes.contains(&BackendRoute {
+            file: "routes.ts".into(),
+            method: Some(HttpVerb::Post),
+            path: "/users".into(),
+        }));
+        assert!(routes.contains(&BackendRoute {
+            file: "routes.ts".into(),
+            method: Some(HttpVerb::Delete),
+            path: "/session/:id".into(),
+        }));
+        assert!(!routes
+            .iter()
+            .any(|r| r.path == "/api/x" || r.path == "/api/y"));
     }
 
     #[test]

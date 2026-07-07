@@ -151,7 +151,7 @@ fn ci_integrity_claim(project_root: &Path) -> ReviewClaim {
             title: "CI integrity".to_string(),
             verdict: Verdict::Pass,
             detail: "No test files deleted and no tests newly skipped/ignored in the diff \
-                     (scanned `git diff HEAD` for removed test files + added skip markers)."
+                     (scanned the diff since the default-branch merge-base for removed test files + added skip markers)."
                 .to_string(),
         }
     } else {
@@ -342,9 +342,18 @@ fn security_claim(project_root: &Path) -> ReviewClaim {
         };
     }
     if scan.has_findings() {
+        // A leaked SECRET is a hard block (Fail -> not mergeable); an advisory dependency
+        // CVE is a Warn (a human reviewer decides). Without the Fail path a PR carrying a
+        // LIVE leaked key from the owned SAST / gitleaks scan could still be reported
+        // "ready to merge".
+        let verdict = if scan.has_secret_findings() {
+            Verdict::Fail
+        } else {
+            Verdict::Warn
+        };
         ReviewClaim {
             title: "Security scan".to_string(),
-            verdict: Verdict::Warn,
+            verdict,
             detail: format!(
                 "{} (see `.umadev/audit/security-scan.json`).",
                 scan.summary_line()
@@ -486,8 +495,24 @@ fn read_quality(project_root: &Path, slug: &str) -> Option<QualityReport> {
 /// `git diff HEAD` (with rename detection) over the workspace, or `None` when
 /// it's not a usable git repo. Fail-open: any spawn error / non-zero exit → None.
 fn git_diff(project_root: &Path) -> Option<String> {
+    // Prefer diffing against the MERGE-BASE with the default branch: a PR whose changes are
+    // already COMMITTED to the feature branch produces an EMPTY `git diff HEAD`, so the
+    // CI-weakening scan would PASS having inspected NOTHING (R-H1). `git diff <merge-base>`
+    // covers everything since the branch diverged - committed AND uncommitted. Fall back to
+    // `git diff HEAD` (uncommitted only) when no default branch / merge-base is resolvable.
+    if let Some(base) = merge_base_with_default(project_root) {
+        if let Some(d) = run_git_diff(project_root, &base) {
+            return Some(d);
+        }
+    }
+    run_git_diff(project_root, "HEAD")
+}
+
+/// `git diff --find-renames <against>` in `project_root`; `None` on spawn failure or a
+/// non-zero git exit.
+fn run_git_diff(project_root: &Path, against: &str) -> Option<String> {
     let out = Command::new("git")
-        .args(["diff", "--find-renames", "HEAD"])
+        .args(["diff", "--find-renames", against])
         .current_dir(project_root)
         .output()
         .ok()?;
@@ -495,6 +520,66 @@ fn git_diff(project_root: &Path) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Resolve the merge-base of HEAD with the repo default branch (tries the common
+/// remotes/locals in order). `None` when git is absent or none exist (a brand-new repo with
+/// no default branch), so `git_diff` falls back to the working-tree diff.
+fn merge_base_with_default(project_root: &Path) -> Option<String> {
+    for base in ["origin/main", "origin/master", "main", "master"] {
+        let out = Command::new("git")
+            .args(["merge-base", "HEAD", base])
+            .current_dir(project_root)
+            .output()
+            .ok()?;
+        if out.status.success() {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !sha.is_empty() {
+                return Some(sha);
+            }
+        }
+    }
+    None
+}
+
+/// Whether hay contains needle with a WORD BOUNDARY before it: the char immediately
+/// preceding the match must not be a word char (letter/digit/underscore). Stops
+/// process.exit( / std::process::exit( from matching the xit( skip marker, and
+/// edit.skip / latest.skip from matching it.skip - a false "CI weakened" that blocked
+/// legitimate PRs.
+fn contains_at_word_boundary(hay: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(needle) {
+        let at = from + rel;
+        let boundary = match hay[..at].chars().next_back() {
+            Some(ch) => !ch.is_alphanumeric() && ch != '_',
+            None => true,
+        };
+        if boundary {
+            return true;
+        }
+        from = at + needle.len();
+    }
+    false
+}
+
+/// Whether a repo-relative path is a CI / workflow / shell / build file - where an
+/// ambiguous disable form like `|| true` or `if: false` genuinely weakens the build, as
+/// opposed to being ordinary source (`const x = a || true`).
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // `path` is lower-cased first
+fn is_ci_or_build_file(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.contains(".github/workflows/")
+        || p.contains(".gitlab-ci")
+        || p.contains(".circleci")
+        || p.contains("azure-pipelines")
+        || p.contains("jenkinsfile")
+        || p.ends_with(".yml")
+        || p.ends_with(".yaml")
+        || p.ends_with(".sh")
+        || p.ends_with(".bash")
+        || p.ends_with("makefile")
+        || p.contains("/makefile")
 }
 
 /// Scan a unified diff for signals that CI/test coverage was weakened:
@@ -523,6 +608,19 @@ pub fn scan_ci_weakening(diff: &str) -> Vec<String> {
         "@Ignore",
         "t.Skip(",
     ];
+    // CI-DISABLING directives (distinct from per-test skips): an ADDED line that makes a
+    // failing step stop failing the build. UNAMBIGUOUS phrases - never appear in ordinary
+    // source - matched anywhere:
+    const CI_DISABLE_MARKERS_ALWAYS: &[&str] = &[
+        "continue-on-error: true",
+        "--passwithnotests",
+        "--no-verify",
+        "fail_ci_if_error: false",
+    ];
+    // AMBIGUOUS forms that ALSO occur in normal code (const x = a || true; a schema field
+    // visible_if: false) - only flag these in a CI / workflow / shell / build file, else the
+    // CI-integrity claim false-Fails a change that never touched CI (M2 regression).
+    const CI_DISABLE_MARKERS_FILE_SCOPED: &[&str] = &["|| true", "|| exit 0", "if: false"];
 
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
@@ -544,10 +642,30 @@ pub fn scan_ci_weakening(diff: &str) -> Vec<String> {
         if line.starts_with('+') && !line.starts_with("+++") {
             let added = &line[1..];
             for m in SKIP_MARKERS {
-                if added.contains(m) {
+                if contains_at_word_boundary(added, m) {
                     signals.push(format!(
                         "added skip/ignore (`{}`) in `{}`",
                         m.trim_end_matches(['(', ' ']),
+                        if cur_file.is_empty() {
+                            "<file>"
+                        } else {
+                            &cur_file
+                        }
+                    ));
+                    break;
+                }
+            }
+            let added_lc = added.to_ascii_lowercase();
+            let scoped: &[&str] = if is_ci_or_build_file(&cur_file) {
+                CI_DISABLE_MARKERS_FILE_SCOPED
+            } else {
+                &[]
+            };
+            for m in CI_DISABLE_MARKERS_ALWAYS.iter().chain(scoped.iter()) {
+                if added_lc.contains(m) {
+                    signals.push(format!(
+                        "added CI-weakening directive (`{}`) in `{}`",
+                        m.trim(),
                         if cur_file.is_empty() {
                             "<file>"
                         } else {
@@ -638,6 +756,66 @@ mod tests {
                     +def test_login(): ...\n";
         let s = scan_ci_weakening(diff);
         assert!(s.iter().any(|x| x.contains("skip/ignore")));
+    }
+
+    #[test]
+    fn exit_call_is_not_a_false_ci_weakening_but_real_skip_markers_are() {
+        // R-H2: process.exit( / std::process::exit( must NOT match the xit( skip marker
+        // (word-boundary guard), else a legit PR was blocked as CI weakened.
+        let diff = "diff --git a/src/x.rs b/src/x.rs\n+    std::process::exit(1);\n";
+        assert!(
+            scan_ci_weakening(diff).is_empty(),
+            "process::exit must not be flagged as a skip marker"
+        );
+        let real = "diff --git a/a.test.js b/a.test.js\n+  xit('skips this', () => {});\n";
+        assert!(!scan_ci_weakening(real).is_empty(), "real xit( is a skip");
+        let edit = "diff --git a/a.js b/a.js\n+  const s = latest.skip;\n";
+        assert!(
+            scan_ci_weakening(edit).is_empty(),
+            "latest.skip is not it.skip"
+        );
+    }
+
+    #[test]
+    fn ci_disabling_directives_are_flagged() {
+        // DB-M1: forms that make a failing step stop failing the build must be flagged.
+        let gha = "diff --git a/ci.yml b/ci.yml\n+    continue-on-error: true\n";
+        assert!(
+            !scan_ci_weakening(gha).is_empty(),
+            "continue-on-error weakens CI"
+        );
+        let shell = "diff --git a/Makefile b/Makefile\n+\tnpm test || true\n";
+        assert!(
+            !scan_ci_weakening(shell).is_empty(),
+            "|| true swallows the exit"
+        );
+        let jest = "diff --git a/pkg.json b/pkg.json\n+  jest --passWithNoTests\n";
+        assert!(
+            !scan_ci_weakening(jest).is_empty(),
+            "--passWithNoTests weakens CI"
+        );
+        let ok = "diff --git a/x.rs b/x.rs\n+    let ok = true;\n";
+        assert!(
+            scan_ci_weakening(ok).is_empty(),
+            "a normal line is not weakening"
+        );
+        // M2 regression: || true / if: false in ORDINARY source (not a CI/build file) must
+        // NOT be flagged - they occur in real code.
+        let src = "diff --git a/app.ts b/app.ts\n+  const enabled = isDev || true;\n";
+        assert!(
+            scan_ci_weakening(src).is_empty(),
+            "|| true in .ts source is not weakening"
+        );
+        let schema = "diff --git a/schema.json b/schema.json\n+  \"visible_if\": false\n";
+        assert!(
+            scan_ci_weakening(schema).is_empty(),
+            "visible_if: false in json is fine"
+        );
+        let wf = "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n+    run: npm test || true\n";
+        assert!(
+            !scan_ci_weakening(wf).is_empty(),
+            "|| true in a workflow IS weakening"
+        );
     }
 
     #[test]

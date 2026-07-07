@@ -125,9 +125,23 @@ pub async fn drain_stderr_into<R>(stderr: R, tail: StderrTail)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        tail.push(line);
+    let mut reader = BufReader::new(stderr);
+    let mut buf = Vec::new();
+    // read_until + from_utf8_lossy (NOT `.lines()`): Lines::next_line() returns Err on the
+    // FIRST non-UTF-8 byte and ends the drain FOR GOOD - a base emitting a locale-encoded
+    // path or binary noise on stderr would then stop being drained and could backpressure
+    // (a full pipe blocks the base stderr write -> stall). The stdout readers were already
+    // hardened this way; the shared stderr drain was not. Lossy decoding tolerates any bytes.
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            // 0 bytes = EOF; an Err = the pipe is gone - either way, stop draining.
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&buf);
+                tail.push(line.trim_end_matches(['\n', '\r']).to_string());
+            }
+        }
     }
 }
 

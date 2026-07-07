@@ -292,7 +292,11 @@ fn render_migration(spec: &ApiSpec, stack: TechStack) -> String {
                     }
                     "parent" => table.clone(),
                     other if other.ends_with('s') => other.to_string(),
-                    other if other.ends_with("ory") => format!("{}ies", &other[..other.len() - 2]),
+                    // A consonant+y plural: drop the trailing `y` (ONE char) and add `ies` -
+                    // `category` -> `categor` + `ies` = `categories`. Stripping 2 gave the
+                    // broken `categoies` -> a FK `REFERENCES categoies(id)` to a table that is
+                    // never created (invalid migration SQL).
+                    other if other.ends_with("ory") => format!("{}ies", &other[..other.len() - 1]),
                     other => format!("{other}s"),
                 };
                 s.push_str(&format!(

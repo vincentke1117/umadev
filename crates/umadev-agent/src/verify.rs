@@ -546,10 +546,15 @@ fn node_package_manager(workspace: &Path) -> (&'static str, &'static [&'static s
 pub fn detect_project(workspace: &Path) -> ProjectKind {
     if workspace.join("deno.json").is_file() || workspace.join("deno.jsonc").is_file() {
         ProjectKind::Deno
+    } else if workspace.join("Cargo.toml").is_file() {
+        // Rust BEFORE Node: a root Cargo.toml is a strong Rust signal (a pure-JS repo almost
+        // never has one), whereas a Rust backend / Tauri / wasm-bindgen repo commonly ALSO
+        // ships a root package.json for its frontend. Checking package.json first mislabeled
+        // those Node and ran npm while SKIPPING cargo build/cargo test - the compiled backend
+        // went unverified.
+        ProjectKind::Rust
     } else if workspace.join("package.json").is_file() {
         ProjectKind::Node
-    } else if workspace.join("Cargo.toml").is_file() {
-        ProjectKind::Rust
     } else if workspace.join("go.mod").is_file() {
         ProjectKind::Go
     } else if workspace.join("pyproject.toml").is_file()
@@ -1053,7 +1058,10 @@ mod tests {
     }
 
     #[test]
-    fn node_takes_priority_over_rust_when_both_present() {
+    fn rust_takes_priority_over_node_when_both_present() {
+        // A root Cargo.toml is a strong Rust signal; a Rust backend / Tauri repo commonly
+        // ALSO ships a root package.json for its frontend. Rust wins so cargo build/cargo
+        // test actually run (checking package.json first SKIPPED them - the bug).
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
         fs::write(
@@ -1061,7 +1069,7 @@ mod tests {
             "[package]\nname=\"x\"\nversion=\"0.1.0\"",
         )
         .unwrap();
-        assert_eq!(detect_project(tmp.path()), ProjectKind::Node);
+        assert_eq!(detect_project(tmp.path()), ProjectKind::Rust);
     }
 
     #[test]

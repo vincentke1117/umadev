@@ -806,10 +806,28 @@ fn invalidate_stale_steps(root: &Path, plan: &mut Plan) {
     if stale.is_empty() {
         return;
     }
-    let kinds: Vec<_> = stale
-        .iter()
-        .filter_map(|n| artifact_kind_from_name(n))
-        .collect();
+    use crate::critics::ArtifactKind as A;
+    let mut kinds: Vec<A> = Vec::new();
+    for n in &stale {
+        let Some(k) = artifact_kind_from_name(n) else {
+            continue;
+        };
+        kinds.push(k);
+        // A stale SOURCE doc must also invalidate the steps that read its DERIVED typed
+        // contracts (mirrors CriticArtifacts::present): FrontendEngineer reads ApiContract
+        // (derived from architecture.md), NOT Architecture directly, so without expanding
+        // to the derived kinds a revised architecture.md never reopened the frontend step
+        // and it kept building against a STALE contract.
+        match k {
+            A::Architecture => {
+                kinds.push(A::ApiContract);
+                kinds.push(A::DataModel);
+            }
+            A::Uiux => kinds.push(A::DesignTokens),
+            A::Prd => kinds.push(A::Acceptance),
+            _ => {}
+        }
+    }
     plan.invalidate_stale(&kinds);
 }
 
@@ -1375,9 +1393,22 @@ async fn drive_plan_steps(
         // accepted step (real evidence) ticks Done as before.
         let status = if accepted && made_progress {
             StepStatus::Done
+        } else if accepted && step.kind == plan_state::StepKind::Review && gap_evidence.is_empty() {
+            // An empty-team REVIEW is a NEUTRAL skip: there was no seat to convene, so
+            // there are no blocking findings — a clean pass for a review step, NOT a
+            // block. Marking it Blocked made `all Done` false → `clean=false` → the whole
+            // finalize withheld the proof-pack, so a fully-successful build was reported
+            // INCOMPLETE purely because a review step had nobody to convene. (A BUILD
+            // step over a dead turn is still Blocked below — that IS an honest gap.)
+            // GUARD `gap_evidence.is_empty()` (M3): a review step whose residual finding
+            // was CORROBORATED by the deterministic floor returns accepted+!made_progress
+            // WITH non-empty gap_evidence — it must stay Blocked (its own intent), so the
+            // final `clean` fails + a bounded re-plan can route around it. Only the TRUE
+            // empty-team skip (no gap_evidence) ticks Done.
+            StepStatus::Done
         } else {
-            // Bounded: a step that exhausted its fix budget — OR cleared only a
-            // neutral skip with no real work — is Blocked (honest), so it no longer
+            // Bounded: a step that exhausted its fix budget — OR a BUILD step that cleared
+            // only a neutral skip with no real work — is Blocked (honest), so it no longer
             // gates dependents but the plan records the gap. The final QC gate + the
             // caller's hard-gate still decide overall reality.
             StepStatus::Blocked
@@ -2240,7 +2271,24 @@ async fn verify_step_acceptance(
     if !step.evidence.is_empty() {
         return verify_step_evidence(options, events, step, is_build).await;
     }
+    // A DOC-producing Build step (PM/architect/designer authoring output/*.md) has no
+    // CODE deliverable, so the source-present CODE floor (which excludes output/) would
+    // falsely reject it and strand the plan — the SAME exemption `verify_step_evidence`
+    // already applies on its path. Reached here only when the step has NO typed evidence
+    // (the evidence path handled it above); its doc is governed by the doc-evidence floor
+    // + the critic team + coverage, not this floor.
+    let is_doc_seat = matches!(
+        step.seat,
+        crate::critics::Seat::ProductManager
+            | crate::critics::Seat::Architect
+            | crate::critics::Seat::UiuxDesigner
+    );
     match &step.acceptance {
+        A::SourcePresent if is_build && is_doc_seat => StepVerdict {
+            accepted: true,
+            has_positive_evidence: false,
+            evidence: Vec::new(),
+        },
         A::SourcePresent => acceptance_from_verify(
             director::verify(options, events, VerifyKind::SourcePresent).await,
         ),
@@ -2521,7 +2569,15 @@ fn file_exists_outcome(root: &std::path::Path, path: &str) -> EvidenceOutcome {
 fn file_contains_outcome(root: &std::path::Path, path: &str, needle: &str) -> EvidenceOutcome {
     let full = root.join(path);
     match std::fs::read_to_string(&full) {
-        Ok(content) if content.contains(needle) => EvidenceOutcome::Pass,
+        Ok(content)
+            if content
+                .to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase()) =>
+        {
+            // Case-INSENSITIVE contains: the doc-evidence needles ("FR-"/"API") are markers;
+            // a doc that writes "api"/"Api" (or a lower-case FR id) is real work, not a gap.
+            EvidenceOutcome::Pass
+        }
         Ok(_) => EvidenceOutcome::Gap(format!(
             "declared `{path}` contains \"{needle}\" but the file does not contain it"
         )),
@@ -3401,7 +3457,23 @@ fn current_persisted_phase(options: &RunOptions) -> Phase {
 /// `/status` / `continue` read the director-loop's progress the same way they read
 /// the legacy walk's. **Fail-open by contract:** a failed write is swallowed
 /// (`let _ =`) — a disk / permission error can never wedge an otherwise-healthy run.
+/// Canonical CLEAN-completion note - the ONLY note `is_pipeline_complete` (the CLI
+/// `continue` guard) treats as "done". Distinct from the per-phase "Advanced to ..." note
+/// that `persist_phase` writes on EVERY sync, so a mid-run or non-clean state that merely
+/// reached the delivery phase is never mistaken for a finished build (H1).
+pub(crate) const DIRECTOR_COMPLETE_NOTE: &str = "Pipeline complete.";
+
+/// [`persist_phase`] but writing an explicit completion note instead of the per-phase
+/// "Advanced to ..." note. Used only by a CLEAN finalize.
+fn persist_phase_complete(options: &RunOptions, phase: Phase) {
+    persist_phase_impl(options, phase, Some(DIRECTOR_COMPLETE_NOTE));
+}
+
 fn persist_phase(options: &RunOptions, phase: Phase) {
+    persist_phase_impl(options, phase, None);
+}
+
+fn persist_phase_impl(options: &RunOptions, phase: Phase, note_override: Option<&str>) {
     // Read the existing state ONCE so we can both clamp the phase AND carry the
     // base session id forward (a phase-transition write must NEVER erase the
     // cross-session resume pointer the run-open path captured — otherwise a
@@ -3428,7 +3500,10 @@ fn persist_phase(options: &RunOptions, phase: Phase) {
         slug: options.effective_slug(),
         requirement: options.requirement.clone(),
         last_transition_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        note: format!("Advanced to {} (director loop)", phase.id()),
+        note: note_override.map_or_else(
+            || format!("Advanced to {} (director loop)", phase.id()),
+            str::to_string,
+        ),
         backend: options.backend.clone(),
         // Preserve the resume pointer across every phase transition of THIS run.
         base_session_id: current_state.and_then(|s| s.base_session_id),
@@ -3454,21 +3529,18 @@ fn sync_phase_from_plan(plan: &Plan, options: &RunOptions) {
 /// the in-progress anchor (still never regresses). Fail-open.
 fn finalize_phase_from_plan(plan: &Plan, options: &RunOptions, clean: bool) {
     let reached = furthest_done_phase(plan);
-    let phase = match (clean, reached) {
-        // A clean finish with real completed work: advance to that furthest phase, and
-        // — only when clean — let the build claim `Delivery` as the terminal hand-off
-        // (it is the deepest phase, so this is always ≥ the furthest seat's phase).
-        (true, Some(_)) => Phase::Delivery,
-        // A clean finish with no anchorable Done step (e.g. a single-turn build whose
-        // plan never ticked): the build still completed clean, so `Delivery` is honest.
-        (true, None) => Phase::Delivery,
-        // Not clean: persist only what genuinely completed; never an optimistic jump.
-        (false, Some(p)) => p,
+    match (clean, reached) {
+        // A clean finish: advance to Delivery (the terminal hand-off) AND stamp the
+        // distinct completion note so `continue` recognizes a genuinely-done build (and
+        // ONLY a done build - a mid-run sync to the delivery phase keeps "Advanced to ...").
+        (true, _) => persist_phase_complete(options, Phase::Delivery),
+        // Not clean: persist only what genuinely completed, with the ordinary per-phase
+        // note (never the completion note), so `continue` can still resume the build.
+        (false, Some(p)) => persist_phase(options, p),
         // Not clean and nothing completed: leave the on-disk phase as-is (the clamp in
         // `persist_phase` keeps whatever the in-progress sync already wrote).
-        (false, None) => current_persisted_phase(options),
-    };
-    persist_phase(options, phase);
+        (false, None) => persist_phase(options, current_persisted_phase(options)),
+    }
 }
 
 /// [`finalize_phase_from_plan`] over the single-turn loop's `&Option<Plan>`. A
@@ -3479,7 +3551,7 @@ fn finalize_phase_from_plan(plan: &Plan, options: &RunOptions, clean: bool) {
 fn finalize_phase_from_plan_opt(plan: &Option<Plan>, options: &RunOptions, clean: bool) {
     match plan {
         Some(p) => finalize_phase_from_plan(p, options, clean),
-        None if clean => persist_phase(options, Phase::Delivery),
+        None if clean => persist_phase_complete(options, Phase::Delivery),
         None => {} // non-clean + no plan: keep the current on-disk phase (no regress)
     }
 }

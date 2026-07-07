@@ -34,6 +34,16 @@ pub struct ChunkMeta {
     /// `None` when absent — the majority of legacy files have no front-matter.
     #[serde(default)]
     pub difficulty: Option<String>,
+    /// `true` when this chunk came from a `.umadev/learned/` or `~/.umadev/learned/`
+    /// SEDIMENT dir (a recorded lesson/reflection) rather than the curated `knowledge/`
+    /// corpus. Stamped at index time from the corpus dir the file was under. Lets the
+    /// phase/seat filter always let learned experience through WITHOUT relying on the
+    /// `lesson-` filename marker — which a PROMOTED GLOBAL lesson (a slug filename) lacks,
+    /// so those were silently filtered out of every phase whose subdirs did not include
+    /// their domain (knowledge #1). serde(default) = false keeps old cached indexes
+    /// readable (they rebuild on the schema-version bump).
+    #[serde(default)]
+    pub is_learned: bool,
 }
 
 /// One retrievable unit: metadata + tokenised body + raw text excerpt.
@@ -140,6 +150,45 @@ pub fn chunk_file(knowledge_root: &Path, abs_path: &Path) -> Vec<Chunk> {
     chunk_text(&rel, &body)
 }
 
+/// Soft upper bound on a single chunk body, in bytes (~1k tokens). Past this a chunk is
+/// BM25 length-penalized, truncated to the embedder ~512-token window, and impossible to
+/// sub-retrieve (a one-paragraph match drags in the whole doc).
+const MAX_CHUNK_BYTES: usize = 4096;
+
+/// Split a section body that exceeds [`MAX_CHUNK_BYTES`] into multiple sub-chunks on
+/// PARAGRAPH (blank-line) boundaries, NEVER breaking inside a fenced code block. A giant
+/// H2-less doc otherwise indexes as ONE oversized chunk. Each sub-chunk keeps the section
+/// heading. A section with no eligible split point (one huge fence, no blank lines) stays
+/// whole - correctness first, never fracture a fence.
+fn split_oversized_section(heading: &str, body: &str) -> Vec<(String, String)> {
+    if body.len() <= MAX_CHUNK_BYTES {
+        return vec![(heading.to_string(), body.to_string())];
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut cur = String::new();
+    let mut in_fence = false;
+    for line in body.lines() {
+        if is_code_fence(line.trim_start()) {
+            in_fence = !in_fence;
+        }
+        if !in_fence && line.trim().is_empty() && cur.len() >= MAX_CHUNK_BYTES {
+            if !cur.trim().is_empty() {
+                out.push((heading.to_string(), std::mem::take(&mut cur)));
+            }
+            continue;
+        }
+        cur.push_str(line);
+        cur.push('\n');
+    }
+    if !cur.trim().is_empty() {
+        out.push((heading.to_string(), cur));
+    }
+    if out.is_empty() {
+        out.push((heading.to_string(), body.to_string()));
+    }
+    out
+}
+
 /// Pure chunker over in-memory text — exposed for tests and the vector
 /// layer (which re-chunks the same text to embed).
 #[must_use]
@@ -180,6 +229,7 @@ pub fn chunk_text(rel_path: &str, body: &str) -> Vec<Chunk> {
 
     sections
         .into_iter()
+        .flat_map(|(heading, section_body)| split_oversized_section(&heading, &section_body))
         .map(|(heading, section_body)| {
             let trimmed = section_body.trim().to_string();
             let indexed = format!("{title} {heading} {trimmed}");
@@ -206,6 +256,9 @@ pub fn chunk_text(rel_path: &str, body: &str) -> Vec<Chunk> {
                     tags: tags.clone(),
                     domain: domain.clone(),
                     difficulty: difficulty.clone(),
+                    // Default: a knowledge-corpus chunk. The index build loop overrides this
+                    // to true for a file that came from a learned sediment dir.
+                    is_learned: false,
                 },
                 body: trimmed,
                 tokens,

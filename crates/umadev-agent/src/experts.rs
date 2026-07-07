@@ -1177,8 +1177,17 @@ pub fn excerpt_sections(text: &str, max_chars: usize) -> String {
     // section so a doc that opens with prose keeps its intro.
     let mut sections: Vec<String> = Vec::new();
     let mut cur = String::new();
+    // Track fenced-code state: a `#`-led line INSIDE a ```/~~~ block (a shell comment,
+    // `#!/bin/bash`, a CSS hex `#3a3a3a`) is NOT a heading - splitting there fractured a
+    // section (dropping a critical `## API` / `## Data model` tail under budget) and left an
+    // unclosed fence that swallowed later prompt content.
+    let mut in_fence = false;
     for line in text.lines() {
-        if line.starts_with('#') && !cur.is_empty() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+        }
+        if !in_fence && line.starts_with('#') && !cur.is_empty() {
             sections.push(std::mem::take(&mut cur));
         }
         cur.push_str(line);

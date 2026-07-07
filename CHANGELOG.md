@@ -2,6 +2,35 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.37] - 三底座对齐最新版 + 五轮深度审查修掉一大批 bug + Windows 移动鼠标乱码根治
+
+对 claude-code / codex / opencode 三家做了一次深度审计(逐条对照各自最新官方 CLI/协议源码),把 UmaDev 的适配对齐到最新、修掉隐患。全部确定性、fail-open、非破坏。
+
+### 修复
+
+- opencode 挂死根治(源头级):opencode 自己的 run.ts 对每个非交互运行都会 deny 掉 question/plan_enter/plan_exit(非交互下没渠道回答,允许提问会让会话永不 idle 导致挂死)。UmaDev 之前的会话 ruleset 没 deny 这三个,于是底座一旦提澄清问题就阻塞、相位挂死(此前只有兜底超时,现在从源头不让它问)。两档(自主/守护)都加上,和官方一致。
+- opencode critic 只读 fork 现在能读黑板:只读 fork 之前用 全通配 deny,把 read/grep/glob 也拒了,critic 根本读不了它要评审的文件、只能凭指令文本推理。改成放行读、只 deny 写/bash/交互提问,既能读又保持单写不变量。
+- codex 默认守护路径的审批真 bug:UmaDev 回审批发的是 approved 布尔,但当前 codex(app-server V2)要的是 decision 枚举(accept/decline);approved 字段 codex 没有、必需的 decision 缺失,响应反序列化失败。默认守护档下 codex 会对联网/越工作区动作发起审批(装依赖的构建常见),此前这些审批答不上。现在按 codex 官方 serde 类型发 decision。
+- codex 命令实时日志对齐 V2:开启进程日志时的中途命令输出,之前监听的 item/updated 通知 codex V2 根本不发、实时流从不触发;改为监听 V2 真正的 item/commandExecution/outputDelta 增量通知。
+- codex 终止事件不再可能丢:app-server stdout 关闭时的终止 TurnDone Failed 之前用 try_send(256 槽满会丢),相位要等到 idle 超时才慢速失败;改为阻塞 send().await 保证送达、立即归因失败。
+
+### 深度审查修复(五轮 + Windows 专项,~85 个真 bug,全部带回归测试)
+
+- Windows 移动鼠标冒乱码根治 + 整类转义漏字:Windows conhost 发的是传统 X10 鼠标序列(`ESC[M`+3 字节)而非 SGR,漏字兜底之前只认 SGR,移动鼠标就在输入框冒出 `[M#…6` 乱码。现在兜底识别 X10 鼠标 + 焦点事件(`ESC[I`/`ESC[O`)+ CSI 私有查询回复(`ESC[?…`)整类并吞掉;另补 Windows `boot_id`,重启后 PID 复用不再被误判成还在跑的并发运行。
+- 跨项目自学习真正生效:全局经验晋升的 slug 之前保留了 `/`,组装成多段路径写进从不创建的目录,晋升一直静默失败——自学习跨项目复用这个卖点实际是死的。slug 净化成安全单段(顺带堵掉路径穿越)+ 原子写;学到的经验按 `is_learned` 标记检索、不再靠文件名 `lesson-` 前缀,晋升的全局经验不再被相位过滤漏掉。
+- 守护档逐工具门真正门控危险工具:claude 的 `--allowedTools` 之前无条件预批准 Read/Edit/Write/Bash,守护档下 Write/Bash 因此绕过 UmaDev 信任地板。现在守护档只预批准只读 Read,写/执行触发 `can_use_tool` 走门由信任地板裁决(可逆放行、不可逆拒绝),自主档才全预批。
+- 运行时证明不再误判:全 GET 探测把 POST-only/需鉴权后端(每条路由 401/405)误降级成未验证、工作的后端被判失败;改为只在全部路由 5xx 或无响应时才降级(4xx=服务器活着在路由)。另修子目录前端(`cd web && pnpm dev`)预览进程 pid 存成了 `cd` 导致孤儿永不回收,改存真实程序名。
+- 流水线完成识别:每个相位写的进入交付 note 之前被误当整体完成,导致续跑一个未完成构建被拒;改为只在真正干净收尾才写专属完成 note,单轮无计划的干净收尾也正确标记。
+- 文档证据与门禁鲁棒性:FR-/API 证据检查大小写敏感,中文文档用小写 `api` 会假失败、被无谓打回——改为大小写不敏感;门相位(文档确认/预览确认)之前会泄漏上一轮的经验记忆进门提示,现在门相位不带任何记忆通道。
+- 信任/安全地板加固:网络下载器管道到 shell 解释器(`curl | sh` 这类 RCE 形态)每种间距都能识别;扩展网络令牌(yarn/pnpm、cargo install、go get、gem/brew/pip3/apt 等);`/dev/null` 这类良性字符设备不再被当成越工作区写;守护档只对真正越出工作区的写要确认。
+- TUI 交互一批:取消"停止中"窗口内的输入不再静默丢失(还回输入框可立即重发);滚动阅读历史时活动指示器消失不再让视口跳一下;checkpoint 列表上限、adopt 跳过超大文件、tech_debt 账本改为覆盖快照而非无限追加、experts 分段先判代码围栏、error_kb 类型错误归类顺序修正。
+- 知识检索与解析:索引 schema 升版让旧缓存失效、超大无分隔段落切分不丢内容、契约后端路由正则支持自定义 router、契约校验跳过不可校验路径段、coach 关键词按词边界匹配(`art` 不再命中 startup/smart)。
+- 第五轮对抗式自查:用独立代理对抗式复核本轮所有修复,抓出并修掉 5 个自引入的回归(其中含守护档门控、运行时证明两个 HIGH/MED)——修复本身也过一遍审查,不带病发版。
+
+### 说明
+
+- claude-code 适配经审计确认已完全跟得上最新版(v2.1.x),无破坏性错配、无弃用 flag、无协议漂移,本版无需改动。
+
 ## [1.0.36] - 交互挂死根治 + 信任模式中途切换即时生效(今日反馈)
 
 深挖并修复了一整类"底座要用户输入 / 底座卡住 → UmaDev 挂死或不响应"的交互 bug(用 8 路审查把三底座各驱动路径的挂死点与授权 surface 全测绘了一遍)。全部确定性、fail-open、非破坏。

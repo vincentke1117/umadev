@@ -4553,6 +4553,13 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     if cur_scroll > 0 && grew_below > 0 {
         let anchored = cur_scroll.saturating_add(grew_below).min(hidden_above);
         app.transcript_scroll.set(anchored);
+    } else if cur_scroll > 0 && hidden_above < prev_hidden {
+        // Content SHRANK below the viewport (e.g. the 3-row live "thinking" indicator vanished
+        // on turn-settle). SYMMETRIC to the growth anchor above: decrement the from-bottom
+        // offset by the shrink so the user's read position stays put instead of JUMPING down
+        // by those rows once per turn while scrolled up reading history.
+        let shrank = prev_hidden.saturating_sub(hidden_above);
+        app.transcript_scroll.set(cur_scroll.saturating_sub(shrank));
     }
     app.transcript_prev_hidden.set(hidden_above);
 

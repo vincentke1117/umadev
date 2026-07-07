@@ -123,6 +123,17 @@ impl SecurityScan {
             .any(|r| r.status == ScanStatus::Findings)
     }
 
+    /// `true` iff a SECRETS scanner (gitleaks) reported findings — a leaked key in the
+    /// working tree is a HARD, always-critical block, distinct from an advisory dependency
+    /// CVE. Used by the review report to Fail (block merge) on a live secret while a
+    /// dependency advisory only Warns.
+    #[must_use]
+    pub fn has_secret_findings(&self) -> bool {
+        self.results
+            .iter()
+            .any(|r| r.category == "secrets" && r.status == ScanStatus::Findings)
+    }
+
     /// A neutral one-line summary for logs / the review report.
     #[must_use]
     pub fn summary_line(&self) -> String {
@@ -437,7 +448,8 @@ fn tool_on_path(tool: &str) -> bool {
 /// `(exit_code, combined_output)` on completion, or `None` on spawn failure /
 /// timeout. The thread-less timeout is a poll loop on `try_wait` — we avoid
 /// pulling tokio into a synchronous, fail-open scan path.
-fn run_capped(cmd: &str, args: &[&str], cwd: &Path) -> Option<(i32, String)> {
+fn run_capped(cmd: &str, args: &[&str], cwd: &Path) -> Option<(i32, String, String)> {
+    use std::io::Read;
     use std::process::Stdio;
     let mut child = Command::new(cmd)
         .args(args)
@@ -447,26 +459,43 @@ fn run_capped(cmd: &str, args: &[&str], cwd: &Path) -> Option<(i32, String)> {
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
+    // Drain stdout + stderr on their OWN threads: a scanner that writes >64 KiB before it
+    // exits would otherwise fill the pipe buffer, BLOCK the child, and stall the try_wait
+    // loop until the timeout (the M2 deadlock). Returning stdout and stderr SEPARATELY also
+    // lets a JSON caller parse stdout without the progress text a tool writes to stderr -
+    // merging them made cargo audit --json / pip-audit parse-fail on every run (S-H3).
+    let mut stdout_pipe = child.stdout.take()?;
+    let mut stderr_pipe = child.stderr.take()?;
+    let out_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    });
     let start = Instant::now();
-    loop {
+    let code = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let out = child.wait_with_output().ok()?;
-                let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-                combined.push_str(&String::from_utf8_lossy(&out.stderr));
-                return Some((status.code().unwrap_or(-1), combined));
-            }
+            Ok(Some(status)) => break status.code().unwrap_or(-1),
             Ok(None) => {
                 if start.elapsed() > SCAN_TIMEOUT {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = out_h.join();
+                    let _ = err_h.join();
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(_) => return None,
         }
-    }
+    };
+    let stdout = out_h.join().unwrap_or_default();
+    let stderr = err_h.join().unwrap_or_default();
+    Some((code, stdout, stderr))
 }
 
 // =====================================================================
@@ -493,7 +522,7 @@ fn scan_secrets(project_root: &Path) -> ScanResult {
         "--source",
         ".",
     ];
-    let Some((code, out)) = run_capped(TOOL, &args, project_root) else {
+    let Some((code, out, err)) = run_capped(TOOL, &args, project_root) else {
         return ScanResult {
             tool: TOOL.to_string(),
             category: CAT.to_string(),
@@ -511,9 +540,10 @@ fn scan_secrets(project_root: &Path) -> ScanResult {
             detail: "no leaked secrets detected".to_string(),
         };
     }
-    // Non-zero: gitleaks found leaks. Count "leaks found" lines for a rough
-    // tally; the redacted output never carries the secret value itself.
-    let n = count_gitleaks_findings(&out);
+    // Non-zero: gitleaks found leaks. Count "leaks found" lines for a rough tally over BOTH
+    // streams - gitleaks writes its finding summary to STDERR, so parsing stdout alone made
+    // the count silently fall back to 1 (L1). The redacted output never carries the secret.
+    let n = count_gitleaks_findings(&format!("{out}\n{err}"));
     ScanResult {
         tool: TOOL.to_string(),
         category: CAT.to_string(),
@@ -580,7 +610,7 @@ fn scan_npm_audit(project_root: &Path) -> ScanResult {
     if !tool_on_path("npm") {
         return ScanResult::skipped(TOOL, CAT, "npm not installed");
     }
-    let Some((_code, out)) = run_capped("npm", &["audit", "--json"], project_root) else {
+    let Some((_code, out, _err)) = run_capped("npm", &["audit", "--json"], project_root) else {
         return ScanResult {
             tool: TOOL.to_string(),
             category: CAT.to_string(),
@@ -667,7 +697,7 @@ fn scan_cargo_audit(project_root: &Path) -> ScanResult {
     if !tool_on_path("cargo-audit") && !tool_on_path("cargo") {
         return ScanResult::skipped(TOOL, CAT, "cargo-audit not installed");
     }
-    let Some((_code, out)) = run_capped("cargo", &["audit", "--json"], project_root) else {
+    let Some((_code, out, _err)) = run_capped("cargo", &["audit", "--json"], project_root) else {
         return ScanResult {
             tool: TOOL.to_string(),
             category: CAT.to_string(),
@@ -736,7 +766,8 @@ fn scan_pip_audit(project_root: &Path) -> ScanResult {
     if !tool_on_path("pip-audit") {
         return ScanResult::skipped(TOOL, CAT, "pip-audit not installed");
     }
-    let Some((_code, out)) = run_capped("pip-audit", &["--format", "json"], project_root) else {
+    let Some((_code, out, _err)) = run_capped("pip-audit", &["--format", "json"], project_root)
+    else {
         return ScanResult {
             tool: TOOL.to_string(),
             category: CAT.to_string(),

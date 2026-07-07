@@ -590,6 +590,34 @@ const DESIGN_ARCHETYPES: &[&str] = &[
 /// keyword reasoning. Returns `(archetype_id, product_label)`. This is what
 /// makes the design system **default-on**: the frontend always gets a binding
 /// token contract, even when the user never touches `/design`.
+/// Match a design-system trigger keyword against the (lower-cased) requirement. An ASCII
+/// keyword must match at a WORD BOUNDARY - so the trigger "art" hits the word "art" but NOT
+/// "startup" / "smart" / "charting", whose substring `contains` mis-selected the
+/// brutalist-bold BINDING design contract. A CJK keyword keeps plain substring matching (CJK
+/// has no word boundaries and its substrings are meaningful).
+fn keyword_matches(hay: &str, needle: &str) -> bool {
+    if !needle.is_ascii() {
+        return hay.contains(needle);
+    }
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(needle) {
+        let at = from + rel;
+        let before_ok = hay[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_alphanumeric());
+        let after_ok = hay[at + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        from = at + needle.len();
+    }
+    false
+}
+
 fn recommend_design_system(req: &str) -> (&'static str, &'static str) {
     let r = req.to_lowercase();
     // (archetype, human product label, trigger keywords). First hit wins, so
@@ -827,7 +855,7 @@ fn recommend_design_system(req: &str) -> (&'static str, &'static str) {
         ),
     ];
     for (archetype, label, kws) in RULES {
-        if kws.iter().any(|k| r.contains(k)) {
+        if kws.iter().any(|k| keyword_matches(&r, k)) {
             return (archetype, label);
         }
     }
@@ -1720,6 +1748,7 @@ mod tests {
                     tags: vec![],
                     domain: "d".to_string(),
                     difficulty: None,
+                    is_learned: false,
                 },
                 body: body.to_string(),
                 tokens: vec![],

@@ -526,7 +526,7 @@ fn filter_by_phase(
             // experience from prior runs). Lessons are pathed `<domain>/lesson-*`
             // after the .umadev/learned/ prefix is stripped, so we detect
             // them by the `lesson-` filename marker.
-            let is_lesson = path.contains("lesson-");
+            let is_lesson = index.chunks[*idx].meta.is_learned || path.contains("lesson-");
             // Match on a full path SEGMENT, not a loose prefix: the subdir
             // `design` must match `design/x` but NOT `design-systems/x` (which
             // is inlined as the binding contract, not retrieved). Likewise
