@@ -480,8 +480,8 @@ export const i18n = {
       eyebrow: "PARTNERS & COMMUNITIES",
       title: "Empowering Governable AI Coding with Tech Communities",
       list: [
-        { name: "YoMa Cloud", role: "AI Coding Community", logoName: "yoma", url: "#" },
-        { name: "YingHePai", role: "AIGC & Diversified Community", logoName: "yinghepai", url: "#" },
+        { name: "UmaCloud", role: "AI Coding Community", logoName: "yoma", url: "#" },
+        { name: "HACKCORE", role: "AIGC & Diversified Community", logoName: "yinghepai", url: "#" },
         { name: "PaoPai Community", role: "AIGC & Diversified Community", logoName: "paopai", url: "#" },
         { name: "ClawTime", role: "AIGC & Diversified Community", logoName: "clawtime", url: "#" },
         { name: "SEEAI", role: "AIGC & Diversified Community", logoName: "seeai", url: "#" },
