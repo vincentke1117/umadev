@@ -1308,8 +1308,12 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
             
             <div className={styles.contributorsMatrix}>
               {[
-                { ...t.contributors.featured, isVip: true },
-                ...t.contributors.list.map((item) => ({ ...item, isVip: false }))
+                { ...t.contributors.featured, isVip: true, vipText: "#1 核心贡献" },
+                ...t.contributors.list.map((item) => ({
+                  ...item,
+                  isVip: (item as { isVip?: boolean }).isVip || false,
+                  vipText: (item as { isVip?: boolean }).isVip ? "核心贡献" : undefined
+                }))
               ].map((member) => (
                 <div
                   key={member.avatarKey}
@@ -1317,7 +1321,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                   data-vip={member.isVip ? "true" : undefined}
                 >
                   <div className={styles.matrixCardGlow} />
-                  {member.isVip && <div className={styles.matrixVipBadge}>#1 核心贡献</div>}
+                  {member.isVip && <div className={styles.matrixVipBadge}>{member.vipText}</div>}
                   <div className={styles.matrixAvatarWrapper}>
                     <Image
                       src={asset(`/assets/contributors/${member.avatarKey}.png`)}

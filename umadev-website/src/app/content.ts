@@ -238,7 +238,7 @@ export const i18n = {
       featured: { name: "元宝", role: "核心领航贡献者", avatarKey: "yuanbao" },
       list: [
         { name: "Robin", role: "特别贡献者", avatarKey: "robin" },
-        { name: "perfect", role: "特别贡献者", avatarKey: "perfect" },
+        { name: "perfect", role: "核心贡献者", avatarKey: "perfect", isVip: true },
         { name: "境随AI转", role: "特别贡献者", avatarKey: "jingsuiai" },
         { name: "张楠伟", role: "特别贡献者", avatarKey: "zhangnanwei" },
         { name: "慕怀", role: "特别贡献者", avatarKey: "muhuai" },
@@ -247,7 +247,13 @@ export const i18n = {
         { name: "海涛", role: "特别贡献者", avatarKey: "haitao" },
         { name: "眼睛", role: "特别贡献者", avatarKey: "yanjing" },
         { name: "马辉", role: "特别贡献者", avatarKey: "mahui" },
-        { name: "cxuan", role: "特别贡献者", avatarKey: "cxuan" }
+        { name: "cxuan", role: "特别贡献者", avatarKey: "cxuan" },
+        { name: "Daniel", role: "特别贡献者", avatarKey: "daniel" },
+        { name: "Heyailab", role: "特别贡献者", avatarKey: "heyailab" },
+        { name: "Jacky", role: "特别贡献者", avatarKey: "jacky" },
+        { name: "R·K", role: "特别贡献者", avatarKey: "rk" },
+        { name: "林", role: "特别贡献者", avatarKey: "lin" },
+        { name: "秦艽", role: "特别贡献者", avatarKey: "qinjiao" }
       ]
     },
     contributorsPage: {
@@ -484,7 +490,7 @@ export const i18n = {
       featured: { name: "YuanBao", role: "Core Lead Contributor", avatarKey: "yuanbao" },
       list: [
         { name: "Robin", role: "Special Contributor", avatarKey: "robin" },
-        { name: "perfect", role: "Special Contributor", avatarKey: "perfect" },
+        { name: "perfect", role: "Core Contributor", avatarKey: "perfect", isVip: true },
         { name: "JingSuiAI", role: "Special Contributor", avatarKey: "jingsuiai" },
         { name: "ZhangNanWei", role: "Special Contributor", avatarKey: "zhangnanwei" },
         { name: "MuHuai", role: "Special Contributor", avatarKey: "muhuai" },
@@ -493,7 +499,13 @@ export const i18n = {
         { name: "HaiTao", role: "Special Contributor", avatarKey: "haitao" },
         { name: "YanJing", role: "Special Contributor", avatarKey: "yanjing" },
         { name: "MaHui", role: "Special Contributor", avatarKey: "mahui" },
-        { name: "cxuan", role: "Special Contributor", avatarKey: "cxuan" }
+        { name: "cxuan", role: "Special Contributor", avatarKey: "cxuan" },
+        { name: "Daniel", role: "Special Contributor", avatarKey: "daniel" },
+        { name: "Heyailab", role: "Special Contributor", avatarKey: "heyailab" },
+        { name: "Jacky", role: "Special Contributor", avatarKey: "jacky" },
+        { name: "R·K", role: "Special Contributor", avatarKey: "rk" },
+        { name: "Lin", role: "Special Contributor", avatarKey: "lin" },
+        { name: "Qinjiao", role: "Special Contributor", avatarKey: "qinjiao" }
       ]
     },
     contributorsPage: {
