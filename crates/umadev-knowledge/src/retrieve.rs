@@ -307,7 +307,7 @@ pub fn retrieve_with_vector_and_expansion(
     // is fail-open — if it would empty the query it returns the raw tokens — and
     // we additionally fall back to the unmasked search if the masked search
     // somehow finds nothing, so masking can only ever HELP, never starve.
-    let over_fetch = config.top_k * 3;
+    let over_fetch = config.top_k.saturating_mul(3);
     let masked_terms = index.mask_low_idf_terms(query, idf_floor());
     let bm25_masked = index.search_terms(&masked_terms, over_fetch);
     let query_bigram = if bm25_masked.is_empty() {
@@ -414,21 +414,22 @@ fn dedup_learned_chunks(hits: Vec<ScoredChunk>) -> Vec<ScoredChunk> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<ScoredChunk> = Vec::with_capacity(hits.len());
     for hit in hits {
-        let first_line = hit
-            .chunk
-            .body
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("");
+        // Key on the FULL trimmed body, not just the first non-empty line. A prior
+        // `(title, section, first_line)` key falsely collapsed two DISTINCT sub-chunks of
+        // one oversized section that happen to share a first line — a ``` code fence, or a
+        // boilerplate "This guide covers…" intro — silently dropping the second real chunk
+        // from the results. Keying on the whole body means only a byte-identical duplicate
+        // (a lesson sedimented twice) collapses; genuinely different content is always kept.
         let key = format!(
             "{}\0{}\0{}",
-            hit.chunk.meta.title, hit.chunk.meta.section, first_line
+            hit.chunk.meta.title,
+            hit.chunk.meta.section,
+            hit.chunk.body.trim()
         );
         if seen.insert(key) {
             out.push(hit); // first (highest-scored) copy of this content
         }
-        // else: an identical-content, lower-scored copy → drop it.
+        // else: a byte-identical, lower-scored copy → drop it.
     }
     out
 }
@@ -524,9 +525,12 @@ fn filter_by_phase(
             let path = &index.chunks[*idx].meta.path;
             // Always allow sedimented lessons through (they're cross-cutting
             // experience from prior runs). Lessons are pathed `<domain>/lesson-*`
-            // after the .umadev/learned/ prefix is stripped, so we detect
-            // them by the `lesson-` filename marker.
-            let is_lesson = index.chunks[*idx].meta.is_learned || path.contains("lesson-");
+            // after the .umadev/learned/ prefix is stripped, so we detect them by a
+            // `lesson-` FILENAME PREFIX (not a loose substring: `path.contains("lesson-")`
+            // also matched a curated `best-lesson-practices.md`, letting it bypass the
+            // phase/subdir filter — #19).
+            let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            let is_lesson = index.chunks[*idx].meta.is_learned || file_name.starts_with("lesson-");
             // Match on a full path SEGMENT, not a loose prefix: the subdir
             // `design` must match `design/x` but NOT `design-systems/x` (which
             // is inlined as the binding contract, not retrieved). Likewise
@@ -1033,6 +1037,31 @@ mod tests {
         };
         let out = dedup_learned_chunks(vec![mk(&a[0], 1.0), mk(&b[0], 0.9)]);
         assert_eq!(out.len(), 2, "distinct lessons must not be merged");
+    }
+
+    #[test]
+    fn dedup_keeps_distinct_chunks_that_share_a_first_line() {
+        // #11 — two DISTINCT sub-chunks of one oversized section share title + section AND
+        // their first non-empty line (a ``` code fence), but their bodies differ. The old
+        // (title, section, first_line) key falsely collapsed them, dropping the second real
+        // chunk; keying on the full body must keep BOTH.
+        let base = &crate::chunker::chunk_text("kb/guide.md", "# Guide\n\n## Setup\n\nseed")[0];
+        let mut a = base.clone();
+        a.body = "```\nstep one: install the dependencies\n```".to_string();
+        let mut b = base.clone();
+        b.body = "```\nstep two: configure the environment\n```".to_string();
+        assert_eq!(a.meta.title, b.meta.title);
+        assert_eq!(a.meta.section, b.meta.section);
+        let mk = |c: &Chunk, s: f32| ScoredChunk {
+            chunk: c.clone(),
+            score: s,
+        };
+        let out = dedup_learned_chunks(vec![mk(&a, 1.0), mk(&b, 0.9)]);
+        assert_eq!(
+            out.len(),
+            2,
+            "distinct chunks sharing a first line must both survive"
+        );
     }
 
     #[test]

@@ -323,11 +323,27 @@ fn quality_claim(project_root: &Path, slug: &str) -> ReviewClaim {
 /// Security scan — reuse the persisted `.umadev/audit/security-scan.json`.
 fn security_claim(project_root: &Path) -> ReviewClaim {
     let path = project_root.join(crate::security::security_scan_rel_path());
-    let Some(scan) = read(path).pipe_opt(|s| serde_json::from_str::<SecurityScan>(s).ok()) else {
+    let raw = read(path);
+    if raw.trim().is_empty() {
+        // No file → the scan simply hasn't run yet.
         return ReviewClaim {
             title: "Security scan".to_string(),
             verdict: Verdict::Info,
             detail: "No security scan recorded yet (runs at the `delivery` phase).".to_string(),
+        };
+    }
+    let Ok(scan) = serde_json::from_str::<SecurityScan>(&raw) else {
+        // #14 — the file EXISTS but is corrupt / truncated. It used to collapse to the same
+        // "no scan recorded yet" as an absent file, which HIDES a scan that may have found a
+        // leaked secret. Surface it as a Warn so a human re-runs the scan before merge rather
+        // than reading "nothing scanned".
+        return ReviewClaim {
+            title: "Security scan".to_string(),
+            verdict: Verdict::Warn,
+            detail: "A security-scan file exists but could not be parsed (corrupt or \
+                     truncated) — re-run the security scan before merge so a real finding \
+                     is not silently hidden."
+                .to_string(),
         };
     };
     if !scan.any_ran() {
@@ -907,5 +923,26 @@ mod tests {
         // No source implements /api/widgets → a gap → Warn.
         assert_eq!(accept.verdict, Verdict::Warn);
         assert!(accept.detail.contains("/api/widgets"));
+    }
+
+    #[test]
+    fn corrupt_security_scan_warns_instead_of_reading_as_no_scan() {
+        // #14 — a corrupt / truncated security-scan.json must NOT collapse to the same
+        // "no scan recorded yet" as an absent file (that hides a scan that may have found a
+        // leaked secret); it Warns so a human re-runs it. An ABSENT file still reads Info.
+        let tmp = TempDir::new().unwrap();
+        let scan_path = tmp.path().join(crate::security::security_scan_rel_path());
+        fs::create_dir_all(scan_path.parent().unwrap()).unwrap();
+        fs::write(&scan_path, "{ not valid json ]").unwrap();
+        let corrupt = security_claim(tmp.path());
+        assert_eq!(corrupt.verdict, Verdict::Warn, "corrupt scan must warn");
+        assert!(corrupt.detail.contains("could not be parsed"));
+
+        let absent = security_claim(TempDir::new().unwrap().path());
+        assert_eq!(
+            absent.verdict,
+            Verdict::Info,
+            "absent scan stays neutral Info"
+        );
     }
 }

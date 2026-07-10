@@ -467,6 +467,13 @@ async fn run_deploy_command(
             }
         }
         Ok(Err(e)) => {
+            // #21 — `wait()` itself failed, so the child's fate is unknown and it may
+            // still be running. Tear down its whole GROUP (a bare drop + `kill_on_drop`
+            // reaps only the direct child, leaving detached `npx`/`node` descendants), the
+            // same as the timeout branch. Bounded so a wedged wait can't hang.
+            let _ = crate::spawn_util::kill_process_group(&child);
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(KILL_REAP_SECS), child.wait()).await;
             let mut proof =
                 DeployProof::not_deployed(platform, format!("could not run deploy command: {e}"));
             proof.command = Some(command);
