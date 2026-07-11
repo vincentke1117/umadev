@@ -6618,6 +6618,43 @@ async fn event_loop(
                     Some(CompactionOutcome::Failed) => app.fail_compaction(),
                     None => {}
                 }
+                // A SUCCESSFUL fold set `chat_session_dirty`: the resident base
+                // session still holds the PRE-compaction history in its own process
+                // memory and would otherwise re-emit folded turns (history bleed) /
+                // keep driving in stale build context (misroute). This `select!` arm
+                // never falls through to the key-arm drain at the bottom of the loop
+                // (that lives inside the `Event::Key` branch), so consume the flag
+                // HERE the SAME way: close the parked resident session so the next chat
+                // turn reopens FRESH against the compacted transcript, and pre-load a
+                // warm one. Best-effort `try_lock` (a mid-flight turn OWNS the session
+                // → holder is `None` → nothing taken); fail-open — a missed close
+                // leaves a stale-but-harmless session one extra turn, never a
+                // crash/block.
+                if app.chat_session_dirty {
+                    app.chat_session_dirty = false;
+                    let parked = chat_session_holder
+                        .try_lock()
+                        .ok()
+                        .and_then(|mut g| g.take());
+                    if let Some(s) = parked {
+                        // Off the render path — a wedged base's shutdown must not
+                        // freeze the shell.
+                        detach_resident_close(s);
+                    }
+                    spawn_chat_session_preload(
+                        app.backend.as_deref(),
+                        String::new(),
+                        app.project_root.clone(),
+                        continuous_autonomous(app.effective_trust_mode()),
+                        // `apply_compaction` already CLEARED `chat_session_id` (its
+                        // `/clear`-style base-session break ran just above in this same
+                        // arm), so this is `None` → a TRULY FRESH open that front-loads
+                        // only the COMPACTED transcript, NOT a resume of the base's full
+                        // uncompacted native history (which would defeat the fold).
+                        app.chat_session_id.clone(),
+                        chat_session_holder.clone(),
+                    );
+                }
             }
             maybe_event = engine_rx.recv() => {
                 // R3 — engine events change the transcript; mark it dirty

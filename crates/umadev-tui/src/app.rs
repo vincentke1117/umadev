@@ -8924,6 +8924,22 @@ impl App {
         // `persist_chat` writes the full transcript, so re-persisting is harmless
         // and keeps the saved base-session id / timestamp fresh.
         self.persist_chat();
+        // The RESIDENT base session (the live host-CLI process the event loop keeps
+        // alive across this chat) still holds the FULL pre-compaction history in its
+        // OWN process memory, and THAT is what actually drives each turn — so folding
+        // only `conversation` here is cosmetic to the base unless we also close it AND
+        // break the base-session id. Mirror `/clear`'s base-session break (minus the
+        // conversation wipe + `chat_id` re-mint): drop the base's own session pin so
+        // the next turn opens a TRULY FRESH session that front-loads only the COMPACTED
+        // transcript (via `first_chat_directive`). Without clearing `chat_session_id`
+        // the fresh open would RESUME the base's full uncompacted native history — the
+        // compacted transcript and the full history would coexist and the fold would be
+        // defeated (history bleed + stale-build misroute persist). Fail-open: a missed
+        // close/break at worst leaves a stale session one extra turn.
+        self.host_chat_session_active = false;
+        self.chat_session_id = None;
+        self.run_session_handed_to_chat = false;
+        self.chat_session_dirty = true;
         self.push(
             ChatRole::System,
             umadev_i18n::tf(
@@ -16676,6 +16692,48 @@ mod tests {
         // The on-disk FULL transcript is untouched by compaction.
         assert_eq!(app.full_transcript.len(), full_before);
         assert_eq!(app.full_transcript.last().unwrap().content, last_asst);
+    }
+
+    #[test]
+    fn apply_compaction_marks_resident_session_dirty() {
+        // After a SUCCESSFUL fold the resident base session still holds the FULL
+        // pre-compaction history in its own process memory, and that is what drives
+        // each turn — so `apply_compaction` must flag it for close. The event loop
+        // then reopens a FRESH session that front-loads the COMPACTED transcript,
+        // which is what stops the base re-emitting folded turns (history bleed) and
+        // driving in stale build context (a plain question misrouted as a build).
+        let (mut app, _tmp) = temp_app();
+        fill_over_budget(&mut app, 16);
+        let job = app.begin_auto_compaction().expect("a job near budget");
+        // Seed an ACTIVE base-session pin so we can prove the fold breaks it: a fresh
+        // open that RESUMED this id would reload the base's full uncompacted native
+        // history and defeat the fold.
+        app.chat_session_id = Some("sid".into());
+        app.host_chat_session_active = true;
+        assert!(
+            !app.chat_session_dirty,
+            "no pending resident-close before the fold settles"
+        );
+        app.apply_compaction(
+            "## Current work\nWiring the API.",
+            job.fold_count,
+            job.generation,
+        );
+        assert!(
+            app.chat_session_dirty,
+            "a successful fold flags the resident base session for close so the next \
+             turn reopens fresh against the compacted transcript"
+        );
+        assert!(
+            app.chat_session_id.is_none(),
+            "the fold clears the base-session pin so the next open is truly fresh, not \
+             a resume of the full uncompacted native history"
+        );
+        assert!(
+            !app.host_chat_session_active,
+            "the fold breaks the active base session so the next turn does not continue \
+             the pre-compaction session"
+        );
     }
 
     #[test]

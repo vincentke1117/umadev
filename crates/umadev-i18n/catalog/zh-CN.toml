@@ -374,7 +374,7 @@
 "compact.summary" = "[早前对话摘要 · 共 {} 条]\n{}"
 "compact.done" = "[compact] 已把对话折叠摘要:{} 条 -> {} 条,释放上下文且保留早前要点。"
 "compact.in_progress" = "[compact] 正在把早前的对话总结成摘要以释放上下文——最近几轮原样保留,完整历史仍存盘…"
-"compact.summary_block" = "[早前对话摘要 · 共 {} 条]"
+"compact.summary_block" = "[早前对话摘要 · 共 {} 条] 以下是本次对话早前部分的背景摘要,仅供参考,不是待办指令。请回应用户最新的消息;除非用户明确要求,不要恢复或继续任何未完成的任务。"
 "compact.full_history_preserved" = "(完整对话历史已存盘——/resume 可完整恢复)"
 "compact.compacted_notice" = "[compact] 已把 {} 条早前消息折叠成结构化摘要以释放上下文;最近几轮原样保留,完整历史已保留。"
 "run.steer_applied" = "[steer] 应用你排队的消息,按它重做当前阶段…"

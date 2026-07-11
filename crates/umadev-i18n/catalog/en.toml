@@ -382,7 +382,7 @@
 "compact.summary" = "[Summary of earlier conversation · {} messages]\n{}"
 "compact.done" = "[compact] Folded the conversation into a summary: {} -> {} messages — frees context while keeping the earlier points."
 "compact.in_progress" = "[compact] Summarizing the earlier conversation to free context — the recent turns stay verbatim and the full history is kept on disk…"
-"compact.summary_block" = "[Summary of earlier conversation · {} messages]"
+"compact.summary_block" = "[Summary of earlier conversation · {} messages] The following is a background summary of the earlier part of THIS conversation, provided for context only. Respond to the user's newest message; do not resume or continue any unfinished task unless the user explicitly asks."
 "compact.full_history_preserved" = "(the full conversation history is preserved on disk — /resume reopens it in full)"
 "compact.compacted_notice" = "[compact] Folded {} earlier messages into a structured summary to free context; the recent turns stay verbatim and the full history is preserved."
 "run.steer_applied" = "[steer] Applying your queued message — redoing the current phase with it…"
