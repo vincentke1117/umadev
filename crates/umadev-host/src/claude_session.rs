@@ -862,8 +862,14 @@ pub fn parse_stdout_line(line: &str) -> Vec<SessionEvent> {
         // Incremental text deltas (we launch with `--include-partial-messages`), so
         // a reply streams token-by-token instead of arriving all at once.
         Some("stream_event") => parse_stream_event(&v),
-        Some("assistant") => parse_assistant(&v),
-        Some("user") => parse_user_tool_results(&v),
+        // The tool-noise frames (a base `Agent`/`Task` spawns a NESTED sub-agent
+        // whose `tool_use` / `tool_result` blocks otherwise masquerade as the main
+        // agent's output — the file-tree garble). `attribute_if_subagent` is PURELY
+        // additive: a MAIN-line frame (no / null `parent_tool_use_id`) returns the
+        // parser's output UNCHANGED; only a genuine sub-agent frame gets its tool
+        // events visually attributed. See `attribute_if_subagent`.
+        Some("assistant") => attribute_if_subagent(&v, parse_assistant(&v)),
+        Some("user") => attribute_if_subagent(&v, parse_user_tool_results(&v)),
         Some("result") => vec![parse_result(&v)],
         Some("control_request") => parse_control_request(&v),
         // Item 2 — observability: an inbound `control_response` (claude's ACK to our
@@ -906,6 +912,65 @@ pub fn parse_stdout_line(line: &str) -> Vec<SessionEvent> {
         // keep_alive, status, tool_progress, … → not events.
         _ => vec![],
     }
+}
+
+/// Compact sub-agent attribution marker prefixed onto a NESTED sub-agent's rendered
+/// tool-call name / tool-result summary. `↳` is an ASCII-art arrow (U+21B3) and the
+/// label is plain CJK text — deliberately NO emoji (repo rule: emoji are never used
+/// as functional markers). Applied ONLY to sub-agent frames so their nested tool
+/// noise (e.g. a directory Read's file tree) is attributed to the sub-agent instead
+/// of masquerading as the main agent's output.
+const SUBAGENT_MARKER: &str = "↳ 子代理 · ";
+
+/// The `parent_tool_use_id` of a stream-json frame, read at the SAME top level
+/// UmaDev sets it OUTBOUND ([`user_message_line`] — `{…,"parent_tool_use_id":…}`).
+/// claude tags every frame a NESTED sub-agent produces (its `Agent`/`Task` tool
+/// spawns the sub-agent) with a non-null id here; a MAIN-line frame carries `null`
+/// or omits the field. Returns `Some(id)` ONLY for a non-empty string — `null`,
+/// absent, or an empty string all yield `None`. This is the single gate for the
+/// additive sub-agent branch: a frame that is NOT a sub-agent frame can never enter
+/// it, so main-line behavior is provably unchanged. Exposed for tests.
+#[must_use]
+fn parent_tool_use_id(v: &Value) -> Option<&str> {
+    v.get("parent_tool_use_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Attribute `events` to a sub-agent IFF the frame `v` carries a non-null
+/// [`parent_tool_use_id`]. **Purely additive:** a MAIN-line frame (`None`) returns
+/// `events` byte-for-byte unchanged — the exact events UmaDev produced before this
+/// fix; a sub-agent frame (`Some`) routes them through [`mark_subagent_events`].
+/// This is the only place the two lines diverge. Exposed for tests.
+#[must_use]
+fn attribute_if_subagent(v: &Value, events: Vec<SessionEvent>) -> Vec<SessionEvent> {
+    match parent_tool_use_id(v) {
+        Some(_) => mark_subagent_events(events),
+        None => events,
+    }
+}
+
+/// Prefix each `ToolCall` name / `ToolResult` summary with [`SUBAGENT_MARKER`] so the
+/// nested tool row is visually distinguishable from the main agent's. Non-tool events
+/// (text / thinking deltas, turn boundaries) pass through UNCHANGED — sub-agent text
+/// is left as-is rather than prefixed per-token (that would be noise). Exposed for
+/// tests.
+#[must_use]
+fn mark_subagent_events(events: Vec<SessionEvent>) -> Vec<SessionEvent> {
+    events
+        .into_iter()
+        .map(|ev| match ev {
+            SessionEvent::ToolCall { name, input } => SessionEvent::ToolCall {
+                name: format!("{SUBAGENT_MARKER}{name}"),
+                input,
+            },
+            SessionEvent::ToolResult { ok, summary } => SessionEvent::ToolResult {
+                ok,
+                summary: format!("{SUBAGENT_MARKER}{summary}"),
+            },
+            other => other,
+        })
+        .collect()
 }
 
 /// A short, fail-open one-line description of an inbound `control_response` (claude's
@@ -1912,6 +1977,105 @@ mod tests {
         assert!(parse_stdout_line("").is_empty());
         assert!(parse_stdout_line(r#"{"type":"keep_alive"}"#).is_empty());
         assert!(parse_stdout_line(r#"{"type":"system","subtype":"init"}"#).is_empty());
+    }
+
+    #[test]
+    fn parent_tool_use_id_only_non_empty_string_is_some() {
+        // The single gate for the additive sub-agent branch. A non-null string is the
+        // ONLY thing that enters attribution; every main-line shape stays `None`.
+        assert_eq!(
+            parent_tool_use_id(&serde_json::json!({"parent_tool_use_id":"toolu_abc"})),
+            Some("toolu_abc")
+        );
+        assert_eq!(
+            parent_tool_use_id(&serde_json::json!({"parent_tool_use_id":Value::Null})),
+            None,
+            "explicit null (the main-line shape) → None"
+        );
+        assert_eq!(
+            parent_tool_use_id(&serde_json::json!({})),
+            None,
+            "absent field → None"
+        );
+        assert_eq!(
+            parent_tool_use_id(&serde_json::json!({"parent_tool_use_id":""})),
+            None,
+            "empty string → None (never a spurious sub-agent mark)"
+        );
+    }
+
+    #[test]
+    fn main_line_frames_are_byte_for_byte_unchanged_by_the_subagent_fix() {
+        // HARD SAFETY CONTRACT: a frame with NO / null `parent_tool_use_id` must
+        // produce EXACTLY the events it did before the sub-agent fix existed. We pin
+        // that against the literal expected events (the same ones the pre-fix parser
+        // tests assert), for both the absent-field and explicit-null shapes.
+        let expected_call = vec![SessionEvent::ToolCall {
+            name: "Write".to_string(),
+            input: serde_json::json!({"file_path": "src/App.tsx"}),
+        }];
+        // Assistant `tool_use`, field ABSENT (today's frame shape).
+        let absent = r#"{"type":"assistant","message":{"content":[
+            {"type":"tool_use","name":"Write","input":{"file_path":"src/App.tsx"}}]}}"#;
+        assert_eq!(parse_stdout_line(absent), expected_call);
+        // Assistant `tool_use`, field explicit-null (the shape claude tags MAIN-line
+        // frames with — exactly what we set OUTBOUND in `user_message_line`).
+        let null_parent = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[
+            {"type":"tool_use","name":"Write","input":{"file_path":"src/App.tsx"}}]}}"#;
+        assert_eq!(parse_stdout_line(null_parent), expected_call);
+        // User `tool_result`, field explicit-null → unchanged ToolResult.
+        let result_null = r#"{"type":"user","parent_tool_use_id":null,"message":{"content":[
+            {"type":"tool_result","is_error":true,"content":"boom"}]}}"#;
+        assert_eq!(
+            parse_stdout_line(result_null),
+            vec![SessionEvent::ToolResult {
+                ok: false,
+                summary: "boom".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn subagent_frames_attribute_tool_events_with_the_marker() {
+        // A NESTED sub-agent's frames carry a non-null `parent_tool_use_id`. Their
+        // discrete tool events (where the file-tree garble lives) are prefixed with
+        // the sub-agent marker so they read as sub-agent work, not the main agent's.
+        let call = r#"{"type":"assistant","parent_tool_use_id":"toolu_sub1","message":{"content":[
+            {"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#;
+        let evs = parse_stdout_line(call);
+        let SessionEvent::ToolCall { name, input } = &evs[0] else {
+            panic!("expected ToolCall, got {evs:?}");
+        };
+        assert_eq!(name, &format!("{SUBAGENT_MARKER}Read"));
+        assert!(
+            name.starts_with(SUBAGENT_MARKER),
+            "sub-agent tool name carries the attribution marker"
+        );
+        // The raw tool input is NOT touched — only the rendered name is attributed.
+        assert_eq!(input["file_path"], "src/lib.rs");
+
+        // The tool_result (the file-tree summary) is attributed too.
+        let result = r#"{"type":"user","parent_tool_use_id":"toolu_sub1","message":{"content":[
+            {"type":"tool_result","content":"src/\n  App.tsx\n  main.rs"}]}}"#;
+        let evs = parse_stdout_line(result);
+        let SessionEvent::ToolResult { ok, summary } = &evs[0] else {
+            panic!("expected ToolResult, got {evs:?}");
+        };
+        assert!(*ok, "success flag preserved");
+        assert!(
+            summary.starts_with(SUBAGENT_MARKER),
+            "sub-agent tool-result summary carries the marker: {summary}"
+        );
+        assert!(
+            summary.contains("App.tsx"),
+            "the original summary content is preserved after the marker: {summary}"
+        );
+
+        // Repo rule: the marker is ASCII/CJK, never an emoji.
+        assert!(
+            !SUBAGENT_MARKER.chars().any(|c| c as u32 >= 0x1F000),
+            "sub-agent marker must contain no emoji"
+        );
     }
 
     #[test]
