@@ -19,6 +19,13 @@
 //!   parse: we capture the declaration line of each top-level symbol, not its
 //!   body, types, or call graph. That is exactly enough for a map and keeps
 //!   the build lean (the anti-rule against heavy parser trees).
+//!   On top of the symbol scan, a per-language **import scan** resolves each
+//!   file's imports against the scanned file set (relative paths by
+//!   extension resolution, module paths by unique suffix match; an ambiguous
+//!   resolution is *declined*, never guessed) into [`SymbolIndex::edges`] —
+//!   real fan-in centrality for ranking, and a scope-seeded
+//!   random-walk-with-restart that orders the map by structural relatedness
+//!   instead of a bare path-substring partition.
 //! - **Fail-open, never blocks.** Every error path (unreadable file, no source,
 //!   empty repo, pathological input) returns an empty `String` / empty index —
 //!   never an `Err`, never a panic. The map is an *enhancement*; a bug here
@@ -170,6 +177,15 @@ pub struct FileSymbols {
 pub struct SymbolIndex {
     /// Per-file symbol sets, sorted by descending importance after ranking.
     pub files: Vec<FileSymbols>,
+    /// Resolved import edges as `(importer, imported)` index pairs into
+    /// [`SymbolIndex::files`] (kept consistent through the rank reorder).
+    /// Extracted by per-language import patterns and resolved with a
+    /// confidence discipline: relative paths by extension resolution, module
+    /// paths by unique suffix match against the scanned set — a resolution
+    /// matching more than one file is DECLINED rather than guessed. Sorted +
+    /// deduped. Empty when nothing resolves (fail-open: every consumer must
+    /// degrade to its edge-less behaviour).
+    pub edges: Vec<(usize, usize)>,
 }
 
 impl SymbolIndex {
@@ -655,6 +671,716 @@ fn compute_exported(name: &str, line: &str, lang: Lang) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Import edges — per-language import scan + disciplined resolution.
+//
+// The same regex-not-parser tradeoff as the symbol scan: imports are the most
+// regular syntax in every language, so a line-oriented capture is accurate
+// enough, and the consumer (ranking / map ordering) is noise-tolerant by
+// design. The resolution discipline is the important part: a spec that maps
+// to MORE than one scanned file is declined outright — a wrong edge is worse
+// than a missing one when the output is an ordering signal.
+// ---------------------------------------------------------------------------
+
+/// Bounds for the import scan (same spirit as [`limits`]).
+mod import_limits {
+    /// Max import specs captured per file.
+    pub const MAX_IMPORTS_PER_FILE: usize = 200;
+    /// Max resolved edges across the whole index.
+    pub const MAX_EDGES: usize = 20_000;
+    /// Max byte length of a single captured spec (defends against generated
+    /// monster import lines).
+    pub const MAX_SPEC_BYTES: usize = 300;
+    /// Max path segments considered when suffix-matching a module path.
+    pub const MAX_SEGS: usize = 24;
+}
+
+/// A compiled import-capture rule: capture group 1 is the import spec.
+/// `marker` is prefixed onto the captured spec so the resolver can tell apart
+/// declaration forms that resolve differently within one language.
+struct ImportPattern {
+    re: Regex,
+    /// `""` for ordinary imports, `"mod:"` for Rust `mod x;` declarations,
+    /// `"rel:"` for Ruby `require_relative`.
+    marker: &'static str,
+}
+
+/// Build the (cached) import-pattern set for a language. Same fail-open
+/// compile policy as [`patterns_for`]. Go is absent on purpose: its import
+/// blocks are handled by a tiny state machine in [`extract_imports`].
+fn import_patterns_for(lang: Lang) -> &'static [ImportPattern] {
+    static CACHE: OnceLock<HashMap<u8, Vec<ImportPattern>>> = OnceLock::new();
+    let map = CACHE.get_or_init(build_all_import_patterns);
+    map.get(&(lang as u8)).map_or(&[], Vec::as_slice)
+}
+
+/// Compile every language's import-pattern table once.
+fn build_all_import_patterns() -> HashMap<u8, Vec<ImportPattern>> {
+    let mut out: HashMap<u8, Vec<ImportPattern>> = HashMap::new();
+    let mut add = |lang: Lang, defs: &[(&str, &'static str)]| {
+        let v: Vec<ImportPattern> = defs
+            .iter()
+            .filter_map(|(src, marker)| Regex::new(src).ok().map(|re| ImportPattern { re, marker }))
+            .collect();
+        out.insert(lang as u8, v);
+    };
+
+    add(
+        Lang::JsTs,
+        &[
+            // import x / {a,b} / * as ns  from '...'
+            (r#"^\s*import\s+[^'"]*?\bfrom\s*['"]([^'"]+)['"]"#, ""),
+            // side-effect import '...'
+            (r#"^\s*import\s*['"]([^'"]+)['"]"#, ""),
+            // export { a } from '...' / export * from '...'
+            (r#"^\s*export\s+[^'"]*?\bfrom\s*['"]([^'"]+)['"]"#, ""),
+            // closing line of a multi-line import: `} from '...'`
+            (r#"^\s*\}\s*from\s*['"]([^'"]+)['"]"#, ""),
+            // CommonJS require('...')
+            (r#"\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)"#, ""),
+            // dynamic import('...')
+            (r#"\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)"#, ""),
+        ],
+    );
+    add(
+        Lang::Python,
+        &[
+            (r"^\s*from\s+([.\w]+)\s+import\b", ""),
+            (r"^\s*import\s+([\w.]+(?:\s*,\s*[\w.]+)*)", ""),
+        ],
+    );
+    add(
+        Lang::Rust,
+        &[
+            (r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([A-Za-z_][\w:]*)", ""),
+            (
+                r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_]\w*)\s*;",
+                "mod:",
+            ),
+        ],
+    );
+    add(
+        Lang::Java, // also Kotlin
+        &[(r"^\s*import\s+(?:static\s+)?([\w.]+\w)\s*;?\s*$", "")],
+    );
+    add(
+        Lang::Ruby,
+        &[
+            (r#"^\s*require_relative\s+['"]([^'"]+)['"]"#, "rel:"),
+            (r#"^\s*require\s+['"]([^'"]+)['"]"#, ""),
+        ],
+    );
+    add(
+        Lang::Php,
+        &[
+            (r"^\s*use\s+(?:function\s+|const\s+)?\\?([\w\\]+)", ""),
+            (
+                r#"\b(?:require|include)(?:_once)?\s*\(?\s*['"]([^'"]+)['"]"#,
+                "",
+            ),
+        ],
+    );
+    add(
+        Lang::CSharp,
+        &[(r"^\s*using\s+(?:static\s+)?([\w.]+\w)\s*;", "")],
+    );
+    add(
+        Lang::Swift,
+        &[(r"^\s*(?:@testable\s+)?import\s+([A-Za-z_]\w*)", "")],
+    );
+    add(
+        Lang::Dart,
+        &[(r#"^\s*(?:import|export|part)\s+['"]([^'"]+)['"]"#, "")],
+    );
+
+    out
+}
+
+/// Extract the first double-quoted path on a line (`"pkg/path"` → `pkg/path`).
+/// Used for Go import lines, where the path is always double-quoted.
+fn quoted_path(line: &str) -> Option<&str> {
+    let start = line.find('"')? + 1;
+    let end = start + line[start..].find('"')?;
+    let s = &line[start..end];
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Extract raw import specs (with per-form markers) from one file's text.
+/// Line-oriented and bounded like [`extract_symbols`]; block comments and
+/// Python docstrings are skipped so commented-out / documented imports don't
+/// produce phantom edges.
+fn extract_imports(text: &str, lang: Lang) -> Vec<String> {
+    let pats = import_patterns_for(lang);
+    let mut out: Vec<String> = Vec::new();
+    let mut in_block = false;
+    let mut doc_marker: Option<&'static str> = None;
+    let mut in_go_import = false;
+    for raw_line in text.lines() {
+        if out.len() >= import_limits::MAX_IMPORTS_PER_FILE {
+            break;
+        }
+        if raw_line.len() > limits::MAX_LINE_BYTES {
+            continue;
+        }
+        let trimmed = raw_line.trim();
+        if in_block {
+            if trimmed.contains("*/") {
+                in_block = false;
+            }
+            continue;
+        }
+        if let Some(marker) = doc_marker {
+            if trimmed.contains(marker) {
+                doc_marker = None;
+            }
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            if !trimmed.contains("*/") {
+                in_block = true;
+            }
+            continue;
+        }
+        if matches!(lang, Lang::Python)
+            && (trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''"))
+        {
+            let marker = if trimmed.starts_with("\"\"\"") {
+                "\"\"\""
+            } else {
+                "'''"
+            };
+            if !trimmed[marker.len()..].contains(marker) {
+                doc_marker = Some(marker);
+            }
+            continue;
+        }
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        // Go: `import "x"` plus the multi-line `import ( ... )` block.
+        if matches!(lang, Lang::Go) {
+            if in_go_import {
+                if trimmed.starts_with(')') {
+                    in_go_import = false;
+                } else if let Some(q) = quoted_path(trimmed) {
+                    if q.len() <= import_limits::MAX_SPEC_BYTES {
+                        out.push(q.to_string());
+                    }
+                }
+            } else if let Some(rest) = trimmed.strip_prefix("import") {
+                let rest = rest.trim_start();
+                if rest.starts_with('(') {
+                    in_go_import = true;
+                } else if let Some(q) = quoted_path(rest) {
+                    if q.len() <= import_limits::MAX_SPEC_BYTES {
+                        out.push(q.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        for pat in pats {
+            if let Some(caps) = pat.re.captures(trimmed) {
+                if let Some(m) = caps.get(1) {
+                    let spec = m.as_str().trim();
+                    if spec.is_empty() || spec.len() > import_limits::MAX_SPEC_BYTES {
+                        break;
+                    }
+                    // Python `import a, b, c` — split the comma list.
+                    if matches!(lang, Lang::Python) && spec.contains(',') {
+                        for part in spec.split(',') {
+                            let p = part.trim();
+                            if !p.is_empty() {
+                                out.push(p.to_string());
+                            }
+                        }
+                    } else {
+                        out.push(format!("{}{}", pat.marker, spec));
+                    }
+                    break; // one import per line — first matching pattern wins
+                }
+            }
+        }
+    }
+    out
+}
+
+// --- Resolution -------------------------------------------------------------
+
+/// Lookup tables over the scanned file set, built once per resolution pass.
+struct ResolveCtx<'a> {
+    files: &'a [FileSymbols],
+    langs: &'a [Lang],
+    /// Exact relative path → file index.
+    by_path: HashMap<&'a str, usize>,
+    /// File basename (`core.ts`) → file indices (candidate prefilter).
+    by_name: HashMap<&'a str, Vec<usize>>,
+    /// Last parent-dir segment (`tools`) → file indices (package-dir match).
+    by_dir_name: HashMap<&'a str, Vec<usize>>,
+}
+
+impl<'a> ResolveCtx<'a> {
+    fn new(files: &'a [FileSymbols], langs: &'a [Lang]) -> Self {
+        let mut by_path = HashMap::new();
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut by_dir_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, f) in files.iter().enumerate() {
+            let rel = f.rel_path.as_str();
+            by_path.insert(rel, i);
+            let base = rel.rsplit('/').next().unwrap_or(rel);
+            by_name.entry(base).or_default().push(i);
+            let dir = parent_dir(rel);
+            if !dir.is_empty() {
+                let dir_base = dir.rsplit('/').next().unwrap_or(dir);
+                by_dir_name.entry(dir_base).or_default().push(i);
+            }
+        }
+        ResolveCtx {
+            files,
+            langs,
+            by_path,
+            by_name,
+            by_dir_name,
+        }
+    }
+}
+
+/// The `/`-separated parent directory of a relative path (`""` at the root).
+fn parent_dir(rel: &str) -> &str {
+    rel.rsplit_once('/').map_or("", |(d, _)| d)
+}
+
+/// Join a base directory with a relative import spec, resolving `.` / `..`.
+/// `None` when the spec escapes the repo root (declined, not guessed).
+fn normalize_join(base_dir: &str, spec: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if base_dir.is_empty() {
+        Vec::new()
+    } else {
+        base_dir.split('/').collect()
+    };
+    for seg in spec.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            s => parts.push(s),
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+/// Whether a normalized path already carries a recognised code extension.
+fn has_code_ext(p: &str) -> bool {
+    p.rsplit('/')
+        .next()
+        .unwrap_or(p)
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| CODE_EXT.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// First candidate path that exists in the scanned set (extension-resolution
+/// order is a *preference*, not an ambiguity — the first hit wins).
+fn first_hit(cands: &[String], ctx: &ResolveCtx) -> Option<usize> {
+    cands
+        .iter()
+        .find_map(|c| ctx.by_path.get(c.as_str()).copied())
+}
+
+/// Outcome of a suffix match: exactly one file, ambiguous (declined), or none.
+enum ModRes {
+    Hit(usize),
+    Ambiguous,
+    Miss,
+}
+
+/// Match `(basename, path_suffix)` candidates against the scanned set.
+/// The basename bucket keeps this O(candidates), and the full suffix must
+/// align on a `/` boundary. More than one distinct file → [`ModRes::Ambiguous`]
+/// (the caller declines — a guessed edge poisons the ranking signal).
+fn suffix_match(cands: &[(String, String)], ctx: &ResolveCtx) -> ModRes {
+    let mut found: Option<usize> = None;
+    for (base, suffix) in cands {
+        if let Some(list) = ctx.by_name.get(base.as_str()) {
+            for &idx in list {
+                let rel = ctx.files[idx].rel_path.as_str();
+                if rel == suffix || rel.ends_with(&format!("/{suffix}")) {
+                    match found {
+                        None => found = Some(idx),
+                        Some(prev) if prev != idx => return ModRes::Ambiguous,
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    found.map_or(ModRes::Miss, ModRes::Hit)
+}
+
+/// Match a package-style import (Go / C# namespaces) against scanned files by
+/// their parent directory: drop leading segments until the remaining suffix
+/// names a directory holding exactly ONE scanned file of the right language;
+/// multiple dirs / multiple files → declined.
+fn dir_match(segs: &[&str], lang: Lang, ctx: &ResolveCtx) -> Option<usize> {
+    let last = *segs.last()?;
+    let bucket = ctx.by_dir_name.get(last)?;
+    for start in 0..segs.len() {
+        let suffix = segs[start..].join("/");
+        let mut found: Option<usize> = None;
+        for &idx in bucket {
+            if ctx.langs[idx] != lang {
+                continue;
+            }
+            let dir = parent_dir(&ctx.files[idx].rel_path);
+            if dir == suffix || dir.ends_with(&format!("/{suffix}")) {
+                match found {
+                    None => found = Some(idx),
+                    Some(prev) if prev != idx => return None, // >1 file → decline
+                    Some(_) => {}
+                }
+            }
+        }
+        if let Some(idx) = found {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Resolve one captured import spec to a scanned file index, or `None`
+/// (external / unresolvable / ambiguous — all declined the same way).
+#[allow(clippy::too_many_lines)]
+fn resolve_import(raw: &str, lang: Lang, importer_rel: &str, ctx: &ResolveCtx) -> Option<usize> {
+    let dir = parent_dir(importer_rel);
+    match lang {
+        Lang::JsTs => {
+            if raw.starts_with('.') {
+                let p = normalize_join(dir, raw)?;
+                let mut cands: Vec<String> = Vec::new();
+                if has_code_ext(&p) {
+                    cands.push(p.clone());
+                    // TS source written with NodeNext `.js` specifiers.
+                    if let Some(s) = p.strip_suffix(".js") {
+                        cands.push(format!("{s}.ts"));
+                        cands.push(format!("{s}.tsx"));
+                    } else if let Some(s) = p.strip_suffix(".jsx") {
+                        cands.push(format!("{s}.tsx"));
+                    }
+                } else {
+                    for ext in ["ts", "tsx", "js", "jsx", "mjs", "cjs"] {
+                        cands.push(format!("{p}.{ext}"));
+                    }
+                    for ix in ["index.ts", "index.tsx", "index.js", "index.jsx"] {
+                        cands.push(format!("{p}/{ix}"));
+                    }
+                }
+                first_hit(&cands, ctx)
+            } else {
+                // Aliased / baseUrl-style path. A bare one-segment specifier
+                // (`react`) is an external package → declined.
+                let stripped = raw.strip_prefix("~/").unwrap_or(raw);
+                let stripped = if stripped.starts_with('@') {
+                    stripped.split_once('/').map_or("", |(_, r)| r)
+                } else {
+                    stripped
+                };
+                if stripped.is_empty() || !stripped.contains('/') {
+                    return None;
+                }
+                let segs: Vec<&str> = stripped.split('/').filter(|s| !s.is_empty()).collect();
+                if segs.is_empty() || segs.len() > import_limits::MAX_SEGS {
+                    return None;
+                }
+                let joined = segs.join("/");
+                let last = segs[segs.len() - 1];
+                let mut cands: Vec<(String, String)> = Vec::new();
+                if has_code_ext(last) {
+                    cands.push((last.to_string(), joined.clone()));
+                } else {
+                    for ext in ["ts", "tsx", "js", "jsx", "mjs", "cjs"] {
+                        cands.push((format!("{last}.{ext}"), format!("{joined}.{ext}")));
+                    }
+                    for ix in ["index.ts", "index.tsx", "index.js", "index.jsx"] {
+                        cands.push((ix.to_string(), format!("{joined}/{ix}")));
+                    }
+                }
+                match suffix_match(&cands, ctx) {
+                    ModRes::Hit(i) => Some(i),
+                    ModRes::Ambiguous | ModRes::Miss => None,
+                }
+            }
+        }
+        Lang::Python => {
+            if let Some(rest) = raw.strip_prefix('.') {
+                // Relative: `.` = importer's package, each extra `.` pops one.
+                let extra_dots = rest.chars().take_while(|&c| c == '.').count();
+                let rest = &rest[extra_dots..];
+                let mut base: Vec<&str> = if dir.is_empty() {
+                    Vec::new()
+                } else {
+                    dir.split('/').collect()
+                };
+                for _ in 0..extra_dots {
+                    base.pop()?;
+                }
+                let base = base.join("/");
+                let p = if rest.is_empty() {
+                    if base.is_empty() {
+                        return None;
+                    }
+                    base
+                } else {
+                    let rel = rest.replace('.', "/");
+                    if base.is_empty() {
+                        rel
+                    } else {
+                        format!("{base}/{rel}")
+                    }
+                };
+                first_hit(&[format!("{p}.py"), format!("{p}/__init__.py")], ctx)
+            } else {
+                let segs: Vec<&str> = raw.split('.').filter(|s| !s.is_empty()).collect();
+                if segs.is_empty() || segs.len() > import_limits::MAX_SEGS {
+                    return None;
+                }
+                let joined = segs.join("/");
+                let last = segs[segs.len() - 1];
+                let cands = [
+                    (format!("{last}.py"), format!("{joined}.py")),
+                    ("__init__.py".to_string(), format!("{joined}/__init__.py")),
+                ];
+                match suffix_match(&cands, ctx) {
+                    ModRes::Hit(i) => Some(i),
+                    ModRes::Ambiguous | ModRes::Miss => None,
+                }
+            }
+        }
+        Lang::Rust => {
+            if let Some(name) = raw.strip_prefix("mod:") {
+                // `mod x;` — a precise sibling/child module declaration.
+                let stem = file_stem_lc(importer_rel);
+                let mut cands: Vec<String> = Vec::new();
+                let child = |rest: &str| -> String {
+                    if dir.is_empty() {
+                        rest.to_string()
+                    } else {
+                        format!("{dir}/{rest}")
+                    }
+                };
+                if matches!(stem.as_str(), "mod" | "lib" | "main") {
+                    cands.push(child(&format!("{name}.rs")));
+                    cands.push(child(&format!("{name}/mod.rs")));
+                } else {
+                    cands.push(child(&format!("{stem}/{name}.rs")));
+                    cands.push(child(&format!("{stem}/{name}/mod.rs")));
+                    cands.push(child(&format!("{name}.rs")));
+                }
+                first_hit(&cands, ctx)
+            } else {
+                // `use a::b::C` — the tail may be an item, so try the full
+                // module path first and shorten from the right; the first
+                // AMBIGUOUS level declines the whole spec.
+                let path = raw.trim_end_matches(':');
+                let segs: Vec<&str> = path
+                    .split("::")
+                    .filter(|s| !s.is_empty() && !matches!(*s, "crate" | "self" | "super"))
+                    .collect();
+                if segs.is_empty() || segs.len() > import_limits::MAX_SEGS {
+                    return None;
+                }
+                for k in (1..=segs.len()).rev() {
+                    let joined = segs[..k].join("/");
+                    let last = segs[k - 1];
+                    let cands = [
+                        (format!("{last}.rs"), format!("{joined}.rs")),
+                        ("mod.rs".to_string(), format!("{joined}/mod.rs")),
+                    ];
+                    match suffix_match(&cands, ctx) {
+                        ModRes::Hit(i) => return Some(i),
+                        ModRes::Ambiguous => return None,
+                        ModRes::Miss => {}
+                    }
+                }
+                None
+            }
+        }
+        Lang::Go | Lang::CSharp => {
+            // Package/namespace path → the directory holding it.
+            let sep = if matches!(lang, Lang::Go) { '/' } else { '.' };
+            let segs: Vec<&str> = raw.split(sep).filter(|s| !s.is_empty()).collect();
+            if segs.is_empty() || segs.len() > import_limits::MAX_SEGS {
+                return None;
+            }
+            dir_match(&segs, lang, ctx)
+        }
+        Lang::Java => {
+            // `com.example.Foo` — the tail is the type; source roots sit above
+            // the package dirs, so a full-FQN suffix match lands exactly. One
+            // right-shortening step covers `import static com.x.Foo.bar`.
+            let segs: Vec<&str> = raw.split('.').filter(|s| !s.is_empty()).collect();
+            if segs.is_empty() || segs.len() > import_limits::MAX_SEGS {
+                return None;
+            }
+            let min_k = segs.len().saturating_sub(1).max(1);
+            for k in (min_k..=segs.len()).rev() {
+                let joined = segs[..k].join("/");
+                let last = segs[k - 1];
+                let cands = [
+                    (format!("{last}.java"), format!("{joined}.java")),
+                    (format!("{last}.kt"), format!("{joined}.kt")),
+                ];
+                match suffix_match(&cands, ctx) {
+                    ModRes::Hit(i) => return Some(i),
+                    ModRes::Ambiguous => return None,
+                    ModRes::Miss => {}
+                }
+            }
+            None
+        }
+        Lang::Ruby => {
+            if let Some(rel) = raw.strip_prefix("rel:") {
+                let p = normalize_join(dir, rel)?;
+                let cands = if p.ends_with(".rb") {
+                    vec![p]
+                } else {
+                    vec![format!("{p}.rb")]
+                };
+                first_hit(&cands, ctx)
+            } else {
+                let segs: Vec<&str> = raw.split('/').filter(|s| !s.is_empty()).collect();
+                if segs.is_empty() || segs.len() > import_limits::MAX_SEGS {
+                    return None;
+                }
+                let joined = segs.join("/");
+                let last = segs[segs.len() - 1];
+                let base = if last.ends_with(".rb") {
+                    (last.to_string(), joined)
+                } else {
+                    (format!("{last}.rb"), format!("{joined}.rb"))
+                };
+                match suffix_match(&[base], ctx) {
+                    ModRes::Hit(i) => Some(i),
+                    ModRes::Ambiguous | ModRes::Miss => None,
+                }
+            }
+        }
+        Lang::Php => {
+            if raw.starts_with('.') {
+                let p = normalize_join(dir, raw)?;
+                let cands = if p.ends_with(".php") {
+                    vec![p]
+                } else {
+                    vec![format!("{p}.php")]
+                };
+                return first_hit(&cands, ctx);
+            }
+            // Namespace path; a PSR-4 prefix may not exist on disk, so drop
+            // leading segments until the suffix matches exactly one file.
+            let segs: Vec<&str> = raw.split(['\\', '/']).filter(|s| !s.is_empty()).collect();
+            if segs.is_empty() || segs.len() > import_limits::MAX_SEGS {
+                return None;
+            }
+            let last = segs[segs.len() - 1];
+            let base = if last.ends_with(".php") {
+                last.to_string()
+            } else {
+                format!("{last}.php")
+            };
+            for start in 0..segs.len() {
+                let joined = segs[start..].join("/");
+                let suffix = if last.ends_with(".php") {
+                    joined
+                } else {
+                    format!("{joined}.php")
+                };
+                match suffix_match(&[(base.clone(), suffix)], ctx) {
+                    ModRes::Hit(i) => return Some(i),
+                    ModRes::Ambiguous => return None,
+                    ModRes::Miss => {}
+                }
+            }
+            None
+        }
+        Lang::Swift => {
+            // Module import — usually external; only a unique same-named file
+            // in the repo resolves.
+            let cands = [(format!("{raw}.swift"), format!("{raw}.swift"))];
+            match suffix_match(&cands, ctx) {
+                ModRes::Hit(i) => Some(i),
+                ModRes::Ambiguous | ModRes::Miss => None,
+            }
+        }
+        Lang::Dart => {
+            if let Some(rest) = raw.strip_prefix("package:") {
+                // `package:pkg/path.dart` — drop the package name, match the
+                // remaining path (conventionally under `lib/`).
+                let rest = rest.split_once('/').map_or("", |(_, r)| r);
+                if rest.is_empty() {
+                    return None;
+                }
+                let base = rest.rsplit('/').next().unwrap_or(rest).to_string();
+                let cands = [
+                    (base.clone(), rest.to_string()),
+                    (base, format!("lib/{rest}")),
+                ];
+                match suffix_match(&cands, ctx) {
+                    ModRes::Hit(i) => Some(i),
+                    ModRes::Ambiguous | ModRes::Miss => None,
+                }
+            } else if raw.contains(':') {
+                None // `dart:core` and friends — external
+            } else {
+                let p = normalize_join(dir, raw)?;
+                let cands = if p.ends_with(".dart") {
+                    vec![p]
+                } else {
+                    vec![format!("{p}.dart")]
+                };
+                first_hit(&cands, ctx)
+            }
+        }
+    }
+}
+
+/// Resolve every file's captured imports into deduped `(importer, imported)`
+/// edges. Self-edges are dropped; the total is bounded by
+/// [`import_limits::MAX_EDGES`]. Fail-open: anything unresolvable simply
+/// yields no edge.
+fn resolve_edges(
+    files: &[FileSymbols],
+    langs: &[Lang],
+    imports: &[Vec<String>],
+) -> Vec<(usize, usize)> {
+    if files.is_empty() || files.len() != langs.len() || files.len() != imports.len() {
+        return Vec::new();
+    }
+    let ctx = ResolveCtx::new(files, langs);
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    'outer: for (i, specs) in imports.iter().enumerate() {
+        for spec in specs {
+            if edges.len() >= import_limits::MAX_EDGES {
+                break 'outer;
+            }
+            if let Some(j) = resolve_import(spec, langs[i], &files[i].rel_path, &ctx) {
+                if j != i {
+                    edges.push((i, j));
+                }
+            }
+        }
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    edges
+}
+
+// ---------------------------------------------------------------------------
 // Building the index (with mtime cache).
 // ---------------------------------------------------------------------------
 
@@ -670,6 +1396,8 @@ pub fn symbol_index(root: &Path) -> SymbolIndex {
 fn scan(root: &Path) -> SymbolIndex {
     let files = code_files(root);
     let mut file_syms: Vec<FileSymbols> = Vec::new();
+    let mut file_langs: Vec<Lang> = Vec::new();
+    let mut file_imports: Vec<Vec<String>> = Vec::new();
     let mut total = 0usize;
     for path in &files {
         if total >= limits::MAX_TOTAL_SYMBOLS {
@@ -691,13 +1419,19 @@ fn scan(root: &Path) -> SymbolIndex {
             continue;
         }
         total += symbols.len();
+        file_imports.push(extract_imports(&text, lang));
+        file_langs.push(lang);
         file_syms.push(FileSymbols {
             rel_path: rel_display(path, root),
             symbols,
             score: 0.0,
         });
     }
-    let mut index = SymbolIndex { files: file_syms };
+    let edges = resolve_edges(&file_syms, &file_langs, &file_imports);
+    let mut index = SymbolIndex {
+        files: file_syms,
+        edges,
+    };
     rank(&mut index);
     index
 }
@@ -719,14 +1453,17 @@ fn read_bounded(path: &Path, max: usize) -> Option<String> {
 /// - **entry-point bonus** — files named `main`/`index`/`lib`/… are the repo's
 ///   public face;
 /// - **export ratio** — a file exporting many symbols is a module others use;
-/// - **inbound references** — how many *other* files mention this file's symbol
-///   names (a cheap degree-centrality proxy for PageRank: widely-referenced
-///   symbols rank higher);
+/// - **inbound imports (fan-in)** — how many other files actually import this
+///   file (resolved [`SymbolIndex::edges`]); a file that participates in no
+///   edge falls back to the historical same-name proxy (how many *other*
+///   files declare a symbol of the same name), so an edge-less repo ranks
+///   EXACTLY as before (fail-open);
 /// - a mild **shallowness** bonus (top-level files tend to be more central).
 ///
 /// This is deliberately O(files × symbols) with a single reference pass — no
 /// iterative eigenvector solve. It's a *heuristic* to order an outline, not a
-/// precise call graph.
+/// precise call graph. The sort reorders `files`, so `edges` indices are
+/// remapped through the same permutation to stay consistent.
 fn rank(index: &mut SymbolIndex) {
     if index.files.is_empty() {
         return;
@@ -757,8 +1494,22 @@ fn rank(index: &mut SymbolIndex) {
         .map(|(name, n)| (name, n.saturating_sub(1)))
         .collect();
 
+    // 2b) Real fan-in from resolved import edges: inbound import count per
+    //     file. A file that touches no edge keeps the same-name proxy below,
+    //     so an edge-less scan scores identically to the pre-edge behaviour.
+    let n = index.files.len();
+    let mut fan_in = vec![0usize; n];
+    let mut has_edge = vec![false; n];
+    for &(from, to) in &index.edges {
+        if from < n && to < n {
+            fan_in[to] += 1;
+            has_edge[from] = true;
+            has_edge[to] = true;
+        }
+    }
+
     // 3) Score each file.
-    for f in &mut index.files {
+    for (i, f) in index.files.iter_mut().enumerate() {
         let stem = file_stem_lc(&f.rel_path);
         let entry_bonus = if ENTRY_STEMS.contains(&stem.as_str()) {
             6.0
@@ -771,12 +1522,18 @@ fn rank(index: &mut SymbolIndex) {
         let exported = f.symbols.iter().filter(|s| s.exported).count() as f64;
         let export_score = exported.min(20.0) * 0.5;
 
-        let inbound: usize = f
-            .symbols
-            .iter()
-            .filter_map(|s| ref_count.get(s.name.as_str()))
-            .sum();
-        let inbound_score = (inbound as f64).min(20.0) * 1.5;
+        let inbound_score = if has_edge[i] {
+            // Real fan-in: files other files actually import rank higher.
+            (fan_in[i] as f64).min(20.0) * 1.5
+        } else {
+            // No resolved edges for this file → same-name proxy (fail-open).
+            let inbound: usize = f
+                .symbols
+                .iter()
+                .filter_map(|s| ref_count.get(s.name.as_str()))
+                .sum();
+            (inbound as f64).min(20.0) * 1.5
+        };
 
         // A file with very many symbols gets a small bonus (it's a hub) but
         // capped so a generated file doesn't dominate.
@@ -789,13 +1546,31 @@ fn rank(index: &mut SymbolIndex) {
             .sort_by(|a, b| b.exported.cmp(&a.exported).then(a.line.cmp(&b.line)));
     }
 
-    // 4) Order files by descending score, then by path for stability.
-    index.files.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
+    // 4) Order files by descending score, then by path for stability — and
+    //    remap the edge indices through the same permutation so they keep
+    //    pointing at the right files.
+    let mut tagged: Vec<(usize, FileSymbols)> = std::mem::take(&mut index.files)
+        .into_iter()
+        .enumerate()
+        .collect();
+    tagged.sort_by(|a, b| {
+        b.1.score
+            .partial_cmp(&a.1.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.rel_path.cmp(&b.rel_path))
+            .then_with(|| a.1.rel_path.cmp(&b.1.rel_path))
     });
+    let mut new_pos = vec![0usize; tagged.len()];
+    for (new_i, (old_i, _)) in tagged.iter().enumerate() {
+        new_pos[*old_i] = new_i;
+    }
+    index.files = tagged.into_iter().map(|(_, f)| f).collect();
+    for e in &mut index.edges {
+        if e.0 < new_pos.len() && e.1 < new_pos.len() {
+            *e = (new_pos[e.0], new_pos[e.1]);
+        }
+    }
+    index.edges.sort_unstable();
+    index.edges.dedup();
 }
 
 /// Lower-cased file stem (`src/Main.rs` → `main`) for the entry-point check.
@@ -840,8 +1615,8 @@ fn render_map(index: &SymbolIndex, scope: &[String], budget_chars: usize) -> Str
         return String::new();
     }
 
-    // Personalisation: stable-partition files so scope-matching ones come
-    // first, preserving the within-group importance order from `rank`.
+    // Personalisation: scope-matching files come first (and are never
+    // truncated away before unrelated files).
     let scope_lc: Vec<String> = scope
         .iter()
         .map(|s| s.to_lowercase())
@@ -855,10 +1630,50 @@ fn render_map(index: &SymbolIndex, scope: &[String], budget_chars: usize) -> Str
         scope_lc.iter().any(|hint| rel_lc.contains(hint.as_str()))
     };
 
-    let mut ordered: Vec<&FileSymbols> = index.files.iter().collect();
-    if !scope_lc.is_empty() {
-        ordered.sort_by_key(|f| u8::from(!matches_scope(&f.rel_path)));
-    }
+    let n = index.files.len();
+    let scope_hit: Vec<bool> = index
+        .files
+        .iter()
+        .map(|f| matches_scope(&f.rel_path))
+        .collect();
+
+    // Random-walk-with-restart over the import graph, seeded by the
+    // scope-matched files: structurally related files (imports of / importers
+    // of the seeds, transitively) order ahead of unrelated ones. With no
+    // seeds or no edges every score stays 0.0 and the stable sort below
+    // reduces EXACTLY to the historical partition order (fail-open).
+    let seeds: Vec<usize> = scope_hit
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &hit)| hit.then_some(i))
+        .collect();
+    let rwr = if seeds.is_empty() || index.edges.is_empty() {
+        vec![0.0; n]
+    } else {
+        rwr_scores(n, &index.edges, &seeds)
+    };
+
+    // Budget hygiene: tests / fixtures / i18n / generated files don't eat the
+    // firmware budget ahead of product code — unless the scope names them.
+    let low_value: Vec<bool> = index
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| !scope_hit[i] && is_low_value_path(&f.rel_path))
+        .collect();
+
+    let mut ordered: Vec<usize> = (0..n).collect();
+    ordered.sort_by(|&a, &b| {
+        scope_hit[b]
+            .cmp(&scope_hit[a]) // scope matches first
+            .then(low_value[a].cmp(&low_value[b])) // low-value files last
+            .then(
+                rwr[b]
+                    .partial_cmp(&rwr[a])
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            ) // structural relatedness
+            .then(a.cmp(&b)) // stable: rank order breaks ties
+    });
 
     let mut out = String::new();
     let header = "# Repo map (signature outline — path:line)\n";
@@ -866,29 +1681,167 @@ fn render_map(index: &SymbolIndex, scope: &[String], budget_chars: usize) -> Str
         out.push_str(header);
     }
 
-    'files: for f in ordered {
-        // Build this file's block; only commit it if at least the header fits.
-        let file_header = format!("\n{}\n", f.rel_path);
-        if out.len() + file_header.len() > budget_chars {
+    // Whole-file commit discipline: a file's block is either emitted complete
+    // or not at all — trimming to budget drops whole files from the tail
+    // instead of splitting a block mid-way.
+    let max_block = budget_chars.saturating_sub(header.len());
+    for &fi in &ordered {
+        let Some(block) = render_file_block(&index.files[fi], max_block) else {
+            break;
+        };
+        if out.len() + block.len() > budget_chars {
             break;
         }
-        out.push_str(&file_header);
-        for s in &f.symbols {
-            let line = format!(
-                "  {} {}  ·{}\n",
-                s.kind.label(),
-                truncate_sig(&s.signature, 160),
-                s.line
-            );
-            if out.len() + line.len() > budget_chars {
-                // Budget exhausted — stop cleanly mid-file.
-                break 'files;
-            }
-            out.push_str(&line);
-        }
+        out.push_str(&block);
     }
 
     out
+}
+
+/// Render one file's complete block (blank line + path + every symbol line),
+/// capped at `max_len`. The cap only bites when the file alone could never
+/// fit the whole budget: then trailing symbols are dropped at a whole-line
+/// boundary with a `… +N more` marker (the block is still committed
+/// atomically by the caller). `None` when not even the path line fits.
+fn render_file_block(f: &FileSymbols, max_len: usize) -> Option<String> {
+    /// Room reserved for the truncation marker line (`  … +N more\n` ≤ 32 B),
+    /// so appending the marker can never itself overflow `max_len`.
+    const MARKER_RESERVE: usize = 32;
+    let mut block = format!("\n{}\n", f.rel_path);
+    if block.len() > max_len {
+        return None;
+    }
+    let total = f.symbols.len();
+    for (k, s) in f.symbols.iter().enumerate() {
+        let line = format!(
+            "  {} {}  ·{}\n",
+            s.kind.label(),
+            truncate_sig(&s.signature, 160),
+            s.line
+        );
+        // A non-final line must leave room for the marker it would force.
+        let reserve = if k + 1 == total { 0 } else { MARKER_RESERVE };
+        if block.len() + line.len() + reserve > max_len {
+            if k == 0 {
+                return None; // not even one symbol fits — skip the file
+            }
+            let more = total - k;
+            let _ = std::fmt::Write::write_fmt(&mut block, format_args!("  … +{more} more\n"));
+            return Some(block);
+        }
+        block.push_str(&line);
+    }
+    Some(block)
+}
+
+/// Path heuristics for files that should not eat the token budget ahead of
+/// product code: tests, fixtures, i18n catalogs, generated output. They are
+/// *demoted*, never dropped — and a scope hint naming them overrides the
+/// demotion entirely (see [`render_map`]).
+fn is_low_value_path(rel: &str) -> bool {
+    let lc = rel.to_ascii_lowercase();
+    let dir_seg = |seg: &str| -> bool {
+        lc.starts_with(&format!("{seg}/")) || lc.contains(&format!("/{seg}/"))
+    };
+    dir_seg("tests")
+        || dir_seg("test")
+        || dir_seg("__tests__")
+        || dir_seg("testdata")
+        || dir_seg("spec")
+        || dir_seg("fixtures")
+        || dir_seg("fixture")
+        || dir_seg("__fixtures__")
+        || dir_seg("__mocks__")
+        || dir_seg("__snapshots__")
+        || dir_seg("i18n")
+        || dir_seg("locales")
+        || dir_seg("locale")
+        || dir_seg("generated")
+        || dir_seg("__generated__")
+        || lc.contains("_test.")
+        || lc.contains(".test.")
+        || lc.contains(".spec.")
+        || lc.contains("_spec.")
+        || lc.contains(".generated.")
+        || lc.contains(".g.dart")
+        || lc.contains("_pb2.py")
+        || lc.contains(".pb.go")
+        || lc.contains(".min.js")
+        || lc.ends_with(".lock")
+        || lc.ends_with("conftest.py")
+}
+
+/// Personalised random walk with restart over the UNDIRECTED import graph:
+/// `p ← (1-α)·W·p + α·r`, where `r` is uniform over the seed files and `W`
+/// spreads each node's mass equally over its neighbours. Restart α = 0.25,
+/// 25 iterations, computed only on the subgraph reachable from the seeds —
+/// every unreachable file scores exactly `0.0` (so ties fall back to the
+/// caller's rank order). Fail-open: no seeds / no edges → all zeros.
+fn rwr_scores(n: usize, edges: &[(usize, usize)], seeds: &[usize]) -> Vec<f64> {
+    const ALPHA: f64 = 0.25;
+    const ITERS: usize = 25;
+    let mut scores = vec![0.0f64; n];
+    if n == 0 || edges.is_empty() {
+        return scores;
+    }
+    let seeds: Vec<usize> = seeds.iter().copied().filter(|&s| s < n).collect();
+    if seeds.is_empty() {
+        return scores;
+    }
+
+    // Undirected adjacency (imports relate both ways for "what's relevant").
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(a, b) in edges {
+        if a < n && b < n && a != b {
+            adj[a].push(b);
+            adj[b].push(a);
+        }
+    }
+
+    // Bound the walk to the component(s) reachable from the seeds.
+    let mut in_sub = vec![false; n];
+    let mut queue: std::collections::VecDeque<usize> = seeds.iter().copied().collect();
+    for &s in &seeds {
+        in_sub[s] = true;
+    }
+    while let Some(u) = queue.pop_front() {
+        for &v in &adj[u] {
+            if !in_sub[v] {
+                in_sub[v] = true;
+                queue.push_back(v);
+            }
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let restart = 1.0 / seeds.len() as f64;
+    let mut p = vec![0.0f64; n];
+    for &s in &seeds {
+        p[s] += restart;
+    }
+    for _ in 0..ITERS {
+        let mut next = vec![0.0f64; n];
+        for u in 0..n {
+            if !in_sub[u] || p[u] <= 0.0 || adj[u].is_empty() {
+                continue;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let share = p[u] * (1.0 - ALPHA) / adj[u].len() as f64;
+            for &v in &adj[u] {
+                next[v] += share;
+            }
+        }
+        for &s in &seeds {
+            next[s] += ALPHA * restart;
+        }
+        p = next;
+    }
+    for (i, v) in p.into_iter().enumerate() {
+        if in_sub[i] {
+            scores[i] = v;
+        }
+    }
+    scores
 }
 
 /// Truncate a signature line to `max` chars (char-boundary safe), adding an
@@ -915,7 +1868,10 @@ pub const REPOMAP_CACHE_DIR: &str = ".umadev/repomap-cache";
 /// `symbols.json` is silently stale until a file happens to change. Bumping this
 /// (folded into [`mtime_signature`]) invalidates every older-schema cache. Bump
 /// it whenever the language patterns, ranking, or cache wire form change.
-const REPOMAP_SCHEMA_VERSION: u32 = 1;
+///
+/// v2: import edges ([`SymbolIndex::edges`], `E`-lines in the wire form) +
+/// fan-in ranking — v1 caches carry no edges and must rebuild.
+const REPOMAP_SCHEMA_VERSION: u32 = 2;
 
 /// One in-process memo entry: the resolved index plus the cheap freshness keys.
 struct MemoEntry {
@@ -1111,6 +2067,10 @@ fn encode_index(index: &SymbolIndex) -> Option<Vec<u8>> {
             .ok()?;
         }
     }
+    for &(from, to) in &index.edges {
+        // E-line: import edge (importer file index, imported file index).
+        writeln!(s, "E\t{from}\t{to}").ok()?;
+    }
     Some(s.into_bytes())
 }
 
@@ -1118,6 +2078,7 @@ fn encode_index(index: &SymbolIndex) -> Option<Vec<u8>> {
 fn decode_index(bytes: &[u8]) -> Option<SymbolIndex> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut files: Vec<FileSymbols> = Vec::new();
+    let mut edges: Vec<(usize, usize)> = Vec::new();
     for line in text.lines() {
         let mut parts = line.split('\t');
         match parts.next()? {
@@ -1145,10 +2106,22 @@ fn decode_index(bytes: &[u8]) -> Option<SymbolIndex> {
                     exported,
                 });
             }
+            "E" => {
+                let from = parts.next()?.parse::<usize>().ok()?;
+                let to = parts.next()?.parse::<usize>().ok()?;
+                edges.push((from, to));
+            }
             _ => return None,
         }
     }
-    Some(SymbolIndex { files })
+    // An edge pointing outside the file set is corrupt → cache miss.
+    if edges
+        .iter()
+        .any(|&(from, to)| from >= files.len() || to >= files.len())
+    {
+        return None;
+    }
+    Some(SymbolIndex { files, edges })
 }
 
 /// Escape tab / newline / backslash so a field round-trips through the
@@ -1436,6 +2409,7 @@ mod tests {
                 symbols: syms,
                 score: 0.0,
             }],
+            edges: Vec::new(),
         });
         assert!(!n.iter().any(|s| s == "notReal"));
         assert!(!n.iter().any(|s| s == "AlsoNotReal"));
@@ -1552,6 +2526,7 @@ mod tests {
                 ],
                 score: 0.0,
             }],
+            edges: Vec::new(),
         };
         rank(&mut index);
         assert_eq!(index.files[0].symbols[0].name, "pub_b");
@@ -1766,6 +2741,7 @@ mod tests {
                 }],
                 score: 3.5,
             }],
+            edges: Vec::new(),
         };
         let bytes = encode_index(&index).unwrap();
         let back = decode_index(&bytes).unwrap();
@@ -1899,5 +2875,546 @@ mod tests {
         assert!(map.contains("fn pub fn alpha(x: u8) -> u8 { x }") || map.contains("alpha"));
         // line marker present.
         assert!(map.contains("·1"));
+    }
+
+    // --- (8) import extraction per language ----------------------------------
+
+    #[test]
+    fn extract_imports_js_ts_forms() {
+        let specs = extract_imports(
+            "import React from 'react';\n\
+             import { a, b } from './mod';\n\
+             import './side-effect';\n\
+             export { x } from '../lib/x';\n\
+             const y = require('./y');\n\
+             const z = await import('./z');\n\
+             } from './multiline';\n\
+             // import notme from './no'\n\
+             /* import alsonot from './no2' */\n",
+            Lang::JsTs,
+        );
+        for want in [
+            "react",
+            "./mod",
+            "./side-effect",
+            "../lib/x",
+            "./y",
+            "./z",
+            "./multiline",
+        ] {
+            assert!(specs.iter().any(|s| s == want), "missing {want}: {specs:?}");
+        }
+        assert!(
+            !specs.iter().any(|s| s.contains("./no")),
+            "comments skipped: {specs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_imports_python_forms() {
+        let specs = extract_imports(
+            "import os\n\
+             import a.b.c\n\
+             from x.y import z\n\
+             from . import sibling\n\
+             from ..pkg import thing\n\
+             import m1, m2\n\
+             \"\"\"\n\
+             import fake_in_docstring\n\
+             \"\"\"\n",
+            Lang::Python,
+        );
+        for want in ["os", "a.b.c", "x.y", ".", "..pkg", "m1", "m2"] {
+            assert!(specs.iter().any(|s| s == want), "missing {want}: {specs:?}");
+        }
+        assert!(
+            !specs.iter().any(|s| s.contains("fake_in_docstring")),
+            "docstring imports skipped: {specs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_imports_rust_forms() {
+        let specs = extract_imports(
+            "use std::collections::HashMap;\n\
+             pub use crate::foo::bar;\n\
+             use super::baz::{A, B};\n\
+             mod util;\n\
+             pub(crate) mod inner;\n\
+             // use commented::out;\n",
+            Lang::Rust,
+        );
+        assert!(
+            specs.iter().any(|s| s == "std::collections::HashMap"),
+            "{specs:?}"
+        );
+        assert!(specs.iter().any(|s| s == "crate::foo::bar"), "{specs:?}");
+        assert!(
+            specs.iter().any(|s| s.starts_with("super::baz")),
+            "{specs:?}"
+        );
+        assert!(specs.iter().any(|s| s == "mod:util"), "{specs:?}");
+        assert!(specs.iter().any(|s| s == "mod:inner"), "{specs:?}");
+        assert!(!specs.iter().any(|s| s.contains("commented")), "{specs:?}");
+    }
+
+    #[test]
+    fn extract_imports_go_forms() {
+        let specs = extract_imports(
+            "package main\n\
+             import \"single/pkg\"\n\
+             import (\n\
+             \t\"fmt\"\n\
+             \talias \"example.com/app/tools\"\n\
+             )\n\
+             func main() {}\n",
+            Lang::Go,
+        );
+        assert_eq!(
+            specs,
+            vec!["single/pkg", "fmt", "example.com/app/tools"],
+            "single + block imports captured in order"
+        );
+    }
+
+    #[test]
+    fn extract_imports_java_ruby_php_dart_swift_csharp() {
+        let j = extract_imports(
+            "import com.ex.Foo;\nimport static com.ex.Bar.baz;\n",
+            Lang::Java,
+        );
+        assert!(j.contains(&"com.ex.Foo".to_string()), "{j:?}");
+        assert!(j.contains(&"com.ex.Bar.baz".to_string()), "{j:?}");
+
+        let rb = extract_imports(
+            "require 'json'\nrequire_relative '../lib/util'\n",
+            Lang::Ruby,
+        );
+        assert!(rb.contains(&"json".to_string()), "{rb:?}");
+        assert!(rb.contains(&"rel:../lib/util".to_string()), "{rb:?}");
+
+        let php = extract_imports(
+            "use App\\Http\\Controller;\nrequire_once('lib/db.php');\n",
+            Lang::Php,
+        );
+        assert!(
+            php.contains(&"App\\Http\\Controller".to_string()),
+            "{php:?}"
+        );
+        assert!(php.contains(&"lib/db.php".to_string()), "{php:?}");
+
+        let dt = extract_imports(
+            "import 'package:app/src/widget.dart';\nimport 'util.dart';\npart 'gen.g.dart';\n",
+            Lang::Dart,
+        );
+        assert!(
+            dt.contains(&"package:app/src/widget.dart".to_string()),
+            "{dt:?}"
+        );
+        assert!(dt.contains(&"util.dart".to_string()), "{dt:?}");
+        assert!(dt.contains(&"gen.g.dart".to_string()), "{dt:?}");
+
+        let sw = extract_imports("import UIKit\n@testable import MyApp\n", Lang::Swift);
+        assert!(sw.contains(&"UIKit".to_string()), "{sw:?}");
+        assert!(sw.contains(&"MyApp".to_string()), "{sw:?}");
+
+        let cs = extract_imports("using System.Text;\nusing var f = Open(x);\n", Lang::CSharp);
+        assert!(cs.contains(&"System.Text".to_string()), "{cs:?}");
+        assert_eq!(cs.len(), 1, "`using var` is not an import: {cs:?}");
+    }
+
+    // --- (9) edge resolution --------------------------------------------------
+
+    /// Helper: index of a file in the rank-ordered index by its rel path.
+    fn idx_of(index: &SymbolIndex, rel: &str) -> usize {
+        index
+            .files
+            .iter()
+            .position(|f| f.rel_path == rel)
+            .unwrap_or_else(|| panic!("{rel} not in index"))
+    }
+
+    #[test]
+    fn relative_import_edges_resolved_js() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "src/app.ts",
+            "import { util } from './util';\nimport Helper from '../lib/helper';\nexport function app() {}\n",
+        );
+        write(root, "src/util.ts", "export function util() {}\n");
+        write(root, "lib/helper.ts", "export default class Helper {}\n");
+        let index = scan(root);
+        let app = idx_of(&index, "src/app.ts");
+        let util = idx_of(&index, "src/util.ts");
+        let helper = idx_of(&index, "lib/helper.ts");
+        assert_eq!(
+            index.edges.len(),
+            2,
+            "two relative imports resolve: {:?}",
+            index.edges
+        );
+        assert!(index.edges.contains(&(app, util)));
+        assert!(index.edges.contains(&(app, helper)));
+    }
+
+    #[test]
+    fn rust_mod_and_use_edges_resolved_and_deduped() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "src/main.rs",
+            "mod util;\nuse crate::util::helper;\nfn main() {}\n",
+        );
+        write(root, "src/util.rs", "pub fn helper() {}\n");
+        let index = scan(root);
+        let main = idx_of(&index, "src/main.rs");
+        let util = idx_of(&index, "src/util.rs");
+        // `mod util;` and `use crate::util::helper` hit the same file → deduped.
+        assert_eq!(index.edges, vec![(main, util)]);
+    }
+
+    #[test]
+    fn go_import_block_edge_resolved_via_package_dir() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "main.go",
+            "package main\nimport (\n\t\"fmt\"\n\t\"example.com/app/tools\"\n)\nfunc main() {}\n",
+        );
+        write(root, "tools/tool.go", "package tools\nfunc Tool() {}\n");
+        let index = scan(root);
+        let main = idx_of(&index, "main.go");
+        let tool = idx_of(&index, "tools/tool.go");
+        assert_eq!(
+            index.edges,
+            vec![(main, tool)],
+            "module-path suffix resolves the package dir"
+        );
+    }
+
+    #[test]
+    fn java_fqn_import_edge_resolved() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "src/main/java/com/ex/App.java",
+            "import com.ex.svc.Service;\npublic class App {}\n",
+        );
+        write(
+            root,
+            "src/main/java/com/ex/svc/Service.java",
+            "public class Service {}\n",
+        );
+        let index = scan(root);
+        let app = idx_of(&index, "src/main/java/com/ex/App.java");
+        let svc = idx_of(&index, "src/main/java/com/ex/svc/Service.java");
+        assert_eq!(index.edges, vec![(app, svc)]);
+    }
+
+    #[test]
+    fn ambiguous_module_import_declined() {
+        // Two files answer `import util` → the resolution is DECLINED, not
+        // guessed (a wrong edge is worse than a missing one).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "main.py", "import util\ndef run():\n    pass\n");
+        write(root, "a/util.py", "def a_fn():\n    pass\n");
+        write(root, "b/util.py", "def b_fn():\n    pass\n");
+        let index = scan(root);
+        assert!(
+            index.edges.is_empty(),
+            "ambiguous import must resolve to no edge: {:?}",
+            index.edges
+        );
+
+        // Control: with exactly one candidate the same import resolves.
+        let dir2 = tempdir().unwrap();
+        let root2 = dir2.path();
+        write(root2, "main.py", "import util\ndef run():\n    pass\n");
+        write(root2, "a/util.py", "def a_fn():\n    pass\n");
+        let index2 = scan(root2);
+        let main = idx_of(&index2, "main.py");
+        let util = idx_of(&index2, "a/util.py");
+        assert_eq!(index2.edges, vec![(main, util)]);
+    }
+
+    #[test]
+    fn import_escaping_repo_root_is_declined() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "app.ts",
+            "import { x } from '../../outside';\nexport function app() {}\n",
+        );
+        write(root, "outside.ts", "export function x() {}\n");
+        let index = scan(root);
+        assert!(
+            index.edges.is_empty(),
+            "an import escaping the root never resolves: {:?}",
+            index.edges
+        );
+    }
+
+    // --- (10) fan-in ranking ---------------------------------------------------
+
+    #[test]
+    fn fan_in_ranking_beats_same_name_proxy() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // core.ts is imported by three files but shares no symbol name — the
+        // old same-name proxy would give it ZERO inbound signal.
+        write(root, "pkg/core.ts", "export function coreThing() {}\n");
+        for i in 1..=3 {
+            write(
+                root,
+                &format!("consumer{i}.ts"),
+                &format!(
+                    "import {{ coreThing }} from './pkg/core';\nexport function c{i}() {{}}\n"
+                ),
+            );
+        }
+        // Two files share a symbol name (the proxy's favourite) but nothing
+        // imports them.
+        write(root, "pkg/dup_a.ts", "export class SharedThing {}\n");
+        write(root, "pkg/dup_b.ts", "export class SharedThing {}\n");
+        let index = scan(root);
+        assert_eq!(
+            index.edges.len(),
+            3,
+            "three inbound imports: {:?}",
+            index.edges
+        );
+        let core = idx_of(&index, "pkg/core.ts");
+        let dup = idx_of(&index, "pkg/dup_a.ts");
+        assert!(
+            core < dup,
+            "real fan-in must outrank the same-name proxy (core at {core}, dup at {dup}): {:?}",
+            index
+                .files
+                .iter()
+                .map(|f| f.rel_path.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // --- (11) RWR scope personalisation ----------------------------------------
+
+    /// One-symbol file for hand-built render_map indexes.
+    fn one_sym_file(rel: &str) -> FileSymbols {
+        FileSymbols {
+            rel_path: rel.into(),
+            symbols: vec![Symbol {
+                name: "sym".into(),
+                kind: SymbolKind::Function,
+                signature: "fn sym()".into(),
+                line: 1,
+                exported: true,
+            }],
+            score: 0.0,
+        }
+    }
+
+    /// Extract the emitted file order from a rendered map.
+    fn rendered_order(map: &str) -> Vec<String> {
+        map.lines()
+            .filter(|l| !l.is_empty() && !l.starts_with(' ') && !l.starts_with('#'))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn rwr_zero_edges_falls_back_to_exact_partition_order() {
+        // With NO edges, scope ordering must be EXACTLY the historical stable
+        // partition: scope matches first, everything else in rank order.
+        let index = SymbolIndex {
+            files: vec![
+                one_sym_file("src/other.ts"),
+                one_sym_file("src/seed/entry.ts"),
+                one_sym_file("src/linked.ts"),
+            ],
+            edges: Vec::new(),
+        };
+        let map = render_map(&index, &["seed".to_string()], 4000);
+        assert_eq!(
+            rendered_order(&map),
+            vec!["src/seed/entry.ts", "src/other.ts", "src/linked.ts"],
+            "zero edges → exactly the stable-partition order"
+        );
+    }
+
+    #[test]
+    fn rwr_orders_import_neighbours_before_unrelated() {
+        // linked.ts imports the scoped seed → the walk pulls it ahead of the
+        // (rank-higher) unrelated file.
+        let index = SymbolIndex {
+            files: vec![
+                one_sym_file("src/other.ts"),
+                one_sym_file("src/seed/entry.ts"),
+                one_sym_file("src/linked.ts"),
+            ],
+            edges: vec![(2, 1)],
+        };
+        let map = render_map(&index, &["seed".to_string()], 4000);
+        assert_eq!(
+            rendered_order(&map),
+            vec!["src/seed/entry.ts", "src/linked.ts", "src/other.ts"],
+            "structurally related files order ahead of unrelated ones"
+        );
+    }
+
+    #[test]
+    fn rwr_scores_decay_with_distance_and_unreachable_zero() {
+        // 0-1-2 chain seeded at 0; 3 is disconnected. (No seed-vs-neighbour
+        // claim: on a path the degree-2 neighbour legitimately accumulates
+        // comparable mass — what matters for ordering is distance decay and
+        // that unreachable files stay at exactly zero.)
+        let edges = vec![(0, 1), (1, 2)];
+        let scores = rwr_scores(4, &edges, &[0]);
+        assert!(scores[0] > scores[2], "seed outranks the two-hop node");
+        assert!(scores[1] > scores[2], "one hop outranks two hops");
+        assert!(scores[2] > 0.0, "reachable node gets mass");
+        assert!(
+            (scores[3] - 0.0).abs() < f64::EPSILON,
+            "unreachable node scores exactly zero"
+        );
+    }
+
+    // --- (12) budget hygiene ----------------------------------------------------
+
+    #[test]
+    fn budget_never_splits_a_file_block() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..10 {
+            write(
+                root,
+                &format!("src/mod{i}.ts"),
+                "export function alpha() {}\nexport function beta() {}\nexport class Gamma {}\n",
+            );
+        }
+        let budget = 350;
+        let map = repo_map(root, &[], budget);
+        assert!(map.len() <= budget, "map fits budget");
+        let headers = map.lines().filter(|l| l.ends_with(".ts")).count();
+        assert!(headers >= 1, "at least one whole file fits: {map:?}");
+        assert!(headers < 10, "budget forces dropping tail files");
+        // Every emitted file block is COMPLETE: all three symbol lines present.
+        for marker in ["\u{b7}1", "\u{b7}2", "\u{b7}3"] {
+            assert_eq!(
+                map.matches(marker).count(),
+                headers,
+                "no block is split mid-way ({marker}): {map:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn low_value_files_deprioritized_unless_scope_names_them() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/core.ts", "export function coreMain() {}\n");
+        write(root, "src/core.test.ts", "export function coreTest() {}\n");
+        write(root, "tests/helper.ts", "export function helper() {}\n");
+
+        // No scope: product code before test/fixture files.
+        let map = repo_map(root, &[], 4000);
+        let core = map.find("src/core.ts\n").expect("core present");
+        let test = map
+            .find("src/core.test.ts")
+            .expect("test present (demoted, not dropped)");
+        let tests_dir = map.find("tests/helper.ts").expect("tests dir present");
+        assert!(core < test, "product code before .test. file: {map}");
+        assert!(core < tests_dir, "product code before tests/ dir: {map}");
+
+        // Scope naming the test file overrides the demotion.
+        let scoped = repo_map(root, &["core.test".to_string()], 4000);
+        let test_pos = scoped.find("src/core.test.ts").unwrap();
+        let core_pos = scoped.find("src/core.ts\n").unwrap();
+        assert!(
+            test_pos < core_pos,
+            "scope-named test file comes first: {scoped}"
+        );
+    }
+
+    #[test]
+    fn giant_first_file_truncates_at_symbol_boundary_with_marker() {
+        // A single file whose block alone exceeds the whole budget still
+        // renders whole symbol lines plus a `… +N more` marker — never a
+        // half-line.
+        let mut body = String::new();
+        for i in 0..50 {
+            body.push_str(&format!("export function verylongname{i}() {{}}\n"));
+        }
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/huge.ts", &body);
+        let budget = 400;
+        let map = repo_map(root, &[], budget);
+        assert!(map.len() <= budget);
+        assert!(
+            map.contains("src/huge.ts"),
+            "the file still appears: {map:?}"
+        );
+        assert!(map.contains("more\n"), "truncation marker present: {map:?}");
+        // Whole lines only: every symbol line ends with its `·N` marker.
+        for line in map
+            .lines()
+            .filter(|l| l.starts_with("  ") && !l.contains("more"))
+        {
+            assert!(
+                line.contains('\u{b7}'),
+                "no half-emitted symbol line: {line:?}"
+            );
+        }
+    }
+
+    // --- (13) cache with edges ---------------------------------------------------
+
+    #[test]
+    fn cache_roundtrip_preserves_edges() {
+        let index = SymbolIndex {
+            files: vec![one_sym_file("a.ts"), one_sym_file("b.ts")],
+            edges: vec![(0, 1)],
+        };
+        let bytes = encode_index(&index).unwrap();
+        let back = decode_index(&bytes).unwrap();
+        assert_eq!(index, back);
+    }
+
+    #[test]
+    fn decode_rejects_out_of_range_edge() {
+        let index = SymbolIndex {
+            files: vec![one_sym_file("a.ts")],
+            edges: Vec::new(),
+        };
+        let mut bytes = encode_index(&index).unwrap();
+        bytes.extend_from_slice(b"E\t0\t5\n");
+        assert!(
+            decode_index(&bytes).is_none(),
+            "edge past the file set is corrupt"
+        );
+    }
+
+    #[test]
+    fn edges_survive_disk_cache_reload() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "src/app.ts",
+            "import { util } from './util';\nexport function app() {}\n",
+        );
+        write(root, "src/util.ts", "export function util() {}\n");
+        // First call scans + writes the cache; second hits the on-disk cache.
+        let first = load_or_scan_full(root);
+        assert_eq!(first.edges.len(), 1);
+        let second = load_or_scan_full(root);
+        assert_eq!(first, second, "edges round-trip through the on-disk cache");
     }
 }
