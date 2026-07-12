@@ -1528,7 +1528,11 @@ async fn drive_plan_steps(
             StepStatus::Blocked
         };
         plan.mark(&step_id, status);
-        events.emit(EngineEvent::plan_step_status(step_id, step.title, status));
+        events.emit(EngineEvent::plan_step_status(
+            step_id,
+            step.title.clone(),
+            status,
+        ));
         persist_plan_ref(plan, options);
         // Advance the 9-phase workflow state to the furthest phase the plan's Done
         // steps now imply (monotonic — `persist_phase` clamps, never regresses). Only
@@ -1622,7 +1626,7 @@ async fn drive_plan_steps(
         // resumes via `drive_director_loop_resume` (Done steps never re-drive).
         // FAIL-OPEN: if the plan can't persist, do NOT pause — a pause that can't
         // re-load would lose the build on resume, so the run keeps driving instead.
-        if let Some(gate) = confirm_gate_after_step(step.seat, step_kind, status, plan, options) {
+        if let Some(gate) = confirm_gate_after_step(&step, status, plan, options) {
             if plan_state::save(plan, &options.project_root).is_ok() {
                 // Checkpoint the doc versions the user is confirming, so a resume
                 // re-opens doc steps ONLY if the user actually edits a doc while
@@ -1778,9 +1782,15 @@ async fn drive_plan_steps(
 ///   — auto runs end-to-end, exactly as today);
 /// - real work remains (≥1 `Pending`/`Active` step) — a pause with nothing left
 ///   would strand the run (a fully-terminal plan is not resumable).
+///
+/// The designer's **design-tokens deliverable step**
+/// ([`plan_state::is_design_tokens_step`]) is UIUX-seated but is CODE-PHASE PREP,
+/// not doc authoring: it is excluded from the docs family AND from the trigger, so
+/// (1) the docs gate fires as soon as the actual PM/architect/UIUX *docs* are Done
+/// (the tokens step runs after the gate resumes), and (2) the tokens step settling
+/// Done post-resume can never RE-fire `docs_confirm` (gate-opens-once).
 fn confirm_gate_after_step(
-    seat: crate::critics::Seat,
-    kind: plan_state::StepKind,
+    step: &plan_state::PlanStep,
     status: StepStatus,
     plan: &Plan,
     options: &RunOptions,
@@ -1788,7 +1798,7 @@ fn confirm_gate_after_step(
     use crate::critics::Seat;
     // Only a BUILD step that genuinely settled Done completes a gate's producing
     // work (a Blocked doc/frontend step is an honest gap — nothing to confirm).
-    if kind != plan_state::StepKind::Build || status != StepStatus::Done {
+    if step.kind != plan_state::StepKind::Build || status != StepStatus::Done {
         return None;
     }
     if options.mode.gates_auto_approve() || !crate::interaction::gates_hosted() {
@@ -1822,14 +1832,17 @@ fn confirm_gate_after_step(
             Seat::ProductManager | Seat::Architect | Seat::UiuxDesigner
         )
     };
-    if doc_seat(seat)
-        && family_done(&|s: &plan_state::PlanStep| {
-            s.kind == plan_state::StepKind::Build && doc_seat(s.seat)
-        })
-    {
+    // A DOC-family member is a doc-seat BUILD step that is NOT the design-tokens
+    // deliverable (code-phase prep, runs after the docs are confirmed).
+    let doc_member = |s: &plan_state::PlanStep| {
+        s.kind == plan_state::StepKind::Build
+            && doc_seat(s.seat)
+            && !plan_state::is_design_tokens_step(s)
+    };
+    if doc_member(step) && family_done(&doc_member) {
         return Some(crate::gates::Gate::DocsConfirm);
     }
-    if seat == Seat::FrontendEngineer
+    if step.seat == Seat::FrontendEngineer
         && family_done(&|s: &plan_state::PlanStep| {
             s.kind == plan_state::StepKind::Build && s.seat == Seat::FrontendEngineer
         })
@@ -2207,6 +2220,20 @@ async fn drive_build_step(
     // as every other step finding — never an open grind.
     let test_baseline = crate::test_integrity::snapshot(&options.project_root);
 
+    // ARCHITECTURE-FITNESS BASELINE (UD-CODE-005, spec prose pending). Snapshot
+    // the source-shape surface (per-file line counts + content hashes + clone
+    // windows) BEFORE this step's doer turn(s) so the deterministic floor can
+    // judge what the step CHANGED: a new god file / a file grown past the
+    // ceiling blocks with a split directive, a duplicated added block is
+    // advisory (see `crate::arch_fitness`). DELIBERATE builds only — a chat /
+    // quick-edit turn never pays this scan. Fail-open: a huge repo (>5k source
+    // files) or an unreadable tree yields a disabled baseline that reports
+    // nothing.
+    let arch_baseline = route
+        .depth
+        .is_deliberate()
+        .then(|| crate::arch_fitness::baseline(&options.project_root));
+
     let mut drove = false;
     let mut last_reply = String::new();
     // SELF-EVOLUTION accounting across this step's fix rounds (a SIDE EFFECT of the
@@ -2277,6 +2304,33 @@ async fn drive_build_step(
                 events.emit(EngineEvent::Note(format!("floor · {finding}")));
             }
             verdict.evidence.extend(integrity);
+        }
+        // ARCHITECTURE-FITNESS FLOOR (UD-CODE-005, spec prose pending). Compare
+        // the tree to the pre-step baseline: a NEW source file over the line
+        // ceiling / a touched file GROWN past it (god-file, UD-CODE-005a) and an
+        // import edge violating the architecture doc's declared layering
+        // (UD-CODE-005b) are BLOCKING — folded into the verdict so the SAME
+        // bounded re-drive that handles any failing acceptance fixes the cause
+        // (split the file / invert the dependency). A duplicated added block
+        // (UD-CODE-005c) is ADVISORY only — the floor has no advisory channel,
+        // so it surfaces as a Note and never touches the verdict. Deterministic
+        // + fail-open (no arch doc / huge repo / unreadable tree → no findings);
+        // bounded by the same `max_fix_rounds` as every other step finding.
+        if let Some(arch_before) = arch_baseline.as_ref() {
+            let arch = crate::arch_fitness::arch_fitness_findings_since(
+                &options.project_root,
+                &options.effective_slug(),
+                arch_before,
+            );
+            for f in arch {
+                if f.blocking {
+                    verdict.accepted = false;
+                    events.emit(EngineEvent::Note(format!("floor · {}", f.message)));
+                    verdict.evidence.push(f.message);
+                } else {
+                    events.emit(EngineEvent::Note(format!("advisory · {}", f.message)));
+                }
+            }
         }
         // MEDIUM #3 — a dead/hung summon turn that never actually ran (`!drove`) must
         // not "complete" a Build step on a NEUTRAL-SKIP acceptance (an unavailable
@@ -3869,20 +3923,37 @@ fn phase_rank(phase: Phase) -> usize {
         .unwrap_or(0)
 }
 
+/// The phase ANCHOR one plan step contributes when it completes — seat-based
+/// ([`phase_for_seat`]) with ONE step-level override: a QA **BUILD** step is
+/// TEST-AUTHORING (the codebase's test-first model — see
+/// `plan_state::enforce_test_authoring_independence`; the doc-first skeleton
+/// schedules it right after the docs, BEFORE any code), so it anchors to `Spec`
+/// (executable acceptance criteria are spec-era prep), NOT `Quality`. Otherwise a
+/// test-authoring step completing right after the docs would jump `/status` to
+/// `quality` while no frontend/backend code exists yet — and a later non-clean
+/// finalize would dishonestly claim the build reached `quality`. A QA REVIEW step
+/// keeps the seat's `Quality` anchor (reviewing delivered code IS quality-era work).
+fn phase_for_step(step: &plan_state::PlanStep) -> Phase {
+    if step.seat == crate::critics::Seat::QaEngineer && step.kind == plan_state::StepKind::Build {
+        return Phase::Spec;
+    }
+    phase_for_seat(step.seat)
+}
+
 /// The furthest-reached [`Phase`] implied by the plan's COMPLETED (Done) work.
 ///
-/// Each `Done` step contributes its seat's phase; the result is the highest-ranked
-/// such phase (the deepest the build has honestly reached). A plan with no Done steps
-/// yet — or no plan at all — has reached nothing concrete, so this returns `None`
-/// (the caller then keeps the initial `research` phase / writes nothing). A fully
-/// `Done` plan whose furthest step is e.g. a QA seat reaches `Quality`, NOT
-/// `Delivery` — `Delivery` is only asserted by [`finalize_phase`] when the whole run
-/// genuinely finished clean.
+/// Each `Done` step contributes its phase anchor ([`phase_for_step`]); the result is
+/// the highest-ranked such phase (the deepest the build has honestly reached). A plan
+/// with no Done steps yet — or no plan at all — has reached nothing concrete, so this
+/// returns `None` (the caller then keeps the initial `research` phase / writes
+/// nothing). A fully `Done` plan whose furthest step is e.g. a QA review seat reaches
+/// `Quality`, NOT `Delivery` — `Delivery` is only asserted by [`finalize_phase`] when
+/// the whole run genuinely finished clean.
 fn furthest_done_phase(plan: &Plan) -> Option<Phase> {
     plan.steps
         .iter()
         .filter(|s| s.status == StepStatus::Done)
-        .map(|s| phase_for_seat(s.seat))
+        .map(phase_for_step)
         .max_by_key(|p| phase_rank(*p))
 }
 
@@ -5008,6 +5079,21 @@ fn acceptance_floor_blocking(options: &RunOptions, route: Option<&RoutePlan>) ->
         out.push(line);
     }
 
+    // ARCHITECTURE FITNESS (UD-CODE-005, spec prose pending): the REPO-GLOBAL
+    // half of the anti-spaghetti floor — the architecture doc's declared
+    // layer-dependency rules (`## Layering` order / `LAYER-RULE: a !-> b`),
+    // verified against the repo-map's resolved import edges. The touched-file
+    // rules (god-file / added-code clones) run at the STEP level in
+    // `drive_build_step`, where the changed-file set is known from the pre-step
+    // baseline; here the empty touched set makes them a silent no-op by
+    // construction. Fail-open: no doc / no declaration / no resolved edges →
+    // empty, never a fabricated failure.
+    for f in crate::arch_fitness::arch_fitness_findings(root, &slug, &[]) {
+        if f.blocking {
+            out.push(f.message);
+        }
+    }
+
     // BUGFIX: require a reproduction test (red→green). A fix that lands no test
     // asserting the bug can silently regress. Fail-open: only fires when the route
     // is classified Bugfix AND we can read the source tree.
@@ -5367,6 +5453,13 @@ mod tests {
     /// coverage floor is satisfied — otherwise the PRD's declared `FR-001` reads as an
     /// uncovered requirement, failing the contract floor a backend step verifies against
     /// (`ContractMatches`) and stalling the build at the frontend phase.
+    ///
+    /// Also seeds the TWO code-phase-prep deliverables the skeleton now guarantees
+    /// structurally: an authored test file under `tests/` (the QA test-authoring
+    /// step's FileExists evidence — authored tests exist, NOT a green suite) and a
+    /// real `design-tokens.json` on the blackboard (the designer tokens step's
+    /// DesignTokensPresent acceptance), so those inserted steps accept and the
+    /// driving tests keep exercising the SAME doc→code flow as before.
     fn seed_core_docs(root: &std::path::Path) {
         let out = root.join("output");
         std::fs::create_dir_all(&out).unwrap();
@@ -5384,6 +5477,20 @@ mod tests {
         std::fs::write(
             out.join("demo-execution-plan.md"),
             "# Execution plan\n\n- FR-001 login covered by the auth task\n",
+        )
+        .unwrap();
+        // QA test-authoring evidence: the authored acceptance tests exist on disk.
+        let tests = root.join("tests");
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::write(
+            tests.join("acceptance.test.ts"),
+            "test('FR-001 login', () => { expect(1).toBe(1); });\n",
+        )
+        .unwrap();
+        // Designer design-tokens evidence: a REAL tokens file on the blackboard.
+        std::fs::write(
+            out.join("design-tokens.json"),
+            "{ \"color\": { \"primary\": \"#0f62fe\" }, \"space\": { \"s1\": \"4px\" } }\n",
         )
         .unwrap();
     }
@@ -7193,6 +7300,58 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_floor_blocks_a_layer_violation_declared_in_the_architecture_doc() {
+        // UD-CODE-005b (spec prose pending): the architecture doc declares a
+        // one-way layering order; an import edge AGAINST it (repository →
+        // controller) is a blocking finding on the deterministic floor, naming
+        // both files. Without a declaration the check silently no-ops.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(
+            "src/controller/user.ts",
+            "export function userController() {}\n",
+        );
+        write(
+            "src/repository/user.ts",
+            "import { userController } from '../controller/user';\nexport function userRepo() {}\n",
+        );
+        let o = opts(root);
+        let route = build_route();
+        // No layering declaration yet → the floor stays clean (fail-open no-op).
+        write(
+            "output/demo-architecture.md",
+            "# Architecture\n\nprose only\n",
+        );
+        assert!(
+            !acceptance_floor_blocking(&o, Some(&route))
+                .iter()
+                .any(|b| b.contains("layer violation")),
+            "no declaration → no layer findings"
+        );
+        // Declare the layering contract → the violating edge blocks.
+        write(
+            "output/demo-architecture.md",
+            "# Architecture\n\n## Layering\n\n\
+             | dir | layer |\n| --- | --- |\n\
+             | src/controller | controller |\n\
+             | src/repository | repository |\n\n\
+             Order: controller -> repository\n",
+        );
+        let blocking = acceptance_floor_blocking(&o, Some(&route));
+        assert!(
+            blocking.iter().any(|b| b.contains("layer violation")
+                && b.contains("src/repository/user.ts")
+                && b.contains("src/controller/user.ts")),
+            "the floor blocks the against-the-order import, naming both files: {blocking:?}"
+        );
+    }
+
+    #[test]
     fn runtime_proof_blocking_distinguishes_failure_from_skip() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp
@@ -7406,7 +7565,7 @@ mod tests {
         // doer's reply text threads back through `SummonResult.text`.
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path());
-        seed_core_docs(tmp.path()); // the doc-first skeleton prepends 3 doc steps
+        seed_core_docs(tmp.path()); // the skeleton prepends 3 doc + QA-test + tokens steps
         let (events, rec) = sink();
         let plan_json = r#"{"steps":[
             {"id":"scaffold","title":"Scaffold","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
@@ -7429,10 +7588,11 @@ mod tests {
             drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
         assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
 
-        // The plan was posted with all 5 steps (3 doc-first + the 2 brain build steps).
+        // The plan was posted with all 7 steps (3 doc-first + the QA test-authoring +
+        // designer design-tokens skeleton steps + the 2 brain build steps).
         assert!(
-            rec.count(|e| matches!(e, EngineEvent::PlanPosted { total, .. } if *total == 5)) == 1,
-            "a 5-step plan (3 doc + 2 brain) was posted: {:?}",
+            rec.count(|e| matches!(e, EngineEvent::PlanPosted { total, .. } if *total == 7)) == 1,
+            "a 7-step plan (3 doc + test-plan + tokens + 2 brain) was posted: {:?}",
             rec.events()
         );
         // At least one step was surfaced as active (the ready PRD doc step).
@@ -7444,7 +7604,7 @@ mod tests {
         );
         // It was persisted to disk and is loadable, and OPENS with the PRD doc step.
         let loaded = crate::plan_state::load(tmp.path()).expect("plan persisted");
-        assert_eq!(loaded.steps.len(), 5);
+        assert_eq!(loaded.steps.len(), 7);
         assert_eq!(
             loaded.steps[0].id, "umadev-phase-prd",
             "the doc-first skeleton opens the plan with the PRD step"
@@ -7543,14 +7703,17 @@ mod tests {
             {"id":"scaffold","title":"Scaffold","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
             {"id":"ui","title":"Build the UI","seat":"frontend-engineer","kind":"build","depends_on":["scaffold"],"acceptance":"source-present"}
         ],"risks":[],"open_questions":[]}"#;
-        // Turn 1 = plan JSON; the deliberate route prepends 3 doc steps (PRD /
-        // architecture / UIUX), each consuming a doer turn BEFORE scaffold + ui. The
+        // Turn 1 = plan JSON; the deliberate route prepends the skeleton steps (PRD /
+        // architecture / UIUX docs, then the QA test-authoring + designer tokens
+        // code-phase prep), each consuming a doer turn BEFORE scaffold + ui. The
         // FakeSession default-completes any further turns (the final QC gate).
         let turns = vec![
             text_turn(plan_json),
             text_turn("Wrote the PRD. Done."),
             text_turn("Wrote the architecture. Done."),
             text_turn("Wrote the UI/UX doc. Done."),
+            text_turn("Authored the acceptance tests. Done."),
+            text_turn("Wrote the design tokens. Done."),
             text_turn("Scaffolded the app skeleton. Done."),
             text_turn("Built the UI. Done."),
         ];
@@ -7630,13 +7793,16 @@ mod tests {
             {"id":"fe","title":"Build the frontend","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
             {"id":"be","title":"Build the backend","seat":"backend-engineer","kind":"build","depends_on":["fe"],"acceptance":"source-present"}
         ],"risks":[],"open_questions":[]}"#;
-        // The deliberate Greenfield route prepends 3 doc steps (PRD / architecture /
-        // UIUX), each consuming a doer turn BEFORE the fe + be code steps.
+        // The deliberate Greenfield route prepends the skeleton steps (3 docs + the
+        // QA test-authoring + designer tokens prep), each consuming a doer turn
+        // BEFORE the fe + be code steps.
         let turns = vec![
             text_turn(plan_json),
             text_turn("Wrote the PRD. Done."),
             text_turn("Wrote the architecture. Done."),
             text_turn("Wrote the UI/UX doc. Done."),
+            text_turn("Authored the acceptance tests. Done."),
+            text_turn("Wrote the design tokens. Done."),
             text_turn("Built the frontend. Done."),
             text_turn("Built the backend. Done."),
         ];
@@ -7703,6 +7869,46 @@ mod tests {
     }
 
     #[test]
+    fn phase_for_step_anchors_qa_test_authoring_to_spec_not_quality() {
+        // A QA BUILD step is TEST-AUTHORING (test-first: the doc-first skeleton
+        // schedules it right after the docs, before any code) — it anchors to `spec`,
+        // NOT `quality`, so /status doesn't jump to quality while no code exists and
+        // a non-clean finalize can't claim a quality-era finish off spec-era prep. A
+        // QA REVIEW step keeps the seat's quality anchor (it reads delivered code).
+        use crate::critics::Seat;
+        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+        let mk = |seat: Seat, kind: StepKind| PlanStep {
+            id: "s".into(),
+            title: "s".into(),
+            seat,
+            kind,
+            depends_on: vec![],
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: StepStatus::Pending,
+        };
+        assert_eq!(
+            phase_for_step(&mk(Seat::QaEngineer, StepKind::Build)),
+            Phase::Spec,
+            "test-authoring is spec-era prep"
+        );
+        assert_eq!(
+            phase_for_step(&mk(Seat::QaEngineer, StepKind::Review)),
+            Phase::Quality,
+            "a QA review keeps the seat's quality anchor"
+        );
+        // Every other seat still anchors exactly by seat.
+        assert_eq!(
+            phase_for_step(&mk(Seat::BackendEngineer, StepKind::Build)),
+            Phase::Backend
+        );
+        assert_eq!(
+            phase_for_step(&mk(Seat::UiuxDesigner, StepKind::Build)),
+            Phase::Frontend
+        );
+    }
+
+    #[test]
     fn persisted_phase_never_regresses_across_writes() {
         // The monotonic clamp: once the state reached a deeper phase, a later write of
         // an EARLIER phase is ignored (a backend step finishing after a frontend step
@@ -7742,13 +7948,16 @@ mod tests {
             {"id":"be","title":"Build the backend","seat":"backend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
             {"id":"fe","title":"Polish the frontend","seat":"frontend-engineer","kind":"build","depends_on":["be"],"acceptance":"source-present"}
         ],"risks":[],"open_questions":[]}"#;
-        // The deliberate Greenfield route prepends 3 doc steps (PRD / architecture /
-        // UIUX), each consuming a doer turn BEFORE the be + fe code steps.
+        // The deliberate Greenfield route prepends the skeleton steps (3 docs + the
+        // QA test-authoring + designer tokens prep), each consuming a doer turn
+        // BEFORE the be + fe code steps.
         let turns = vec![
             text_turn(plan_json),
             text_turn("Wrote the PRD. Done."),
             text_turn("Wrote the architecture. Done."),
             text_turn("Wrote the UI/UX doc. Done."),
+            text_turn("Authored the acceptance tests. Done."),
+            text_turn("Wrote the design tokens. Done."),
             text_turn("Built the backend. Done."),
             text_turn("Polished the frontend. Done."),
         ];
@@ -9380,6 +9589,120 @@ mod tests {
         );
     }
 
+    /// A doer session that writes ONE giant NEW source file on every turn —
+    /// real source (so the source-present floor passes), no test gaming. The
+    /// ONLY thing that can fail the step is the architecture-fitness god-file
+    /// gate (`UD-CODE-005a`).
+    struct GodFileSession {
+        root: std::path::PathBuf,
+        sent: Arc<std::sync::Mutex<Vec<String>>>,
+        current: std::collections::VecDeque<SessionEvent>,
+    }
+    impl GodFileSession {
+        fn new(root: &std::path::Path) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                current: std::collections::VecDeque::new(),
+            }
+        }
+        fn sent_handle(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
+            Arc::clone(&self.sent)
+        }
+    }
+    #[async_trait::async_trait]
+    impl BaseSession for GodFileSession {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Err(SessionError::ForkUnsupported("test".into()))
+        }
+        async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
+            self.sent.lock().unwrap().push(directive);
+            // Ship one giant new file (idempotent — the god file persists every
+            // round, so the step never clears until it is split).
+            let body: String = (0..600)
+                .map(|i| format!("export function generated_fn_{i}(x) {{ return x + {i}; }}\n"))
+                .collect();
+            std::fs::create_dir_all(self.root.join("src")).unwrap();
+            std::fs::write(self.root.join("src/huge.ts"), body).unwrap();
+            self.current = [
+                SessionEvent::TextDelta("Build done, all in one file.".into()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ]
+            .into_iter()
+            .collect();
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            self.current.pop_front()
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn arch_fitness_floor_blocks_a_god_file_step_with_a_split_directive() {
+        // UD-CODE-005a: a deliberate Build step whose doer ships one giant NEW
+        // source file must NOT be accepted, even though real source is on disk
+        // (the source-present acceptance passes). The god-file gate flips the
+        // verdict, folds the split directive into the bounded re-drive, and is
+        // bounded by the SAME fix-round counter — never an open grind.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, _rec) = sink();
+        let mut sess = GodFileSession::new(tmp.path());
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route(); // Standard depth → deliberate → the floor arms
+        let step = one_failing_build_plan().steps.into_iter().next().unwrap();
+
+        let outcome = drive_build_step(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &step,
+            "",
+            0,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+            &mut std::collections::HashSet::new(),
+        )
+        .await;
+
+        assert!(
+            !outcome.accepted,
+            "a step that ships a 600-line NEW god file must NOT be accepted"
+        );
+        // Bounded: round 0 + MAX_STEP_FIX_ROUNDS re-drives, never infinite.
+        let directives = sent.lock().unwrap().clone();
+        assert_eq!(
+            directives.len(),
+            MAX_STEP_FIX_ROUNDS + 1,
+            "the god-file rework is bounded by the fix-round counter: {directives:?}"
+        );
+        // The re-drive directive carries the split directive naming the file.
+        assert!(
+            directives[1].contains("split it by feature/domain")
+                && directives[1].contains("src/huge.ts"),
+            "the fix directive names the god file and tells the doer to split it: {:?}",
+            directives[1]
+        );
+    }
+
     #[tokio::test]
     async fn a_passing_build_step_rewards_the_recalled_lesson_trust() {
         // SELF-EVOLUTION (relocated onto the default path): a Build step whose
@@ -10823,6 +11146,258 @@ mod tests {
             rec.count(|e| matches!(e, EngineEvent::GateOpened { .. })),
             0,
             "no gate fires when nothing remains to resume into"
+        );
+    }
+
+    #[tokio::test]
+    async fn design_tokens_step_never_triggers_or_holds_the_docs_gate() {
+        // The designer's design-tokens deliverable step is UIUX-SEATED but is
+        // code-phase prep, not doc authoring: (1) a still-pending tokens step must
+        // NOT hold the docs gate closed once the actual docs are Done, and (2) the
+        // tokens step settling Done AFTER the resume must NOT re-fire docs_confirm
+        // (gate-opens-once).
+        use crate::critics::Seat;
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.mode = TrustMode::Guarded;
+        let mk = |id: &str, seat: Seat, acceptance: AcceptanceSpec, status: StepStatus| PlanStep {
+            id: id.into(),
+            title: format!("do {id}"),
+            seat,
+            kind: StepKind::Build,
+            depends_on: vec![],
+            acceptance,
+            evidence: Vec::new(),
+            status,
+        };
+        crate::interaction::hosted(gates_hosted_interaction(), async {
+            // Docs all Done, tokens still Pending, settled step = the UIUX doc: the
+            // gate opens NOW — the pending tokens step (excluded from the family)
+            // does not hold it.
+            let uiux = mk(
+                "uiux",
+                Seat::UiuxDesigner,
+                AcceptanceSpec::SourcePresent,
+                StepStatus::Done,
+            );
+            let plan = Plan {
+                steps: vec![
+                    mk(
+                        "pm",
+                        Seat::ProductManager,
+                        AcceptanceSpec::SourcePresent,
+                        StepStatus::Done,
+                    ),
+                    mk(
+                        "arch",
+                        Seat::Architect,
+                        AcceptanceSpec::SourcePresent,
+                        StepStatus::Done,
+                    ),
+                    uiux.clone(),
+                    mk(
+                        "tokens",
+                        Seat::UiuxDesigner,
+                        AcceptanceSpec::DesignTokensPresent,
+                        StepStatus::Pending,
+                    ),
+                    mk(
+                        "fe",
+                        Seat::FrontendEngineer,
+                        AcceptanceSpec::SourcePresent,
+                        StepStatus::Pending,
+                    ),
+                ],
+                risks: vec![],
+                open_questions: vec![],
+            };
+            assert_eq!(
+                confirm_gate_after_step(&uiux, StepStatus::Done, &plan, &o),
+                Some(crate::gates::Gate::DocsConfirm),
+                "a pending tokens step does not hold the docs gate closed"
+            );
+            // Post-resume: the tokens step settles Done — it must NOT re-fire the
+            // docs gate (it is not a doc-family member OR trigger).
+            let tokens_done = mk(
+                "tokens",
+                Seat::UiuxDesigner,
+                AcceptanceSpec::DesignTokensPresent,
+                StepStatus::Done,
+            );
+            let mut plan2 = plan.clone();
+            plan2.mark("tokens", StepStatus::Done);
+            assert_eq!(
+                confirm_gate_after_step(&tokens_done, StepStatus::Done, &plan2, &o),
+                None,
+                "a design-tokens step settling post-resume never re-fires docs_confirm"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_gate_fires_before_code_phase_prep_and_opens_exactly_once() {
+        // End-to-end over drive_plan_steps + resume with the NEW skeleton shape: a
+        // plan carrying the QA test-authoring + designer tokens prep steps between
+        // the docs and the code. The docs gate must open when the DOCS complete
+        // (prep still pending — it is code-phase work that runs AFTER the user
+        // confirms the docs), the prep steps complete after the resume WITHOUT
+        // re-firing docs_confirm, and the frontend then pauses at preview_confirm.
+        use crate::critics::Seat;
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        // The prep steps' real evidence: authored tests on disk + a real tokens file.
+        std::fs::create_dir_all(tmp.path().join("tests")).unwrap();
+        std::fs::write(tmp.path().join("tests").join("probe.test.ts"), "test();").unwrap();
+        std::fs::write(
+            tmp.path().join("design-tokens.json"),
+            "{ \"color\": { \"primary\": \"#0f62fe\" } }",
+        )
+        .unwrap();
+        let (events, rec) = sink();
+        let mut o = opts(tmp.path());
+        o.mode = TrustMode::Guarded;
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        let mk = |id: &str, seat: Seat, acceptance: AcceptanceSpec, deps: &[&str]| PlanStep {
+            id: id.into(),
+            title: format!("do the {id} work"),
+            seat,
+            kind: StepKind::Build,
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+            acceptance,
+            evidence: Vec::new(),
+            status: StepStatus::Pending,
+        };
+        let mut qa = mk(
+            "qa-tests",
+            Seat::QaEngineer,
+            AcceptanceSpec::SourcePresent,
+            &["arch"],
+        );
+        qa.evidence = vec![crate::plan_state::EvidenceContract::FileExists {
+            path: "tests".to_string(),
+        }];
+        let mut plan = Plan {
+            steps: vec![
+                mk(
+                    "pm",
+                    Seat::ProductManager,
+                    AcceptanceSpec::SourcePresent,
+                    &[],
+                ),
+                mk(
+                    "arch",
+                    Seat::Architect,
+                    AcceptanceSpec::SourcePresent,
+                    &["pm"],
+                ),
+                qa,
+                mk(
+                    "tokens",
+                    Seat::UiuxDesigner,
+                    AcceptanceSpec::DesignTokensPresent,
+                    &["arch"],
+                ),
+                mk(
+                    "fe",
+                    Seat::FrontendEngineer,
+                    AcceptanceSpec::SourcePresent,
+                    &["qa-tests", "tokens"],
+                ),
+                mk(
+                    "be",
+                    Seat::BackendEngineer,
+                    AcceptanceSpec::SourcePresent,
+                    &["qa-tests"],
+                ),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+
+        // 1. Fresh drive → pauses at docs_confirm as soon as pm + arch settle (the
+        //    prep steps are still Pending — they are NOT doc-family members).
+        let mut sess = FakeSession::new(vec![], false, "");
+        let outcome = crate::interaction::hosted(gates_hosted_interaction(), async {
+            drive_plan_steps(
+                &mut sess,
+                &o,
+                &events,
+                &route,
+                &mut plan,
+                IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+                std::time::Instant::now() + Duration::from_secs(3_600),
+            )
+            .await
+        })
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                Some(DirectorLoopOutcome::PausedAtGate {
+                    gate: crate::gates::Gate::DocsConfirm
+                })
+            ),
+            "docs gate opens when the DOCS complete, before the prep steps: {outcome:?}"
+        );
+        let loaded = plan_state::load(tmp.path()).expect("plan persisted at the pause");
+        let status_of = |p: &Plan, id: &str| p.steps.iter().find(|s| s.id == id).unwrap().status;
+        assert_eq!(
+            status_of(&loaded, "qa-tests"),
+            StepStatus::Pending,
+            "test-authoring is code-phase prep — it runs AFTER the docs gate resumes"
+        );
+        assert_eq!(status_of(&loaded, "tokens"), StepStatus::Pending);
+
+        // 2. Approve → resume: the prep steps complete (no docs re-fire), the
+        //    frontend settles → preview_confirm.
+        let mut sess2 = FakeSession::new(vec![], false, "");
+        let outcome2 = crate::interaction::hosted(gates_hosted_interaction(), async {
+            drive_director_loop_resume(&mut sess2, &o, &events, &route).await
+        })
+        .await;
+        assert!(
+            matches!(
+                outcome2,
+                Some(DirectorLoopOutcome::PausedAtGate {
+                    gate: crate::gates::Gate::PreviewConfirm
+                })
+            ),
+            "after the prep steps the frontend pauses at preview_confirm: {outcome2:?}"
+        );
+        assert_eq!(
+            rec.count(|e| matches!(
+                e,
+                EngineEvent::GateOpened {
+                    gate: crate::gates::Gate::DocsConfirm,
+                    ..
+                }
+            )),
+            1,
+            "docs_confirm opened exactly ONCE — the prep steps completing never re-fired it"
+        );
+
+        // 3. Approve the preview → the backend completes and the run finishes.
+        let mut sess3 = FakeSession::new(vec![], false, "");
+        let outcome3 = crate::interaction::hosted(gates_hosted_interaction(), async {
+            drive_director_loop_resume(&mut sess3, &o, &events, &route).await
+        })
+        .await;
+        assert!(
+            matches!(outcome3, Some(DirectorLoopOutcome::Done { .. })),
+            "the final resume completes the plan: {outcome3:?}"
+        );
+        let done = plan_state::load(tmp.path()).expect("plan persisted");
+        assert!(
+            done.steps.iter().all(|s| s.status == StepStatus::Done),
+            "every step (docs, prep, code) settled Done: {:?}",
+            done.steps
+                .iter()
+                .map(|s| (s.id.clone(), s.status))
+                .collect::<Vec<_>>()
         );
     }
 

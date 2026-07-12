@@ -459,6 +459,52 @@ fn push_unique(evidence: &mut Vec<EvidenceContract>, c: EvidenceContract) {
     }
 }
 
+/// Whether a step is the designer's **design-tokens deliverable** BUILD step — a
+/// UIUX-seated Build step whose acceptance is [`AcceptanceSpec::DesignTokensPresent`]
+/// (the typed discriminator; there is no `EvidenceContract` tokens variant). This is
+/// CODE-PHASE PREP (write real `design-tokens.{json,css}` the frontend imports), NOT
+/// the UIUX *doc* authoring step: it never anchors the doc-first chain, never gains
+/// the uiux-doc evidence floor, and never counts toward (or triggers) the
+/// `docs_confirm` gate family — it runs AFTER the docs are confirmed.
+#[must_use]
+pub fn is_design_tokens_step(s: &PlanStep) -> bool {
+    s.kind == StepKind::Build
+        && s.seat == crate::critics::Seat::UiuxDesigner
+        && s.acceptance == AcceptanceSpec::DesignTokensPresent
+}
+
+/// Whether an existing QA BUILD step can safely run **before any code exists** —
+/// the adoption bar for treating a brain-authored QA step as THE test-authoring
+/// (test-first) step that frontend/backend code is wired BEHIND. Its acceptance /
+/// evidence must only demand *authored artifacts* (files on disk); a bar that needs
+/// a GREEN suite/build or a live route ([`AcceptanceSpec::BuildTest`],
+/// [`EvidenceContract::TestPasses`] / `BuildClean` / `RouteResponds` /
+/// `ContractMatches`, or a held [`EvidenceContract::Malformed`] gap) can never pass
+/// while the code it tests is unbuilt — wiring code behind such a step would
+/// deadlock the plan, so it is NOT adopted (the skeleton inserts its own safe
+/// test-authoring step instead). Pure.
+fn qa_step_precode_runnable(s: &PlanStep) -> bool {
+    let acceptance_ok = matches!(
+        s.acceptance,
+        AcceptanceSpec::SourcePresent | AcceptanceSpec::TurnSettled
+    );
+    let evidence_ok = s.evidence.iter().all(|e| {
+        matches!(
+            e,
+            EvidenceContract::SourcePresent
+                | EvidenceContract::FileExists { .. }
+                | EvidenceContract::FileContains { .. }
+        )
+    });
+    acceptance_ok && evidence_ok
+}
+
+/// The repo-relative directory the skeleton-inserted QA test-authoring step names as
+/// its deliverable location (checked via [`EvidenceContract::FileExists`] — "the
+/// authored tests exist on disk", NOT "the suite is green": tests are written BEFORE
+/// the code they check, so they are EXPECTED to fail until the code lands).
+const TEST_AUTHORING_DIR: &str = "tests";
+
 /// One node in the plan DAG. Owns its dependencies (`depends_on`) so independent
 /// nodes are parallelisable and the director can schedule by readiness, not a flat
 /// list.
@@ -896,15 +942,6 @@ impl Plan {
         self.enforce_contract_first();
         self.enforce_test_authoring_independence();
         self.break_dependency_cycles();
-        // PER-SEAT DETERMINISTIC FLOOR (verification-level seat differentiation) —
-        // orthogonal to the DAG above: augment an UNDER-SPECIFIED build step with a
-        // seat-appropriate default evidence contract (backend → FE↔BE contract, QA →
-        // tests pass, frontend/security → build+lint clean), then a falsifiability
-        // backstop when the brain under-specified the plan wholesale. Augment-only +
-        // fail-open: a step already carrying a strong contract, or a seat with no floor,
-        // is left exactly as today. See [`Self::enforce_seat_evidence_floor`] /
-        // [`Self::enforce_falsifiability_floor`].
-        self.enforce_seat_evidence_floor();
         // CORE-DOC EVIDENCE FLOOR (deliberate builds only) — when the plan convened a
         // PM/architect, bind that seat to actually PRODUCE its core doc via a
         // FileContains evidence contract, so the PRD/architecture is a VERIFIED build
@@ -913,14 +950,27 @@ impl Plan {
         // re-plan / test) skips it. Augment-only + fail-open. See
         // [`Self::enforce_doc_evidence_floor`].
         //
-        // Runs BEFORE the falsifiability backstop (F3): binding a PM/architect doc step to
-        // its FileContains contract makes it non-bare, so falsifiability no longer wrongly
-        // pins BuildClean onto a doc-authoring step (which can NEVER make the project build -
-        // the plan would stall at its first doc step, reworking "make the build clean" at a
-        // PM who writes no code).
+        // Runs BEFORE the seat floor + the falsifiability backstop (F3): binding a
+        // PM/architect/designer doc step to its FileContains/FileExists contract makes
+        // it non-bare, so (1) the designer arm of the seat floor below never converts
+        // a deliberate UIUX *doc-authoring* step into a design-tokens step (the doc
+        // step is already contracted to produce the uiux doc; the SEPARATE tokens step
+        // owns the tokens bar), and (2) falsifiability no longer wrongly pins
+        // BuildClean onto a doc-authoring step (which can NEVER make the project build
+        // - the plan would stall at its first doc step, reworking "make the build
+        // clean" at a PM who writes no code).
         if let Some((slug, _needs_ui)) = doc_skeleton {
             self.enforce_doc_evidence_floor(slug);
         }
+        // PER-SEAT DETERMINISTIC FLOOR (verification-level seat differentiation) —
+        // orthogonal to the DAG above: augment an UNDER-SPECIFIED build step with a
+        // seat-appropriate default (backend → FE↔BE contract, QA → tests pass,
+        // frontend/security → build+lint clean, designer → the design-tokens
+        // deliverable), then a falsifiability backstop when the brain under-specified
+        // the plan wholesale. Augment-only + fail-open: a step already carrying a
+        // strong contract, or a seat with no floor, is left exactly as today. See
+        // [`Self::enforce_seat_evidence_floor`] / [`Self::enforce_falsifiability_floor`].
+        self.enforce_seat_evidence_floor();
         self.enforce_falsifiability_floor();
         self.risks.retain(|r| !r.trim().is_empty());
         self.open_questions.retain(|q| !q.trim().is_empty());
@@ -1000,10 +1050,23 @@ impl Plan {
     /// table). A "contract step" is any Build step seated by the architect OR whose
     /// acceptance IS [`AcceptanceSpec::Contract`]; a "consumer" is any Build step
     /// seated by the frontend/backend engineer. Each consumer gains an edge to each
-    /// contract step (deduped, never a self-edge). Any cycle this introduces (e.g. an
-    /// architect step the brain made depend on an engineer) is broken afterward by
-    /// [`Self::break_dependency_cycles`], so the DAG always stays schedulable.
-    /// No contract step ⇒ a deterministic no-op (fail-open). Pure over `self`.
+    /// contract step (deduped, never a self-edge).
+    ///
+    /// **The contract author is DE-BIASED first**: before the consumer edges are
+    /// added, every contract step's OWN `depends_on` entries pointing at consumer code
+    /// steps are STRIPPED (mirroring [`Self::enforce_test_authoring_independence`]).
+    /// A weak base sometimes plans "document the API after implementation" (the
+    /// architect step depending on a backend step) — adding the consumer→contract
+    /// edge over that would close a cycle, and [`Self::break_dependency_cycles`]
+    /// drops an ARBITRARY DFS back-edge, which could be the contract-first edge
+    /// itself: the code step then silently ran BEFORE the architecture doc (a
+    /// docs-first bypass). Stripping the author's code deps means the cycle never
+    /// forms, so the edge ORIENTATION (code depends on contract) deterministically
+    /// survives. A be/fe-seated step that is ITSELF a contract step (acceptance =
+    /// Contract) is not treated as a consumer code dep here. Any residual cycle from
+    /// other shapes is still broken afterward by [`Self::break_dependency_cycles`],
+    /// so the DAG always stays schedulable. No contract step ⇒ a deterministic no-op
+    /// (fail-open). Pure over `self`.
     fn enforce_contract_first(&mut self) {
         use crate::critics::Seat;
         let contract_ids: Vec<String> = self
@@ -1017,6 +1080,25 @@ impl Plan {
             .collect();
         if contract_ids.is_empty() {
             return; // no architect contract in this plan → nothing to order
+        }
+        // De-bias the contract author: the interface is derived from the requirement,
+        // never from the code that must build against it — strip a contract step's
+        // deps on the consumer code steps so the code→contract orientation below can
+        // never be inverted by an arbitrary cycle-break.
+        let code_ids: HashSet<String> = self
+            .steps
+            .iter()
+            .filter(|s| {
+                s.kind == StepKind::Build
+                    && matches!(s.seat, Seat::FrontendEngineer | Seat::BackendEngineer)
+                    && !contract_ids.contains(&s.id)
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for s in &mut self.steps {
+            if contract_ids.contains(&s.id) {
+                s.depends_on.retain(|d| !code_ids.contains(d));
+            }
         }
         for s in &mut self.steps {
             if s.kind != StepKind::Build {
@@ -1068,14 +1150,15 @@ impl Plan {
     /// default [`EvidenceContract`] to a BUILD step the brain left UNDER-SPECIFIED, so
     /// seats are mechanically differentiated at VERIFICATION time (a backend step is
     /// judged by its FE↔BE contract / a real route registration, a QA step by tests
-    /// actually passing, a frontend/security step by a clean build+lint) rather than
-    /// only narratively. This AUGMENTS: it fires ONLY for a step carrying no contract
-    /// stronger than source-present ([`PlanStep::has_strong_contract`]), so a
-    /// brain-volunteered contract is never removed or downgraded. Every default is a
-    /// variant the existing deterministic floor already verifies — no new gate, no new
-    /// [`EvidenceContract`] variant. A REVIEW step, a seat with no floor, or an
-    /// already-contracted step is left exactly as today (fail-open). Bounded (one pass);
-    /// pure over `self`.
+    /// actually passing, a frontend/security step by a clean build+lint, a designer
+    /// step by its real design-tokens deliverable) rather than only narratively. This
+    /// AUGMENTS: it fires ONLY for a step carrying no contract stronger than
+    /// source-present ([`PlanStep::has_strong_contract`]), so a brain-volunteered
+    /// contract is never removed or downgraded. Every default is a check the existing
+    /// deterministic floor already verifies — no new gate, no new [`EvidenceContract`]
+    /// variant (the designer floor lives on the [`AcceptanceSpec`] axis, see below).
+    /// A REVIEW step, a seat with no floor, or an already-contracted step is left
+    /// exactly as today (fail-open). Bounded (one pass); pure over `self`.
     fn enforce_seat_evidence_floor(&mut self) {
         for s in &mut self.steps {
             // Only a BUILD step is judged by an evidence contract; a REVIEW step is
@@ -1095,6 +1178,20 @@ impl Plan {
                 // frontend craft-governance (banned patterns / a11y lint) runs and a
                 // security change's regressions surface.
                 Seat::FrontendEngineer | Seat::SecurityEngineer => EvidenceContract::BuildClean,
+                // Designer: the seat's anti-theatre floor is the DESIGN-TOKENS
+                // deliverable (`design-tokens.{json,css}` as REAL files, verified by
+                // `VerifyKind::DesignTokensPresent`). There is no EvidenceContract
+                // variant for it — the checker lives on the AcceptanceSpec axis — so
+                // the floor UPGRADES the step's weak acceptance in place. Still
+                // augment-only: this arm is reached only for a bare step (acceptance
+                // SourcePresent/TurnSettled, no strong evidence), and a deliberate
+                // route's UIUX *doc* step was already bound to its uiux-doc file by
+                // [`Self::enforce_doc_evidence_floor`] (which runs first), so a
+                // doc-authoring step is never converted.
+                Seat::UiuxDesigner => {
+                    s.acceptance = AcceptanceSpec::DesignTokensPresent;
+                    continue;
+                }
                 // Every other seat keeps today's behaviour (fail-open); the
                 // falsifiability backstop below still covers a wholesale-sloppy plan.
                 _ => continue,
@@ -1165,6 +1262,14 @@ impl Plan {
             if s.kind != StepKind::Build {
                 continue;
             }
+            // The designer's design-tokens DELIVERABLE step is code-phase prep, not
+            // the uiux DOC author — binding it to the uiux doc would make its
+            // evidence non-empty, and the evidence path then bypasses its
+            // DesignTokensPresent acceptance entirely (the tokens bar would silently
+            // vanish). Its own acceptance governs it; skip.
+            if is_design_tokens_step(s) {
+                continue;
+            }
             let contract = match s.seat {
                 Seat::ProductManager => EvidenceContract::FileContains {
                     path: format!("output/{slug}-prd.md"),
@@ -1187,15 +1292,48 @@ impl Plan {
     /// the three core-doc BUILD steps (PRD → architecture → [UIUX]) even when the
     /// brain's plan omitted them, so a weak base that decomposed the requirement into
     /// backend code with no docs is still forced through docs FIRST. For each core-doc
-    /// seat missing from the plan (matched by seat + [`StepKind::Build`]), a step is
-    /// synthesised and PREPENDED, chained in order (PRD → architecture → UIUX) so the
-    /// docs run sequentially; a seat the brain ALREADY seated is left in place (its id
-    /// still anchors the chain, so no duplicate is inserted). When `needs_ui`, the UIUX
-    /// doc is part of the chain and every frontend BUILD step gains a `depends_on` on it
-    /// (design system before the UI). Any code step is later wired behind the architect
-    /// seat by [`Self::enforce_contract_first`], so implementation can never start
-    /// before the docs land. Idempotent (an already-doc-first plan is unchanged) and
-    /// fail-open (no code step / all docs present ⇒ a no-op). Pure over `self`.
+    /// seat missing from the plan (matched by seat + [`StepKind::Build`]; a designer
+    /// design-tokens step never anchors the doc chain — see [`is_design_tokens_step`]),
+    /// a step is synthesised and PREPENDED, chained in order (PRD → architecture →
+    /// UIUX) so the docs run sequentially; a seat the brain ALREADY seated is left in
+    /// place (its id still anchors the chain, so no duplicate is inserted). When
+    /// `needs_ui`, the UIUX doc is part of the chain and every frontend BUILD step
+    /// gains a `depends_on` on it (design system before the UI). Any code step is
+    /// later wired behind the architect seat by [`Self::enforce_contract_first`], so
+    /// implementation can never start before the docs land.
+    ///
+    /// **Two team deliverables are STRUCTURALLY guaranteed after the doc chain** (the
+    /// planner prompt asks for them — belt — and this skeleton inserts them when the
+    /// brain omitted them — suspenders). Both are CODE-PHASE PREP: they depend on
+    /// EVERY doc anchor, so they only become ready after the whole doc family is Done
+    /// — i.e. AFTER the `docs_confirm` gate fires and resumes, never inside the doc
+    /// era (the gate's family/trigger detection also excludes them, see
+    /// `confirm_gate_after_step`):
+    ///
+    /// 1. **QA test-authoring** (`umadev-phase-test-plan`, test-first): QA writes the
+    ///    acceptance tests from the PRD/contract BEFORE any code exists; every
+    ///    frontend/backend BUILD step gains a `depends_on` on it. Its evidence is
+    ///    "the authored tests EXIST on disk" ([`EvidenceContract::FileExists`] on
+    ///    [`TEST_AUTHORING_DIR`]) — deliberately NOT `TestPasses`: authored tests are
+    ///    EXPECTED to fail until the code lands, so a green-suite bar here would
+    ///    deadlock the plan. An existing brain QA BUILD step positioned before the
+    ///    code steps is ADOPTED instead of duplicated when its own bar can run
+    ///    pre-code ([`qa_step_precode_runnable`]); a bare adopted step gains the same
+    ///    authored-tests evidence (pre-empting the seat floor's `TestPasses`, which
+    ///    cannot pass pre-code). [`Self::enforce_test_authoring_independence`] (which
+    ///    runs after) strips any QA→code edge, so the code→QA orientation
+    ///    deterministically survives — never left to an arbitrary cycle-break.
+    /// 2. **Designer design-tokens** (`umadev-phase-design-tokens`, UI-bearing builds
+    ///    only): the designer ships the design system as REAL
+    ///    `design-tokens.{json,css}` files (acceptance
+    ///    [`AcceptanceSpec::DesignTokensPresent`], verified on the deterministic
+    ///    floor) before the UI is built; every frontend BUILD step gains a
+    ///    `depends_on` on it. An existing brain tokens step is adopted (deps wired,
+    ///    not duplicated) and DE-BIASED: its own deps on code steps are stripped so
+    ///    the frontend→tokens orientation survives.
+    ///
+    /// Idempotent (an already-complete plan only gains the ordering edges, deduped)
+    /// and fail-open (no code step ⇒ the wiring is a no-op). Pure over `self`.
     fn ensure_doc_first_skeleton(&mut self, slug: &str, needs_ui: bool) {
         use crate::critics::Seat;
         let mut wanted: Vec<(Seat, &'static str, String, EvidenceContract)> = vec![
@@ -1230,14 +1368,21 @@ impl Plan {
         }
         let mut inserted: Vec<PlanStep> = Vec::new();
         let mut prev_doc_id: Option<String> = None;
+        // Every doc anchor (existing or inserted) — the "docs are locked" prerequisite
+        // set the code-phase prep steps below are wired behind.
+        let mut doc_anchor_ids: Vec<String> = Vec::new();
         let mut uiux_doc_id: Option<String> = None;
         for (seat, id, title, evidence) in wanted {
+            // A designer step whose acceptance is DesignTokensPresent is the TOKENS
+            // deliverable, not the UIUX doc author — it never anchors the doc chain
+            // (otherwise a tokens-only plan would silently satisfy the uiux-doc seat).
             if let Some(existing) = self
                 .steps
                 .iter()
-                .find(|s| s.seat == seat && s.kind == StepKind::Build)
+                .find(|s| s.seat == seat && s.kind == StepKind::Build && !is_design_tokens_step(s))
             {
                 prev_doc_id = Some(existing.id.clone());
+                doc_anchor_ids.push(existing.id.clone());
                 if seat == Seat::UiuxDesigner {
                     uiux_doc_id = Some(existing.id.clone());
                 }
@@ -1254,24 +1399,175 @@ impl Plan {
                 status: StepStatus::Pending,
             };
             prev_doc_id = Some(step.id.clone());
+            doc_anchor_ids.push(step.id.clone());
             if seat == Seat::UiuxDesigner {
                 uiux_doc_id = Some(step.id.clone());
             }
             inserted.push(step);
         }
-        if inserted.is_empty() {
-            return;
+
+        let is_code_step = |s: &PlanStep| {
+            s.kind == StepKind::Build
+                && matches!(s.seat, Seat::FrontendEngineer | Seat::BackendEngineer)
+        };
+
+        // ── 1. QA test-authoring step (test-first) ─────────────────────────────
+        // Adopt the brain's own test-authoring step when it is a QA BUILD step
+        // positioned BEFORE the code steps AND its bar can run pre-code; otherwise
+        // insert the skeleton step. (Indexes are the brain's original order — the
+        // inserted docs are only prepended at the end of this function.)
+        let first_code_idx = self.steps.iter().position(&is_code_step);
+        let qa_anchor: Option<String> = self
+            .steps
+            .iter()
+            .enumerate()
+            .find(|(i, s)| {
+                s.kind == StepKind::Build
+                    && s.seat == Seat::QaEngineer
+                    && first_code_idx.is_none_or(|c| *i < c)
+                    && qa_step_precode_runnable(s)
+            })
+            .map(|(_, s)| s.id.clone());
+        let qa_id = if let Some(id) = qa_anchor {
+            for s in &mut self.steps {
+                if s.id == id {
+                    // A bare adopted step gains the authored-tests evidence — this
+                    // pre-empts the seat floor's TestPasses default, which could
+                    // never pass before the code the tests check exists.
+                    if !s.has_strong_contract() {
+                        push_unique(
+                            &mut s.evidence,
+                            EvidenceContract::FileExists {
+                                path: TEST_AUTHORING_DIR.to_string(),
+                            },
+                        );
+                    }
+                    // Docs-first: test-authoring starts only after the docs are locked
+                    // (and therefore after the docs_confirm gate, which fires when the
+                    // doc family completes).
+                    for d in &doc_anchor_ids {
+                        if *d != s.id && !s.depends_on.contains(d) {
+                            s.depends_on.push(d.clone());
+                        }
+                    }
+                }
+            }
+            id
+        } else {
+            let step = PlanStep {
+                id: "umadev-phase-test-plan".to_string(),
+                title: "QA 先行编写验收测试（依据 PRD 功能需求与 API 契约盲写测试,先于前后端实现,\
+                        测试文件写入 tests/ 目录;此时测试可以失败,代码落地后再转绿）"
+                    .to_string(),
+                seat: Seat::QaEngineer,
+                kind: StepKind::Build,
+                depends_on: doc_anchor_ids.clone(),
+                acceptance: AcceptanceSpec::SourcePresent,
+                evidence: vec![EvidenceContract::FileExists {
+                    path: TEST_AUTHORING_DIR.to_string(),
+                }],
+                status: StepStatus::Pending,
+            };
+            let id = step.id.clone();
+            inserted.push(step);
+            id
+        };
+        // TEST-FIRST ordering: every frontend/backend BUILD step builds AGAINST the
+        // authored tests. The reverse (QA→code) edges are stripped by
+        // `enforce_test_authoring_independence` (runs after this), so these edges can
+        // never close a cycle — the orientation survives deterministically.
+        for s in &mut self.steps {
+            if is_code_step(s) && s.id != qa_id && !s.depends_on.contains(&qa_id) {
+                s.depends_on.push(qa_id.clone());
+            }
         }
-        if let Some(ref uiux) = uiux_doc_id {
+
+        // ── 2. Designer design-tokens step (UI-bearing builds only) ────────────
+        if needs_ui {
+            let tokens_anchor: Option<String> = self
+                .steps
+                .iter()
+                .find(|s| is_design_tokens_step(s))
+                .map(|s| s.id.clone());
+            let tokens_id = if let Some(id) = tokens_anchor {
+                // De-bias the adopted tokens step (tokens precede the code that
+                // imports them) + docs-first ordering — so the frontend→tokens
+                // edges below can never close a cycle.
+                let code_ids: Vec<String> = self
+                    .steps
+                    .iter()
+                    .filter(|s| is_code_step(s))
+                    .map(|s| s.id.clone())
+                    .collect();
+                for s in &mut self.steps {
+                    if s.id == id {
+                        s.depends_on.retain(|d| !code_ids.contains(d));
+                        for d in &doc_anchor_ids {
+                            if *d != s.id && !s.depends_on.contains(d) {
+                                s.depends_on.push(d.clone());
+                            }
+                        }
+                    }
+                }
+                id
+            } else {
+                let step = PlanStep {
+                    id: "umadev-phase-design-tokens".to_string(),
+                    title: "输出设计令牌文件 design-tokens.{json,css}（类型比例、色板、间距、\
+                            组件清单,先于前端实现锁定设计系统,供前端直接 import）"
+                        .to_string(),
+                    seat: Seat::UiuxDesigner,
+                    kind: StepKind::Build,
+                    depends_on: doc_anchor_ids.clone(),
+                    // The tokens bar lives on the AcceptanceSpec axis
+                    // (VerifyKind::DesignTokensPresent); evidence stays empty so the
+                    // verifier takes the acceptance path, not the evidence path.
+                    acceptance: AcceptanceSpec::DesignTokensPresent,
+                    evidence: Vec::new(),
+                    status: StepStatus::Pending,
+                };
+                let id = step.id.clone();
+                inserted.push(step);
+                id
+            };
+            // Design system before the UI: every frontend BUILD step imports the
+            // tokens, so it depends on them.
             for s in &mut self.steps {
                 if s.kind == StepKind::Build
                     && s.seat == Seat::FrontendEngineer
-                    && &s.id != uiux
+                    && s.id != tokens_id
+                    && !s.depends_on.contains(&tokens_id)
+                {
+                    s.depends_on.push(tokens_id.clone());
+                }
+            }
+        }
+
+        // Design DOC before the UI: every frontend BUILD step also depends on the
+        // UIUX doc anchor. The adopted anchor is de-biased first (its own deps on
+        // code steps stripped — a doc derives from the requirement, never from the
+        // code built against it), so this edge can never be inverted by an arbitrary
+        // cycle-break.
+        if let Some(ref uiux) = uiux_doc_id {
+            let code_ids: Vec<String> = self
+                .steps
+                .iter()
+                .filter(|s| is_code_step(s))
+                .map(|s| s.id.clone())
+                .collect();
+            for s in &mut self.steps {
+                if &s.id == uiux {
+                    s.depends_on.retain(|d| !code_ids.contains(d));
+                } else if s.kind == StepKind::Build
+                    && s.seat == Seat::FrontendEngineer
                     && !s.depends_on.contains(uiux)
                 {
                     s.depends_on.push(uiux.clone());
                 }
             }
+        }
+        if inserted.is_empty() {
+            return;
         }
         let mut head = inserted;
         head.append(&mut self.steps);
@@ -1490,16 +1786,20 @@ pub async fn synthesize_plan(
          {{\"kind\":\"contract-matches\"}}, {{\"kind\":\"source-present\"}}. Prefer the most \
          specific evidence the step actually produces (a concrete file/route over a generic \
          build-clean). \
-         Team-deliverable rules (UmaDev ALSO enforces these structurally, so honour them): \
+         Team-deliverable rules (UmaDev enforces ALL of these STRUCTURALLY after parsing — \
+         a missing tokens/QA step is inserted and the ordering edges are wired — so a plan \
+         that already honours them survives normalisation unchanged): \
          (a) when there is a UI surface, the uiux-designer has a BUILD step that writes the \
          design system as real `design-tokens.{{json,css}}` files (acceptance=design-tokens) \
          and every frontend step depends_on it; \
          (b) the architect's API contract is a depends_on PREREQUISITE of every \
          frontend/backend step (lock the interface first); \
-         (c) QA AUTHORS tests as its OWN build step (seat=qa-engineer, kind=build, \
-         acceptance=build-test) that does NOT depend on the frontend/backend code steps — \
-         the test-author must not be the code-author (de-biasing); a QA review step is \
-         separate. \
+         (c) QA AUTHORS tests as its OWN build step BEFORE the code steps (seat=qa-engineer, \
+         kind=build, acceptance=source-present, evidence=file-exists on the test dir/files — \
+         authored tests are EXPECTED to fail until the code lands, so never gate this step \
+         on a green suite) that does NOT depend on the frontend/backend code steps, while \
+         every frontend/backend step depends_on it — the test-author must not be the \
+         code-author (de-biasing); a QA review step is separate. \
          JSON shape: {{\"steps\":[{{\"id\":\"scaffold\",\"title\":\"…\",\"seat\":\"…\",\
          \"kind\":\"build\",\"depends_on\":[],\"acceptance\":\"source-present\",\
          \"evidence\":[{{\"kind\":\"file-exists\",\"path\":\"src/App.tsx\"}}]}}],\
@@ -2882,6 +3182,403 @@ mod tests {
             "no PM/architect step ⇒ no invented core-doc evidence: {:?}",
             ev_of(&no_pm, "ui")
         );
+    }
+
+    // ── Structural team deliverables: QA test-authoring + designer design-tokens ──
+
+    #[test]
+    fn skeleton_inserts_qa_test_authoring_and_design_tokens_steps() {
+        // GAP5 / B2#3: "QA writes tests before code" and "designer ships design-tokens"
+        // are STRUCTURAL guarantees, not prompt requests. A brain plan with only code
+        // steps must, on a deliberate UI-bearing route, gain BOTH prep steps AFTER the
+        // doc chain: the QA test-authoring step (authored-tests evidence, NOT a green
+        // suite) and the designer tokens step (DesignTokensPresent acceptance) — and
+        // the code steps must be wired BEHIND them (test-first / tokens-first).
+        let p = plan(vec![
+            step_seat(
+                "fe",
+                &[],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "be",
+                &[],
+                Seat::BackendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized(Some(("demo", true)))
+        .expect("usable");
+        // Head order: the three docs, then the code-phase prep (test-plan → tokens).
+        let head: Vec<&str> = p.steps.iter().take(5).map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            head,
+            vec![
+                "umadev-phase-prd",
+                "umadev-phase-architecture",
+                "umadev-phase-uiux",
+                "umadev-phase-test-plan",
+                "umadev-phase-design-tokens",
+            ],
+            "docs first, then the QA test-authoring + designer tokens prep"
+        );
+        // QA test-authoring: evidence = "the authored tests EXIST", never TestPasses
+        // (tests are written BEFORE the code they check — a green-suite bar here
+        // would deadlock the plan behind its own dependents).
+        let qa = p
+            .steps
+            .iter()
+            .find(|s| s.id == "umadev-phase-test-plan")
+            .unwrap();
+        assert_eq!(qa.seat, Seat::QaEngineer);
+        assert_eq!(qa.kind, StepKind::Build);
+        assert!(
+            qa.evidence.contains(&EvidenceContract::FileExists {
+                path: "tests".to_string()
+            }),
+            "the QA step's bar is authored-tests-exist: {:?}",
+            qa.evidence
+        );
+        assert!(
+            !qa.evidence
+                .iter()
+                .any(|c| matches!(c, EvidenceContract::TestPasses { .. })),
+            "the seat floor's TestPasses must NOT bind a test-authoring step: {:?}",
+            qa.evidence
+        );
+        // Test-authoring waits for the docs to be locked (so it runs AFTER the
+        // docs_confirm gate, which fires when the doc family completes).
+        for d in [
+            "umadev-phase-prd",
+            "umadev-phase-architecture",
+            "umadev-phase-uiux",
+        ] {
+            assert!(
+                qa.depends_on.contains(&d.to_string()),
+                "the QA step depends on doc anchor {d}: {:?}",
+                qa.depends_on
+            );
+        }
+        // Designer tokens: the bar lives on the AcceptanceSpec axis with EMPTY
+        // evidence — a non-empty evidence list would route verification down the
+        // evidence path and silently bypass the DesignTokensPresent check.
+        let tokens = p
+            .steps
+            .iter()
+            .find(|s| s.id == "umadev-phase-design-tokens")
+            .unwrap();
+        assert_eq!(tokens.seat, Seat::UiuxDesigner);
+        assert_eq!(tokens.acceptance, AcceptanceSpec::DesignTokensPresent);
+        assert!(
+            tokens.evidence.is_empty(),
+            "the tokens step keeps empty evidence (the acceptance IS the bar; the \
+             doc-evidence floor must not bolt the uiux doc onto it): {:?}",
+            tokens.evidence
+        );
+        assert!(is_design_tokens_step(tokens));
+        // The uiux DOC step is NOT converted by the designer seat floor — it stays
+        // the doc author (FileExists on the uiux doc, weak acceptance untouched).
+        let uiux = p
+            .steps
+            .iter()
+            .find(|s| s.id == "umadev-phase-uiux")
+            .unwrap();
+        assert_eq!(uiux.acceptance, AcceptanceSpec::SourcePresent);
+        assert!(!is_design_tokens_step(uiux));
+        // TEST-FIRST + TOKENS-FIRST ordering: both code steps build against the
+        // authored tests; the frontend additionally waits for the tokens.
+        assert!(deps_of(&p, "fe").contains(&"umadev-phase-test-plan".to_string()));
+        assert!(deps_of(&p, "be").contains(&"umadev-phase-test-plan".to_string()));
+        assert!(deps_of(&p, "fe").contains(&"umadev-phase-design-tokens".to_string()));
+        assert!(
+            !deps_of(&p, "be").contains(&"umadev-phase-design-tokens".to_string()),
+            "only the frontend imports the tokens"
+        );
+        // The DAG stays schedulable end-to-end (docs → prep → code).
+        assert!(!p.ready_steps().is_empty());
+    }
+
+    #[test]
+    fn skeleton_inserts_test_plan_but_no_tokens_step_on_a_non_ui_build() {
+        // needs_ui == false: the QA test-authoring guarantee still holds (test-first
+        // is not a UI concern) but no designer tokens step is invented.
+        let p = plan(vec![step_seat(
+            "api",
+            &[],
+            Seat::BackendEngineer,
+            StepKind::Build,
+            AcceptanceSpec::SourcePresent,
+        )])
+        .normalized(Some(("demo", false)))
+        .expect("usable");
+        assert!(p.steps.iter().any(|s| s.id == "umadev-phase-test-plan"));
+        assert!(
+            !p.steps.iter().any(|s| s.id == "umadev-phase-design-tokens"),
+            "no tokens step on a UI-less build"
+        );
+        assert!(deps_of(&p, "api").contains(&"umadev-phase-test-plan".to_string()));
+        let qa = p
+            .steps
+            .iter()
+            .find(|s| s.id == "umadev-phase-test-plan")
+            .unwrap();
+        for d in ["umadev-phase-prd", "umadev-phase-architecture"] {
+            assert!(qa.depends_on.contains(&d.to_string()));
+        }
+    }
+
+    #[test]
+    fn skeleton_adopts_a_precode_qa_step_and_a_brain_tokens_step() {
+        // Idempotence: a brain plan that ALREADY carries a pre-code QA test-authoring
+        // step and a designer tokens step keeps them — no umadev-phase duplicate is
+        // inserted; the skeleton only wires the ordering edges. The adopted BARE QA
+        // step gains the authored-tests evidence (pre-empting the seat floor's
+        // TestPasses, which cannot pass before the code exists).
+        let p = plan(vec![
+            step_seat(
+                "prd",
+                &[],
+                Seat::ProductManager,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "arch",
+                &["prd"],
+                Seat::Architect,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "uiux",
+                &["arch"],
+                Seat::UiuxDesigner,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "qa-author",
+                &["arch"],
+                Seat::QaEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "tokens",
+                &["uiux"],
+                Seat::UiuxDesigner,
+                StepKind::Build,
+                AcceptanceSpec::DesignTokensPresent,
+            ),
+            step_seat(
+                "fe",
+                &[],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "be",
+                &[],
+                Seat::BackendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized(Some(("demo", true)))
+        .expect("usable");
+        assert!(
+            !p.steps
+                .iter()
+                .any(|s| s.id.starts_with("umadev-phase-test-plan")
+                    || s.id.starts_with("umadev-phase-design-tokens")
+                    || s.id.starts_with("umadev-phase-uiux")),
+            "nothing is duplicated when the brain already planned the deliverables: {:?}",
+            p.steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>()
+        );
+        // The adopted bare QA step gained the authored-tests bar, not TestPasses.
+        assert!(
+            ev_of(&p, "qa-author").contains(&EvidenceContract::FileExists {
+                path: "tests".to_string()
+            })
+        );
+        assert!(!ev_of(&p, "qa-author")
+            .iter()
+            .any(|c| matches!(c, EvidenceContract::TestPasses { .. })));
+        // The code steps were wired behind the brain's OWN prep steps.
+        for code in ["fe", "be"] {
+            assert!(
+                deps_of(&p, code).contains(&"qa-author".to_string()),
+                "{code} builds against the authored tests: {:?}",
+                deps_of(&p, code)
+            );
+        }
+        assert!(deps_of(&p, "fe").contains(&"tokens".to_string()));
+        // The adopted tokens step kept its acceptance bar and empty evidence (the
+        // doc-evidence floor exempts it — it is NOT the uiux doc author).
+        assert!(ev_of(&p, "tokens").is_empty());
+    }
+
+    #[test]
+    fn skeleton_inserts_its_own_test_plan_when_the_brain_qa_step_needs_a_green_suite() {
+        // A brain QA step whose bar REQUIRES passing tests (acceptance build-test, per
+        // an older prompt) cannot run before the code exists — adopting it as the
+        // test-first anchor would deadlock the plan behind its own dependents. The
+        // skeleton inserts its OWN safe test-authoring step instead and wires the code
+        // behind THAT; the brain's step is left as planned.
+        let p = plan(vec![
+            step_seat(
+                "qa-green",
+                &[],
+                Seat::QaEngineer,
+                StepKind::Build,
+                AcceptanceSpec::BuildTest,
+            ),
+            step_seat(
+                "fe",
+                &[],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized(Some(("demo", true)))
+        .expect("usable");
+        assert!(
+            p.steps.iter().any(|s| s.id == "umadev-phase-test-plan"),
+            "a green-suite QA step is not a safe pre-code anchor — insert our own"
+        );
+        assert!(deps_of(&p, "fe").contains(&"umadev-phase-test-plan".to_string()));
+        assert!(
+            !deps_of(&p, "fe").contains(&"qa-green".to_string()),
+            "the code is never wired behind a bar that needs the code built first"
+        );
+        // The brain's own step survives untouched (acceptance never downgraded).
+        assert_eq!(
+            p.steps
+                .iter()
+                .find(|s| s.id == "qa-green")
+                .unwrap()
+                .acceptance,
+            AcceptanceSpec::BuildTest
+        );
+    }
+
+    #[test]
+    fn tokens_orientation_survives_a_brain_tokens_step_depending_on_code() {
+        // A pathological brain tokens step that depends on the frontend it should
+        // precede. The skeleton DE-BIASES the adopted tokens step (its code deps are
+        // stripped) BEFORE wiring frontend→tokens, so the orientation survives
+        // deterministically — never left to an arbitrary cycle-break edge choice.
+        let p = plan(vec![
+            step_seat(
+                "tokens",
+                &["fe"],
+                Seat::UiuxDesigner,
+                StepKind::Build,
+                AcceptanceSpec::DesignTokensPresent,
+            ),
+            step_seat(
+                "fe",
+                &[],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized(Some(("demo", true)))
+        .expect("usable");
+        assert!(
+            !deps_of(&p, "tokens").contains(&"fe".to_string()),
+            "the tokens step's code dep is stripped (tokens precede the code): {:?}",
+            deps_of(&p, "tokens")
+        );
+        assert!(
+            deps_of(&p, "fe").contains(&"tokens".to_string()),
+            "the frontend still builds on the tokens: {:?}",
+            deps_of(&p, "fe")
+        );
+    }
+
+    #[test]
+    fn designer_build_step_gains_the_design_tokens_floor_when_bare() {
+        // The designer arm of the per-seat floor (GAP5): a bare UIUX build step on a
+        // lean route is upgraded to the DesignTokensPresent acceptance — the seat's
+        // anti-theatre bar (real design-tokens files, not a narrated design system).
+        // A frontend peer keeps the plan below the wholesale backstop.
+        let p = plan(vec![
+            step_seat(
+                "design",
+                &[],
+                Seat::UiuxDesigner,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "ui",
+                &[],
+                Seat::FrontendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized(None)
+        .expect("usable");
+        let design = p.steps.iter().find(|s| s.id == "design").unwrap();
+        assert_eq!(
+            design.acceptance,
+            AcceptanceSpec::DesignTokensPresent,
+            "a bare designer build step is judged by its tokens deliverable"
+        );
+        assert!(
+            design.evidence.is_empty(),
+            "the designer floor lives on the acceptance axis — no evidence bolted on"
+        );
+    }
+
+    #[test]
+    fn contract_first_orientation_survives_architect_depending_on_an_engineer() {
+        // The empirically-reproduced docs-first bypass: the brain planned "document
+        // the API after implementation" (architect depends_on the backend step).
+        // enforce_contract_first must DE-BIAS the contract author (strip its code
+        // deps) BEFORE adding the code→contract edges, so the orientation is
+        // deterministic — previously break_dependency_cycles dropped an ARBITRARY
+        // back-edge, which could be the contract-first edge itself, letting the
+        // backend run before the architecture doc.
+        let p = plan(vec![
+            step_seat(
+                "arch",
+                &["be"],
+                Seat::Architect,
+                StepKind::Build,
+                AcceptanceSpec::Contract,
+            ),
+            step_seat(
+                "be",
+                &[],
+                Seat::BackendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized(None)
+        .expect("usable");
+        assert!(
+            !deps_of(&p, "arch").contains(&"be".to_string()),
+            "the architect's dep on the code it specifies is stripped: {:?}",
+            deps_of(&p, "arch")
+        );
+        assert!(
+            deps_of(&p, "be").contains(&"arch".to_string()),
+            "the backend depends on the locked contract (orientation survives): {:?}",
+            deps_of(&p, "be")
+        );
+        // And the contract step is what's ready first.
+        let ready: Vec<_> = p.ready_steps().iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ready, vec!["arch"]);
     }
 
     #[test]
