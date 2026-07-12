@@ -445,6 +445,23 @@ pub struct PlanStepRow {
     pub seat: String,
 }
 
+/// Plain-text status glyph for a plan step — the SAME marks the live `/plan`
+/// transcript card renders (`done` `[x]`, `active` `[~]`, `blocked` `[!]`, any
+/// other/pending `[ ]`). Shared by [`App::show_plan_status`] and the
+/// build-completion card so the card's persisted task breakdown matches the
+/// panel exactly and the glyph map lives in ONE place. Fail-open: an unknown
+/// status falls through to `[ ]`. (The colored ratatui panel uses its own
+/// styled `checklist_glyph` in `ui.rs`; this is the plain-markdown twin.)
+#[must_use]
+fn plan_step_glyph(status: &str) -> &'static str {
+    match status {
+        "done" => "[x]",
+        "active" => "[~]",
+        "blocked" => "[!]",
+        _ => "[ ]",
+    }
+}
+
 /// Lifecycle status of a background run task tracked by the [`App`] task
 /// registry. A workspace-mutating run is single-writer, so at most one task is
 /// [`Running`](Self::Running) at a time; the rest are settled history rows.
@@ -10807,12 +10824,7 @@ impl App {
                 umadev_i18n::t(self.lang, "plan.panel.title")
             ));
             for step in &self.plan_steps {
-                let mark = match step.status.as_str() {
-                    "done" => "[x]",
-                    "active" => "[~]",
-                    "blocked" => "[!]",
-                    _ => "[ ]",
-                };
+                let mark = plan_step_glyph(step.status.as_str());
                 body.push_str(&format!("  {mark} {} · {}\n", step.id, step.title));
             }
         }
@@ -12127,6 +12139,54 @@ impl App {
         ];
         let lang = self.lang;
         let mut lines: Vec<String> = vec![umadev_i18n::t(lang, "build.complete.title").to_string()];
+
+        // Per-step task breakdown — the FINAL status of every plan step, with the
+        // SAME glyphs + `done/total` count the live `/plan` panel used. This is the
+        // card's whole reason for existing after a build ends: the live plan panel
+        // is cleared on finish (`finalize_live_panels`), so without this the user
+        // loses all visibility into WHICH tasks landed DONE, which are BLOCKED, and
+        // which stayed INCOMPLETE — the exact loss the user reported, worst when a
+        // build ends withheld (delivery blocked). Read here, in `build_completion_card`
+        // (called by `post_build_completion_card` BEFORE it clears the rows), so the
+        // statuses are still live. Omitted for a plan-less chat/Fast build so there's
+        // never an empty "tasks" block.
+        if !self.plan_steps.is_empty() {
+            let done = self
+                .plan_steps
+                .iter()
+                .filter(|s| s.status == "done")
+                .count();
+            let total = self.plan_steps.len();
+            let mut section =
+                umadev_i18n::tf(lang, "build.complete.tasks", &[&format!("{done}/{total}")]);
+            // When the build did NOT finish every step, lead with an unmissable
+            // one-liner naming how many blocked vs. still-unfinished — the user's
+            // core ask ("show me which are BLOCKED, which INCOMPLETE") surfaced up
+            // front, not buried in the list.
+            if done < total {
+                let blocked = self
+                    .plan_steps
+                    .iter()
+                    .filter(|s| s.status == "blocked")
+                    .count();
+                let unfinished = total - done - blocked;
+                section.push('\n');
+                section.push_str(&umadev_i18n::tf(
+                    lang,
+                    "build.complete.tasks_incomplete",
+                    &[&blocked.to_string(), &unfinished.to_string()],
+                ));
+            }
+            for step in &self.plan_steps {
+                section.push_str(&format!(
+                    "\n  {} {} · {}",
+                    plan_step_glyph(step.status.as_str()),
+                    step.id,
+                    step.title
+                ));
+            }
+            lines.push(section);
+        }
 
         // Changed files — the real working-tree delta from `git status`. Capped
         // for readability with a "+N more". Fail-open: a non-git workspace (or an
@@ -17099,6 +17159,90 @@ mod tests {
         assert!(
             card.contains("src"),
             "falls back to naming an output dir: {card}"
+        );
+    }
+
+    #[test]
+    fn build_completion_card_persists_task_statuses_before_panel_clears() {
+        // The user's core ask: when a build finishes — worst when it ends
+        // INCOMPLETE — the completion card must carry the per-step task
+        // breakdown (which are DONE, BLOCKED, INCOMPLETE), because the live
+        // `/plan` panel is cleared right after. This proves the ordering holds:
+        // `post_build_completion_card` reads the rows for the card BEFORE
+        // `finalize_live_panels` clears them, so the statuses survive in the
+        // transcript even though the panel goes away.
+        let (mut app, _tmp) = temp_app();
+        // Real source so a completion card is legitimate; a non-web project so
+        // no dev server is started under the unit test.
+        std::fs::create_dir_all(app.project_root.join("src")).unwrap();
+        std::fs::write(app.project_root.join("src").join("main.rs"), "fn main(){}").unwrap();
+        // A plan that ended INCOMPLETE: 2 done, 1 blocked, 1 pending.
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · scaffold (frontend)".into(),
+                "s2 · login route (backend)".into(),
+                "s3 · login form (frontend)".into(),
+                "s4 · e2e review (qa)".into(),
+            ],
+            statuses: vec![
+                "done".into(),
+                "done".into(),
+                "blocked".into(),
+                "pending".into(),
+            ],
+            done: 2,
+            total: 4,
+        });
+        // Build + push the card through the REAL finalize path (the one that
+        // also clears the live panel afterwards).
+        let target = app.post_build_completion_card();
+        assert!(target.is_none(), "non-web build resolves no preview target");
+        let card = app
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == ChatRole::UmaDev)
+            .expect("a completion card was pushed")
+            .body()
+            .clone();
+        // Same `done/total` convention as the live `/plan` panel.
+        assert!(card.contains("2/4"), "card carries the done count: {card}");
+        // Every step with its final glyph — DONE / BLOCKED / INCOMPLETE visible.
+        assert!(card.contains("[x] s1"), "done step checked: {card}");
+        assert!(card.contains("[!] s3"), "blocked step flagged: {card}");
+        assert!(card.contains("[ ] s4"), "pending step blank: {card}");
+        // The incomplete lead names 1 blocked + 1 unfinished (pending).
+        assert!(
+            card.contains(&umadev_i18n::tf(
+                app.lang,
+                "build.complete.tasks_incomplete",
+                &["1", "1"],
+            )),
+            "incomplete build leads with blocked/unfinished counts: {card}"
+        );
+        // The live panel is cleared AFTER the card captured the statuses.
+        assert!(
+            app.plan_steps.is_empty(),
+            "the live plan panel clears after the card is built"
+        );
+    }
+
+    #[test]
+    fn build_completion_card_omits_task_section_without_a_plan() {
+        // A plan-less chat/Fast build (no live plan) → NO empty "tasks" block:
+        // the section renders only when there are steps to report.
+        let (app, _tmp) = temp_app();
+        std::fs::create_dir_all(app.project_root.join("src")).unwrap();
+        assert!(app.plan_steps.is_empty());
+        let card = app.build_completion_card(false);
+        assert!(
+            !card.contains(&umadev_i18n::tf(app.lang, "build.complete.tasks", &["0/0"])),
+            "no task-status header when there is no plan: {card}"
+        );
+        // And no orphan glyph lines leak in.
+        assert!(
+            !card.contains("[x]") && !card.contains("[ ]"),
+            "no step glyphs: {card}"
         );
     }
 

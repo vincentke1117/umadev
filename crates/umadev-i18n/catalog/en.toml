@@ -329,6 +329,8 @@
 
 # Build-complete card (every effective build: chat / Fast / Delivery)
 "build.complete.title" = "✅ Build complete"
+"build.complete.tasks" = "**Task status** ({} done):"
+"build.complete.tasks_incomplete" = "Ended incomplete — {} blocked, {} unfinished"
 "build.complete.files" = "**Files changed** ({}):\n{}"
 "build.complete.files_more" = "\n  …and {} more"
 "build.complete.no_files" = "**Output dir**: {}"

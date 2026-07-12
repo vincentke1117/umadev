@@ -18,7 +18,11 @@
 //! Launch flags (from the headless stream-json contract):
 //! `claude --print --input-format stream-json --output-format stream-json
 //! --verbose --session-id <uuid> --permission-mode <acceptEdits|default>
-//! --allowedTools "Read,Edit,Write,Bash"` (+ optional `--append-system-prompt`).
+//! --allowedTools <read-only + research + sub-agent set; auto adds the mutating
+//! Edit/Write/Bash/NotebookEdit>` (+ optional `--append-system-prompt`). The base's
+//! native read/research/delegate tools (incl. `Agent`/`Task` sub-agents) are
+//! pre-approved so they run natively instead of eating a per-tool approval — see
+//! [`GUARDED_ALLOWED_TOOLS`] / [`AUTO_ALLOWED_TOOLS`].
 //! We deliberately use `--append-system-prompt` (NOT `--system-prompt`, which
 //! would replace the tool guidance and degrade the base into a chat box).
 //!
@@ -547,6 +551,37 @@ fn maybe_divert_firmware(
     divert_append_system_to_file_in(args.to_vec(), &std::env::temp_dir())
 }
 
+/// The read-only + research + delegate native tools UmaDev ALWAYS pre-approves —
+/// even in Guarded — so the base keeps its native capabilities under UmaDev instead
+/// of eating a `can_use_tool` round-trip (and, in interactive Guarded chat, a
+/// confusing user pause that fail-open DENIES) for every `Grep` / `Glob` /
+/// `WebSearch` / `WebFetch` / `TodoWrite` and every sub-agent spawn. `Agent` / `Task`
+/// (the current + legacy sub-agent tool names) are pre-approved so the base's OWN
+/// sub-agents (Explore etc.) run natively; a sub-agent's own `Edit` / `Write` /
+/// `Bash` still pass through governance (it runs in the SAME claude process, so the
+/// PreToolUse hook + the per-tool floor still gate its mutations). Every tool here is
+/// read-only / side-effect-free, so pre-approving them bypasses NO write governance.
+/// Honors the "inject NOTHING — the base's native capabilities run" contract.
+const GUARDED_ALLOWED_TOOLS: &str = "Read,Grep,Glob,WebSearch,WebFetch,TodoWrite,Agent,Task";
+
+/// AUTO additionally pre-approves the MUTATING working set (`Edit` / `Write` / `Bash`
+/// / `NotebookEdit`) so an unattended autonomous run is never interrupted by a
+/// per-tool prompt — the autonomy tier the user opted into.
+const AUTO_ALLOWED_TOOLS: &str =
+    "Read,Edit,Write,Bash,Grep,Glob,WebSearch,WebFetch,TodoWrite,NotebookEdit,Agent,Task";
+
+/// The `--allowedTools` value for an autonomy tier: AUTO pre-approves the mutating set
+/// too; GUARDED / plan pre-approves only the read-only + research + sub-agent set so
+/// `Edit` / `Write` / `Bash` still hit UmaDev's per-tool trust floor.
+#[must_use]
+fn allowed_tools_for(autonomous: bool) -> String {
+    if autonomous {
+        AUTO_ALLOWED_TOOLS.to_string()
+    } else {
+        GUARDED_ALLOWED_TOOLS.to_string()
+    }
+}
+
 /// The argument vector preceding any input — the stream-json continuous-session
 /// flags. Exposed for tests. `--append-system-prompt` (NOT `--system-prompt`).
 ///
@@ -593,19 +628,7 @@ pub fn session_args(
         "--permission-mode".to_string(),
         permission_mode,
         "--allowedTools".to_string(),
-        if autonomous {
-            // AUTO: pre-approve the full working set so no per-tool prompt interrupts.
-            "Read,Edit,Write,Bash".to_string()
-        } else {
-            // GUARDED / plan: pre-approve ONLY the read-only Read. Edit/Write/Bash are the
-            // MUTATING tools guarded must GATE - leaving them off the allowlist makes claude
-            // raise a `can_use_tool` control request for each, which UmaDev's always-on trust
-            // floor answers (allow a reversible in-tree edit, DENY an irreversible action).
-            // The old unconditional allowlist pre-approved them, so under Guarded a Write /
-            // Bash ran WITHOUT ever hitting UmaDev's per-tool floor - the guarded gate was
-            // silently bypassed (P1). Read stays auto so file reads never prompt.
-            "Read".to_string()
-        },
+        allowed_tools_for(autonomous),
     ];
     push_max_turns(&mut args, max_turns);
     if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
@@ -689,19 +712,7 @@ pub fn resume_session_args(
         "--permission-mode".to_string(),
         permission_mode,
         "--allowedTools".to_string(),
-        if autonomous {
-            // AUTO: pre-approve the full working set so no per-tool prompt interrupts.
-            "Read,Edit,Write,Bash".to_string()
-        } else {
-            // GUARDED / plan: pre-approve ONLY the read-only Read. Edit/Write/Bash are the
-            // MUTATING tools guarded must GATE - leaving them off the allowlist makes claude
-            // raise a `can_use_tool` control request for each, which UmaDev's always-on trust
-            // floor answers (allow a reversible in-tree edit, DENY an irreversible action).
-            // The old unconditional allowlist pre-approved them, so under Guarded a Write /
-            // Bash ran WITHOUT ever hitting UmaDev's per-tool floor - the guarded gate was
-            // silently bypassed (P1). Read stays auto so file reads never prompt.
-            "Read".to_string()
-        },
+        allowed_tools_for(autonomous),
     ];
     push_max_turns(&mut args, max_turns);
     if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
@@ -1350,20 +1361,37 @@ mod tests {
     /// answers, so the human-in-the-loop / irreversible-action floor is live).
     #[test]
     fn guarded_gates_mutating_tools_but_auto_pre_approves_all() {
-        // P1: under GUARDED (autonomous=false) the allowlist pre-approves ONLY the read-only
-        // Read, so Edit/Write/Bash each raise a `can_use_tool` control request that UmaDev
-        // trust floor gates (they were unconditionally pre-approved before, silently BYPASSING
-        // the guarded gate). AUTO pre-approves the full set (no prompts).
+        // P1: under GUARDED (autonomous=false) the allowlist pre-approves the read-only +
+        // research + sub-agent set but NOT the MUTATING tools (Edit/Write/Bash/NotebookEdit),
+        // so each mutation still raises a `can_use_tool` control request that UmaDev's trust
+        // floor gates (the guarded gate must not be silently bypassed). The base's native
+        // read/research/delegate tools (incl. Agent/Task sub-agents) ARE pre-approved so they
+        // run natively instead of eating a per-tool pause. AUTO pre-approves the full set.
         let guarded = session_args("sid", None, false, None);
         let t = guarded.iter().position(|a| a == "--allowedTools").unwrap();
-        assert_eq!(
-            guarded[t + 1],
-            "Read",
-            "guarded pre-approves only the read-only Read; mutating tools hit the gate"
-        );
+        assert_eq!(guarded[t + 1], GUARDED_ALLOWED_TOOLS);
+        for mutating in ["Edit", "Write", "Bash", "NotebookEdit"] {
+            assert!(
+                !guarded[t + 1].split(',').any(|x| x == mutating),
+                "guarded must NOT pre-approve the mutating tool {mutating} (it must hit the gate)"
+            );
+        }
+        for native in ["Agent", "Task", "Grep", "Glob", "WebSearch"] {
+            assert!(
+                guarded[t + 1].split(',').any(|x| x == native),
+                "guarded must pre-approve the read-only/delegate tool {native} so it runs natively"
+            );
+        }
         let auto = session_args("sid", None, true, None);
         let t = auto.iter().position(|a| a == "--allowedTools").unwrap();
-        assert_eq!(auto[t + 1], "Read,Edit,Write,Bash");
+        assert_eq!(auto[t + 1], AUTO_ALLOWED_TOOLS);
+        // Auto pre-approves the mutating set too (the autonomy tier the user opted into).
+        for tool in ["Edit", "Write", "Bash", "Agent", "Task"] {
+            assert!(
+                auto[t + 1].split(',').any(|x| x == tool),
+                "auto must pre-approve {tool}"
+            );
+        }
     }
 
     #[test]
@@ -1462,7 +1490,7 @@ mod tests {
         );
         // Writable toolset (Write/Edit), NOT the read-only fork allowlist.
         let tools = args.iter().position(|a| a == "--allowedTools").unwrap();
-        assert_eq!(args[tools + 1], "Read,Edit,Write,Bash");
+        assert_eq!(args[tools + 1], AUTO_ALLOWED_TOOLS);
         // Permission mode tracks autonomy exactly like a fresh start.
         let perm = args.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(args[perm + 1], "acceptEdits", "autonomous → acceptEdits");

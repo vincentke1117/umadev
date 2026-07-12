@@ -324,6 +324,8 @@
 
 # Build-complete card (every effective build: chat / Fast / Delivery)
 "build.complete.title" = "✅ 构建完成"
+"build.complete.tasks" = "**任务完成情况**({} 完成):"
+"build.complete.tasks_incomplete" = "未完全交付 —— {} 项受阻、{} 项未完成"
 "build.complete.files" = "**改动的文件**({} 个):\n{}"
 "build.complete.files_more" = "\n  …还有 {} 个"
 "build.complete.no_files" = "**产出目录**:{}"
