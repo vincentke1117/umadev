@@ -3320,18 +3320,23 @@ fn render_title_row(frame: &mut Frame, area: Rect, app: &App) {
         format!(" {} ", app.backend.as_deref().unwrap_or("offline")),
         Style::default().fg(theme::TEXT_MUTED()),
     );
-    let line = Line::from(vec![
-        title,
-        Span::styled("·", Style::default().fg(theme::BORDER())),
-        slug,
-        Span::styled("·", Style::default().fg(theme::BORDER())),
-        base,
-        Span::styled("·", Style::default().fg(theme::BORDER())),
-        phase,
-    ]);
+    let sep = || Span::styled("·", Style::default().fg(theme::BORDER()));
+    let mut segs: Vec<Span<'static>> = vec![title, sep(), slug, sep(), base, sep(), phase];
+    // Worst-case width guard (same [`disp_width_cjk`] budget as the meta row):
+    // the `·` separators are East-Asian-AMBIGUOUS (2 cells on CJK-locale
+    // terminals), so a title line built to the narrow table could physically
+    // overflow and wrap on Chinese Windows. Drop the right-most segment (with
+    // its separator) until the worst-case width fits the row.
+    let seg_w = |s: &Span<'_>| disp_width_cjk(s.content.as_ref());
+    let mut used: usize = segs.iter().map(seg_w).sum();
+    while used > usize::from(area.width) && segs.len() > 2 {
+        used -= segs.pop().map_or(0, |s| seg_w(&s)); // the segment
+        used -= segs.pop().map_or(0, |s| seg_w(&s)); // its `·` separator
+    }
+    let line = Line::from(segs);
     // Fill the rest of the row with a faint rule so it reads as a divider.
     let mut rule = String::new();
-    for _ in 0..area.width.saturating_sub(40) {
+    for _ in 0..title_rule_cols(area.width) {
         rule.push('─');
     }
     let para = Paragraph::new(vec![
@@ -3339,6 +3344,18 @@ fn render_title_row(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(Span::styled(rule, Style::default().fg(theme::BORDER()))),
     ]);
     frame.render_widget(para, area);
+}
+
+/// Columns of `─` the title-row divider may draw: the historical
+/// `width - 40` fill, additionally capped at HALF the row. `─` (U+2500) is
+/// East-Asian-AMBIGUOUS — CJK-locale terminals (Chinese-locale Windows)
+/// render it 2 cells wide — so `n` rule chars must be budgeted as `2n`
+/// columns (the same [`disp_width_cjk`] margin the meta row applies). A rule
+/// that under-fills just ends early; one that overflows physically wraps the
+/// row and drags the whole frame below it out of alignment.
+fn title_rule_cols(width: u16) -> usize {
+    let w = usize::from(width);
+    w.saturating_sub(40).min(w / 2)
 }
 
 /// The scrolling transcript — opencode-style. Each message is a block with a
@@ -4747,6 +4764,18 @@ fn disp_width(s: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(s)
 }
 
+/// Worst-case display columns: the East-Asian width table with AMBIGUOUS
+/// characters counted as 2 cells. `·` (U+00B7), `─` (U+2500), `—` (U+2014),
+/// `…` (U+2026) and the rest of the ambiguous class are 1 cell on Western
+/// terminals but 2 on CJK-locale ones (Chinese-locale Windows console being
+/// the reported case). Rows that must never physically wrap are budgeted
+/// against THIS width, not [`disp_width`]: under-filling is always safe
+/// (ratatui pads the row), overflowing shoves the tail past the terminal edge
+/// and wraps it down the next line, corrupting the frame.
+fn disp_width_cjk(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width_cjk(s)
+}
+
 /// Left-align `s` and pad with spaces to at least `width` DISPLAY columns (CJK
 /// glyphs are 2 columns wide). Rust's `format!("{:<width$}")` pads by `char`
 /// count, so a CJK label under-pads — `简体中文` is 4 chars but 8 columns — and
@@ -4758,6 +4787,24 @@ fn pad_to_width(s: &str, width: usize) -> String {
     out.push_str(s);
     for _ in w..width {
         out.push(' ');
+    }
+    out
+}
+
+/// Truncate `s` to at most `max` WORST-CASE display columns (ambiguous = 2,
+/// see [`disp_width_cjk`]), char-aligned so a glyph is never split. Used by
+/// the meta row's right-pinned status so it can never physically overflow a
+/// terminal that renders `·` / `—` two cells wide.
+fn truncate_to_width_cjk(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0usize;
+    for c in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0);
+        if col + cw > max {
+            break;
+        }
+        out.push(c);
+        col += cw;
     }
     out
 }
@@ -5581,36 +5628,11 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         visible_rows,
     ));
 
-    // Placeholder (Claude Code style: dim hint when empty). Localized. `Cow` so
-    // the state hints stay borrowed from the static catalog while the I9
-    // first-run example tip (an owned, file-substituted String) can slot in.
-    let placeholder: std::borrow::Cow<'_, str> = if app.active_gate.is_some() {
-        umadev_i18n::t(app.lang, "input.gate").into()
-    } else if app.thinking || app.tool_in_progress {
-        // ACTIVELY working a turn (a chat reply streaming, or a tool running) —
-        // show the interruptible "running" hint. This MUST win over `aborted`
-        // below: a chat turn doesn't fire `PipelineStarted` (only a build does),
-        // so a stale `aborted` from a PRIOR block would otherwise persist and the
-        // placeholder wrongly read "本轮已中止" while the base was replying normally
-        // (user-reported). A live turn is, by definition, not aborted.
-        umadev_i18n::t(app.lang, "input.running").into()
-    } else if app.finished {
-        umadev_i18n::t(app.lang, "input.finished").into()
-    } else if app.aborted {
-        // The round bailed — tell the user to re-enter a requirement, NOT that a
-        // run is still in flight (which the bare `run_started` branch below would
-        // wrongly imply, since `run_started` stays set on an aborted block).
-        umadev_i18n::t(app.lang, "input.aborted").into()
-    } else if app.run_started {
-        umadev_i18n::t(app.lang, "input.running").into()
-    } else if let Some(tip) = app.first_run_example_tip() {
-        // I9 — idle + empty + first-run: a rotating "try this" example above the
-        // plain idle hint, teaching the prompt surface by demonstration. Vanishes
-        // the moment the user types (the box is no longer empty) or interacts.
-        tip.into()
-    } else {
-        umadev_i18n::t(app.lang, "input.idle").into()
-    };
+    // Placeholder (Claude Code style: dim hint when empty). Localized. See
+    // `input_placeholder` for the precedence: special states (gate / running /
+    // finished / aborted) win; a plain idle empty box rotates through the
+    // example + command-hint pool.
+    let placeholder = input_placeholder(app);
 
     // Build the wrapped input: row 0 carries the `>_ ` mode prefix; wrapped
     // continuation rows are indented 3 cols so they align under the text.
@@ -5701,12 +5723,16 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     // `None` mid-turn (the activity indicator above the input already proves
     // motion). Reused by both the gate-branch meta row and the normal one.
     let status = status_text_and_color(app);
-    // Context line beneath the input box: model / backend / hints.
+    // Context line beneath the input box: model / backend / state tag. `None`
+    // when idle — the keyboard / `/help` hints that used to sit here
+    // permanently now rotate through the input-box placeholder instead
+    // (`App::idle_placeholder`), keeping the meta row slim: brand · backend ·
+    // trust chip · model · gauges.
     let backend = app.backend.as_deref().unwrap_or("offline");
-    let hint: String = if !app.mention_matches().is_empty() {
-        umadev_i18n::t(app.lang, "tui.hint.mention").into()
+    let hint: Option<String> = if !app.mention_matches().is_empty() {
+        Some(umadev_i18n::t(app.lang, "tui.hint.mention").into())
     } else if app.input.starts_with('/') {
-        umadev_i18n::t(app.lang, "tui.hint.palette").into()
+        Some(umadev_i18n::t(app.lang, "tui.hint.palette").into())
     } else if let Some(gate) = app.active_gate {
         let mut gate_parts = vec![
             (
@@ -5726,26 +5752,28 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         }
         return meta_row(frame, prompt_chunks[1], border_color, &gate_parts, status);
     } else if app.input.contains('\n') {
-        umadev_i18n::t(app.lang, "tui.hint.multiline").into()
+        Some(umadev_i18n::t(app.lang, "tui.hint.multiline").into())
     } else if !app.input.is_empty() {
-        umadev_i18n::t(app.lang, "tui.hint.typed").into()
+        Some(umadev_i18n::t(app.lang, "tui.hint.typed").into())
     } else if app.thinking || app.tool_in_progress {
         // ACTIVELY working (a reply streaming / a tool running) — show the
         // interruptible running hint. Must win over `finished`/`aborted`: a stale
         // terminal flag from a prior block would otherwise paint "[aborted] 本轮已停止"
         // under a build that is plainly still reading files and thinking
         // (user-reported, with a screenshot). A live turn is not aborted.
-        umadev_i18n::t(app.lang, "tui.hint.running").into()
+        Some(umadev_i18n::t(app.lang, "tui.hint.running").into())
     } else if app.finished {
-        umadev_i18n::t(app.lang, "tui.hint.finished").into()
+        Some(umadev_i18n::t(app.lang, "tui.hint.finished").into())
     } else if app.aborted {
         // Aborted round — the hint must match the `[aborted]` status, not the
         // "wait for the next gate" line a live run shows.
-        umadev_i18n::t(app.lang, "tui.hint.aborted").into()
+        Some(umadev_i18n::t(app.lang, "tui.hint.aborted").into())
     } else if app.run_started {
-        umadev_i18n::t(app.lang, "tui.hint.running").into()
+        Some(umadev_i18n::t(app.lang, "tui.hint.running").into())
     } else {
-        umadev_i18n::t(app.lang, "tui.hint.idle").into()
+        // Idle: no hint chip — `Enter 提交` / `/help 查看全部命令` moved into
+        // the rotating input placeholder, where they don't burn meta-row width.
+        None
     };
     // Trust-tier chip: plan (read-only) / guarded (review each gate) / auto.
     let mode = app.effective_trust_mode();
@@ -5819,18 +5847,90 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
             parts.push((gauge, color));
         }
     }
-    parts.push(("·".into(), theme::BORDER()));
-    parts.push((hint, theme::TEXT_MUTED()));
+    if let Some(hint) = hint {
+        parts.push(("·".into(), theme::BORDER()));
+        parts.push((hint, theme::TEXT_MUTED()));
+    }
     meta_row(frame, prompt_chunks[1], border_color, &parts, status);
+}
+
+/// The input-box placeholder for the current app state. Precedence: an open
+/// gate, then a live turn (`running`), then a settled block (`finished` /
+/// `aborted`), then a started run, then the I9 first-run example tip — and
+/// only for a plain idle empty box the rotating pool
+/// ([`App::idle_placeholder`]): example requirements + the command hints
+/// (`/help` / `/plan` / `Enter 提交`…) that used to sit permanently on the
+/// meta row. `Cow` so the state hints stay borrowed from the static catalog
+/// while the owned rotating / example strings slot in.
+fn input_placeholder(app: &App) -> std::borrow::Cow<'static, str> {
+    if app.active_gate.is_some() {
+        umadev_i18n::t(app.lang, "input.gate").into()
+    } else if app.thinking || app.tool_in_progress {
+        // ACTIVELY working a turn (a chat reply streaming, or a tool running) —
+        // show the interruptible "running" hint. This MUST win over `aborted`
+        // below: a chat turn doesn't fire `PipelineStarted` (only a build does),
+        // so a stale `aborted` from a PRIOR block would otherwise persist and the
+        // placeholder wrongly read "本轮已中止" while the base was replying normally
+        // (user-reported). A live turn is, by definition, not aborted.
+        umadev_i18n::t(app.lang, "input.running").into()
+    } else if app.finished {
+        umadev_i18n::t(app.lang, "input.finished").into()
+    } else if app.aborted {
+        // The round bailed — tell the user to re-enter a requirement, NOT that a
+        // run is still in flight (which the bare `run_started` branch below would
+        // wrongly imply, since `run_started` stays set on an aborted block).
+        umadev_i18n::t(app.lang, "input.aborted").into()
+    } else if app.run_started {
+        umadev_i18n::t(app.lang, "input.running").into()
+    } else if let Some(tip) = app.first_run_example_tip() {
+        // I9 — idle + empty + first-run: a rotating "try this" example above the
+        // plain idle hint, teaching the prompt surface by demonstration. Vanishes
+        // the moment the user types (the box is no longer empty) or interacts.
+        tip.into()
+    } else {
+        // Idle + empty: rotate through the placeholder pool (deterministic per
+        // submitted prompt, never per frame — no flicker).
+        app.idle_placeholder().into()
+    }
+}
+
+/// Decide how many leading meta-row `parts` fit a row of `width` columns on a
+/// WORST-CASE terminal — every char budgeted at [`disp_width_cjk`], so `·`
+/// (U+00B7) and friends count 2 cells as Chinese-locale Windows actually
+/// renders them. Each part costs its text plus the one-space gap `meta_row`
+/// appends; the leading pad space costs 1. Chips drop from the RIGHT until the
+/// row fits, and a right-most orphaned `·` separator drops with its chip so
+/// the row never ends on a dangling dot. Returns `(kept, used)`: the number of
+/// leading parts to render and their worst-case column footprint.
+fn meta_row_fit(parts: &[(String, Color)], width: usize) -> (usize, usize) {
+    let cost = |p: &(String, Color)| disp_width_cjk(&p.0) + 1;
+    let mut kept = parts.len();
+    let mut used = 1 + parts.iter().map(cost).sum::<usize>();
+    while kept > 0 && used > width {
+        kept -= 1;
+        used -= cost(&parts[kept]);
+    }
+    while kept > 0 && parts[kept - 1].0.trim() == "·" {
+        kept -= 1;
+        used -= cost(&parts[kept]);
+    }
+    (kept, used)
 }
 
 /// Render the meta row: `parts` left-aligned, with the optional live `status`
 /// pinned to the bottom-RIGHT of the SAME row (reclaiming the footer line the
-/// old standalone status row used to burn just to print one word). The left
-/// meta's own trailing space provides the gap; the status is clipped by display
-/// width (CJK-safe) to whatever room is left, and on a terminal too narrow to
-/// fit even a sliver of it the status is dropped entirely (fail-open) so the
-/// meta info always wins — it never wraps or overruns the row.
+/// old standalone status row used to burn just to print one word). The whole
+/// row is budgeted by WORST-CASE display width ([`disp_width_cjk`]): `·`
+/// (U+00B7) / `─` / `—` / `…` are East-Asian-AMBIGUOUS and render 2 cells on
+/// CJK-locale terminals (Chinese Windows), so a row built to exactly fill the
+/// narrow-table width physically overflowed there and wrapped its tail down
+/// the left column. Chips drop from the right ([`meta_row_fit`]) until the
+/// worst-case width fits; the status is clipped to the remaining worst-case
+/// room and rendered LEFT-aligned inside a right-pinned, worst-case-sized
+/// chunk (right-aligning by the narrow table would push its tail past the
+/// terminal edge on an ambiguous-wide terminal). Under-filling is safe —
+/// ratatui pads; overflow is the corruption. Fail-open: on a terminal too
+/// narrow for even a sliver of status, the meta info wins.
 fn meta_row(
     frame: &mut Frame,
     area: Rect,
@@ -5838,35 +5938,37 @@ fn meta_row(
     parts: &[(String, Color)],
     status: Option<(String, Color)>,
 ) {
+    let total = usize::from(area.width);
+    let (kept, used) = meta_row_fit(parts, total);
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    for (text, color) in parts {
+    for (text, color) in &parts[..kept] {
         spans.push(Span::styled(text.clone(), Style::default().fg(*color)));
         spans.push(Span::raw(" "));
     }
-    let left_width: usize = spans.iter().map(|s| disp_width(s.content.as_ref())).sum();
-    let total = usize::from(area.width);
     if let Some((text, color)) = status {
-        // Room left after the meta (whose last span is already a space → the gap).
-        // Need at least 2 cols to be worth showing; otherwise the meta info wins.
-        let room = total.saturating_sub(left_width);
+        // Room left after the meta (whose last span is already a space → the
+        // gap), on the worst-case table. Need at least 2 cols to be worth
+        // showing; otherwise the meta info wins.
+        let room = total.saturating_sub(used);
         if room >= 2 {
-            let shown = if disp_width(&text) > room {
-                truncate_to_width(&text, room)
+            let shown = if disp_width_cjk(&text) > room {
+                truncate_to_width_cjk(&text, room)
             } else {
                 text
             };
-            let status_w = u16::try_from(disp_width(&shown)).unwrap_or(0);
-            let split = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(0), Constraint::Length(status_w)])
-                .split(area);
-            frame.render_widget(Paragraph::new(Line::from(spans)), split[0]);
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(shown, Style::default().fg(color))))
-                    .alignment(Alignment::Right),
-                split[1],
-            );
-            return;
+            let status_w = u16::try_from(disp_width_cjk(&shown)).unwrap_or(0);
+            if status_w > 0 {
+                let split = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Min(0), Constraint::Length(status_w)])
+                    .split(area);
+                frame.render_widget(Paragraph::new(Line::from(spans)), split[0]);
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(shown, Style::default().fg(color)))),
+                    split[1],
+                );
+                return;
+            }
         }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -6992,11 +7094,15 @@ mod tests {
     #[test]
     fn chat_input_box_title_changes_with_state() {
         let mut app = app_with(Some("offline"));
+        // Fresh session, empty box → the I9 first-run example tip renders as
+        // the placeholder (the idle rotation takes over after the first send).
         let empty = render_to_string(&app);
+        let tip = app.first_run_example_tip().expect("first-run tip offered");
+        // The test buffer emits a pad cell behind every wide glyph, so compare
+        // with all spaces stripped from both haystack and needle.
         assert!(
-            empty.contains("输入需求")
-                || empty.contains("type requirement")
-                || empty.contains("help")
+            empty.replace(' ', "").contains(&tip.replace(' ', "")),
+            "empty box shows the first-run tip: {tip}"
         );
         // Some normal text → the localized "typed" meta hint. Assert against the
         // resolved value (and its language-neutral key glyph) so this passes in
@@ -7006,9 +7112,11 @@ mod tests {
         }
         let typed = render_to_string(&app);
         let typed_hint = umadev_i18n::t(app.lang, "tui.hint.typed");
-        // The hint mentions Enter + Shift+Enter in every locale (key names stay
+        // The hint mentions the newline chord in every locale (key names stay
         // literal); a substring of the resolved value must appear on screen.
-        assert!(typed_hint.contains("Enter"));
+        // (`Enter 提交` deliberately no longer lives on the meta row — it
+        // rotates through the input placeholder instead.)
+        assert!(typed_hint.contains("Shift+Enter"));
         assert!(typed.contains("Shift+Enter"));
     }
 
@@ -8088,6 +8196,233 @@ mod tests {
     }
 
     #[test]
+    fn disp_width_cjk_budgets_ambiguous_chars_as_two_cells() {
+        // The exact glyphs the reported Chinese-Windows overflow was built
+        // from: `·` (U+00B7), `─` (U+2500), `—` (U+2014), `…` (U+2026) are
+        // East-Asian AMBIGUOUS — 1 col on the narrow table, 2 on the CJK one.
+        for amb in ["·", "─", "—", "…"] {
+            assert_eq!(disp_width(amb), 1, "{amb} narrow");
+            assert_eq!(disp_width_cjk(amb), 2, "{amb} worst-case");
+        }
+        // Plain ASCII and full-width CJK carry no ambiguous margin.
+        assert_eq!(disp_width_cjk("abc"), disp_width("abc"));
+        assert_eq!(disp_width_cjk("自动过门"), disp_width("自动过门"));
+    }
+
+    #[test]
+    fn truncate_to_width_cjk_counts_ambiguous_as_wide() {
+        // "a·b" = 1+2+1 worst-case cols → at max 3 the trailing `b` is dropped.
+        assert_eq!(truncate_to_width_cjk("a·b", 3), "a·");
+        assert_eq!(truncate_to_width_cjk("a·b", 4), "a·b");
+        assert_eq!(truncate_to_width_cjk("模型 x", 4), "模型");
+    }
+
+    /// Assemble the exact left-row string `meta_row` renders for the kept
+    /// parts: the leading pad + each part + its one-space gap.
+    fn meta_left_string(parts: &[(String, Color)], kept: usize) -> String {
+        let mut s = String::from(" ");
+        for (text, _) in &parts[..kept] {
+            s.push_str(text);
+            s.push(' ');
+        }
+        s
+    }
+
+    /// The realistic Chinese-locale meta row that physically overflowed on
+    /// Windows: every chip present, `·` separators between them.
+    fn cjk_meta_parts() -> Vec<(String, Color)> {
+        let c = theme::TEXT_MUTED();
+        [
+            "UmaDev",
+            "·",
+            "claude-code",
+            "·",
+            "自动过门 (shift+Tab 转手动)",
+            "·",
+            "模型 claude-sonnet-4-5",
+            "·",
+            "[queued 2]",
+        ]
+        .iter()
+        .map(|s| ((*s).to_string(), c))
+        .collect()
+    }
+
+    #[test]
+    fn meta_row_fit_keeps_everything_when_worst_case_fits() {
+        let parts = cjk_meta_parts();
+        let (kept, used) = meta_row_fit(&parts, 200);
+        assert_eq!(kept, parts.len());
+        assert_eq!(used, disp_width_cjk(&meta_left_string(&parts, kept)));
+    }
+
+    #[test]
+    fn meta_row_stays_within_worst_case_width_budget() {
+        // Width chosen so the NARROW table says the row fits but the CJK
+        // table (ambiguous `·` = 2 cells) says it overflows — exactly the
+        // Chinese-Windows corruption. The fit must go by the worst case.
+        let parts = cjk_meta_parts();
+        let full = meta_left_string(&parts, parts.len());
+        let width = disp_width(&full) + 1;
+        assert!(
+            disp_width_cjk(&full) > width,
+            "premise: ambiguous margin overflows this width"
+        );
+        let (kept, used) = meta_row_fit(&parts, width);
+        assert!(kept < parts.len(), "right-most chips must drop");
+        let rendered = meta_left_string(&parts, kept);
+        assert!(
+            disp_width_cjk(&rendered) <= width,
+            "worst-case width {} must fit {width}: {rendered:?}",
+            disp_width_cjk(&rendered)
+        );
+        assert_eq!(used, disp_width_cjk(&rendered));
+    }
+
+    #[test]
+    fn meta_row_fit_drops_chips_from_the_right_never_the_brand() {
+        let parts = cjk_meta_parts();
+        // Squeeze hard: only the brand survives.
+        let (kept, _) = meta_row_fit(&parts, 10);
+        assert_eq!(kept, 1, "brand chip survives the squeeze");
+        assert_eq!(parts[0].0, "UmaDev");
+        // Every narrower budget keeps a PREFIX of the parts (drop from the
+        // right), and never ends on a dangling `·` separator.
+        for width in 5..120 {
+            let (kept, used) = meta_row_fit(&parts, width);
+            assert!(used <= width.max(1), "used {used} > width {width}");
+            if kept > 0 {
+                assert_ne!(parts[kept - 1].0, "·", "no orphaned separator");
+            }
+        }
+    }
+
+    #[test]
+    fn meta_row_render_never_paints_past_worst_case_budget() {
+        // End-to-end through ratatui: render the overflowing CJK meta row plus
+        // a status carrying ambiguous `·` into a narrow frame, then replay the
+        // buffer the way a terminal backend prints it — contiguous runs of
+        // painted cells, each re-anchored at an absolute column (default
+        // padding cells become a MoveTo). Every run, printed from its start
+        // column with AMBIGUOUS chars rendered 2 cells wide, must still end
+        // inside the terminal — that is exactly the Chinese-Windows wrap bug.
+        let parts = cjk_meta_parts();
+        let status = Some(("阶段 · 仍在工作 (01:23) · Esc".to_string(), theme::INFO()));
+        for width in [40u16, 60, 72, 80] {
+            let backend = TestBackend::new(width, 1);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| meta_row(f, f.area(), theme::BORDER(), &parts, status.clone()))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let is_padding = |x: u16| {
+                let cell = &buffer[(x, 0)];
+                cell.symbol() == " " && cell.style().fg == Some(ratatui::style::Color::Reset)
+            };
+            let mut x = 0u16;
+            while x < width {
+                if is_padding(x) {
+                    x += 1;
+                    continue;
+                }
+                // A painted run: collect symbols (skipping the shadow cell
+                // behind each wide glyph) until the next padding cell.
+                let start = usize::from(x);
+                let mut run = String::new();
+                while x < width && !is_padding(x) {
+                    let sym = buffer[(x, 0)].symbol().to_string();
+                    let w = u16::try_from(disp_width(&sym).max(1)).unwrap_or(1);
+                    run.push_str(&sym);
+                    x += w;
+                }
+                assert!(
+                    start + disp_width_cjk(&run) <= usize::from(width),
+                    "width {width}: run at col {start} worst-case-overflows: {run:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn title_rule_never_exceeds_half_the_row() {
+        // `─` (U+2500) is ambiguous-width: n rule chars may render 2n cells,
+        // so the divider is capped at width/2 — the historical `width - 40`
+        // fill still applies on narrow terminals where it is the tighter cap.
+        assert_eq!(title_rule_cols(60), 20); // width-40 binds
+        assert_eq!(title_rule_cols(120), 60); // width/2 binds
+        assert_eq!(title_rule_cols(30), 0);
+        for w in [10u16, 40, 80, 100, 200] {
+            assert!(
+                2 * title_rule_cols(w) <= usize::from(w),
+                "worst-case rule must fit at width {w}"
+            );
+        }
+    }
+
+    // ---- rotating idle placeholder (input box) -------------------------------
+
+    #[test]
+    fn input_placeholder_special_states_beat_the_rotation() {
+        let mut app = app_with(Some("offline"));
+        app.session_turns = 1; // past the I9 first-run window
+                               // Idle + empty → a pool entry.
+        let idle = input_placeholder(&app).into_owned();
+        let pool: Vec<String> = crate::app::App::IDLE_PLACEHOLDERS
+            .iter()
+            .map(|k| umadev_i18n::t(app.lang, k).to_string())
+            .collect();
+        assert!(pool.contains(&idle), "idle picks from the pool: {idle}");
+        // Running (streaming / tool) wins.
+        app.thinking = true;
+        assert_eq!(
+            input_placeholder(&app),
+            umadev_i18n::t(app.lang, "input.running")
+        );
+        app.thinking = false;
+        // A settled block wins.
+        app.finished = true;
+        assert_eq!(
+            input_placeholder(&app),
+            umadev_i18n::t(app.lang, "input.finished")
+        );
+        app.finished = false;
+        app.aborted = true;
+        assert_eq!(
+            input_placeholder(&app),
+            umadev_i18n::t(app.lang, "input.aborted")
+        );
+        app.aborted = false;
+        // An open gate wins over everything.
+        app.apply_engine(umadev_agent::EngineEvent::GateOpened {
+            gate: umadev_agent::Gate::DocsConfirm,
+            choice: None,
+        });
+        assert_eq!(
+            input_placeholder(&app),
+            umadev_i18n::t(app.lang, "input.gate")
+        );
+    }
+
+    #[test]
+    fn input_placeholder_rotates_deterministically_per_submit() {
+        let mut app = app_with(Some("offline"));
+        app.session_turns = 1; // past the first-run tip
+                               // Same state → same pick, every frame (no flicker).
+        assert_eq!(
+            input_placeholder(&app).into_owned(),
+            input_placeholder(&app).into_owned()
+        );
+        // Advancing the submit counters walks the whole pool.
+        let n = crate::app::App::IDLE_PLACEHOLDERS.len();
+        let mut seen = std::collections::BTreeSet::new();
+        for turn in 0..n {
+            app.session_turns = 1 + turn;
+            seen.insert(app.idle_placeholder());
+        }
+        assert_eq!(seen.len(), n, "every pool entry is reachable");
+    }
+
+    #[test]
     fn pad_to_width_pads_by_display_columns_not_char_count() {
         // Fix 6 — the first-run picker's label column must align by DISPLAY width.
         // A CJK label is 2 columns per glyph, so `format!("{:<width$}")`'s char-count
@@ -8233,8 +8568,10 @@ mod tests {
         app.session_tokens = 94_000;
 
         // Wide terminal: the gauge shows the token count (and its bar glyph) in
-        // the meta row.
-        let wide = render_chat_to_string(&app, 110, 16);
+        // the meta row. 130 cols — the meta row is now budgeted by WORST-CASE
+        // width (ambiguous `·`/`▍` = 2 cells), so the right-most chips drop a
+        // little earlier than the narrow table would suggest.
+        let wide = render_chat_to_string(&app, 130, 16);
         assert!(
             wide.contains("94K tok"),
             "gauge token count shown on a wide terminal: {wide}"

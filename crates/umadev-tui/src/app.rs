@@ -6098,9 +6098,45 @@ impl App {
         Some(umadev_i18n::tf(self.lang, TEMPLATES[idx], &[&file]))
     }
 
+    /// The idle-empty input placeholder pool: example requirements (echoing
+    /// the welcome-banner examples) interleaved with command hints — the
+    /// `Enter 提交` / `/help 查看全部命令` chips that used to sit permanently
+    /// on the meta row now rotate here instead. i18n keys, resolved per
+    /// locale; rotated by [`Self::idle_placeholder`].
+    pub(crate) const IDLE_PLACEHOLDERS: [&'static str; 10] = [
+        // Keep every entry distinct per locale — the rotation test asserts the
+        // whole pool is reachable.
+        "input.idle",
+        "input.ph.dashboard",
+        "input.ph.help",
+        "input.ph.todo",
+        "input.ph.plan",
+        "input.ph.landing",
+        "input.ph.design",
+        "input.ph.fix",
+        "input.ph.keys",
+        "input.ph.blog",
+    ];
+
+    /// The rotating idle-empty placeholder shown in the input box when nothing
+    /// is typed and nothing is in flight. Deterministic rotation: the index
+    /// advances once per SUBMITTED prompt (session turns + the persisted
+    /// prompt-history depth), never per frame — so the hint is stable while
+    /// idle (no flicker) and rotates to the next pool entry after each send /
+    /// each launch. Special states (gate / running / finished / aborted / the
+    /// I9 first-run tip) are handled by the caller with priority; this is only
+    /// the plain-idle fallback.
+    #[must_use]
+    pub(crate) fn idle_placeholder(&self) -> String {
+        let idx = self.session_turns.wrapping_add(self.input_history.len())
+            % Self::IDLE_PLACEHOLDERS.len();
+        umadev_i18n::t(self.lang, Self::IDLE_PLACEHOLDERS[idx]).to_string()
+    }
+
     /// True when nothing is in flight or settled — the same "idle" condition
-    /// under which the input placeholder shows `input.idle` (no open gate, not
-    /// thinking, no tool running, no started / finished / aborted run). Gates the
+    /// under which the input placeholder rotates through the idle pool (no
+    /// open gate, not thinking, no tool running, no started / finished /
+    /// aborted run). Gates the
     /// first-run example tip ([`Self::first_run_example_tip`]).
     fn is_idle_for_tip(&self) -> bool {
         self.active_gate.is_none()
