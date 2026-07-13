@@ -385,6 +385,11 @@ pub fn set_light_theme(is_light: bool) {
 
 /// Draw one full frame — dispatches on the current screen.
 pub fn render(frame: &mut Frame, app: &App) {
+    // Caret: cleared FIRST, so a frame that never reaches the input box (the
+    // picker, an overlay, the too-small-terminal bail) leaves `None` behind and
+    // [`place_caret`] keeps the caret hidden rather than re-showing it at last
+    // frame's stale cell. `render_prompt` publishes the real cell when it paints.
+    app.caret.set(None);
     match app.mode {
         AppMode::Picker => render_picker(frame, app),
         AppMode::Chat => render_chat(frame, app),
@@ -395,6 +400,39 @@ pub fn render(frame: &mut Frame, app: &App) {
     } else if app.show_help {
         render_help_overlay(frame, app);
     }
+}
+
+/// Put the real terminal caret where this frame's input box wants it — the
+/// **last** thing a frame does, after every cell has been painted.
+///
+/// Called once per frame by the event loop, immediately after `terminal.draw`
+/// and still inside the synchronized-output (BSU/ESU) bracket where the terminal
+/// supports it.
+///
+/// Order matters, and is the whole point: `MoveTo` **then** `Show`. Both are
+/// crossterm `execute!`s — each is a queue **plus its own flush** — so any
+/// `Show` emitted while the caret still sits at the end of the last painted cell
+/// run is a real, observable frame with the caret in the wrong place. ratatui's
+/// `Terminal::try_draw` does exactly that (`show_cursor()` before
+/// `set_cursor_position()`), which is why [`render`] leaves the frame caret
+/// unset: with `Frame::cursor_position == None` ratatui takes its `hide_cursor()`
+/// arm, the caret stays hidden through the paint, and this function reveals it
+/// only once it is already on the right cell.
+///
+/// `None` (overlay / help / picker / too-small) → nothing to do: ratatui's own
+/// `hide_cursor()` already left the caret hidden.
+///
+/// Fail-open: an `io::Error` from a caret write is returned to the caller, which
+/// ignores it — a caret hiccup must never kill the render loop.
+pub fn place_caret<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &App,
+) -> std::io::Result<()> {
+    if let Some((x, y)) = app.caret.get() {
+        terminal.set_cursor_position((x, y))?;
+        terminal.show_cursor()?;
+    }
+    Ok(())
 }
 
 /// Render a scrollable, near-fullscreen overlay used by `/spec`,
@@ -6022,22 +6060,31 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     let input_panel = Paragraph::new(lines).scroll((scroll, 0)).block(input_block);
     frame.render_widget(input_panel, prompt_chunks[0]);
 
-    // Cursor: place it at the wrapped `(cursor_row_abs, cursor_col)` computed
-    // above (same folding as the drawn rows, with the wrap-boundary push so a
-    // caret at a full row's edge wraps to col 0 of the next row instead of
-    // overrunning the right border). The column already counts wide glyphs (CJK
-    // = 2) via the Unicode width table. The vertical position subtracts `scroll`
-    // so it tracks the visible window.
+    // Caret: the wrapped `(cursor_row_abs, cursor_col)` computed above (same fold
+    // as the drawn rows, with the wrap-boundary push so a caret at a full row's
+    // edge wraps to col 0 of the next row instead of overrunning the right
+    // border). The column counts wide glyphs (CJK = 2) through `char_width` — the
+    // SAME `unicode-width` table `wrap_input_rows` folds with and ratatui lays its
+    // cells out with, so the caret can never drift from the glyphs it sits behind.
+    // (Deliberately NOT `disp_width_cjk`: budgeting ambiguous chars at 2 is right
+    // for rows that must not physically wrap, but the caret has to agree with what
+    // ratatui actually PAINTED, which is the narrow table.) The vertical position
+    // subtracts `scroll` so it tracks the visible window.
+    //
+    // This is PUBLISHED to the app, not set on the frame: `place_caret` re-asserts
+    // it after the paint in the correct `MoveTo`-then-`Show` order. See
+    // [`place_caret`] and `App::caret` for why setting it here would make the caret
+    // visibly jump on a terminal that repaints on its own timer (conhost).
     let input_area = prompt_chunks[0];
     let cursor_row_vis = cursor_row_abs.saturating_sub(scroll);
     if app.overlay.is_none() && !app.show_help {
-        frame.set_cursor_position((
+        app.caret.set(Some((
             input_area
                 .x
                 .saturating_add(u16::try_from(prefix_w).unwrap_or(3))
                 .saturating_add(cursor_col),
             input_area.y.saturating_add(cursor_row_vis),
-        ));
+        )));
     }
 
     // Live state (ready / running heartbeat / aborted / complete) — pinned to the
@@ -7922,11 +7969,282 @@ mod tests {
         assert_eq!(app.input_cursor, 1);
         // The rendered cursor column lands right after the single remaining
         // wide char: gutter(2) + prefix `>_ `(3) + 2 cols for "你" = x 7.
+        // Driven through the REAL frame path the event loop uses: `render` publishes
+        // the caret, `place_caret` puts it on the terminal (MoveTo, then Show).
         let backend = TestBackend::new(60, 20);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render(f, &app)).unwrap();
+        place_caret(&mut term, &app).unwrap();
         let cur = term.backend_mut().get_cursor_position().unwrap();
         assert_eq!(cur.x, 7, "cursor must sit just past the wide char");
+    }
+
+    // ── Caret placement (the "光标会跳" fix) ────────────────────────────────
+    //
+    // The caret must land on exactly the cell the painted glyphs end at, and it
+    // must be (re)placed on EVERY draw path — a frame that skips it leaves the
+    // caret parked wherever the last cell write dragged it.
+
+    /// Drive one real frame the way the event loop does: `render` publishes the
+    /// caret, `place_caret` asserts it onto the terminal. Returns the caret cell.
+    fn frame_caret(app: &App) -> Option<(u16, u16)> {
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| render(f, app)).unwrap();
+        place_caret(&mut term, app).unwrap();
+        app.caret.get()
+    }
+
+    /// The input box's left text edge: the chat layout's inset (2) plus the mode
+    /// prefix. The caret must sit this far right, plus the display width of the
+    /// text before it.
+    const INPUT_INSET: u16 = 2;
+
+    #[test]
+    fn caret_column_equals_display_width_of_text_before_it() {
+        // ASCII (1 cell), CJK (2 cells), mixed, and the AMBIGUOUS `·` (U+00B7).
+        // `·` is deliberately budgeted at ONE cell here: the caret must agree with
+        // what ratatui actually painted (the narrow `unicode-width` table it lays
+        // cells out with), NOT with `disp_width_cjk`'s worst-case ambiguous=2 —
+        // that budget exists for rows that must never physically wrap, and using it
+        // for the caret would push the caret a cell right of its glyph on every
+        // Western terminal.
+        for (text, want_w) in [
+            ("hello", 5u16), // ASCII: 5 x 1
+            ("你好世界", 8), // CJK: 4 x 2
+            ("ab你好", 6),   // mixed: 2 x 1 + 2 x 2
+            ("a·b", 3),      // ambiguous `·` counts as 1, like the painted cell
+            ("", 0),         // empty box: caret sits at the text origin
+        ] {
+            let mut app = app_with(Some("offline"));
+            app.insert_str_at_cursor(text);
+            let (x, y) = frame_caret(&app).expect("idle chat frame must own a caret");
+            assert_eq!(
+                x,
+                INPUT_INSET + 3 + want_w, // 3 = the `>_ ` idle prefix
+                "caret column must equal the display width of {text:?} before it"
+            );
+            assert_eq!(y, app.input_area.get().1, "caret must sit on the first row");
+        }
+    }
+
+    #[test]
+    fn caret_column_matches_the_width_the_row_is_rendered_with() {
+        // The invariant that actually prevents drift: whatever fold `wrap_input_rows`
+        // paints, `caret_in_wrapped` must agree with — the caret is derived from the
+        // SAME `char_width` table, so a caret at end-of-text always equals the
+        // display width of the last painted row.
+        for text in ["hello", "你好世界", "ab你好cd", "a·b—c", "混合 mixed 文字"] {
+            let mut app = app_with(Some("offline"));
+            app.insert_str_at_cursor(text);
+            let cols = app.input_text_cols.get().max(1);
+            let rows = wrap_input_rows(&app.input, cols);
+            let (row, col) = caret_in_wrapped(&app.input, app.input_cursor, cols);
+            let _ = frame_caret(&app);
+            assert_eq!(
+                usize::from(col),
+                disp_width(&rows[usize::from(row)]),
+                "caret col must equal the painted width of its row for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn caret_tracks_multi_line_input() {
+        // Shift+Enter multi-line: the caret drops to the wrapped continuation row
+        // and its column is measured from that row's start, not the whole buffer.
+        let mut app = app_with(Some("offline"));
+        app.insert_str_at_cursor("first\n你好");
+        let (x, y) = frame_caret(&app).expect("multi-line frame must own a caret");
+        let (ax, ay, ..) = app.input_area.get();
+        assert_eq!(
+            x,
+            ax + 3 + 4,
+            "caret col = width of \"你好\" (2 x 2) on row 1"
+        );
+        assert_eq!(y, ay + 1, "caret must be on the second visual row");
+    }
+
+    #[test]
+    fn caret_follows_the_wider_approval_bar_prefix() {
+        // A pending approval swaps the `>_ ` prefix (3 cols) for `[y/n] ` (6), which
+        // both narrows the wrap width and shifts the text origin right. The caret
+        // must follow the prefix — this is the layout-headroom regression class.
+        let mut base = app_with(Some("offline"));
+        base.insert_str_at_cursor("你好");
+        let idle = frame_caret(&base).expect("caret").0;
+
+        let mut app = app_with(Some("offline"));
+        app.insert_str_at_cursor("你好");
+        app.pending_approval = Some(("cmd".into(), "rm -rf /".into()));
+        let approving = frame_caret(&app).expect("caret").0;
+
+        assert_eq!(idle, INPUT_INSET + 3 + 4, "idle: `>_ ` prefix is 3 cols");
+        assert_eq!(
+            approving,
+            INPUT_INSET + 6 + 4,
+            "approval: `[y/n] ` prefix is 6 cols, caret shifts with it"
+        );
+    }
+
+    #[test]
+    fn caret_is_placed_on_every_draw_path_including_a_heal_clear_frame() {
+        // The jump-to-top-left case: a heal frame calls `terminal.clear()`, which on
+        // Windows parks the console caret at (0,0). The very next thing the frame does
+        // must be to put the caret back — if any draw path skipped `place_caret`, the
+        // caret would stay at the origin. Assert the caret is re-asserted on a plain
+        // frame AND on a frame that cleared first.
+        let mut app = app_with(Some("offline"));
+        app.insert_str_at_cursor("hi");
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+
+        term.draw(|f| render(f, &app)).unwrap();
+        place_caret(&mut term, &app).unwrap();
+        let plain = term.backend_mut().get_cursor_position().unwrap();
+
+        // A heal frame: clear (caret → origin), repaint, re-place.
+        term.clear().unwrap();
+        term.set_cursor_position((0, 0)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        place_caret(&mut term, &app).unwrap();
+        let healed = term.backend_mut().get_cursor_position().unwrap();
+
+        assert_eq!(
+            (healed.x, healed.y),
+            (plain.x, plain.y),
+            "a heal/clear frame must land the caret in the same place as a plain frame"
+        );
+        assert_ne!(
+            (healed.x, healed.y),
+            (0, 0),
+            "caret must not stay at the origin"
+        );
+    }
+
+    #[test]
+    fn caret_is_hidden_not_stale_when_an_overlay_or_help_owns_the_screen() {
+        // No caret this frame → `None`, so `place_caret` leaves it hidden (ratatui's
+        // own `hide_cursor()` arm) instead of re-showing it at last frame's cell.
+        let mut app = app_with(Some("offline"));
+        app.insert_str_at_cursor("hi");
+        assert!(
+            frame_caret(&app).is_some(),
+            "a plain chat frame owns the caret"
+        );
+
+        app.show_help = true;
+        assert_eq!(
+            frame_caret(&app),
+            None,
+            "/help must not leave a stale caret"
+        );
+
+        app.show_help = false;
+        assert!(
+            frame_caret(&app).is_some(),
+            "caret returns when help closes"
+        );
+    }
+
+    /// A [`TestBackend`] that records the ORDER of the cursor ops a frame emits.
+    /// The whole bug is an ordering bug, so the order is what the test asserts.
+    struct CursorOpLog {
+        inner: TestBackend,
+        ops: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+
+    impl ratatui::backend::Backend for CursorOpLog {
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.ops.borrow_mut().push("cells");
+            self.inner.draw(content)
+        }
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.ops.borrow_mut().push("hide");
+            self.inner.hide_cursor()
+        }
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.ops.borrow_mut().push("show");
+            self.inner.show_cursor()
+        }
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+            self.inner.get_cursor_position()
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> std::io::Result<()> {
+            self.ops.borrow_mut().push("move");
+            self.inner.set_cursor_position(position)
+        }
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.ops.borrow_mut().push("clear");
+            self.inner.clear()
+        }
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            self.inner.size()
+        }
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            self.inner.window_size()
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn caret_is_moved_before_it_is_shown_and_never_shown_mid_paint() {
+        // THE root cause, locked. ratatui's `Terminal::try_draw` emits `show_cursor()`
+        // (an `execute!` — its own flush) BEFORE `set_cursor_position()` (a second
+        // flush), so with a frame caret set the byte stream reads
+        // `cells… Show MoveTo`: the caret is made VISIBLE at the end of the last
+        // painted cell run, one whole write-gap before it is moved back to the input
+        // box. A terminal that repaints on its own timer instead of per write —
+        // Windows conhost, which also has no DEC-2026 sync to hide the gap — renders
+        // that state, and the caret visibly jumps.
+        //
+        // The fix: `render` leaves the frame caret unset (ratatui takes its
+        // `hide_cursor()` arm — hiding is never visually wrong), and `place_caret`
+        // asserts the caret afterwards as `move` THEN `show`. Assert exactly that,
+        // and that no `show` is ever emitted before the cells are down.
+        let mut app = app_with(Some("offline"));
+        app.insert_str_at_cursor("hi");
+        let ops = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let backend = CursorOpLog {
+            inner: TestBackend::new(60, 20),
+            ops: std::rc::Rc::clone(&ops),
+        };
+        let mut term = Terminal::new(backend).unwrap();
+
+        // If `render` set the frame caret, ratatui would emit `show` then `move` and
+        // the ordering assertions below would fail — so this also locks the "leave
+        // `Frame::cursor_position` unset" half of the fix.
+        term.draw(|f| render(f, &app)).unwrap();
+        place_caret(&mut term, &app).unwrap();
+
+        let ops = ops.borrow().clone();
+        let show = ops.iter().position(|o| *o == "show").expect("caret shown");
+        let mv = ops.iter().position(|o| *o == "move").expect("caret moved");
+        assert!(
+            mv < show,
+            "caret must be MOVED before it is SHOWN, got {ops:?}"
+        );
+        let cells = ops
+            .iter()
+            .position(|o| *o == "cells")
+            .expect("cells painted");
+        assert!(
+            cells < show,
+            "caret must never be shown mid-paint, got {ops:?}"
+        );
+        // And it lands on the published cell.
+        let cur = term.backend_mut().get_cursor_position().unwrap();
+        assert_eq!(
+            (cur.x, cur.y),
+            app.caret.get().unwrap(),
+            "place_caret must leave the caret on the published cell"
+        );
     }
 
     #[test]

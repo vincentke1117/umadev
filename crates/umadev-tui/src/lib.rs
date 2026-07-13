@@ -7141,6 +7141,17 @@ async fn event_loop(
             if sync_output {
                 let _ = terminal.backend_mut().execute(BeginSynchronizedUpdate);
             }
+            // P5 — the caret is HIDDEN for the whole paint, and only revealed again
+            // (by `ui::place_caret`, below) once it is back on its real cell. Painting
+            // drags the caret: `terminal.clear()` parks it at (0,0) — on Windows
+            // crossterm's `clear_entire_screen` explicitly `move_to(0,0)`s — and the
+            // cell writes then walk it through every changed cell, the entire screen
+            // on a full repaint. A terminal that repaints on its own timer rather than
+            // per write (conhost, which has no DEC-2026 sync to hide any of this)
+            // renders those intermediate states, and the user sees the caret jumping
+            // to the top-left / sweeping the screen. Hiding first costs one 6-byte
+            // write and makes the whole paint caret-invisible. Fail-open.
+            let _ = terminal.hide_cursor();
             // P0 — heal terminal-side drift, but NOT on every frame. ratatui's flush
             // diffs its OWN prev/next buffers and never reconciles against the real
             // terminal, so a drifted screen under identical buffers produces an empty
@@ -7171,6 +7182,16 @@ async fn event_loop(
             // (keeping only the Copy `Rect`), so the ESU write through
             // `backend_mut()` below doesn't conflict with that borrow.
             let draw_result = terminal.draw(|f| ui::render(f, app)).map(|f| f.area);
+            // P5 — the paint is done, so the caret can come back. UNCONDITIONAL on
+            // every draw path (heal / clear / heartbeat / plain diff alike): the frame
+            // above left the caret hidden wherever the last cell write parked it, and
+            // this is the single place that puts it back. `place_caret` emits
+            // `MoveTo` then `Show` — never the reverse — and runs INSIDE the BSU/ESU
+            // bracket, so on a sync terminal the caret move lands in the same atomic
+            // swap as the cells. A frame with no caret (overlay / help / picker /
+            // too-small) publishes `None` and correctly leaves it hidden.
+            // Fail-open: a caret write error never blocks the loop.
+            let _ = ui::place_caret(terminal, app);
             if sync_output {
                 let _ = terminal.backend_mut().execute(EndSynchronizedUpdate);
             }

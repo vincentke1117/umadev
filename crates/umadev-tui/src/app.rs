@@ -2159,6 +2159,22 @@ pub struct App {
     /// the input box. `(0,0,0,0)` until the first render.
     pub input_area: std::cell::Cell<(u16, u16, u16, u16)>,
 
+    /// The **terminal caret cell** `(x, y)` the input box wants this frame, published
+    /// by `ui::render_prompt`; `None` when this frame owns no caret (an overlay /
+    /// `/help` is up, or the terminal is too small and the "make the window bigger"
+    /// card bailed before layout).
+    ///
+    /// The caret is deliberately NOT set on the ratatui `Frame`. `Terminal::try_draw`
+    /// would then emit `Show` **before** `MoveTo` — each an `execute!`, i.e. its own
+    /// flush — so the caret becomes visible at the end of the last painted cell run
+    /// one whole write-gap before it is moved back to the input box. A terminal that
+    /// repaints on its own timer (Windows conhost) renders that window, and the caret
+    /// visibly jumps. Leaving the frame caret `None` makes ratatui take its
+    /// `hide_cursor()` arm instead, and `ui::place_caret` re-asserts the caret in the
+    /// correct order (`MoveTo` **then** `Show`) once painting is done. `(0,0)` is a
+    /// legal caret cell, hence `Option` rather than a sentinel.
+    pub caret: std::cell::Cell<Option<(u16, u16)>>,
+
     /// **Per-frame cache of the wrapped input rows** (the logical text, no leading
     /// mode-prefix gutter) — one `String` per visual row, in render order, the
     /// same `wrap_input_rows` fold the box paints. The input-box selection maps a
@@ -2851,6 +2867,7 @@ impl App {
             input_selection: None,
             input_selection_dragging: false,
             input_area: std::cell::Cell::new((0, 0, 0, 0)),
+            caret: std::cell::Cell::new(None),
             input_rows: std::cell::RefCell::new(Vec::new()),
             input_gutter: std::cell::Cell::new(0),
             input_scroll: std::cell::Cell::new(0),
