@@ -17,7 +17,7 @@
 //!
 //! Launch flags (from the headless stream-json contract):
 //! `claude --print --input-format stream-json --output-format stream-json
-//! --verbose --session-id <uuid> --permission-mode <acceptEdits|default>
+//! --verbose --session-id <uuid> --permission-mode <bypassPermissions|default>
 //! --allowedTools <read-only + research + sub-agent set; auto adds the mutating
 //! Edit/Write/Bash/NotebookEdit>` (+ optional `--append-system-prompt`). The base's
 //! native read/research/delegate tools (incl. `Agent`/`Task` sub-agents) are
@@ -27,10 +27,14 @@
 //! would replace the tool guidance and degrade the base into a chat box).
 //!
 //! The permission mode tracks the autonomy tier so claude is consistent with the
-//! codex / opencode drivers: `autonomous` (auto tier) → `acceptEdits` (the base
-//! writes unattended), non-autonomous (guarded / plan tier) → `default` (claude
-//! raises a `can_use_tool` approval for each tool, which becomes a
-//! `NeedApproval` the orchestrator answers — the human-in-the-loop floor, so the
+//! codex / opencode drivers: `autonomous` (auto tier) → `bypassPermissions` (the
+//! base runs with FULL ACCESS and never interrupts — matching codex
+//! `approvalPolicy: never` + full-access sandbox and opencode's wildcard-allow
+//! ruleset; UmaDev's PreToolUse/PostToolUse governance hooks still see every
+//! tool call, since claude runs hooks regardless of the permission mode),
+//! non-autonomous (guarded / plan tier) → `default` (claude raises a
+//! `can_use_tool` approval for each tool, which becomes a `NeedApproval` the
+//! orchestrator answers — the human-in-the-loop floor, so the
 //! irreversible-action gate is not bypassed). `UMADEV_CLAUDE_PERMISSION_MODE`
 //! overrides the derived default when set.
 //!
@@ -108,7 +112,8 @@ impl ClaudeSession {
     /// session id is generated.
     ///
     /// `autonomous` selects the permission mode (see [`session_args`]): `true` →
-    /// `acceptEdits` (write unattended), `false` → `default` (claude asks before
+    /// `bypassPermissions` (full access, never interrupts — governance hooks
+    /// still audit every call), `false` → `default` (claude asks before
     /// each tool, surfaced as a `NeedApproval` — the guarded human-in-the-loop
     /// tier). This mirrors the codex / opencode drivers' autonomy handling.
     ///
@@ -623,8 +628,9 @@ fn allowed_tools_for(autonomous: bool) -> String {
 /// flags. Exposed for tests. `--append-system-prompt` (NOT `--system-prompt`).
 ///
 /// `autonomous` picks the permission mode so claude tracks the trust tier like
-/// the codex / opencode drivers: `true` → `acceptEdits` (write unattended),
-/// `false` → `default` (claude raises a `can_use_tool` approval per tool, which
+/// the codex / opencode drivers: `true` → `bypassPermissions` (full access,
+/// never interrupts; governance hooks still audit every call), `false` →
+/// `default` (claude raises a `can_use_tool` approval per tool, which
 /// the orchestrator answers — keeping the human-in-the-loop / irreversible-action
 /// floor live). `UMADEV_CLAUDE_PERMISSION_MODE`, when set, overrides the derived
 /// default for both tiers.
@@ -687,7 +693,16 @@ fn push_max_turns(args: &mut Vec<String>, max_turns: Option<u32>) {
 }
 
 /// Resolve claude's `--permission-mode` for an autonomy tier. `autonomous` →
-/// `acceptEdits` (write unattended); otherwise `default` (claude asks before
+/// `bypassPermissions` — the AUTO tier is the user's explicit full-trust
+/// opt-in, so the base itself must never interrupt the run with a per-tool
+/// prompt (the cross-base parity contract: codex auto runs `approvalPolicy:
+/// never` + full-access sandbox, opencode auto runs a wildcard-allow ruleset —
+/// claude on `acceptEdits` still raised `can_use_tool` for Bash/network like
+/// `npm install`, blocking auto runs on ONE base only). UmaDev's OWN governance
+/// still sees every tool call: the PreToolUse/PostToolUse hooks (`umadev hook`,
+/// registered in settings.json) run REGARDLESS of the permission mode, so the
+/// audit trail + write rules survive full bypass — that is what keeps auto safe
+/// without base-side prompts. Non-autonomous → `default` (claude asks before
 /// each tool → a `NeedApproval` the orchestrator answers, the guarded
 /// human-in-the-loop tier). `UMADEV_CLAUDE_PERMISSION_MODE` overrides both.
 ///
@@ -713,7 +728,11 @@ fn push_max_turns(args: &mut Vec<String>, max_turns: Option<u32>) {
 /// unchanged — this does not alter what UmaDev's `TrustMode::Plan` does (that tier
 /// stops the run at the docs/plan gate and is a separate mechanism entirely).
 fn claude_permission_mode(autonomous: bool) -> String {
-    let derived = if autonomous { "acceptEdits" } else { "default" };
+    let derived = if autonomous {
+        "bypassPermissions"
+    } else {
+        "default"
+    };
     match std::env::var("UMADEV_CLAUDE_PERMISSION_MODE") {
         Ok(over) if !over.is_empty() => {
             if !autonomous && over.eq_ignore_ascii_case("plan") {
@@ -2093,9 +2112,10 @@ mod tests {
     }
 
     /// The permission mode tracks the autonomy tier (claude consistent with
-    /// codex / opencode): autonomous → `acceptEdits` (write unattended), guarded
-    /// → `default` (claude asks per tool → a NeedApproval the orchestrator
-    /// answers, so the human-in-the-loop / irreversible-action floor is live).
+    /// codex / opencode): autonomous → `bypassPermissions` (full access, never
+    /// interrupts; governance hooks still audit), guarded → `default` (claude
+    /// asks per tool → a NeedApproval the orchestrator answers, so the
+    /// human-in-the-loop / irreversible-action floor is live).
     #[test]
     fn guarded_gates_mutating_tools_but_auto_pre_approves_all() {
         // P1: under GUARDED (autonomous=false) the allowlist pre-approves the read-only +
@@ -2143,7 +2163,12 @@ mod tests {
 
         let auto = session_args("sid-a", None, true, None);
         let auto_idx = auto.iter().position(|a| a == "--permission-mode").unwrap();
-        assert_eq!(auto[auto_idx + 1], "acceptEdits", "auto → acceptEdits");
+        assert_eq!(
+            auto[auto_idx + 1],
+            "bypassPermissions",
+            "auto → bypassPermissions (full access — the base itself never prompts; \
+             cross-base parity with codex `approvalPolicy: never` + opencode wildcard-allow)"
+        );
 
         let guarded = session_args("sid-g", None, false, None);
         let g_idx = guarded
@@ -2333,7 +2358,11 @@ mod tests {
         assert_eq!(args[tools + 1], AUTO_ALLOWED_TOOLS);
         // Permission mode tracks autonomy exactly like a fresh start.
         let perm = args.iter().position(|a| a == "--permission-mode").unwrap();
-        assert_eq!(args[perm + 1], "acceptEdits", "autonomous → acceptEdits");
+        assert_eq!(
+            args[perm + 1],
+            "bypassPermissions",
+            "autonomous → bypassPermissions"
+        );
         // Streams partial messages so a resumed reply renders token-by-token.
         assert!(args.iter().any(|a| a == "--include-partial-messages"));
         // Firmware still injects natively on resume.

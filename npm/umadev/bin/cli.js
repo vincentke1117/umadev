@@ -427,8 +427,64 @@ const NO_MODEL_COMMANDS = new Set([
   'mcp-manage', 'skill', 'knowledge-manage', 'pr',
 ]);
 
+// ── The `sudo npm i -g` footgun, reported at RUNTIME.
+//
+// Why here and not in postinstall: npm 7+ SWALLOWS lifecycle-script output
+// (postinstall stdout/stderr is only shown with --foreground-scripts, or when
+// the script exits nonzero — which we must never do). The shim, by contrast,
+// runs with inherited stdio on every launch, so this is the one channel that
+// actually reaches the user.
+//
+// What it catches: an install whose files are ROOT-OWNED while the user is not
+// root — i.e. `sudo npm i -g umadev`. It runs fine today, but it leaves a
+// root-owned tree in the npm prefix, so every LATER non-root npm command on
+// that prefix (`npm update -g`, `npm i -g <anything>`) dies with EACCES and npm
+// aborts the whole transaction — taking the user's OTHER global packages (their
+// base CLI: @anthropic-ai/claude-code, @openai/codex) down with it.
+//
+// Shown at most ONCE (a marker under the user-owned ~/.umadev, never the
+// root-owned install dir). Fail-open: any error here is swallowed — a cosmetic
+// advisory must never keep the agent from starting.
+function warnIfRootOwnedInstall(binary) {
+  try {
+    if (process.platform === 'win32' || typeof process.getuid !== 'function') return;
+    const me = process.getuid();
+    if (me === 0) return; // running as root: a root-owned tree is consistent
+    if (fs.statSync(binary).uid !== 0) return; // user-owned install — all good
+
+    const marker = path.join(homeDir(), '.umadev', '.sudo-install-warned');
+    if (fs.existsSync(marker)) return;
+
+    const w = (s) => process.stderr.write(s + '\n');
+    w('');
+    w('  [warn] umadev was installed with `sudo` — its files are root-owned.');
+    w('         It runs, but LATER npm commands you run as yourself on this prefix');
+    w('         (`npm update -g`, `npm i -g <anything>`) will fail with EACCES, and npm');
+    w('         aborts the whole transaction — so your OTHER global packages, including');
+    w('         your base CLI (@anthropic-ai/claude-code / @openai/codex), can no longer');
+    w('         be updated either. This is the classic `sudo npm` footgun, not a umadev bug.');
+    w('         用 sudo 安装会留下 root 属主文件,之后普通用户跑 npm 会 EACCES,并连带影响其它全局包。');
+    w('');
+    w('  Repair (no sudo from here on):');
+    w('           sudo npm uninstall -g umadev');
+    w('           sudo chown -R $(whoami) ~/.npm');
+    w('           npm config set prefix ~/.npm-global');
+    w('           export PATH="$HOME/.npm-global/bin:$PATH"   # add to ~/.zshrc or ~/.bashrc');
+    w('           npm i -g umadev');
+    w('');
+    w('  Run `umadev doctor` for the full diagnosis. (This notice is shown once.)');
+    w('');
+
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, new Date().toISOString());
+  } catch (_) {
+    /* advisory only — never block the launch */
+  }
+}
+
 async function main() {
   const binary = findBinary();
+  warnIfRootOwnedInstall(binary);
   // npm artifact round-trips (upload/download-artifact in CI) can strip the
   // executable bit off the prebuilt binary; restore it defensively before exec.
   try {
@@ -461,6 +517,23 @@ async function main() {
 
   if (result.error) {
     console.error(`umadev: failed to exec binary: ${result.error.message}`);
+    // A present-but-unexecutable ELF reports ENOENT — the kernel is reporting the
+    // missing *ELF interpreter*, not the missing binary. On Linux that is almost
+    // always musl (Alpine): we ship glibc builds, and the message as-is reads like
+    // "the file isn't there", which sends people hunting the wrong bug.
+    if (
+      result.error.code === 'ENOENT' &&
+      process.platform === 'linux' &&
+      fs.existsSync(binary)
+    ) {
+      console.error(
+        '\numadev: the binary IS present, so this is a C-library mismatch —\n' +
+          '  the prebuilt Linux binaries are glibc builds, and this system looks like musl\n' +
+          '  (Alpine). Options: use a glibc image (e.g. node:20-bookworm / debian / ubuntu),\n' +
+          '  add glibc compatibility, or build from source:\n' +
+          '    cargo install --git https://github.com/umacloud/umadev umadev\n',
+      );
+    }
     process.exit(1);
   }
 

@@ -926,6 +926,13 @@ struct PendingApproval {
     /// Dropping it (cancel / quit / a cleared holder) makes the drain's `await`
     /// fail-open to [`ApprovalReply::Deny`] — the "no hang" guarantee.
     reply_tx: tokio::sync::oneshot::Sender<ApprovalReply>,
+    /// What the base wants to do (e.g. `Bash`) — carried so the event loop can
+    /// mirror the pause into the app model and the renderer can pin a VISIBLE
+    /// sticky approval bar above the input box (A2#5: the pause used to surface
+    /// only as one scrolling Note with no persistent approval entry point).
+    action: String,
+    /// The action's target (e.g. `npm install`), same purpose as `action`.
+    target: String,
 }
 
 /// Shared slot for the single in-flight [`PendingApproval`]. A plain `std::sync::Mutex`
@@ -991,19 +998,34 @@ fn interactive_user_present() -> bool {
 }
 
 /// Event-loop hook (runs on the UI thread, before the normal key→`Action` pipeline):
-/// if the resident chat drain is BLOCKED on a guarded approval, consume this keypress
-/// as the decision so it can never leak into the input line or spawn a second turn on
-/// the one session. Returns `true` when the key was consumed (the caller then skips the
+/// if the resident chat drain is BLOCKED on a guarded approval, an EMPTY-input
+/// `y`/`n`/Esc keypress IS the decision: consume it so it can never leak into the
+/// input line. Returns `true` when the key was consumed (the caller then skips the
 /// normal action dispatch for it).
 ///
 /// - No approval pending → returns `false` immediately (the key flows normally).
 /// - A **modified** key (Ctrl-C cancel, Ctrl-O, …) is NEVER intercepted, so hard-cancel
 ///   still works mid-pause.
-/// - `y`/`Y` → [`ApprovalReply::Allow`]; `n`/`N`/Esc → [`ApprovalReply::Deny`]; any other
-///   BARE key is swallowed (kept pending) so a stray Enter can't fire a fresh turn.
+/// - Esc → [`ApprovalReply::Deny`] always (the advertised deny key — kept even with
+///   text in the box so it can never fall through to the interrupt/quit gesture
+///   mid-pause and nuke the whole run).
+/// - With an EMPTY input line: `y`/`Y` → [`ApprovalReply::Allow`]; `n`/`N` →
+///   [`ApprovalReply::Deny`].
+/// - **Every other key flows through** (A2#5): the old behaviour swallowed every bare
+///   key, so a user typing 「批准」 saw dead keys and had no approval entry point at
+///   all. Now characters land in the input line and `App::submit_text` classifies the
+///   submitted text (「批准」/"approve" → allow, 「拒绝」/"deny" → deny) via
+///   [`crate::app::Action::ApprovalReply`]. A stray Enter on an empty box is a no-op
+///   submit, and a non-approval submit parks on the normal queued-chat / steering
+///   lanes — a paused session can still never grow a second concurrent turn.
 ///
 /// Fail-open: a poisoned lock returns `false` (the key flows normally, nothing hangs).
-fn resolve_pending_approval(holder: &ApprovalHolder, code: KeyCode, mods: KeyModifiers) -> bool {
+fn resolve_pending_approval(
+    holder: &ApprovalHolder,
+    code: KeyCode,
+    mods: KeyModifiers,
+    input_empty: bool,
+) -> bool {
     // A modified chord (Ctrl-C / Alt-… / Super-…) is left for the normal pipeline so the
     // user can always hard-cancel the paused turn. A bare Shift is still "unmodified".
     if mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) {
@@ -1019,25 +1041,73 @@ fn resolve_pending_approval(holder: &ApprovalHolder, code: KeyCode, mods: KeyMod
     // trust-mode cycle (`cycle_approval_mode`): the advertised "shift+Tab 转手动 / flip to
     // Auto to release the paused action" only works if this keystroke is NOT swallowed
     // here. The mode-cycle handler then republishes the live tier and, when it lands on
-    // Auto, resolves THIS pending approval as Allow (see the `allow_pending_approval` call
-    // after `apply_key_with_mods`). Every OTHER bare key stays consumed below so a stray
-    // Enter/character can never start a turn on the one paused session.
+    // Auto, RELEASES this pending approval as Allow — unless the narrowed Auto floor
+    // still escalates it (see `release_pending_approval_on_auto_switch` after
+    // `apply_key_with_mods`; a true disaster keeps its explicit prompt).
     if matches!(code, KeyCode::BackTab) {
         return false;
     }
     let decision = match code {
-        KeyCode::Char('y' | 'Y') => Some(ApprovalReply::Allow),
-        KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(ApprovalReply::Deny),
+        // Esc denies regardless of input content: it is the advertised deny key, and
+        // letting it fall through with text in the box would reach the Esc interrupt
+        // arm (`is_pipeline_active`) — a double-Esc there cancels the WHOLE run.
+        KeyCode::Esc => Some(ApprovalReply::Deny),
+        KeyCode::Char('y' | 'Y') if input_empty => Some(ApprovalReply::Allow),
+        KeyCode::Char('n' | 'N') if input_empty => Some(ApprovalReply::Deny),
         _ => None,
     };
     if let Some(d) = decision {
         if let Some(p) = guard.take() {
             let _ = p.reply_tx.send(d); // a dropped receiver (task gone) is harmless
         }
+        return true;
     }
-    // Every bare key is consumed while a pause is active — only y/n/Esc resolve it, but
-    // a stray Enter / character must never reach the action pipeline and start a turn.
-    true
+    // Everything else flows into the normal pipeline: the user can TYPE a reply
+    // (「批准」/「拒绝」, classified at submit) instead of facing dead keys.
+    false
+}
+
+/// Whether a base `NeedApproval` should PAUSE for the live user rather than
+/// auto-decide on the floor. Two lanes:
+/// - **Guarded per-item review** ([`umadev_agent::guarded_should_pause_item`]) —
+///   a consequential, un-remembered action under Guarded with a live user.
+/// - **AUTO residual escalation** — a TRUE disaster the narrowed Auto floor
+///   still confirms (`rm -rf`, a force-push, credential exfiltration, an
+///   out-of-tree write). With a live user present it must SURFACE the visible
+///   prompt, never headless-deny (the reported "待批准 with no entry, had to
+///   drop to the raw CLI"). Headless Auto keeps the deterministic deny floor.
+///
+/// Pure + deterministic (unit-tested without the process-global trust tier).
+fn should_pause_for_user(
+    mode: umadev_agent::TrustMode,
+    interactive: bool,
+    cap: umadev_agent::Capability,
+    already_remembered: bool,
+    needs_confirm: bool,
+) -> bool {
+    umadev_agent::guarded_should_pause_item(mode, interactive, interactive, cap, already_remembered)
+        || (needs_confirm && interactive && matches!(mode, umadev_agent::TrustMode::Auto))
+}
+
+/// Snapshot the in-flight approval pause's `(action, target)` for the app model —
+/// the renderer pins these into the sticky approval bar above the input box.
+/// Fail-open: a poisoned lock / no pause reads as `None` (bar hidden).
+fn pending_approval_item(holder: &ApprovalHolder) -> Option<(String, String)> {
+    holder
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|p| (p.action.clone(), p.target.clone())))
+}
+
+/// Resolve an in-flight guarded approval as DENY — the typed-reply path
+/// (「拒绝」/"deny" submitted while the pause is active). Fail-open: a poisoned
+/// lock / no pending approval is a no-op (the drain's own budget still bounds it).
+fn deny_pending_approval(holder: &ApprovalHolder) {
+    if let Ok(mut g) = holder.lock() {
+        if let Some(p) = g.take() {
+            let _ = p.reply_tx.send(ApprovalReply::Deny);
+        }
+    }
 }
 
 /// Clear any pending approval (dropping its `reply_tx` so the drain's `await` fail-opens
@@ -1049,14 +1119,41 @@ fn clear_pending_approval(holder: &ApprovalHolder) {
     }
 }
 
-/// Resolve an in-flight guarded approval as ALLOW. Called when the user switches the
-/// trust tier to one that would NOT have paused this action (shift+Tab / `/mode` to
-/// Auto mid-turn): the currently-paused action then proceeds immediately instead of
-/// waiting out [`APPROVAL_WAIT_BUDGET`] and fail-open DENYing — which is exactly the
-/// reported "switched to Auto but the edit was still rejected". Fail-open: a poisoned
-/// lock / no pending approval is a no-op.
+/// Resolve an in-flight guarded approval as ALLOW — the user's EXPLICIT verdict
+/// (a typed 「批准」/"approve" via [`crate::app::Action::ApprovalReply`], or the
+/// empty-input `y` key). Always resolves, whatever the item: an explicit human
+/// approval is exactly what the prompt asked for. Fail-open: a poisoned lock /
+/// no pending approval is a no-op.
 fn allow_pending_approval(holder: &ApprovalHolder) {
     if let Ok(mut g) = holder.lock() {
+        if let Some(p) = g.take() {
+            let _ = p.reply_tx.send(ApprovalReply::Allow);
+        }
+    }
+}
+
+/// Release an in-flight approval on a MODE SWITCH to Auto (shift+Tab / `/mode`
+/// mid-turn): the currently-paused action proceeds immediately instead of
+/// waiting out [`APPROVAL_WAIT_BUDGET`] and fail-open DENYing — which is exactly
+/// the reported "switched to Auto but the edit was still rejected".
+///
+/// **Floor guard — this is NOT an explicit approval:** an item the narrowed AUTO
+/// floor would STILL escalate (a true disaster — `rm -rf`, a force-push,
+/// credential exfiltration, an out-of-tree write; see
+/// [`umadev_agent::floor_escalates`]) is NOT silently released by the mode
+/// switch: it stays pending so the user answers the visible prompt explicitly
+/// (typed 「批准」 / `y` still resolves it via [`allow_pending_approval`]). An
+/// ordinary item (an npm install, an in-tree write) resolves Allow, matching the
+/// tier the user just opted into. Fail-open: a poisoned lock / no pending
+/// approval is a no-op.
+fn release_pending_approval_on_auto_switch(holder: &ApprovalHolder) {
+    if let Ok(mut g) = holder.lock() {
+        let still_escalates = g.as_ref().is_some_and(|p| {
+            umadev_agent::requires_confirmation(umadev_agent::TrustMode::Auto, &p.action, &p.target)
+        });
+        if still_escalates {
+            return; // a true disaster keeps its explicit prompt even in Auto
+        }
         if let Some(p) = g.take() {
             let _ = p.reply_tx.send(ApprovalReply::Allow);
         }
@@ -1075,10 +1172,18 @@ async fn await_user_approval(
     target: &str,
 ) -> ApprovalReply {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    // Register the pause so the event loop routes the user's keypress here. If the lock
-    // is poisoned we can't register → fail-open DENY (never block on an unroutable wait).
+    // Register the pause so the event loop routes the user's keypress here — carrying
+    // the item's identity so the loop mirrors it into the sticky approval bar (A2#5).
+    // If the lock is poisoned we can't register → fail-open DENY (never block on an
+    // unroutable wait).
     match holder.lock() {
-        Ok(mut g) => *g = Some(PendingApproval { reply_tx: tx }),
+        Ok(mut g) => {
+            *g = Some(PendingApproval {
+                reply_tx: tx,
+                action: action.to_string(),
+                target: target.to_string(),
+            });
+        }
         Err(_) => return ApprovalReply::Deny,
     }
     sink.emit(EngineEvent::Note(umadev_i18n::tlf(
@@ -4103,8 +4208,8 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     // Fix ③ (INTERACTIVE-ONLY): in Guarded, PAUSE and ask the live user to
                     // approve a genuinely consequential action the policy would otherwise
                     // auto-decide — backed by the trust ledger so an approved kind is NOT
-                    // re-asked. HEADLESS / Auto / Plan / a read all fall through to the
-                    // always-on floor auto-decide below (deny irreversible, allow the rest),
+                    // re-asked. HEADLESS / Plan / a read all fall through to the
+                    // floor auto-decide below (deny a floor escalation, allow the rest),
                     // so a userless guarded run is never wedged waiting on a human.
                     // Read the LIVE trust tier, not the spawn-time snapshot: a mid-turn
                     // switch (shift+Tab / `/mode`) must apply to the turn already running,
@@ -4113,50 +4218,60 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     let cap = umadev_agent::capability_class(&action, &target);
                     let ledger = umadev_agent::TrustLedger::load(&project_root);
                     let already = ledger.remembers_rooted(&action, &target, &project_root);
-                    let decision = if umadev_agent::guarded_should_pause_item(
+                    // The tier-aware, root-aware, ledger-aware confirm decision — the
+                    // narrowed Auto floor lets ordinary network dev work (npm install)
+                    // run freely; a remembered approved class is not re-asked.
+                    let needs_confirm = umadev_agent::requires_confirmation_with_ledger(
                         mode,
-                        interactive,
-                        interactive,
-                        cap,
-                        already,
-                    ) {
-                        // Block on the user's y/n (bounded + cancellable; fail-open DENY on
-                        // Esc / cancel / a dead session / the wait budget — never a hang).
-                        match await_user_approval(&approval_holder, &sink, &action, &target).await {
-                            ApprovalReply::Allow => {
-                                // Remember this reversible class so it is not re-asked (an
-                                // irreversible-floor action records nothing → always re-asks).
-                                umadev_agent::remember_project_approval(
-                                    &project_root,
-                                    &action,
-                                    &target,
-                                );
-                                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                                    "trust.pause.allowed",
-                                    &[&action, &target],
-                                )));
-                                umadev_runtime::ApprovalDecision::Allow
+                        &action,
+                        &target,
+                        &project_root,
+                        &ledger,
+                    );
+                    // Guarded per-item review, OR — AUTO with a live user — a residual
+                    // floor escalation (a true disaster) that must SURFACE the visible
+                    // prompt instead of a headless deny (see `should_pause_for_user`).
+                    let decision =
+                        if should_pause_for_user(mode, interactive, cap, already, needs_confirm) {
+                            // Block on the user's y/n (bounded + cancellable; fail-open DENY on
+                            // Esc / cancel / a dead session / the wait budget — never a hang).
+                            match await_user_approval(&approval_holder, &sink, &action, &target)
+                                .await
+                            {
+                                ApprovalReply::Allow => {
+                                    // Remember this reversible class so it is not re-asked (an
+                                    // irreversible-floor action records nothing → always re-asks).
+                                    umadev_agent::remember_project_approval(
+                                        &project_root,
+                                        &action,
+                                        &target,
+                                    );
+                                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                        "trust.pause.allowed",
+                                        &[&action, &target],
+                                    )));
+                                    umadev_runtime::ApprovalDecision::Allow
+                                }
+                                ApprovalReply::Deny => {
+                                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                        "trust.pause.denied",
+                                        &[&action, &target],
+                                    )));
+                                    umadev_runtime::ApprovalDecision::Deny
+                                }
                             }
-                            ApprovalReply::Deny => {
-                                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                                    "trust.pause.denied",
-                                    &[&action, &target],
-                                )));
-                                umadev_runtime::ApprovalDecision::Deny
-                            }
-                        }
-                    } else if umadev_agent::requires_confirmation(mode, &action, &target) {
-                        // Always-on irreversible floor (headless / non-guarded / non-paused):
-                        // deny an irreversible action, allow the rest so a guarded chat turn
-                        // isn't wedged waiting on a human headlessly.
-                        sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                            "continuous.dangerous_action_denied",
-                            &[&action, &target],
-                        )));
-                        umadev_runtime::ApprovalDecision::Deny
-                    } else {
-                        umadev_runtime::ApprovalDecision::Allow
-                    };
+                        } else if needs_confirm {
+                            // Floor escalation with NO live user to ask (headless / Plan):
+                            // deny it, allow the rest so a userless turn is never wedged
+                            // waiting on a human.
+                            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                "continuous.dangerous_action_denied",
+                                &[&action, &target],
+                            )));
+                            umadev_runtime::ApprovalDecision::Deny
+                        } else {
+                            umadev_runtime::ApprovalDecision::Allow
+                        };
                     if let Err(e) = session.respond(&req_id, decision).await {
                         let _ = session.end().await;
                         let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
@@ -6843,6 +6958,17 @@ async fn event_loop(
             }
         }
 
+        // A2#5 — mirror the shared in-flight approval pause into the app model so
+        // the renderer pins a VISIBLE sticky approval bar above the input box (the
+        // pause used to surface only as one scrolling Note the transcript pushed
+        // out of view — no persistent approval entry point). Cheap: one short
+        // mutex lock per iteration (the tick guarantees promptness — the Note the
+        // pause emits also wakes the loop immediately); fail-open — a poisoned
+        // lock just keeps the previous frame's state.
+        if app.set_pending_approval(pending_approval_item(&approval_holder)) {
+            needs_redraw = true;
+        }
+
         // P2 — resolve the startup sync-output probe. The DECRPM verdict is
         // captured inside `input.next()` (the reply yields no input event, so
         // it can't wake the loop itself); polling it here — the 80ms tick
@@ -7557,15 +7683,19 @@ async fn event_loop(
                         };
                         for replay_key in replay_keys {
                             // Fix ③ — interactive guarded approval pause. If the resident
-                            // chat drain is BLOCKED awaiting the user's y/n on a consequential
-                            // action, this keypress IS that decision: consume it here so it
-                            // can't leak into the input line or spawn a second turn on the one
-                            // session. A modified chord (Ctrl-C, …) is never intercepted, so
-                            // hard-cancel still works. No pause active → a no-op passthrough.
+                            // chat drain is BLOCKED awaiting the user's decision on a
+                            // consequential action, an empty-input y/n (or Esc) IS that
+                            // decision: consume it here so it can't leak into the input
+                            // line. Every other key flows through so the user can TYPE a
+                            // reply (「批准」/「拒绝」 — classified at submit; A2#5). A
+                            // modified chord (Ctrl-C, …) is never intercepted, so
+                            // hard-cancel still works. No pause active → a no-op
+                            // passthrough.
                             if resolve_pending_approval(
                                 &approval_holder,
                                 replay_key.code,
                                 replay_key.modifiers,
+                                app.input.is_empty(),
                             ) {
                                 needs_redraw = true;
                                 continue;
@@ -7579,18 +7709,30 @@ async fn event_loop(
                             last_key_instant = Some(Instant::now());
                             app.key_arrived_in_burst =
                                 key_gap.is_some_and(|g| g <= crate::app::PASTE_BURST_GAP);
+                            let trust_before_key = app.effective_trust_mode();
                             let action =
                                 app.apply_key_with_mods(replay_key.code, replay_key.modifiers);
                             // Republish the LIVE trust tier so a mid-turn mode switch
                             // (shift+Tab cycles it here) applies to the turn already
-                            // running. Switching to Auto also RESOLVES any in-flight
-                            // guarded pause as Allow, so the paused action proceeds instead
-                            // of waiting out the budget and denying (the reported bug).
+                            // running. An ACTUAL switch onto Auto also RELEASES an
+                            // in-flight guarded pause (Allow), so the paused action
+                            // proceeds instead of waiting out the budget and denying
+                            // (the reported bug) — EXCEPT a true disaster the narrowed
+                            // Auto floor still escalates, which keeps its explicit
+                            // prompt (`release_pending_approval_on_auto_switch`).
+                            // Gated on the before→after EDGE, not on "tier is Auto":
+                            // now that keys flow into the input during a pause (A2#5
+                            // typed replies), an unconditional Auto check would
+                            // silently auto-approve the escalated FLOOR action on the
+                            // first character typed — including the first key of
+                            // 「拒绝」.
                             {
                                 let m = app.effective_trust_mode();
                                 publish_live_trust(m);
-                                if matches!(m, umadev_agent::TrustMode::Auto) {
-                                    allow_pending_approval(&approval_holder);
+                                if m != trust_before_key
+                                    && matches!(m, umadev_agent::TrustMode::Auto)
+                                {
+                                    release_pending_approval_on_auto_switch(&approval_holder);
                                 }
                             }
                             match action {
@@ -7599,6 +7741,22 @@ async fn event_loop(
                                 // the inner replay loop, not the event loop.) None is
                                 // likewise a no-op, so the two share an arm.
                                 Action::Quit | Action::None => {}
+                                Action::ApprovalReply(allow) => {
+                                    // A2#5 — the user TYPED the approval decision
+                                    // (「批准」/"approve" → allow, 「拒绝」/"deny" →
+                                    // deny) while the guarded pause was active.
+                                    // Resolve the shared waiter; the top-of-loop
+                                    // sync then clears the sticky bar. The paused
+                                    // drain emits its own allowed/denied Note, so
+                                    // no extra transcript row here. Fail-open: a
+                                    // pause that already resolved (timeout / mode
+                                    // switch) makes this a harmless no-op.
+                                    if allow {
+                                        allow_pending_approval(&approval_holder);
+                                    } else {
+                                        deny_pending_approval(&approval_holder);
+                                    }
+                                }
                                 Action::BackendChanged => {
                                     // A base was just chosen — either first-launch picker
                                     // completion (the `None`→host case) or a `/backend`
@@ -8582,17 +8740,220 @@ mod tests {
 
     #[test]
     fn allow_pending_approval_resolves_the_waiter_as_allow() {
-        // Switching to Auto mid-pause must RESOLVE an in-flight guarded approval as
+        // Switching to Auto mid-pause must RELEASE an in-flight guarded approval as
         // Allow (not leave it to time out and deny) — the reported "switched to Auto
-        // but the edit was still rejected".
+        // but the edit was still rejected". `npm install` no longer escalates under
+        // the narrowed Auto floor, so the switch releases it.
         let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
         let (tx, rx) = tokio::sync::oneshot::channel();
-        *holder.lock().unwrap() = Some(PendingApproval { reply_tx: tx });
-        allow_pending_approval(&holder);
+        *holder.lock().unwrap() = Some(test_pending_approval(tx));
+        release_pending_approval_on_auto_switch(&holder);
         assert_eq!(rx.blocking_recv().ok(), Some(ApprovalReply::Allow));
         // The holder is cleared, so a second call is a harmless no-op.
         assert!(holder.lock().unwrap().is_none());
+        release_pending_approval_on_auto_switch(&holder);
+
+        // The EXPLICIT verdict path (typed 「批准」 → Action::ApprovalReply(true))
+        // resolves unconditionally — whatever the item.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *holder.lock().unwrap() = Some(test_pending_approval(tx));
         allow_pending_approval(&holder);
+        assert_eq!(rx.blocking_recv().ok(), Some(ApprovalReply::Allow));
+        assert!(holder.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn auto_switch_keeps_a_true_disaster_pending_but_explicit_approve_resolves() {
+        // Floor guard: a mode switch to Auto must NOT silently release an item the
+        // narrowed Auto floor STILL escalates (a destructive verb) — the user must
+        // answer the visible prompt explicitly.
+        let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        *holder.lock().unwrap() = Some(PendingApproval {
+            reply_tx: tx,
+            action: "Bash".to_string(),
+            target: "rm -rf node_modules".to_string(),
+        });
+        release_pending_approval_on_auto_switch(&holder);
+        assert!(
+            holder.lock().unwrap().is_some(),
+            "a still-escalating disaster stays pending across the mode switch"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no Allow was sent for the still-escalating disaster"
+        );
+        // An explicit y / typed 「批准」 still resolves it (the explicit verdict
+        // path is never blocked by the floor guard).
+        assert!(resolve_pending_approval(
+            &holder,
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            true
+        ));
+        assert!(holder.lock().unwrap().is_none());
+
+        // And the typed-verdict resolver releases a disaster too — it IS the
+        // explicit answer the prompt asked for.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *holder.lock().unwrap() = Some(PendingApproval {
+            reply_tx: tx,
+            action: "Bash".to_string(),
+            target: "rm -rf node_modules".to_string(),
+        });
+        allow_pending_approval(&holder);
+        assert_eq!(rx.blocking_recv().ok(), Some(ApprovalReply::Allow));
+    }
+
+    #[test]
+    fn should_pause_for_user_covers_guarded_review_and_auto_disasters() {
+        use umadev_agent::{Capability, TrustMode};
+        // Guarded + live user + consequential un-remembered action → pause.
+        assert!(should_pause_for_user(
+            TrustMode::Guarded,
+            true,
+            Capability::Shell,
+            false,
+            false
+        ));
+        // Guarded remembered class → no pause (no nagging).
+        assert!(!should_pause_for_user(
+            TrustMode::Guarded,
+            true,
+            Capability::Shell,
+            true,
+            false
+        ));
+        // AUTO + live user + residual floor escalation (a true disaster) → the
+        // visible prompt, never a headless deny while a human is present.
+        assert!(should_pause_for_user(
+            TrustMode::Auto,
+            true,
+            Capability::Shell,
+            false,
+            true
+        ));
+        // AUTO + live user + a freed action (npm install under the narrowed
+        // floor: needs_confirm=false) → no pause, it just runs.
+        assert!(!should_pause_for_user(
+            TrustMode::Auto,
+            true,
+            Capability::Network,
+            false,
+            false
+        ));
+        // AUTO headless keeps the deterministic floor (deny path), never a pause.
+        assert!(!should_pause_for_user(
+            TrustMode::Auto,
+            false,
+            Capability::Shell,
+            false,
+            true
+        ));
+        // Plan stays on the deterministic deny floor (read-only tier).
+        assert!(!should_pause_for_user(
+            TrustMode::Plan,
+            true,
+            Capability::Shell,
+            false,
+            true
+        ));
+    }
+
+    /// Build a registered pause for tests (the real one is registered by
+    /// `await_user_approval` with the base's action/target).
+    fn test_pending_approval(tx: tokio::sync::oneshot::Sender<ApprovalReply>) -> PendingApproval {
+        PendingApproval {
+            reply_tx: tx,
+            action: "Bash".to_string(),
+            target: "npm install".to_string(),
+        }
+    }
+
+    #[test]
+    fn deny_pending_approval_resolves_the_waiter_as_deny() {
+        // The typed-reply deny path (「拒绝」/"deny" submitted mid-pause) must
+        // resolve the waiter as Deny — not leave it to time out.
+        let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *holder.lock().unwrap() = Some(test_pending_approval(tx));
+        deny_pending_approval(&holder);
+        assert_eq!(rx.blocking_recv().ok(), Some(ApprovalReply::Deny));
+        assert!(holder.lock().unwrap().is_none());
+        deny_pending_approval(&holder); // cleared → harmless no-op
+    }
+
+    #[test]
+    fn pending_approval_item_mirrors_the_registered_pause() {
+        // A2#5 — the sticky approval bar reads the pause's identity through this
+        // snapshot; no pause (or a cleared one) reads as None (bar hidden).
+        let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+        assert_eq!(pending_approval_item(&holder), None);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        *holder.lock().unwrap() = Some(test_pending_approval(tx));
+        assert_eq!(
+            pending_approval_item(&holder),
+            Some(("Bash".to_string(), "npm install".to_string()))
+        );
+        clear_pending_approval(&holder);
+        assert_eq!(pending_approval_item(&holder), None);
+    }
+
+    #[test]
+    fn approval_pause_keys_resolve_or_flow_for_typing() {
+        // A2#5 — while a pause is active: an EMPTY-input y resolves Allow, n
+        // resolves Deny, Esc denies even with text in the box; every other key
+        // FLOWS THROUGH so the user can type 「批准」 instead of facing dead keys.
+        let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+        // No pause → nothing intercepted.
+        assert!(!resolve_pending_approval(
+            &holder,
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            true
+        ));
+
+        // Empty input, y → consumed as Allow.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *holder.lock().unwrap() = Some(test_pending_approval(tx));
+        assert!(resolve_pending_approval(
+            &holder,
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            true
+        ));
+        assert_eq!(rx.blocking_recv().ok(), Some(ApprovalReply::Allow));
+
+        // Non-empty input: y/n are ordinary characters (they flow into the line);
+        // printable keys always flow; Enter flows (submit classifies the text).
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        *holder.lock().unwrap() = Some(test_pending_approval(tx));
+        for (code, empty) in [
+            (KeyCode::Char('y'), false),
+            (KeyCode::Char('n'), false),
+            (KeyCode::Char('批'), true),
+            (KeyCode::Enter, true),
+            (KeyCode::Enter, false),
+            (KeyCode::Backspace, false),
+        ] {
+            assert!(
+                !resolve_pending_approval(&holder, code, KeyModifiers::NONE, empty),
+                "{code:?} (empty={empty}) must flow through for typing"
+            );
+        }
+        assert!(
+            holder.lock().unwrap().is_some(),
+            "flowing keys must keep the pause registered"
+        );
+        // Esc denies even with text in the box (never falls through to the
+        // run-interrupt gesture mid-pause).
+        assert!(resolve_pending_approval(
+            &holder,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            false
+        ));
+        assert!(holder.lock().unwrap().is_none());
     }
 
     #[test]
@@ -9266,7 +9627,7 @@ mod tests {
         // fail-opens to DENY), exactly as `Cancel` does.
         let active: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        *active.lock().unwrap() = Some(PendingApproval { reply_tx: tx });
+        *active.lock().unwrap() = Some(test_pending_approval(tx));
         if quit_needs_active_cleanup(true, false) {
             clear_pending_approval(&active);
         }
@@ -9279,7 +9640,7 @@ mod tests {
         // is NEVER invoked — proving idle quit does no active-run work.
         let idle: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
         let (tx2, _rx2) = tokio::sync::oneshot::channel();
-        *idle.lock().unwrap() = Some(PendingApproval { reply_tx: tx2 });
+        *idle.lock().unwrap() = Some(test_pending_approval(tx2));
         if quit_needs_active_cleanup(false, false) {
             clear_pending_approval(&idle);
         }

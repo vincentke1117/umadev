@@ -30,6 +30,7 @@
 
 # Input box placeholders (always visible)
 "input.gate" = "Type revision, or /continue to approve…"
+"input.approval" = "approval needed — type approve / deny (or press y / n; Esc denies)"
 "input.finished" = "New requirement, or /quit…"
 "input.running" = "running — type to queue a message (sent at the next gap); Esc to interrupt"
 "model.synced" = "synced driving model {} (from {}) — the agent runs on the base's own model"
@@ -75,7 +76,7 @@
 "mode.guarded_chip" = "guarded · review each gate (/mode to switch)"
 "mode.plan.on" = "[ok] Plan mode: on (read-only). Only research + PRD/architecture/UIUX planning docs are produced; the pipeline stops at the docs checkpoint and does NOT execute spec/frontend/backend — no real code is written. Once you're happy, run /mode guarded or /mode auto to execute."
 "mode.guarded.on" = "[ok] Guarded mode: on (default). Every checkpoint pauses for your review; type c to approve, or text to revise. Actions touching .git / the network / destructive shell always require confirmation."
-"mode.auto.on" = "[ok] Autonomous mode: on. Checkpoints auto-approve and deliver end-to-end. Irreversible actions (.git / network / destructive shell) still ask for your confirmation — a safety floor that auto mode does not bypass."
+"mode.auto.on" = "[ok] Autonomous mode: on. Checkpoints auto-approve and the base runs with full access — dependency installs and ordinary network work no longer interrupt. Only genuinely irreversible/destructive actions (rm -rf, force-push, .git rewrites, deploy/push/publish, credential exfiltration, writes outside the workspace) still ask for confirmation. Governance hooks and the audit trail stay fully active."
 "mode.current" = "Current trust mode: {}. Switch with /mode plan|guarded|auto (plan = read-only plan, guarded = review each gate, auto = fully autonomous)."
 "mode.unknown" = "Unknown mode \"{}\". Options: plan (read-only plan) / guarded (review each gate, default) / auto (fully autonomous)."
 "mode.plan.gate" = "[plan] Plan mode (read-only): the pipeline stops here — no later phases ran and no real code was written. Once you're happy with the plan above, re-enter the requirement under /mode guarded or /mode auto to execute."
@@ -90,7 +91,9 @@
 "trust.cap.shell" = "run shell commands (confirm)"
 "trust.cap.network" = "network access (allowlist)"
 "trust.approval_remembered" = "[trust] Approval remembered for this project — UmaDev won't re-ask for this action class."
-"trust.pause.approve" = "[review] The base wants to: {} -> {}. Approve? Press y to allow, n or Esc to deny."
+"trust.pause.approve" = "[review] The base wants to: {} -> {}. Approve? Press y or type \"approve\" to allow; n, Esc, or \"deny\" to refuse."
+"approval.bar.label" = "APPROVAL"
+"approval.bar.hint" = "y/approve=allow · n/deny=refuse · Esc=deny"
 "trust.pause.allowed" = "[ok] Approved: {} -> {} (remembered for this project — won't re-ask)."
 "trust.pause.denied" = "[deny] Denied: {} -> {}."
 "trust.pause.timeout" = "[deny] No response — denied for safety: {} -> {}."

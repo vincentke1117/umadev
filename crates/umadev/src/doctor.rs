@@ -15,6 +15,11 @@
 //! 8. Delivery / deployment readiness (after a run completes): delivery notes
 //!    present with a deploy command, build output exists, and a deploy CLI
 //!    (vercel / netlify / wrangler) is on PATH.
+//! 9. npm delivery health (`check_npm_install`): a `sudo`-installed (root-owned)
+//!    global tree or a root-owned `~/.npm` cache — which wedge every LATER
+//!    non-root npm operation on that prefix, including the user's *other* global
+//!    packages — and the "installed locally, so the command is not on PATH"
+//!    confusion (`npm i umadev` without `-g` → run it via `npx umadev`).
 //!
 //! The hook check (7) was added in 4.6 alongside the restored real-time
 //! governance hook (`umadev install`). When `.claude/settings.json` exists
@@ -86,6 +91,7 @@ pub async fn run_all(workspace: &Path) -> Vec<CheckResult> {
     results.push(check_claude_hook(workspace));
     results.push(check_delivery_readiness(workspace));
     results.push(check_ecosystem(workspace));
+    results.push(check_npm_install());
     results
 }
 
@@ -403,6 +409,204 @@ fn check_claude_noninteractive_auth(backend: Option<&str>) -> CheckResult {
     }
 }
 
+/// Name of the npm-delivery check row (shared by the check and its tests).
+const NPM_CHECK: &str = "npm install health";
+
+/// Is `path` inside an npm `node_modules` tree? That is how we recognise an
+/// npm-delivered umadev (the JS shim exec's the platform sub-package binary at
+/// `…/node_modules/@umacloud/cli-<plat>/bin/umadev`) versus a source / release
+/// binary the user placed on PATH themselves.
+fn under_node_modules(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "node_modules")
+}
+
+/// Is `path` inside an npm **global** tree (`<prefix>/lib/node_modules/…`, or
+/// `<prefix>/node_modules/…` on Windows) as opposed to a project-local
+/// `./node_modules`? Global installs put a command on PATH; local ones do not.
+fn under_global_node_modules(path: &Path) -> bool {
+    let parts: Vec<_> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts
+        .windows(2)
+        .any(|w| w[0] == "lib" && w[1] == "node_modules")
+}
+
+/// The uid that owns `path`, or `None` off unix / on a stat error.
+#[cfg(unix)]
+fn owner_uid(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|m| m.uid())
+}
+#[cfg(not(unix))]
+fn owner_uid(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// The current user's uid, derived dependency-free from the ownership of `$HOME`
+/// (stat'ing our own home is a std-only stand-in for `geteuid()`, which would
+/// otherwise pull in `libc`). `None` when there is no home dir or off unix.
+fn current_uid() -> Option<u32> {
+    if !cfg!(unix) {
+        return None;
+    }
+    let home = std::env::var_os("HOME")?;
+    owner_uid(Path::new(&home))
+}
+
+/// Walk `dir` breadth-first, up to `cap` entries, and return the first entry
+/// owned by root (uid 0). Bounded on purpose: `~/.npm/_cacache` can hold tens of
+/// thousands of files and the doctor must stay instant. Fail-open: any I/O error
+/// is treated as "nothing found".
+#[cfg(unix)]
+fn first_root_owned(dir: &Path, cap: usize) -> Option<std::path::PathBuf> {
+    let mut queue = std::collections::VecDeque::from([dir.to_path_buf()]);
+    let mut seen = 0usize;
+    while let Some(next) = queue.pop_front() {
+        if seen >= cap {
+            return None;
+        }
+        let Ok(entries) = fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen >= cap {
+                return None;
+            }
+            let path = entry.path();
+            if owner_uid(&path) == Some(0) {
+                return Some(path);
+            }
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                queue.push_back(path);
+            }
+        }
+    }
+    None
+}
+#[cfg(not(unix))]
+fn first_root_owned(_dir: &Path, _cap: usize) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Check 12: npm delivery health — the two ways an npm-installed umadev ends up
+/// "installed but not working", both of which are npm/OS setup rather than a
+/// umadev bug, and both of which have an exact fix we can print:
+///
+/// 1. **Root-owned global install** (`sudo npm i -g umadev`). It works *today*,
+///    but every later NON-root npm operation on that prefix — including the
+///    tree-wide `npm update -g` — then fails with `EACCES`, which wedges the
+///    user's *other* global packages (their base CLI: `@anthropic-ai/claude-code`,
+///    `@openai/codex`) too, since npm aborts the whole transaction. Same for a
+///    root-owned `~/.npm` cache (what `sudo -E npm …` leaves behind).
+/// 2. **Local install** (`npm i umadev`, no `-g`). npm deliberately does not put
+///    a locally-installed command on PATH — `umadev` then reports "command not
+///    found" and the install looks broken when it is in fact fine: it is reached
+///    via `npx umadev`.
+///
+/// Fail-open: anything we cannot determine (no home dir, stat error, non-npm
+/// build) reports `Passed` — the doctor never invents a problem.
+fn check_npm_install() -> CheckResult {
+    let row = |status: Status, detail: String| CheckResult {
+        name: NPM_CHECK.to_string(),
+        status,
+        detail,
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return row(
+            Status::Passed,
+            "could not resolve the running binary — skipped".to_string(),
+        );
+    };
+    if !under_node_modules(&exe) {
+        return row(
+            Status::Passed,
+            "not an npm-delivered binary (source / release build) — nothing to check".to_string(),
+        );
+    }
+
+    // A local (non-global) install: npm never links its command onto PATH. This
+    // is npm's design, not a bug — but nothing tells the user, so `umadev` reads
+    // as "did not install". Point them at the invocation that does work.
+    if !under_global_node_modules(&exe) && !which_on_path("umadev") {
+        return row(
+            Status::Warning,
+            "installed locally (`npm i umadev`, no `-g`): npm does NOT put a local command on PATH, \
+             so bare `umadev` says \"command not found\" — the install is fine. Run it as `npx umadev`, \
+             or install it as a command with a user-owned prefix (no sudo): \
+             `npm config set prefix ~/.npm-global && npm i -g umadev` \
+             (then add ~/.npm-global/bin to PATH)."
+                .to_string(),
+        );
+    }
+
+    let Some(me) = current_uid() else {
+        return row(
+            Status::Passed,
+            "npm-delivered install detected; ownership checks are unix-only".to_string(),
+        );
+    };
+    // Running AS root — a root-owned tree is then self-consistent; say nothing.
+    if me == 0 {
+        return row(
+            Status::Passed,
+            "running as root — npm ownership checks not applicable".to_string(),
+        );
+    }
+
+    // (1) A root-owned install tree means it was installed with `sudo`.
+    if owner_uid(&exe) == Some(0) {
+        return row(
+            Status::Warning,
+            "installed with `sudo` (the binary is root-owned). It runs, but every later NON-root \
+             npm command on that prefix — including the tree-wide `npm update -g` — will fail with \
+             EACCES, and npm aborts the WHOLE transaction, so your other global packages (e.g. your \
+             base CLI @anthropic-ai/claude-code / @openai/codex) can no longer be updated either. \
+             Fix — reinstall without sudo into a user-owned prefix: \
+             `sudo npm un -g umadev` then `npm config set prefix ~/.npm-global` \
+             (add ~/.npm-global/bin to PATH) then `npm i -g umadev`."
+                .to_string(),
+        );
+    }
+
+    // (2) A root-owned npm cache (the `sudo -E npm …` footgun) breaks later
+    // non-root installs of ANY package, not just umadev.
+    if let Some(home) = std::env::var_os("HOME") {
+        let cache = Path::new(&home).join(".npm");
+        if cache.is_dir() {
+            if let Some(hit) = first_root_owned(&cache, 4000) {
+                return row(
+                    Status::Warning,
+                    format!(
+                        "your npm cache has root-owned files (e.g. {}) — a past `sudo npm …`. Later \
+                         non-root `npm install` of ANY package can fail with EACCES there. \
+                         Fix: `sudo chown -R $(whoami) ~/.npm`.",
+                        hit.display()
+                    ),
+                );
+            }
+        }
+    }
+
+    // (3) Globally installed, no sudo damage — but is the command reachable?
+    if !which_on_path("umadev") {
+        return row(
+            Status::Warning,
+            "installed globally but `umadev` is not on PATH — npm's global bin dir is not in your \
+             shell PATH (common with Homebrew node). Add it: `export PATH=\"$(npm prefix -g)/bin:$PATH\"` \
+             (put it in ~/.zshrc / ~/.bashrc to persist)."
+                .to_string(),
+        );
+    }
+
+    row(
+        Status::Passed,
+        "npm install is user-owned and on PATH".to_string(),
+    )
+}
+
 /// Check if an executable is on PATH (without spawning a subprocess).
 fn which_on_path(cmd: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
@@ -714,10 +918,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_all_returns_eleven_checks_on_empty_workspace() {
+    async fn run_all_returns_twelve_checks_on_empty_workspace() {
         let tmp = TempDir::new().unwrap();
         let results = run_all(tmp.path()).await;
-        assert_eq!(results.len(), 11);
+        assert_eq!(results.len(), 12);
         // No FAILs on a clean workspace — only a manifest WARN.
         assert!(results.iter().all(|r| r.status != Status::Failed));
         // The "AI host backends" check warns iff no base CLI is on PATH, and the
@@ -734,6 +938,61 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn npm_tree_detection_separates_global_from_local() {
+        // Global install: the shim exec's the platform sub-package binary under
+        // <prefix>/lib/node_modules/… — a command IS linked onto PATH.
+        let global = Path::new(
+            "/home/dev/.npm-global/lib/node_modules/umadev/node_modules/@umacloud/cli-linux-x64/bin/umadev",
+        );
+        assert!(under_node_modules(global));
+        assert!(under_global_node_modules(global));
+
+        // Local install (`npm i umadev`): a project ./node_modules — npm links NO
+        // command onto PATH, which is exactly the "it didn't install" confusion.
+        let local = Path::new("/home/dev/proj/node_modules/@umacloud/cli-linux-x64/bin/umadev");
+        assert!(under_node_modules(local));
+        assert!(!under_global_node_modules(local));
+
+        // A source / release build is not npm-delivered at all.
+        let source = Path::new("/home/dev/umadev/target/release/umadev");
+        assert!(!under_node_modules(source));
+        assert!(!under_global_node_modules(source));
+    }
+
+    #[test]
+    fn npm_check_passes_for_a_source_build() {
+        // The test binary itself is a cargo build (never under node_modules), so
+        // the check must stay silent — the doctor never invents a problem.
+        let r = check_npm_install();
+        assert_eq!(r.status, Status::Passed);
+        assert_eq!(r.name, NPM_CHECK);
+        assert!(r.detail.contains("not an npm-delivered binary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_root_owned_finds_nothing_in_a_user_owned_tree() {
+        // A tmpdir we just created is owned by us, so the scan must come back
+        // empty — a false "root-owned cache" WARN would be worse than no check.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("_cacache/content-v2")).unwrap();
+        fs::write(tmp.path().join("_cacache/content-v2/blob"), b"x").unwrap();
+        assert!(first_root_owned(tmp.path(), 4000).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_root_owned_is_bounded_by_the_cap() {
+        // The cap keeps `umadev doctor` instant even against a huge npm cache:
+        // with a cap of 1 the walk must give up immediately, not scan the tree.
+        let tmp = TempDir::new().unwrap();
+        for i in 0..5 {
+            fs::write(tmp.path().join(format!("f{i}")), b"x").unwrap();
+        }
+        assert!(first_root_owned(tmp.path(), 1).is_none());
     }
 
     #[tokio::test]

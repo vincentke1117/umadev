@@ -118,6 +118,25 @@ flowchart LR
 npm install -g umadev
 ```
 
+**Linux 上不要用 sudo。** npm 默认前缀（`/usr/local`）属主是 root，普通用户 `npm i -g` 会 `EACCES`；而 `sudo npm i -g` 看似「解决」了，实则在 npm 前缀里留下一棵 **root 属主**的目录树——之后你以普通用户执行的每一条 npm 全局命令（`npm update -g`、`npm i -g <任何包>`）都会 `EACCES`，且 npm 会整体回滚，**连带**你的其它全局包（含底座 CLI `@anthropic-ai/claude-code`、`@openai/codex`）也再也更新不动。正确做法是换一个你自己拥有的前缀：
+
+```bash
+npm config set prefix ~/.npm-global
+export PATH="$HOME/.npm-global/bin:$PATH"   # 写进 ~/.zshrc 或 ~/.bashrc
+npm install -g umadev
+```
+
+或者干脆不做全局安装——不改前缀、不用 sudo、不占 PATH：
+
+```bash
+npx umadev                 # 直接从 registry 拉起来跑
+npm i umadev && npx umadev # 或作为项目本地依赖
+```
+
+（不带 `-g` 的 `npm i umadev` 是能装上的，只是 npm 按设计**不会**把本地命令挂到 PATH 上，直接敲 `umadev` 会提示 command not found——这不是装坏了，用 `npx umadev` 运行即可。）
+
+已经踩了 sudo 的坑？`umadev doctor` 会检出 root 属主的安装目录或 npm 缓存，并打印确切的修复命令（`sudo chown -R $(whoami) ~/.npm`，然后在自有前缀下重装）。
+
 npm 只是分发壳。真正运行的是 Rust 编译出的 `umadev` 二进制。
 
 安装时还会自动附带一个小型本地嵌入模型（`multilingual-e5-small`，f16，约 224MB，作为可选依赖）并自动接好——它驱动离线向量检索，无需 API key、运行时不联网，**无需手动下载**。若你的镜像源或网络跳过了这个可选下载，umadev 仍可用：检索降级为纯 BM25，重新执行 `npm install -g umadev` 即可恢复向量通道。

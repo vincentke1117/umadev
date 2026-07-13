@@ -12363,4 +12363,59 @@ mod tests {
         assert!(matches!(hosted_deny.decision, ApprovalDecision::Deny));
         assert!(!hosted_deny.headless);
     }
+
+    #[tokio::test]
+    async fn resolve_approval_auto_frees_installs_but_still_asks_on_disasters() {
+        // The narrowed AUTO floor on the director path: a dependency install is
+        // ordinary dev work — allowed WITHOUT consulting the user (the callback
+        // must never fire; the reported "npm install 待批准 in auto" nag). A true
+        // disaster (`rm -rf`) still escalates and — hosted — asks the live user.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.mode = TrustMode::Auto;
+        let (events, _rec) = sink();
+
+        let consulted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let consulted_probe = Arc::clone(&consulted);
+        let never: crate::interaction::ApprovalFn = Arc::new(move |_a, _t| {
+            consulted_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { false }) as crate::interaction::ApprovalFuture
+        });
+        let freed = crate::interaction::hosted(
+            crate::interaction::RunInteraction {
+                steer: None,
+                approval: Some(never),
+                confirm_gates: false,
+            },
+            resolve_approval(&o, &events, "bash", "npm install"),
+        )
+        .await;
+        assert!(
+            matches!(freed.decision, ApprovalDecision::Allow),
+            "auto allows the ordinary inbound network install without a prompt"
+        );
+        assert!(
+            !consulted.load(std::sync::atomic::Ordering::SeqCst),
+            "auto must not consult the user for npm install"
+        );
+
+        // A destructive disaster still surfaces the interactive prompt in Auto,
+        // and the user's verdict decides.
+        let approve: crate::interaction::ApprovalFn =
+            Arc::new(|_a, _t| Box::pin(async { true }) as crate::interaction::ApprovalFuture);
+        let asked = crate::interaction::hosted(
+            crate::interaction::RunInteraction {
+                steer: None,
+                approval: Some(approve),
+                confirm_gates: false,
+            },
+            resolve_approval(&o, &events, "bash", "rm -rf node_modules && rm -rf dist"),
+        )
+        .await;
+        assert!(matches!(asked.decision, ApprovalDecision::Allow));
+        assert!(
+            !asked.headless,
+            "the residual auto escalation must ask the live user, not headless-decide"
+        );
+    }
 }

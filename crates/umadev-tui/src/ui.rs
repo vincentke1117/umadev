@@ -2734,8 +2734,13 @@ fn render_chat(frame: &mut Frame, app: &App) {
     // above the prompt always fit: `area.height - 3` is the most the prompt may
     // take. Without this a tall multi-line input on a short terminal would shove
     // the spacer (and the bottom of the input) past the viewport edge.
+    // A2#5 — sticky approval bar: one warning-colored row pinned DIRECTLY above
+    // the input box while a base action is paused awaiting the user's decision,
+    // so the approval entry point can never scroll out of view with the
+    // transcript. 0 rows (hidden) in the common no-pause case.
+    let approval_h = u16::from(app.pending_approval.is_some());
     let prompt_h = prompt_block_height(&app.input, inner.width, mode_prefix_width(app))
-        .min(inner.height.saturating_sub(3))
+        .min(inner.height.saturating_sub(3 + approval_h))
         .max(2);
     // Wave-1 live plan + team-review panel — a fixed region between the
     // transcript and the prompt, shown only when a plan / review is live and the
@@ -2754,16 +2759,19 @@ fn render_chat(frame: &mut Frame, app: &App) {
         let want = u16::try_from(panel_lines.len())
             .unwrap_or(0)
             .saturating_add(1);
-        let headroom = inner.height.saturating_sub(1 + 3 + 1 + prompt_h); // title + min transcript + spacer + prompt
+        let headroom = inner
+            .height
+            .saturating_sub(1 + 3 + 1 + prompt_h + approval_h); // title + min transcript + spacer + approval bar + prompt
         want.min(headroom).min(PLAN_PANEL_MAX_ROWS)
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),        // title row (borderless)
-            Constraint::Min(1),           // transcript (grows; ≥1 guaranteed)
-            Constraint::Length(panel_h),  // live plan / team-review panel (0 = hidden)
-            Constraint::Length(1),        // spacer — breathing room above the prompt
+            Constraint::Length(1),          // title row (borderless)
+            Constraint::Min(1),             // transcript (grows; ≥1 guaranteed)
+            Constraint::Length(panel_h),    // live plan / team-review panel (0 = hidden)
+            Constraint::Length(1),          // spacer — breathing room above the prompt
+            Constraint::Length(approval_h), // sticky approval bar (0 = hidden)
             Constraint::Length(prompt_h), // prompt: input(N) + border(1) + meta(1, live status pinned bottom-right)
         ])
         .split(inner);
@@ -2778,7 +2786,10 @@ fn render_chat(frame: &mut Frame, app: &App) {
     // against the content above it. The live status that used to burn its own
     // footer row now rides the bottom-right of the prompt's meta row instead, so
     // this gap costs no net vertical space.
-    render_prompt(frame, chunks[4], app);
+    if approval_h > 0 {
+        render_approval_bar(frame, chunks[4], app);
+    }
+    render_prompt(frame, chunks[5], app);
 
     // Feature B — when the search bar is open it OWNS the input mode, so it
     // replaces the popovers entirely: render the one-row search bar in the spacer
@@ -2804,11 +2815,75 @@ fn render_chat(frame: &mut Frame, app: &App) {
         // Slash-command palette popover when typing a `/`-prefixed command.
         let palette = app.palette_matches();
         if !palette.is_empty() {
-            render_palette_popover(frame, chunks[4], app, &palette);
+            render_palette_popover(frame, chunks[5], app, &palette);
         }
     } else {
-        render_mention_popover(frame, chunks[4], app, &mention);
+        render_mention_popover(frame, chunks[5], app, &mention);
     }
+}
+
+/// A2#5 — render the STICKY approval bar: one warning-colored row pinned
+/// directly above the input box while a base action is paused awaiting the
+/// user's decision. A bold `待批准` label chip on the warning color, the
+/// `action -> target` item, then the answer hint (y / typed 「批准」 allows,
+/// n / Esc / typed 「拒绝」 denies) — truncated to the row by worst-case CJK
+/// display width so it can never wrap or overflow. Before this bar the pause
+/// surfaced only as one scrolling Note: the transcript pushed it out of view
+/// and the user faced dead keys with no visible approval entry point.
+/// Fail-open: no pending approval renders nothing.
+fn render_approval_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let Some((action, target)) = &app.pending_approval else {
+        return;
+    };
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let lang = app.lang;
+    // Tint the whole row so the bar reads as one strip, matching the search bar.
+    let bar_bg = theme::BG_ELEMENT();
+    frame.render_widget(Block::default().style(Style::default().bg(bar_bg)), area);
+
+    let label = umadev_i18n::t(lang, "approval.bar.label");
+    let label = format!(" {label} ");
+    let hint = umadev_i18n::t(lang, "approval.bar.hint");
+    let item = format!(" {action} -> {target}  ");
+    // Budget by worst-case display width (CJK-ambiguous glyphs count 2): the
+    // label always shows; the item is truncated to what remains; the hint only
+    // renders if it still fits in full (a truncated hint would misteach keys).
+    let total = usize::from(area.width);
+    let label_w = disp_width_cjk(&label);
+    let room = total.saturating_sub(label_w);
+    let item_shown = if disp_width_cjk(&item) > room {
+        truncate_to_width_cjk(&item, room)
+    } else {
+        item
+    };
+    let used = label_w + disp_width_cjk(&item_shown);
+    let mut spans: Vec<Span<'static>> = vec![
+        // Label chip: panel-dark text ON the warning color — the strongest
+        // attention cue the theme has without inventing colors.
+        Span::styled(
+            label,
+            Style::default()
+                .fg(theme::BG_PANEL())
+                .bg(theme::WARNING())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            item_shown,
+            Style::default()
+                .fg(theme::WARNING())
+                .bg(bar_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if disp_width_cjk(hint) <= total.saturating_sub(used) {
+        spans.push(Span::styled(
+            hint.to_string(),
+            Style::default().fg(theme::TEXT_MUTED()).bg(bar_bg),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Feature B — render the one-row in-transcript search bar (Ctrl+F) into the
@@ -5748,7 +5823,9 @@ fn highlight_row_bg(line: &Line<'static>, from: usize, to: usize, bg: Color) -> 
 /// at any terminal width — otherwise the wider run/gate markers push the text
 /// past the right edge on a narrow terminal.
 fn mode_prefix_width(app: &App) -> u16 {
-    if app.active_gate.is_some() {
+    if app.pending_approval.is_some() {
+        6 // "[y/n]" + space
+    } else if app.active_gate.is_some() {
         7
     } else if app.run_started && !app.finished {
         6
@@ -5815,8 +5892,8 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     // Border color: muted gray normally (Claude Code's promptBorder
-    // rgb(136,136,136)), warm yellow at a gate.
-    let border_color = if app.active_gate.is_some() {
+    // rgb(136,136,136)), warm yellow at a gate or while an approval is pending.
+    let border_color = if app.active_gate.is_some() || app.pending_approval.is_some() {
         theme::WARNING()
     } else {
         theme::BORDER_ACTIVE()
@@ -5830,7 +5907,11 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     // `[run]` there would contradict the `[aborted]` status bar and lie about a
     // dead round. `is_pipeline_active()` already excludes both finished AND
     // aborted, so the run marker only shows for a genuinely live run.
-    let mode_icon = if app.active_gate.is_some() {
+    let mode_icon = if app.pending_approval.is_some() {
+        // A2#5 — a paused approval owns the prompt: the marker mirrors the two
+        // fast keys so the decision surface is visible at the caret itself.
+        "[y/n]"
+    } else if app.active_gate.is_some() {
         "[gate]"
     } else if app.is_pipeline_active() {
         "[run]"
@@ -5841,7 +5922,7 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     // cursor and the wrap width (above) all use it, so they can never drift apart
     // as the terminal resizes or the mode marker changes.
     let prefix_w = usize::from(mode_prefix_width(app));
-    let mode_color = if app.active_gate.is_some() {
+    let mode_color = if app.active_gate.is_some() || app.pending_approval.is_some() {
         theme::WARNING()
     } else {
         theme::PRIMARY()
@@ -6104,7 +6185,12 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
 /// meta row. `Cow` so the state hints stay borrowed from the static catalog
 /// while the owned rotating / example strings slot in.
 fn input_placeholder(app: &App) -> std::borrow::Cow<'static, str> {
-    if app.active_gate.is_some() {
+    if app.pending_approval.is_some() {
+        // A2#5 — a base action is paused on the user's approval: teach the
+        // answer surface right where the user is about to type. Wins over every
+        // other state — the pause is the one thing blocking progress.
+        umadev_i18n::t(app.lang, "input.approval").into()
+    } else if app.active_gate.is_some() {
         umadev_i18n::t(app.lang, "input.gate").into()
     } else if app.thinking || app.tool_in_progress {
         // ACTIVELY working a turn (a chat reply streaming, or a tool running) —
@@ -8641,6 +8727,13 @@ mod tests {
         assert_eq!(
             input_placeholder(&app),
             umadev_i18n::t(app.lang, "input.gate")
+        );
+        // A2#5 — a PAUSED approval wins over even the gate: it is the one thing
+        // blocking progress, so the answer surface must own the prompt.
+        let _ = app.set_pending_approval(Some(("Bash".into(), "npm install".into())));
+        assert_eq!(
+            input_placeholder(&app),
+            umadev_i18n::t(app.lang, "input.approval")
         );
     }
 

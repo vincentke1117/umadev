@@ -269,6 +269,12 @@ pub enum Action {
     /// User submitted text while a gate was active — record as a revision and
     /// re-run the most recent block.
     Revise(String),
+    /// The user TYPED the decision for a paused consequential-action approval
+    /// (「批准」/"approve"/"y" → `true`, 「拒绝」/"deny"/"n" → `false`) while
+    /// [`App::pending_approval`] was live. The event loop resolves the shared
+    /// approval waiter with it (A2#5 — the typed-reply path; the empty-input
+    /// y/n/Esc fast keys are handled before the key pipeline in lib.rs).
+    ApprovalReply(bool),
     /// `/compact` — fold the older conversation turns into one structured summary
     /// via a forked base `complete()`. The event loop drives the async summary
     /// (and falls back to FIFO if the base is unreachable); the slash handler only
@@ -311,6 +317,22 @@ pub enum Action {
     /// — worse on flaky Windows consoles. The event loop owns `terminal`, so the
     /// actual `terminal.clear()` is issued there, not from the app model.
     ForceRedraw,
+}
+
+/// Classify a typed reply to a PAUSED consequential-action approval (A2#5):
+/// `Some(true)` = allow, `Some(false)` = deny, `None` = not a decision (the text
+/// falls through to the normal queued-chat / steering lanes untouched).
+///
+/// Thin wrapper over [`umadev_agent::classify_approval_reply`] — the agent crate
+/// is the reply-classification home (the same one-source-of-truth discipline as
+/// `gates::classify_reply` / `claims_code_changes`), so the trilingual
+/// approve/deny vocabulary can never drift between the TUI and any other
+/// surface. EXACT match only (trimmed, case-folded) — a decision this
+/// consequential is never inferred from a substring of a longer steering
+/// message.
+#[must_use]
+pub(crate) fn classify_approval_reply(text: &str) -> Option<bool> {
+    umadev_agent::classify_approval_reply(text)
 }
 
 /// Status of one pipeline phase.
@@ -2292,6 +2314,15 @@ pub struct App {
     /// The highlighted option index in [`Self::gate_choice`] (0-based). Reset to
     /// 0 each time a fresh choice is set; meaningless when `gate_choice` is `None`.
     pub gate_choice_sel: usize,
+    /// A base action PAUSED awaiting the user's decision, as `(action, target)`
+    /// (e.g. `("Bash", "npm install")`). Mirrored each event-loop iteration from
+    /// the shared approval holder (lib.rs) via [`Self::set_pending_approval`], so
+    /// the renderer pins a STICKY approval bar directly above the input box and
+    /// [`Self::submit_text`] can classify a typed 「批准」/「拒绝」 as the decision
+    /// (A2#5 — the pause used to surface only as one scrolling Note, with every
+    /// key silently consumed and no visible approval entry point). `None` = no
+    /// pause (the common case).
+    pub pending_approval: Option<(String, String)>,
     /// `true` once a delivery proof-pack has landed.
     pub finished: bool,
     /// `true` once the user has kicked off a pipeline run in this session.
@@ -2848,6 +2879,7 @@ impl App {
             active_gate: None,
             gate_choice: None,
             gate_choice_sel: 0,
+            pending_approval: None,
             finished: false,
             run_started: false,
             aborted: false,
@@ -8292,6 +8324,21 @@ impl App {
             self.input_cursor = self.input_len();
             return Action::None;
         }
+        // A2#5 — a PAUSED consequential-action approval is live: an exact typed
+        // decision (「批准」/"approve"/"y" allows, 「拒绝」/"deny"/"n" denies)
+        // resolves the pause instead of queueing as a normal message with no
+        // effect (the reported trap). Anything else falls through to the normal
+        // lanes below — a real steering message typed mid-pause still lands, and
+        // the sticky bar keeps showing how to answer. The paused drain emits its
+        // own allowed/denied Note, so only the user's turn is echoed here.
+        if self.pending_approval.is_some() {
+            if let Some(allow) = classify_approval_reply(&text) {
+                self.pending_approval = None;
+                self.push(ChatRole::You, text);
+                self.refresh_status();
+                return Action::ApprovalReply(allow);
+            }
+        }
         // Fix (dedup): a failed chat turn armed a ONE-SHOT guard with its exact text.
         // If the user's very next submit is that same text — a reflexive re-send, or a
         // double-Enter that outran the failure note — swallow it ONCE so a failed turn
@@ -13373,6 +13420,24 @@ impl App {
     /// instant, captured BEFORE the settle clears it) is at least
     /// [`BELL_MIN_ELAPSED`] in the past. A `None` start or a too-short turn arms
     /// nothing — no beep on a quick turn.
+    /// Mirror the shared in-flight approval pause into the app model (called by
+    /// the event loop each iteration with the holder's current `(action, target)`
+    /// snapshot). Returns `true` when the state CHANGED so the caller schedules a
+    /// redraw of the sticky approval bar (A2#5). The appearance edge (`None` →
+    /// `Some`) also arms the completion bell — a pause popping up deep into a
+    /// long turn is exactly the "stepped away, run silently waiting" case the
+    /// bell exists for. Fail-open: a same-value call is a no-op.
+    pub fn set_pending_approval(&mut self, item: Option<(String, String)>) -> bool {
+        if self.pending_approval == item {
+            return false;
+        }
+        if item.is_some() && self.pending_approval.is_none() {
+            self.arm_completion_bell(self.thinking_started);
+        }
+        self.pending_approval = item;
+        true
+    }
+
     pub(crate) fn arm_completion_bell(&mut self, since: Option<std::time::Instant>) {
         if !self.bell_enabled {
             return;
@@ -15146,6 +15211,87 @@ mod tests {
         // (where `animations_enabled_default` would otherwise pick `false`).
         app.animations = true;
         app
+    }
+
+    // ---- A2#5: typed approval replies + sticky pending-approval state --------
+
+    #[test]
+    fn classify_approval_reply_exact_tokens_only() {
+        for t in [
+            "y", "Y", "yes", "批准", " 同意 ", "允许", "允許", "approve", "APPROVE", "ok", "通过",
+            "确认", "可以",
+        ] {
+            assert_eq!(classify_approval_reply(t), Some(true), "{t}");
+        }
+        for t in [
+            "n",
+            "no",
+            "拒绝",
+            "拒絕",
+            "不批准",
+            "不同意",
+            "deny",
+            "Reject",
+            "取消",
+            "cancel",
+            "skip",
+        ] {
+            assert_eq!(classify_approval_reply(t), Some(false), "{t}");
+        }
+        // NOT decisions: empty, decision words inside longer messages, plain
+        // steering text — these fall through to the normal queued lanes.
+        for t in [
+            "",
+            "批准这个改动吧",
+            "please approve the plan",
+            "先跑一下测试",
+            "not ok",
+        ] {
+            assert_eq!(classify_approval_reply(t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn typed_approval_reply_resolves_pause_instead_of_queueing() {
+        let mut app = fresh_app(Some("claude-code"));
+        // A chat turn is in flight and the drain paused on an approval.
+        app.thinking = true;
+        assert!(app.set_pending_approval(Some(("Bash".into(), "npm install".into()))));
+        // Same snapshot again → unchanged (no redraw churn).
+        assert!(!app.set_pending_approval(Some(("Bash".into(), "npm install".into()))));
+        // The reported trap: 「批准」 used to queue as a normal message with no
+        // effect (every key silently consumed, no approval entry point). Now it
+        // resolves the pause as ALLOW — and must NOT also park on a queue.
+        assert_eq!(
+            app.submit_text("批准".to_string()),
+            Action::ApprovalReply(true)
+        );
+        assert!(app.pending_approval.is_none());
+        assert!(
+            app.queued_chat.is_empty(),
+            "the decision must not ALSO queue as a chat turn"
+        );
+        // A deny word denies.
+        let _ = app.set_pending_approval(Some(("Write".into(), ".claude/skills/x.md".into())));
+        assert_eq!(
+            app.submit_text("拒绝".to_string()),
+            Action::ApprovalReply(false)
+        );
+        // A NON-decision message mid-pause keeps the pause and parks on the
+        // normal queued-chat lane, exactly as before.
+        let _ = app.set_pending_approval(Some(("Bash".into(), "npm install".into())));
+        assert_eq!(
+            app.submit_text("先解释一下为什么要装这个依赖".to_string()),
+            Action::None
+        );
+        assert_eq!(app.queued_chat.len(), 1);
+        assert!(
+            app.pending_approval.is_some(),
+            "a steering message must keep the pause registered"
+        );
+        // The pause resolving (holder emptied) clears the mirrored state.
+        assert!(app.set_pending_approval(None));
+        assert!(app.pending_approval.is_none());
     }
 
     // ---- Context-usage gauge + proactive compaction nudge --------------------

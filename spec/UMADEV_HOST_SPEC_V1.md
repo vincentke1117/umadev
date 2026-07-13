@@ -418,14 +418,33 @@ how much autonomy the run is granted at the confirmation gates:
   (the §4.2 / §4.3 human-in-the-loop behaviour).
 - `auto` — fully autonomous; every gate auto-approves.
 
-Riding on top of the ladder is a **hard reversibility floor**: any action
-that is irreversible or blast-radius-heavy — touching version-control
-internals, the **network**, a **push**, opening a **PR**, a **deploy**, or a
-destructive shell verb — **MUST** be escalated to an explicit confirmation
-**regardless of mode**. `auto` does **not** get to skip the floor; the only
-non-interactive bypass is an explicit `--yes`. The classifier is a pure,
-deterministic function of the action — it introduces no new model endpoint
-and no randomness.
+Riding on top of the ladder is a **hard reversibility floor**, and the floor
+is **tier-aware on exactly one axis**:
+
+- The **true-disaster classes** — a destructive shell verb, version-control
+  internals / history rewrite (including a **force-push**), an obfuscated
+  payload the classifier cannot vet, a **credential-exfiltrating** network
+  command, a **publish-outward** network action (a **push**, opening a
+  **PR**, a package **publish**, a **deploy**), and a write that **escapes
+  the workspace** — **MUST** be escalated to an explicit confirmation
+  **regardless of mode**. `auto` does **not** get to skip these; the only
+  non-interactive bypass is an explicit `--yes`.
+- The **ordinary inbound network reach** — a dependency install
+  (`npm install`, `pip install`, `cargo install`, …), a plain
+  fetch / clone / registry read — **MUST** be confirmed under `guarded` /
+  `plan`, and **MUST run without confirmation under `auto`**: installing
+  dependencies is normal development work, not an irreversible disaster,
+  and the `auto` tier is the user's explicit full-trust opt-in. Under
+  `auto` the host **SHOULD** also grant the base its least-restrictive
+  native permission posture (the base itself never interrupts the run),
+  while the host's own governance hooks and audit trail remain active on
+  every tool call.
+
+An interactive host **MUST** surface any residual floor escalation as a
+visible, answerable prompt (approvable by key **and** by typed text) rather
+than a silent headless deny while a live user is present. The classifier is
+a pure, deterministic function of the action — it introduces no new model
+endpoint and no randomness.
 
 ## 5. Layer 3 — Delivery artifacts
 

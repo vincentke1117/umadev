@@ -30,6 +30,7 @@
 
 # 輸入框佔位提示（始終可見）
 "input.gate" = "輸入修改意見,或 /continue 通過…"
+"input.approval" = "待批准 — 輸入 批准 / 拒絕(或按 y / n,Esc 拒絕)"
 "input.finished" = "輸入新需求,或 /quit 結束…"
 "input.running" = "執行中 — 直接輸入會排隊,空隙時發給底座;Esc 中斷"
 "model.synced" = "已同步驅動模型 {}(來自 {})—— Agent 就用底座這個模型工作"
@@ -74,7 +75,7 @@
 "mode.guarded_chip" = "守護模式·逐門審核 (/mode 切換)"
 "mode.plan.on" = "[ok] 計畫模式:已開啟(唯讀)。只做研究 + PRD/架構/UIUX 計畫文件,在 docs 檢查點停止,不執行 spec/前端/後端、不寫真實程式碼。審核滿意後用 /mode guarded 或 /mode auto 執行。"
 "mode.guarded.on" = "[ok] 守護模式:已開啟(預設)。每個檢查點都會停下等你審核;輸入 c 通過,打字則按你的意見返工。涉及 .git/網路/破壞性操作的動作始終需要確認。"
-"mode.auto.on" = "[ok] 自主模式:已開啟。檢查點自動通過,端到端交付。涉及 .git/網路/破壞性 shell 的不可逆動作仍會要求你確認(安全底線,自主模式也不例外)。"
+"mode.auto.on" = "[ok] 自主模式:已開啟。檢查點自動通過,底座以完整權限運行,依賴安裝與常規網路操作不再打斷;僅真正不可逆/破壞性動作(如 rm -rf、強制推送、改寫 .git、部署/推送發佈、憑據外洩、寫出工作區)仍會要求你確認。治理鉤子與稽核全程照常生效。"
 "mode.current" = "目前信任模式:{}。可用 /mode plan|guarded|auto 切換(plan=唯讀出計畫,guarded=逐門審核,auto=全自動)。"
 "mode.unknown" = "未知模式「{}」。可選:plan(唯讀出計畫)/ guarded(逐門審核,預設)/ auto(全自動)。"
 "mode.plan.gate" = "[plan] 計畫模式(唯讀):流水線在此停止,未執行後續階段、未寫真實程式碼。審核以上計畫滿意後,用 /mode guarded 或 /mode auto 重新輸入需求以執行。"
@@ -89,7 +90,9 @@
 "trust.cap.shell" = "執行 shell 命令(確認)"
 "trust.cap.network" = "網路存取(白名單)"
 "trust.approval_remembered" = "[trust] 已為本專案記住該批准 —— UmaDev 不會再次詢問這一類操作。"
-"trust.pause.approve" = "[審閱] 底座想要執行:{} -> {}。是否批准?按 y 允許,按 n 或 Esc 拒絕。"
+"trust.pause.approve" = "[審閱] 底座想要執行:{} -> {}。是否批准?按 y 或輸入「批准」允許,按 n、Esc 或輸入「拒絕」拒絕。"
+"approval.bar.label" = "待批准"
+"approval.bar.hint" = "y/批准=允許 · n/拒絕=拒絕 · Esc=拒絕"
 "trust.pause.allowed" = "[ok] 已批准:{} -> {}(已為本專案記住,不再詢問)。"
 "trust.pause.denied" = "[deny] 已拒絕:{} -> {}。"
 "trust.pause.timeout" = "[deny] 無回應 —— 出於安全已拒絕:{} -> {}。"

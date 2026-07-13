@@ -155,8 +155,20 @@ pub fn codex_sandbox_override() -> Option<String> {
 ///
 /// (The read-only critic fork — [`thread_start_params_readonly`] — is NEVER driven
 /// by this: its `read-only` sandbox is the single-writer invariant, not a knob.)
-fn codex_sandbox_mode() -> &'static str {
-    resolve_codex_sandbox(codex_sandbox_override().as_deref())
+///
+/// **Autonomy tiering (cross-base parity):** with NO explicit override, the AUTO
+/// tier launches `danger-full-access` — the user's explicit full-trust opt-in
+/// must run with full access on every base (claude auto → `bypassPermissions`,
+/// opencode auto → wildcard-allow; codex on `workspace-write` silently starved
+/// network work like `npm install` inside the sandbox). Guarded/plan keep the
+/// safe `workspace-write` baseline. An explicit `.umadevrc` / env override wins
+/// on BOTH tiers — the user's stated sandbox choice is never widened silently.
+fn codex_sandbox_mode(autonomous: bool) -> &'static str {
+    match codex_sandbox_override() {
+        Some(raw) => resolve_codex_sandbox(Some(&raw)),
+        None if autonomous => "danger-full-access",
+        None => "workspace-write",
+    }
 }
 
 /// Pure, unit-testable core of [`codex_sandbox_mode`]: map a raw env string to
@@ -776,9 +788,10 @@ fn initialize_params() -> Value {
 /// Build the `thread/start` params for `workspace` / `model` / autonomy tier.
 /// The launch sandbox is resolved from [`codex_sandbox_mode`] (`.umadevrc`
 /// `[codex] sandbox_mode` published via `UMADEV_CODEX_SANDBOX`); unset → the
-/// safe `workspace-write` baseline, so default behaviour is unchanged.
+/// autonomy tier decides: auto → `danger-full-access` (full access, cross-base
+/// parity), guarded/plan → the safe `workspace-write` baseline.
 fn thread_start_params(workspace: &Path, model: &str, autonomous: bool) -> Value {
-    thread_start_params_for(workspace, model, autonomous, codex_sandbox_mode())
+    thread_start_params_for(workspace, model, autonomous, codex_sandbox_mode(autonomous))
 }
 
 /// Pure inner of [`thread_start_params`] taking the resolved `sandbox`
@@ -842,7 +855,7 @@ fn thread_resume_params_writable(
         workspace,
         model,
         autonomous,
-        codex_sandbox_mode(),
+        codex_sandbox_mode(autonomous),
     )
 }
 
@@ -1856,9 +1869,17 @@ mod tests {
 
     #[test]
     fn thread_start_params_sets_policy_and_drops_non_native_model() {
-        let autonomous = thread_start_params(Path::new("/tmp/p"), "gpt-5-codex", true);
+        // Cross-base parity: with no explicit sandbox override, the AUTO tier
+        // launches full-access + never-ask (claude auto → bypassPermissions,
+        // opencode auto → wildcard-allow; codex on workspace-write starved
+        // network work like `npm install` inside the sandbox).
+        let autonomous = thread_start_params_for(
+            Path::new("/tmp/p"),
+            "gpt-5-codex",
+            true,
+            codex_sandbox_mode(true),
+        );
         assert_eq!(autonomous["approvalPolicy"], "never");
-        assert_eq!(autonomous["sandbox"], "workspace-write");
         assert_eq!(autonomous["model"], "gpt-5-codex");
         // Gate tier → on-request; claude model id dropped (absent key).
         let gated = thread_start_params(Path::new("/tmp/p"), "claude-sonnet-4-6", false);
@@ -1904,18 +1925,29 @@ mod tests {
         set_codex_sandbox(Some("read-only"));
         assert_eq!(codex_sandbox_override().as_deref(), Some("read-only"));
         assert_eq!(
-            codex_sandbox_mode(),
+            codex_sandbox_mode(false),
             "read-only",
             "driver reads shared state"
         );
+        // An explicit override wins on BOTH tiers — auto never silently widens
+        // (nor narrows) the user's stated sandbox choice.
+        assert_eq!(
+            codex_sandbox_mode(true),
+            "read-only",
+            "explicit override beats the auto full-access default"
+        );
 
         set_codex_sandbox(Some("danger-full-access"));
-        assert_eq!(codex_sandbox_mode(), "danger-full-access");
+        assert_eq!(codex_sandbox_mode(false), "danger-full-access");
 
-        // Clearing it falls back to the fail-open default (no env involved).
+        // Clearing it falls back to the tier defaults (no env involved):
+        // guarded/plan → the safe workspace-write baseline; auto → full access
+        // (cross-base parity: the auto tier must not starve network work in
+        // the sandbox while claude/opencode auto run fully open).
         set_codex_sandbox(None);
         assert_eq!(codex_sandbox_override(), None);
-        assert_eq!(codex_sandbox_mode(), "workspace-write");
+        assert_eq!(codex_sandbox_mode(false), "workspace-write");
+        assert_eq!(codex_sandbox_mode(true), "danger-full-access");
 
         // An empty / whitespace value clears it too (never widens by accident).
         set_codex_sandbox(Some("   "));
@@ -2018,13 +2050,19 @@ mod tests {
 
     #[test]
     fn thread_resume_params_writable_is_workspace_write() {
-        // A cross-session resume re-opens the thread WRITABLE: workspace-write
-        // sandbox + the autonomy-tiered approval policy, so it can keep building
-        // (the opposite of the fresh read-only critic thread/start above).
-        let auto =
-            thread_resume_params_writable("thr_main", Path::new("/tmp/p"), "gpt-5-codex", true);
+        // A cross-session resume re-opens the thread WRITABLE with the
+        // tier-resolved sandbox + the autonomy-tiered approval policy, so it can
+        // keep building (the opposite of the fresh read-only critic thread/start
+        // above). The auto tier mirrors a fresh start: full access, never-ask
+        // (cross-base parity — see `codex_sandbox_mode`).
+        let auto = thread_resume_params_writable_for(
+            "thr_main",
+            Path::new("/tmp/p"),
+            "gpt-5-codex",
+            true,
+            codex_sandbox_mode(true),
+        );
         assert_eq!(auto["threadId"], "thr_main");
-        assert_eq!(auto["sandbox"], "workspace-write");
         assert_eq!(
             auto["approvalPolicy"], "never",
             "autonomous → never-approve"

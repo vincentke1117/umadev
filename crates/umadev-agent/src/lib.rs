@@ -227,10 +227,10 @@ pub use test_integrity::{
     check as check_test_integrity, snapshot as snapshot_test_surface, TestSnapshot,
 };
 pub use trust::{
-    capability_class, capability_requires_confirmation, guarded_should_pause_item,
-    remember_project_approval, requires_confirmation, requires_confirmation_with_ledger,
-    reversibility_class, Capability, CapabilityPolicy, CircuitBreaker, ConsecutiveFailureBreaker,
-    GateTrust, Reversibility, TrustLedger, TrustMode, TrustSuggestion, CIRCUIT_THRESHOLD,
-    CIRCUIT_WINDOW_SECS, CONSECUTIVE_FAILURE_THRESHOLD,
+    capability_class, capability_requires_confirmation, classify_approval_reply, floor_escalates,
+    guarded_should_pause_item, remember_project_approval, requires_confirmation,
+    requires_confirmation_with_ledger, reversibility_class, Capability, CapabilityPolicy,
+    CircuitBreaker, ConsecutiveFailureBreaker, GateTrust, Reversibility, TrustLedger, TrustMode,
+    TrustSuggestion, CIRCUIT_THRESHOLD, CIRCUIT_WINDOW_SECS, CONSECUTIVE_FAILURE_THRESHOLD,
 };
 pub use verify::{detect_project, record_verify_outcome, run_verify, ProjectKind, VerifyOutcome};

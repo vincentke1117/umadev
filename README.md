@@ -57,7 +57,26 @@ It's a single Rust binary. npm is just the delivery shell.
 npm install -g umadev
 ```
 
-The npm package is a distribution shim. The actual program is a Rust binary. Prebuilt binaries ship for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64), and Windows (x86_64).
+**On Linux, don't reach for `sudo`.** The default npm prefix (`/usr/local`) is root-owned, so `npm i -g` there fails with `EACCES` — and `sudo npm i -g` "fixes" it by writing a **root-owned** tree into the npm prefix, which then breaks every *later* non-root npm command on that prefix (`npm update -g`, `npm i -g <anything>`) with `EACCES`. npm aborts the whole transaction, so your **other** global packages — including your base CLI (`@anthropic-ai/claude-code`, `@openai/codex`) — can no longer be updated either. Use a prefix you own instead:
+
+```bash
+npm config set prefix ~/.npm-global
+export PATH="$HOME/.npm-global/bin:$PATH"   # add to ~/.zshrc or ~/.bashrc
+npm install -g umadev
+```
+
+Or skip the global install entirely — no prefix, no sudo, nothing on PATH:
+
+```bash
+npx umadev                 # run it straight from the registry
+npm i umadev && npx umadev # or as a project-local dependency
+```
+
+(`npm i umadev` without `-g` installs fine, but npm deliberately does **not** put a local command on PATH — bare `umadev` will say "command not found". That's npm, not a broken install: run it as `npx umadev`.)
+
+Already hit the sudo trap? `umadev doctor` detects a root-owned install or npm cache and prints the exact repair (`sudo chown -R $(whoami) ~/.npm`, then reinstall under a user-owned prefix).
+
+The npm package is a distribution shim. The actual program is a Rust binary. Prebuilt binaries ship for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64, glibc ≥ 2.18 — musl/Alpine needs a source build), and Windows (x86_64).
 
 The binary and the curated knowledge corpus install from npm and work fully offline. The optional local embedding model (`multilingual-e5-small`, f16, ~224 MB) is **not** bundled in the npm package — it is fetched on first run to `~/.umadev/embed-model` (a one-time download), then powers offline vector search locally with no API key and no runtime network. If that first-run download is unavailable (offline install, restricted network), umadev still works: retrieval falls back to BM25-only until the model is present, and it self-heals — a later run re-downloads it (a corrupt cache is re-fetched, not trusted).
 
