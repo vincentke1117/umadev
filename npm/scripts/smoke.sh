@@ -48,3 +48,234 @@ else
   echo "  got:                 $OUTPUT" >&2
   exit 1
 fi
+
+# ── `umadev update` must be handled by the SHIM, never by the binary.
+#
+# The binary lives inside the very npm tree npm is about to replace. If the
+# binary is the one running `npm install -g`, Windows refuses to unlink the
+# running image: npm installs the new version but cannot delete the tree it
+# renamed aside, so it leaves it behind (`node_modules/.umadev-<rand>/`) and
+# prints an EPERM wall that reads like a failed upgrade. Handling `update` in
+# the shim means nothing under the prefix is open when npm swaps the tree.
+#
+# This checks the two properties that keep that true: the shim must NOT exec
+# the binary for `update`, and it must sweep the staging dirs a previous broken
+# upgrade left behind.
+echo "▶ smoke.sh: checking the update path stays in the shim"
+UPD_TMP="$(mktemp -d)"
+trap 'rm -rf "$UPD_TMP"' EXIT
+
+INSTALLED_VERSION="$(node -p "require('$NPM_ROOT/umadev/package.json').version")"
+
+# Point the registry probe at a closed port so it fails INSTANTLY and the
+# already-latest check falls back to the stand-in `npm view` on PATH. That keeps
+# every assertion below fully offline AND exercises the real fallback chain.
+DEAD_REGISTRY="https://127.0.0.1:1"
+
+# Materialize a fake global install of umadev rooted at $1 (which must be a
+# `node_modules` dir — that is what marks an install as package-manager-owned).
+make_install() {
+  mkdir -p "$1/umadev/bin" "$1/@umacloud"
+  cp "$NPM_ROOT/umadev/bin/cli.js" "$1/umadev/bin/"
+  cp "$NPM_ROOT/umadev/package.json" "$1/umadev/"
+}
+
+# A stand-in package manager on PATH. It answers `--version` (so the shim sees it
+# as runnable), answers `npm view umadev version` with $3 (so the already-latest
+# check never touches the network), and otherwise just records what it was told to
+# run — a real global install is never performed.
+make_stub() {
+  cat > "$UPD_TMP/bin/$1" <<STUB
+#!/bin/sh
+case "\$1" in
+  --version) echo "9.9.9"; exit 0 ;;
+  view)      echo "$2"; exit 0 ;;
+esac
+echo "$1-called: \$*"
+STUB
+  chmod +x "$UPD_TMP/bin/$1"
+}
+
+mkdir -p "$UPD_TMP/bin"
+make_stub npm  "999.0.0"
+make_stub pnpm "999.0.0"
+make_stub bun  "999.0.0"
+
+# ── 1. An npm-owned install upgrades via npm, in the shim, sweeping npm's debris.
+make_install "$UPD_TMP/node_modules"
+# The debris a previous EPERM'd upgrade leaves in an npm prefix.
+mkdir -p "$UPD_TMP/node_modules/.umadev-vv1jMlhy" \
+         "$UPD_TMP/node_modules/@umacloud/.cli-win32-x64-AbC123"
+
+# The shim finds no platform sub-package under this fake prefix, so if it ever
+# tried to exec the binary it would say so — which is exactly what we assert
+# against. A `y` on stdin carries it past the confirmation.
+UPD_OUT="$(cd "$UPD_TMP" && echo y | PATH="$UPD_TMP/bin:$PATH" \
+  UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
+  node "$UPD_TMP/node_modules/umadev/bin/cli.js" update 2>&1)"
+
+if [[ "$UPD_OUT" != *"npm-called: install -g umadev@latest"* ]]; then
+  echo "✗ smoke.sh: the shim did not run the npm upgrade" >&2
+  echo "$UPD_OUT" >&2
+  exit 1
+fi
+if [[ "$UPD_OUT" == *"not installed"* || "$UPD_OUT" == *"failed to exec binary"* ]]; then
+  echo "✗ smoke.sh: the shim tried to launch the binary to update it" >&2
+  echo "$UPD_OUT" >&2
+  exit 1
+fi
+if [[ -d "$UPD_TMP/node_modules/.umadev-vv1jMlhy" ]] ||
+   [[ -d "$UPD_TMP/node_modules/@umacloud/.cli-win32-x64-AbC123" ]]; then
+  echo "✗ smoke.sh: abandoned npm staging dirs were not swept" >&2
+  exit 1
+fi
+echo "✓ smoke.sh: update ran in the shim, binary untouched, debris swept"
+
+# ── 2. A closed stdin must read as "no" — a scripted caller that never answered
+# must not be upgraded behind its back.
+UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/bin:$PATH" \
+  UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
+  node "$UPD_TMP/node_modules/umadev/bin/cli.js" update < /dev/null 2>&1)"
+if [[ "$UPD_OUT" == *"npm-called: install"* ]]; then
+  echo "✗ smoke.sh: update proceeded without an answer" >&2
+  exit 1
+fi
+echo "✓ smoke.sh: an unanswered update aborts"
+
+# ── 3. A pnpm-owned install must upgrade with PNPM, not npm. Running `npm i -g` on
+# a pnpm install does not replace it — it drops a SECOND copy in npm's prefix and
+# whichever bin dir wins PATH decides which binary actually runs.
+PNPM_ROOT="$UPD_TMP/pnpm/global/5/node_modules"
+make_install "$PNPM_ROOT"
+UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/bin:$PATH" \
+  UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
+  node "$PNPM_ROOT/umadev/bin/cli.js" update -y 2>&1)"
+if [[ "$UPD_OUT" != *"pnpm-called: add -g umadev@latest"* ]]; then
+  echo "✗ smoke.sh: a pnpm-owned install did not upgrade via pnpm" >&2
+  echo "$UPD_OUT" >&2
+  exit 1
+fi
+if [[ "$UPD_OUT" == *"npm-called: install"* ]]; then
+  echo "✗ smoke.sh: a pnpm-owned install shelled out to npm anyway" >&2
+  echo "$UPD_OUT" >&2
+  exit 1
+fi
+echo "✓ smoke.sh: a pnpm-owned install upgrades via pnpm"
+
+# ── 4. Same for a bun-owned install ($BUN_INSTALL/install/global).
+BUN_ROOT="$UPD_TMP/.bun/install/global/node_modules"
+make_install "$BUN_ROOT"
+UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/bin:$PATH" \
+  UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
+  node "$BUN_ROOT/umadev/bin/cli.js" update -y 2>&1)"
+if [[ "$UPD_OUT" != *"bun-called: add -g umadev@latest"* ]]; then
+  echo "✗ smoke.sh: a bun-owned install did not upgrade via bun" >&2
+  echo "$UPD_OUT" >&2
+  exit 1
+fi
+if [[ "$UPD_OUT" == *"npm-called: install"* ]]; then
+  echo "✗ smoke.sh: a bun-owned install shelled out to npm anyway" >&2
+  echo "$UPD_OUT" >&2
+  exit 1
+fi
+echo "✓ smoke.sh: a bun-owned install upgrades via bun"
+
+# ── 5. Already on the latest version: say so and reinstall NOTHING.
+mkdir -p "$UPD_TMP/latest-bin"
+cat > "$UPD_TMP/latest-bin/npm" <<STUB
+#!/bin/sh
+case "\$1" in
+  --version) echo "9.9.9"; exit 0 ;;
+  view)      echo "$INSTALLED_VERSION"; exit 0 ;;
+esac
+echo "npm-called: \$*"
+STUB
+chmod +x "$UPD_TMP/latest-bin/npm"
+UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/latest-bin:$PATH" \
+  UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
+  node "$UPD_TMP/node_modules/umadev/bin/cli.js" update -y 2>&1)"
+if [[ "$UPD_OUT" != *"Already on the latest version"* ]]; then
+  echo "✗ smoke.sh: an up-to-date install did not short-circuit" >&2
+  echo "$UPD_OUT" >&2
+  exit 1
+fi
+if [[ "$UPD_OUT" == *"npm-called: install"* ]]; then
+  echo "✗ smoke.sh: an up-to-date install reinstalled itself anyway" >&2
+  echo "$UPD_OUT" >&2
+  exit 1
+fi
+echo "✓ smoke.sh: an already-latest install short-circuits"
+
+# ── 6. A ROOT-OWNED install (`sudo npm i -g`) must be REFUSED with the repair, not
+# handed to a package manager that dies with EACCES half-way through and aborts the
+# whole global transaction (taking the user's other global packages with it).
+#
+# A root-owned dir cannot be fabricated without root, so we use a real one: /tmp is
+# uid 0 on macOS and Linux. Symlinking it in as the `node_modules` component gives
+# the shim a package root that IS genuinely root-owned. Skipped when the test itself
+# runs as root (a root-owned tree is then consistent and there is nothing to refuse).
+if [[ "$(id -u)" -eq 0 ]]; then
+  echo "· smoke.sh: running as root — root-owned refusal check skipped"
+else
+  mkdir -p "$UPD_TMP/rootcase"
+  ln -s /tmp "$UPD_TMP/rootcase/node_modules"
+  set +e
+  ROOT_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/bin:$PATH" \
+    UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
+    node -e '
+      const shim = require(process.argv[1]);
+      shim.runSelfUpdate(["-y"], process.argv[2]).then((handled) => {
+        if (!handled) { console.error("not handled"); process.exit(2); }
+        process.exit(process.exitCode || 0);
+      });
+    ' "$NPM_ROOT/umadev/bin/cli.js" "$UPD_TMP/rootcase/node_modules" 2>&1)"
+  ROOT_RC=$?
+  set -e
+  if [[ "$ROOT_RC" -eq 0 ]]; then
+    echo "✗ smoke.sh: a root-owned install did not fail the update" >&2
+    echo "$ROOT_OUT" >&2
+    exit 1
+  fi
+  if [[ "$ROOT_OUT" != *"root-owned"* ]] ||
+     [[ "$ROOT_OUT" != *"sudo npm uninstall -g umadev"* ]]; then
+    echo "✗ smoke.sh: a root-owned install did not print the repair" >&2
+    echo "$ROOT_OUT" >&2
+    exit 1
+  fi
+  if [[ "$ROOT_OUT" == *"-called:"* ]]; then
+    echo "✗ smoke.sh: a root-owned install ran the package manager anyway" >&2
+    echo "$ROOT_OUT" >&2
+    exit 1
+  fi
+  echo "✓ smoke.sh: a root-owned install refuses with the repair"
+fi
+
+# ── 7. Ownership detection, per layout. The e2e cases above cover npm/pnpm/bun;
+# this pins yarn's layouts and the env-var evidence (PNPM_HOME / BUN_INSTALL), which
+# have no fabricable global install here.
+node -e '
+  const assert = require("node:assert");
+  const { detectPackageManager, versionAtLeast } = require(process.argv[1]);
+  const cases = [
+    ["/usr/local/lib/node_modules/umadev", {}, "npm"],
+    ["/home/u/Library/pnpm/global/5/node_modules/umadev", {}, "pnpm"],
+    ["/home/u/Library/pnpm/global/5/.pnpm/umadev@1.0.0/node_modules/umadev", {}, "pnpm"],
+    ["/home/u/.bun/install/global/node_modules/umadev", {}, "bun"],
+    ["/home/u/.config/yarn/global/node_modules/umadev", {}, "yarn"],
+    ["/home/u/.yarn/global/node_modules/umadev", {}, "yarn"],
+    ["/c/Users/u/AppData/Local/Yarn/Data/global/node_modules/umadev", {}, "yarn"],
+    // Evidence from the manager home, for a layout we did not hard-code.
+    ["/opt/pnpm-store/x/node_modules/umadev", { PNPM_HOME: "/opt/pnpm-store" }, "pnpm"],
+    ["/opt/bunhome/install/global/node_modules/umadev", { BUN_INSTALL: "/opt/bunhome" }, "bun"],
+    // A pnpm HOME that does NOT contain this install must not claim it.
+    ["/usr/local/lib/node_modules/umadev", { PNPM_HOME: "/opt/pnpm-store" }, "npm"],
+  ];
+  for (const [p, env, want] of cases) {
+    assert.strictEqual(detectPackageManager(p, env), want, p + " -> " + want);
+  }
+  assert.ok(versionAtLeast("1.0.40", "1.0.40"));
+  assert.ok(versionAtLeast("1.0.41", "1.0.40"));
+  assert.ok(!versionAtLeast("1.0.39", "1.0.40"));
+  assert.ok(!versionAtLeast("1.0.40", "1.1.0"));
+' "$NPM_ROOT/umadev/bin/cli.js"
+echo "✓ smoke.sh: package-manager ownership is detected from the install layout"

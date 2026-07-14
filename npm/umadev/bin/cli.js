@@ -445,33 +445,53 @@ const NO_MODEL_COMMANDS = new Set([
 // Shown at most ONCE (a marker under the user-owned ~/.umadev, never the
 // root-owned install dir). Fail-open: any error here is swallowed — a cosmetic
 // advisory must never keep the agent from starting.
+
+// Is `p` owned by root while WE are not root — i.e. the `sudo npm i -g` footgun?
+// False on Windows (no uid) and when we are root ourselves (a root-owned tree is
+// then consistent). Never throws: an unreadable path reads as "not root-owned".
+function isRootOwned(p) {
+  try {
+    if (process.platform === 'win32' || typeof process.getuid !== 'function') return false;
+    if (process.getuid() === 0) return false;
+    return fs.statSync(p).uid === 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+// The one copy of the sudo-footgun diagnosis + repair. Used by BOTH the once-per-
+// machine launch warning and by `umadev update`, which must refuse to hand a
+// root-owned prefix to a package manager (see rootOwnedRefusal).
+function sudoFootgunLines() {
+  return [
+    '',
+    '  [warn] umadev was installed with `sudo` — its files are root-owned.',
+    '         It runs, but LATER npm commands you run as yourself on this prefix',
+    '         (`npm update -g`, `npm i -g <anything>`) will fail with EACCES, and npm',
+    '         aborts the whole transaction — so your OTHER global packages, including',
+    '         your base CLI (@anthropic-ai/claude-code / @openai/codex), can no longer',
+    '         be updated either. This is the classic `sudo npm` footgun, not a umadev bug.',
+    '         用 sudo 安装会留下 root 属主文件,之后普通用户跑 npm 会 EACCES,并连带影响其它全局包。',
+    '',
+    '  Repair (no sudo from here on):',
+    '           sudo npm uninstall -g umadev',
+    '           sudo chown -R $(whoami) ~/.npm',
+    '           npm config set prefix ~/.npm-global',
+    '           export PATH="$HOME/.npm-global/bin:$PATH"   # add to ~/.zshrc or ~/.bashrc',
+    '           npm i -g umadev',
+    '',
+  ];
+}
+
 function warnIfRootOwnedInstall(binary) {
   try {
-    if (process.platform === 'win32' || typeof process.getuid !== 'function') return;
-    const me = process.getuid();
-    if (me === 0) return; // running as root: a root-owned tree is consistent
-    if (fs.statSync(binary).uid !== 0) return; // user-owned install — all good
+    if (!isRootOwned(binary)) return;
 
     const marker = path.join(homeDir(), '.umadev', '.sudo-install-warned');
     if (fs.existsSync(marker)) return;
 
     const w = (s) => process.stderr.write(s + '\n');
-    w('');
-    w('  [warn] umadev was installed with `sudo` — its files are root-owned.');
-    w('         It runs, but LATER npm commands you run as yourself on this prefix');
-    w('         (`npm update -g`, `npm i -g <anything>`) will fail with EACCES, and npm');
-    w('         aborts the whole transaction — so your OTHER global packages, including');
-    w('         your base CLI (@anthropic-ai/claude-code / @openai/codex), can no longer');
-    w('         be updated either. This is the classic `sudo npm` footgun, not a umadev bug.');
-    w('         用 sudo 安装会留下 root 属主文件,之后普通用户跑 npm 会 EACCES,并连带影响其它全局包。');
-    w('');
-    w('  Repair (no sudo from here on):');
-    w('           sudo npm uninstall -g umadev');
-    w('           sudo chown -R $(whoami) ~/.npm');
-    w('           npm config set prefix ~/.npm-global');
-    w('           export PATH="$HOME/.npm-global/bin:$PATH"   # add to ~/.zshrc or ~/.bashrc');
-    w('           npm i -g umadev');
-    w('');
+    for (const line of sudoFootgunLines()) w(line);
     w('  Run `umadev doctor` for the full diagnosis. (This notice is shown once.)');
     w('');
 
@@ -482,7 +502,371 @@ function warnIfRootOwnedInstall(binary) {
   }
 }
 
+// ── Self-update, run from the SHIM and never from the binary.
+//
+// The updater must not be the thing being updated. `umadev` on Windows is
+// `umadev.cmd` -> node (this shim) -> umadev.exe, so if the EXE runs `npm
+// install -g`, npm renames the old tree aside and then cannot delete it — the
+// .exe inside it is the running image, and Windows refuses to unlink a mapped
+// executable (EPERM). npm still installs the new version, but it leaves the
+// renamed tree behind as garbage that accumulates on every upgrade, and it
+// prints a wall of red that reads like a failed install.
+//
+// Handling `update` HERE means the binary is never launched, so nothing under
+// the npm prefix is open when npm swaps the tree, and npm's own cleanup works.
+// POSIX doesn't have the unlink restriction, but there is no reason to keep two
+// code paths: the shim is the right place on every platform.
+const PACKAGE_ROOT = path.resolve(__dirname, '..');
+
+// Is this a JS-package-manager install (as opposed to a dev checkout / a
+// `cargo install` build)? Every one of npm / pnpm / yarn / bun materializes a
+// global install under a `node_modules` dir; a cargo/manual binary never does, and
+// falls through to the Rust binary's own self-updater.
+function isPackageManaged(pkgRoot) {
+  return path.resolve(pkgRoot).split(path.sep).includes('node_modules');
+}
+
+// ── Which package manager OWNS this install?
+//
+// The upgrade must run through the manager that installed us. Running `npm i -g`
+// on a pnpm-owned install does not upgrade it — it drops a SECOND copy into npm's
+// prefix, and whichever bin dir comes first on PATH wins, so the user "updates"
+// and still runs the old binary.
+//
+// Detection is EVIDENCE-BASED: it looks at where this copy actually lives (and at
+// the manager's own home env var), never at which manager happens to be on PATH —
+// a dev box typically has all four installed.
+//
+//   pnpm  $PNPM_HOME/global/<n>/node_modules/umadev, files in .../global/<n>/.pnpm/…
+//         (macOS ~/Library/pnpm, Linux ~/.local/share/pnpm, Windows %LOCALAPPDATA%\pnpm)
+//   bun   $BUN_INSTALL/install/global/node_modules/umadev   (default ~/.bun)
+//   yarn  ~/.config/yarn/global/node_modules/umadev            (classic, POSIX)
+//         ~/.yarn/global/…  |  %LOCALAPPDATA%\Yarn\Data\global\…
+//   npm   <prefix>/lib/node_modules/umadev — the default, and the fallback
+//
+// Each manager's global-upgrade command. Constant strings — nothing from argv is
+// ever interpolated into a shell command.
+const UPGRADE_COMMANDS = {
+  pnpm: 'pnpm add -g umadev@latest',
+  yarn: 'yarn global add umadev@latest',
+  bun: 'bun add -g umadev@latest',
+  npm: 'npm install -g umadev@latest',
+};
+
+function detectPackageManager(pkgRoot, env = process.env) {
+  const p = path.resolve(pkgRoot);
+  // Compare on a normalized, lowercased path: Windows mixes separators and cases
+  // (`%LOCALAPPDATA%\Yarn\Data\global`).
+  const norm = p.split(path.sep).join('/').toLowerCase();
+  const under = (root) => {
+    if (!root) return false;
+    const base = path.resolve(root).split(path.sep).join('/').toLowerCase();
+    return norm === base || norm.startsWith(base.replace(/\/+$/, '') + '/');
+  };
+
+  if (norm.includes('/.pnpm/') || norm.includes('/pnpm/global/') || under(env.PNPM_HOME)) {
+    return 'pnpm';
+  }
+  if (norm.includes('/.bun/install/global/') || under(env.BUN_INSTALL)) return 'bun';
+  if (
+    norm.includes('/yarn/global/') ||
+    norm.includes('/.yarn/global/') ||
+    norm.includes('/yarn/data/global/') ||
+    under(env.YARN_GLOBAL_FOLDER)
+  ) {
+    return 'yarn';
+  }
+  return 'npm';
+}
+
+// Can we actually execute this manager? `shell: true` so Windows resolves the
+// `.cmd` / `.ps1` shims npm-family tools install themselves as.
+function managerRunnable(mgr) {
+  try {
+    const r = spawnSync(mgr + ' --version', { stdio: 'ignore', shell: true });
+    return !r.error && r.status === 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+// npm stages a replacement by renaming the old package dir to `.<name>-<rand>`
+// and deleting it afterwards. A delete that hit EPERM (see above) leaves that
+// directory behind forever. Sweep the ones belonging to us — they are npm's own
+// abandoned temp dirs, and by the time we run, nothing in them is in use.
+// Fail-open: any error is ignored; a failed sweep must never block an upgrade.
+function sweepAbandonedStagingDirs(pkgRoot) {
+  const staging = /^\.(umadev|cli-|knowledge|model-)[^/\\]*$/;
+  const roots = [
+    path.dirname(pkgRoot), // …/node_modules
+    path.join(path.dirname(pkgRoot), '@umacloud'), // …/node_modules/@umacloud
+  ];
+  let swept = 0;
+  for (const root of roots) {
+    let entries;
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch (_) {
+      continue;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory() || !staging.test(e.name)) continue;
+      try {
+        fs.rmSync(path.join(root, e.name), { recursive: true, force: true });
+        swept += 1;
+      } catch (_) {
+        /* still locked by another process — leave it, try again next time */
+      }
+    }
+  }
+  return swept;
+}
+
+// One line from stdin, synchronously — works for a TTY and for piped input.
+// EOF (or a closed stdin) reads as "no", so a non-interactive caller that did
+// not pass --yes aborts instead of silently upgrading.
+function readLineSync() {
+  const buf = Buffer.alloc(1);
+  let out = '';
+  for (;;) {
+    let n;
+    try {
+      n = fs.readSync(0, buf, 0, 1, null);
+    } catch (err) {
+      if (err && err.code === 'EAGAIN') continue; // TTY not ready yet
+      return out; // EOF / closed stdin / not readable
+    }
+    if (n === 0) break;
+    const ch = buf.toString('utf8');
+    if (ch === '\n') break;
+    if (ch !== '\r') out += ch;
+  }
+  return out;
+}
+
+// ── "Am I already on the latest?" — so `umadev update` on a current install is a
+// no-op instead of a multi-hundred-MB reinstall.
+//
+// Fail-open by contract: any failure returns null and the caller just proceeds with
+// the upgrade. An offline / firewalled / private-registry box must never be BLOCKED
+// from updating by the check that was only meant to save it a reinstall.
+
+// The registry to ask. Honors npm's own config (`npm_config_registry`, set for a
+// company mirror / npmmirror.com) and an explicit override, so a user behind a
+// private registry checks THEIR registry, not npmjs.org.
+function registryBase() {
+  const raw =
+    process.env.UMADEV_REGISTRY_URL ||
+    process.env.npm_config_registry ||
+    'https://registry.npmjs.org';
+  return raw.replace(/\/+$/, '');
+}
+
+// The registry lookup is a convenience, not a gate — keep it snappy.
+const REGISTRY_TIMEOUT_MS = 5000;
+
+// Cheap, dependency-free registry query: one GET of the `latest` dist-tag document
+// (a few hundred bytes), short timeout. Resolves to a version string or null.
+function registryLatestVersion() {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+    let url;
+    try {
+      url = registryBase() + '/umadev/latest';
+      const client = url.startsWith('http://') ? require('node:http') : https;
+      const req = client.get(
+        url,
+        { headers: { 'User-Agent': 'umadev-cli', Accept: 'application/json' } },
+        (res) => {
+          if (res.statusCode !== 200) {
+            res.resume();
+            return done(null);
+          }
+          let body = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => {
+            body += c;
+            if (body.length > 262144) req.destroy(); // a sane cap; never buffer a huge doc
+          });
+          res.on('end', () => {
+            try {
+              const v = JSON.parse(body).version;
+              done(typeof v === 'string' ? v : null);
+            } catch (_) {
+              done(null);
+            }
+          });
+          res.on('error', () => done(null));
+        },
+      );
+      req.on('error', () => done(null));
+      req.setTimeout(REGISTRY_TIMEOUT_MS, () => {
+        req.destroy();
+        done(null);
+      });
+    } catch (_) {
+      done(null);
+    }
+  });
+}
+
+// Fallback when the direct GET fails (proxy-only network, custom CA, …): ask npm,
+// which already knows the user's proxy/registry/auth config. Returns null if npm is
+// absent or errors.
+function npmViewLatestVersion() {
+  try {
+    const r = spawnSync('npm view umadev version', {
+      encoding: 'utf8',
+      shell: true,
+      timeout: 20000,
+    });
+    if (r.error || r.status !== 0 || !r.stdout) return null;
+    const v = r.stdout.trim().split(/\s+/).pop();
+    return /^\d+\.\d+\.\d+/.test(v || '') ? v : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function latestPublishedVersion() {
+  return (await registryLatestVersion()) || npmViewLatestVersion();
+}
+
+// Is `current` >= `latest`? Used to short-circuit an update that would change
+// nothing. Non-semver on either side falls back to string equality — an unknown
+// version is never treated as "up to date" unless it is literally identical.
+function versionAtLeast(current, latest) {
+  const parse = (v) => {
+    const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(v || '').trim());
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  };
+  const a = parse(current);
+  const b = parse(latest);
+  if (!a || !b) return String(current) === String(latest);
+  for (let i = 0; i < 3; i += 1) {
+    if (a[i] !== b[i]) return a[i] > b[i];
+  }
+  return true;
+}
+
+// A root-owned install (`sudo npm i -g umadev`) cannot be upgraded by a package
+// manager running as the user: it dies with EACCES PART-WAY THROUGH and aborts the
+// whole global transaction, which can leave the user's OTHER global packages (their
+// base CLI) broken. So: name the problem and print the repair instead of running the
+// manager. Returns the lines to print, or null when the install is upgradable.
+function rootOwnedRefusal(pkgDir, mgr) {
+  if (!isRootOwned(pkgDir)) return null;
+  const cmd = UPGRADE_COMMANDS[mgr] || UPGRADE_COMMANDS.npm;
+  return [
+    '',
+    `umadev: this install is root-owned, so \`${cmd}\` would fail with EACCES`,
+    '        half-way through — and an aborted global transaction can break your OTHER',
+    '        global packages. Not running it.',
+    ...sudoFootgunLines(),
+    '  Then re-run `umadev update`.',
+    '',
+  ];
+}
+
+// `umadev update`. Returns true if it handled the command (the caller must then
+// exit without launching the binary), false to fall through to the binary — a
+// dev/cargo build is nobody's package install, and the binary self-updates from the
+// GitHub Release on its own.
+async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
+  if (!isPackageManaged(pkgRoot)) return false;
+
+  const mgr = detectPackageManager(pkgRoot);
+  const command = UPGRADE_COMMANDS[mgr];
+
+  // BEFORE anything else — no registry call, no manager, no prompt.
+  const refusal = rootOwnedRefusal(pkgRoot, mgr);
+  if (refusal) {
+    for (const line of refusal) console.error(line);
+    process.exitCode = 1;
+    return true;
+  }
+
+  let current = 'unknown';
+  try {
+    current = require(path.join(pkgRoot, 'package.json')).version;
+  } catch (_) {
+    /* keep "unknown" — the upgrade itself doesn't depend on knowing it */
+  }
+  console.log(`UmaDev ${current} is installed (via ${mgr}).`);
+
+  const force = args.includes('--force');
+  if (!force) {
+    const latest = await latestPublishedVersion();
+    if (latest && versionAtLeast(current, latest)) {
+      console.log(`Already on the latest version (${latest}). Nothing to do.`);
+      return true;
+    }
+    if (latest) console.log(`Latest published version: ${latest}.`);
+  }
+
+  // Upgrade with the manager that OWNS this install. If its binary is somehow not
+  // runnable (uninstalled since, or not on this PATH), npm is the universal
+  // fallback; if npm is missing too, we cannot do it for them — print the exact
+  // command and fail loudly rather than silently installing a shadow copy.
+  let useCommand = command;
+  if (!managerRunnable(mgr)) {
+    if (mgr !== 'npm' && managerRunnable('npm')) {
+      console.log(`\`${mgr}\` is not runnable here — falling back to npm.`);
+      useCommand = UPGRADE_COMMANDS.npm;
+    } else {
+      console.error(
+        `\numadev: \`${mgr}\` owns this install but is not runnable, and npm is not\n` +
+          'available either. Upgrade it yourself with:\n' +
+          `    ${command}\n`,
+      );
+      process.exitCode = 1;
+      return true;
+    }
+  }
+
+  const yes = args.includes('-y') || args.includes('--yes');
+  if (!yes) {
+    process.stdout.write(`Upgrade now via \`${useCommand}\`? [y/N] `);
+    const reply = readLineSync().trim().toLowerCase();
+    if (reply !== 'y' && reply !== 'yes') {
+      console.log('Aborted.');
+      return true;
+    }
+  }
+
+  sweepAbandonedStagingDirs(pkgRoot);
+
+  // A constant command string — nothing from argv reaches the shell.
+  const r = spawnSync(useCommand, { stdio: 'inherit', shell: true });
+  if (r.error || r.status !== 0) {
+    console.error(
+      '\numadev: the upgrade did not complete. Run it yourself to see why:\n' +
+        `    ${useCommand}\n`,
+    );
+    process.exitCode = 1;
+    return true;
+  }
+
+  // The manager's own cleanup normally succeeds now that the binary was never
+  // launched; sweep once more in case an unrelated process held something open.
+  sweepAbandonedStagingDirs(pkgRoot);
+  console.log('[ok] UmaDev upgraded. Run `umadev --version` to confirm.');
+  return true;
+}
+
 async function main() {
+  // Before anything else: `update` must not launch the binary it replaces.
+  if ((process.argv[2] || '') === 'update') {
+    if (await runSelfUpdate(process.argv.slice(3))) {
+      process.exit(process.exitCode || 0);
+    }
+  }
   const binary = findBinary();
   warnIfRootOwnedInstall(binary);
   // npm artifact round-trips (upload/download-artifact in CI) can strip the
@@ -540,4 +924,20 @@ async function main() {
   process.exit(result.status === null ? 1 : result.status);
 }
 
-main();
+// Run only when invoked as the CLI (which is how npm's bin shim launches us).
+// Being `require`-able keeps the update logic — package-manager detection, the
+// already-latest short-circuit, the root-owned refusal — testable from
+// npm/scripts/smoke.sh without a network or a second global install.
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  detectPackageManager,
+  isPackageManaged,
+  isRootOwned,
+  rootOwnedRefusal,
+  runSelfUpdate,
+  versionAtLeast,
+  UPGRADE_COMMANDS,
+};

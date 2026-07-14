@@ -30,9 +30,6 @@
     "bin/",
     "README.md"
   ],
-  "scripts": {
-    "postinstall": "node bin/postinstall.js"
-  },
   "engines": {
     "node": ">=18"
   },
