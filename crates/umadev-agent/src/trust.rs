@@ -894,7 +894,15 @@ fn target_escapes_workspace(target_path: &str, workspace_root: Option<&Path>) ->
     if p.split(['/', '\\']).any(|seg| seg == "..") {
         return true;
     }
-    if Path::new(p).is_absolute() {
+    // `is_absolute()` is not the whole question on Windows: a DRIVE-RELATIVE path
+    // (`\Windows\System32\drivers\etc\hosts`, or the `/etc/...` spelling a base
+    // trained on POSIX will happily emit) has a ROOT but no drive, so it is not
+    // "absolute" there — and it was therefore read as a project-relative path and
+    // written INSIDE the tree's rule set, when Windows will in fact resolve it
+    // against the current drive, i.e. outside the workspace. `has_root()` catches
+    // both spellings and is identical to `is_absolute()` on Unix. Escalating is the
+    // safe direction: the cost of a false escalation is one confirmation prompt.
+    if Path::new(p).has_root() {
         // MEDIUM M4 — root-aware escape detection. When we know the REAL workspace
         // root, an absolute target is in-tree ONLY when it lies under that root; ANY
         // other absolute path (a system dir, `/opt`, `/var`, `/Library/LaunchAgents`,

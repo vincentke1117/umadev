@@ -630,18 +630,40 @@ pub(crate) fn pid_is_alive(pid: u32) -> Option<bool> {
         .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
         .output()
         .ok()?;
-    if !out.status.success() {
-        return None;
+    // Classify by what tasklist SAID, not by how it exited. "No tasks are running
+    // which match the specified criteria" — the answer we care about most, a dead
+    // pid — is printed on stdout while the exit status is NON-ZERO on the Windows
+    // builds that matter. Bailing on the status first turned every dead pid into
+    // "unknown", so a crashed owner fell through to the age window: a stranded work
+    // tree stayed stranded for the whole rewind window, and a dead run lock held the
+    // tree for hours. The Unix arm has always classified by the message; this one
+    // now does too.
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+    .to_lowercase();
+    if said.contains("no tasks") {
+        return Some(false);
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // tasklist prints "INFO: No tasks ..." when nothing matches; a real row
-    // contains the PID. Look for the pid as a CSV field.
-    if stdout.to_lowercase().contains("no tasks") {
+    // A pid tasklist itself rejects as unusable cannot name a running process.
+    if said.contains("invalid") || said.contains("illegal") {
+        return Some(false);
+    }
+    // A real match is a CSV row carrying the pid as its own quoted field. Match that
+    // exactly — a bare substring search hits the pid inside an image name, a memory
+    // figure, or a session id, and reports a dead pid as alive (which is the one
+    // mistake that must never happen: it makes a stale lock permanent).
+    if said.contains(&format!("\"{pid}\"")) {
+        return Some(true);
+    }
+    // Understood nothing. Say so — the caller falls back to the age window rather
+    // than guessing in either direction.
+    if out.status.success() {
         Some(false)
-    } else if stdout.contains(&format!("\"{pid}\"")) || stdout.contains(&pid.to_string()) {
-        Some(true)
     } else {
-        Some(false)
+        None
     }
 }
 
