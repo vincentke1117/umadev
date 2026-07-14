@@ -15202,7 +15202,11 @@ mod tests {
         // painted at the stale width and garbles. `setup_terminal` therefore enters
         // the alt screen FIRST and probes second. The order is invisible to a unit
         // test at runtime (it needs a real TTY), so lock it structurally.
-        let source = include_str!("lib.rs");
+        // Normalize the line endings first: git checks this file out with CRLF on
+        // Windows (autocrlf), so a scan for a literal "\n}\n" finds nothing there and
+        // the test dies on its own `expect` rather than on the property it guards.
+        // Source-text introspection must never assume the developer's line endings.
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
         let body_start = source
             .find("fn setup_terminal() -> Result<Term> {")
             .expect("setup_terminal exists");
