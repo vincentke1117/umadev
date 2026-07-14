@@ -5,8 +5,11 @@ domain: design-systems
 category: design-systems
 difficulty: intermediate
 tags: [glassmorphism, aurora, frosted, depth, ai, modern, gradient-controlled, design-systems, palette, patterns]
+register: [brand]
+icon-library: Lucide
+icon-stroke: 1.5
 quality_score: 72
-last_updated: 2026-06-19
+last_updated: 2026-07-14
 ---
 # Glass Aurora
 
@@ -20,34 +23,72 @@ AI / 大模型产品、现代消费工具、creator 工具、做得高级的 web
 
 ```css
 :root {
-  --color-bg: #07080d;                 /* 近黑带蓝 */
-  --color-surface: rgba(255,255,255,0.04);   /* 玻璃层：低透明白 */
-  --color-surface-strong: rgba(255,255,255,0.08);
-  --color-glass-border: rgba(255,255,255,0.12);  /* 1px 反光描边 */
-  --color-text: #f4f6fb;
-  --color-text-secondary: #aab1c5;
-  --color-text-tertiary: #6b7390;
-  --color-primary: #5e8bff;            /* 主色：克制的电蓝 */
-  --color-primary-hover: #7aa2ff;
-  --color-accent: #36e0c8;             /* 青绿点缀 */
-  --color-success: #36e0c8;
-  --color-error: #ff5d6c;
-  --color-border: rgba(255,255,255,0.08);
-  /* 极光：极低饱和、大模糊、固定在背景，绝不做成 hero 主色块 */
-  --aurora: radial-gradient(60% 50% at 20% 0%, rgba(94,139,255,0.18), transparent 70%),
-            radial-gradient(50% 40% at 90% 10%, rgba(54,224,200,0.12), transparent 70%);
+  /* Surfaces + paired foregrounds — 玻璃层叠在实底 token 之上，前景永远配对 */
+  --color-bg: oklch(13.6% 0.012 274.6);          /* 近黑带蓝 */
+  --color-on-bg: oklch(97.3% 0.007 268.5);
+  --color-surface: oklch(19.3% 0.017 273.8);     /* 玻璃层的实底回退（backdrop-filter 不可用时） */
+  --color-on-surface: oklch(97.3% 0.007 268.5);
+  --color-card: oklch(23.2% 0.020 271.8);
+  --color-on-card: oklch(91.6% 0.016 270.0);
+  --color-muted: oklch(17.0% 0.015 272.3);
+  --color-on-muted: oklch(71.3% 0.033 269.7);
+
+  --color-primary: oklch(66.2% 0.179 265.8);     /* 克制的电蓝 — 蓝，不是 AI 紫 */
+  --color-on-primary: oklch(14.9% 0.041 261.8);
+  --color-primary-hover: oklch(72.0% 0.160 265.8);
+  --color-accent: oklch(81.8% 0.137 180.7);      /* 青绿点缀 */
+  --color-on-accent: oklch(23.5% 0.039 183.5);
+
+  --color-success: oklch(81.8% 0.137 180.7);
+  --color-on-success: oklch(23.5% 0.039 183.5);
+  --color-warning: oklch(86.2% 0.135 81.0);
+  --color-on-warning: oklch(24.2% 0.047 81.2);
+  --color-error: oklch(69.5% 0.196 18.5);
+  --color-on-error: oklch(19.6% 0.065 20.5);
+
+  /* 玻璃 */
+  --color-glass: oklch(100% 0 0 / 0.04);
+  --color-glass-strong: oklch(100% 0 0 / 0.08);
+  --color-glass-border: oklch(100% 0 0 / 0.12);  /* 1px 反光描边 */
+  --color-border: oklch(100% 0 0 / 0.08);
   --blur: 16px;
-  --radius: 16px;
+
+  /* 极光：极低饱和、大模糊、固定在背景，绝不做成 hero 主色块 */
+  --aurora: radial-gradient(60% 50% at 20% 0%, oklch(66.2% 0.179 265.8 / 0.18), transparent 70%),
+            radial-gradient(50% 40% at 90% 10%, oklch(81.8% 0.137 180.7 / 0.12), transparent 70%);
+
+  /* Type scale — brand register */
+  --text-xs: 0.75rem; --text-sm: 0.875rem; --text-base: 1rem;
+  --text-lg: 1.25rem; --text-xl: 1.625rem; --text-2xl: 2.25rem;
+  --text-3xl: 3rem; --text-display: 4.5rem;
+
+  /* Spacing — 4pt grid */
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
+  --space-6: 24px; --space-8: 32px; --space-12: 48px; --space-16: 64px;
+  --space-24: 96px;
+
+  --radius-sm: 8px; --radius-md: 12px; --radius-lg: 16px; --radius-full: 9999px;
+
+  --duration-fast: 150ms;
+  --duration-normal: 240ms;
+  --duration-reveal: 600ms;
+  --ease-standard: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 @media (prefers-color-scheme: light) {
   :root {
-    --color-bg: #f5f7fc;
-    --color-surface: rgba(255,255,255,0.7);
-    --color-glass-border: rgba(10,20,40,0.08);
-    --color-text: #0c1124;
-    --color-text-secondary: #4a5270;
-    --aurora: radial-gradient(60% 50% at 20% 0%, rgba(94,139,255,0.10), transparent 70%);
+    --color-bg: oklch(97.6% 0.007 268.5); --color-on-bg: oklch(18.4% 0.040 271.0);
+    --color-surface: oklch(100% 0 0); --color-on-surface: oklch(18.4% 0.040 271.0);
+    --color-card: oklch(100% 0 0); --color-on-card: oklch(37.7% 0.044 273.7);
+    --color-muted: oklch(94.9% 0.013 266.7); --color-on-muted: oklch(42.5% 0.042 274.0);
+    --color-primary: oklch(48.0% 0.191 266.5); --color-on-primary: oklch(100% 0 0);
+    --color-accent: oklch(47.4% 0.085 180.5); --color-on-accent: oklch(100% 0 0);
+    --color-success: oklch(47.4% 0.085 180.5); --color-on-success: oklch(100% 0 0);
+    --color-warning: oklch(51.2% 0.108 75.1); --color-on-warning: oklch(100% 0 0);
+    --color-error: oklch(53.7% 0.190 21.0); --color-on-error: oklch(100% 0 0);
+    --color-glass: oklch(100% 0 0 / 0.7);
+    --color-glass-border: oklch(18.4% 0.040 271.0 / 0.08);
+    --aurora: radial-gradient(60% 50% at 20% 0%, oklch(48.0% 0.191 266.5 / 0.10), transparent 70%);
   }
 }
 ```
@@ -66,10 +107,6 @@ AI / 大模型产品、现代消费工具、creator 工具、做得高级的 web
 | body-lg | 1.125rem (18px) | 400 | 1.6 | 0 | Lead |
 | body | 1rem (16px) | 400 | 1.6 | 0 | 正文 |
 | caption | 0.8125rem (13px) | 500 | 1.4 | 0.02em | 标签 |
-
-## Spacing
-
-4px 基：`4 / 8 / 12 / 16 / 24 / 32 / 48 / 64 / 96`。玻璃卡片内边距 24-32px，卡片间距 16-24px。
 
 ## Layout
 

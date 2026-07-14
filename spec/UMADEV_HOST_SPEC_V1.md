@@ -280,6 +280,86 @@ findings; the clause carried in the machine-readable `CLAUSES` data is the
 parent `UD-CODE-006`. (The `-005` slot in this family remains reserved for
 the §10 accessibility candidate.)
 
+### 3.7 Design-system conformance floor (`UD-CODE-007`)
+
+> Level: **MUST** (the advisory tier of sub-rule `UD-CODE-007e` is advisory)
+
+The injected firmware *preaches* design tokens, paired foregrounds, measured
+contrast, one committed hue, and one icon system — but a prompt is not a
+floor. The pre-existing check (`design-tokens.{json,css} exists`) passed on
+`:root{--color-bg:#000}`, which proves a file was written, not that a design
+SYSTEM exists and not that the UI uses it. A conformant host **MUST** verify
+design-system conformance on its own deterministic floor, with six sub-rules:
+
+1. **Token schema floor** (`UD-CODE-007a`, blocking) — the token file **MUST**
+   declare at least **6** color roles, each with a PAIRED `on-<role>`
+   foreground; a type scale of at least **4** steps whose every adjacent ratio
+   is at least **1.125**; a spacing scale of at least 4 steps, every step a
+   multiple of **4** (the 4pt grid); a radius scale; and at least **2** motion
+   durations plus at least **1** easing curve.
+2. **Contrast** (`UD-CODE-007b`, blocking) — every DECLARED
+   `(surface, on-surface)` pair **MUST** be MEASURED with the WCAG relative-
+   luminance formula and reach **4.5:1** (body) or **3:1** (large text / UI
+   chrome roles). The computation is pure arithmetic over parsed color values
+   (`#hex`, `rgb()`, `oklch()`); no browser and no external dependency is
+   required. A failing pair names both tokens and the measured ratio.
+   A translucent surface composites over an unknown backdrop and is skipped
+   rather than measured against a fiction.
+3. **Token drift** (`UD-CODE-007c`, blocking) — UI source **MUST** draw its
+   colors, font families, radii, and font sizes FROM the token set. A literal
+   not present in the set is a blocking finding, subject to tolerances
+   (color ±6 per channel, radius ±0.5px, size ±0.5px) so a legitimate derived
+   value is never mistaken for drift. A `var(...)` reference never drifts.
+4. **Banned brand hue** (`UD-CODE-007d`, blocking) — a declared primary /
+   accent **MUST NOT** fall in the AI indigo/violet band (OKLCH hue **270–320**
+   at chroma ≥ **0.09** and lightness **0.35–0.85**) unless the requirement text
+   explicitly asks for purple. The band is stated perceptually, not as a hex
+   list, so a near-neighbour of a canonical tell is caught while genuine blues
+   (which sit below hue 270 in OKLCH) are deliberately spared.
+5. **Design-lint registry** (`UD-CODE-007e`) — a registry of deterministic,
+   numerically-thresholded source lints, each declaring `{id, severity,
+   register_scope, tell, positive_redirect}`. A small P0 tier is **blocking**;
+   the rest are **advisory** and fold into the rework directive. Every message
+   **MUST** carry BOTH the observable tell and the positive target — a bare
+   prohibition tells the brain what not to type and leaves it to invent the
+   replacement.
+6. **Visual direction** (`UD-CODE-007f`, blocking) — when a UI/UX document
+   exists it **MUST** carry a `## Visual direction` section, and the plan
+   **MUST** schedule the step that produces it BEFORE the design-tokens step.
+   The section **MUST** state: a one-line design read (page kind / audience /
+   register / vibe / aesthetic family); three forced decisions — a color
+   commitment level (`restrained` | `committed` | `full-palette` | `drenched`),
+   the light-vs-dark theme decided by a PHYSICAL-SCENE sentence (who uses this,
+   where, under what ambient light, in what mood), and 2–3 NAMED anchor
+   references each bound to a specific dimension (density from one, type from
+   another, whitespace from a third — bare adjectives such as "modern" or
+   "clean" are rejected); and anti-goals.
+
+**The REGISTER** is normative to this clause. Every visual rule belongs to a
+register: **`brand`** (landing / marketing / campaign / portfolio — design IS
+the product) or **`product`** (app / dashboard / admin / settings / devtool —
+design SERVES the task). The rules are not merely different, they are
+**opposite**: on a product surface a familiar neutral system font is CORRECT,
+the type scale is a fixed **1.125–1.2** rem ratio, there is NO page-load
+choreography, restrained color is the floor, and density is a virtue —
+while a brand surface demands a distinctive display face, a dramatic type
+jump, and one orchestrated entrance. A host **MUST** scope its register-bound
+rules (in the injected law and in the lint registry alike) to the declared
+register. An **unknown** register **MUST** fall back to the host's full
+historical rule set, never to a reduced one — an unclassifiable turn is never
+under-governed.
+
+Blocking findings are part of the **deterministic floor** (not an advisory
+critic): each folds into the step's acceptance as a typed, token-naming rework
+directive under the host's existing bounded fix-round / stall counters. The
+gate is **fail-open**: no token file, an unparseable token file, an unreadable
+tree, an unknown color syntax, and a missing UI/UX document all degrade to a
+silent skip. A project that never asked for a design system is entirely
+unaffected — only a project that SHIPPED one is held to the contract it
+implicitly claimed. The strengthened acceptance
+(`AcceptanceSpec::DesignTokensConform`) composes with, and does not remove,
+the existence check (`DesignTokensPresent`).
+
 ## 4. Layer 2 — Flow contract
 
 This layer governs **the order, gates, and continuity** of the

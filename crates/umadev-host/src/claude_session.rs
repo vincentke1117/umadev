@@ -431,21 +431,7 @@ impl BaseSession for ClaudeSession {
         // Non-blocking peek (the lock + try_wait both never block): a contended
         // lock or a try_wait error fails open to None; `Ok(Some(status))` = the
         // base exited, `Ok(None)` = still alive.
-        match self.child.try_lock() {
-            Ok(mut g) => {
-                let r = g.try_wait();
-                if std::env::var("UMADEV_DBG_EXIT").is_ok() {
-                    eprintln!("DBG try_lock=ok try_wait={r:?}");
-                }
-                r.ok().flatten()
-            }
-            Err(e) => {
-                if std::env::var("UMADEV_DBG_EXIT").is_ok() {
-                    eprintln!("DBG try_lock=CONTENDED {e:?}");
-                }
-                None
-            }
-        }
+        self.child.try_lock().ok()?.try_wait().ok().flatten()
     }
 
     fn session_id(&self) -> Option<&str> {
@@ -3380,14 +3366,30 @@ mod tests {
         .await
         .expect("start");
 
-        // Poll briefly for the child to exit + its stderr to be drained (fail-open
-        // bounded loop, never an unbounded wait).
+        // Poll for the child to exit + its stderr to be drained, bounded by a
+        // WALL-CLOCK deadline (never an unbounded wait).
+        //
+        // The bound is a deadline, NOT a fixed iteration count. The old loop was
+        // `for _ in 0..250 { …; sleep(20ms) }`, which silently conflates "how long
+        // we waited" with "how many times we looped": under a saturated box each
+        // iteration costs *more* than its 20ms sleep, so the loop burned its 250
+        // ticks in ~5.5s of wall time — while the thing it is waiting for (fork +
+        // exec + dyld of a fresh `/bin/sh`, competing with 15 other test threads
+        // that are also spawning children) took ~7.9s. Nothing was deadlocked; the
+        // budget was simply smaller than process-startup latency under load, so the
+        // test lost a race it never meant to run. Measured: the child, its stderr
+        // line, and its exit all landed together at ~7.9s.
+        //
+        // The property under test is *observability* — "the driver eventually
+        // captures the stderr reason and sees the exit" — not "it happens within N
+        // seconds". So the deadline is set far above any plausible scheduling delay
+        // rather than tuned to a machine: on an idle box this loop still finishes in
+        // tens of milliseconds, and a genuine regression (a child that never exits,
+        // a stderr tail that is never captured) still fails, just later.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut exited = false;
         let mut tail = None;
-        // Generous bound (≈5s): tokio's Unix child reaper (which `try_wait` depends
-        // on) can be slow to get a worker when the whole test suite runs in parallel
-        // and saturates the cores — a tighter budget made this flake under load.
-        for _ in 0..250 {
+        while std::time::Instant::now() < deadline {
             if s.try_exit_status().is_some() {
                 exited = true;
             }

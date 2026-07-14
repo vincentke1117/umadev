@@ -5,8 +5,11 @@ domain: design-systems
 category: design-systems
 difficulty: intermediate
 tags: [brutalist, swiss, editorial, mono, high-contrast, oversized-type, design-systems, palette, patterns]
+register: [brand]
+icon-library: Tabler
+icon-stroke: 2
 quality_score: 72
-last_updated: 2026-06-19
+last_updated: 2026-07-14
 ---
 # Brutalist Bold
 
@@ -20,30 +23,62 @@ last_updated: 2026-06-19
 
 ```css
 :root {
-  --color-bg: #0a0a0a;
-  --color-surface: #141414;
-  --color-surface-elevated: #1c1c1c;
-  --color-text: #fafafa;
-  --color-text-secondary: #a3a3a3;
-  --color-text-tertiary: #6b6b6b;
-  --color-primary: #e6ff00;            /* 单一刺眼信号色：电光黄 */
-  --color-primary-hover: #f0ff4d;
-  --color-accent: #e61919;             /* 危险红，仅用于最强调 */
-  --color-border: #2a2a2a;
-  --color-border-strong: #fafafa;      /* 硬边：纯白/纯黑 1-2px */
-  --color-success: #00e676;
-  --color-error: #e61919;
-  --radius: 0px;                       /* 野兽派：拒绝圆角 */
+  /* Surfaces + paired foregrounds — hard edges, zero softness, still AA-legible */
+  --color-bg: oklch(14.5% 0 0);                  /* #0a0a0a */
+  --color-on-bg: oklch(98.5% 0 0);
+  --color-surface: oklch(19.1% 0 0);
+  --color-on-surface: oklch(98.5% 0 0);
+  --color-card: oklch(22.6% 0 0);
+  --color-on-card: oklch(90.7% 0 0);
+  --color-muted: oklch(17.8% 0 0);
+  --color-on-muted: oklch(71.5% 0 0);
+
+  --color-primary: oklch(94.9% 0.218 116.7);     /* 单一刺眼信号色：电光黄 */
+  --color-on-primary: oklch(14.5% 0 0);
+  --color-primary-hover: oklch(97.0% 0.180 116.7);
+  --color-accent: oklch(64.5% 0.241 27.4);       /* 危险红，仅用于最强调 */
+  --color-on-accent: oklch(14.8% 0.061 29.2);
+
+  --color-success: oklch(81.0% 0.214 151.8);
+  --color-on-success: oklch(23.4% 0.054 154.8);
+  --color-warning: oklch(81.2% 0.170 76.4);
+  --color-on-warning: oklch(24.2% 0.050 83.0);
+  --color-error: oklch(64.5% 0.241 27.4);
+  --color-on-error: oklch(14.8% 0.061 29.2);
+
+  --color-border: oklch(26.0% 0 0);
+  --color-border-strong: oklch(98.5% 0 0);       /* 硬边：1-2px */
+
+  /* Type scale — brand register: 巨型排版 */
+  --text-xs: 0.75rem; --text-sm: 0.875rem; --text-base: 1rem;
+  --text-lg: 1.25rem; --text-xl: 2rem; --text-2xl: 3rem;
+  --text-3xl: 4rem; --text-display: clamp(4rem, 11vw, 15rem);
+
+  /* Spacing — 4pt grid */
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
+  --space-6: 24px; --space-8: 32px; --space-12: 48px; --space-16: 64px;
+  --space-24: 96px;
+
+  --radius-sm: 0px; --radius-md: 0px; --radius-lg: 0px; --radius-full: 0px;  /* 野兽派：拒绝圆角 */
+
+  --duration-fast: 80ms;
+  --duration-normal: 160ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);   /* 硬切，不弹 */
 }
 
 @media (prefers-color-scheme: light) {
   :root {
-    --color-bg: #f2f2f2;
-    --color-surface: #ffffff;
-    --color-text: #0a0a0a;
-    --color-text-secondary: #404040;
-    --color-primary: #1a1aff;          /* 浅色下换电光蓝 */
-    --color-border-strong: #0a0a0a;
+    --color-bg: oklch(96.1% 0.003 106.4); --color-on-bg: oklch(14.5% 0 0);
+    --color-surface: oklch(100% 0 0); --color-on-surface: oklch(14.5% 0 0);
+    --color-card: oklch(100% 0 0); --color-on-card: oklch(32.1% 0 0);
+    --color-muted: oklch(92.4% 0.004 106.5); --color-on-muted: oklch(37.1% 0 0);
+    --color-primary: oklch(46.7% 0.303 266.3);   /* 浅色下换电光蓝 */
+    --color-on-primary: oklch(100% 0 0);
+    --color-accent: oklch(51.6% 0.202 28.2); --color-on-accent: oklch(100% 0 0);
+    --color-success: oklch(46.4% 0.115 154.2); --color-on-success: oklch(100% 0 0);
+    --color-warning: oklch(47.1% 0.099 76.3); --color-on-warning: oklch(100% 0 0);
+    --color-error: oklch(51.6% 0.202 28.2); --color-on-error: oklch(100% 0 0);
+    --color-border-strong: oklch(14.5% 0 0);
   }
 }
 ```
@@ -62,10 +97,6 @@ last_updated: 2026-06-19
 | h2 | 1.5rem (24px) | 700 | 1.1 | -0.01em | Subsection |
 | body | 1rem (16px) | 400 | 1.5 | 0 | 正文 |
 | label | 0.75rem (12px) | 700 | 1.1 | 0.08em | 标签，UPPERCASE + mono |
-
-## Spacing
-
-8px 基：`8 / 16 / 24 / 48 / 80 / 128`。区块之间用**硬分隔线**（1-2px 实线）而非留白渐变。
 
 ## Layout
 

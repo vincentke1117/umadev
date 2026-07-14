@@ -228,6 +228,22 @@ pub struct RoutePlan {
 }
 
 impl RoutePlan {
+    /// Whether this turn is building a USER INTERFACE — the one authoritative answer to
+    /// "does the design law apply here?".
+    ///
+    /// Every UI-scoped floor must gate on THIS, and never on the presence of a file: a
+    /// brownfield repo, or a second run in a workspace where an earlier UI build left
+    /// `output/<slug>-uiux.md` behind, still has the artifact on disk long after the UI
+    /// work is over. A pure backend task that inherits a design gate from a file it did
+    /// not write gets a blocking finding it can neither act on nor escape.
+    ///
+    /// Same rule the plan skeleton uses to decide whether to schedule the UIUX doc and
+    /// the design-direction step, so the plan and the floor cannot disagree.
+    #[must_use]
+    pub const fn needs_ui(&self) -> bool {
+        matches!(self.kind, TaskKind::Greenfield | TaskKind::FrontendOnly)
+    }
+
     /// A one-line human rationale for this route — what UmaDev decided and why, for
     /// the [`crate::events::EngineEvent::IntentDecided`] card. Bilingual-friendly,
     /// derived deterministically from the typed fields (no model call).

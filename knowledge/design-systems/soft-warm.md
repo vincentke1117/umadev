@@ -5,8 +5,11 @@ domain: design-systems
 category: design-systems
 difficulty: intermediate
 tags: [borders, color, component, design-systems, palette, patterns, radius, soft]
+register: [brand, product]
+icon-library: Lucide
+icon-stroke: 1.75
 quality_score: 70
-last_updated: 2026-06-15
+last_updated: 2026-07-14
 ---
 # Soft Warm
 
@@ -20,35 +23,65 @@ Consumer apps, education, wellness, onboarding flows, community products. Produc
 
 ```css
 :root {
-  --color-bg: #fffbf5;
-  --color-surface: #ffffff;
-  --color-surface-elevated: #ffffff;
-  --color-surface-sunken: #faf5ee;
-  --color-text: #37352f;
-  --color-text-secondary: #787774;
-  --color-text-tertiary: #b4b4b0;
-  --color-primary: #eb5757;
-  --color-primary-hover: #d94444;
-  --color-primary-muted: #fce8e8;
-  --color-accent: #4ea8de;
-  --color-success: #4dab6f;
-  --color-warning: #e9b949;
-  --color-error: #eb5757;
-  --color-border: #e9e5df;
-  --color-border-hover: #ddd9d3;
-  --color-border-focus: #eb5757;
+  /* Surfaces + paired foregrounds */
+  --color-bg: oklch(99.0% 0.009 78.3);
+  --color-on-bg: oklch(32.9% 0.011 91.7);
+  --color-surface: oklch(100% 0 0);
+  --color-on-surface: oklch(32.9% 0.011 91.7);
+  --color-card: oklch(100% 0 0);
+  --color-on-card: oklch(44.6% 0.013 89.8);
+  --color-muted: oklch(97.2% 0.011 76.6);
+  --color-on-muted: oklch(47.5% 0.012 87.5);
+
+  --color-primary: oklch(56.2% 0.180 25.1);      /* warm coral-red */
+  --color-on-primary: oklch(100% 0 0);
+  --color-primary-hover: oklch(50.5% 0.170 25.1);
+  --color-accent: oklch(51.6% 0.103 238.7);      /* calm blue */
+  --color-on-accent: oklch(100% 0 0);
+
+  --color-success: oklch(51.9% 0.105 154.7);
+  --color-on-success: oklch(100% 0 0);
+  --color-warning: oklch(52.9% 0.104 80.9);
+  --color-on-warning: oklch(100% 0 0);
+  --color-error: oklch(56.2% 0.180 25.1);
+  --color-on-error: oklch(100% 0 0);
+
+  --color-border: oklch(92.5% 0.008 84.6);
+  --color-border-hover: oklch(88.5% 0.010 84.6);
+  --color-border-focus: oklch(56.2% 0.180 25.1);
+
+  /* Type scale — approachable but disciplined (ratio ~1.22) */
+  --text-xs: 0.75rem; --text-sm: 0.875rem; --text-base: 1rem;
+  --text-lg: 1.125rem; --text-xl: 1.375rem; --text-2xl: 1.75rem;
+  --text-3xl: 2.25rem; --text-display: 3rem;
+
+  /* Spacing — 4pt grid */
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
+  --space-6: 24px; --space-8: 32px; --space-12: 48px; --space-16: 64px;
+  --space-24: 96px;
+
+  --radius-sm: 8px; --radius-md: 12px; --radius-lg: 16px; --radius-full: 9999px;
+
+  --duration-fast: 150ms;
+  --duration-normal: 220ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0.2, 1);
+
   --shadow-sm: 0 1px 4px rgb(55 53 47 / 0.06);
   --shadow-md: 0 4px 16px rgb(55 53 47 / 0.08);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --color-bg: #191919;
-    --color-surface: #202020;
-    --color-surface-sunken: #141414;
-    --color-text: #ffffffcf;
-    --color-text-secondary: #ffffff80;
-    --color-border: #ffffff14;
+    --color-bg: oklch(20.9% 0.004 84.6); --color-on-bg: oklch(96.2% 0.009 84.6);
+    --color-surface: oklch(25.2% 0.004 84.6); --color-on-surface: oklch(96.2% 0.009 84.6);
+    --color-card: oklch(28.9% 0.006 91.6); --color-on-card: oklch(88.6% 0.012 84.6);
+    --color-muted: oklch(23.5% 0.004 84.6); --color-on-muted: oklch(72.0% 0.014 82.4);
+    --color-primary: oklch(72.7% 0.140 21.1); --color-on-primary: oklch(20.9% 0.059 23.8);
+    --color-accent: oklch(77.7% 0.090 235.4); --color-on-accent: oklch(23.1% 0.041 235.8);
+    --color-success: oklch(76.2% 0.125 154.0); --color-on-success: oklch(25.2% 0.059 153.0);
+    --color-warning: oklch(81.2% 0.117 84.1); --color-on-warning: oklch(24.5% 0.047 83.7);
+    --color-error: oklch(72.7% 0.140 21.1); --color-on-error: oklch(20.9% 0.059 23.8);
+    --color-border: oklch(32.0% 0.005 84.6);
   }
 }
 ```
@@ -66,19 +99,6 @@ Consumer apps, education, wellness, onboarding flows, community products. Produc
 | body | 1rem (16px) | 400 | 1.6 | Default text |
 | body-sm | 0.875rem (14px) | 400 | 1.5 | Secondary text |
 | caption | 0.75rem (12px) | 600 | 1.4 | Labels |
-
-## Spacing
-
-4px base: `4 / 8 / 12 / 16 / 24 / 32 / 48 / 64`
-
-Generous padding. Cards: 24px minimum. Sections: 48-64px vertical.
-
-## Borders & radius
-
-- Default radius: `12px`
-- Small radius: `8px`
-- Large radius: `16px`
-- Full radius: `9999px` (avatars, pills, floating action buttons)
 
 ## Component patterns
 

@@ -767,38 +767,19 @@ impl<R: Runtime> AgentRunner<R> {
     /// (cheap file probes) so a project that grows a backend mid-run flips back
     /// to strict on the next phase — fail-open toward strict.
     fn project_context(&self) -> umadev_governance::ProjectContext {
-        let ctx = crate::planner::derive_project_context(
+        // Derive AND persist through the ONE shared entry point
+        // ([`crate::planner::persist_project_context`]): the real-time PreToolUse hook
+        // (`umadev hook pre-write`) and `umadev ci` (the pre-commit gate) are separate
+        // processes with no access to this run's in-memory state, and they must govern by
+        // the SAME context — or the run accepts what the gate refuses and the build cannot
+        // converge. Fully fail-open: a write failure is swallowed and never blocks the run.
+        // Recomputed (and so re-stamped) per phase, so a project that grows a backend
+        // mid-run flips the on-disk context back to strict on the next phase.
+        crate::planner::persist_project_context(
             &self.options.requirement,
             &self.options.project_root,
             &self.options.effective_slug(),
-        );
-        // Persist the derived context so the real-time PreToolUse hook
-        // (`umadev hook pre-write`), which runs as a separate process with no
-        // access to this run's in-memory state, can govern by the SAME project
-        // context instead of falling back to strict defaults and nagging a
-        // static frontend about CSP / structured logging / crypto-RNG. Fully
-        // fail-open: a write failure is swallowed and never blocks the run; if
-        // the file is absent or stale the hook re-derives the conservative
-        // strict default on its own. Recomputed (and so re-stamped) per phase,
-        // so a project that grows a backend mid-run flips the on-disk context
-        // back to strict on the next phase.
-        self.persist_project_context(ctx);
-        ctx
-    }
-
-    /// Best-effort write of the run's [`umadev_governance::ProjectContext`] to
-    /// `.umadev/governance-context.json` so the out-of-process PreToolUse hook
-    /// can read it. Fail-open: any IO/serialization error is swallowed (the hook
-    /// defaults to strict when the file is missing/unreadable, so a write failure
-    /// only costs the static-frontend leniency, never correctness).
-    fn persist_project_context(&self, ctx: umadev_governance::ProjectContext) {
-        let dir = self.options.project_root.join(".umadev");
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&ctx) {
-            let _ = std::fs::write(dir.join("governance-context.json"), json);
-        }
+        )
     }
 
     /// Emit `event` to the attached sink (no-op for the null sink).
@@ -4224,7 +4205,7 @@ impl<R: Runtime> AgentRunner<R> {
         let user = format!(
             "## 设计意图(UIUX)\n\n{}\n\n## 设计法(必须遵守,任何违反即判定非商业级)\n\n{}\n\n## 交付的 UI 代码(节选)\n\n{code}",
             excerpt_sections(&uiux, 6000),
-            crate::experts::ANTI_SLOP_LAW
+            crate::experts::anti_slop_law(crate::design_system::register_from_text(&uiux))
         );
         self.consult(system, user).await
     }
@@ -4451,6 +4432,9 @@ impl<R: Runtime> AgentRunner<R> {
                 .to_string(),
             passed: false,
             skipped: false,
+            // Stamp WHICH tree this verdict describes, so it cannot later be read as
+            // evidence about code that has since changed (see `crate::freshness`).
+            source_fingerprint: crate::freshness::workspace_fingerprint(&self.options.project_root),
         };
         let _ =
             crate::verify::record_verify_outcome(&self.options.project_root, phase.id(), &outcome);

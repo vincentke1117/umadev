@@ -406,7 +406,7 @@ const CustomChart = ({ data, options }) => {
           labels: data.map(d => d.label),
           datasets: [{
             data: data.map(d => d.value),
-            backgroundColor: options.colors || ['#4F46E5']
+            backgroundColor: options.colors || ['#2563EB']
           }]
         }
       });

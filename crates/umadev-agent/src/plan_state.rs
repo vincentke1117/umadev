@@ -109,6 +109,16 @@ pub enum AcceptanceSpec {
     /// just a narrated claim. Composes with the always-on governance that blocks
     /// emoji-as-icon + hardcoded colors (existence here, quality there).
     DesignTokensPresent,
+    /// The designer's design system **CONFORMS**, not merely exists
+    /// (`VerifyKind::DesignSystemConform`, UD-CODE-007 / spec §3.7) — the STRONGER
+    /// contract. [`Self::DesignTokensPresent`] passes on `:root{--color-bg:#000}`;
+    /// this one demands a real system: >= 6 color roles each with a paired `on-`
+    /// foreground, a >= 4-step type scale at ratio >= 1.125, a 4pt spacing scale, a
+    /// radius scale, >= 2 durations + >= 1 easing; every declared (surface,
+    /// on-surface) pair MEASURED against WCAG; the UI source actually drawing from
+    /// the token set; and no AI-purple brand hue unless the user asked for one.
+    /// Fail-open: no token file → a neutral skip (today's behaviour).
+    DesignTokensConform,
     /// A review step is accepted by its reviewing seat (no blocking verdict).
     ReviewClean,
     /// No machine criterion — accepted when its work turn settles. The weakest
@@ -131,6 +141,10 @@ impl AcceptanceSpec {
             "source-present" | "source" | "files-exist" | "files" => Self::SourcePresent,
             "build-test" | "build" | "test" | "tests" | "lint" => Self::BuildTest,
             "contract" | "api-contract" | "api" => Self::Contract,
+            "design-tokens-conform"
+            | "design-system-conform"
+            | "design-conformance"
+            | "tokens-conform" => Self::DesignTokensConform,
             "design-tokens-present" | "design-tokens" | "design-system" | "tokens" => {
                 Self::DesignTokensPresent
             }
@@ -225,6 +239,27 @@ pub enum EvidenceContract {
         #[serde(default)]
         name: Option<String>,
     },
+    /// **RED→GREEN**: ONE named test that must FAIL at this step's PRE-state and PASS
+    /// at head — the falsifiable form of "test-first".
+    ///
+    /// [`Self::TestPasses`] can be satisfied by a test written AFTER the code it
+    /// "checks", which proves nothing: a test that never failed has never demonstrated
+    /// that it can detect the absence of the behaviour. This contract closes that hole
+    /// mechanically. UmaDev rewinds the workspace to the step's pre-state in a
+    /// SCOPED, REVERSIBLE way ([`crate::checkpoint::begin_temp_rewind`]), runs the ONE
+    /// named test there (it MUST fail — or not exist, which is the same fact), restores
+    /// head, and runs it again (it MUST pass). A test that was ALREADY GREEN before the
+    /// step is a rejected step, with the diagnosis stated plainly.
+    ///
+    /// Opt-in per step, never global, and fail-open at every inconclusive edge (no
+    /// rewind available, no test runner, a timeout) — those degrade to
+    /// [`Self::TestPasses`] semantics rather than blocking on our own inability to
+    /// verify.
+    TestFailsThenPasses {
+        /// The single test id/name to run in isolation (a test-name filter the
+        /// project's own runner understands — NOT the whole suite).
+        test: String,
+    },
     /// An HTTP route answers with the expected status (probed via the runtime
     /// proof — boot the app + `curl` the path). `status == None` means "any non-error
     /// (`< 400`) response"; `Some(code)` requires that EXACT status — so a required
@@ -269,6 +304,9 @@ impl EvidenceContract {
                 Some(n) => format!("test \"{n}\" is present and passing"),
                 None => "the test suite passes".to_string(),
             },
+            Self::TestFailsThenPasses { test } => {
+                format!("test \"{test}\" FAILS before this step and PASSES after it (red→green)")
+            }
             Self::RouteResponds {
                 method,
                 path,
@@ -351,6 +389,27 @@ impl EvidenceContract {
                 Some(Self::TestPasses {
                     name: (!n.is_empty()).then_some(n),
                 })
+            }
+            // RED→GREEN. A name is MANDATORY: the check runs ONE named test at two
+            // tree states, so "the suite" is not expressible here. A missing name is a
+            // retained GAP (M6), never a silent drop to the coarse default.
+            "test-fails-then-passes" | "red-green" | "test-red-green" | "fails-then-passes" => {
+                let test = {
+                    let t = str_field("test");
+                    if t.is_empty() {
+                        str_field("name")
+                    } else {
+                        t
+                    }
+                };
+                if test.is_empty() {
+                    Some(Self::malformed(
+                        "test-fails-then-passes",
+                        "requires a non-empty `test` naming ONE test to run",
+                    ))
+                } else {
+                    Some(Self::TestFailsThenPasses { test })
+                }
             }
             "route-responds" | "route" | "endpoint" | "http" => {
                 let path = str_field("path");
@@ -470,7 +529,33 @@ fn push_unique(evidence: &mut Vec<EvidenceContract>, c: EvidenceContract) {
 pub fn is_design_tokens_step(s: &PlanStep) -> bool {
     s.kind == StepKind::Build
         && s.seat == crate::critics::Seat::UiuxDesigner
-        && s.acceptance == AcceptanceSpec::DesignTokensPresent
+        && matches!(
+            s.acceptance,
+            AcceptanceSpec::DesignTokensPresent | AcceptanceSpec::DesignTokensConform
+        )
+}
+
+/// The step id of the designer's **visual-direction** step (UD-CODE-007f) — the
+/// step that must land BEFORE any token.
+pub const DESIGN_DIRECTION_STEP_ID: &str = "umadev-phase-design-direction";
+
+/// Whether `s` is the designer's **visual-direction** step. Like the tokens step,
+/// it is UIUX-seated but is **code-phase prep, not doc authoring**: it refines the
+/// UIUX doc that the doc-family step already produced, so it must never be adopted
+/// as the UIUX doc anchor and must never re-fire the docs gate.
+#[must_use]
+pub fn is_design_direction_step(s: &PlanStep) -> bool {
+    s.kind == StepKind::Build
+        && s.seat == crate::critics::Seat::UiuxDesigner
+        && s.id == DESIGN_DIRECTION_STEP_ID
+}
+
+/// Whether `s` is a designer step that is **code-phase PREP** (the visual
+/// direction, or the design-tokens deliverable) rather than DOC AUTHORING. Both
+/// are excluded from the docs family and from the docs-gate trigger.
+#[must_use]
+pub fn is_design_prep_step(s: &PlanStep) -> bool {
+    is_design_tokens_step(s) || is_design_direction_step(s)
 }
 
 /// Whether an existing QA BUILD step can safely run **before any code exists** —
@@ -478,11 +563,15 @@ pub fn is_design_tokens_step(s: &PlanStep) -> bool {
 /// (test-first) step that frontend/backend code is wired BEHIND. Its acceptance /
 /// evidence must only demand *authored artifacts* (files on disk); a bar that needs
 /// a GREEN suite/build or a live route ([`AcceptanceSpec::BuildTest`],
-/// [`EvidenceContract::TestPasses`] / `BuildClean` / `RouteResponds` /
-/// `ContractMatches`, or a held [`EvidenceContract::Malformed`] gap) can never pass
-/// while the code it tests is unbuilt — wiring code behind such a step would
-/// deadlock the plan, so it is NOT adopted (the skeleton inserts its own safe
-/// test-authoring step instead). Pure.
+/// [`EvidenceContract::TestPasses`] / `TestFailsThenPasses` / `BuildClean` /
+/// `RouteResponds` / `ContractMatches`, or a held [`EvidenceContract::Malformed`] gap)
+/// can never pass while the code it tests is unbuilt — wiring code behind such a step
+/// would deadlock the plan, so it is NOT adopted (the skeleton inserts its own safe
+/// test-authoring step instead).
+///
+/// The RED→GREEN contract in particular belongs on the step that turns a test GREEN
+/// (the implementation step), NEVER on the step that AUTHORS it: an authored test is
+/// expected to be red at head until the code lands. Pure.
 fn qa_step_precode_runnable(s: &PlanStep) -> bool {
     let acceptance_ok = matches!(
         s.acceptance,
@@ -504,6 +593,50 @@ fn qa_step_precode_runnable(s: &PlanStep) -> bool {
 /// authored tests exist on disk", NOT "the suite is green": tests are written BEFORE
 /// the code they check, so they are EXPECTED to fail until the code lands).
 const TEST_AUTHORING_DIR: &str = "tests";
+
+/// The **declared file surface** of one plan step — the repo-relative paths the step
+/// says it will bring into existence (`create`) or edit (`modify`).
+///
+/// This is the DUAL of requirement coverage. [`crate::coverage`] answers "which
+/// declared requirement has no step?" (UNDER-building); a declared surface lets
+/// [`crate::scope_creep`] answer the opposite question — "which CHANGE belongs to no
+/// step?" (OVER-building). Without it, a run that quietly adds an unplanned
+/// dependency, an unplanned source file, or an unplanned public route lands those
+/// changes with nobody having asked for them and nothing having reviewed them.
+///
+/// Entries are repo-relative, `/`-separated. A trailing `/` (or a bare directory
+/// name that exists as a directory) claims the whole subtree, so a step can claim
+/// `src/api/` without enumerating every file it will write there.
+///
+/// Optional by contract: the planner prompt ASKS for it, but a plan that omits it is
+/// perfectly valid and simply disables the scope check for that run (fail-open — the
+/// check never invents a finding out of an absent declaration).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepFiles {
+    /// Repo-relative paths (or directory prefixes) this step will CREATE.
+    #[serde(default)]
+    pub create: Vec<String>,
+    /// Repo-relative paths (or directory prefixes) this step will MODIFY.
+    #[serde(default)]
+    pub modify: Vec<String>,
+}
+
+impl StepFiles {
+    /// Whether the step declared any surface at all. An all-empty declaration is the
+    /// same as no declaration (the scope check stays silent).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.create.is_empty() && self.modify.is_empty()
+    }
+
+    /// Every declared path (create + modify), in declaration order.
+    pub fn all(&self) -> impl Iterator<Item = &str> {
+        self.create
+            .iter()
+            .chain(self.modify.iter())
+            .map(String::as_str)
+    }
+}
 
 /// One node in the plan DAG. Owns its dependencies (`depends_on`) so independent
 /// nodes are parallelisable and the director can schedule by readiness, not a flat
@@ -534,6 +667,13 @@ pub struct PlanStep {
     /// (fail-open). `#[serde(default)]` so older `plan.json` files still load.
     #[serde(default)]
     pub evidence: Vec<EvidenceContract>,
+    /// The step's DECLARED FILE SURFACE — what it says it will create / modify (see
+    /// [`StepFiles`]). Read by the scope-creep floor ([`crate::scope_creep`]) to
+    /// decide whether a change in the working tree belongs to ANY step. Optional:
+    /// `#[serde(default)]` so older `plan.json` files still load, and a plan where NO
+    /// step declares a surface simply disables the check (fail-open).
+    #[serde(default)]
+    pub files: StepFiles,
     /// Lifecycle status (persisted, so the plan resumes).
     pub status: StepStatus,
 }
@@ -972,9 +1112,82 @@ impl Plan {
         // [`Self::enforce_seat_evidence_floor`] / [`Self::enforce_falsifiability_floor`].
         self.enforce_seat_evidence_floor();
         self.enforce_falsifiability_floor();
+        // RED→GREEN FLOOR (deliberate builds only) — the doc-first skeleton has just
+        // guaranteed that QA AUTHORS the tests before any code step runs, so on this
+        // path a code step's named test provably did not exist (let alone pass) before
+        // the run. That makes the red→green bar checkable, so upgrade an
+        // implementation step's `test-passes` claim into it. Opt-in by construction
+        // (only a code step that NAMED a test is touched) and never global. See
+        // [`Self::enforce_red_green_floor`].
+        if doc_skeleton.is_some() {
+            self.enforce_red_green_floor();
+        }
         self.risks.retain(|r| !r.trim().is_empty());
         self.open_questions.retain(|q| !q.trim().is_empty());
         Some(self)
+    }
+
+    /// **RED→GREEN FLOOR** — upgrade a code step's `test-passes <name>` claim into the
+    /// falsifiable [`EvidenceContract::TestFailsThenPasses`].
+    ///
+    /// A completion claim is only worth the evidence behind it, and "a named test
+    /// passes" is the weakest possible test evidence: a test authored AFTER the code,
+    /// asserting whatever the code already does, passes on the first run and has never
+    /// demonstrated that it can detect the behaviour's ABSENCE. The only mechanical
+    /// difference between a real test and a rubber stamp is that a real test FAILED
+    /// once — before the change that made it pass.
+    ///
+    /// This floor is deliberately NARROW. It only touches a step that is:
+    /// 1. a BUILD step on a code seat (frontend / backend engineer) — the seats that
+    ///    make a test go green; never QA (which AUTHORS the test, and whose authored
+    ///    test is *expected* to be red at head), never a doc seat;
+    /// 2. already claiming a SPECIFIC named test ([`EvidenceContract::TestPasses`] with
+    ///    `Some(name)`) — a step that named no test is left exactly as it was; and
+    /// 3. wired BEHIND the plan's QA test-authoring step (`depends_on` it), which the
+    ///    doc-first skeleton guarantees on this path. That dependency is what makes the
+    ///    pre-state meaningful: the test exists (QA wrote it) and the code does not, so
+    ///    "red at the pre-state" is the truth we can hold the step to.
+    ///
+    /// The upgrade only ADDS a requirement (the pre-state must have been red); the
+    /// head-state bar is the one the step already accepted. Verification itself is
+    /// fail-open at every inconclusive edge (see [`EvidenceContract::TestFailsThenPasses`]),
+    /// so a workspace where the temporary rewind or the test runner is unavailable
+    /// degrades to exactly today's `test-passes` behaviour. Idempotent + pure.
+    fn enforce_red_green_floor(&mut self) {
+        use crate::critics::Seat;
+        // The QA test-authoring anchor: a QA BUILD step that the code steps are wired
+        // behind. Without one there is no guaranteed "the test existed and was red"
+        // pre-state, so the floor does nothing (fail-open).
+        let qa_ids: HashSet<String> = self
+            .steps
+            .iter()
+            .filter(|s| s.kind == StepKind::Build && s.seat == Seat::QaEngineer)
+            .map(|s| s.id.clone())
+            .collect();
+        if qa_ids.is_empty() {
+            return;
+        }
+        for s in &mut self.steps {
+            let is_code_build = s.kind == StepKind::Build
+                && matches!(s.seat, Seat::FrontendEngineer | Seat::BackendEngineer);
+            if !is_code_build || !s.depends_on.iter().any(|d| qa_ids.contains(d)) {
+                continue;
+            }
+            // Rewrite each `test-passes <name>` in place, preserving order + dedupe.
+            let mut upgraded: Vec<EvidenceContract> = Vec::with_capacity(s.evidence.len());
+            for c in std::mem::take(&mut s.evidence) {
+                let next = match c {
+                    EvidenceContract::TestPasses { name: Some(n) } if !n.trim().is_empty() => {
+                        EvidenceContract::TestFailsThenPasses {
+                            test: n.trim().to_string(),
+                        }
+                    }
+                    other => other,
+                };
+                push_unique(&mut upgraded, next);
+            }
+            s.evidence = upgraded;
+        }
     }
 
     /// Detect and break dependency cycles via DFS. A back-edge (a dep that points to
@@ -1379,7 +1592,7 @@ impl Plan {
             if let Some(existing) = self
                 .steps
                 .iter()
-                .find(|s| s.seat == seat && s.kind == StepKind::Build && !is_design_tokens_step(s))
+                .find(|s| s.seat == seat && s.kind == StepKind::Build && !is_design_prep_step(s))
             {
                 prev_doc_id = Some(existing.id.clone());
                 doc_anchor_ids.push(existing.id.clone());
@@ -1389,6 +1602,7 @@ impl Plan {
                 continue;
             }
             let step = PlanStep {
+                files: StepFiles::default(),
                 id: id.to_string(),
                 title,
                 seat,
@@ -1442,6 +1656,14 @@ impl Plan {
                             },
                         );
                     }
+                    // SCOPE: a QA step bound (above, or by the brain) to deliver its
+                    // tests in `tests/` has said where it writes — record that as its
+                    // declared surface so the scope check does not read its own
+                    // structurally-required output as unplanned work. Only when the
+                    // brain declared no surface of its own.
+                    if s.files.is_empty() {
+                        s.files.create.push(TEST_AUTHORING_DIR.to_string());
+                    }
                     // Docs-first: test-authoring starts only after the docs are locked
                     // (and therefore after the docs_confirm gate, which fires when the
                     // doc family completes).
@@ -1455,6 +1677,13 @@ impl Plan {
             id
         } else {
             let step = PlanStep {
+                // The step's evidence contract already binds it to deliver its tests in
+                // `tests/`; declaring the same surface keeps the scope check from
+                // reading UmaDev's own structurally-required step as unplanned work.
+                files: StepFiles {
+                    create: vec![TEST_AUTHORING_DIR.to_string()],
+                    modify: Vec::new(),
+                },
                 id: "umadev-phase-test-plan".to_string(),
                 title: "QA 先行编写验收测试（依据 PRD 功能需求与 API 契约盲写测试,先于前后端实现,\
                         测试文件写入 tests/ 目录;此时测试可以失败,代码落地后再转绿）"
@@ -1482,7 +1711,60 @@ impl Plan {
             }
         }
 
-        // ── 2. Designer design-tokens step (UI-bearing builds only) ────────────
+        // ── 2. Designer VISUAL-DIRECTION step (UI-bearing builds only) ─────────
+        // UD-CODE-007f. The designer used to jump straight to a tokens file whose
+        // ONLY gate was existence — i.e. it answered "what hex?" before ever
+        // answering "what is this, for whom, and what does it feel like?". A hex
+        // chosen with no direction behind it is a guess, and a guess is exactly what
+        // reads as AI-slop. So the plan now FORCES a decision step first, whose
+        // evidence is a `## Visual direction` section in the UIUX doc carrying: a
+        // one-line design read (page kind / audience / REGISTER / vibe / family),
+        // three forced decisions (color commitment level; the theme decided by a
+        // physical-scene sentence; 2-3 NAMED anchor references each bound to one
+        // dimension — adjectives are rejected), and anti-goals.
+        //
+        // Excluded from the docs family (`is_design_prep_step`) like the tokens step:
+        // it REFINES the UIUX doc rather than authoring it, so it never anchors the
+        // doc chain and never re-fires `docs_confirm`.
+        let direction_id: Option<String> = if needs_ui {
+            let existing = self
+                .steps
+                .iter()
+                .find(|s| is_design_direction_step(s))
+                .map(|s| s.id.clone());
+            let id = existing.unwrap_or_else(|| {
+                let step = PlanStep {
+                    files: StepFiles::default(),
+                    id: DESIGN_DIRECTION_STEP_ID.to_string(),
+                    title: "先定视觉方向,再谈颜色:在 UIUX 文档写出 `## Visual direction` \
+                            段——(1) 一句话 design read(页面类型/受众/register 是 brand 还是 \
+                            product/气质/美学家族);(2) 三个必须做出的决定:配色承诺度\
+                            (restrained|committed|full-palette|drenched)、明暗由一句物理场景\
+                            决定(谁在用、在哪、什么环境光、什么情绪——逼不出明暗就把场景写得更\
+                            具体)、2-3 个具名锚点参照且每个绑定到一个具体维度(密度参照一个/\
+                            排版参照另一个/留白参照第三个,\"现代\"\"干净\"这类形容词不算);\
+                            (3) anti-goals(明确不做什么)"
+                        .to_string(),
+                    seat: Seat::UiuxDesigner,
+                    kind: StepKind::Build,
+                    depends_on: doc_anchor_ids.clone(),
+                    acceptance: AcceptanceSpec::SourcePresent,
+                    evidence: vec![EvidenceContract::FileContains {
+                        path: format!("output/{slug}-uiux.md"),
+                        needle: "## Visual direction".to_string(),
+                    }],
+                    status: StepStatus::Pending,
+                };
+                let id = step.id.clone();
+                inserted.push(step);
+                id
+            });
+            Some(id)
+        } else {
+            None
+        };
+
+        // ── 3. Designer design-tokens step (UI-bearing builds only) ────────────
         if needs_ui {
             let tokens_anchor: Option<String> = self
                 .steps
@@ -1507,22 +1789,43 @@ impl Plan {
                                 s.depends_on.push(d.clone());
                             }
                         }
+                        // DIRECTION BEFORE TOKENS: a hex chosen with no direction
+                        // behind it is a guess. The adopted tokens step is wired
+                        // behind the direction step too.
+                        if let Some(dir) = direction_id.as_ref() {
+                            if *dir != s.id && !s.depends_on.contains(dir) {
+                                s.depends_on.push(dir.clone());
+                            }
+                        }
+                        // Raise an adopted tokens step from EXISTENCE to CONFORMANCE
+                        // (UD-CODE-007): `:root{--color-bg:#000}` used to pass.
+                        if s.acceptance == AcceptanceSpec::DesignTokensPresent {
+                            s.acceptance = AcceptanceSpec::DesignTokensConform;
+                        }
                     }
                 }
                 id
             } else {
+                let mut depends_on = doc_anchor_ids.clone();
+                if let Some(dir) = direction_id.as_ref() {
+                    depends_on.push(dir.clone());
+                }
                 let step = PlanStep {
+                    files: StepFiles::default(),
                     id: "umadev-phase-design-tokens".to_string(),
-                    title: "输出设计令牌文件 design-tokens.{json,css}（类型比例、色板、间距、\
-                            组件清单,先于前端实现锁定设计系统,供前端直接 import）"
+                    title: "输出设计令牌文件 design-tokens.{json,css}（按 Visual direction 落地:\
+                            OKLCH 色板且每个 surface 配一个 `on-` 前景并算过 WCAG 对比度、\
+                            ≥4 级字阶(相邻比例 1.125-1.2)、4pt 间距刻度、圆角刻度、\
+                            ≥2 个动效时长 + ≥1 条缓动曲线,先于前端实现锁定设计系统,\
+                            供前端直接 import）"
                         .to_string(),
                     seat: Seat::UiuxDesigner,
                     kind: StepKind::Build,
-                    depends_on: doc_anchor_ids.clone(),
+                    depends_on,
                     // The tokens bar lives on the AcceptanceSpec axis
-                    // (VerifyKind::DesignTokensPresent); evidence stays empty so the
+                    // (VerifyKind::DesignSystemConform); evidence stays empty so the
                     // verifier takes the acceptance path, not the evidence path.
-                    acceptance: AcceptanceSpec::DesignTokensPresent,
+                    acceptance: AcceptanceSpec::DesignTokensConform,
                     evidence: Vec::new(),
                     status: StepStatus::Pending,
                 };
@@ -1667,6 +1970,75 @@ struct BrainStep {
     /// falls back to its [`AcceptanceSpec`].
     #[serde(default)]
     evidence: Vec<serde_json::Value>,
+    /// The brain's PROPOSED file surface for this step (`{"create":[…],"modify":[…]}`)
+    /// — the declaration the scope-creep floor holds the working tree against. Parsed
+    /// as a raw value so a sloppy shape (a bare array, a string, a missing key) can
+    /// never fail the whole plan parse; [`parse_brain_files`] normalises it and yields
+    /// an EMPTY surface on anything it cannot read (fail-open → the check stays silent
+    /// for that step).
+    #[serde(default)]
+    files: serde_json::Value,
+}
+
+/// Normalise the brain's proposed per-step file surface into an owned [`StepFiles`].
+///
+/// Tolerant by design — the declaration is a HINT the brain volunteers, and a plan
+/// that fumbles the shape must degrade to "declared nothing" (which disables the
+/// scope check for that step), never to a parse failure:
+/// - `{"create":["a"],"modify":["b"]}` — the canonical object form.
+/// - `["a","b"]` — a bare array is read as `modify` (the conservative reading: an
+///   un-annotated path is not claimed as a NEW file).
+/// - anything else (a string, a number, `null`, a missing key) → empty.
+///
+/// Each entry is trimmed, `\`-separated paths are normalised to `/`, a leading `./`
+/// is stripped, empties are dropped, and the list is capped at
+/// [`MAX_DECLARED_PATHS`] per bucket so a runaway reply cannot blow the check up.
+fn parse_brain_files(v: &serde_json::Value) -> StepFiles {
+    let list = |val: Option<&serde_json::Value>| -> Vec<String> {
+        val.and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter_map(normalize_declared_path)
+                    .take(MAX_DECLARED_PATHS)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if let Some(obj) = v.as_object() {
+        return StepFiles {
+            create: list(obj.get("create").or_else(|| obj.get("new"))),
+            modify: list(obj.get("modify").or_else(|| obj.get("edit"))),
+        };
+    }
+    if v.is_array() {
+        // A bare array names paths without saying whether they are new. Read them as
+        // `modify` — the conservative bucket (claiming them as `create` would let an
+        // unplanned NEW file hide behind a vague declaration).
+        return StepFiles {
+            create: Vec::new(),
+            modify: list(Some(v)),
+        };
+    }
+    StepFiles::default()
+}
+
+/// Per-bucket cap on a step's declared paths — a bound on the brain's declaration so
+/// the scope check's matching work stays proportional to the plan, not to a runaway
+/// reply.
+const MAX_DECLARED_PATHS: usize = 64;
+
+/// Canonicalise ONE declared path: trim, normalise `\` → `/`, strip a leading `./`
+/// and any leading `/` (declarations are repo-relative), and reject an empty result
+/// or an absolute / parent-escaping path (a declaration can only claim things INSIDE
+/// the workspace). `None` ⇒ the entry is dropped.
+fn normalize_declared_path(raw: &str) -> Option<String> {
+    let p = raw.trim().replace('\\', "/");
+    let p = p.trim_start_matches("./").trim_start_matches('/').trim();
+    if p.is_empty() || p.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    Some(p.to_string())
 }
 
 /// Synthesise a [`Plan`] by borrowing the base's brain for ONE forked, read-only,
@@ -1783,9 +2155,24 @@ pub async fn synthesize_plan(
          {{\"kind\":\"file-contains\",\"path\":\"src/api.ts\",\"needle\":\"/api/login\"}}, \
          {{\"kind\":\"test-passes\",\"name\":\"login\"}}, {{\"kind\":\"build-clean\"}}, \
          {{\"kind\":\"route-responds\",\"method\":\"POST\",\"path\":\"/api/login\",\"status\":200}}, \
-         {{\"kind\":\"contract-matches\"}}, {{\"kind\":\"source-present\"}}. Prefer the most \
+         {{\"kind\":\"contract-matches\"}}, {{\"kind\":\"source-present\"}}, \
+         {{\"kind\":\"test-fails-then-passes\",\"test\":\"login_rejects_bad_password\"}}. \
+         Prefer the most \
          specific evidence the step actually produces (a concrete file/route over a generic \
          build-clean). \
+         `test-fails-then-passes` is the strongest bar available and the right one for an \
+         IMPLEMENTATION step that makes a previously-authored test go green: UmaDev rewinds \
+         to the step's pre-state, runs THAT ONE named test (it must FAIL there), restores \
+         head, and runs it again (it must PASS). Name a test that genuinely could not have \
+         passed before this step. Never put it on the step that AUTHORS the test — an \
+         authored test is expected to be red until the code lands. \
+         `files` (OPTIONAL but STRONGLY preferred): the step's file surface, \
+         {{\"create\":[\"src/api/login.ts\"],\"modify\":[\"src/routes.ts\"]}} — the paths this \
+         step will bring into existence or edit (a trailing `/` claims a whole directory). \
+         UmaDev holds the working tree against the UNION of every step's surface: a NEW \
+         source file, a NEW dependency, or a NEW public route that NO step claimed is \
+         out-of-scope work and blocks. So declare where each step will write; if a change \
+         is genuinely needed, it belongs in some step's surface. \
          Team-deliverable rules (UmaDev enforces ALL of these STRUCTURALLY after parsing — \
          a missing tokens/QA step is inserted and the ordering edges are wired — so a plan \
          that already honours them survives normalisation unchanged): \
@@ -1802,7 +2189,8 @@ pub async fn synthesize_plan(
          code-author (de-biasing); a QA review step is separate. \
          JSON shape: {{\"steps\":[{{\"id\":\"scaffold\",\"title\":\"…\",\"seat\":\"…\",\
          \"kind\":\"build\",\"depends_on\":[],\"acceptance\":\"source-present\",\
-         \"evidence\":[{{\"kind\":\"file-exists\",\"path\":\"src/App.tsx\"}}]}}],\
+         \"evidence\":[{{\"kind\":\"file-exists\",\"path\":\"src/App.tsx\"}}],\
+         \"files\":{{\"create\":[\"src/App.tsx\"],\"modify\":[]}}}}],\
          \"risks\":[\"…\"],\"open_questions\":[\"…\"]}}",
         class = route.class.as_str(),
         kind = route.kind.id(),
@@ -1849,13 +2237,10 @@ pub async fn synthesize_plan(
     // the floor binds each such seat to actually produce its PRD/architecture/UIUX (a
     // verified deliverable), so the docs are real up front — never a template stub
     // retro-fitted at finalize. `needs_ui` is true only for a UI-bearing build.
-    let doc_skeleton = route.depth.is_deliberate().then(|| {
-        let needs_ui = matches!(
-            route.kind,
-            crate::planner::TaskKind::Greenfield | crate::planner::TaskKind::FrontendOnly
-        );
-        (options.effective_slug(), needs_ui)
-    });
+    let doc_skeleton = route
+        .depth
+        .is_deliberate()
+        .then(|| (options.effective_slug(), route.needs_ui()));
     plan.normalized(doc_skeleton.as_ref().map(|(s, ui)| (s.as_str(), *ui)))
 }
 
@@ -1880,6 +2265,7 @@ fn brain_step_to_plan_step(b: BrainStep) -> PlanStep {
         depends_on: b.depends_on,
         acceptance: AcceptanceSpec::parse(&b.acceptance, kind),
         evidence: parse_brain_evidence(&b.evidence),
+        files: parse_brain_files(&b.files),
         status: StepStatus::Pending,
     }
 }
@@ -1910,6 +2296,7 @@ mod tests {
 
     fn step(id: &str, deps: &[&str]) -> PlanStep {
         PlanStep {
+            files: StepFiles::default(),
             id: id.to_string(),
             title: format!("step {id}"),
             seat: Seat::FrontendEngineer,
@@ -1931,6 +2318,7 @@ mod tests {
         acceptance: AcceptanceSpec,
     ) -> PlanStep {
         PlanStep {
+            files: StepFiles::default(),
             id: id.to_string(),
             title: format!("step {id}"),
             seat,
@@ -3212,8 +3600,11 @@ mod tests {
         ])
         .normalized(Some(("demo", true)))
         .expect("usable");
-        // Head order: the three docs, then the code-phase prep (test-plan → tokens).
-        let head: Vec<&str> = p.steps.iter().take(5).map(|s| s.id.as_str()).collect();
+        // Head order: the three docs, then the code-phase prep
+        // (test-plan → design-DIRECTION → design-tokens). UD-CODE-007f: the designer
+        // DECIDES a direction before it picks a single value; a hex with no direction
+        // behind it is a guess.
+        let head: Vec<&str> = p.steps.iter().take(6).map(|s| s.id.as_str()).collect();
         assert_eq!(
             head,
             vec![
@@ -3221,9 +3612,31 @@ mod tests {
                 "umadev-phase-architecture",
                 "umadev-phase-uiux",
                 "umadev-phase-test-plan",
+                "umadev-phase-design-direction",
                 "umadev-phase-design-tokens",
             ],
-            "docs first, then the QA test-authoring + designer tokens prep"
+            "docs first, then the QA test-authoring + designer direction + tokens prep"
+        );
+        // DIRECTION BEFORE TOKENS is a structural edge, not a prompt request.
+        let direction = p
+            .steps
+            .iter()
+            .find(|s| s.id == DESIGN_DIRECTION_STEP_ID)
+            .expect("the direction step is inserted on a UI-bearing deliberate route");
+        assert_eq!(direction.seat, Seat::UiuxDesigner);
+        assert!(
+            direction
+                .evidence
+                .contains(&EvidenceContract::FileContains {
+                    path: "output/demo-uiux.md".to_string(),
+                    needle: "## Visual direction".to_string(),
+                }),
+            "the direction step's bar is the `## Visual direction` section: {:?}",
+            direction.evidence
+        );
+        assert!(
+            is_design_direction_step(direction) && is_design_prep_step(direction),
+            "the direction step is designer PREP, never a doc-family anchor"
         );
         // QA test-authoring: evidence = "the authored tests EXIST", never TestPasses
         // (tests are written BEFORE the code they check — a green-suite bar here
@@ -3271,7 +3684,16 @@ mod tests {
             .find(|s| s.id == "umadev-phase-design-tokens")
             .unwrap();
         assert_eq!(tokens.seat, Seat::UiuxDesigner);
-        assert_eq!(tokens.acceptance, AcceptanceSpec::DesignTokensPresent);
+        // UD-CODE-007: the bar is CONFORMANCE, not mere existence — the old
+        // `DesignTokensPresent` passed on `:root{--color-bg:#000}`.
+        assert_eq!(tokens.acceptance, AcceptanceSpec::DesignTokensConform);
+        assert!(
+            tokens
+                .depends_on
+                .contains(&DESIGN_DIRECTION_STEP_ID.to_string()),
+            "tokens are wired BEHIND the direction step: {:?}",
+            tokens.depends_on
+        );
         assert!(
             tokens.evidence.is_empty(),
             "the tokens step keeps empty evidence (the acceptance IS the bar; the \
@@ -3842,5 +4264,186 @@ mod tests {
         // Unparseable / no steps → EMPTY (fail-open, nothing merged).
         assert!(parse_brain_steps("not json at all").is_empty());
         assert!(parse_brain_steps(r#"{"steps":[]}"#).is_empty());
+    }
+
+    // ── RED→GREEN evidence contract ────────────────────────────────────────────
+
+    #[test]
+    fn red_green_contract_parses_and_holds_an_unnamed_one_as_a_gap() {
+        use serde_json::json;
+        // A named test parses into the typed contract.
+        assert_eq!(
+            EvidenceContract::parse_value(
+                &json!({"kind":"test-fails-then-passes","test":"login_rejects_bad_password"})
+            ),
+            Some(EvidenceContract::TestFailsThenPasses {
+                test: "login_rejects_bad_password".to_string()
+            })
+        );
+        // `name` is accepted as an alias for `test`, and so are the kind aliases.
+        assert_eq!(
+            EvidenceContract::parse_value(&json!({"kind":"red-green","name":"t_login"})),
+            Some(EvidenceContract::TestFailsThenPasses {
+                test: "t_login".to_string()
+            })
+        );
+        // A red→green claim with NO test named is a retained GAP — it must never
+        // silently degrade to the coarse "some source exists" default.
+        let malformed =
+            EvidenceContract::parse_value(&json!({"kind":"test-fails-then-passes"})).unwrap();
+        assert!(matches!(malformed, EvidenceContract::Malformed { .. }));
+        // There is no bareword form: the contract is meaningless without a test name.
+        assert_eq!(
+            EvidenceContract::parse_kind_only("test-fails-then-passes"),
+            None
+        );
+    }
+
+    #[test]
+    fn red_green_floor_upgrades_a_code_steps_named_test_but_leaves_qa_alone() {
+        // THE POINT: on the doc-first path QA authors the tests BEFORE any code, so a
+        // code step's named test provably could not have passed beforehand — which
+        // makes the red→green bar checkable. Upgrade the code step's weak
+        // "test-passes" claim into it. The QA step that AUTHORS the test must NOT be
+        // upgraded: its own test is expected to be red at head until the code lands.
+        let brain = r#"{"steps":[
+          {"id":"qa","title":"author acceptance tests","seat":"qa-engineer","kind":"build",
+           "acceptance":"source-present","evidence":[{"kind":"file-exists","path":"tests"}]},
+          {"id":"api","title":"build the login route","seat":"backend-engineer","kind":"build",
+           "depends_on":["qa"],"acceptance":"build-test",
+           "evidence":[{"kind":"test-passes","name":"login_rejects_bad_password"}]}
+        ]}"#;
+        let raw: BrainPlan = serde_json::from_str(brain).unwrap();
+        let plan = Plan {
+            steps: raw.steps.into_iter().map(brain_step_to_plan_step).collect(),
+            risks: vec![],
+            open_questions: vec![],
+        }
+        .normalized(Some(("demo", false)))
+        .expect("plan normalises");
+
+        let api = plan.steps.iter().find(|s| s.id == "api").unwrap();
+        assert!(
+            api.evidence
+                .contains(&EvidenceContract::TestFailsThenPasses {
+                    test: "login_rejects_bad_password".to_string()
+                }),
+            "the implementation step's named-test claim is upgraded to red→green: {:?}",
+            api.evidence
+        );
+        assert!(
+            !api.evidence
+                .iter()
+                .any(|e| matches!(e, EvidenceContract::TestPasses { name: Some(_) })),
+            "the weak named-test claim is REPLACED, not duplicated: {:?}",
+            api.evidence
+        );
+
+        // QA (the test AUTHOR) is untouched — a red→green bar there would demand its
+        // own freshly-written test be green at head, which deadlocks the plan.
+        let qa = plan.steps.iter().find(|s| s.id == "qa").unwrap();
+        assert!(
+            !qa.evidence
+                .iter()
+                .any(|e| matches!(e, EvidenceContract::TestFailsThenPasses { .. })),
+            "the test-authoring step never carries a red→green bar: {:?}",
+            qa.evidence
+        );
+    }
+
+    #[test]
+    fn red_green_floor_leaves_a_step_that_named_no_test_alone() {
+        // OPT-IN, NEVER GLOBAL: a code step whose evidence names no specific test is
+        // not conscripted into a red→green bar (there is no test to replay).
+        let brain = r#"{"steps":[
+          {"id":"qa","title":"author tests","seat":"qa-engineer","kind":"build",
+           "acceptance":"source-present","evidence":[{"kind":"file-exists","path":"tests"}]},
+          {"id":"api","title":"build it","seat":"backend-engineer","kind":"build",
+           "depends_on":["qa"],"acceptance":"build-test","evidence":[{"kind":"build-clean"}]}
+        ]}"#;
+        let raw: BrainPlan = serde_json::from_str(brain).unwrap();
+        let plan = Plan {
+            steps: raw.steps.into_iter().map(brain_step_to_plan_step).collect(),
+            risks: vec![],
+            open_questions: vec![],
+        }
+        .normalized(Some(("demo", false)))
+        .unwrap();
+        let api = plan.steps.iter().find(|s| s.id == "api").unwrap();
+        assert!(
+            !api.evidence
+                .iter()
+                .any(|e| matches!(e, EvidenceContract::TestFailsThenPasses { .. })),
+            "a step that named no test keeps its own bar: {:?}",
+            api.evidence
+        );
+    }
+
+    // ── Declared file surface (the scope-creep denominator) ────────────────────
+
+    #[test]
+    fn brain_declared_file_surface_parses_tolerantly() {
+        use serde_json::json;
+        // Canonical object form.
+        let f =
+            parse_brain_files(&json!({"create":["src/api/login.ts"],"modify":["src/routes.ts"]}));
+        assert_eq!(f.create, vec!["src/api/login.ts"]);
+        assert_eq!(f.modify, vec!["src/routes.ts"]);
+        assert!(!f.is_empty());
+
+        // A bare array is read as `modify` — the conservative bucket, so a vague
+        // declaration can never launder a brand-new file into "claimed as created".
+        let bare = parse_brain_files(&json!(["src/a.ts", "src/b.ts"]));
+        assert!(bare.create.is_empty());
+        assert_eq!(bare.modify.len(), 2);
+
+        // Normalisation: `./`, backslashes, and a leading `/` are stripped.
+        let norm = parse_brain_files(&json!({"create":["./src\\api\\x.ts", "/src/y.ts"]}));
+        assert_eq!(norm.create, vec!["src/api/x.ts", "src/y.ts"]);
+
+        // A parent-escaping or empty entry is DROPPED — a declaration can only claim
+        // paths inside the workspace.
+        let escape = parse_brain_files(&json!({"create":["../../etc/passwd", "  ", "src/ok.ts"]}));
+        assert_eq!(escape.create, vec!["src/ok.ts"]);
+
+        // Anything unreadable → an EMPTY surface (which disables the check for that
+        // step), never a parse failure.
+        assert!(parse_brain_files(&json!("src/a.ts")).is_empty());
+        assert!(parse_brain_files(&json!(null)).is_empty());
+        assert!(parse_brain_files(&json!(7)).is_empty());
+    }
+
+    #[test]
+    fn skeleton_test_authoring_step_declares_the_surface_it_is_bound_to_write() {
+        // The QA step's evidence contract already binds it to deliver tests in
+        // `tests/`. Declaring the SAME surface keeps the scope check from reading
+        // UmaDev's own structurally-required step as unplanned work.
+        let plan = Plan {
+            steps: vec![PlanStep {
+                files: StepFiles::default(),
+                id: "api".into(),
+                title: "build the api".into(),
+                seat: Seat::BackendEngineer,
+                kind: StepKind::Build,
+                depends_on: vec![],
+                acceptance: AcceptanceSpec::BuildTest,
+                evidence: vec![],
+                status: StepStatus::Pending,
+            }],
+            risks: vec![],
+            open_questions: vec![],
+        }
+        .normalized(Some(("demo", false)))
+        .unwrap();
+        let qa = plan
+            .steps
+            .iter()
+            .find(|s| s.id == "umadev-phase-test-plan")
+            .expect("the skeleton seats a QA test-authoring step");
+        assert_eq!(
+            qa.files.create,
+            vec![TEST_AUTHORING_DIR.to_string()],
+            "the step declares exactly the surface its evidence binds it to"
+        );
     }
 }

@@ -2382,27 +2382,35 @@ mod tests {
         });
 
         // A fake `opencode serve`: print the listening line (pointing at our real
-        // server's port), then sleep so the child stays alive while we drive it.
+        // server's port), then sleep so the child stays alive while we drive it. The sleep
+        // is a WALL-CLOCK lifetime, so it has to outlast a scrape that gets starved under
+        // load — not just the happy-path microseconds.
         let dir = tempfile::TempDir::new().unwrap();
         let script = dir.path().join("fake-opencode-serve");
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho 'opencode server listening on http://127.0.0.1:{port}'\nsleep 5\n"
+                "#!/bin/sh\necho 'opencode server listening on http://127.0.0.1:{port}'\nsleep 60\n"
             ),
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Explicit timeout (not the global env var) so parallel tests can't
-        // race each other's serve-start budget.
+        // Explicit timeout (not the global env var) so parallel tests can't race each
+        // other's serve-start budget — and a GENEROUS one, for the same reason its sibling
+        // `read_listening_url_keeps_draining_stdout_for_the_session_lifetime` uses 30s: a
+        // `/bin/sh` fake's spawn + first echo can be arbitrarily slow under a fully loaded
+        // test runner, and this budget is a wall clock, not a work budget. What is under
+        // test is that the port is SCRAPED and the session created off it — never how many
+        // milliseconds a loaded machine took to get there. A tight bound here is a CI flake,
+        // not a check.
         let session = OpenCodeSession::start_with_program_timeout(
             script.to_str().unwrap(),
             dir.path(),
             None,
             None,
             true,
-            Duration::from_secs(10),
+            Duration::from_secs(30),
         )
         .await
         .expect("start should scrape the port and create the session");

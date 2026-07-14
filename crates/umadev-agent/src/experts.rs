@@ -13,6 +13,7 @@
 //!   need to mention (no LLM call required).
 //! - Future tuning (better wording, few-shot examples) is one file.
 
+use umadev_governance::design::Register;
 use umadev_runtime::{CompletionRequest, Message};
 
 /// A reusable prompt — system + a single user message.
@@ -59,44 +60,109 @@ component. This is non-negotiable and is enforced by the governance hook \
 - Use design tokens (CSS vars / theme keys). NEVER hardcoded colors.\n\
 - Frontend fetch URLs MUST match architecture API paths.\n\
 - Output structured markdown sections as requested.\n";
-/// Anti-AI-slop design law — named bans + positive moves distilled from how
-/// v0 / Lovable / bolt.new and Anthropic's frontend-design guidance get
-/// non-generic UI. Injected into the UIUX spec + frontend prompts (and mirrored
-/// by the design-conformance review) so "looks AI-generated" becomes concrete,
-/// enforced rules rather than vibes.
-pub(crate) const ANTI_SLOP_LAW: &str = "ANTI-AI-SLOP DESIGN LAW (non-negotiable):\n\
-- COMMIT to ONE specific, culturally-loaded design direction (editorial / brutalist / \
-technical / Swiss / warm-editorial / art-deco / neo-grotesque / ...) and name the ONE thing \
-a user will remember. Defaulting to the safe average IS the slop.\n\
-- BANNED fonts (they read as AI-generated): Inter, Roboto, Arial, Open Sans, Lato, \
-system-font-only -- AND Space Grotesk (the usual escape hatch). Pick a high-contrast pairing \
-(display serif + geometric sans, or a grotesk + a mono).\n\
-- BANNED looks: purple / indigo gradients (especially on white), white+purple combos, \
-timid evenly-distributed palettes, predictable cookie-cutter layouts.\n\
+/// The REGISTER-INDEPENDENT half of the design law — it holds on a landing page
+/// and on a dashboard alike. Token discipline, contrast, real content, one icon
+/// system, the banned AI hue.
+const DESIGN_LAW_CORE: &str = "DESIGN LAW (non-negotiable, every register):\n\
+- FIRST, DECLARE THE REGISTER in the UIUX doc's `## Visual direction`: `brand` (landing / \
+marketing / campaign / portfolio -- design IS the product) or `product` (app / dashboard / \
+admin / settings / devtool -- design SERVES the task). They take OPPOSITE rules. Applying \
+the brand rules to a dashboard makes the product measurably worse to use; applying the \
+product rules to a landing page makes it forgettable. If you cannot tell: does the user \
+arrive to DECIDE (brand) or to DO (product)?\n\
+- TOKEN DISCIPLINE: every color / font / spacing / radius / duration comes from a semantic \
+design token. NEVER direct utilities like text-white / text-black / bg-white / bg-black or \
+raw hex in components. NEVER a one-off inline style -- extend the design system.\n\
+- PAIRED FOREGROUNDS: every surface token ships an `--color-on-<role>` partner, and every \
+pair MEASURES to WCAG (4.5:1 body, 3:1 large/UI). Compute it; do not eyeball it.\n\
+- BANNED HUE: no AI indigo/violet (OKLCH hue 270-320 at chroma >=0.09; #6366f1 / #4f46e5 / \
+#8b5cf6 / #7c3aed and neighbours) as primary or accent, and no purple->pink / indigo->blue \
+hero gradient -- UNLESS the requirement explicitly asks for purple. Instead: commit to a hue \
+this product OWNS.\n\
+- ICONS: declare ONE icon library and ONE stroke weight, and never mix. Never emoji as a \
+functional icon. Never a hand-rolled decorative SVG. WHICH library is YOUR choice per \
+product -- there is no default, because a single mandated library is itself a sameness \
+driver.\n\
+- Real representative content, never lorem or placeholder boxes. No invented metrics \
+('10x faster' / '99.9% uptime') without a real source.\n\
+- Every interactive element ships hover / focus-visible / active / disabled; every async \
+surface ships loading / empty / error.\n\
+- Code complexity MUST match the aesthetic (a minimalist direction means minimal code).";
+
+/// The BRAND-register half — a marketing surface where design IS the product.
+/// These clauses are WRONG on a dashboard: they would demand a display face, 3x
+/// type jumps, extreme weights, a textured background, and a page-load reveal on
+/// a data table.
+const DESIGN_LAW_BRAND: &str = "\n\nBRAND REGISTER (landing / marketing / campaign / \
+portfolio -- design IS the product):\n\
+- COMMIT to ONE specific, culturally-loaded direction (editorial / brutalist / technical / \
+Swiss / warm-editorial / art-deco / neo-grotesque / ...) and name the ONE thing a user will \
+remember. Defaulting to the safe average IS the slop.\n\
+- AVOID as the lead face (they read as AI-generated HERE): Inter, Roboto, Arial, Open Sans, \
+Lato, system-font-only -- AND Space Grotesk (the usual escape hatch). Pick a high-contrast \
+pairing (display serif + geometric sans, or a grotesk + a mono). They may stay in the \
+fallback stack.\n\
 - POSITIVE moves: one DOMINANT color + ONE sharp accent (not even distribution); a type \
-scale with BIG jumps (3x+, not 1.5x) and EXTREME weights (100/200 vs 800/900, not 400/600); \
-backgrounds with depth (gradient mesh / grain / geometric / layered), never a flat default; \
-concentrate motion into ONE orchestrated page-load reveal, not scattered micro-interactions; \
-pick a binary -- generous negative space OR controlled density, never the safe middle.\n\
-- TOKEN DISCIPLINE: every color / font / spacing / radius comes from a semantic design \
-token. NEVER direct utilities like text-white / text-black / bg-white / bg-black or raw hex \
-in components. NEVER a one-off inline style -- extend the design system / add a variant.\n\
-- Real representative content, never lorem or placeholder boxes.\n\
-- Code complexity MUST match the aesthetic (a minimalist direction means minimal code).\n\
-- Web/React default stack unless the spec says otherwise: shadcn/ui + Tailwind + Radix, \
-themed entirely through CSS-variable design tokens (theme once, it propagates everywhere).\n\
-CARDINAL SINS (auto-reject, from shipped-product design linters): Tailwind default \
-indigo/violet as the accent (#6366f1, #4f46e5, #8b5cf6, #7c3aed) is THE textbook AI \
-tell -- never use it, bind the spec's --accent token. Also reject: the 'AI dashboard \
-tile' (rounded card + a colored left-border -- drop one of the two); two-stop hero \
-'trust' gradients (purple->blue, blue->cyan, indigo->pink); invented metrics ('10x \
-faster' / '99.9% uptime' -- use a real source or a labelled placeholder); the canned \
-Hero->Features->Pricing->FAQ->CTA skeleton with no variation (add >=1 unconventional \
-section); the accent used 6+ times (cap ~2 visible uses per screen). THE 80/20 + SOUL \
-TEST: ~80% proven patterns + ~20% ONE bold distinctive move (a type choice, a single \
-color decision, one memorable micro-interaction, one product-specific detail). If \
-someone outside the project cannot tell WHICH product a screenshot is for, you shipped \
-a template -- redo it.";
+scale with BIG jumps (>=2.5x display:body) and deliberate weight extremes; backgrounds with \
+depth (grain / geometric / layered), never a flat default; concentrate motion into ONE \
+orchestrated page-load reveal; pick a binary -- generous negative space OR controlled \
+density, never the safe middle.\n\
+- CARDINAL SINS (auto-reject): the 'AI dashboard tile' (rounded card + a colored \
+left-border -- drop one of the two); the canned Hero->Features->Pricing->FAQ->CTA skeleton \
+with no variation (add >=1 unconventional section); the accent used 6+ times (cap ~2 visible \
+uses per screen).\n\
+- THE 80/20 + SOUL TEST: ~80% proven patterns + ~20% ONE bold distinctive move. If someone \
+outside the project cannot tell WHICH product a screenshot is for, you shipped a template -- \
+redo it.";
+
+/// The PRODUCT-register half — an app surface where design SERVES the task.
+/// A familiar neutral face is CORRECT, the scale is fixed, motion is silent, and
+/// density is a virtue.
+const DESIGN_LAW_PRODUCT: &str = "\n\nPRODUCT REGISTER (app / dashboard / admin / settings / \
+devtool -- design SERVES the task):\n\
+- The user did not come to admire the interface; they came to finish something. FAMILIARITY \
+beats novelty: every gram of novelty is a gram of relearning.\n\
+- TYPE: a familiar neutral UI / system font (Inter, system-ui, the platform face) is the \
+CORRECT choice -- NOT a defect. Do NOT import a display face for a data table. Fixed rem \
+scale, adjacent step ratio 1.125-1.2 (never a 3x jump). Weights 400/500/600 only. Hierarchy \
+comes from weight, color, and spacing.\n\
+- MOTION: NO page-load choreography. No mount animation, no staggered reveal, no \
+scroll-triggered entrance. Motion ONLY confirms a user action (<=150ms) or covers a state \
+change. Animate transform/opacity, never width/height/padding/margin.\n\
+- COLOR: restraint is the FLOOR. Color is a semantic signal (status, selection, danger), not \
+decoration. Flat surface tokens -- a decorative/gradient background steals contrast from the \
+data.\n\
+- DENSITY IS A FEATURE: minimize travel, fit more TRUE rows per screen. Tight inside a group \
+(8-12px), open between groups (24-48px). Radius 4-12px on cards/inputs (>=24px reads as a \
+toy).\n\
+- LAYOUT: conventional placement WINS. Put the nav where the user's hand already is. Do not \
+break symmetry to look interesting.\n\
+- The best compliment is that nobody mentioned the UI.";
+
+/// The anti-AI-slop design law, SCOPED TO ITS REGISTER.
+///
+/// The old law was a single block that applied MARKETING-surface rules
+/// universally: ban system fonts, demand 3x type jumps and extreme weights,
+/// demand a textured background, demand an orchestrated page-load reveal. For a
+/// landing page every one of those is right. For a dashboard / admin / devtool
+/// every one of those is WRONG — we were actively making product UIs worse.
+///
+/// So the law now splits: a register-independent [`DESIGN_LAW_CORE`] (token
+/// discipline, paired foregrounds + measured contrast, the banned AI hue, one
+/// icon system, real content, component states) plus exactly ONE register half.
+///
+/// **Fail-open**: [`Register::Unknown`] emits core + brand — byte-for-byte the
+/// law's historical reach — so a turn whose register we cannot determine is never
+/// silently under-governed. It also always carries the instruction to DECLARE the
+/// register, which is how Unknown stops being the common case.
+#[must_use]
+pub fn anti_slop_law(register: Register) -> String {
+    match register {
+        Register::Product => format!("{DESIGN_LAW_CORE}{DESIGN_LAW_PRODUCT}"),
+        // Brand, and Unknown (fail-open to the historical behaviour).
+        Register::Brand | Register::Unknown => format!("{DESIGN_LAW_CORE}{DESIGN_LAW_BRAND}"),
+    }
+}
 
 /// Clarify expert — BEFORE research, the worker turns a one-line requirement
 /// into a scoped brief by stating its interpretation + the reasonable default
@@ -301,6 +367,10 @@ pub fn architecture_prompt(slug: &str, requirement: &str, prd_excerpt: &str) -> 
 /// UI/UX expert — produces `output/<slug>-uiux.md`.
 #[must_use]
 pub fn uiux_prompt(slug: &str, requirement: &str, prd_excerpt: &str) -> Prompt {
+    // The designer has not written `## Visual direction` yet, so the register can
+    // only come from the user's own words + the PRD. Unknown → the full law.
+    let register =
+        crate::design_system::register_from_text(&format!("{requirement}\n{prd_excerpt}"));
     let system = format!(
         "{SPEC_PREAMBLE}\n\
          Role: senior UI/UX designer — creates a design SYSTEM, not mockups. Output \
@@ -311,23 +381,55 @@ pub fn uiux_prompt(slug: &str, requirement: &str, prd_excerpt: &str) -> Prompt {
          semantic layer, never raw hex. Dark mode overrides the semantic layer.\n\n\
          Required sections (in this EXACT order):\n\
          - # UI/UX — {slug}\n\
-         - ## Visual direction — COMMIT to ONE named direction (editorial-clean / \
-           modern-minimal / tech-utility / soft-warm / bold-geometric / brutalist-bold / \
-           glass-aurora / premium-luxury). Anchor it to 1-3 real reference products \
-           IN THE TARGET'S OWN DOMAIN and borrow ONE specific move from each (name the \
-           move, not just the product). Name THE ONE memorable thing, and one AVOID \
-           line (what this product is NOT).\n\
-         - ## Color palette — a `:root` CSS block with AT LEAST these semantic \
-           tokens: --color-bg, --color-surface, --color-text, --color-text-secondary, \
-           --color-primary, --color-primary-hover, --color-accent, --color-border, \
-           --color-error, --color-success. Near-black/near-white (NEVER #000/#fff), \
-           neutrals tinted toward the brand hue, ONE scarce accent (CTA/focus/link only).\n\
-         - ## Dark mode — `@media (prefers-color-scheme: dark)` overriding \
-           bg/surface/text/border tokens. NOT optional.\n\
-         - ## Typography system — font stack (2 families max, NOT default Inter), a \
-           type scale `--text-xs … --text-3xl` with BIG jumps (ratio ≥1.25, display \
-           48-96px), and weight tokens. One signature detail (e.g. tabular-nums on \
-           numbers) so it isn't generic.\n\
+         - ## Visual direction — THE DECISION STEP. Do NOT pick a single hex before \
+           this section is complete; a color chosen with no direction behind it is a \
+           guess, and a guess is exactly what reads as AI-generated. It MUST contain, \
+           in this order:\n\
+           (1) DESIGN READ, one line: page kind / audience / **register** / vibe / \
+           aesthetic family. State the register as the literal word `brand` or \
+           `product` on a `register:` line. `brand` = landing / marketing / campaign / \
+           portfolio (design IS the product). `product` = app / dashboard / admin / \
+           settings / devtool (design SERVES the task). If unsure: does the user \
+           arrive to DECIDE (brand) or to DO (product)? Family: one of \
+           editorial-clean / modern-minimal / tech-utility / soft-warm / \
+           bold-geometric / brutalist-bold / glass-aurora / premium-luxury.\n\
+           (2) THREE FORCED DECISIONS, each actually decided:\n\
+             a. COLOR COMMITMENT LEVEL — pick exactly ONE word: `restrained` | \
+             `committed` | `full-palette` | `drenched`.\n\
+             b. THEME (light vs dark) decided by a PHYSICAL-SCENE SENTENCE — write who \
+             uses this, WHERE, under what ambient LIGHT, in what MOOD; then the theme \
+             falls out of it. If your sentence does not FORCE light-vs-dark, it is not \
+             specific enough — add detail until it does. ('Users prefer dark mode' is \
+             not a scene.)\n\
+             c. 2-3 NAMED ANCHOR REFERENCES, EACH BOUND TO ONE DIMENSION — write them \
+             as `density: <named reference> — <the specific move>`, `type: <named \
+             reference> — …`, `whitespace: <named reference> — …`. Borrow ONE specific \
+             move from each. Adjectives ('modern', 'clean', 'professional') are \
+             REJECTED: they decide nothing.\n\
+           (3) ANTI-GOALS — name what this product deliberately is NOT.\n\
+         - ## Color palette — a `:root` CSS block in OKLCH. EVERY surface token ships \
+           a PAIRED foreground: --color-bg/--color-on-bg, --color-surface/\
+           --color-on-surface, --color-card/--color-on-card, --color-muted/\
+           --color-on-muted, --color-primary/--color-on-primary, --color-accent/\
+           --color-on-accent, plus --color-success/--color-error with their `on-` \
+           partners and --color-border. At least 6 surface roles. COMPUTE the WCAG \
+           contrast of every pair and state it: 4.5:1 body, 3:1 large/UI — do not \
+           eyeball it. Near-black/near-white (NEVER #000/#fff), neutrals tinted toward \
+           the brand hue, ONE scarce accent. NO AI indigo/violet (OKLCH hue 270-320 at \
+           chroma >= 0.09) as primary or accent unless the requirement asked for purple.\n\
+         - ## Dark mode — `@media (prefers-color-scheme: dark)` overriding the \
+           surfaces AND their `on-` partners (a surface flipped without its foreground \
+           is a contrast bug). NOT optional.\n\
+         - ## Typography system — font stack (2 families max) + a type scale \
+           `--text-xs … --text-3xl` + weight tokens. SCALE TO THE REGISTER: in `brand`, \
+           big jumps (ratio >= 1.25, display 48-96px) and a distinctive display face \
+           are the point; in `product`, a FIXED ratio of 1.125-1.2, weights 400/500/600, \
+           and a FAMILIAR NEUTRAL UI/system face is the CORRECT choice — do NOT import \
+           a display face for a data table. One signature detail (e.g. tabular-nums on \
+           numbers).\n\
+         - ## Icons — declare ONE icon library and ONE stroke weight, and never mix. \
+           Never emoji as an icon; never a hand-rolled decorative SVG. WHICH library is \
+           YOUR choice for this product — there is no default.\n\
          - ## Spacing scale — 4px base, 8+ steps; tight interior, large gaps between \
            sections (~64-96px rhythm).\n\
          - ## Icon library — exactly ONE: Lucide / Heroicons / Tabler.\n\
@@ -350,7 +452,7 @@ pub fn uiux_prompt(slug: &str, requirement: &str, prd_excerpt: &str) -> Prompt {
          detail? Motion tokens + reduced-motion? Every component has states? \
          Thumbnail test — would a stranger know WHICH product this is?"
     ) + "\n\n"
-        + ANTI_SLOP_LAW;
+        + &anti_slop_law(register);
     let user = format!(
         "## Requirement\n\n{requirement}\n\n\
          ## PRD (excerpt)\n\n{prd_excerpt}\n\n\
@@ -373,6 +475,10 @@ pub fn frontend_prompt(
     arch_excerpt: &str,
     prd_excerpt: &str,
 ) -> Prompt {
+    // The UIUX doc's `## Visual direction` DECLARES the register; the requirement
+    // is the fallback. Unknown → the full law (fail-open).
+    let register =
+        crate::design_system::register_from_text(&format!("{uiux_excerpt}\n{requirement}"));
     let system = format!(
         "{SPEC_PREAMBLE}\n\
          Role: senior frontend engineer.\n\
@@ -417,7 +523,7 @@ pub fn frontend_prompt(
          - Under a `## Run command` heading: the exact command to start the\
            dev server again (e.g. `cd web && npm run dev`)."
     ) + "\n\n"
-        + ANTI_SLOP_LAW;
+        + &anti_slop_law(register);
     let user = format!(
         "## Requirement\n\n{requirement}\n\n\
          ## UIUX Design Tokens (bind these)\n\n{uiux_excerpt}\n\n\
@@ -521,7 +627,7 @@ pub fn delivery_prompt(slug: &str, requirement: &str, arch_excerpt: &str) -> Pro
 /// continuous driver injects it as the first lean directive's preamble.
 ///
 /// Kept deliberately SHORT: the whole point of the lean path is speed, so this is
-/// a few sentences, not the multi-paragraph [`SPEC_PREAMBLE`] + [`ANTI_SLOP_LAW`]
+/// a few sentences, not the multi-paragraph [`SPEC_PREAMBLE`] + [`anti_slop_law`]
 /// that the heavyweight document phases carry.
 #[must_use]
 pub fn lean_priming() -> &'static str {
@@ -697,14 +803,20 @@ pub fn persona_for_role(role: &str) -> &'static str {
         }
         "architect" | "architecture" | "tech-lead" => phase_persona(Phase::Spec),
         "uiux-designer" | "uiux" | "designer" | "ui" | "ux" => {
-            "You are now working as a senior UI/UX designer. Your remit: a \
-             deliberate design system delivered as REAL files on the blackboard — write \
-             `design-tokens.json` (the token source of truth: a typographic scale, a \
-             color palette, spacing, radii, and the component list) AND `design-tokens.css` \
-             (the same tokens as CSS custom properties the frontend imports — never \
-             hardcoded values). Declare an icon library (Lucide / Heroicons / Tabler — \
-             never emoji) and specify every component state. It must read as intentional \
-             craft, never a template."
+            "You are now working as a senior UI/UX designer. Your remit, in order: \
+             FIRST decide the DIRECTION — write `## Visual direction` in the UI/UX doc \
+             (a one-line design read naming the REGISTER `brand` or `product`; a color \
+             commitment level; the theme forced by a physical-scene sentence; 2-3 named \
+             anchor references each bound to one dimension; anti-goals). Only THEN pick a \
+             single value. Deliver the system as REAL files on the blackboard — \
+             `design-tokens.json` (the source of truth) AND `design-tokens.css` (the same \
+             tokens as CSS custom properties the frontend imports — never hardcoded \
+             values), in OKLCH, where every surface token ships a PAIRED `on-` foreground \
+             whose WCAG contrast you computed. Declare ONE icon library and ONE stroke \
+             weight (which one is your call — never emoji) and specify every component \
+             state. Build to the register: on a product surface a familiar neutral system \
+             font is CORRECT and page-load choreography is a defect. It must read as \
+             intentional craft, never a template."
         }
         "frontend-engineer" | "frontend" | "fe" => phase_persona(Phase::Frontend),
         "backend-engineer" | "backend" | "be" => phase_persona(Phase::Backend),
@@ -853,11 +965,28 @@ pub fn seat_method(role: &str) -> &'static str {
         }
         "uiux-designer" | "uiux" | "designer" | "ui" | "ux" => {
             "## Your working method\n\
-             Deliver the design system as REAL files: a token source of truth \
-             (typographic scale, color palette, spacing, radii) and ONE declared icon \
-             library (Lucide / Heroicons / Tabler — never emoji), with every component \
-             state specified. It must read as intentional craft, never a template — no \
-             default-font-only, no purple/pink AI-slop gradient."
+             DIRECTION BEFORE TOKENS. Never pick a hex before you have written the \
+             `## Visual direction` section: (1) a one-line design read (page kind / \
+             audience / REGISTER — `brand` or `product` / vibe / aesthetic family); \
+             (2) three forced decisions — a color commitment level (restrained | \
+             committed | full-palette | drenched); the light-vs-dark theme decided by a \
+             PHYSICAL-SCENE sentence (who uses this, where, under what ambient light, in \
+             what mood — if it doesn't force the choice, add detail until it does); and \
+             2-3 NAMED anchor references, EACH bound to one dimension (density from one, \
+             type from another, whitespace from a third — 'modern' and 'clean' are \
+             adjectives, not anchors, and are rejected); (3) anti-goals.\n\
+             THEN deliver the system as REAL files: a token source of truth in OKLCH \
+             where every surface ships a PAIRED `on-` foreground whose WCAG contrast you \
+             COMPUTED (4.5:1 body, 3:1 large/UI), a type scale (>=4 steps; ratio \
+             1.125-1.2 in the product register, big jumps in brand), a 4pt spacing scale, \
+             a radius scale, and motion tokens (>=2 durations + >=1 easing). Declare ONE \
+             icon library and ONE stroke weight (which one is YOUR call — never emoji, \
+             never a hand-rolled decorative SVG), and specify every component state.\n\
+             BUILD TO THE REGISTER. In `product`, a familiar neutral system font is \
+             CORRECT, there is NO page-load choreography, restrained color is the floor, \
+             and density is a virtue. In `brand`, a distinctive face, a dramatic type \
+             jump, and ONE orchestrated entrance are the job. Dressing a dashboard like a \
+             landing page is a defect, not ambition."
         }
         "frontend-engineer" | "frontend" | "fe" => {
             "## Your working method\n\
@@ -953,7 +1082,7 @@ pub fn agentic_team_identity() -> &'static str {
 /// reads / changes / builds something — NOT small talk).
 ///
 /// A deliberately TERSE distillation of the heavyweight [`SPEC_PREAMBLE`] +
-/// [`ANTI_SLOP_LAW`] the document phases carry — the core of how this team's work
+/// [`anti_slop_law`] the document phases carry — the core of how this team's work
 /// looks when it's good, framed as the director's OWN standards and taste, not a
 /// compliance checklist. So a routine "fix this" turn carries the team's bar
 /// WITHOUT the multi-paragraph pipeline preamble that would make day-to-day chat
@@ -964,13 +1093,24 @@ pub fn agentic_team_identity() -> &'static str {
 pub fn agentic_engineering_rules() -> &'static str {
     "HOW YOUR TEAM BUILDS (your craft and taste when you write or change code — \
      scaled to the task, never over-engineered):\n\
-     - Your UIs never use emoji as icons — you pull real icons from a proper \
-     library (Lucide / Heroicons / Tabler). It's a tell you're above.\n\
-     - You theme through design tokens (CSS vars / theme keys), not hardcoded hex. \
-     You avoid the AI-default look: purple/indigo gradients and the Tailwind \
-     indigo/violet accent (#6366f1 / #4f46e5 / #8b5cf6 / #7c3aed), Inter/Roboto/\
-     Arial-only type. You commit to ONE deliberate design direction over the safe \
-     generic average — work nobody can mistake for a template.\n\
+     - Your UIs never use emoji as icons. You declare ONE icon library and ONE \
+     stroke weight for the product and never mix — and you never hand-roll a \
+     decorative SVG. WHICH library is your own call each time; reaching for the \
+     same one by reflex is itself how work starts looking the same.\n\
+     - You theme through design tokens (CSS vars / theme keys), not hardcoded hex, \
+     and every surface token ships a paired `on-` foreground whose contrast you \
+     MEASURE (4.5:1 body, 3:1 large/UI) rather than eyeball. You avoid the \
+     AI-default look: purple/indigo gradients and the indigo/violet accent \
+     (#6366f1 / #4f46e5 / #8b5cf6 / #7c3aed). You commit to ONE deliberate design \
+     direction over the safe generic average — work nobody can mistake for a \
+     template.\n\
+     - You know which REGISTER you are in, and you build to it. A landing page is \
+     the BRAND register (design IS the product: a distinctive face, a dramatic type \
+     scale, one orchestrated entrance). An app / dashboard / admin / devtool is the \
+     PRODUCT register (design SERVES the task: a familiar neutral system font is \
+     CORRECT, a fixed 1.125–1.2 type scale, NO page-load choreography, restrained \
+     color, and density is a virtue). Dressing a dashboard like a landing page is \
+     not ambition — it is a defect.\n\
      - You keep frontend calls wired to the backend's real routes, validate \
      inputs, and use real representative content — never lorem or placeholder \
      boxes.\n\
@@ -1614,7 +1754,7 @@ mod tests {
         // Stays compact — a fraction of the full preamble + anti-slop law so it
         // doesn't bloat day-to-day chat.
         assert!(
-            p.len() < SPEC_PREAMBLE.len() + ANTI_SLOP_LAW.len(),
+            p.len() < SPEC_PREAMBLE.len() + anti_slop_law(Register::Unknown).len(),
             "agentic rules must be a compact distillation"
         );
     }

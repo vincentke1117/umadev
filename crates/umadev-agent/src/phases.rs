@@ -4292,7 +4292,7 @@ mod tests {
         );
         assert_eq!(dirty.0, "warning", "AI-purple is a hard tell: {dirty:?}");
         assert!(
-            dirty.2.contains("ai-purple"),
+            dirty.2.contains("ai-color-palette"),
             "should name the tell: {dirty:?}"
         );
     }

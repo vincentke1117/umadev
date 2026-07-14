@@ -78,6 +78,17 @@ pub fn framework_for(clause_id: &str) -> ComplianceFrameworks {
             iso27001_annex_a: s(&["A.8.25", "A.8.28"]),
             eu_ai_act_article: s(&["Article 15"]),
         },
+        // Design-system conformance floor: deterministic checks over the delivered
+        // design system (token schema, MEASURED WCAG contrast on every declared
+        // surface/foreground pair, token drift, the banned brand hue, the
+        // register-scoped design lints, and the designer's visual-direction step).
+        // The contrast half is an ACCESSIBILITY control, so it maps to the
+        // transparency/accessible-information articles as well as change management.
+        "UD-CODE-007" => ComplianceFrameworks {
+            soc2_cc: s(&["CC8.1"]),
+            iso27001_annex_a: s(&["A.8.25", "A.8.28"]),
+            eu_ai_act_article: s(&["Article 13", "Article 15"]),
+        },
         // Test-integrity guard: anti-reward-hacking enforcement over the test
         // signal — change-management + monitoring controls; ISO secure-coding +
         // security-testing in development/acceptance; EU AI Act accuracy/robustness.

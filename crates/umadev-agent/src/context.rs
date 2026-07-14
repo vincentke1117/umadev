@@ -74,7 +74,7 @@
 use std::path::Path;
 
 use crate::experts::{
-    agentic_engineering_rules, agentic_team_identity, excerpt, persona_for_role, ANTI_SLOP_LAW,
+    agentic_engineering_rules, agentic_team_identity, anti_slop_law, excerpt, persona_for_role,
 };
 use crate::router::{RouteClass, RoutePlan};
 
@@ -260,14 +260,28 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
     // ── Layer 2: 心法 / anti-slop (work-class only) ──────────────────────────
     if tier.wants_craft() {
         fw.push_block(agentic_engineering_rules());
-        // The full anti-slop / design-system law leads EVERY work turn, not just a
-        // deliberate /run build: a chat-promoted build (the light resident-session
-        // path) writes real UI too, and its visual quality is exactly the "moat" the
-        // user judges. ANTI_SLOP_LAW is a STATIC string (no retrieval / no I/O), so
-        // carrying it on the work-class head costs nothing on latency — the slow
-        // layers are the JIT repo-map + knowledge below, which stay gated. Without
-        // this, a UI built from chat skipped the design system and read as AI-slop.
-        fw.push_block(ANTI_SLOP_LAW);
+        // The full design law leads EVERY work turn, not just a deliberate /run
+        // build: a chat-promoted build (the light resident-session path) writes real
+        // UI too, and its visual quality is exactly the "moat" the user judges.
+        // Without this, a UI built from chat skipped the design system and read as
+        // AI-slop.
+        //
+        // SCOPED TO ITS REGISTER (UD-CODE-007). The law used to apply MARKETING
+        // rules universally — ban system fonts, demand 3x type jumps + extreme
+        // weights, demand a textured background, demand an orchestrated page-load
+        // reveal. Right for a landing page; WRONG for a dashboard / admin / devtool,
+        // where a familiar neutral face is CORRECT, the scale is a fixed 1.125–1.2,
+        // and page-load choreography is a defect. So we inject exactly ONE register
+        // half on top of the register-independent core.
+        //
+        // The register comes from the project's OWN declaration (the UIUX doc's
+        // `## Visual direction`), falling back to the user's words. Fail-open:
+        // `Register::Unknown` emits core + brand — byte-for-byte the law's historical
+        // reach — so a turn we cannot classify is never under-governed. Cost: one
+        // small directory read (like the charter / facts reads below), and the result
+        // is STABLE for a project, so the KV-cache prefix still holds turn to turn.
+        let register = crate::design_system::register_for_root(root, requirement);
+        fw.push_block(&anti_slop_law(register));
 
         // ── The team's CHARTER (only when the user has EDITED it) ────────────
         // The constitution (`.umadev/constitution.md`) makes the firmware's
@@ -840,7 +854,10 @@ mod tests {
         let fw = compose_firmware(tmp.path(), &r, "做一个待办事项 SaaS 产品").await;
         assert!(fw.to_lowercase().contains("umadev"));
         assert!(fw.contains("HOW YOUR TEAM BUILDS"), "craft law present");
-        assert!(fw.contains("ANTI-AI-SLOP"), "anti-slop present on a build");
+        assert!(
+            fw.contains("DESIGN LAW"),
+            "the design law is present on a build"
+        );
     }
 
     #[tokio::test]
@@ -876,8 +893,8 @@ mod tests {
             "craft present on a work turn"
         );
         assert!(
-            fw.contains("ANTI-AI-SLOP"),
-            "the design-system law is always-on for a work turn (every UI must be exquisite)"
+            fw.contains("DESIGN LAW"),
+            "the design law is always-on for a work turn (every UI must be exquisite)"
         );
         // …but the SLOW JIT retrieval (knowledge / memory) stays gated for speed.
         assert!(!fw.contains("Lessons from prior runs"));
@@ -1607,7 +1624,7 @@ mod tests {
         // Sanity: the head actually contains the stable blocks it claims to.
         assert!(head.to_lowercase().contains("umadev"), "identity in head");
         assert!(head.contains("HOW YOUR TEAM BUILDS"), "craft in head");
-        assert!(head.contains("ANTI-AI-SLOP"), "anti-slop in head");
+        assert!(head.contains("DESIGN LAW"), "the design law in head");
     }
 
     #[tokio::test]
@@ -1649,7 +1666,8 @@ mod tests {
         // The two composes DIFFER (different volatile tails)…
         assert_ne!(a, b, "the two composes must carry different volatile tails");
         // …but the stable prefix THROUGH the anti-slop law is byte-identical.
-        let anchor = a.find(ANTI_SLOP_LAW).expect("anti-slop law present") + ANTI_SLOP_LAW.len();
+        let law = anti_slop_law(umadev_governance::design::Register::Unknown);
+        let anchor = a.find(&law).expect("design law present") + law.len();
         assert_eq!(
             a.as_bytes().get(..anchor),
             b.as_bytes().get(..anchor),

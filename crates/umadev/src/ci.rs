@@ -18,7 +18,8 @@
 
 use std::path::{Path, PathBuf};
 use umadev_governance::{
-    check_sensitive_path, pre_write_floor_decision, scan_content_with_policy, Policy,
+    check_sensitive_path, pre_write_floor_decision, scan_content_with_context, Policy,
+    ProjectContext,
 };
 
 /// File extensions the CI scan considers "source" (governance-eligible).
@@ -126,6 +127,23 @@ pub struct CiResult {
 /// Returns an error only on a filesystem traversal failure.
 pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
     let policy = Policy::load(&opts.project_root);
+    // The run's own governance context — READ IT, don't assume. `umadev ci` is the surface
+    // that actually BLOCKS (the PreToolUse hook downgrades every non-floor finding to a
+    // pass, and `install --base pre-commit` writes `umadev ci --changed-only` into
+    // `.git/hooks/pre-commit`), so a decision the run already honoured and a decision this
+    // gate makes MUST be the same decision. Judging with a hardcoded `unknown()` context is
+    // what let a user say "our brand is violet", watch the run accept it, and then be unable
+    // to COMMIT it: the pre-commit hook blocked UD-CODE-002 on the very color they asked
+    // for, with no way to converge — the finding just moved one surface over.
+    //
+    // Resolved PER FILE, not once for the scan root: git runs its hooks with the cwd set to
+    // the repository TOP LEVEL, so in a monorepo (`/repo/apps/web/.umadev/`) the scan root is
+    // `/repo` — which carries no `.umadev/` at all — while the files being judged live inside
+    // a real UmaDev workspace one level down. A root-only lookup finds nothing there, falls
+    // back to `unknown()`, and reproduces the exact unconvergeable block this reader exists to
+    // prevent. So each file is judged by the context of the nearest workspace that CONTAINS
+    // it (memoized per directory; the single-workspace case resolves once and costs nothing).
+    let mut contexts = ContextCache::new(&opts.project_root);
     let files = collect_source_files(&opts.project_root, opts.changed_only)?;
     let mut result = CiResult {
         files_scanned: files.len(),
@@ -133,6 +151,7 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
     };
 
     for file in &files {
+        let ctx = contexts.for_file(file);
         let rel = file
             .strip_prefix(&opts.project_root)
             .unwrap_or(file)
@@ -165,7 +184,7 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
         let decision = if floor.block {
             floor
         } else {
-            scan_content_with_policy(&rel, &content, &policy)
+            scan_content_with_context(&rel, &content, &policy, ctx)
         };
         if decision.block {
             result.files_blocked += 1;
@@ -214,6 +233,116 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
 
     result.failed = result.files_blocked > 0 && !opts.report_only;
     Ok(result)
+}
+
+/// The run's persisted governance [`ProjectContext`] for `root` —
+/// `.umadev/governance-context.json`, written by the agent runner and read by the
+/// PreToolUse hook.
+///
+/// It carries what the RUN already established and the user already decided: whether the
+/// project is a proven static frontend (so server-surface rules have nothing to guard), and
+/// whether the requirement asked for a purple/violet brand (the ONE stand-down of the
+/// banned-hue default-reject). `umadev ci` is the surface that actually fails a commit, so
+/// it must read the same context every other surface reads — a gate that judges by a
+/// different rule book than the run is unconvergeable by construction.
+///
+/// **Conservative & fail-open**: no context file, an unreadable one, or malformed JSON →
+/// [`ProjectContext::unknown`] (full strictness). Governance is never relaxed because we
+/// *couldn't read* the context.
+///
+/// **And never relaxed by a context we cannot attribute.** The file is a *permission*, and
+/// a permission belongs to a requirement. `umadev ci` runs long after the run that wrote it
+/// — from `.git/hooks/pre-commit`, on whatever the tree is now — so it checks the context's
+/// provenance against the workspace's live requirement before honouring it
+/// ([`ProjectContext::if_current`]): a `purple_allowed: true` left behind by last quarter's
+/// violet rebrand must not stand the banned-hue band down for today's "no purple anywhere".
+/// A context that still matches the current requirement is honoured whatever its age — that
+/// is the legitimately-purple project, and blocking it is the very bug this reader exists
+/// to avoid.
+fn load_project_context(root: &Path) -> ProjectContext {
+    let Ok(raw) = std::fs::read_to_string(root.join(".umadev").join("governance-context.json"))
+    else {
+        return ProjectContext::unknown();
+    };
+    let ctx = serde_json::from_str::<ProjectContext>(&raw).unwrap_or_else(|_| {
+        // Malformed / partial JSON → strict.
+        ProjectContext::unknown()
+    });
+    ctx.if_current(now_secs(), workspace_requirement(root).as_deref())
+}
+
+/// Per-file governance-context resolution, memoized by directory.
+///
+/// The scan root is NOT necessarily the UmaDev workspace. `install --base pre-commit` writes
+/// `umadev ci --changed-only` into `.git/hooks/pre-commit`, and git runs hooks with the cwd
+/// set to the repository TOP LEVEL — so in a monorepo whose workspace is `/repo/apps/web`,
+/// this gate runs at `/repo`, where there is no `.umadev/` at all. Judging `apps/web`'s files
+/// with the resulting `unknown()` context is the same unconvergeable block as writing no
+/// context: the run accepted the brand the commit gate now refuses.
+///
+/// So a file is judged by the nearest workspace that CONTAINS it: walk up from the file's own
+/// directory, stopping at the scan root, and take the first ancestor with a `.umadev/` dir.
+/// Nothing found → the scan root's own context (which is `unknown()` when it has none — the
+/// strict default, unchanged).
+struct ContextCache<'a> {
+    root: &'a Path,
+    by_dir: std::collections::HashMap<PathBuf, ProjectContext>,
+}
+
+impl<'a> ContextCache<'a> {
+    fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            by_dir: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The context governing `file`. Memoized per directory, so the common
+    /// single-workspace scan does exactly one lookup.
+    fn for_file(&mut self, file: &Path) -> ProjectContext {
+        let dir = file.parent().unwrap_or(self.root).to_path_buf();
+        if let Some(hit) = self.by_dir.get(&dir) {
+            return *hit;
+        }
+        let ctx = self.resolve(&dir);
+        self.by_dir.insert(dir, ctx);
+        ctx
+    }
+
+    /// First ancestor of `dir` (up to and including the scan root) that carries a `.umadev/`
+    /// directory; the scan root's own context when none does.
+    fn resolve(&self, dir: &Path) -> ProjectContext {
+        let mut at = Some(dir);
+        while let Some(cur) = at {
+            if cur.join(".umadev").is_dir() {
+                return load_project_context(cur);
+            }
+            if cur == self.root {
+                break;
+            }
+            at = cur.parent();
+        }
+        load_project_context(self.root)
+    }
+}
+
+/// The requirement this workspace is currently being built from
+/// (`.umadev/workflow-state.json`), or `None` when no run has recorded one (a hand-written
+/// repo, a fresh clone). `None` means "nothing to match against" — the context then falls
+/// back to its age ([`ProjectContext::MAX_UNMATCHED_AGE_SECS`]) rather than being trusted
+/// forever. Fail-open: an unreadable / corrupt state file reads as `None`.
+fn workspace_requirement(root: &Path) -> Option<String> {
+    umadev_agent::state::read_workflow_state(root)
+        .map(|s| s.requirement)
+        .filter(|r| !r.trim().is_empty())
+}
+
+/// UNIX seconds, or 0 when the clock is unreadable (which ages every unmatched context out
+/// — the strict direction).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Render the one-line scan summary from the FINAL [`CiResult`] — after the
@@ -492,6 +621,241 @@ mod tests {
         assert_eq!(result.files_scanned, 1);
         assert_eq!(result.files_blocked, 0);
         assert!(!result.failed);
+    }
+
+    /// Run `umadev ci` over `root` and return how many files it blocked.
+    fn ci_blocked(root: &Path) -> usize {
+        run(&CiOptions {
+            report_only: false,
+            changed_only: false,
+            project_root: root.to_path_buf(),
+        })
+        .unwrap()
+        .files_blocked
+    }
+
+    /// The gate must judge by the SAME rule book the run does — and the DEFAULT run path
+    /// must actually write that rule book.
+    ///
+    /// `umadev ci` is the surface that actually blocks — the PreToolUse hook downgrades every
+    /// non-floor finding to a pass, and `install --base pre-commit` writes
+    /// `umadev ci --changed-only` into `.git/hooks/pre-commit`. So while the run honoured
+    /// "our brand is violet" and wrote the palette, this gate blocked UD-CODE-002 on that
+    /// very color and the user COULD NOT COMMIT the brand they asked for. There is no fix
+    /// from inside that loop; the finding had just been relocated one surface over.
+    ///
+    /// The context file was only ever written by the legacy gated walk and the single-shot
+    /// runner — never by the DEFAULT director path — so this is driven here through the same
+    /// entry point the director loop calls, not a hand-written JSON blob that could pass while
+    /// the product path still wrote nothing.
+    #[test]
+    fn ci_honours_the_runs_governance_context() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // The hue the user asked for, written as the run wrote it. Named hues, so the ONLY
+        // rule with anything to say about this file is the banned-hue one — the one the
+        // permission governs (a hardcoded-color finding would be a different, still-correct
+        // complaint about literals vs tokens).
+        let requested_purple = "export const hero = 'linear-gradient(135deg, purple, pink)';";
+        std::fs::write(root.join("brand.ts"), requested_purple).unwrap();
+
+        // No context ⇒ default-REJECT: a purple nobody asked for is still caught.
+        assert_eq!(
+            ci_blocked(root),
+            1,
+            "with no recorded permission the banned hue still blocks (default-reject)"
+        );
+
+        // THE RUN. The same call `director_loop` makes at its door, before it writes a single
+        // file — carrying the BRAIN's verdict on the requirement (`color_permission`), which is
+        // the only thing that may grant this permission. A word list used to answer it here and
+        // leaked on every review round; a run whose brain says "yes, they chose violet" records
+        // that, and this gate must read the same decision.
+        let requirement = "做一个品牌落地页,主色用紫色 #7c3aed 的渐变";
+        let ctx = umadev_agent::planner::persist_project_context_with_color(
+            requirement,
+            root,
+            "brand",
+            true,
+        );
+        assert!(
+            ctx.purple_allowed,
+            "the run recorded the brain's grant — the context must carry it"
+        );
+
+        // …and the commit gate now reads the SAME decision.
+        assert_eq!(
+            ci_blocked(root),
+            0,
+            "the user asked for this color and the run agreed — the commit gate cannot be the \
+             one surface that says no"
+        );
+
+        // A LEGITIMATELY CURRENT context stays honoured however old it gets: the workspace's
+        // live requirement still matches the one the permission was derived from.
+        let state = umadev_agent::state::WorkflowState {
+            requirement: requirement.to_string(),
+            ..umadev_agent::state::WorkflowState::new(umadev_spec::Phase::Frontend)
+        };
+        umadev_agent::state::write_workflow_state(root, &state).unwrap();
+        assert_eq!(
+            ci_blocked(root),
+            0,
+            "a context that matches the workspace's own requirement is current — blocking it \
+             would re-open the very bug this test exists for"
+        );
+    }
+
+    /// A permission belongs to the requirement it was derived from. `umadev ci` runs from
+    /// `.git/hooks/pre-commit` — long after the run that wrote the context, on whatever the
+    /// tree is now — so a `purple_allowed: true` left behind by an OLD run must not stand the
+    /// banned-hue band down for a NEW requirement whose first line is "no purple".
+    #[test]
+    fn a_stale_context_from_a_different_requirement_does_not_stand_the_rule_down() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("brand.ts"),
+            "export const hero = 'linear-gradient(135deg, purple, pink)';",
+        )
+        .unwrap();
+
+        // LAST quarter's run: the brand really was violet, the brain said so, and the run
+        // recorded the permission.
+        let old = umadev_agent::planner::persist_project_context_with_color(
+            "品牌主色用紫色",
+            root,
+            "brand",
+            true,
+        );
+        assert!(old.purple_allowed);
+        assert_eq!(ci_blocked(root), 0, "that run's own commit was fine");
+
+        // THIS quarter's requirement is the opposite — and it is what the workspace is being
+        // built from now. The permission on disk belongs to a requirement that is no longer
+        // the one in force, so it is not evidence for anything.
+        let state = umadev_agent::state::WorkflowState {
+            requirement: "重做品牌:不要任何紫色".to_string(),
+            ..umadev_agent::state::WorkflowState::new(umadev_spec::Phase::Frontend)
+        };
+        umadev_agent::state::write_workflow_state(root, &state).unwrap();
+        assert_eq!(
+            ci_blocked(root),
+            1,
+            "a permission derived from a DIFFERENT requirement is not a permission for this one"
+        );
+
+        // And the new run's own door re-decides it (its brain reads a requirement that forbids
+        // the hue), so the band is armed on disk too — not merely ignored at read time.
+        let fresh = umadev_agent::planner::persist_project_context_with_color(
+            "重做品牌:不要任何紫色",
+            root,
+            "brand",
+            false,
+        );
+        assert!(!fresh.purple_allowed);
+        assert_eq!(ci_blocked(root), 1);
+
+        // THE CARRY-FORWARD, which is what every later surface depends on: the per-tool-call
+        // refresh (`persist_project_context`) has no brain and must NEVER invent a permission.
+        // For the requirement the door already decided, it reproduces that decision; for any
+        // other, it grants nothing.
+        let carried =
+            umadev_agent::planner::persist_project_context("重做品牌:不要任何紫色", root, "brand");
+        assert!(
+            !carried.purple_allowed,
+            "the refresh carries the door's verdict forward — it does not re-derive one"
+        );
+        assert_eq!(ci_blocked(root), 1);
+    }
+
+    /// Git runs its hooks with the cwd set to the repository TOP LEVEL. In a monorepo whose
+    /// UmaDev workspace is `apps/web`, the pre-commit gate therefore runs at `/repo` — where
+    /// there is no `.umadev/` at all — while the files it judges live inside a real workspace
+    /// one level down. A root-only context lookup finds nothing, falls back to strict, and
+    /// blocks the color the run in `apps/web` had accepted: HIGH 1 all over again, one
+    /// directory deeper.
+    #[test]
+    fn a_workspace_in_a_monorepo_subdir_is_still_governed_by_its_own_context() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path(); // the git top-level: no .umadev of its own
+        let web = repo.join("apps").join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        let purple = "export const hero = 'linear-gradient(135deg, purple, pink)';";
+        std::fs::write(web.join("brand.ts"), purple).unwrap();
+
+        // Nothing recorded anywhere → strict, as always.
+        assert_eq!(ci_blocked(repo), 1);
+
+        // The run happened INSIDE apps/web, and wrote its context there.
+        let ctx = umadev_agent::planner::persist_project_context_with_color(
+            "做一个品牌落地页,主色用紫色",
+            &web,
+            "brand",
+            true,
+        );
+        assert!(ctx.purple_allowed);
+
+        // The pre-commit gate still runs at the repo top level — and must find it.
+        assert_eq!(
+            ci_blocked(repo),
+            0,
+            "the gate at the git top level must judge apps/web by apps/web's own rule book"
+        );
+
+        // A sibling package with NO workspace of its own is still governed strictly: the
+        // permission belongs to apps/web, not to the whole monorepo.
+        let api = repo.join("apps").join("api");
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::write(api.join("theme.ts"), purple).unwrap();
+        assert_eq!(
+            ci_blocked(repo),
+            1,
+            "a permission recorded in one package does not leak into its siblings"
+        );
+    }
+
+    /// An UNSTAMPED context (hand-written, or from a build that predates the provenance
+    /// fields) has nothing to date it or attribute it to — so it cannot stand a rule down.
+    #[test]
+    fn an_unstamped_context_is_not_a_permission() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("brand.ts"),
+            "export const hero = 'linear-gradient(135deg, purple, pink)';",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".umadev")).unwrap();
+        std::fs::write(
+            root.join(".umadev").join("governance-context.json"),
+            r#"{"static_frontend_only":false,"purple_allowed":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ci_blocked(root),
+            1,
+            "a permission with no provenance is not honoured — anyone could drop that file in"
+        );
+    }
+
+    #[test]
+    fn ci_context_is_conservative_when_unreadable() {
+        // FAIL-OPEN, in the SAFE direction: a malformed / partial context is not a permission.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".umadev")).unwrap();
+        for body in ["{ not json", "{}", ""] {
+            std::fs::write(root.join(".umadev").join("governance-context.json"), body).unwrap();
+            let ctx = load_project_context(root);
+            assert!(
+                !ctx.purple_allowed,
+                "an unreadable context is never a stand-down: {body:?}"
+            );
+        }
+        // …and a missing file, likewise.
+        std::fs::remove_file(root.join(".umadev").join("governance-context.json")).unwrap();
+        assert!(!load_project_context(root).purple_allowed);
     }
 
     #[test]

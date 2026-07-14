@@ -19,7 +19,7 @@ use crate::fswalk::{classify_no_follow, EntryKind};
 /// Source + style extensions. The code files form the "implementation surface"
 /// for the endpoint-coverage check; the style files (css/…) matter for the
 /// post-phase governance scan, where hardcoded colors live.
-const SRC_EXT: &[&str] = &[
+pub(crate) const SRC_EXT: &[&str] = &[
     "tsx", "jsx", "ts", "js", "mjs", "cjs", "vue", "svelte", "astro", "py", "rs", "go", "java",
     "rb", "php", "cs", "kt", "ex", "exs", "dart", "swift", "scala", "c", "cc", "cpp", "h", "hpp",
     "css", "scss", "sass", "less", "html",
@@ -35,7 +35,7 @@ const SRC_EXT: &[&str] = &[
 /// 'done'?") would be fooled by a stray doc-dir HTML into passing a zero-code
 /// build. So `output` is skipped alongside the build-output / vendor dirs.
 /// (`.umadev` is already skipped via the leading-dot rule.)
-const SKIP_DIRS: &[&str] = &[
+pub(crate) const SKIP_DIRS: &[&str] = &[
     "node_modules",
     "target",
     "dist",
@@ -54,7 +54,7 @@ const SKIP_DIRS: &[&str] = &[
 /// projects commonly nest real code below `src/views/.../components/...`, so an
 /// 8-level cap misses legitimate source and feeds empty/partial evidence to QA.
 /// File count + skip dirs remain the real monorepo guard.
-const MAX_SOURCE_DEPTH: usize = 16;
+pub(crate) const MAX_SOURCE_DEPTH: usize = 16;
 
 /// Maximum number of source files scanned (guards a pathological monorepo).
 /// `pub` so the SAST scan can tell whether a large tree was CAPPED and therefore

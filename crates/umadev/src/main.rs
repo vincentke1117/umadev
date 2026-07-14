@@ -42,6 +42,7 @@ mod knowledge_bundle;
 mod knowledge_manager;
 mod mcp;
 mod mcp_manager;
+mod self_update;
 mod skill_manager;
 
 use std::io::Write;
@@ -535,6 +536,12 @@ enum Command {
         /// Workspace root; defaults to current directory.
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Repair what can be repaired safely. Today: clear a STALE rewind marker that is
+        /// permanently halting every run (a marker whose snapshot this workspace can no
+        /// longer identify — its shadow checkpoint repo was deleted). Touches no file in
+        /// your work-tree. A marker the automatic repair can still act on is left alone.
+        #[arg(long)]
+        fix: bool,
     },
     /// Show common-workflow examples for new users.
     #[command(
@@ -627,11 +634,18 @@ enum Command {
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
-    /// Upgrade UmaDev to the latest version (re-installs via npm).
+    /// Upgrade UmaDev to the latest version.
+    ///
+    /// A package-manager install (npm / pnpm / yarn / bun) is upgraded by that
+    /// manager; any other install (`cargo install`, a downloaded release binary)
+    /// self-updates from the latest GitHub Release.
     Update {
         /// Skip the confirmation prompt (for scripts).
-        #[arg(long)]
+        #[arg(short = 'y', long)]
         yes: bool,
+        /// Re-install even when already on the latest published version.
+        #[arg(long)]
+        force: bool,
     },
     /// Run UmaDev as an MCP (Model Context Protocol) server over stdio.
     ///
@@ -774,6 +788,12 @@ async fn main() -> Result<()> {
     );
     init_tracing(is_tui);
 
+    // A Windows self-update parks the running `umadev.exe` as `umadev.exe.old`
+    // (a mapped .exe cannot be unlinked, but it CAN be renamed). By now that image
+    // is long gone, so drop it. Best-effort and cheap (one `remove_file`, Windows
+    // only); a failure here never touches the launch.
+    self_update::sweep_stale_backup();
+
     // Stage the embedded `knowledge/` corpus to ~/.umadev/knowledge once per
     // build and point UMADEV_KNOWLEDGE_DIR at it, so knowledge recall works in
     // any user project with zero setup. Done BEFORE command dispatch (incl. the
@@ -781,6 +801,24 @@ async fn main() -> Result<()> {
     // CLI, director loop — discovers the full curated KB. Fail-open: any error
     // is swallowed and recall degrades to empty, never blocking startup.
     knowledge_bundle::ensure_staged();
+
+    // WORKSPACE INTEGRITY, before anything else runs. A previous `umadev` that was
+    // SIGKILLed / OOM-killed / whose terminal was closed *inside* a temporary evidence
+    // rewind (the red→green pre-state replay) left the user's own tracked source files
+    // reverted to an earlier state — no destructor ran, so nothing put them back, and
+    // `rollback` moves the wrong way. Put the present back and SAY SO, on every entry
+    // (CLI verb or TUI), before the terminal is taken over. Fail-open + strictly
+    // conservative: a no-op unless the marker's owner is provably gone, and it can only
+    // reset to a checkpoint UmaDev itself wrote.
+    //
+    // This covers the cwd (the TUI's workspace, and every verb run from inside the
+    // project). A verb pointed ELSEWHERE with `--project-root` heals THAT tree instead —
+    // see `resolve_root`, which is the single choke point every workspace verb passes
+    // through, so `umadev rollback --project-root /elsewhere` can never act on a tree
+    // that is still stuck in the past.
+    if let Ok(cwd) = std::env::current_dir() {
+        heal_workspace(&cwd);
+    }
 
     // No subcommand → launch the TUI (the recommended interactive entry).
     // In a non-TTY environment (piped output, CI, docker), fall back to
@@ -880,7 +918,7 @@ async fn main() -> Result<()> {
             create,
             yes,
         } => cmd_pr(slug, project_root, create, yes),
-        Command::Doctor { project_root } => cmd_doctor(project_root).await,
+        Command::Doctor { project_root, fix } => cmd_doctor(project_root, fix).await,
         Command::Examples => cmd_examples(),
         Command::Guide => cmd_guide(),
         Command::Hook { check } => cmd_hook(check),
@@ -890,7 +928,7 @@ async fn main() -> Result<()> {
             yes,
             project_root,
         } => cmd_uninstall(base, yes, project_root),
-        Command::Update { yes } => cmd_update(yes),
+        Command::Update { yes, force } => cmd_update(yes, force).await,
         Command::Mcp { transport } => cmd_mcp(transport),
         Command::Ci {
             report_only,
@@ -1216,38 +1254,63 @@ fn confirm(prompt: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-/// `umadev update` — re-install the latest published version via npm. A manual /
-/// dev build (not under npm) just prints the upgrade instructions.
-fn cmd_update(yes: bool) -> Result<()> {
-    let exe = std::env::current_exe().ok();
-    let npm_managed = exe
-        .as_ref()
-        .is_some_and(|p| p.to_string_lossy().contains("node_modules"));
+/// `umadev update` — upgrade to the latest published version, whatever the install
+/// method was.
+///
+/// Three cases, decided by where the running binary lives
+/// ([`self_update::classify_install`]):
+///
+/// - **package-managed** (under `node_modules`): the JS shim (`npm/umadev/bin/cli.js`)
+///   normally intercepts `update` and never launches this binary — it upgrades with
+///   the manager that OWNS the install (npm / pnpm / yarn / bun). Reaching here means
+///   someone ran the raw binary directly, so re-install via npm as before.
+/// - **dev build** (inside a cargo `target/` dir): print guidance; never overwrite a
+///   build output.
+/// - **standalone** (`cargo install`, a downloaded release asset, a manual copy):
+///   really self-update from the latest GitHub Release — see [`self_update::run`].
+async fn cmd_update(yes: bool, force: bool) -> Result<()> {
     println!("UmaDev {} is installed.", env!("CARGO_PKG_VERSION"));
-    if !npm_managed {
+    let Some(exe) = std::env::current_exe().ok() else {
         println!(
-            "This is a manual / dev build (not an npm install).\n  \
+            "Could not locate the running binary, so it cannot be replaced safely.\n  \
              upgrade:  npm install -g umadev@latest\n  \
              releases: https://github.com/umacloud/umadev/releases"
         );
         return Ok(());
-    }
-    if !yes && !confirm("Upgrade now via `npm install -g umadev@latest`?") {
-        println!("Aborted.");
-        return Ok(());
-    }
-    match umadev_host::std_command("npm")
-        .args(["install", "-g", "umadev@latest"])
-        .status()
-    {
-        Ok(s) if s.success() => {
-            println!("[ok] UmaDev upgraded. Run `umadev --version` to confirm.");
-            warn_if_umadev_shadowed_on_path();
+    };
+    match self_update::classify_install(&exe) {
+        self_update::InstallKind::DevBuild => {
+            println!(
+                "This is a dev build from a cargo target/ dir (not an install).\n  \
+                 upgrade:  npm install -g umadev@latest\n  \
+                 releases: https://github.com/umacloud/umadev/releases"
+            );
             Ok(())
         }
-        Ok(s) => anyhow::bail!("npm exited with status {s}"),
-        Err(e) => {
-            anyhow::bail!("could not run npm ({e}); run `npm install -g umadev@latest` yourself")
+        self_update::InstallKind::PackageManaged => {
+            if !yes && !confirm("Upgrade now via `npm install -g umadev@latest`?") {
+                println!("Aborted.");
+                return Ok(());
+            }
+            match umadev_host::std_command("npm")
+                .args(["install", "-g", "umadev@latest"])
+                .status()
+            {
+                Ok(s) if s.success() => {
+                    println!("[ok] UmaDev upgraded. Run `umadev --version` to confirm.");
+                    warn_if_umadev_shadowed_on_path();
+                    Ok(())
+                }
+                Ok(s) => anyhow::bail!("npm exited with status {s}"),
+                Err(e) => anyhow::bail!(
+                    "could not run npm ({e}); run `npm install -g umadev@latest` yourself"
+                ),
+            }
+        }
+        self_update::InstallKind::Standalone => {
+            self_update::run(&exe, yes, force, confirm).await?;
+            warn_if_umadev_shadowed_on_path();
+            Ok(())
         }
     }
 }
@@ -1509,8 +1572,13 @@ fn cmd_knowledge(
 }
 
 /// `umadev ci` — run governance on the whole workspace (CI/CD mode).
+///
+/// Resolves the root through [`resolve_root`], like every other workspace verb: the
+/// pre-commit gate must never judge a tree that is still stranded in the past by a run
+/// killed inside a temporary evidence rewind (it would scan — and the user would commit —
+/// an earlier step's source). Heal first, then gate.
 fn cmd_ci(report_only: bool, changed_only: bool, project_root: Option<PathBuf>) -> Result<()> {
-    let root = project_root_or_cwd(project_root);
+    let root = resolve_root(project_root)?;
     let result = ci::run(&ci::CiOptions {
         report_only,
         changed_only,
@@ -1647,9 +1715,9 @@ fn uninstall_pre_commit_hook(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_doctor(project_root: Option<PathBuf>) -> Result<()> {
+async fn cmd_doctor(project_root: Option<PathBuf>, fix: bool) -> Result<()> {
     let workspace = resolve_root(project_root)?;
-    let results = doctor::run_all(&workspace).await;
+    let results = doctor::run_all(&workspace, fix).await;
     print!("{}", doctor::render_report(&workspace, &results));
     if results.iter().any(|r| r.status == doctor::Status::Failed) {
         anyhow::bail!("umadev doctor: one or more checks failed");
@@ -4120,38 +4188,56 @@ fn cmd_spec(clauses_only: bool) -> Result<()> {
     Ok(())
 }
 
+/// `umadev history` — everything this workspace can be taken back to.
+///
+/// TWO subsystems, and a user who has just been told "your work is safe in checkpoint
+/// `abc1234`" must find it here. They were not both listed, and that made the recovery
+/// note a lie:
+///
+/// - **Workflow snapshots** (`.umadev/history/*.json`) — the pipeline PHASE only. They
+///   revert no file.
+/// - **File checkpoints** (the shadow git repo at `.umadev/checkpoints.git`) — the actual
+///   SOURCE. This is where the run baseline lives, where `/rewind` reads from, and where
+///   the workspace heal parks the rescue snapshot of a tree it is about to reset. That
+///   snapshot IS the user's work, and until now no CLI verb could even see it.
 fn cmd_history(project_root: Option<PathBuf>) -> Result<()> {
     let project_root = resolve_root(project_root)?;
     let snaps = list_snapshots(&project_root);
-    if snaps.is_empty() {
+    let checkpoints = umadev_agent::checkpoint::list_checkpoints(&project_root);
+    if snaps.is_empty() && checkpoints.is_empty() {
         println!(
             "No snapshots yet. Snapshots are created automatically on every phase transition."
         );
         println!("Run `umadev run` / `umadev continue` to advance the pipeline.");
         return Ok(());
     }
-    println!(
-        "Available rollback snapshots (newest first):
-"
-    );
-    let state = read_workflow_state(&project_root);
-    for (i, ts) in snaps.iter().enumerate() {
-        // Try to show what phase each snapshot would restore.
-        let snap_path = project_root
-            .join(".umadev/history")
-            .join(format!("{ts}.json"));
-        let phase = std::fs::read_to_string(&snap_path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<WorkflowState>(&t).ok())
-            .map_or("?".to_string(), |s| s.phase);
-        let marker = if i == 0 { " (latest)" } else { "" };
-        println!("  {ts}  →  phase: {phase}{marker}");
+    if !checkpoints.is_empty() {
+        println!("File checkpoints — restore the SOURCE TREE (newest first):\n");
+        for c in &checkpoints {
+            let when = c.when.split('T').next().unwrap_or(&c.when);
+            println!("  {}  {}  {}", c.id, when, c.label);
+        }
+        println!("\nRestore the files with:  umadev rollback <id>");
     }
-    let _ = state;
-    println!(
-        "
-Roll back with:  umadev rollback latest"
-    );
+    if !snaps.is_empty() {
+        if !checkpoints.is_empty() {
+            println!();
+        }
+        println!("Workflow snapshots — restore the PIPELINE PHASE only (newest first):\n");
+        for (i, ts) in snaps.iter().enumerate() {
+            // Try to show what phase each snapshot would restore.
+            let snap_path = project_root
+                .join(".umadev/history")
+                .join(format!("{ts}.json"));
+            let phase = std::fs::read_to_string(&snap_path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<WorkflowState>(&t).ok())
+                .map_or("?".to_string(), |s| s.phase);
+            let marker = if i == 0 { " (latest)" } else { "" };
+            println!("  {ts}  →  phase: {phase}{marker}");
+        }
+        println!("\nRoll back the phase with:  umadev rollback latest");
+    }
     Ok(())
 }
 
@@ -4328,19 +4414,44 @@ fn truncate_cli(s: &str, max: usize) -> String {
     t
 }
 
+/// `umadev rollback <id>` — take this workspace back to a recorded state.
+///
+/// Two subsystems answer to this one verb, and the id says WHICH (see [`cmd_history`]).
+/// The workflow-snapshot behaviour is resolved FIRST and is completely unchanged — a
+/// timestamp (or `latest`) still restores the pipeline phase and still touches no file.
+/// Only when nothing in that subsystem matches do we look in the shadow repo, where an id
+/// names a FILE CHECKPOINT and the source tree really is restored.
+///
+/// That second half is what makes the workspace-heal note true. The heal snapshots the
+/// tree it is about to reset (`HEAL_RESCUE_LABEL`) and tells the user their work is safe
+/// in checkpoint `<id>` — and that id lived ONLY in the shadow repo, reachable only from
+/// the TUI's `/rewind`. A CLI user who typed the verb the note named got
+/// "no snapshots available". The rescue commit is the one thing standing between them and
+/// lost work, so the natural verb now reaches it.
+///
+/// Restoring files is itself undoable: [`umadev_agent::checkpoint::restore_checkpoint`]
+/// snapshots the present and anchors it before it resets. `latest` is deliberately NOT
+/// extended to checkpoints — from a tree that may be in the past, "the newest thing you
+/// wrote" is not a safe guess; a file checkpoint must be named.
 fn cmd_rollback(timestamp: String, project_root: Option<PathBuf>) -> Result<()> {
     let project_root = resolve_root(project_root)?;
     let snaps = list_snapshots(&project_root);
-    if snaps.is_empty() {
-        anyhow::bail!("no snapshots available — run `umadev history` to check");
-    }
     let target = if timestamp == "latest" {
-        snaps[0].clone()
+        match snaps.first() {
+            Some(t) => t.clone(),
+            None => anyhow::bail!(
+                "no workflow snapshots available — run `umadev history` to check (a FILE \
+                 checkpoint must be rolled back by its own id: `umadev rollback <id>`)"
+            ),
+        }
     } else {
         // Allow partial match (e.g. user passes 20260614T12 to match 20260614T120000.123).
         let matches: Vec<&String> = snaps.iter().filter(|s| s.starts_with(&timestamp)).collect();
         match matches.len() {
-            0 => anyhow::bail!("no snapshot matches `{timestamp}`. Run `umadev history`."),
+            // Not a workflow snapshot — it may be a FILE checkpoint from the shadow repo
+            // (a run baseline, a phase rewind point, or the rescue snapshot the workspace
+            // heal just handed the user by id).
+            0 => return rollback_file_checkpoint(&project_root, &timestamp),
             1 => matches[0].clone(),
             _ => anyhow::bail!(
                 "`{timestamp}` is ambiguous ({} matches). Use more digits.",
@@ -4355,7 +4466,41 @@ fn cmd_rollback(timestamp: String, project_root: Option<PathBuf>) -> Result<()> 
     println!("  phase: {before} → {after}");
     println!("Note: artifacts on disk are NOT reverted — only workflow-state.json.");
     println!("      The pipeline now resumes from phase `{after}` on the next `umadev continue`.");
+    println!("      To restore FILES, roll back to a file checkpoint: `umadev history`.");
     Ok(())
+}
+
+/// Restore the SOURCE TREE to a shadow-repo file checkpoint — the second half of
+/// [`cmd_rollback`], reached only when the id matched no workflow snapshot.
+///
+/// The id is RESOLVED against the known-checkpoint set inside `restore_checkpoint` before
+/// anything destructive happens, and the reset targets the resolved commit — so neither an
+/// unknown handle nor a git revision expression (`<id>^`, `<id>~1`) can ever `reset --hard`
+/// the tree to a commit that is not a checkpoint.
+///
+/// The success line promises the restore is itself undoable. That promise is now KEPT rather
+/// than assumed: `restore_checkpoint` aborts (and this prints nothing) when the pre-restore
+/// snapshot it rests on could not be taken.
+///
+/// # Errors
+/// Returns `Err` when the id names neither subsystem, when the pre-restore snapshot could not
+/// be taken, or when the shadow-repo reset fails. The underlying reason leads the message —
+/// those are three different problems and the user has to be told which one they have.
+fn rollback_file_checkpoint(project_root: &Path, id: &str) -> Result<()> {
+    match umadev_agent::checkpoint::restore_checkpoint(project_root, id) {
+        Ok(()) => {
+            println!("Restored the workspace files to checkpoint {id}.");
+            println!(
+                "  The tree as it stood a moment ago was snapshotted first — `umadev history` \
+                 lists it, so this is itself undoable."
+            );
+            Ok(())
+        }
+        Err(e) => anyhow::bail!(
+            "{e}\n(`{id}` is not a workflow snapshot id either — `umadev history` lists both \
+             kinds.)"
+        ),
+    }
 }
 
 async fn cmd_verify(project_root: Option<PathBuf>, runtime: bool) -> Result<()> {
@@ -5260,16 +5405,60 @@ fn line_count(path: &std::path::Path) -> usize {
 }
 
 fn resolve_root(project_root: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(root) = project_root {
-        return Ok(root);
+    let root = match project_root {
+        Some(root) => root,
+        // Default to cwd. We deliberately do NOT honour CLAUDE_PROJECT_DIR /
+        // UMADEV_PROJECT_DIR here: when the user runs `umadev` from a
+        // directory, that directory IS the workspace they mean. The env vars
+        // would override cwd even when the user cd'd elsewhere (e.g. a smoke
+        // test in /tmp while CLAUDE_PROJECT_DIR still points at the real repo),
+        // which is surprising and wrong for the CLI entry.
+        None => {
+            std::env::current_dir().context("could not resolve project root (cwd unreadable)")?
+        }
+    };
+    // WORKSPACE INTEGRITY for the workspace this verb will actually act on. Every verb
+    // that touches a project resolves its root HERE, so this is the one place that sees
+    // an explicit `--project-root`. Without it, `umadev rollback --project-root
+    // /elsewhere` (or verify / report / history) would run against a tree still stranded
+    // in the past by a killed evidence rewind — and rollback would then move it further
+    // backwards from a state that was never the user's.
+    heal_workspace(&root);
+    Ok(root)
+}
+
+/// Put `root` back at the present if a previous run was killed inside a temporary
+/// evidence rewind, and surface the note. Idempotent per process AND per root: the
+/// startup pass heals the cwd, and a verb that resolves that same root must not print
+/// the note a second time.
+///
+/// Fail-open: a no-op unless the marker's owner is provably gone; it can only ever reset
+/// to a checkpoint UmaDev itself wrote; and it never fails the command it precedes.
+fn heal_workspace(root: &Path) {
+    static HEALED: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> =
+        std::sync::Mutex::new(None);
+
+    // Canonicalize so `.` / a symlinked path / a trailing slash all name the same root.
+    // Best-effort: an unresolvable path is used as given (the worst case is one extra
+    // no-op recovery attempt).
+    let key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if let Ok(mut guard) = HEALED.lock() {
+        if !guard
+            .get_or_insert_with(std::collections::HashSet::new)
+            .insert(key)
+        {
+            return; // already healed this root in this process
+        }
     }
-    // Default to cwd. We deliberately do NOT honour CLAUDE_PROJECT_DIR /
-    // UMADEV_PROJECT_DIR here: when the user runs `umadev` from a
-    // directory, that directory IS the workspace they mean. The env vars
-    // would override cwd even when the user cd'd elsewhere (e.g. a smoke
-    // test in /tmp while CLAUDE_PROJECT_DIR still points at the real repo),
-    // which is surprising and wrong for the CLI entry.
-    std::env::current_dir().context("could not resolve project root (cwd unreadable)")
+    if let Some(note) = umadev_agent::checkpoint::recover_abandoned_temp_rewind(root) {
+        // A CLI verb speaks on stderr. The TUI cannot: this runs a moment before the
+        // alternate screen takes the terminal, which wipes it. So ALSO hand the note to
+        // the workspace-notice queue, which the TUI drains into its transcript as a system
+        // row — "your files were in the past / still are" must never be a message only a
+        // log file receives.
+        eprintln!("{note}");
+        umadev_agent::checkpoint::record_workspace_notice(note);
+    }
 }
 
 /// Resolve the workspace root for the extension managers (MCP / skill /
@@ -5343,6 +5532,199 @@ fn infer_slug(project_root: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_explicit_project_root_is_healed_before_the_verb_acts_on_it() {
+        // B1b. Startup healed the CWD only — but every verb takes `--project-root`. So
+        // `umadev rollback --project-root /elsewhere` (or verify / report / history) ran
+        // against a tree still stranded in the past by a killed evidence rewind, and
+        // rollback then moved it FURTHER backwards from a state that was never the
+        // user's. `resolve_root` is the one choke point every workspace verb passes
+        // through, so the tree a verb is about to act on is the tree that gets healed.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map_or(true, |o| !o.status.success())
+        {
+            return;
+        }
+        let elsewhere = tempfile::tempdir().unwrap();
+        let root = elsewhere.path();
+        std::fs::write(root.join("src.rs"), "the user's real work").unwrap();
+        let pre = umadev_agent::checkpoint::create_checkpoint(root, "pre-step").expect("pre");
+        std::fs::write(root.join("src.rs"), "the user's NEWER real work").unwrap();
+
+        // A killed rewind: the tree is in the past, and only the crash marker survives.
+        let rewind = umadev_agent::checkpoint::begin_temp_rewind(root, &pre).expect("temp rewind");
+        std::mem::forget(rewind); // no destructor — exactly what a SIGKILL leaves
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).unwrap(),
+            "the user's real work",
+            "precondition: the workspace really is stuck in the past"
+        );
+        // Re-point the marker at a dead owner (the live one is this test process).
+        let marker = root.join(umadev_agent::checkpoint::TEMP_REWIND_MARKER_REL);
+        let mut m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        m["pid"] = serde_json::json!(4_294_967_294u32);
+        std::fs::write(&marker, serde_json::to_string(&m).unwrap()).unwrap();
+
+        // The verb resolves ITS root — and that is what gets put back. (The cwd here is
+        // the cargo test dir; it is emphatically NOT this workspace.)
+        let resolved = resolve_root(Some(root.to_path_buf())).expect("resolve");
+        assert_eq!(resolved, root);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).unwrap(),
+            "the user's NEWER real work",
+            "the workspace the verb is about to act on is healed BEFORE it acts"
+        );
+        assert!(!marker.exists(), "the marker is consumed");
+    }
+
+    #[test]
+    fn the_command_the_heal_note_names_actually_brings_the_users_work_back() {
+        // THE WHOLE POINT OF THE HEAL, END TO END. When the heal moves a user's files it
+        // says: "your work is safe — here is how to get it back." That sentence named
+        // `umadev history` / `umadev rollback`, and BOTH of them read the workflow-state
+        // snapshots in `.umadev/history/*.json` — a different subsystem entirely. The rescue
+        // commit lives in the shadow repo, so `umadev history` printed "No snapshots yet"
+        // and `umadev rollback <rescue>` answered "no snapshots available". The one sentence
+        // that makes the heal worth anything was false for every CLI user.
+        //
+        // So: heal a real workspace, take the command OUT OF THE NOTE THE USER IS HANDED,
+        // run exactly that, and require the user's file content back on disk.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map_or(true, |o| !o.status.success())
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("src.rs"), "the user's real work").unwrap();
+        let pre = umadev_agent::checkpoint::create_checkpoint(root, "pre-step").expect("pre");
+        std::fs::write(root.join("src.rs"), "the user's NEWER real work").unwrap();
+
+        // A run killed inside an evidence rewind: the tree is in the past, no destructor
+        // ran, only the crash marker survives.
+        let rewind = umadev_agent::checkpoint::begin_temp_rewind(root, &pre).expect("temp rewind");
+        std::mem::forget(rewind);
+        let marker = root.join(umadev_agent::checkpoint::TEMP_REWIND_MARKER_REL);
+        let mut m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        m["pid"] = serde_json::json!(4_294_967_294u32); // a pid that cannot be alive
+        std::fs::write(&marker, serde_json::to_string(&m).unwrap()).unwrap();
+        // …and, in the long window before the next start, the user REDID the work by hand on
+        // the tree they found reverted. This is the work the heal is about to move.
+        std::fs::write(root.join("src.rs"), "REDONE BY HAND").unwrap();
+
+        let note = umadev_agent::checkpoint::recover_abandoned_temp_rewind(root)
+            .expect("the heal ran and spoke");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).unwrap(),
+            "the user's NEWER real work",
+            "precondition: the heal reset the tree to the present, moving the hand-redone work"
+        );
+
+        // Read the recovery command straight out of the note — whatever the UI language.
+        let at = note
+            .find("umadev rollback ")
+            .expect("the note must name the recovery command");
+        let id: String = note[at + "umadev rollback ".len()..]
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        assert!(!id.is_empty(), "…with a concrete checkpoint id: {note}");
+
+        // 1. The verb the note names can SEE it.
+        assert!(
+            umadev_agent::checkpoint::list_checkpoints(root)
+                .iter()
+                .any(|c| c.id == id),
+            "`umadev history` must list the rescue snapshot the note just promised"
+        );
+        // 2. And running exactly that command brings the user's work back.
+        cmd_rollback(id.clone(), Some(root.to_path_buf())).expect("the named command must work");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).unwrap(),
+            "REDONE BY HAND",
+            "the command the note handed the user must actually restore their files"
+        );
+    }
+
+    #[test]
+    fn rollback_still_restores_a_workflow_snapshot_and_says_which_subsystem_it_touched() {
+        // The file-checkpoint arm must not weaken the workflow-state arm: a timestamp (and
+        // `latest`) still resolves in the workflow subsystem FIRST, and still reverts no file.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Writing the state snapshots the PREVIOUS one, so two writes leave one snapshot
+        // holding `frontend`.
+        umadev_agent::write_workflow_state(root, &WorkflowState::new(umadev_spec::Phase::Frontend))
+            .unwrap();
+        umadev_agent::write_workflow_state(root, &WorkflowState::new(umadev_spec::Phase::Delivery))
+            .unwrap();
+        // A file the rollback must NOT touch.
+        std::fs::write(root.join("app.ts"), "written after the snapshot").unwrap();
+        assert!(!list_snapshots(root).is_empty(), "precondition: a snapshot");
+
+        cmd_rollback("latest".to_string(), Some(root.to_path_buf())).expect("rollback");
+        assert_eq!(
+            read_workflow_state(root).map(|s| s.phase).as_deref(),
+            Some("frontend"),
+            "the workflow snapshot still restores the PHASE"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("app.ts")).unwrap(),
+            "written after the snapshot",
+            "…and still reverts no file — the two subsystems stay distinct"
+        );
+        // An id in NEITHER subsystem is an actionable error, not a reset to some stray ref.
+        assert!(cmd_rollback("deadbeef".to_string(), Some(root.to_path_buf())).is_err());
+    }
+
+    #[test]
+    fn the_pre_commit_gate_heals_the_tree_before_it_judges_it() {
+        // `umadev ci` is what `.git/hooks/pre-commit` runs, and it was the ONE workspace verb
+        // that skipped `resolve_root` (it took the bare cwd). So the gate could scan — and
+        // the user could commit — a tree still stranded in the past by a run killed inside a
+        // temporary evidence rewind: an earlier step's source, judged as if it were the
+        // change being made. Heal first, then gate.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map_or(true, |o| !o.status.success())
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("src.ts"), "export const a = 1;").unwrap();
+        let pre = umadev_agent::checkpoint::create_checkpoint(root, "pre-step").expect("pre");
+        std::fs::write(root.join("src.ts"), "export const a = 2; // the present").unwrap();
+
+        let rewind = umadev_agent::checkpoint::begin_temp_rewind(root, &pre).expect("temp rewind");
+        std::mem::forget(rewind); // SIGKILL: no destructor ran
+        let marker = root.join(umadev_agent::checkpoint::TEMP_REWIND_MARKER_REL);
+        let mut m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        m["pid"] = serde_json::json!(4_294_967_294u32); // a pid that cannot be alive
+        std::fs::write(&marker, serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.ts")).unwrap(),
+            "export const a = 1;",
+            "precondition: the tree the gate would scan is in the past"
+        );
+
+        // report_only so the gate cannot exit(1) out from under the test.
+        cmd_ci(true, false, Some(root.to_path_buf())).expect("ci runs");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.ts")).unwrap(),
+            "export const a = 2; // the present",
+            "the gate judged the PRESENT — it healed the workspace first, like every other verb"
+        );
+    }
 
     #[test]
     fn find_all_umadev_in_reports_every_launcher_in_path_order() {

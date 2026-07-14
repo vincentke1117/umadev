@@ -1132,6 +1132,7 @@ mod tests {
         let plan = Plan {
             steps: vec![
                 PlanStep {
+                    files: umadev_agent::StepFiles::default(),
                     id: "scaffold".into(),
                     title: "Scaffold the app".into(),
                     seat: Seat::FrontendEngineer,
@@ -1142,6 +1143,7 @@ mod tests {
                     status: StepStatus::Done,
                 },
                 PlanStep {
+                    files: umadev_agent::StepFiles::default(),
                     id: "auth".into(),
                     title: "Auth route".into(),
                     seat: Seat::BackendEngineer,

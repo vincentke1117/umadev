@@ -24,6 +24,12 @@ umadev-i18n = { workspace = true }
 
 clap = { workspace = true }
 include_dir = { workspace = true }
+# `umadev update` self-updates a non-package-managed install (cargo install /
+# downloaded release asset) straight from the GitHub Releases API. reqwest is
+# ALREADY linked into this binary through umadev-host (a non-optional dep there),
+# so naming it here adds zero new crates and no second TLS stack — and it beats
+# shelling out to curl / Invoke-WebRequest, neither of which is guaranteed present.
+reqwest = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

@@ -257,7 +257,20 @@ pub async fn run_block(
     // frontend gets nagged about server-only rules (CSP / structured logging /
     // crypto-RNG) in real time. Re-derived + re-persisted per tool call too (see
     // `govern_tool_call`) so a project that grows a backend mid-run re-arms strict.
-    persist_project_context(options);
+    //
+    // This legacy gated walk is a RUN DOOR like the director's two, so it asks the brain
+    // the colour question here, once, exactly as they do — otherwise the ONE stand-down of
+    // the banned-hue default-reject would never be recorded on this path and a user who
+    // asked for a violet brand could not write it. The per-tool-call refresh below carries
+    // the verdict forward; it never re-derives one (it has no brain, and must not spawn one).
+    let permission =
+        crate::color_permission::consult_color_permission(session, &options.requirement).await;
+    let _ = crate::planner::persist_project_context_with_color(
+        &options.requirement,
+        &options.project_root,
+        &options.effective_slug(),
+        permission.purple_allowed,
+    );
 
     // The phases this block drives, tailored to the plan. A GATED plan
     // (`Greenfield` / `FrontendOnly` / `BackendOnly` / `DocsOnly`) keeps the
@@ -641,18 +654,16 @@ fn project_context_for(options: &RunOptions) -> umadev_governance::ProjectContex
 }
 
 /// Write the derived context to `<root>/.umadev/governance-context.json` so the
-/// out-of-process PreToolUse hook reads the SAME context the in-process scans
-/// use. Best-effort / fail-open: a create/serialize/write error is swallowed
-/// (the hook then defaults to full strictness — conservative, never a false
-/// "clean"). Mirrors the agent runner's single-shot persistence.
+/// out-of-process PreToolUse hook and `umadev ci` read the SAME context the in-process
+/// scans use. One implementation for every run path
+/// ([`crate::planner::persist_project_context`]) — a gate that judges by a different rule
+/// book than the run is unconvergeable by construction. Best-effort / fail-open.
 fn persist_project_context(options: &RunOptions) {
-    let ctx = project_context_for(options);
-    let dir = options.project_root.join(".umadev");
-    if std::fs::create_dir_all(&dir).is_ok() {
-        if let Ok(json) = serde_json::to_string_pretty(&ctx) {
-            let _ = std::fs::write(dir.join("governance-context.json"), json);
-        }
-    }
+    let _ = crate::planner::persist_project_context(
+        &options.requirement,
+        &options.project_root,
+        &options.effective_slug(),
+    );
 }
 
 fn govern_tool_call(

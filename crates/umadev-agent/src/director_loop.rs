@@ -575,6 +575,56 @@ pub enum DirectorLoopOutcome {
     },
 }
 
+/// Persist this run's derived governance context to `.umadev/governance-context.json`,
+/// at the point the requirement is known and BEFORE any code is written.
+///
+/// **One rule book for the run, the write hook, and the commit gate.** The context records
+/// what the run has established and the user has already decided — is this a proven static
+/// frontend (so the server/security-surface rules have nothing to guard), and did the
+/// requirement ask for a purple/violet brand (the ONE stand-down of the banned-hue
+/// default-reject). Two of the three surfaces that need it are OTHER PROCESSES with no
+/// access to this run's memory: `umadev hook pre-write` (spawned per base tool call) and
+/// `umadev ci` (spawned from `.git/hooks/pre-commit`, and the one that actually fails the
+/// commit).
+///
+/// The legacy gated walk (`continuous::run_block`) and the single-shot `AgentRunner` both
+/// wrote it. The DEFAULT path — this one — did not. So a user who asked for a purple brand
+/// landing page watched the run honour it, and then could not commit it: `ci` read no
+/// context, judged with `ProjectContext::unknown()` (purple forbidden), blocked UD-CODE-002
+/// on the very color they had specified, and exited 1 with nothing they could edit to
+/// converge. The same hole stood the `static_frontend_only` leniency down for the whole
+/// director path.
+///
+/// Called from the two public doors into this engine ([`drive_director_loop_routed`] and
+/// [`drive_director_loop_resume`]) — every code-writing path passes through one of them.
+///
+/// ## The colour permission is asked ONCE, here, and only here
+///
+/// The ONE stand-down of the banned-hue default-reject is "the user authorized this hue",
+/// and that is an INTENT question — the same class as "is this turn chat, an edit, or a
+/// build", which UmaDev answers by asking the brain, never with a keyword table. So this is
+/// where the brain is asked ([`crate::color_permission::consult_color_permission`]): one
+/// short structured consult on a read-only fork, at the door, before the first file is
+/// written, and the verdict is PERSISTED. The three readers that come after — the PreToolUse
+/// hook, `umadev ci`, the design floor — are other processes with no brain, and they read the
+/// stored decision rather than re-deriving one. A model call per write is not an option.
+///
+/// STRICT on failure: no brain, no fork, a garbled reply → permission withheld, rule armed
+/// (see the `color_permission` module docs for why this is not a fail-open violation — it
+/// never blocks the host, it only declines to disarm a check).
+///
+/// Fail-open: a write failure is swallowed, and the readers then default to full strictness.
+async fn persist_run_governance_context(session: &mut dyn BaseSession, options: &RunOptions) {
+    let permission =
+        crate::color_permission::consult_color_permission(session, &options.requirement).await;
+    let _ = crate::planner::persist_project_context_with_color(
+        &options.requirement,
+        &options.project_root,
+        &options.effective_slug(),
+        permission.purple_allowed,
+    );
+}
+
 /// Drive an explicit `/run` (full product build) through the **director build loop**
 /// — the USB-model engine. ONE live [`BaseSession`] is the director's brain; the
 /// firmware (team identity + craft + knowledge) is already injected by the caller
@@ -627,6 +677,15 @@ pub async fn drive_director_loop_routed(
     first_directive: String,
     route: Option<&RoutePlan>,
 ) -> DirectorLoopOutcome {
+    // 0. ONE RULE BOOK. Persist the derived governance context BEFORE anything is written.
+    //    See `persist_run_governance_context` — the default `/run` path drives the base
+    //    from HERE, and it used to be the one path that never wrote the context: the run
+    //    honoured "a purple brand landing page" in-process, then the user's `git commit`
+    //    ran `umadev ci`, which read no context, judged with `ProjectContext::unknown()`,
+    //    and BLOCKED the exact color they had asked for — unconvergeable, because the gate
+    //    and the run were reading different rule books.
+    persist_run_governance_context(session, options).await;
+
     // 1. Surface the routing decision so the user sees the intent (fail-open: no
     //    route → no card, current behaviour).
     if let Some(r) = route {
@@ -928,6 +987,12 @@ pub async fn drive_director_loop_resume(
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
 ) -> Option<DirectorLoopOutcome> {
+    // ONE RULE BOOK, on the resume door too (see `persist_run_governance_context`): a
+    // `/continue` drives the remaining steps and writes real code, so it must leave the
+    // same context on disk that the PreToolUse hook and `umadev ci` will judge by. A
+    // resumed run is still a run.
+    persist_run_governance_context(session, options).await;
+
     // MED-3: a RESUME must honor the same Plan (read-only) gate as a fresh routed run.
     // Without this, `/continue` in Plan mode re-drove every remaining step while the
     // approval floor denied each write (Plan escalates all non-read actions) — the same
@@ -1112,6 +1177,16 @@ async fn drive_director_loop_with_idle(
     let mut reworked = false;
 
     for round in 0..MAX_QC_ROUNDS {
+        // The single-turn twin of the scheduler's halt (see `halt_if_workspace_in_past`).
+        // This path had NO check at all: a workspace known to be stranded at an earlier
+        // checkpoint would still be handed the build turn, and then a fix turn, and then
+        // another — every one of them writing new code on top of files that are not the
+        // user's. The flag is raised at process start by a heal that stood down, and every
+        // fix round is another turn's worth of writes, so it is read on each round, not
+        // once. A pure mutex lookup — it costs nothing on the (overwhelming) happy path.
+        if let Some(halt) = halt_if_workspace_in_past(options, events) {
+            return halt;
+        }
         // Wall-clock ceiling (graceful): a fix round past the budget is abandoned —
         // the build so far stands on its own deterministic floor (the source-present
         // hard-gate the caller runs). Round 0 (the build itself) always runs.
@@ -1350,6 +1425,35 @@ const MAX_STEP_TRANSITIONS: usize = 32;
 /// bound), or `None` when it could not drive even its FIRST step — the signal for
 /// the caller to fail open to the single end-to-end turn (so a wedged base never
 /// loses the whole build to a scheduling failure).
+/// STOP the schedule when this run's workspace is known to be stuck at an earlier
+/// checkpoint — a temporary evidence rewind that could not be undone (see
+/// [`crate::checkpoint::workspace_is_in_past`]).
+///
+/// `Some(Failed)` ends the run immediately: no further steps, no final gate, no finalize
+/// — every one of those WRITES, and writing onto a tree that is in the past compounds the
+/// damage (new code layered over reverted files, a proof-pack attesting to a state that
+/// never existed). The user gets the loud note on the surface they are watching, plus the
+/// workspace notice the next start drains.
+///
+/// **The note tells the truth about which branch they are in** — see
+/// [`crate::checkpoint::InPastReason`]. It used to say "restart UmaDev and it will put the
+/// tree back" in BOTH branches, and in one of them that is false: a marker whose head this
+/// workspace cannot name is refused by the heal on every start, forever, so the restart it
+/// advises can only reproduce the halt. That branch gets the note that names the real escape.
+///
+/// `None` (the overwhelming default) changes nothing.
+fn halt_if_workspace_in_past(
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+) -> Option<DirectorLoopOutcome> {
+    // ONE definition of the note, shared with the TUI chat write path — see
+    // `checkpoint::workspace_in_past_note`. A halt worded differently on two surfaces drifts.
+    let note = crate::checkpoint::workspace_in_past_note(&options.project_root)?;
+    events.emit(EngineEvent::Note(note.clone()));
+    crate::checkpoint::record_workspace_notice(note.clone());
+    Some(DirectorLoopOutcome::Failed(note))
+}
+
 async fn drive_plan_steps(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -1360,6 +1464,16 @@ async fn drive_plan_steps(
     deadline: std::time::Instant,
 ) -> Option<DirectorLoopOutcome> {
     let _ = idle; // each summon turn reads the idle window itself (drive_rework_turn)
+                  // BEFORE THE FIRST STEP, NOT ONLY AFTER IT. The halt was read only once a step had
+                  // already driven — so a process that STARTS with the flag up drove a FULL STEP's worth
+                  // of writes onto a tree that is in the past before it ever looked. And it can start
+                  // that way: the workspace heal raises the flag at process start whenever it stood down
+                  // (it could not snapshot the present, it could not reset, or the marker names a head it
+                  // cannot identify — see `checkpoint::recover_abandoned_temp_rewind`). The first swing is
+                  // as damaging as the fifth.
+    if let Some(halt) = halt_if_workspace_in_past(options, events) {
+        return Some(halt);
+    }
     events.emit(EngineEvent::Note(format!(
         "team · scheduling {} step(s) over the team ({} build · {} review)",
         plan.steps.len(),
@@ -1480,6 +1594,17 @@ async fn drive_plan_steps(
                 drive_review_step(session, options, events, route, &step, deadline).await
             }
         };
+        // A WORKSPACE IN THE PAST MUST NOT ACCUMULATE MORE WRITES. A step's evidence check
+        // can rewind the tree to an earlier checkpoint to replay a test (the red half of a
+        // red→green contract) and then put it back. When that restore FAILS, the user's
+        // tracked source is left reverted — and every step we drive from here writes new
+        // code on top of files that are not theirs, on a base reading a codebase that no
+        // longer exists. Stop, honestly, right here: the plan is persisted, the notice is
+        // raised, and the next start's heal puts the tree back before anything else runs.
+        if let Some(halt) = halt_if_workspace_in_past(options, events) {
+            return Some(halt);
+        }
+
         let StepOutcome {
             accepted,
             reply,
@@ -1857,12 +1982,13 @@ fn confirm_gate_after_step(
             Seat::ProductManager | Seat::Architect | Seat::UiuxDesigner
         )
     };
-    // A DOC-family member is a doc-seat BUILD step that is NOT the design-tokens
-    // deliverable (code-phase prep, runs after the docs are confirmed).
+    // A DOC-family member is a doc-seat BUILD step that is NOT designer code-phase
+    // PREP — neither the visual-direction step nor the design-tokens deliverable
+    // (both run AFTER the docs are confirmed, and neither may re-fire the gate).
     let doc_member = |s: &plan_state::PlanStep| {
         s.kind == plan_state::StepKind::Build
             && doc_seat(s.seat)
-            && !plan_state::is_design_tokens_step(s)
+            && !plan_state::is_design_prep_step(s)
     };
     if doc_member(step) && family_done(&doc_member) {
         return Some(crate::gates::Gate::DocsConfirm);
@@ -2288,6 +2414,27 @@ async fn drive_build_step(
     // over turns that never ran, converging into a fake clean delivery.
     let step_tree_baseline = source_tree_snapshot(&options.project_root);
 
+    // RED→GREEN PRE-STATE CHECKPOINT. A step that declares
+    // [`plan_state::EvidenceContract::TestFailsThenPasses`] is claiming its named test
+    // could NOT have passed before it ran — a claim that is only falsifiable if we can
+    // GO BACK and try. So snapshot the pre-state now, while it still exists.
+    //
+    // Taken ONLY for a step that declared the contract: no other step pays a shadow
+    // commit for a question it never asked. Fail-open — `None` (no `git`, no shadow
+    // repo) simply means the red half cannot be checked, and the contract degrades to
+    // the ordinary `TestPasses` bar (see `test_red_green_outcome`).
+    let red_green_pre = step
+        .evidence
+        .iter()
+        .any(|e| matches!(e, plan_state::EvidenceContract::TestFailsThenPasses { .. }))
+        .then(|| {
+            crate::checkpoint::create_checkpoint(
+                &options.project_root,
+                &format!("{}{}", crate::checkpoint::RED_GREEN_PRE_PREFIX, step.id),
+            )
+        })
+        .flatten();
+
     let mut drove = false;
     let mut last_reply = String::new();
     // SELF-EVOLUTION accounting across this step's fix rounds (a SIDE EFFECT of the
@@ -2368,7 +2515,15 @@ async fn drive_build_step(
         // summon's governed pump). Fail-open: capture never affects the schedule.
         capture_turn_pitfalls(options, events, &summoned.pitfalls);
         // Verify against THIS step's acceptance on the deterministic floor.
-        let mut verdict = verify_step_acceptance(session, options, events, route, step).await;
+        let mut verdict = verify_step_acceptance(
+            session,
+            options,
+            events,
+            route,
+            step,
+            red_green_pre.as_deref(),
+        )
+        .await;
         // TEST-INTEGRITY FLOOR (UD-QA-001). Compare the test surface to the
         // pre-step baseline. If the doer gamed the tests to fake a pass (deleted a
         // test, stripped assertions, added a skip/xfail/ignore marker, baked the
@@ -2897,6 +3052,12 @@ async fn verify_step_acceptance(
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
     step: &plan_state::PlanStep,
+    // The checkpoint id of this step's PRE-state, captured in `drive_build_step` ONLY
+    // when the step declared a red→green contract — the state its named test must have
+    // FAILED at. `None` (the step asked no such question, or `git` is unavailable) makes
+    // the red half unaskable, and the contract degrades to the ordinary `TestPasses`
+    // bar (fail-open — see `test_red_green_outcome`).
+    pre_checkpoint: Option<&str>,
 ) -> StepVerdict {
     use plan_state::AcceptanceSpec as A;
     // HIGH #1 — the source-present honesty floor binds ANY step that CLAIMED to build
@@ -2914,7 +3075,7 @@ async fn verify_step_acceptance(
     // persisted plan predates the field) falls through to the acceptance check below
     // (fail-open — a missing/uncheckable contract never blocks).
     if !step.evidence.is_empty() {
-        return verify_step_evidence(options, events, step, is_build).await;
+        return verify_step_evidence(options, events, step, is_build, pre_checkpoint).await;
     }
     // A DOC-producing Build step (PM/architect/designer authoring output/*.md) has no
     // CODE deliverable, so the source-present CODE floor (which excludes output/) would
@@ -2948,6 +3109,22 @@ async fn verify_step_acceptance(
         A::DesignTokensPresent => acceptance_from_verify(
             director::verify(options, events, VerifyKind::DesignTokensPresent).await,
         ),
+        // The STRONGER design contract (UD-CODE-007, spec §3.7): the token file is
+        // not merely present but CONFORMANT — schema floor, WCAG contrast measured
+        // on every declared (surface, on-surface) pair, the UI actually drawing from
+        // the token set, and no AI-purple brand hue. Layered over the existence
+        // check so an ABSENT tokens file still reads as "the designer produced
+        // nothing" (the honest reject), while a PRESENT one is held to the contract
+        // it implicitly claimed. Fail-open at both layers.
+        A::DesignTokensConform => {
+            let present = director::verify(options, events, VerifyKind::DesignTokensPresent).await;
+            if present.available && !present.passed {
+                return acceptance_from_verify(present);
+            }
+            acceptance_from_verify(
+                director::verify(options, events, VerifyKind::DesignSystemConform).await,
+            )
+        }
         A::BuildTest => {
             // Honesty floor first: no source ⇒ fail regardless of a skipped build.
             let src = director::verify(options, events, VerifyKind::SourcePresent).await;
@@ -3095,6 +3272,9 @@ async fn verify_step_evidence(
     events: &Arc<dyn EventSink>,
     step: &plan_state::PlanStep,
     is_build: bool,
+    // This step's PRE-state checkpoint (see [`verify_step_acceptance`]) — what the
+    // red→green contract rewinds to. `None` ⇒ the red half is unaskable (fail-open).
+    pre_checkpoint: Option<&str>,
 ) -> StepVerdict {
     use plan_state::EvidenceContract as E;
     let root = &options.project_root;
@@ -3152,7 +3332,27 @@ async fn verify_step_evidence(
         .iter()
         .any(|c| matches!(c, E::RouteResponds { .. }));
     let runtime = if needs_runtime {
-        Some(crate::runtime_proof::run_runtime_proof(root).await)
+        let proof = crate::runtime_proof::run_runtime_proof(root).await;
+        // FRESHNESS: a proof is a statement about the tree it ran against. If the
+        // source moved between the probe and this instant (a concurrent write, a base
+        // still finishing a file), the proof no longer describes the code we are about
+        // to accept — so it is NOT evidence, and every route contract falls to a
+        // neutral skip rather than passing on a stale green. Fail-open where we truly
+        // know nothing: an UNSTAMPED proof (we never recorded which tree it described)
+        // reads as fresh. A STAMPED proof whose tree can no longer be fingerprinted reads
+        // as STALE — we do not claim a freshness we cannot establish, and the cost is one
+        // re-verification, never a block (see `freshness::is_stale`).
+        if proof.is_stale(root) {
+            events.emit(EngineEvent::Note(
+                "team · runtime proof discarded — the source changed after the probe ran, so it \
+                 no longer describes this code (evidence produced before the last change to the \
+                 code it describes is not evidence)"
+                    .to_string(),
+            ));
+            None
+        } else {
+            Some(proof)
+        }
     } else {
         None
     };
@@ -3164,6 +3364,9 @@ async fn verify_step_evidence(
             E::FileExists { path } => file_exists_outcome(root, path),
             E::FileContains { path, needle } => file_contains_outcome(root, path, needle),
             E::TestPasses { name } => test_passes_outcome(root, name.as_deref(), build.as_ref()),
+            E::TestFailsThenPasses { test } => {
+                test_red_green_outcome(root, events, test, pre_checkpoint, build.as_ref()).await
+            }
             E::BuildClean => build_clean_outcome(build.as_ref()),
             E::ContractMatches => contract_outcome(contract.as_ref()),
             E::RouteResponds {
@@ -3285,6 +3488,231 @@ fn test_passes_outcome(
                 EvidenceOutcome::Skip
             }
         }
+    }
+}
+
+/// `TestFailsThenPasses` contract → **RED→GREEN**: the named test must FAIL at the
+/// step's pre-state and PASS at head. The falsifiable form of "test-first".
+///
+/// ## Why this check exists
+/// `TestPasses` is satisfied by a test written AFTER the code it "checks". Such a test
+/// asserts whatever the implementation already happens to do; it passes on its first
+/// run and has never once demonstrated that it can detect the behaviour's ABSENCE. It
+/// is a rubber stamp with a green tick. The ONE mechanical property that separates a
+/// real test from a rubber stamp is that a real test **failed once** — before the
+/// change that made it pass. That property is checkable, and this is the check.
+///
+/// ## How
+/// 1. **Head, green half.** The test must be PRESENT in the source (a test that does
+///    not exist cannot pass — and this also closes the "a filter that matches nothing
+///    exits 0" hole that would otherwise let a runner report success for a test that
+///    isn't there) and must PASS when run by name. A failing/absent test at head is a
+///    gap, exactly as `TestPasses` would report.
+/// 2. **Pre-state, red half.** Rewind the workspace to the step's pre-state in a
+///    SCOPED, REVERSIBLE way ([`crate::checkpoint::begin_temp_rewind`] — the present is
+///    snapshotted and anchored first, and restored on the way out even through a panic;
+///    dependency trees / build caches are outside the shadow repo, so the source goes
+///    back in time and the toolchain does not, which is what makes the rewound tree
+///    runnable). Run the SAME single test there. It must FAIL — or not exist at all,
+///    which is the same fact stated more strongly.
+/// 3. Restore head. (Unconditional: `TempRewind` restores on drop.)
+///
+/// A test that was **already green at the pre-state** rejects the step, and says so
+/// plainly. That is not a bug in the check; it is the entire point of it.
+///
+/// ## Fail-open (never block on our own inability to verify)
+/// Every inconclusive edge — no pre-state checkpoint (no `git`/shadow repo), the rewind
+/// could not be taken, no test runner on PATH, an unrecognised project, a timeout —
+/// degrades to exactly the existing [`test_passes_outcome`] semantics. We hold the step
+/// to the bar we CAN check, never to a verdict we could not reach. Only a positively
+/// observed "it was already passing" is a finding.
+///
+/// Bounded: at most two runs of ONE named test (never the whole suite), each capped by
+/// [`crate::verify::run_named_test`]'s own timeout.
+async fn test_red_green_outcome(
+    root: &std::path::Path,
+    events: &Arc<dyn EventSink>,
+    test: &str,
+    pre_checkpoint: Option<&str>,
+    build: Option<&VerifyResult>,
+) -> EvidenceOutcome {
+    use crate::verify::NamedTestOutcome as T;
+
+    // ── Head: the green half ────────────────────────────────────────────────────
+    // Presence first — it is toolchain-independent and it is what makes a
+    // matches-nothing filter (which some runners exit 0 on) unable to fake a pass.
+    let needle = test.trim();
+    if needle.len() >= 3 && !source_mentions(root, needle) {
+        return EvidenceOutcome::Gap(format!(
+            "declared red→green on test \"{test}\" but no test by that name is present in the \
+             codebase — write the test, watch it fail, then make it pass"
+        ));
+    }
+    match crate::verify::run_named_test(root, needle).await {
+        T::Failed => {
+            return EvidenceOutcome::Gap(format!(
+                "declared red→green on test \"{test}\" but it does NOT pass at head — the step \
+                 is not done until its own test is green"
+            ));
+        }
+        // We could not run it at all (no runner / unrecognised project / timeout). Fall
+        // open to the ordinary named-test bar — never block on our own blindness.
+        T::Unavailable => return test_passes_outcome(root, Some(needle), build),
+        T::Passed => {}
+    }
+
+    // ── Pre-state: the red half ─────────────────────────────────────────────────
+    // Without a pre-state we cannot ask whether the test could ever have failed. The
+    // green half already held, which is exactly the `TestPasses` bar — accept there.
+    let Some(pre) = pre_checkpoint else {
+        return test_passes_outcome(root, Some(needle), build);
+    };
+
+    // THE PAST DOES NOT MOVE. The red half asks one question about one immutable
+    // commit — "did this test fail AT `pre`?" — and the answer cannot change while the
+    // step's bounded fix rounds re-drive the PRESENT. Asking it again each round would
+    // pay a full rewind (two `reset --hard`s over the user's tracked tree) and a test
+    // run for an answer we already hold, and each rewind is a window in which a kill
+    // leaves the tree in the past. So: ask once, remember the answer for (root, pre,
+    // test), and let every later round read it.
+    let red = if let Some(cached) = red_half_cached(root, pre, needle) {
+        cached
+    } else {
+        let Some(rewind) = crate::checkpoint::begin_temp_rewind(root, pre) else {
+            return test_passes_outcome(root, Some(needle), build);
+        };
+        events.emit(EngineEvent::Note(format!(
+            "team · red→green — replaying test \"{needle}\" against this step's pre-state (a test \
+             that never failed has never proven it can detect the bug)"
+        )));
+        // Inside the rewound window the user's tracked source is IN THE PAST. Keep this
+        // SHORT (a dedicated, much smaller budget than the ordinary named-test one),
+        // take no early return that skips the restore (`TempRewind` restores on drop
+        // regardless — this is belt and braces), and let the crash marker cover the one
+        // thing neither can: a kill.
+        let observed = if source_mentions(root, needle) {
+            crate::verify::run_named_test_bounded(
+                root,
+                needle,
+                crate::verify::RED_TEST_TIMEOUT_SECS,
+            )
+            .await
+        } else {
+            // The test did not exist before this step — it could not possibly have
+            // passed. The strongest possible red, and free.
+            T::Failed
+        };
+        if !rewind.restore() {
+            // THE TREE IS IN THE PAST AND WE COULD NOT PUT IT BACK. This used to be a
+            // bare `tracing::warn!` — a line in a log FILE under the TUI — while the
+            // schedule went right on driving further steps, writing new code on top of a
+            // source tree reverted to an earlier state. `checkpoint::restore` has already
+            // raised the workspace notice + the in-the-past signal for this root; SAY it
+            // here too, on the surface the user is actually looking at. The scheduler
+            // reads the same signal and stops (see `halt_if_workspace_in_past`).
+            events.emit(EngineEvent::Note(
+                umadev_i18n::tl("checkpoint.workspace_in_past_halt").to_string(),
+            ));
+        }
+        red_half_remember(root, pre, needle, observed);
+        observed
+    };
+
+    match red_half_verdict(test, red) {
+        Some(outcome) => outcome,
+        // Could not run it in the rewound tree (a toolchain that needs the new
+        // dependencies, a timeout). Inconclusive → fall open to the green-half bar.
+        None => test_passes_outcome(root, Some(needle), build),
+    }
+}
+
+/// The memo of red-half observations, keyed by `(workspace, pre-state commit, test)`.
+///
+/// Sound because the key pins an IMMUTABLE fact: `pre` is a commit id (a specific past),
+/// and the question is about that past alone. A different step takes a different
+/// pre-state checkpoint, so it gets a different key and its own observation. Bounded —
+/// past [`MAX_RED_HALF_MEMO`] entries the memo is dropped wholesale (a memo is an
+/// optimisation; losing it costs a rewind, never a wrong answer).
+static RED_HALF_MEMO: std::sync::Mutex<
+    Option<std::collections::HashMap<String, crate::verify::NamedTestOutcome>>,
+> = std::sync::Mutex::new(None);
+
+/// Cap on the red-half memo before it is cleared wholesale.
+const MAX_RED_HALF_MEMO: usize = 256;
+
+/// The memo key — the workspace, the immutable pre-state, and the test.
+fn red_half_key(root: &std::path::Path, pre: &str, test: &str) -> String {
+    format!("{}\u{1f}{pre}\u{1f}{test}", root.display())
+}
+
+/// A previously observed red half for this exact `(root, pre, test)`, if any.
+/// Fail-open: a poisoned lock simply misses (we re-run the rewind).
+fn red_half_cached(
+    root: &std::path::Path,
+    pre: &str,
+    test: &str,
+) -> Option<crate::verify::NamedTestOutcome> {
+    let guard = RED_HALF_MEMO.lock().ok()?;
+    guard.as_ref()?.get(&red_half_key(root, pre, test)).copied()
+}
+
+/// Remember a red-half observation — but ONLY a conclusive one.
+///
+/// `Passed` / `Failed` are immutable FACTS ABOUT THE PAST: at commit `pre`, that test
+/// did (or did not) fail. That past does not change, so memoizing it is sound and a
+/// later fix round of the same step can reuse it.
+///
+/// `Unavailable` is not a fact about the past at all — it is a fact about OUR TOOLING at
+/// one moment (a timeout, a toolchain that needed dependencies the pre-state did not
+/// have, a transient runner failure). Memoizing it would freeze one transient miss into
+/// the answer for `(root, pre, test)` for the whole process: every later fix round of
+/// that step would skip the rewind, read the cached `Unavailable`, and fall open to the
+/// plain `TestPasses` bar — permanently downgrading the red→green contract on the basis
+/// of a single flake. So a non-verdict is never cached; we simply pay for the rewind
+/// again and get a real answer.
+///
+/// Fail-open: a poisoned lock simply does not memoize.
+fn red_half_remember(
+    root: &std::path::Path,
+    pre: &str,
+    test: &str,
+    outcome: crate::verify::NamedTestOutcome,
+) {
+    if matches!(outcome, crate::verify::NamedTestOutcome::Unavailable) {
+        return;
+    }
+    let Ok(mut guard) = RED_HALF_MEMO.lock() else {
+        return;
+    };
+    let memo = guard.get_or_insert_with(std::collections::HashMap::new);
+    if memo.len() >= MAX_RED_HALF_MEMO {
+        memo.clear();
+    }
+    memo.insert(red_half_key(root, pre, test), outcome);
+}
+
+/// The RED half's verdict, given how the named test behaved at the step's PRE-state.
+/// Pure — the decision, separated from the IO that produces it (see
+/// [`test_red_green_outcome`], which has already established that the test is present
+/// and GREEN at head before asking this).
+///
+/// `None` ⇒ **inconclusive**: the caller must fall open to the ordinary `TestPasses`
+/// bar rather than reach a verdict it could not support.
+fn red_half_verdict(test: &str, red: crate::verify::NamedTestOutcome) -> Option<EvidenceOutcome> {
+    use crate::verify::NamedTestOutcome as T;
+    match red {
+        // The step's test was RED before it ran and is GREEN now. That is a test.
+        T::Failed => Some(EvidenceOutcome::Pass),
+        // THE FINDING. The test passed BEFORE the step's work existed, so it cannot be
+        // asserting that work — it was written to match code that was already there.
+        T::Passed => Some(EvidenceOutcome::Gap(format!(
+            "test \"{test}\" ALREADY PASSED at this step's pre-state — it was written after (or \
+             around) the code, so it has never demonstrated that it can detect the behaviour's \
+             absence. Make it a real test: assert the behaviour this step is supposed to add, \
+             confirm it FAILS without that code, then make it pass"
+        ))),
+        // We could not run it in the rewound tree — inconclusive, never a verdict.
+        T::Unavailable => None,
     }
 }
 
@@ -3661,6 +4089,12 @@ fn acceptance_label(spec: &plan_state::AcceptanceSpec) -> &'static str {
         A::BuildTest => "the project's build/test passes",
         A::Contract => "the frontend↔backend API contract holds",
         A::DesignTokensPresent => "the design-tokens.{json,css} design system exists on disk",
+        A::DesignTokensConform => {
+            "the design system CONFORMS: >=6 color roles each with a paired `on-` foreground, a \
+             >=4-step type scale, a 4pt spacing scale, a radius scale, motion tokens; every \
+             (surface, on-surface) pair measured against WCAG; the UI drawing from the tokens; \
+             no AI-purple brand hue"
+        }
         A::ReviewClean => "the review team raises no blocking issue",
         A::TurnSettled => "the work turn completes",
     }
@@ -5268,9 +5702,23 @@ async fn run_auto_qc(
     //     artifact / unreadable doc yields no gap, never a false alarm), so a check
     //     that genuinely can't run is a NEUTRAL skip, not a fabricated failure.
     if route.map(|r| r.depth.is_deliberate()).unwrap_or(false) {
-        for line in acceptance_floor_blocking(options, route) {
+        // ONE scope-creep computation for BOTH halves of its answer. It stages the whole
+        // work-tree, reads the run diff, and extracts every backend route in the repo —
+        // and the floor (new unclaimed surfaces) and the notes (unclaimed edits) are two
+        // views of that ONE set, not two questions. Computing it twice paid for all of
+        // it twice, and left the two views able to disagree if a file landed between the
+        // calls. Fail-open exactly as before: no plan → no set → both halves silent.
+        let scope: Vec<crate::scope_creep::ScopeFinding> =
+            crate::plan_state::load(&options.project_root)
+                .map(|plan| crate::scope_creep::unclaimed_changes(&options.project_root, &plan))
+                .unwrap_or_default();
+        for line in acceptance_floor_blocking_with(options, route, Some(&scope)) {
             blocking.push(line);
         }
+        // The ADVISORY half of the SAME set (an unclaimed edit inside code that already
+        // existed): worth seeing, not worth blocking. Bounded + fail-open — silent
+        // whenever the check itself is silent.
+        emit_scope_advisories(events, &scope);
     }
 
     // 3. Optional fork review (UmaDev's read-only QC over read-only forks). The team
@@ -5310,6 +5758,26 @@ async fn run_auto_qc(
 /// cannot run never fabricates a failure. Returns the blocking lines (empty =
 /// the floor is clean OR nothing could be checked).
 fn acceptance_floor_blocking(options: &RunOptions, route: Option<&RoutePlan>) -> Vec<String> {
+    acceptance_floor_blocking_with(options, route, None)
+}
+
+/// [`acceptance_floor_blocking`], reusing a scope-creep result the caller ALREADY
+/// computed.
+///
+/// `unclaimed_changes` is not cheap: it stages the whole work-tree into the shadow index
+/// (`git add -A --force`), reads a full run diff, and runs a repo-wide backend-route
+/// extraction. A QC pass needs BOTH halves of its answer — the blocking new-surface
+/// findings for the floor, and the advisory edits for the notes — and computing it twice
+/// pays all of that twice for one set of facts (and can even disagree with itself if a
+/// file lands between the two calls). Compute once, partition by severity.
+///
+/// `scope: None` keeps the standalone behaviour (compute it here) for callers that have
+/// no precomputed set.
+fn acceptance_floor_blocking_with(
+    options: &RunOptions,
+    route: Option<&RoutePlan>,
+    scope: Option<&[crate::scope_creep::ScopeFinding]>,
+) -> Vec<String> {
     let slug = options.effective_slug();
     let root = &options.project_root;
     let mut out: Vec<String> = Vec::new();
@@ -5364,6 +5832,34 @@ fn acceptance_floor_blocking(options: &RunOptions, route: Option<&RoutePlan>) ->
         }
     }
 
+    // SCOPE CREEP — the DUAL of the coverage check above. Coverage asks "which declared
+    // requirement has no step?" (UNDER-building). This asks the opposite: "which CHANGE
+    // belongs to no step?" (OVER-building) — an unplanned dependency, an unplanned
+    // source file, an unplanned public route: work nobody sized, nobody asked for, and
+    // nobody reviewed. Only the NEW-SURFACE findings block; an unclaimed edit inside
+    // existing code is advisory (surfaced as a note by the caller). Fail-open and
+    // SILENT when no step declared a file surface, when there is no run baseline to diff
+    // against, or when the diff can't be read — an absent declaration is not a claim
+    // that nothing will change, so it can never manufacture a finding.
+    // See [`crate::scope_creep`]. Reuse the caller's set when it already paid for one.
+    match scope {
+        Some(findings) => out.extend(
+            findings
+                .iter()
+                .filter(|f| f.blocking)
+                .map(|f| f.message.clone()),
+        ),
+        None => {
+            if let Some(plan) = crate::plan_state::load(root) {
+                for f in crate::scope_creep::unclaimed_changes(root, &plan) {
+                    if f.blocking {
+                        out.push(f.message);
+                    }
+                }
+            }
+        }
+    }
+
     // BUGFIX: require a reproduction test (red→green). A fix that lands no test
     // asserting the bug can silently regress. Fail-open: only fires when the route
     // is classified Bugfix AND we can read the source tree.
@@ -5380,6 +5876,47 @@ fn acceptance_floor_blocking(options: &RunOptions, route: Option<&RoutePlan>) ->
         );
     }
 
+    // DESIGN-SYSTEM CONFORMANCE (UD-CODE-007, spec §3.7): the deterministic half
+    // of the design moat. The firmware PREACHES token discipline, paired
+    // foregrounds, measured contrast, and one committed hue — but a prompt is not
+    // a floor. This is the floor:
+    //
+    //   - `007a` schema     — a real system (>= 6 color roles each with a paired
+    //                         `on-` foreground, a >= 4-step type scale at ratio
+    //                         >= 1.125, a 4pt spacing scale, a radius scale,
+    //                         >= 2 durations + >= 1 easing), not `:root{--bg:#000}`.
+    //   - `007b` contrast   — every DECLARED (surface, on-surface) pair MEASURED
+    //                         with the WCAG formula in pure Rust (no browser, no
+    //                         deps): 4.5:1 body, 3:1 large/UI.
+    //   - `007c` drift      — the UI actually DRAWS from the token set (a literal
+    //                         color / font / radius / size off the scale is drift).
+    //   - `007d` hue        — no AI indigo/violet primary/accent unless the
+    //                         requirement asked for purple.
+    //   - `007e` lints      — the register-scoped design-lint registry; only its
+    //                         small P0 tier blocks, the advisory tier is a Note.
+    //   - `007f` direction  — the designer decided a DIRECTION before any token.
+    //
+    // Fail-open at EVERY edge: no `design-tokens.{json,css}` → the report is
+    // `unavailable` and contributes nothing (a project that never asked for a
+    // design system is completely unaffected); no UIUX doc → no direction finding.
+    // Only a project that SHIPPED a design system is held to the contract it
+    // implicitly claimed.
+    let register = crate::design_system::register_for_project(root, &slug);
+    let report = crate::design_system::verify_design_system(root, &options.requirement, register);
+    for f in report.blocking() {
+        out.push(f.message.clone());
+    }
+    // `007f` is gated on the ROUTE, not on a file: an `output/*-uiux.md` left behind by
+    // an earlier UI run (or already present in a brownfield repo) is not a reason to
+    // hold a backend-only task to a design contract it never entered. No route → no UI
+    // claim → nothing (fail-open).
+    let needs_ui = route.is_some_and(RoutePlan::needs_ui);
+    for f in crate::design_system::visual_direction_findings(root, &slug, needs_ui) {
+        if f.blocking {
+            out.push(f.message);
+        }
+    }
+
     out
 }
 
@@ -5389,10 +5926,21 @@ fn acceptance_floor_blocking(options: &RunOptions, route: Option<&RoutePlan>) ->
 /// A written-but-not-verified proof whose reason is a SKIP (no dev server / no
 /// curl) is also neutral; only a proof that ran and failed blocks. Fail-open: an
 /// unreadable / unparseable file → `None`.
+///
+/// FRESHNESS: a proof whose source fingerprint no longer matches the tree is STALE
+/// and is not read at all — in EITHER direction. A stale FAILURE must not block code
+/// that has since been fixed, and (more importantly) a stale PASS must not be mistaken
+/// for evidence about the code we are shipping. A proof produced before the last change
+/// to the code it describes is not a proof; the check has to be re-run for real, which
+/// is exactly what the floor does on its own path. Fail-open: an unstamped proof (an
+/// older artifact) has no fingerprint to contradict, so it is read as before.
 fn runtime_proof_blocking(root: &std::path::Path) -> Option<String> {
     let path = root.join(crate::runtime_proof::runtime_proof_rel_path());
     let body = std::fs::read_to_string(path).ok()?;
     let proof: crate::runtime_proof::RuntimeProof = serde_json::from_str(&body).ok()?;
+    if proof.is_stale(root) {
+        return None; // describes a tree that no longer exists → says nothing about this one
+    }
     if proof.status.is_verified() {
         return None; // booted + answered → no problem
     }
@@ -5452,6 +6000,33 @@ fn has_reproduction_test(root: &std::path::Path) -> bool {
     }
     false
 }
+
+/// Surface the ADVISORY half of the scope check as notes — an unclaimed edit inside a
+/// file that already existed. Ordinary drift most of the time; occasionally the first
+/// visible sign that the run is building something nobody planned. Advisory by design:
+/// it informs, it never blocks (only a NEW unclaimed surface — file / dependency /
+/// route — does that, via [`acceptance_floor_blocking`]).
+///
+/// Bounded (at most [`MAX_SCOPE_ADVISORIES`] notes) and fail-open: silent when no step
+/// declared a file surface, when there is no run baseline, or when the diff can't be
+/// read — i.e. whenever `scope` is empty, which is exactly what the check itself returns
+/// in every one of those cases.
+///
+/// Takes the ALREADY-COMPUTED set: the blocking half and this advisory half are two
+/// views of ONE `unclaimed_changes` result (which stages the tree and scans every route
+/// in the repo), so the QC pass computes it once and partitions it.
+fn emit_scope_advisories(events: &Arc<dyn EventSink>, scope: &[crate::scope_creep::ScopeFinding]) {
+    for f in scope
+        .iter()
+        .filter(|f| !f.blocking)
+        .take(MAX_SCOPE_ADVISORIES)
+    {
+        events.emit(EngineEvent::Note(format!("team · {}", f.message)));
+    }
+}
+
+/// How many scope advisories one QC pass surfaces before it stops talking.
+const MAX_SCOPE_ADVISORIES: usize = 5;
 
 /// Map a [`VerifyResult`] from a build/test check to a blocking line, or `None` when
 /// it passed / was skipped (an unavailable check is neutral — fail-open).
@@ -5739,9 +6314,27 @@ mod tests {
             "# Architecture\n\n## API\nGET /api/x\n",
         )
         .unwrap();
+        // The UIUX doc carries the `## Visual direction` the designer's DIRECTION step
+        // (UD-CODE-007f) is bound to — a design read naming the REGISTER, the three
+        // forced decisions (color commitment level; the theme forced by a physical
+        // scene; named anchors each bound to a dimension), and anti-goals.
         std::fs::write(
             out.join("demo-uiux.md"),
-            "# UI/UX\n\ndesign tokens + component states\n",
+            "# UI/UX\n\n\
+             ## Visual direction\n\n\
+             Design read: an internal task console for support agents — register: product — \
+             calm, dense, unremarkable — family: tech-utility.\n\n\
+             - Color commitment: restrained. Color is a status signal, never decoration.\n\
+             - Theme: agents sit in a windowless floor lit by overhead fluorescents for an \
+             8-hour shift and glance between two monitors; the constant flat light and long \
+             dwell force a light theme with strong contrast.\n\
+             - Anchors:\n\
+               - density: from a flight-status board — many true rows, one line each.\n\
+               - type: from a transit signage system — one neutral face, tabular figures.\n\
+               - whitespace: from a spreadsheet — tight rows, generous column gutters.\n\n\
+             Anti-goals: not a consumer dashboard, not a marketing surface, no illustration, \
+             no page-load animation.\n\n\
+             ## Tokens\n\ndesign tokens + component states\n",
         )
         .unwrap();
         std::fs::write(
@@ -5757,10 +6350,28 @@ mod tests {
             "test('FR-001 login', () => { expect(1).toBe(1); });\n",
         )
         .unwrap();
-        // Designer design-tokens evidence: a REAL tokens file on the blackboard.
+        // Designer design-tokens evidence: a REAL, CONFORMANT tokens file on the
+        // blackboard (UD-CODE-007). The old fixture (`{"color":{"primary":"#0f62fe"}}`)
+        // was exactly the theatre the conformance floor now rejects: a file, not a
+        // system. This one declares >= 6 color roles each with a paired `on-`
+        // foreground (all clearing WCAG), a >= 4-step type scale at ratio >= 1.125, a
+        // 4pt spacing scale, a radius scale, and motion tokens.
         std::fs::write(
-            out.join("design-tokens.json"),
-            "{ \"color\": { \"primary\": \"#0f62fe\" }, \"space\": { \"s1\": \"4px\" } }\n",
+            out.join("design-tokens.css"),
+            ":root {\n\
+             --color-bg: #fafafa; --color-on-bg: #18181b;\n\
+             --color-surface: #ffffff; --color-on-surface: #18181b;\n\
+             --color-card: #ffffff; --color-on-card: #3f3f46;\n\
+             --color-muted: #f4f4f5; --color-on-muted: #52525b;\n\
+             --color-primary: #1d4ed8; --color-on-primary: #ffffff;\n\
+             --color-accent: #0f766e; --color-on-accent: #ffffff;\n\
+             --color-border: #e4e4e7;\n\
+             --text-xs: 0.75rem; --text-sm: 0.875rem; --text-base: 1rem; --text-lg: 1.125rem;\n\
+             --space-1: 4px; --space-2: 8px; --space-4: 16px; --space-6: 24px;\n\
+             --radius-sm: 6px; --radius-md: 8px;\n\
+             --duration-fast: 120ms; --duration-normal: 180ms;\n\
+             --ease-standard: cubic-bezier(0.2, 0, 0.2, 1);\n\
+             }\n",
         )
         .unwrap();
     }
@@ -7460,6 +8071,7 @@ mod tests {
         use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
         let (events, rec) = sink();
         let mk = |id: &str, seat, status| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.to_string(),
             title: format!("do {id}"),
             seat,
@@ -7697,6 +8309,42 @@ mod tests {
         let mut r = build_route();
         r.kind = crate::planner::TaskKind::Bugfix;
         r
+    }
+
+    #[test]
+    fn a_backend_only_run_is_not_blocked_by_a_leftover_uiux_doc() {
+        // HIGH: the visual-direction floor used to gate on a FILE (`output/<slug>-uiux.md`
+        // exists). A brownfield repo — or simply a SECOND run in a workspace where an
+        // earlier UI build left the doc behind — hands a pure BACKEND task a blocking
+        // design finding it can neither act on nor escape. The gate belongs on the
+        // ROUTE's own judgement about whether this turn builds UI.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("output");
+        std::fs::create_dir_all(&out).unwrap();
+        // The leftover: a UIUX doc with NO `## Visual direction` section at all — the one
+        // condition that still blocks a UI run.
+        std::fs::write(out.join("demo-uiux.md"), "# UIUX\n\n## Tokens\n\n:root{}\n").unwrap();
+        let o = opts(tmp.path());
+
+        let mut backend = build_route();
+        backend.kind = crate::planner::TaskKind::BackendOnly;
+        assert!(!backend.needs_ui());
+        let blocking = acceptance_floor_blocking(&o, Some(&backend));
+        assert!(
+            !blocking.iter().any(|b| b.contains("Visual direction")),
+            "a backend-only run inherits no design gate from a file it did not write: \
+             {blocking:?}"
+        );
+
+        // The SAME tree, on a UI-bearing run → the floor still binds.
+        let ui = build_route(); // Greenfield
+        assert!(ui.needs_ui());
+        assert!(
+            acceptance_floor_blocking(&o, Some(&ui))
+                .iter()
+                .any(|b| b.contains("Visual direction")),
+            "a UI run that skipped the direction step is still held to it"
+        );
     }
 
     #[test]
@@ -7966,6 +8614,7 @@ mod tests {
         seed_source(tmp.path());
         let (events, rec) = sink();
         let mk = |id: &str| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.to_string(),
             title: format!("step {id}"),
             seat: crate::critics::Seat::FrontendEngineer,
@@ -8105,11 +8754,12 @@ mod tests {
             drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
         assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
 
-        // The plan was posted with all 7 steps (3 doc-first + the QA test-authoring +
-        // designer design-tokens skeleton steps + the 2 brain build steps).
+        // The plan was posted with all 8 steps (3 doc-first + the QA test-authoring +
+        // the designer VISUAL-DIRECTION step (UD-CODE-007f — direction before tokens) +
+        // the design-tokens skeleton step + the 2 brain build steps).
         assert!(
-            rec.count(|e| matches!(e, EngineEvent::PlanPosted { total, .. } if *total == 7)) == 1,
-            "a 7-step plan (3 doc + test-plan + tokens + 2 brain) was posted: {:?}",
+            rec.count(|e| matches!(e, EngineEvent::PlanPosted { total, .. } if *total == 8)) == 1,
+            "an 8-step plan (3 doc + test-plan + direction + tokens + 2 brain) was posted: {:?}",
             rec.events()
         );
         // At least one step was surfaced as active (the ready PRD doc step).
@@ -8121,7 +8771,7 @@ mod tests {
         );
         // It was persisted to disk and is loadable, and OPENS with the PRD doc step.
         let loaded = crate::plan_state::load(tmp.path()).expect("plan persisted");
-        assert_eq!(loaded.steps.len(), 7);
+        assert_eq!(loaded.steps.len(), 8);
         assert_eq!(
             loaded.steps[0].id, "umadev-phase-prd",
             "the doc-first skeleton opens the plan with the PRD step"
@@ -8268,6 +8918,7 @@ mod tests {
             text_turn("Wrote the architecture. Done."),
             text_turn("Wrote the UI/UX doc. Done."),
             text_turn("Authored the acceptance tests. Done."),
+            text_turn("Decided the visual direction. Done."),
             text_turn("Wrote the design tokens. Done."),
             text_turn("Scaffolded the app skeleton. Done."),
             text_turn("Built the UI. Done."),
@@ -8361,6 +9012,7 @@ mod tests {
             text_turn("Wrote the architecture. Done."),
             text_turn("Wrote the UI/UX doc. Done."),
             text_turn("Authored the acceptance tests. Done."),
+            text_turn("Decided the visual direction. Done."),
             text_turn("Wrote the design tokens. Done."),
             text_turn("Built the frontend. Done."),
             text_turn("Built the backend. Done."),
@@ -8437,6 +9089,7 @@ mod tests {
         use crate::critics::Seat;
         use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
         let mk = |seat: Seat, kind: StepKind| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: "s".into(),
             title: "s".into(),
             seat,
@@ -8516,6 +9169,7 @@ mod tests {
             text_turn("Wrote the architecture. Done."),
             text_turn("Wrote the UI/UX doc. Done."),
             text_turn("Authored the acceptance tests. Done."),
+            text_turn("Decided the visual direction. Done."),
             text_turn("Wrote the design tokens. Done."),
             text_turn("Built the backend. Done."),
             text_turn("Polished the frontend. Done."),
@@ -8548,6 +9202,7 @@ mod tests {
     fn finalize_phase_is_honest_clean_vs_unclean() {
         use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
         let mk = |id: &str, seat: crate::critics::Seat, status: StepStatus| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: format!("step {id}"),
             seat,
@@ -8774,6 +9429,7 @@ mod tests {
     fn upstream_peer_plan() -> crate::plan_state::Plan {
         use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
         let mk = |id: &str, deps: &[&str]| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: format!("Build the {id}"),
             seat: crate::critics::Seat::FrontendEngineer,
@@ -8793,6 +9449,217 @@ mod tests {
             risks: vec![],
             open_questions: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn the_director_path_writes_the_governance_context_before_it_writes_code() {
+        // HIGH 1. `.umadev/governance-context.json` was written ONLY by the legacy gated walk
+        // and the single-shot runner. The DEFAULT path — this one — never wrote it. So a user
+        // asked for a purple brand landing page, the run honoured it in-process, and then
+        // their `git commit` fired `.git/hooks/pre-commit` → `umadev ci` → no context →
+        // `ProjectContext::unknown()` → BLOCK UD-CODE-002 on the exact color they had asked
+        // for, exit 1, with nothing they could edit to converge. The run and the gate have to
+        // read one rule book, and the run is the one that has to write it.
+        //
+        // And the COLOUR PERMISSION in that rule book is the BRAIN's verdict, asked once at
+        // this door (`color_permission::consult_color_permission`) — never a reading of the
+        // requirement's words, which is a question a word list cannot answer.
+        let requirement = "做一个品牌落地页,主色用紫色渐变";
+
+        // (a) A brain that GRANTS. The door asks it, and persists what it says.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx_file = tmp.path().join(".umadev").join("governance-context.json");
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(
+            vec![],
+            true,
+            "{\"purple_allowed\":true,\"reason\":\"the user chose violet as the brand\"}",
+        );
+        let mut o = opts(tmp.path());
+        o.requirement = requirement.to_string();
+        let route = build_route();
+
+        assert!(!ctx_file.exists(), "precondition: no context yet");
+        let _ = drive_director_loop_routed(&mut sess, &o, &events, "GO".to_string(), Some(&route))
+            .await;
+
+        let ctx: umadev_governance::ProjectContext =
+            serde_json::from_str(&std::fs::read_to_string(&ctx_file).expect("context persisted"))
+                .expect("valid context json");
+        assert!(
+            ctx.purple_allowed,
+            "the brain judged the requirement to authorize the hue — every surface must be \
+             able to read that"
+        );
+        // And it is STAMPED, or the readers (which cannot see this run) would refuse to
+        // honour it: a permission with no provenance belongs to nobody.
+        assert_eq!(
+            ctx.requirement_hash,
+            umadev_governance::requirement_fingerprint(&o.requirement)
+        );
+        assert!(ctx.derived_at > 0);
+
+        // (b) NO BRAIN (`can_fork: false`) — the STRICT floor. The SAME requirement, and the
+        // permission is WITHHELD: a decision we could not establish is not a permission. This
+        // is the direction that makes the whole design safe. A leak writes AI-slop into the
+        // customer's repo irreversibly; a false block is one recoverable rework.
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let ctx_file2 = tmp2.path().join(".umadev").join("governance-context.json");
+        let (events2, _rec2) = sink();
+        let mut blind = FakeSession::new(vec![], false, "");
+        let mut o2 = opts(tmp2.path());
+        o2.requirement = requirement.to_string();
+        let _ =
+            drive_director_loop_routed(&mut blind, &o2, &events2, "GO".to_string(), Some(&route))
+                .await;
+        let ctx2: umadev_governance::ProjectContext =
+            serde_json::from_str(&std::fs::read_to_string(&ctx_file2).expect("context persisted"))
+                .expect("valid context json");
+        assert!(
+            !ctx2.purple_allowed,
+            "no brain ⇒ no permission: the anti-slop rule stays ARMED"
+        );
+        // The context is still written and stamped — the OTHER decisions in it (the static
+        // frontend signal) are unaffected, and the readers still need a rule book.
+        assert!(ctx2.derived_at > 0);
+    }
+
+    #[tokio::test]
+    async fn a_workspace_stuck_in_the_past_stops_the_schedule_instead_of_writing_on_it() {
+        // MED. A step's red→green evidence check rewinds the tree to an earlier checkpoint to
+        // replay a test, then puts it back. When that restore FAILED, the old code emitted a
+        // `tracing::warn!` — a line in a log FILE under the TUI — and the scheduler drove
+        // right on, writing new code on top of the user's source reverted to an earlier state,
+        // on a base reading a codebase that no longer exists. The module's own invariant says
+        // "a workspace stuck in the past is never a silent condition"; the driver has to obey
+        // it too.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path()); // every source-present step would otherwise pass
+        let (events, rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        let mut plan = upstream_peer_plan();
+
+        // The condition a failed `TempRewind::restore` / `Drop` leaves behind.
+        crate::checkpoint::mark_workspace_in_past(
+            tmp.path(),
+            crate::checkpoint::InPastReason::Retryable,
+        );
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        crate::checkpoint::clear_workspace_in_past(tmp.path());
+
+        // The run STOPS — it does not fall through to the final gate / finalize, both of
+        // which write.
+        assert!(
+            matches!(outcome, Some(DirectorLoopOutcome::Failed(_))),
+            "a tree in the past must end the run, not merely log: {outcome:?}"
+        );
+        // NOT ONE step is driven. The flag was already up when the schedule was entered —
+        // which is exactly how a process STARTS when the workspace heal stood down — and the
+        // check used to run only AFTER a step had driven, so a full step's worth of writes
+        // landed on the in-past tree before anything noticed. The first swing counts.
+        assert_eq!(
+            active_order(&rec).len(),
+            0,
+            "no step may be scheduled onto a tree that is already in the past"
+        );
+        // And it is LOUD on the surface the user is watching, plus the notice queue the next
+        // start drains.
+        let halt = umadev_i18n::tl("checkpoint.workspace_in_past_halt");
+        assert!(
+            rec.events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Note(n) if n == halt)),
+            "the user must SEE it, not find it in a log file"
+        );
+        assert!(
+            crate::checkpoint::take_workspace_notices()
+                .iter()
+                .any(|n| n == halt),
+            "…and the workspace-integrity queue carries it too"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_single_turn_build_path_also_refuses_a_workspace_in_the_past() {
+        // The lean / Fast build path (no plan, or a route that isn't deliberate) runs the
+        // single end-to-end turn + bounded QC fix rounds — and it had NO halt check at all.
+        // A workspace known to be stranded at an earlier checkpoint (the flag the workspace
+        // heal raises at process start when it stood down) was still handed the build turn,
+        // and then a fix turn, and then another: every one of them writing new code on top
+        // of files that are not the user's. Not one turn may be driven.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let mut sess = FakeSession::new(vec![text_turn("built the whole thing")], false, "");
+        let sent = sess.sent_handle();
+        let o = opts(tmp.path());
+
+        crate::checkpoint::mark_workspace_in_past(
+            tmp.path(),
+            crate::checkpoint::InPastReason::Retryable,
+        );
+        let outcome = drive_director_loop_with_idle(
+            &mut sess,
+            &o,
+            &events,
+            "build it".to_string(),
+            None, // no plan → the single-turn loop, not the step scheduler
+            None,
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        crate::checkpoint::clear_workspace_in_past(tmp.path());
+
+        assert!(
+            matches!(outcome, DirectorLoopOutcome::Failed(_)),
+            "the single-turn path must STOP, not build onto a tree in the past: {outcome:?}"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "not one turn may be driven onto a workspace that is in the past"
+        );
+        let halt = umadev_i18n::tl("checkpoint.workspace_in_past_halt");
+        assert!(
+            rec.events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Note(n) if n == halt)),
+            "…and the user must SEE why the build stopped"
+        );
+        let _ = crate::checkpoint::take_workspace_notices();
+    }
+
+    #[tokio::test]
+    async fn a_healthy_workspace_is_never_halted() {
+        // The guard is keyed by ROOT: a stranded tree in ANOTHER workspace must not stop a
+        // run in this one (a process legitimately touches several via --project-root).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        crate::checkpoint::mark_workspace_in_past(
+            other.path(),
+            crate::checkpoint::InPastReason::Retryable,
+        );
+        let (events, _rec) = sink();
+        let o = opts(tmp.path());
+        let halted = halt_if_workspace_in_past(&o, &events);
+        crate::checkpoint::clear_workspace_in_past(other.path());
+        assert!(
+            halted.is_none(),
+            "another workspace's stranded tree is not this run's problem"
+        );
     }
 
     #[tokio::test]
@@ -8938,6 +9805,7 @@ mod tests {
         let mut plan = Plan {
             steps: vec![
                 PlanStep {
+                    files: plan_state::StepFiles::default(),
                     id: "impl".into(),
                     title: "Implement the login".into(),
                     seat: crate::critics::Seat::FrontendEngineer,
@@ -8948,6 +9816,7 @@ mod tests {
                     status: StepStatus::Pending,
                 },
                 PlanStep {
+                    files: plan_state::StepFiles::default(),
                     id: "review".into(),
                     title: "Cross-review".into(),
                     seat: crate::critics::Seat::QaEngineer,
@@ -9074,6 +9943,7 @@ mod tests {
     fn dead_session_plan() -> crate::plan_state::Plan {
         use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
         let mk = |id: &str, deps: &[&str]| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: format!("step {id}"),
             seat: crate::critics::Seat::FrontendEngineer,
@@ -9180,6 +10050,7 @@ mod tests {
         o.requirement = "做一个完整的任务管理产品".to_string();
         let route = build_route();
         let step = crate::plan_state::PlanStep {
+            files: plan_state::StepFiles::default(),
             id: "feature".into(),
             title: "Build the feature".into(),
             seat: crate::critics::Seat::FrontendEngineer,
@@ -9390,6 +10261,7 @@ mod tests {
         let route = build_route();
         // schema (radius 2: api + ui depend on it) is the only initially-ready step.
         let mk = |id: &str, deps: &[&str]| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: format!("Build the {id}"),
             seat: crate::critics::Seat::FrontendEngineer,
@@ -9447,6 +10319,7 @@ mod tests {
         use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
         Plan {
             steps: vec![PlanStep {
+                files: plan_state::StepFiles::default(),
                 id: "a".into(),
                 title: "Step A".into(),
                 seat: crate::critics::Seat::FrontendEngineer,
@@ -9583,6 +10456,7 @@ mod tests {
         use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
         let (events, rec) = sink();
         let mk = |id: &str, deps: &[&str], status: StepStatus| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: format!("step {id}"),
             seat: crate::critics::Seat::FrontendEngineer,
@@ -9644,6 +10518,7 @@ mod tests {
         // NO source → step a's source-present acceptance fails every round → Blocked.
         let (events, rec) = sink();
         let mk = |id: &str, deps: &[&str]| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: format!("step {id}"),
             seat: crate::critics::Seat::FrontendEngineer,
@@ -9710,6 +10585,7 @@ mod tests {
         // is what stops the loop — proving an EARLY, diagnosed stop.
         let n_steps = (crate::trust::CONSECUTIVE_FAILURE_THRESHOLD as usize) + 2;
         let mk = |id: &str| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: format!("step {id}"),
             seat: crate::critics::Seat::FrontendEngineer,
@@ -9773,6 +10649,7 @@ mod tests {
         use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
         Plan {
             steps: vec![PlanStep {
+                files: plan_state::StepFiles::default(),
                 id: "a".into(),
                 title: "Build with a weak review-clean acceptance".into(),
                 seat: crate::critics::Seat::FrontendEngineer,
@@ -9800,6 +10677,7 @@ mod tests {
         let o = opts(tmp.path());
         let route = build_route();
         let step = PlanStep {
+            files: plan_state::StepFiles::default(),
             id: "a".into(),
             title: "claimed done, wrote nothing".into(),
             seat: crate::critics::Seat::FrontendEngineer,
@@ -9809,7 +10687,7 @@ mod tests {
             evidence: Vec::new(),
             status: StepStatus::Active,
         };
-        let verdict = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        let verdict = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
         assert!(
             !verdict.accepted,
             "a TurnSettled Build over an empty tree must NOT pass the honesty floor"
@@ -9822,6 +10700,7 @@ mod tests {
     fn evidence_step(evidence: Vec<crate::plan_state::EvidenceContract>) -> plan_state::PlanStep {
         use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
         PlanStep {
+            files: plan_state::StepFiles::default(),
             id: "a".into(),
             title: "deliver the thing".into(),
             seat: crate::critics::Seat::FrontendEngineer,
@@ -9851,7 +10730,7 @@ mod tests {
         let step = evidence_step(vec![E::FileExists {
             path: "src/App.tsx".into(),
         }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
         assert!(v.accepted, "the declared file exists → the step is done");
         assert!(v.has_positive_evidence);
         assert!(v.evidence.is_empty(), "no gap: {:?}", v.evidence);
@@ -9874,7 +10753,7 @@ mod tests {
         let step = evidence_step(vec![E::Malformed {
             detail: "file-exists: missing a non-empty `path`".into(),
         }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
         assert!(
             !v.accepted,
             "an under-specified evidence contract must leave the step NOT done despite source"
@@ -9900,7 +10779,7 @@ mod tests {
         let step = evidence_step(vec![E::FileExists {
             path: "src/App.tsx".into(),
         }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
         assert!(
             !v.accepted,
             "the declared file is absent → the step is NOT done"
@@ -9927,7 +10806,7 @@ mod tests {
             path: "src/api.ts".into(),
             needle: "/api/login".into(),
         }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &miss).await;
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &miss, None).await;
         assert!(!v.accepted);
         assert!(
             v.evidence_line().contains("does not contain"),
@@ -9944,7 +10823,7 @@ mod tests {
             path: "src/api.ts".into(),
             needle: "/api/login".into(),
         }]);
-        let v2 = verify_step_acceptance(&mut sess, &o, &events, &route, &hit).await;
+        let v2 = verify_step_acceptance(&mut sess, &o, &events, &route, &hit, None).await;
         assert!(v2.accepted && v2.has_positive_evidence);
     }
 
@@ -9958,6 +10837,7 @@ mod tests {
         let mut sess = FakeSession::new(vec![], false, "");
         let route = build_route();
         let mk = |status| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: "a".into(),
             title: "t".into(),
             seat: crate::critics::Seat::FrontendEngineer,
@@ -9977,6 +10857,7 @@ mod tests {
             &events,
             &route,
             &mk(StepStatus::Active),
+            None,
         )
         .await;
         assert!(
@@ -9991,6 +10872,7 @@ mod tests {
             &events,
             &route,
             &mk(StepStatus::Active),
+            None,
         )
         .await;
         assert!(
@@ -10018,7 +10900,7 @@ mod tests {
             path: "/api/x".into(),
             status: Some(200),
         }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
         assert!(
             v.accepted,
             "an unbootable route check is a neutral skip, never a false block"
@@ -10041,7 +10923,7 @@ mod tests {
         let step = evidence_step(vec![E::TestPasses {
             name: Some("checkout".into()),
         }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
         assert!(!v.accepted);
         assert!(
             v.evidence_line().contains("checkout")
@@ -10070,7 +10952,7 @@ mod tests {
         let step = evidence_step(vec![E::TestPasses {
             name: Some("login".into()),
         }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
         assert!(v.accepted && v.has_positive_evidence);
     }
 
@@ -10094,7 +10976,7 @@ mod tests {
                 path: "src/b.tsx".into(),
             },
         ]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
         assert!(!v.accepted, "one unmet contract blocks the whole step");
         assert!(v.evidence_line().contains("src/b.tsx"));
         assert!(
@@ -10615,6 +11497,7 @@ mod tests {
         let mut route = build_route();
         route.team = vec![]; // empty team → no seat actually reviews
         let step = PlanStep {
+            files: plan_state::StepFiles::default(),
             id: "review".into(),
             title: "Cross-review".into(),
             seat: crate::critics::Seat::QaEngineer,
@@ -10710,6 +11593,7 @@ mod tests {
         let o = opts(tmp.path());
         let route = build_route(); // team = [FrontendEngineer] → a seat actually reviews
         let step = PlanStep {
+            files: plan_state::StepFiles::default(),
             id: "review".into(),
             title: "Cross-review".into(),
             seat: crate::critics::Seat::QaEngineer,
@@ -10762,6 +11646,7 @@ mod tests {
         let o = opts(tmp.path());
         let route = build_route();
         let step = PlanStep {
+            files: plan_state::StepFiles::default(),
             id: "review".into(),
             title: "Cross-review".into(),
             seat: crate::critics::Seat::QaEngineer,
@@ -11067,6 +11952,7 @@ mod tests {
     ) -> crate::plan_state::PlanStep {
         use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind};
         PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: title.into(),
             seat: crate::critics::Seat::FrontendEngineer,
@@ -11441,6 +12327,7 @@ mod tests {
     fn blocked_subtree_plan() -> Plan {
         use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind};
         let mk = |id: &str, deps: &[&str], status: StepStatus| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: format!("Build the {id}"),
             seat: crate::critics::Seat::BackendEngineer,
@@ -11630,6 +12517,7 @@ mod tests {
         let mut plan = Plan {
             steps: vec![
                 PlanStep {
+                    files: plan_state::StepFiles::default(),
                     id: "scaffold".into(),
                     title: "scaffold".into(),
                     seat: crate::critics::Seat::FrontendEngineer,
@@ -11640,6 +12528,7 @@ mod tests {
                     status: StepStatus::Done,
                 },
                 PlanStep {
+                    files: plan_state::StepFiles::default(),
                     id: "leaf".into(),
                     title: "a leaf".into(),
                     seat: crate::critics::Seat::FrontendEngineer,
@@ -11690,6 +12579,7 @@ mod tests {
         use crate::critics::Seat;
         use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
         let mk = |id: &str, seat: Seat, deps: &[&str]| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: format!("do the {id} work"),
             seat,
@@ -11949,6 +12839,7 @@ mod tests {
         o.requirement = "写两份文档".to_string();
         let route = build_route();
         let mk = |id: &str, seat: Seat, deps: &[&str]| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: format!("write the {id} doc"),
             seat,
@@ -12004,6 +12895,7 @@ mod tests {
         let mut o = opts(tmp.path());
         o.mode = TrustMode::Guarded;
         let mk = |id: &str, seat: Seat, acceptance: AcceptanceSpec, status: StepStatus| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: format!("do {id}"),
             seat,
@@ -12104,6 +12996,7 @@ mod tests {
         o.requirement = "做一个完整的产品".to_string();
         let route = build_route();
         let mk = |id: &str, seat: Seat, acceptance: AcceptanceSpec, deps: &[&str]| PlanStep {
+            files: plan_state::StepFiles::default(),
             id: id.into(),
             title: format!("do the {id} work"),
             seat,
@@ -12416,6 +13309,304 @@ mod tests {
         assert!(
             !asked.headless,
             "the residual auto escalation must ask the live user, not headless-decide"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // RED→GREEN evidence contract — "a test that never failed proves nothing"
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn red_green_verdict_passes_a_test_that_was_red_before_the_step() {
+        use crate::verify::NamedTestOutcome as T;
+        // The whole contract in one line: the named test FAILED at the pre-state and
+        // (the caller has already established) PASSES at head. That is a real test.
+        assert!(matches!(
+            red_half_verdict("login_rejects_bad_password", T::Failed),
+            Some(EvidenceOutcome::Pass)
+        ));
+    }
+
+    #[test]
+    fn red_green_verdict_fails_the_step_when_the_test_already_passed_at_baseline() {
+        // THE POINT OF THE WHOLE MECHANISM. A test that was ALREADY GREEN before the
+        // step's work existed cannot be asserting that work — it was written after (or
+        // around) the code, to match what the code already did. It has never once
+        // demonstrated that it can detect the behaviour's absence. `TestPasses` is
+        // satisfied by exactly this test; the red→green contract rejects it, by name,
+        // with the diagnosis stated plainly.
+        use crate::verify::NamedTestOutcome as T;
+        let Some(EvidenceOutcome::Gap(msg)) = red_half_verdict("adds_two_numbers", T::Passed)
+        else {
+            panic!("a test that was already green at the pre-state MUST reject the step");
+        };
+        assert!(msg.contains("ALREADY PASSED"), "{msg}");
+        assert!(msg.contains("adds_two_numbers"), "{msg}");
+    }
+
+    #[test]
+    fn red_green_verdict_is_inconclusive_when_the_pre_state_test_cannot_be_run() {
+        // FAIL-OPEN: a rewound tree we could not run the test in (a toolchain that
+        // needs dependencies the pre-state lacked, a timeout) yields NO verdict — the
+        // caller degrades to the ordinary named-test bar. We never block a step on our
+        // own inability to verify.
+        use crate::verify::NamedTestOutcome as T;
+        assert!(
+            red_half_verdict("t", T::Unavailable).is_none(),
+            "an unrunnable pre-state is inconclusive, never a finding"
+        );
+    }
+
+    #[test]
+    fn the_red_half_memo_never_caches_a_non_verdict() {
+        // N3. The memo may only hold IMMUTABLE FACTS ABOUT THE PAST: at commit `pre`,
+        // that test did (Passed) or did not (Failed) succeed. `Unavailable` is not such a
+        // fact — it is a fact about our TOOLING at one moment (a timeout, a transient
+        // runner failure). Caching it froze one flake into the answer for
+        // `(root, pre, test)` for the entire process: every later fix round of that step
+        // skipped the rewind, read the cached non-verdict, and fell open to the plain
+        // `TestPasses` bar — permanently downgrading the red→green contract because of a
+        // single transient miss.
+        use crate::verify::NamedTestOutcome as T;
+        let root = std::path::Path::new("/tmp/umadev-red-half-memo-test");
+        let pre = "cafe1234";
+        let test = "n3_regression_probe";
+
+        // A transient non-verdict is NOT remembered — the next round asks again.
+        red_half_remember(root, pre, test, T::Unavailable);
+        assert!(
+            red_half_cached(root, pre, test).is_none(),
+            "a non-verdict must never be memoized: it would downgrade the contract for the \
+             whole process on the strength of one flake"
+        );
+
+        // …and the round that DOES get an answer records it, so the (immutable) past is
+        // not re-derived by a second rewind.
+        red_half_remember(root, pre, test, T::Failed);
+        assert_eq!(
+            red_half_cached(root, pre, test),
+            Some(T::Failed),
+            "a real observation about the past IS sound to memoize"
+        );
+
+        // A later `Unavailable` must not clobber the fact we already established.
+        red_half_remember(root, pre, test, T::Unavailable);
+        assert_eq!(
+            red_half_cached(root, pre, test),
+            Some(T::Failed),
+            "a transient miss cannot erase an established fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn red_green_falls_open_to_test_passes_when_no_runner_or_rewind_exists() {
+        // END-TO-END FAIL-OPEN, through the real contract path. The workspace has the
+        // named test in its source but NO recognised project manifest (so no test
+        // runner) and NO pre-state checkpoint. Both halves are unaskable → the step is
+        // held to exactly the bar we CAN check (the test exists), never blocked on a
+        // question we could not ask.
+        use crate::plan_state::EvidenceContract as E;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/app.test.js"),
+            "test('login_rejects_bad_password', () => { expect(1).toBe(1); });",
+        )
+        .unwrap();
+        let o = opts(tmp.path());
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let route = build_route();
+        let step = evidence_step(vec![E::TestFailsThenPasses {
+            test: "login_rejects_bad_password".into(),
+        }]);
+
+        let v = verify_step_acceptance(
+            &mut sess, &o, &events, &route, &step,
+            None, // no pre-state checkpoint → the red half is unaskable
+        )
+        .await;
+        assert!(
+            v.accepted,
+            "an unverifiable red→green degrades to the TestPasses bar: {:?}",
+            v.evidence
+        );
+    }
+
+    #[tokio::test]
+    async fn red_green_still_rejects_a_test_that_is_not_in_the_codebase_at_all() {
+        // The green half is toolchain-INDEPENDENT: a test that appears nowhere in the
+        // source cannot pass, no matter what a runner would say (and this is what stops
+        // a "filter matched nothing, exit 0" runner from faking a green).
+        use crate::plan_state::EvidenceContract as E;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/app.js"), "export const a = 1;\n").unwrap();
+        let o = opts(tmp.path());
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let route = build_route();
+        let step = evidence_step(vec![E::TestFailsThenPasses {
+            test: "a_test_nobody_ever_wrote".into(),
+        }]);
+
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
+        assert!(
+            !v.accepted,
+            "an absent test cannot satisfy a red→green claim"
+        );
+        assert!(
+            v.evidence_line().contains("a_test_nobody_ever_wrote"),
+            "the gap names the missing test: {:?}",
+            v.evidence
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SCOPE CREEP — "which change belongs to no step?" (the dual of coverage)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// A workspace with a run baseline + a persisted plan whose one code step claims
+    /// `claim` as its file surface. `None` when `git` is unavailable (fail-open env).
+    fn scoped_workspace(claim: &[&str]) -> Option<tempfile::TempDir> {
+        if !std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            return None;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        crate::checkpoint::create_run_baseline(tmp.path(), "demo")?;
+        let plan = plan_state::Plan {
+            steps: vec![plan_state::PlanStep {
+                files: crate::plan_state::StepFiles {
+                    create: claim.iter().map(|c| (*c).to_string()).collect(),
+                    modify: vec![],
+                },
+                id: "impl".into(),
+                title: "build the planned thing".into(),
+                seat: crate::critics::Seat::BackendEngineer,
+                kind: plan_state::StepKind::Build,
+                depends_on: vec![],
+                acceptance: plan_state::AcceptanceSpec::SourcePresent,
+                evidence: vec![],
+                status: plan_state::StepStatus::Pending,
+            }],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        plan_state::save(&plan, tmp.path()).unwrap();
+        Some(tmp)
+    }
+
+    #[test]
+    fn acceptance_floor_blocks_an_unclaimed_new_source_file() {
+        // OVER-BUILDING is the dual of the coverage gap above. The plan said it would
+        // write `planned.ts`; the run ALSO wrote `rogue.ts` — a new place for logic to
+        // live that nobody sized, nobody asked for, and no reviewer looked at. It
+        // blocks, on the same deterministic floor as an uncovered requirement.
+        let Some(tmp) = scoped_workspace(&["planned.ts"]) else {
+            return;
+        };
+        std::fs::write(tmp.path().join("planned.ts"), "export const p = 1;\n").unwrap();
+        std::fs::write(tmp.path().join("rogue.ts"), "export const r = 1;\n").unwrap();
+
+        let o = opts(tmp.path());
+        let route = build_route();
+        let blocking = acceptance_floor_blocking(&o, Some(&route));
+        assert!(
+            blocking
+                .iter()
+                .any(|b| b.starts_with("scope:") && b.contains("rogue.ts")),
+            "an unclaimed new source file blocks: {blocking:?}"
+        );
+        assert!(
+            !blocking.iter().any(|b| b.contains("planned.ts")),
+            "the CLAIMED file is in scope and never a finding: {blocking:?}"
+        );
+    }
+
+    #[test]
+    fn acceptance_floor_is_silent_on_scope_when_the_plan_declared_no_surface() {
+        // FAIL-OPEN, and the reason the check can ship at all: a plan that never
+        // declared where it would write has made no claim to hold the tree against.
+        // The very same rogue file produces NOT ONE scope finding.
+        let Some(tmp) = scoped_workspace(&[]) else {
+            return;
+        };
+        std::fs::write(tmp.path().join("rogue.ts"), "export const r = 1;\n").unwrap();
+        let o = opts(tmp.path());
+        let route = build_route();
+        let blocking = acceptance_floor_blocking(&o, Some(&route));
+        assert!(
+            !blocking.iter().any(|b| b.starts_with("scope:")),
+            "an absent declaration is not a claim that nothing will change: {blocking:?}"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EVIDENCE FRESHNESS — "a proof taken before the last change is not a proof"
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn a_stale_runtime_proof_is_not_read_by_the_floor_in_either_direction() {
+        // A runtime proof describes ONE state of the source. Once the code moves, the
+        // proof is about a tree that no longer exists — so the floor must not read it,
+        // in EITHER direction: a stale FAILURE must not block code that has since been
+        // fixed, and (the dangerous one) a stale PASS must never be mistaken for
+        // evidence about the code we are shipping.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let audit = tmp.path().join(".umadev").join("audit");
+        std::fs::create_dir_all(&audit).unwrap();
+
+        let write_failed_proof = |fingerprint: Option<String>| {
+            let proof = crate::runtime_proof::RuntimeProof {
+                timestamp: "2026-07-01T00:00:00Z".to_string(),
+                status: crate::runtime_proof::RuntimeStatus::NotVerified(
+                    "server did not become ready within 60s".to_string(),
+                ),
+                dev_server: Some("Vite dev server".to_string()),
+                command: Some("npm run dev".to_string()),
+                base_url: Some("http://localhost:5173".to_string()),
+                ready_ms: None,
+                routes: Vec::new(),
+                e2e: None,
+                source_fingerprint: fingerprint,
+            };
+            std::fs::write(
+                audit.join("runtime-proof.json"),
+                serde_json::to_string(&proof).unwrap(),
+            )
+            .unwrap();
+        };
+
+        // FRESH failure (stamped with the tree as it stands) → a real, blocking fact.
+        let now = crate::freshness::workspace_fingerprint(tmp.path())
+            .expect("a test tree is fingerprintable");
+        write_failed_proof(Some(now));
+        assert!(
+            runtime_proof_blocking(tmp.path()).is_some(),
+            "a proof that describes THIS code is read"
+        );
+
+        // The code CHANGES. The same recorded failure now describes a tree we are not
+        // shipping — it is no longer evidence about anything, so the floor drops it and
+        // the check has to be re-run for real.
+        std::fs::write(tmp.path().join("fixed.ts"), "export const fixed = true;\n").unwrap();
+        assert!(
+            runtime_proof_blocking(tmp.path()).is_none(),
+            "evidence produced before the last change to the code it describes is not evidence"
+        );
+
+        // FAIL-OPEN: an UNSTAMPED proof has no fingerprint to contradict — an unknown is
+        // never a finding, so an older artifact behaves exactly as it always did.
+        write_failed_proof(None);
+        assert!(
+            runtime_proof_blocking(tmp.path()).is_some(),
+            "an unstamped proof is read as before — we never block on our own blindness"
         );
     }
 }

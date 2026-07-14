@@ -5,8 +5,11 @@ domain: design-systems
 category: design-systems
 difficulty: intermediate
 tags: [clean, color, component, design-systems, editorial, motion, palette, patterns]
+register: [brand, product]
+icon-library: Heroicons
+icon-stroke: 1.5
 quality_score: 70
-last_updated: 2026-06-15
+last_updated: 2026-07-14
 ---
 # Editorial Clean
 
@@ -20,35 +23,65 @@ Content sites, blogs, portfolios, documentation, news/media products. Products w
 
 ```css
 :root {
-  --color-bg: #fefdfb;
-  --color-surface: #ffffff;
-  --color-surface-elevated: #ffffff;
-  --color-surface-sunken: #f7f5f0;
-  --color-text: #1a1a1a;
-  --color-text-secondary: #666666;
-  --color-text-tertiary: #999999;
-  --color-primary: #c0392b;
-  --color-primary-hover: #a93226;
-  --color-primary-muted: #fce4e1;
-  --color-accent: #2c3e50;
-  --color-success: #27ae60;
-  --color-warning: #f39c12;
-  --color-error: #e74c3c;
-  --color-border: #e8e4dd;
-  --color-border-hover: #d5d0c8;
-  --color-border-focus: #c0392b;
+  /* Surfaces + paired foregrounds */
+  --color-bg: oklch(99.4% 0.003 84.6);           /* warm near-white, not a templated cream */
+  --color-on-bg: oklch(21.8% 0 0);
+  --color-surface: oklch(100% 0 0);
+  --color-on-surface: oklch(21.8% 0 0);
+  --color-card: oklch(100% 0 0);
+  --color-on-card: oklch(35.0% 0.009 80.7);
+  --color-muted: oklch(97.0% 0.007 88.6);
+  --color-on-muted: oklch(45.4% 0.014 84.6);
+
+  --color-primary: oklch(49.5% 0.157 29.5);      /* ink red */
+  --color-on-primary: oklch(100% 0 0);
+  --color-primary-hover: oklch(44.5% 0.150 29.5);
+  --color-accent: oklch(35.6% 0.039 249.0);      /* slate blue */
+  --color-on-accent: oklch(100% 0 0);
+
+  --color-success: oklch(52.5% 0.123 152.7);
+  --color-on-success: oklch(100% 0 0);
+  --color-warning: oklch(54.5% 0.116 70.2);
+  --color-on-warning: oklch(100% 0 0);
+  --color-error: oklch(54.3% 0.174 29.7);
+  --color-on-error: oklch(100% 0 0);
+
+  --color-border: oklch(91.0% 0.008 84.6);
+  --color-border-hover: oklch(85.0% 0.010 84.6);
+  --color-border-focus: oklch(49.5% 0.157 29.5);
+
+  /* Type scale — reading-first: a real display step, calm body steps */
+  --text-xs: 0.75rem; --text-sm: 0.875rem; --text-base: 1.0625rem;
+  --text-lg: 1.25rem; --text-xl: 1.5rem; --text-2xl: 2rem;
+  --text-3xl: 2.75rem; --text-display: 4rem;
+
+  /* Spacing — 4pt grid */
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
+  --space-6: 24px; --space-8: 32px; --space-12: 48px; --space-16: 64px;
+  --space-24: 96px;
+
+  --radius-sm: 2px; --radius-md: 4px; --radius-lg: 6px; --radius-full: 9999px;
+
+  --duration-fast: 140ms;
+  --duration-normal: 220ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0.2, 1);
+
   --shadow-sm: 0 1px 3px rgb(0 0 0 / 0.04);
   --shadow-md: 0 4px 12px rgb(0 0 0 / 0.06);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --color-bg: #1a1a1a;
-    --color-surface: #242424;
-    --color-surface-sunken: #141414;
-    --color-text: #eeeeee;
-    --color-text-secondary: #aaaaaa;
-    --color-border: #333333;
+    --color-bg: oklch(19.2% 0.004 84.6); --color-on-bg: oklch(93.8% 0.012 84.6);
+    --color-surface: oklch(23.9% 0.006 91.6); --color-on-surface: oklch(93.8% 0.012 84.6);
+    --color-card: oklch(27.8% 0.006 78.2); --color-on-card: oklch(86.8% 0.013 82.4);
+    --color-muted: oklch(21.4% 0.004 84.6); --color-on-muted: oklch(71.5% 0.013 75.3);
+    --color-primary: oklch(71.6% 0.128 32.2); --color-on-primary: oklch(20.9% 0.047 33.9);
+    --color-accent: oklch(76.7% 0.061 244.8); --color-on-accent: oklch(22.0% 0.027 242.6);
+    --color-success: oklch(75.5% 0.137 155.7); --color-on-success: oklch(23.0% 0.055 151.4);
+    --color-warning: oklch(78.5% 0.122 82.1); --color-on-warning: oklch(23.8% 0.046 80.5);
+    --color-error: oklch(69.6% 0.142 28.0); --color-on-error: oklch(20.4% 0.057 30.4);
+    --color-border: oklch(31.0% 0.006 84.6);
   }
 }
 ```
@@ -68,12 +101,6 @@ Content sites, blogs, portfolios, documentation, news/media products. Products w
 | body-lg | 1.25rem (20px) | 400 | 1.7 | 0 | Article body (long-form) |
 | body | 1rem (16px) | 400 | 1.6 | 0 | Default text |
 | caption | 0.8125rem (13px) | 500 | 1.4 | 0.03em | Bylines, dates, tags |
-
-## Spacing
-
-8px base: `8 / 16 / 24 / 32 / 48 / 64 / 80 / 120`
-
-Content column: max-width 680px, centered. Sidebars: 280px.
 
 ## Component patterns
 

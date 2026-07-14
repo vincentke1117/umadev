@@ -30,6 +30,7 @@
 )]
 
 pub mod audit;
+pub mod color;
 pub mod compliance;
 pub mod context;
 pub mod design;
@@ -37,8 +38,11 @@ pub mod policy;
 pub mod rules;
 pub mod tokenizer;
 
+pub use color::{contrast_ratio, is_ai_purple, oklch_to_srgb, parse_color, Oklch, Srgb};
 pub use design::{
-    extract_fonts, is_generic_font, scan_design_quality, DesignFinding, DesignSeverity,
+    extract_fonts, is_generic_font, requirement_mentions_flagged_color, rule as design_rule,
+    scan_design_quality, scan_design_rules, scan_design_rules_with, DesignFinding, DesignIntent,
+    DesignRule, DesignSeverity, Register, RuleScope, DESIGN_RULES,
 };
 
 pub use audit::{
@@ -51,13 +55,13 @@ pub use compliance::{
 pub use context::{compose_session_context, SessionContext};
 pub use policy::{DisabledSection, ExclusionsSection, ExtraSection, Policy};
 pub use rules::{
-    check_a11y, check_ai_slop, check_api_error_convention, check_bare_catch,
-    check_c_buffer_overflow, check_c_malloc_null_check, check_color_tokens, check_csp_required,
-    check_dangerous_bash, check_db_transaction_rollback, check_debug_residue, check_deep_nesting,
-    check_emoji, check_error_boundary, check_eval_injection, check_frontend_db_access,
-    check_go_panic, check_hardcoded_secret, check_hsts_header, check_https_redirect,
-    check_i18n_required, check_input_validation, check_insecure_cookie, check_insecure_cors,
-    check_java_system_exit, check_jwt_defects, check_kotlin_nonnull_assertion,
+    check_a11y, check_ai_slop, check_ai_slop_with_intent, check_api_error_convention,
+    check_bare_catch, check_c_buffer_overflow, check_c_malloc_null_check, check_color_tokens,
+    check_csp_required, check_dangerous_bash, check_db_transaction_rollback, check_debug_residue,
+    check_deep_nesting, check_emoji, check_error_boundary, check_eval_injection,
+    check_frontend_db_access, check_go_panic, check_hardcoded_secret, check_hsts_header,
+    check_https_redirect, check_i18n_required, check_input_validation, check_insecure_cookie,
+    check_insecure_cors, check_java_system_exit, check_jwt_defects, check_kotlin_nonnull_assertion,
     check_loose_array_types, check_magic_numbers, check_malicious_urls, check_missing_auth_guard,
     check_non_null_assertion, check_php_shell_exec, check_python_bare_except, check_python_global,
     check_rate_limiting, check_ruby_eval_send, check_rust_unwrap, check_security_headers,
@@ -65,9 +69,9 @@ pub use rules::{
     check_swift_force_unwrap, check_todo_residue, check_ts_any, check_typosquat_packages,
     check_unreliable_sources, check_unsafe_deserialization, check_unused_variables,
     check_xpath_injection, check_xxe, file_has_server_surface, is_config_secret_path,
-    is_irreversible_write_floor, is_secret_scanned_path, pre_write_floor_decision, sast_scan_file,
-    scan_content, scan_content_with_context, scan_content_with_policy, Decision, ProjectContext,
-    SastFinding, SastSeverity,
+    is_irreversible_write_floor, is_secret_scanned_path, pre_write_floor_decision,
+    requirement_fingerprint, sast_scan_file, scan_content, scan_content_with_context,
+    scan_content_with_policy, Decision, ProjectContext, SastFinding, SastSeverity,
 };
 #[allow(unused_imports)]
 pub use rules::{

@@ -23,10 +23,15 @@
 //!    DBMS / `flock`-style supervisor reaps a dead holder).
 //! 2. **Same host + owner PID is alive** → a real concurrent run; refuse with an
 //!    actionable message.
-//! 3. **Different host, or identity unparseable/missing** → we can't probe
-//!    liveness, so fall back to a generous age threshold ([`STALE_SECS`]): an
-//!    ancient lock with no heartbeat is reclaimed, otherwise refuse (with a
-//!    "delete the file to force" hint).
+//! 3. **Different host, or identity unparseable/missing, or the boot id conflicts
+//!    with a live PID** → we can't attribute the owner, so fall back to a generous
+//!    age threshold ([`STALE_SECS`]): an ancient lock with no heartbeat is
+//!    reclaimed, otherwise refuse (with a "delete the file to force" hint).
+//!
+//! That verdict is [`classify_claim_owner`] — the SINGLE owner-liveness rule,
+//! shared with the temporary-rewind crash marker in [`crate::checkpoint`], because
+//! two files answering the same question two different ways is exactly how a live
+//! holder's lock gets reclaimed under it.
 //!
 //! Liveness probing is itself **fail-open**: if we cannot determine whether the
 //! PID is alive we treat it as *alive* (conservative — never reclaim a lock that
@@ -132,6 +137,21 @@ impl RunLock {
     /// run on this host holds the lock. Any other IO problem fails open (un-owned
     /// guard) so a lock bug can never block a legitimate run.
     pub fn acquire_for_run(project_root: &Path) -> io::Result<RunLock> {
+        // WORKSPACE-INTEGRITY BACKSTOP, before anything else. A previous run that was
+        // SIGKILLed / OOM-killed / whose terminal was closed inside a temporary
+        // evidence rewind left the user's tracked source files reverted to an earlier
+        // step's state — no destructor ran, so nothing put them back. Restore the
+        // PRESENT before this run starts writing on top of a tree that is silently in
+        // the past. Fail-open and strictly conservative: it no-ops unless the marker's
+        // owner is provably gone, and it can only reset to a checkpoint we ourselves
+        // wrote (see `checkpoint::recover_abandoned_temp_rewind`).
+        if let Some(note) = crate::checkpoint::recover_abandoned_temp_rewind(project_root) {
+            // A `tracing::warn!` alone is invisible to the person this is FOR: under the TUI
+            // the log goes to a file. Hand the note to the surface that can actually speak
+            // (the transcript drains it), and keep the log line for post-mortems.
+            tracing::warn!("{note}");
+            crate::checkpoint::record_workspace_notice(note);
+        }
         Self::acquire_with(project_root, AcquireIntent::Run)
     }
 
@@ -271,19 +291,118 @@ fn holder_is_self(path: &Path) -> bool {
     let Some(owner) = Owner::parse(&contents) else {
         return false;
     };
-    let same_host = owner.host.is_empty() || owner.host == hostname();
+    let local_host = hostname();
+    let local_boot = boot_id();
+    let same_host = owner.host.is_empty() || local_host.is_empty() || owner.host == local_host;
     // A recorded boot-id that differs from THIS boot means the lock predates a reboot, so a
     // matching PID is a RECYCLED pid, not us - never treat that as self (else the routing
-    // layer queues input into a run that no longer exists).
-    let same_boot = owner.boot.is_empty() || owner.boot == boot_id();
+    // layer queues input into a run that no longer exists). Empty on EITHER side = unknown =
+    // "matches": an unreadable local boot id (`sysctl` absent, `wmic` gone in current Windows)
+    // must not make us stop recognising our OWN lock.
+    let same_boot = owner.boot.is_empty() || local_boot.is_empty() || owner.boot == local_boot;
     owner.pid == std::process::id() && same_host && same_boot
+}
+
+/// The recorded owner of a workspace claim: a `.umadev/run.lock` line, or a temporary-rewind
+/// crash marker ([`crate::checkpoint`]). Both files exist to answer ONE question — "is the
+/// process that wrote this still alive?" — and getting two different answers out of them is
+/// how a live single-writer lock gets reclaimed under a live holder.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClaimOwner<'a> {
+    /// The owner's process id (`0` = none recorded).
+    pub pid: u32,
+    /// The owner's hostname (empty = not recorded / unreadable).
+    pub host: &'a str,
+    /// The owner's boot id (empty = not recorded / unreadable).
+    pub boot: &'a str,
+}
+
+/// What we can PROVE about a claim's owner. Deliberately three-valued: "I could not tell"
+/// is a distinct answer from "it is dead", and collapsing them is what reclaims live locks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerLiveness {
+    /// Alive (proved, or conservatively assumed) — the claim stands. NEVER reclaim.
+    Live,
+    /// Provably gone — the claim may be reclaimed right now.
+    Abandoned,
+    /// Unattributable. The caller's own age window is the only honest signal left.
+    AgeOnly,
+}
+
+/// The ONE owner-liveness rule, shared by the run lock ([`is_stale`]) and the temporary-rewind
+/// crash marker (`checkpoint::marker_is_abandoned`). Pure + fully injectable (the local host,
+/// the local boot id, our pid and the liveness answer are all parameters), so every branch —
+/// reboot, PID reuse, shared network workspace, unreadable boot id — is decidable in a test.
+///
+/// Decision order — **host, then boot, then PID, then age**:
+///
+/// 1. **It is us** (our live pid, same host, no boot conflict) → [`OwnerLiveness::Live`].
+/// 2. **Another host** (a shared / network workspace): its process table is unreachable and
+///    its boot id is unrelated to ours, so NEITHER probe means anything →
+///    [`OwnerLiveness::AgeOnly`]. This is the ordering that matters: a boot check placed
+///    ahead of the host check reclaims a *live* remote holder's lock on every acquire (machine
+///    B never has machine A's boot id), putting two writers on one tree.
+/// 3. **No usable pid** → [`OwnerLiveness::AgeOnly`].
+/// 4. **Same host, pid probe** — the primary and STRONGEST signal:
+///    - dead → [`OwnerLiveness::Abandoned`] (the ordinary crash path, and the ordinary
+///      post-reboot path: a reboot kills the holder, so its pid is normally gone);
+///    - alive **and** no boot conflict → [`OwnerLiveness::Live`];
+///    - alive **but** the recorded boot id differs → [`OwnerLiveness::AgeOnly`]. The mismatch
+///      has TWO readings we cannot tell apart: a reboot recycled the pid onto an unrelated
+///      live process, **or** the boot id itself moved under a still-live owner (macOS
+///      recomputes `kern.boottime` on every clock correction, and an unreadable id reads as
+///      empty). Reclaiming on a boot STRING alone would delete a live holder's claim — the
+///      single-writer invariant, gone. The age window still frees a genuinely rebooted owner;
+///      it just never yanks a live one.
+///    - unprobeable → [`OwnerLiveness::AgeOnly`] (conservative: an errored probe is not proof
+///      of death; a boot mismatch is not proof either).
+///
+/// Empty = **unknown**, and unknown reads as "matches" on both host and boot: a claim written
+/// by an older build, or on a machine whose boot id / hostname cannot be read (`sysctl`
+/// missing; `wmic` is gone in current Windows), must keep behaving exactly as it did — never
+/// as "a different boot ⇒ dead", which would reclaim a LIVE local lock.
+pub(crate) fn classify_claim_owner(
+    owner: ClaimOwner<'_>,
+    local_host: &str,
+    local_boot: &str,
+    self_pid: u32,
+    alive: Option<bool>,
+) -> OwnerLiveness {
+    let same_host = owner.host.is_empty() || local_host.is_empty() || owner.host == local_host;
+    let boot_conflict =
+        !owner.boot.is_empty() && !local_boot.is_empty() && owner.boot != local_boot;
+
+    // 1. Ours, right now.
+    if owner.pid != 0 && owner.pid == self_pid && same_host && !boot_conflict {
+        return OwnerLiveness::Live;
+    }
+    // 2. Another machine — unprobeable by construction.
+    if !same_host {
+        return OwnerLiveness::AgeOnly;
+    }
+    // 3. Nothing to probe.
+    if owner.pid == 0 {
+        return OwnerLiveness::AgeOnly;
+    }
+    // 4. This host: the pid probe decides, and a boot mismatch may only DOWNGRADE a live
+    //    answer to the age window — never upgrade it to "reclaim".
+    match alive {
+        Some(false) => OwnerLiveness::Abandoned,
+        Some(true) if !boot_conflict => OwnerLiveness::Live,
+        Some(true) | None => OwnerLiveness::AgeOnly,
+    }
 }
 
 /// A best-effort identifier that CHANGES on every reboot (whitespace-stripped to a single
 /// token). Linux: `/proc/sys/kernel/random/boot_id`. macOS: the `kern.boottime` sysctl. Empty
 /// when neither is available (reboot-detection then simply doesn't apply). Lets an abandoned
 /// pre-reboot lock be reclaimed even when its PID was recycled by a live process.
-fn boot_id() -> String {
+///
+/// `pub(crate)` because the temp-rewind crash marker
+/// ([`crate::checkpoint::TempRewindMarker`]) needs the SAME reboot rule: after a reboot a
+/// PID is meaningless, so an owner-liveness probe against a recycled PID must never be
+/// allowed to keep a dead owner's claim alive.
+pub(crate) fn boot_id() -> String {
     #[cfg(target_os = "linux")]
     if let Ok(id) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
         return id.split_whitespace().collect();
@@ -321,16 +440,21 @@ fn boot_id() -> String {
 }
 
 /// `true` when the lock at `path` belongs to a crashed/abandoned run and may be
-/// reclaimed. Decision order (PID liveness first, age fallback second):
+/// reclaimed. The owner verdict is the SHARED rule ([`classify_claim_owner`] —
+/// host → boot → PID → age), so the run lock and the temporary-rewind marker can
+/// never disagree about whether the same process is alive:
 ///
-/// 1. Same host + dead PID  → stale (reclaim).
-/// 2. Same host + live PID  → NOT stale (real concurrent run).
-/// 3. Cross-host / unparseable owner → stale only if older than [`STALE_SECS`].
+/// 1. Same host + dead PID → stale (reclaim).
+/// 2. Same host + live PID → NOT stale (a real concurrent run) — and no boot-id
+///    string may override that: a live holder's lock is never reclaimed out from
+///    under it, because two writers on one tree is the failure this lock exists
+///    to prevent.
+/// 3. Cross-host / unattributable / boot-conflicted owner → stale only if older
+///    than [`STALE_SECS`] (measured from the owner's own recorded `ts`).
 ///
 /// Fail-open at every branch: an unreadable file is treated as stale (the holder
 /// can no longer be identified, so it can't be live), and a PID we cannot probe
-/// is treated as *alive* so we never steal a lock from a process that might be
-/// running — the age fallback still frees a truly abandoned lock.
+/// falls to the age window rather than being reclaimed.
 fn is_stale(path: &Path) -> bool {
     // Can't read it → owner is unidentifiable → safe to reclaim.
     let Ok(contents) = std::fs::read_to_string(path) else {
@@ -342,26 +466,30 @@ fn is_stale(path: &Path) -> bool {
         return older_than_stale(&Owner::default(), path);
     };
 
-    // A lock from a PRIOR boot (its boot-id differs from ours) is definitively abandoned -
-    // the reboot killed its holder - regardless of whether its PID is now alive (recycled).
-    if !owner.boot.is_empty() && owner.boot != boot_id() {
-        return true;
+    // Never probe pid 0 (on Unix `kill -0 0` signals the whole process GROUP and
+    // would read back as "alive"); an owner with no pid is decided by age.
+    let alive = if owner.pid == 0 {
+        None
+    } else {
+        pid_is_alive(owner.pid)
+    };
+    match classify_claim_owner(
+        ClaimOwner {
+            pid: owner.pid,
+            host: &owner.host,
+            boot: &owner.boot,
+        },
+        &hostname(),
+        &boot_id(),
+        std::process::id(),
+        alive,
+    ) {
+        OwnerLiveness::Live => false,
+        OwnerLiveness::Abandoned => true,
+        // Age from the OWNER's recorded `ts` (the lock's own heartbeat), NOT the
+        // file's mtime.
+        OwnerLiveness::AgeOnly => older_than_stale(&owner, path),
     }
-    let same_host = !owner.host.is_empty() && owner.host == hostname();
-    if same_host && owner.pid != 0 {
-        // Primary path: probe the actual holder. Dead → stale; alive → live.
-        return match pid_is_alive(owner.pid) {
-            Some(true) => false, // a real run holds it
-            Some(false) => true, // crashed/killed → reclaim
-            // Can't probe → conservative + age fallback. Age from the OWNER's
-            // recorded `ts` (the lock's own heartbeat), NOT the file's mtime.
-            None => older_than_stale(&owner, path),
-        };
-    }
-
-    // Different host (can't probe its process table) or no usable PID: the only
-    // safe signal left is age.
-    older_than_stale(&owner, path)
 }
 
 /// `true` when the lock is older than [`STALE_SECS`].
@@ -422,7 +550,11 @@ impl Owner {
 /// falls back to `/etc/hostname`-equivalent via `uname -n`. An empty string when
 /// nothing is available — callers treat empty as "host unknown" (no same-host
 /// PID probe, age fallback only), which is the safe direction.
-fn hostname() -> String {
+///
+/// `pub(crate)`: the temp-rewind crash marker records the same owner identity, so a
+/// marker written on another machine (a shared / network workspace) is never judged by
+/// THIS host's process table.
+pub(crate) fn hostname() -> String {
     for key in ["HOSTNAME", "COMPUTERNAME"] {
         if let Ok(h) = std::env::var(key) {
             let h = h.trim();
@@ -458,7 +590,7 @@ fn hostname() -> String {
 /// - **Windows**: `tasklist /FI "PID eq <pid>"` and look for the PID in output.
 /// - Anything else / probe error → `None`.
 #[cfg(unix)]
-fn pid_is_alive(pid: u32) -> Option<bool> {
+pub(crate) fn pid_is_alive(pid: u32) -> Option<bool> {
     // `kill -0` sends no signal but performs the permission/existence check.
     // Exit status 0 → exists. Non-zero → distinguish "no such process" (gone)
     // from other errors (unknown). We run the standalone `kill` utility so this
@@ -493,7 +625,7 @@ fn pid_is_alive(pid: u32) -> Option<bool> {
 }
 
 #[cfg(windows)]
-fn pid_is_alive(pid: u32) -> Option<bool> {
+pub(crate) fn pid_is_alive(pid: u32) -> Option<bool> {
     let out = std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
         .output()
@@ -514,7 +646,7 @@ fn pid_is_alive(pid: u32) -> Option<bool> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn pid_is_alive(_pid: u32) -> Option<bool> {
+pub(crate) fn pid_is_alive(_pid: u32) -> Option<bool> {
     None
 }
 
@@ -786,6 +918,133 @@ mod tests {
         assert!(
             !is_stale(&path),
             "a fresh owner.ts must not be reclaimable on the age path"
+        );
+    }
+
+    /// THE SINGLE-WRITER BLOCKER: a boot-id mismatch must NEVER reclaim a LIVE lock.
+    ///
+    /// The rule used to test the boot id BEFORE the host — so `owner.boot != boot_id()`
+    /// reclaimed the lock outright, and the same-host check below it was unreachable. Three
+    /// ways that deletes a live holder's lock and puts two writers on one tree:
+    ///
+    /// 1. A shared / network workspace: machine B NEVER has machine A's boot id, so B
+    ///    reclaimed A's live lock on every single acquire.
+    /// 2. Our own `boot_id()` returns "" when the OS won't say (`wmic` is REMOVED in current
+    ///    Windows; `sysctl` can fail to spawn) → "" ≠ the recorded boot → a LIVE LOCAL lock
+    ///    reclaimed.
+    /// 3. macOS recomputes `kern.boottime` on every clock correction, so the boot string can
+    ///    change WITHIN one boot, under a live holder.
+    ///
+    /// Decided by the shared rule ([`classify_claim_owner`]) — host, then boot, then pid,
+    /// then age — so the run lock and the temp-rewind marker can never disagree about the
+    /// liveness of the same process.
+    #[test]
+    fn a_boot_id_mismatch_never_reclaims_a_live_lock() {
+        let me = std::process::id();
+        let live_local = ClaimOwner {
+            pid: me,
+            host: "our-host",
+            boot: "our-boot",
+        };
+        // (a) A DIFFERENT boot string over a live same-host owner (macOS clock correction,
+        //     a re-read that drifted): the pid probe says ALIVE — that answer stands.
+        let other_pid = ClaimOwner {
+            pid: 4321,
+            host: "our-host",
+            boot: "a-DIFFERENT-boot-string",
+        };
+        assert_eq!(
+            classify_claim_owner(other_pid, "our-host", "our-boot", me, Some(true)),
+            OwnerLiveness::AgeOnly,
+            "a live same-host owner under a different boot string is NEVER reclaimed on the \
+             spot — the boot string is not trustworthy enough to kill a live claim"
+        );
+        // (b) An EMPTY LOCAL boot id (the Windows-11 `wmic` case): unknown ≠ mismatch.
+        assert_eq!(
+            classify_claim_owner(live_local, "our-host", "", me, Some(true)),
+            OwnerLiveness::Live,
+            "an unreadable local boot id must not make us reclaim our own live lock"
+        );
+        // (c) An EMPTY RECORDED boot (a legacy lock line): likewise.
+        let legacy = ClaimOwner {
+            pid: 4321,
+            host: "our-host",
+            boot: "",
+        };
+        assert_eq!(
+            classify_claim_owner(legacy, "our-host", "our-boot", me, Some(true)),
+            OwnerLiveness::Live,
+            "a lock with no recorded boot id is judged by its PID, not by a phantom reboot"
+        );
+        // A genuinely rebooted same-host owner IS reclaimed: after a reboot its pid is gone.
+        let rebooted = ClaimOwner {
+            pid: 4321,
+            host: "our-host",
+            boot: "boot-BEFORE-the-reboot",
+        };
+        assert_eq!(
+            classify_claim_owner(rebooted, "our-host", "boot-AFTER", me, Some(false)),
+            OwnerLiveness::Abandoned,
+            "a rebooted owner's dead pid is reclaimed at once"
+        );
+        // …and if the reboot RECYCLED its pid onto a live process, the age window still
+        // frees it (bounded), so a workspace can never wedge forever.
+        assert_eq!(
+            classify_claim_owner(rebooted, "our-host", "boot-AFTER", me, Some(true)),
+            OwnerLiveness::AgeOnly,
+            "a recycled pid falls to the age window — freed, but never by yanking a live claim"
+        );
+        // A LIVE owner on ANOTHER host (a shared / NFS workspace) is respected: its process
+        // table is unreachable and its boot id is unrelated to ours, so age is all we have.
+        let remote = ClaimOwner {
+            pid: 4321,
+            host: "their-host",
+            boot: "their-boot",
+        };
+        assert_eq!(
+            classify_claim_owner(remote, "our-host", "our-boot", me, Some(false)),
+            OwnerLiveness::AgeOnly,
+            "another host's lock is decided by AGE — never by our own process table, and never \
+             by a boot id that means nothing across machines"
+        );
+    }
+
+    /// The same blocker, end-to-end through the real lock file: an ALIVE local owner
+    /// (pid 1 = init/launchd) whose recorded boot id differs from ours must not be stale.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_local_lock_with_a_foreign_boot_id_is_not_reclaimable() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        write_lock(
+            root,
+            &format!(
+                "pid=1 host={} ts={} boot=not-the-boot-id-we-have-now",
+                hostname(),
+                now_secs()
+            ),
+        );
+        let path = root.join(".umadev").join("run.lock");
+        assert!(
+            !is_stale(&path),
+            "a LIVE holder's lock must survive a boot-id mismatch — reclaiming it is two \
+             writers on one tree"
+        );
+        let err = RunLock::acquire(root).expect_err("the live holder still owns the workspace");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+
+        // The same lock, but ANCIENT: the age window is the honest way out, and it still works.
+        write_lock(
+            root,
+            &format!(
+                "pid=1 host={} ts={} boot=not-the-boot-id-we-have-now",
+                hostname(),
+                now_secs().saturating_sub(STALE_SECS + 60)
+            ),
+        );
+        assert!(
+            is_stale(&path),
+            "past the age window even a boot-conflicted live pid is reclaimable"
         );
     }
 

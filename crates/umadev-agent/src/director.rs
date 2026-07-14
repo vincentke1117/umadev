@@ -189,6 +189,24 @@ pub enum VerifyKind {
     /// colors) is the qualitative half — together they make "the team has a design
     /// system" a checkable fact, not a narrated claim.
     DesignTokensPresent,
+    /// The STRONGER design contract (UD-CODE-007, spec §3.7) — the token file is
+    /// not merely PRESENT but CONFORMANT (via [`crate::design_system`]):
+    ///
+    /// - the schema floor holds (>= 6 color roles each with a paired `on-`
+    ///   foreground, a >= 4-step type scale at ratio >= 1.125, a 4pt spacing
+    ///   scale, a radius scale, >= 2 durations + >= 1 easing);
+    /// - every declared `(surface, on-surface)` pair MEASURES to WCAG (4.5:1 body,
+    ///   3:1 large/UI) — pure Rust, no browser;
+    /// - the UI source actually DRAWS from the token set (a literal color / font /
+    ///   radius / size that is not on the scale is drift);
+    /// - the declared primary/accent is not in the AI indigo/violet band unless the
+    ///   requirement explicitly asked for purple.
+    ///
+    /// [`Self::DesignTokensPresent`] keeps working and stays the weaker bar; this
+    /// is the contract a deliberate build should hold the designer seat to.
+    /// Fail-open: no token file → `available: false` (a neutral skip), exactly as
+    /// before the conformance check existed.
+    DesignSystemConform,
 }
 
 impl VerifyKind {
@@ -200,6 +218,7 @@ impl VerifyKind {
             Self::Contract => "contract",
             Self::SourcePresent => "source-present",
             Self::DesignTokensPresent => "design-tokens-present",
+            Self::DesignSystemConform => "design-system-conform",
         }
     }
 }
@@ -566,6 +585,7 @@ pub async fn verify(
         VerifyKind::Contract => verify_contract(options),
         VerifyKind::SourcePresent => verify_source_present(options),
         VerifyKind::DesignTokensPresent => verify_design_tokens(options),
+        VerifyKind::DesignSystemConform => verify_design_system(options),
     }
 }
 
@@ -750,6 +770,73 @@ fn verify_design_tokens(options: &RunOptions) -> VerifyResult {
             "design tokens on the blackboard: {}",
             names.join(", ")
         )],
+    }
+}
+
+/// Confirm the design system CONFORMS, not merely exists (UD-CODE-007, spec
+/// §3.7) — the schema floor, WCAG contrast on every declared `(surface,
+/// on-surface)` pair, token drift in UI source, the banned AI-purple brand hue,
+/// and the register-scoped design-lint registry. See [`crate::design_system`].
+///
+/// The register is read from the project's own UIUX doc (`## Visual direction`);
+/// an unstated register runs EVERY lint rule, which is exactly the pre-register
+/// behaviour (fail-open — an unknown register never silently disables a check).
+///
+/// **Fail-open**: no `design-tokens.{json,css}` at all → `available: false`, a
+/// neutral SKIP the director must not read as a red signal. So a project that
+/// never asked for a design system is completely unaffected; only a project that
+/// SHIPPED a token file is held to the contract it implicitly claimed.
+fn verify_design_system(options: &RunOptions) -> VerifyResult {
+    let report = crate::design_system::verify_design_system(
+        &options.project_root,
+        &options.requirement,
+        crate::design_system::register_for_project(
+            &options.project_root,
+            &options.effective_slug(),
+        ),
+    );
+    if !report.available {
+        return VerifyResult {
+            available: false,
+            passed: true,
+            evidence: vec![
+                "no design-tokens.{json,css} on the blackboard — design-system conformance not \
+                 applicable (skipped, not failed)"
+                    .to_string(),
+            ],
+        };
+    }
+    let blocking: Vec<String> = report
+        .blocking()
+        .iter()
+        .map(|f| format!("[{}] {}", f.rule, f.message))
+        .collect();
+    if blocking.is_empty() {
+        let advisory: Vec<String> = report
+            .findings
+            .iter()
+            .filter(|f| !f.blocking)
+            .map(|f| f.message.clone())
+            .collect();
+        let mut evidence = vec![format!(
+            "design system conforms: {} ({} color role(s), {} type step(s), {} radius step(s)) — \
+             schema, WCAG contrast, token usage, and brand hue all clear",
+            report.files.join(", "),
+            report.tokens.colors.len(),
+            report.tokens.type_steps.len(),
+            report.tokens.radii.len(),
+        )];
+        evidence.extend(advisory.into_iter().take(4));
+        return VerifyResult {
+            available: true,
+            passed: true,
+            evidence,
+        };
+    }
+    VerifyResult {
+        available: true,
+        passed: false,
+        evidence: blocking,
     }
 }
 
@@ -941,6 +1028,30 @@ pub fn finalize(
     }
     result.missing_docs = missing;
 
+    // EVIDENCE FRESHNESS (the anti-"stale green" floor). The proof-pack's whole value
+    // is that a reader can trust it without re-doing the work: it says "this code was
+    // verified". A proof captured BEFORE the last change to the code it describes does
+    // not say that — it says "some earlier code was verified", and stapling it to
+    // today's delivery is how an unverified build ships behind a passing artifact.
+    //
+    // So: if a persisted proof is STALE (its recorded source fingerprint no longer
+    // matches the tree), we do NOT assemble a pack around it. We say so, plainly, and
+    // withhold — the same honesty rule that withholds the pack for an unclean build.
+    // The remedy is not a disclaimer; it is to re-run the proof.
+    //
+    // Fail-open: an UNSTAMPED proof (an older artifact) has no fingerprint to
+    // contradict and is never stale, so an existing workspace behaves exactly as before.
+    let stale = stale_proof_artifacts(&options.project_root);
+    if !stale.is_empty() {
+        events.emit(EngineEvent::Note(format!(
+            "team · delivery — withheld: {} is STALE (the source changed after it was taken, so \
+             it describes code we are not shipping). A completion claim is only as fresh as the \
+             evidence behind it — re-run the proof (`umadev verify --runtime`) and deliver again",
+            stale.join(", ")
+        )));
+        return result;
+    }
+
     // … plus the full, shareable proof-pack + scorecard.
     {
         match crate::phases::run_delivery(options) {
@@ -976,6 +1087,28 @@ pub fn finalize(
     }
 
     result
+}
+
+/// The persisted proof artifacts that are STALE — their recorded source fingerprint no
+/// longer matches the tree, so they describe code that has since changed. Named for the
+/// honest withhold note in [`finalize`].
+///
+/// Fail-open at every edge: an absent artifact, an unreadable/unparseable one, or one
+/// written before the freshness stamp existed contributes NOTHING (an unknown is not a
+/// finding). Only a proof that positively records a fingerprint that no longer matches
+/// is stale. See [`crate::freshness`].
+fn stale_proof_artifacts(root: &std::path::Path) -> Vec<String> {
+    let mut stale = Vec::new();
+    let rel = crate::runtime_proof::runtime_proof_rel_path();
+    if let Some(proof) = std::fs::read_to_string(root.join(rel))
+        .ok()
+        .and_then(|b| serde_json::from_str::<crate::runtime_proof::RuntimeProof>(&b).ok())
+    {
+        if proof.is_stale(root) {
+            stale.push(format!("`{rel}`"));
+        }
+    }
+    stale
 }
 
 #[cfg(test)]
@@ -1523,6 +1656,28 @@ mod tests {
         std::fs::write(root.join("app.ts"), "export const x = 1;").unwrap();
     }
 
+    /// Write a VERIFIED `runtime-proof.json` into `audit`, optionally carrying the
+    /// freshness stamp of the tree it describes. Built through the real type so the
+    /// on-disk shape can never drift from what the reader parses.
+    fn write_proof(audit: &std::path::Path, fingerprint: Option<String>) {
+        let proof = crate::runtime_proof::RuntimeProof {
+            timestamp: "2026-07-01T00:00:00Z".to_string(),
+            status: crate::runtime_proof::RuntimeStatus::Verified,
+            dev_server: Some("Vite dev server".to_string()),
+            command: Some("npm run dev".to_string()),
+            base_url: Some("http://localhost:5173".to_string()),
+            ready_ms: Some(900),
+            routes: Vec::new(),
+            e2e: None,
+            source_fingerprint: fingerprint,
+        };
+        std::fs::write(
+            audit.join("runtime-proof.json"),
+            serde_json::to_string(&proof).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn finalize_lean_build_ships_code_only_no_doc_ceremony() {
         // PROPORTIONALITY (audit #7): a LEAN/Fast Build's deliverable IS the code —
@@ -1651,6 +1806,78 @@ mod tests {
                 "{name} must NOT be scaffolded for an incomplete build"
             );
         }
+    }
+
+    #[test]
+    fn finalize_withholds_the_proof_pack_when_the_runtime_proof_is_stale() {
+        // EVIDENCE FRESHNESS. A proof-pack's whole value is that a reader can trust it
+        // without re-doing the work. A runtime proof captured BEFORE the last change to
+        // the code it describes does not say "this code was verified" — it says "some
+        // earlier code was verified", and stapling it to today's delivery is how an
+        // unverified build ships behind a passing artifact. So a stale proof withholds
+        // the pack and says so, exactly as an unclean build does.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let ev = sink();
+        let o = opts(tmp.path());
+        let route = build_route(crate::router::Depth::Standard);
+
+        // A runtime proof that VERIFIED — stamped with the tree as it stood then.
+        let audit = tmp.path().join(".umadev").join("audit");
+        std::fs::create_dir_all(&audit).unwrap();
+        let taken = crate::freshness::workspace_fingerprint(tmp.path())
+            .expect("a test tree is fingerprintable");
+        write_proof(&audit, Some(taken));
+
+        // A FRESH proof still delivers — the pack is assembled as before.
+        let fresh = finalize(&o, &ev, Some(&route), true);
+        assert!(
+            fresh.proof_pack,
+            "a proof that describes THIS tree still delivers: {fresh:?}"
+        );
+
+        // …now the SOURCE MOVES after the proof was taken. The proof describes code we
+        // are no longer shipping.
+        std::fs::write(
+            tmp.path().join("later.ts"),
+            "export const changedAfterTheProof = true;\n",
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(tmp.path().join("release"));
+
+        let stale = finalize(&o, &ev, Some(&route), true);
+        assert!(
+            !stale.proof_pack,
+            "a stale proof must not be assembled into a delivery pack: {stale:?}"
+        );
+        let release = tmp.path().join("release");
+        assert!(
+            !release.exists()
+                || std::fs::read_dir(&release)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+            "no proof-pack zip is written around stale evidence"
+        );
+    }
+
+    #[test]
+    fn finalize_still_delivers_when_a_proof_carries_no_freshness_stamp() {
+        // FAIL-OPEN. An artifact written before the stamp existed has no fingerprint to
+        // contradict — an unknown, never a finding. Such a workspace behaves exactly as
+        // it did before this check existed.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let ev = sink();
+        let o = opts(tmp.path());
+        let route = build_route(crate::router::Depth::Standard);
+        let audit = tmp.path().join(".umadev").join("audit");
+        std::fs::create_dir_all(&audit).unwrap();
+        write_proof(&audit, None);
+        let r = finalize(&o, &ev, Some(&route), true);
+        assert!(
+            r.proof_pack,
+            "an unstamped proof is not stale — delivery is unchanged: {r:?}"
+        );
     }
 
     #[test]

@@ -231,6 +231,21 @@ pub const CLAUSES: &[Clause] = &[
         level: ClauseLevel::Must,
         section: "3.6",
     },
+    // Design-system conformance floor. One clause entry carries six sub-rules
+    // (the data model has no variant ids): the token schema floor (`007a`,
+    // blocking), WCAG contrast measured on every declared surface/foreground
+    // pair (`007b`, blocking), token drift in UI source (`007c`, blocking), the
+    // banned AI indigo/violet brand hue (`007d`, blocking), the register-scoped
+    // design-lint registry (`007e`, a small P0 tier blocks, the rest advisory),
+    // and the designer's visual-direction step (`007f`, blocking). Sub-rule ids
+    // live in the prose (§3.7) and in `umadev_agent::design_system`.
+    Clause {
+        id: "UD-CODE-007",
+        layer: Layer::Code,
+        title: "Design-system conformance floor",
+        level: ClauseLevel::Must,
+        section: "3.7",
+    },
     // Test-integrity guard: a code-weight constraint over the TEST code the team
     // writes. Namespaced `UD-QA-*` (the `UD-CODE-005` slot is reserved for the §10
     // accessibility candidate), but classified in the Code layer with its siblings

@@ -5,8 +5,11 @@ domain: design-systems
 category: design-systems
 difficulty: intermediate
 tags: [borders, color, component, design-systems, minimal, modern, palette, patterns]
+register: [product]
+icon-library: Lucide
+icon-stroke: 1.5
 quality_score: 70
-last_updated: 2026-06-15
+last_updated: 2026-07-14
 ---
 # Modern Minimal
 
@@ -14,132 +17,132 @@ last_updated: 2026-06-15
 
 ## When to use
 
-SaaS products, developer tools, dashboards, productivity apps. Products where information density matters but visual noise must stay low.
+**Register: product.** SaaS products, developer tools, dashboards, productivity apps. Products where information density matters but visual noise must stay low. Read `01-register.md` first: the product register's rules apply here, and every brand-only rule (display type, page-load choreography, background depth) is OFF.
 
 ## Color palette
 
+Every surface role ships a paired `on-` foreground; every declared pair clears WCAG AA (4.5:1 body). Colors are OKLCH — perceptually uniform, so `L` is the only knob you need to turn to derive a hover/muted variant.
+
 ```css
 :root {
-  /* Surface */
-  --color-bg: #fafafa;
-  --color-surface: #ffffff;
-  --color-surface-elevated: #ffffff;
-  --color-surface-sunken: #f4f4f5;
+  /* Surfaces + their paired foregrounds */
+  --color-bg: oklch(98.5% 0 0); --color-on-bg: oklch(21.0% 0.006 285.9);
+  --color-surface: oklch(100% 0 0); --color-on-surface: oklch(21.0% 0.006 285.9);
+  --color-card: oklch(100% 0 0); --color-on-card: oklch(37.0% 0.012 285.8);
+  --color-muted: oklch(96.7% 0 0); --color-on-muted: oklch(44.2% 0.015 285.8);
 
-  /* Text */
-  --color-text: #18181b;
-  --color-text-secondary: #71717a;
-  --color-text-tertiary: #a1a1aa;
-
-  /* Brand */
-  --color-primary: #2563eb;
-  --color-primary-hover: #1d4ed8;
-  --color-primary-muted: #dbeafe;
-
-  /* Accent */
-  --color-accent: #8b5cf6;
+  /* Brand + one restrained accent (never AI-purple) */
+  --color-primary: oklch(48.8% 0.217 264.4); --color-on-primary: oklch(100% 0 0);
+  --color-primary-hover: oklch(43.8% 0.200 264.4);
+  --color-accent: oklch(51.1% 0.086 186.4); --color-on-accent: oklch(100% 0 0);
 
   /* Status */
-  --color-success: #22c55e;
-  --color-warning: #f59e0b;
-  --color-error: #ef4444;
+  --color-success: oklch(52.7% 0.137 150.1); --color-on-success: oklch(100% 0 0);
+  --color-warning: oklch(55.5% 0.146 49.0); --color-on-warning: oklch(100% 0 0);
+  --color-error: oklch(53.5% 0.203 27.6); --color-on-error: oklch(100% 0 0);
 
   /* Border */
-  --color-border: #e4e4e7;
-  --color-border-hover: #d4d4d8;
-  --color-border-focus: #2563eb;
+  --color-border: oklch(92.0% 0.004 286.3);
+  --color-border-hover: oklch(87.0% 0.006 286.3);
+  --color-border-focus: oklch(48.8% 0.217 264.4);
+
+  /* Type scale — product register: fixed ratio ~1.2 */
+  --text-xs: 0.75rem; --text-sm: 0.875rem; --text-base: 1rem; --text-lg: 1.125rem;
+  --text-xl: 1.375rem; --text-2xl: 1.625rem; --text-3xl: 2rem;
+
+  /* Spacing — 4pt grid */
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
+  --space-5: 20px; --space-6: 24px; --space-8: 32px; --space-10: 40px;
+  --space-12: 48px; --space-16: 64px;
+
+  /* Radius */
+  --radius-sm: 6px; --radius-md: 8px; --radius-lg: 12px; --radius-full: 9999px;
+
+  /* Motion */
+  --duration-fast: 120ms; --duration-normal: 180ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0.2, 1);
 
   /* Shadow */
   --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
   --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.07), 0 2px 4px -2px rgb(0 0 0 / 0.05);
-  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.08), 0 4px 6px -4px rgb(0 0 0 / 0.04);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --color-bg: #09090b;
-    --color-surface: #18181b;
-    --color-surface-elevated: #27272a;
-    --color-surface-sunken: #09090b;
-    --color-text: #fafafa;
-    --color-text-secondary: #a1a1aa;
-    --color-text-tertiary: #71717a;
-    --color-primary-muted: #1e3a5f;
-    --color-border: #27272a;
-    --color-border-hover: #3f3f46;
-    --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.3);
-    --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.4);
-    --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.5);
+    --color-bg: oklch(14.1% 0.004 285.8);       /* #09090b */
+    --color-on-bg: oklch(98.5% 0 0);
+    --color-surface: oklch(21.0% 0.006 285.9); --color-on-surface: oklch(98.5% 0 0);
+    --color-card: oklch(27.4% 0.005 286.0); --color-on-card: oklch(92.0% 0.004 286.3);
+    --color-muted: oklch(21.0% 0.006 285.9); --color-on-muted: oklch(71.2% 0.013 286.1);
+    --color-primary: oklch(71.4% 0.143 254.6); --color-on-primary: oklch(18.3% 0.031 263.4);
+    --color-accent: oklch(78.5% 0.133 181.9); --color-on-accent: oklch(22.5% 0.036 182.4);
+    --color-success: oklch(80.0% 0.182 151.7); --color-on-success: oklch(26.6% 0.063 152.9);
+    --color-warning: oklch(83.7% 0.164 84.4); --color-on-warning: oklch(23.5% 0.047 73.4);
+    --color-error: oklch(71.1% 0.166 22.2); --color-on-error: oklch(19.9% 0.061 24.7);
+    --color-border: oklch(27.4% 0.005 286.0);
+    --color-border-hover: oklch(37.0% 0.012 285.8);
   }
 }
 ```
 
 ## Typography
 
-- **Headings**: `Inter, -apple-system, BlinkMacSystemFont, sans-serif`, weight 600
-- **Body**: `Inter, -apple-system, BlinkMacSystemFont, sans-serif`, weight 400
-- **Code**: `JetBrains Mono, Menlo, monospace`, weight 400
+Product register: a familiar neutral UI face is CORRECT here — the user is reading data, not admiring the letterforms. Do not import a display face for a dashboard.
 
-| Level | Size | Weight | Line-height | Letter-spacing | Use |
-|---|---|---|---|---|---|
-| h1 | 2.25rem (36px) | 700 | 1.2 | -0.025em | Page title |
-| h2 | 1.5rem (24px) | 600 | 1.3 | -0.02em | Section header |
-| h3 | 1.25rem (20px) | 600 | 1.4 | -0.015em | Card title |
-| body-lg | 1.125rem (18px) | 400 | 1.6 | 0 | Hero subtitle |
-| body | 1rem (16px) | 400 | 1.5 | 0 | Default text |
-| body-sm | 0.875rem (14px) | 400 | 1.5 | 0 | Secondary text |
-| caption | 0.75rem (12px) | 500 | 1.4 | 0.02em | Labels, badges |
+- **UI / Body**: `Inter, ui-sans-serif, system-ui, sans-serif`, weight 400
+- **Headings**: same family, weight 600 (hierarchy comes from weight + color, not a second face)
+- **Code / numerics**: `JetBrains Mono, ui-monospace, monospace`, weight 400 — tabular figures for any column of numbers
 
-## Spacing
+Fixed scale, adjacent step ratio ~1.2 (never a 3x display jump — that is the brand register):
 
-4px base grid: `4 / 8 / 12 / 16 / 20 / 24 / 32 / 40 / 48 / 64 / 80 / 96`
-
-## Borders & radius
-
-- Default radius: `8px`
-- Small radius: `6px` (badges, tags)
-- Large radius: `12px` (cards, modals)
-- Full radius: `9999px` (pills, avatars)
-- Border width: `1px`
+| Level | Token | Size | Weight | Line-height | Tracking | Use |
+|---|---|---|---|---|---|---|
+| h1 | `--text-3xl` | 32px | 600 | 1.25 | -0.02em | Page title |
+| h2 | `--text-2xl` | 26px | 600 | 1.3 | -0.015em | Section header |
+| h3 | `--text-xl` | 22px | 600 | 1.35 | -0.01em | Card title |
+| body | `--text-base` | 16px | 400 | 1.5 | 0 | Default text |
+| body-sm | `--text-sm` | 14px | 400 | 1.5 | 0 | Table cells, secondary |
+| caption | `--text-xs` | 12px | 500 | 1.4 | 0.02em | Labels, badges |
 
 ## Component patterns
 
 ### Buttons
-- Primary: `bg-primary text-white`, hover darkens 10%, active darkens 15%, disabled opacity 0.5
-- Secondary: `bg-transparent border-default text-primary`, hover bg-surface-sunken
-- Ghost: no border, hover bg-surface-sunken
-- Height: 36px (sm), 40px (md), 44px (lg)
+- Primary: `background: var(--color-primary); color: var(--color-on-primary)`; hover → `--color-primary-hover`; disabled opacity 0.5
+- Secondary: transparent fill, `--color-border`, text `--color-primary`; hover fill `--color-muted`
+- Ghost: no border; hover fill `--color-muted`
+- Height: 32px (sm), 36px (md), 40px (lg) — product register: compact hit targets beat airy ones
 - Padding: 12px horizontal (sm), 16px (md), 20px (lg)
-- Font: body-sm weight 500
+- Font: `--text-sm` weight 500
 
 ### Cards
-- `bg-surface border-default radius-lg shadow-sm`
-- Hover: `shadow-md border-hover`
-- Padding: 20px (compact), 24px (default)
+- `background: var(--color-card); color: var(--color-on-card); border: 1px solid var(--color-border); border-radius: var(--radius-lg)`
+- Hover: `--shadow-md` + `--color-border-hover`
+- Padding: 16px (compact), 20px (default) — never both a 1px hairline border AND a wide (≥16px blur) shadow; pick one elevation language
 
 ### Inputs
-- Height: 40px
-- `bg-surface border-default radius-md`
-- Focus: `border-focus shadow(0 0 0 3px primary-muted)`
-- Error: `border-error`
+- Height: 36px
+- `background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md)`
+- Focus: `--color-border-focus` + a 2px focus ring at 2px offset
+- Error: `--color-error` border + an `--color-on-error`-legible message
 
 ## Motion
 
-- `--transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1)` — hover, focus
-- `--transition-normal: 200ms cubic-bezier(0.4, 0, 0.2, 1)` — expand, collapse
-- `--transition-slow: 300ms cubic-bezier(0.4, 0, 0.2, 1)` — modals, drawers
+Product register: motion CONFIRMS an action, it never announces the page. No mount/entrance animation, no staggered reveal, no scroll-triggered choreography — that is the brand register.
+
+- `--duration-fast: 120ms` + `--ease-standard` — hover, focus, press
+- `--duration-normal: 180ms` + `--ease-standard` — expand/collapse, popover, drawer
+- Never animate `width` / `height` / `padding` / `margin` (they force layout) — animate `transform` and `opacity`.
 
 ## Do
 
-- Let whitespace do the work. 24-32px between sections minimum.
+- Let whitespace do the work between GROUPS (16–24px); keep rows dense (8–12px).
 - One accent color, used at most 2x per screen.
 - Subtle borders over heavy shadows.
-- Monochrome icons (Lucide stroke width 1.5).
+- Monochrome icons from ONE library at ONE stroke weight (this pack: Lucide, stroke 1.5).
 
 ## Don't
 
-- Purple/pink gradient hero backgrounds.
-- More than 2 font weights per page.
-- Shadows heavier than `shadow-md` on cards.
-- Icon + text + icon on every row.
-- Rounded everything (keep some sharp edges for contrast).
+- Purple/pink gradient hero backgrounds → commit to `--color-primary` as a solid.
+- More than 2 font weights per page → carry hierarchy with size + color instead.
+- Shadows heavier than `--shadow-md` on cards → let the border carry elevation.
+- A mount/entrance animation on a dashboard route → motion only on interaction.

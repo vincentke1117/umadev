@@ -49,6 +49,7 @@ pub mod base_gate;
 pub mod bg_agents;
 pub mod checkpoint;
 pub mod coach;
+pub mod color_permission;
 pub mod compaction;
 pub mod config;
 pub mod constitution;
@@ -57,6 +58,7 @@ pub mod continuous;
 pub mod coverage;
 pub mod critics;
 pub mod deploy;
+pub mod design_system;
 pub mod director;
 pub mod director_loop;
 pub mod error_kb;
@@ -64,6 +66,7 @@ pub mod events;
 pub mod experts;
 pub mod fact_extract;
 pub mod first_pass;
+pub mod freshness;
 pub(crate) mod fswalk;
 pub mod gates;
 pub mod interaction;
@@ -84,6 +87,7 @@ pub mod run_lock;
 pub mod runner;
 pub mod runtime_proof;
 pub mod scaffolding;
+pub mod scope_creep;
 pub mod security;
 pub mod self_evolve;
 pub mod sizing_calibration;
@@ -174,7 +178,7 @@ pub use phases::{
 };
 pub use plan_state::{
     load as load_plan, save as save_plan, synthesize_plan, AcceptanceSpec, EvidenceContract, Plan,
-    PlanStep, StepKind, StepStatus,
+    PlanStep, StepFiles, StepKind, StepStatus,
 };
 pub use planner::{
     advisory_prior, phase_from_id, plan as plan_phases, plan_light, redoable_phase_ids, PhasePlan,

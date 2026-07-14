@@ -848,7 +848,64 @@ pub fn derive_project_context(
     project_root: &std::path::Path,
     slug: &str,
 ) -> umadev_governance::ProjectContext {
-    let strict = umadev_governance::ProjectContext::unknown();
+    derive_project_context_with_color(
+        requirement,
+        project_root,
+        slug,
+        stored_color_permission(project_root, requirement),
+    )
+}
+
+/// The colour permission ALREADY RECORDED for `requirement` in this workspace, or `false`.
+///
+/// [`derive_project_context`] is called on every base tool call (`continuous::govern_tool_call`
+/// re-derives so a static project that grows a server file re-arms strict), and it has no
+/// brain and must never spawn one — a model call per write would be absurd. So it CARRIES
+/// FORWARD the decision the run door already made ([`persist_project_context_with_color`]),
+/// rather than re-deriving it.
+///
+/// Provenance-gated by [`umadev_governance::ProjectContext::if_current`]: the stored decision
+/// is honoured only when it was derived from THIS requirement. A different requirement — or an
+/// unstamped / unreadable / absent context — carries nothing forward and the rule stays ARMED.
+/// So last quarter's violet rebrand cannot stand the band down for today's "no purple", and a
+/// run whose door never consulted the brain simply keeps the default-reject.
+pub(crate) fn stored_color_permission(project_root: &std::path::Path, requirement: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(project_root.join(GOVERNANCE_CONTEXT_REL)) else {
+        return false;
+    };
+    serde_json::from_str::<umadev_governance::ProjectContext>(&raw)
+        .map(|ctx| ctx.if_current(now_secs(), Some(requirement)).purple_allowed)
+        .unwrap_or(false)
+}
+
+/// [`derive_project_context`] with the colour permission supplied by the caller — the form the
+/// RUN DOOR uses, once, right after it has asked the brain
+/// ([`crate::color_permission::consult_color_permission`]).
+///
+/// `purple_allowed` is the ONE stand-down of the banned-hue default-reject, and it is an
+/// INTENT judgement, so it is not derived here: this crate owns no model, and a word list
+/// cannot answer "did the user authorize this hue?" (it was tried, and it leaked on every
+/// review round). The decision rides on EVERY return path below because it is orthogonal to
+/// the server-surface question, and it must reach the WRITE governor
+/// (`scan_content_with_context` → the PreToolUse hook), not just the design floor — otherwise
+/// the user who chose the palette cannot write it and has nothing to fix.
+#[must_use]
+pub fn derive_project_context_with_color(
+    requirement: &str,
+    project_root: &std::path::Path,
+    slug: &str,
+    purple_allowed: bool,
+) -> umadev_governance::ProjectContext {
+    let purple = purple_allowed;
+    // PROVENANCE, on every return path. The context is persisted and read back by other
+    // PROCESSES (the PreToolUse hook, `umadev ci` in the pre-commit hook) that have no idea
+    // what produced it — so it carries WHICH requirement it was derived from and WHEN.
+    // Without that stamp a permission has no expiry and no owner: a `purple_allowed: true`
+    // from an old violet rebrand would stand the banned-hue band down for every later
+    // requirement, including one whose first line is "no purple". See
+    // `ProjectContext::if_current`, which is what the readers apply.
+    let stamp = |ctx: umadev_governance::ProjectContext| ctx.derived_from(requirement, now_secs());
+    let strict = stamp(umadev_governance::ProjectContext::unknown().with_purple_allowed(purple));
 
     // Signal 1: task kind must be a frontend-only / light build.
     let kind = classify(requirement);
@@ -879,7 +936,88 @@ pub fn derive_project_context(
         return strict;
     }
 
-    umadev_governance::ProjectContext::static_frontend()
+    stamp(umadev_governance::ProjectContext::static_frontend().with_purple_allowed(purple))
+}
+
+/// UNIX seconds, or 0 when the clock is unreadable (which reads as "unstamped" — the
+/// strict direction).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Workspace-relative path of the persisted governance context.
+pub const GOVERNANCE_CONTEXT_REL: &str = ".umadev/governance-context.json";
+
+/// **Derive the run's governance [`ProjectContext`](umadev_governance::ProjectContext) and
+/// PERSIST it** — the single place any run path writes the rule book that the other
+/// surfaces read back.
+///
+/// The context is not an in-process detail. It is the answer to "did the user ask for
+/// this?", and three surfaces need that answer:
+///
+/// - the in-process write scan (this run),
+/// - the out-of-process PreToolUse hook (`umadev hook`, a separate process per tool call),
+/// - and `umadev ci` — which is the one that actually FAILS a commit, out of
+///   `.git/hooks/pre-commit`.
+///
+/// A run that honours "make our brand violet" in memory but never writes the context leaves
+/// `ci` to judge with [`ProjectContext::unknown`](umadev_governance::ProjectContext::unknown)
+/// — so the pre-commit hook blocks UD-CODE-002 on the exact color the user asked for, exit
+/// 1, and there is nothing the user can edit to converge: the run accepts what the gate
+/// refuses. Every path that can write code must therefore pass through here FIRST, before
+/// the first file is written.
+///
+/// The COLOUR permission is not re-derived here — it is carried forward from whatever the
+/// run door already recorded for this same requirement (see [`stored_color_permission`]).
+/// This function runs on every base tool call and has no brain; only
+/// [`persist_project_context_with_color`] may set the permission.
+///
+/// Fail-open: an unwritable `.umadev/` is swallowed (the readers then default to full
+/// strictness — conservative, never a false "clean"), and the derived context is returned
+/// regardless so the in-process caller is never blocked by a persistence failure.
+pub fn persist_project_context(
+    requirement: &str,
+    project_root: &std::path::Path,
+    slug: &str,
+) -> umadev_governance::ProjectContext {
+    let ctx = derive_project_context(requirement, project_root, slug);
+    write_project_context(project_root, &ctx);
+    ctx
+}
+
+/// [`persist_project_context`] with the brain's colour verdict — the RUN-DOOR form, called
+/// exactly ONCE per run, the instant the requirement is known and before the first file is
+/// written.
+///
+/// This is the only writer of [`umadev_governance::ProjectContext::purple_allowed`]. Every
+/// other surface (the PreToolUse hook, `umadev ci`, the design floor, and
+/// [`persist_project_context`]'s per-tool-call refresh) READS the decision this call stored.
+/// One decision, one writer, many readers — a gate that judges by a different rule book than
+/// the run is unconvergeable by construction, and a per-write model call is not an option.
+///
+/// Fail-open: an unwritable `.umadev/` is swallowed and the context is returned regardless.
+pub fn persist_project_context_with_color(
+    requirement: &str,
+    project_root: &std::path::Path,
+    slug: &str,
+    purple_allowed: bool,
+) -> umadev_governance::ProjectContext {
+    let ctx = derive_project_context_with_color(requirement, project_root, slug, purple_allowed);
+    write_project_context(project_root, &ctx);
+    ctx
+}
+
+/// Best-effort write of the context to [`GOVERNANCE_CONTEXT_REL`]. Fail-open: an unwritable
+/// `.umadev/` is swallowed, and the readers then default to full strictness.
+fn write_project_context(project_root: &std::path::Path, ctx: &umadev_governance::ProjectContext) {
+    let dir = project_root.join(".umadev");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        if let Ok(json) = serde_json::to_string_pretty(ctx) {
+            let _ = std::fs::write(dir.join("governance-context.json"), json);
+        }
+    }
 }
 
 /// Whether an architecture doc (already lowercased) declares a real server /

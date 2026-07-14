@@ -19,7 +19,7 @@
 //! principle — not an aspiration. The governance-derived articles (icons /
 //! colors / secrets / sensitive paths) cite the exact clause id the kernel
 //! blocks on; the craft articles mirror the firmware's own wording
-//! ([`crate::experts::ANTI_SLOP_LAW`] / [`crate::experts::agentic_engineering_rules`]).
+//! ([`crate::experts::anti_slop_law`] / [`crate::experts::agentic_engineering_rules`]).
 //! A unit test in this module asserts the cited governance rules really fire on a
 //! violating sample, so the charter can never promise a rule that isn't enforced.
 //!

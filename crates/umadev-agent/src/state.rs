@@ -307,6 +307,7 @@ mod tests {
         let plan = Plan {
             steps: vec![
                 PlanStep {
+                    files: crate::plan_state::StepFiles::default(),
                     id: "scaffold".into(),
                     title: "Scaffold the app".into(),
                     seat: Seat::FrontendEngineer,
@@ -317,6 +318,7 @@ mod tests {
                     status: StepStatus::Done,
                 },
                 PlanStep {
+                    files: crate::plan_state::StepFiles::default(),
                     id: "auth".into(),
                     title: "Add email auth".into(),
                     seat: Seat::BackendEngineer,

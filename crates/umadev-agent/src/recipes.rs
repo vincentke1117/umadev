@@ -830,6 +830,7 @@ mod tests {
 
     fn done_build_step(id: &str, seat: Seat, title: &str, files: &[&str]) -> PlanStep {
         PlanStep {
+            files: crate::plan_state::StepFiles::default(),
             id: id.to_string(),
             title: title.to_string(),
             seat,

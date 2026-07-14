@@ -105,6 +105,15 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
         config_path,
         opts.project_root.clone(),
     );
+    // WORKSPACE INTEGRITY, said to the person it concerns. The startup heal already ran
+    // (in `main`, before the terminal was taken over) — it may have put the user's source
+    // tree back after a run was killed mid-rewind, or found a rewind it could NOT undo.
+    // Its `eprintln!` is about to be wiped by the alternate screen and its `tracing::warn!`
+    // goes to a log file, so drain the notes into the transcript instead: this is the one
+    // surface the user is actually looking at. Fail-open: no notes → nothing shown.
+    for note in umadev_agent::checkpoint::take_workspace_notices() {
+        app.push_workspace_notice(note);
+    }
 
     // Install a panic hook BEFORE entering raw mode. If anything in the
     // event loop panics, the default hook would print the backtrace but
@@ -3845,6 +3854,29 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
         interactive,
         approval_holder,
     } = turn;
+
+    // ── THE TREE IS IN THE PAST: DRIVE NOTHING ───────────────────────────────────
+    // This is a WRITE-CAPABLE path — the base reaches for `Write`/`Edit` whenever it
+    // decides to, and `react_to_first_write` promotes the turn to a build the moment it
+    // does. So the halt that `/run` has always honoured has to hold HERE too, on the
+    // surface most users actually live on. It did not: a heal that stood down raised the
+    // flag, the user typed "fix the login bug" into chat, and the base wrote onto a tree
+    // stuck at an earlier checkpoint — while `checkpoint.temp_rewind_unrecoverable` was
+    // literally promising them "no further work will be driven onto this tree until it is
+    // back at the present".
+    //
+    // Same note, same wording, same escape as the director halt (ONE definition —
+    // `checkpoint::workspace_in_past_note`). Refusing the turn is the whole point: the
+    // base cannot be trusted to only READ, and a tree in the past gives it the wrong file
+    // contents to reason from even when it does. The user is never locked out — slash
+    // commands are dispatched BEFORE this (`try_slash_command`), and the way out
+    // (`umadev doctor --fix`) is a separate process the halt cannot reach.
+    if let Some(note) = umadev_agent::checkpoint::workspace_in_past_note(&project_root) {
+        umadev_agent::checkpoint::record_workspace_notice(note.clone());
+        sink.emit(EngineEvent::Note(note.clone()));
+        let _ = route_tx.send(RouteDecision::Failed(note));
+        return;
+    }
 
     // RELAY a pending base `AskUserQuestion`: if a PRIOR turn surfaced a structured
     // question, the user's reply this turn is their ANSWER — resolve a bare option
@@ -8598,6 +8630,15 @@ async fn event_loop(
                 // syscall; a real change runs the EXACT same heal as a delivered
                 // Event::Resize. Fail-open: a failed size query changes nothing,
                 // and an unchanged size never clears (no per-frame flicker).
+                // Workspace-integrity notes raised MID-SESSION (a run taking the
+                // single-writer lock heals the tree first — `RunLock::acquire_for_run`).
+                // They are raised deep inside the engine, off the event stream, so drain
+                // them onto the transcript here. Cheap: an uncontended lock on an empty
+                // vec; empty on every tick but the one that matters.
+                for note in umadev_agent::checkpoint::take_workspace_notices() {
+                    app.push_workspace_notice(note);
+                    draw_now = true;
+                }
                 let polled = terminal.size().ok().map(|s| (s.width, s.height));
                 if size_poll_detected_resize(last_known_size, polled) {
                     apply_resize_heal(&mut last_resize_at);
@@ -13031,6 +13072,44 @@ mod tests {
             false,
             true,
         ));
+    }
+
+    #[test]
+    fn the_chat_write_path_refuses_a_tree_that_is_in_the_past() {
+        // MED-2. The workspace-in-the-past halt was read ONLY inside the `/run` director
+        // loop. But the DEFAULT surface is chat — `drive_chat_session_turn`, which is
+        // WRITE-CAPABLE (`react_to_first_write` promotes the turn to a build the moment the
+        // base reaches for `Write`/`Edit`) and had zero halt checks. So: the heal stands
+        // down, the flag goes up, the user types "fix the login bug" in chat, and the base
+        // writes onto a tree stuck in the past — while `checkpoint.temp_rewind_unrecoverable`
+        // is literally promising them "no further work will be driven onto this tree until
+        // it is back at the present".
+        //
+        // The guard is `checkpoint::workspace_in_past_note` — the SAME one definition the
+        // director halt reads, so the two surfaces cannot drift apart in wording or in the
+        // escape they name. This test locks the CONTRACT that guard is built on: it answers
+        // for a stranded root, and — the mirror image — it stays silent on a healthy one, so
+        // ordinary chat is never blocked.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        assert!(
+            umadev_agent::checkpoint::workspace_in_past_note(root).is_none(),
+            "a healthy tree must never have its chat turn refused"
+        );
+
+        umadev_agent::checkpoint::mark_workspace_in_past(
+            root,
+            umadev_agent::checkpoint::InPastReason::Unrecoverable,
+        );
+        let note = umadev_agent::checkpoint::workspace_in_past_note(root)
+            .expect("a stranded tree halts the chat write path");
+        assert!(!note.is_empty());
+        assert!(
+            note.contains("umadev doctor"),
+            "the refusal must be ACTIONABLE — it names the way out: {note}"
+        );
+        umadev_agent::checkpoint::clear_workspace_in_past(root);
+        assert!(umadev_agent::checkpoint::workspace_in_past_note(root).is_none());
     }
 
     /// Models the reported stale-post-run chat session: its FIRST turn fails with an

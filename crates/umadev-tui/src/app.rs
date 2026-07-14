@@ -3336,6 +3336,18 @@ impl App {
         }
     }
 
+    /// Show a workspace-integrity note in the transcript as a system row.
+    ///
+    /// The recovery paths that raise these (a run killed inside a temporary evidence
+    /// rewind → the tree put back, or a tree we could NOT put back) run before any UI
+    /// exists, so they can only leave the note behind them
+    /// (`umadev_agent::checkpoint::take_workspace_notices`). Under the TUI a
+    /// `tracing::warn!` goes to a log file and a startup `eprintln!` is wiped by the
+    /// alternate screen — this is the surface the user actually reads.
+    pub fn push_workspace_notice(&mut self, note: impl Into<String>) {
+        self.push(ChatRole::System, note);
+    }
+
     fn push(&mut self, role: ChatRole, body: impl Into<String>) {
         self.history.push_back(ChatMessage {
             role,
@@ -18309,6 +18321,7 @@ mod tests {
         // Persist a plan + workflow-state exactly as an interrupted /run leaves.
         let plan = umadev_agent::Plan {
             steps: vec![umadev_agent::PlanStep {
+                files: umadev_agent::StepFiles::default(),
                 id: "a".into(),
                 title: "build the login page".into(),
                 seat: umadev_agent::Seat::FrontendEngineer,
@@ -19053,6 +19066,7 @@ mod tests {
         // requirement — exactly what an interrupted /run leaves behind.
         let plan = umadev_agent::Plan {
             steps: vec![umadev_agent::PlanStep {
+                files: umadev_agent::StepFiles::default(),
                 id: "a".into(),
                 title: "build the login page".into(),
                 seat: umadev_agent::Seat::FrontendEngineer,
@@ -19165,6 +19179,7 @@ mod tests {
         // A resumable run exists on disk (what an interrupted /run leaves behind).
         let plan = umadev_agent::Plan {
             steps: vec![umadev_agent::PlanStep {
+                files: umadev_agent::StepFiles::default(),
                 id: "s2".into(),
                 title: "wire auth API".into(),
                 seat: umadev_agent::Seat::BackendEngineer,
@@ -20914,6 +20929,42 @@ mod tests {
         let joined = app.overlay.as_ref().unwrap().lines.join("\n");
         assert!(joined.contains("model        gpt-live-session (reported by the base)"));
         assert!(!joined.contains("gpt-static-config"));
+    }
+
+    #[test]
+    fn a_workspace_recovery_note_lands_in_the_transcript() {
+        // The heal that puts a user's source tree back (after a run was killed inside a
+        // temporary evidence rewind) runs before any UI exists — under the TUI its
+        // `tracing::warn!` goes to a log FILE and its startup `eprintln!` is wiped by the
+        // alternate screen. So it spoke to nobody. The note now travels through the
+        // workspace-notice queue onto the transcript, which is the surface the user reads.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut app = App::new(
+            "demo".to_string(),
+            UserConfig::default(),
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        let before = app.history.len();
+
+        umadev_agent::checkpoint::record_workspace_notice("workspace restored: …".to_string());
+        let notices = umadev_agent::checkpoint::take_workspace_notices();
+        assert!(
+            notices.iter().any(|n| n.contains("workspace restored")),
+            "the queue carries the note across the surface boundary"
+        );
+        for note in notices {
+            app.push_workspace_notice(note);
+        }
+
+        assert_eq!(
+            app.history.len(),
+            before + 1,
+            "the note is IN the transcript"
+        );
+        let row = app.history.back().expect("row");
+        assert!(matches!(row.role, ChatRole::System));
+        assert!(row.kind.as_text().contains("workspace restored"));
     }
 
     #[test]

@@ -20,6 +20,10 @@
 //!    non-root npm operation on that prefix, including the user's *other* global
 //!    packages — and the "installed locally, so the command is not on PATH"
 //!    confusion (`npm i umadev` without `-g` → run it via `npx umadev`).
+//! 10. Stale temp-rewind marker (`check_workspace_rewind_marker`) — the ONE condition
+//!     that can wedge UmaDev permanently: a marker naming a snapshot the workspace can no
+//!     longer identify makes every `umadev run` abort on every start, forever. This is the
+//!     only check that can REPAIR (with `--fix`), and it repairs only that.
 //!
 //! The hook check (7) was added in 4.6 alongside the restored real-time
 //! governance hook (`umadev install`). When `.claude/settings.json` exists
@@ -65,15 +69,21 @@ impl Status {
 
 /// Run every doctor check, returning the rows in a stable order.
 ///
+/// `fix` lets the checks that CAN repair themselves do so. Today that is exactly one — the
+/// stale rewind marker ([`check_workspace_rewind_marker`]), which is the only condition that
+/// can permanently wedge the product with no way out. Every other check is read-only, with
+/// or without the flag.
+///
 /// Async because the backend check now spawns a real `<base> --version` probe
 /// (via `umadev_host::probe_all`) so it agrees with the run path instead of a
 /// PATH-only heuristic. Fail-open: a probe error degrades to a Warning row,
 /// never a hard failure.
-pub async fn run_all(workspace: &Path) -> Vec<CheckResult> {
+pub async fn run_all(workspace: &Path, fix: bool) -> Vec<CheckResult> {
     let mut results = vec![
         check_binary_identity(),
         check_embedded_spec(),
         check_workspace_writable(workspace),
+        check_workspace_rewind_marker(workspace, fix),
         check_spec_manifest(workspace),
     ];
     results.push(check_ai_backends().await);
@@ -695,6 +705,55 @@ fn check_workspace_writable(workspace: &Path) -> CheckResult {
     }
 }
 
+/// Check: a STALE TEMP-REWIND MARKER — the one condition that can wedge UmaDev permanently,
+/// and the only check here that can repair anything.
+///
+/// The failure it catches: a marker left by a killed run, plus a `.umadev/checkpoints.git`
+/// the user has since deleted (to reclaim disk, or by rsyncing the workspace without it).
+/// The heal then finds a recorded head it cannot identify, correctly refuses to `reset --hard`
+/// the work-tree to an unvalidated ref, and raises the workspace-in-the-past halt — on EVERY
+/// process start. Every `umadev run` aborts immediately, forever. No verb cleared it, and this
+/// doctor did not even look for it; the only escape was hand-`rm`ing a file nothing ever
+/// mentioned.
+///
+/// The discrimination is the whole check, and it is not symmetric:
+/// - **Recoverable** (the head IS a known checkpoint) → PASS, and `--fix` deliberately leaves
+///   it ALONE. That marker is the only map back to the user's present; deleting it would strand
+///   them in the past permanently, which is the mirror image of the bug being fixed.
+/// - **Unrecoverable** (the head names nothing this workspace can identify) → FAIL, with the
+///   repair named. `--fix` deletes the marker and clears the halt. It touches no file in the
+///   work-tree — it only stops UmaDev from re-raising a stop it can never act on.
+///
+/// Fail-open: an unreadable marker is treated as unrecoverable (it is — nothing can act on it).
+fn check_workspace_rewind_marker(workspace: &Path, fix: bool) -> CheckResult {
+    use umadev_agent::checkpoint::TempRewindState;
+    let name = umadev_i18n::tl("doctor.rewind_marker_name").to_string();
+    match umadev_agent::checkpoint::clear_temp_rewind_state(workspace, !fix) {
+        TempRewindState::Clean => CheckResult {
+            name,
+            status: Status::Passed,
+            detail: umadev_i18n::tl("doctor.rewind_marker_clean").to_string(),
+        },
+        // The automatic heal can still do this itself — say so, and do NOT remove the marker
+        // it needs. This is a PASS: nothing is broken, a restart genuinely fixes it.
+        TempRewindState::Recoverable { head } => CheckResult {
+            name,
+            status: Status::Passed,
+            detail: umadev_i18n::tlf("doctor.rewind_marker_recoverable", &[&head]),
+        },
+        TempRewindState::ClearedUnrecoverable { head } if fix => CheckResult {
+            name,
+            status: Status::Warning,
+            detail: umadev_i18n::tlf("doctor.rewind_marker_cleared", &[&head]),
+        },
+        TempRewindState::ClearedUnrecoverable { head } => CheckResult {
+            name,
+            status: Status::Failed,
+            detail: umadev_i18n::tlf("doctor.rewind_marker_unrecoverable", &[&head]),
+        },
+    }
+}
+
 /// Pretty-print one report block.
 #[must_use]
 pub fn render_report(workspace: &Path, results: &[CheckResult]) -> String {
@@ -918,10 +977,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_all_returns_twelve_checks_on_empty_workspace() {
+    async fn run_all_returns_thirteen_checks_on_empty_workspace() {
         let tmp = TempDir::new().unwrap();
-        let results = run_all(tmp.path()).await;
-        assert_eq!(results.len(), 12);
+        let results = run_all(tmp.path(), false).await;
+        assert_eq!(results.len(), 13);
         // No FAILs on a clean workspace — only a manifest WARN.
         assert!(results.iter().all(|r| r.status != Status::Failed));
         // The "AI host backends" check warns iff no base CLI is on PATH, and the
@@ -1001,7 +1060,7 @@ mod tests {
         umadev_agent::SpecManifest::new("demo")
             .write_to(tmp.path(), false)
             .unwrap();
-        let results = run_all(tmp.path()).await;
+        let results = run_all(tmp.path(), false).await;
         // Everything passes except the env-dependent checks: the backend check
         // warns when no base CLI is installed (e.g. in CI), and the Claude
         // non-interactive auth check warns when claude-code is the ambient
@@ -1017,7 +1076,7 @@ mod tests {
     #[tokio::test]
     async fn render_report_includes_counts() {
         let tmp = TempDir::new().unwrap();
-        let results = run_all(tmp.path()).await;
+        let results = run_all(tmp.path(), false).await;
         let report = render_report(tmp.path(), &results);
         assert!(report.contains("passed"));
         assert!(report.contains("failed"));
@@ -1029,7 +1088,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join(".claude")).unwrap();
         fs::write(tmp.path().join(".claude/settings.json"), r#"{"hooks":{}}"#).unwrap();
-        let results = run_all(tmp.path()).await;
+        let results = run_all(tmp.path(), false).await;
         let hook_check = results
             .iter()
             .find(|r| r.name == "Claude Code hook")
@@ -1047,7 +1106,7 @@ mod tests {
             r#"{"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"command":"umadev hook pre-write"}]}]}}"#,
         )
         .unwrap();
-        let results = run_all(tmp.path()).await;
+        let results = run_all(tmp.path(), false).await;
         let hook_check = results
             .iter()
             .find(|r| r.name == "Claude Code hook")
@@ -1284,5 +1343,44 @@ mod tests {
         let r = check_claude_hook(tmp.path());
         assert_eq!(r.status, Status::Warning);
         assert!(r.detail.contains("not valid JSON"), "{}", r.detail);
+    }
+
+    #[test]
+    fn the_rewind_marker_check_detects_the_permanent_halt_and_fix_clears_it() {
+        // MED-4. `umadev doctor` did not even LOOK for the one condition that permanently
+        // wedges the product — a stale marker whose snapshot the workspace can no longer
+        // identify, which aborts every `umadev run` on every start with no verb to clear it.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // A clean workspace: nothing to say.
+        let clean = check_workspace_rewind_marker(root, false);
+        assert_eq!(clean.status, Status::Passed);
+
+        // A marker naming a head this workspace cannot identify (no shadow repo at all —
+        // the user deleted `.umadev/checkpoints.git` to reclaim disk).
+        let marker = root.join(".umadev").join("temp-rewind.json");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(
+            &marker,
+            r#"{"head":"deadbee","to":"cafe123","pid":0,"started_at":1}"#,
+        )
+        .unwrap();
+
+        // Without `--fix` it is a FAILURE that names the repair — and changes nothing.
+        let broken = check_workspace_rewind_marker(root, false);
+        assert_eq!(broken.status, Status::Failed);
+        assert!(broken.detail.contains("deadbee"), "{}", broken.detail);
+        assert!(marker.exists(), "a report must not mutate anything");
+
+        // With `--fix` the lockout is lifted.
+        let fixed = check_workspace_rewind_marker(root, true);
+        assert_eq!(fixed.status, Status::Warning);
+        assert!(!marker.exists(), "the stale marker is gone");
+        // …and it is idempotent.
+        assert_eq!(
+            check_workspace_rewind_marker(root, true).status,
+            Status::Passed
+        );
     }
 }

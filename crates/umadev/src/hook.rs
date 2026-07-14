@@ -244,6 +244,17 @@ fn run_pre_write_scoped(
 /// the strict default. We never relax governance because we *couldn't read* the
 /// context; only an explicit, parseable static-frontend context loosens the
 /// surface rules.
+///
+/// **A context with no provenance is not honoured either** ([`ProjectContext::if_current`]):
+/// an unstamped file (hand-written, or from a build that predates the stamp) has nothing to
+/// date it or attribute it to, so it cannot stand a rule down.
+///
+/// Unlike `umadev ci`, the hook does NOT cross-check the stamp against the workspace's
+/// recorded requirement — it fires DURING a run, in the window where the run has already
+/// written the context for the requirement in flight while `workflow-state.json` may still
+/// name the previous one. Matching there would strictly-block the very requirement the run
+/// is honouring. The age fallback is the right bound for this surface, and the stakes are
+/// low: the hook blocks nothing but the irreversible floor anyway (see [`pre_write`]).
 fn load_project_context(file_path: &str) -> ProjectContext {
     let Some(root) = find_project_root(file_path) else {
         return ProjectContext::unknown();
@@ -254,7 +265,17 @@ fn load_project_context(file_path: &str) -> ProjectContext {
     };
     // Malformed / partial JSON → strict default. `#[serde(default)]` on the
     // field also means a `{}` document deserializes to the strict default.
-    serde_json::from_str::<ProjectContext>(&raw).unwrap_or_else(|_| ProjectContext::unknown())
+    let ctx =
+        serde_json::from_str::<ProjectContext>(&raw).unwrap_or_else(|_| ProjectContext::unknown());
+    ctx.if_current(now_secs(), None)
+}
+
+/// UNIX seconds, or 0 when the clock is unreadable (which ages every unstamped context out
+/// — the strict direction).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Find the project root for `file_path`: the nearest ancestor directory that
@@ -1407,6 +1428,10 @@ mod tests {
     /// Build a temp project root with a `.umadev/governance-context.json` holding
     /// the given `static_frontend_only` value. Returns the TempDir (keep alive)
     /// and its absolute path.
+    ///
+    /// STAMPED, as a real run writes it: an unstamped context has no provenance and is
+    /// downgraded to full strictness on read (see [`load_project_context`]), so a fixture
+    /// without the stamp would silently stop testing the lenient path at all.
     fn project_with_context(static_frontend_only: bool) -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::TempDir::new().unwrap();
         // Canonicalize so the path the hook reconstructs (via ancestors) matches
@@ -1414,12 +1439,54 @@ mod tests {
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let dir = root.join(".umadev");
         std::fs::create_dir_all(&dir).unwrap();
+        let ctx = if static_frontend_only {
+            ProjectContext::static_frontend()
+        } else {
+            ProjectContext::unknown()
+        }
+        .derived_from("a static frontend page", now_secs());
         std::fs::write(
             dir.join("governance-context.json"),
-            format!("{{\"static_frontend_only\":{static_frontend_only}}}"),
+            serde_json::to_string(&ctx).unwrap(),
         )
         .unwrap();
         (tmp, root)
+    }
+
+    #[test]
+    fn an_unstamped_or_ancient_context_is_not_honoured_by_the_hook() {
+        // A context is a PERMISSION, and a permission with no provenance belongs to nobody:
+        // a `{"static_frontend_only":true}` blob anyone could drop in must not stand the
+        // server-surface rules down, and neither must one from a run months ago that no
+        // longer describes this workspace.
+        let (_tmp, root) = project_with_context(true);
+        let ctx_path = root.join(".umadev").join("governance-context.json");
+
+        std::fs::write(&ctx_path, r#"{"static_frontend_only":true}"#).unwrap();
+        assert!(
+            !load_project_context(&root.join("index.html").to_string_lossy()).static_frontend_only,
+            "an unstamped context has no provenance — it cannot stand a rule down"
+        );
+
+        let ancient = ProjectContext::static_frontend().derived_from(
+            "a static frontend page",
+            now_secs() - ProjectContext::MAX_UNMATCHED_AGE_SECS - 1,
+        );
+        std::fs::write(&ctx_path, serde_json::to_string(&ancient).unwrap()).unwrap();
+        assert!(
+            !load_project_context(&root.join("index.html").to_string_lossy()).static_frontend_only,
+            "a context too old to attribute to this workspace is not evidence"
+        );
+
+        // …while the freshly-stamped one from the fixture IS honoured (or the guard above
+        // would be vacuous).
+        let fresh =
+            ProjectContext::static_frontend().derived_from("a static frontend page", now_secs());
+        std::fs::write(&ctx_path, serde_json::to_string(&fresh).unwrap()).unwrap();
+        assert!(
+            load_project_context(&root.join("index.html").to_string_lossy()).static_frontend_only,
+            "a current context still stands the surface rules down"
+        );
     }
 
     /// JSON PreToolUse payload for a Write of `content` to absolute `path`.

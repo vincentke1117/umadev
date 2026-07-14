@@ -2,6 +2,17 @@
 
 > 纯模型产出最大的问题不是"丑"，是"**generic（千篇一律、一眼 AI）**"。区别精品与 generic 的，是 **token 背后的"为什么"** 与一套**正向的品味规则**——不是只躲开几个雷，而是主动做对。本文件随设计系统**默认绑定**，每次 UI 都生效。
 
+## 0.0 先读 `01-register.md`：本文件多数条款只对 `brand` register 生效
+
+标 `[brand]` 的条款（禁系统字体、拉大字阶、极端字重、有质感的背景、编排式入场动效、强制结构非对称）**只适用于落地/营销/作品集页**。
+把它们套到 dashboard / admin / 设置页 / 开发者工具上，是在**主动把产品做坏**：
+- `[product]` 里，**熟悉的中性系统字体是正确答案**（用户是来读数据的，不是来欣赏字体的）；
+- `[product]` 里，字阶是**固定 rem 比例 1.125–1.2**，层级靠字重与颜色，不靠 3 倍跳跃；
+- `[product]` 里，**没有页面入场编排**，动效只确认用户动作（≤150ms）；
+- `[product]` 里，**克制的配色是底线**，密度是优点。
+
+未标注的条款 = `[both]`，永远生效（token 纪律、对比度、真实内容、单一图标库、无 emoji 图标、禁 AI 紫）。
+
 ---
 
 ## 0. 先定方向，再写代码（最关键的一步）
@@ -19,10 +30,11 @@
 
 ## 1. 排版即身份（Typography as identity）
 
-- **不要默认 Inter / Arial / 系统字体**——它们是 AI 味的头号信号。选有性格的字体族（可配一个 display 标题字 + 一个干净正文字），用 `next/font` 或 `@font-face` 真正加载。
-- **战略性字距 letter-spacing**：大标题收紧（`-0.02em ~ -0.01em`，更自信）；全大写的小标签/eyebrow 放开（`0.06em ~ 0.1em`）；正文 `0`。
-- **模块化字阶**（用比例而非随手取值）：1.2（紧凑/数据密）或 1.25（通用）；建立 `--text-xs…--text-5xl`，标题与正文**对比要拉开**（display 可到 48–96px）。
-- 正文行高 1.5–1.7，行宽 50–75 字符；标题行高 1.05–1.2。一个页面字重 ≤3 种。
+- `[brand]` **不要默认 Inter / Arial / 系统字体**——在营销页上它们是 AI 味的头号信号。选有性格的字体族（一个 display 标题字 + 一个干净正文字），用 `next/font` 或 `@font-face` 真正加载。
+- `[product]` **反过来：熟悉的中性 UI 字体（含系统字体栈）就是正确选择**，别给数据表硬塞展示字体——那是在增加认知成本，不是在提升品质。
+- **战略性字距 letter-spacing** `[both]`：大标题收紧（`-0.02em ~ -0.01em`）；全大写小标签放开（`0.06em ~ 0.1em`）；正文 `0`；下限 `-0.04em`（再紧就是挤成一团）。
+- **模块化字阶** `[both]`（用比例而非随手取值）：`[product]` 固定 1.125–1.2；`[brand]` 可拉到 1.25–1.333，display 与正文**对比要拉开**（display 可到 48–96px）。建立 `--text-xs…--text-5xl`。
+- 正文行高 1.5–1.7（下限 1.3），行宽 50–75 字符；标题行高 1.05–1.2。一个页面字重 ≤3 种；`[product]` 用 400/500/600 即可。
 
 ## 2. 色彩：主色 + 锐利强调，OKLCH 思维
 
@@ -85,35 +97,41 @@
 
 ## 10. 硬规格（battle-tested 具体值，照抄即可）
 
-**字体 reflex-reject（默认禁用，除非品牌 brief 明确点名）**
-- 被用烂的"安全默认"：`Inter / Roboto / Open Sans / Lato / Montserrat / Poppins / Nunito` — 一眼 AI。
+**`[brand]` 字体 reflex-reject（营销面默认禁用，除非品牌 brief 明确点名）**
+- 被用烂的"安全默认"：`Inter / Roboto / Open Sans / Lato / Montserrat / Poppins / Nunito` — 在落地页上一眼 AI。
 - 设计师"反射性"高级字：`Playfair Display / Fraunces / Cormorant / Space Grotesk / DM Sans` — 也别条件反射地用。
 - 正确做法：先写**三个具象品牌气质词**（"warm and mechanical and opinionated"，不是"modern"），再据此选字；display + body 在**对比轴**上配对，≤3 个字体族。
+- `[product]` **本条不适用**：应用/后台里用这些中性 UI 字体是**对的**——它们易读、字距成熟、数字有 tabular 变体。
 
-**色彩硬规格**
+**色彩硬规格** `[both]`
 - **60-30-10**（按视觉重量）：60% 中性面 / 30% 次要 / 10% 主色；accent 占视口 **≤3%**，只给最高优先 CTA。
 - 用 **OKLCH**；中性色向品牌色相偏 `+0.005~0.015` chroma（有温度的灰）。
-- **禁 AI 紫**：hue 250–310 的主色、`#7c3aed / #8b5cf6 / #a855f7 / #764ba2 / #667eea` 渐变。
+- **禁 AI 紫**：OKLCH **色相 270–320 且 chroma ≥ 0.09** 的主色/强调色（`#6366f1 #4f46e5 #8b5cf6 #7c3aed #a855f7` 及邻近色）、以及 `#667eea→#764ba2` 这类渐变。**改用**：产品自己拥有的一个色相（电蓝+青绿 / 金 / 电光黄 / 墨红…），并把对比度算出来。
 - **禁"奶油米色"带**：OKLCH `L 0.84–0.97 · C<0.06 · hue 40–100`（以及 `--paper/--cream/--sand/--linen` 这种 token 命名本身就是 tell）。
+- 每个 surface token **必须配一个 `on-` 前景**；每一对都过 WCAG（正文 4.5:1、大字/UI 3:1）——用算的，不用看的。
 - 深色模式：正文字重 −50，抬升用**更亮**不是更暗，绝不切换色相。纯 `#000/#fff` 禁用（用近黑近白）。
 
 **字体/标题硬规格**
-- hero 标题按**字数**定级：21–50 字符 = display 大字；**>90 字符 = 头号 AI tell**（拆短）。
-- display 字距下限 `≥ -0.04em`；ALL-CAPS 字距 `0.05–0.12em`；全大写行高下限 1.0；**斜体标题全局禁用**。
-- 标题与正文字重差 `≥300`；type scale 比例 `≥1.25`；正文 `≥16px`。
+- `[brand]` hero 标题按**字数**定级：21–50 字符 = display 大字；**>90 字符 = 头号 AI tell**（拆短）。
+- `[both]` display 字距下限 `≥ -0.04em`；ALL-CAPS 字距 `0.05–0.12em`；全大写行高下限 1.0；**斜体标题全局禁用**；正文 `≥16px`（`[product]` 数据密表格可到 13–14px，但不得 <12px）。
+- `[brand]` 标题与正文字重差 `≥300`；type scale 比例 `≥1.25`。
+- `[product]` type scale 比例 **1.125–1.2**，字重 400/500/600——层级靠字重+颜色+间距，不靠尺寸暴力。
 
 **间距/层级**
 - 4pt 刻度 `4 8 12 16 24 32 48 64 96`；紧密分组 8–12px、区块分隔 48–96px。
 - 卡片栅格 `repeat(auto-fit, minmax(280px,1fr))`；z-index 用**语义命名层级**（绝不 `999/9999`）。
 
 **动效硬规格**
-- 时长桶 `120 / 220 / 420ms`（或 100/300/500）；**退场 ≈ 进场的 75%**；80ms 以下视为"瞬时"。
-- 缓动：`--ease-out: cubic-bezier(0.16,1,0.3,1)`、quart `(0.25,1,0.5,1)`、expo；**禁 bounce `(0.34,1.56,0.64,1)` / elastic 过冲**。
-- stagger `calc(var(--i)*50ms)` 封顶 500ms；`@media (prefers-reduced-motion)` 块必写；只用 transform/opacity 动，禁 animate 宽高。
+- `[both]` 时长桶 `120 / 220 / 420ms`（或 100/300/500）；**退场 ≈ 进场的 75%**；80ms 以下视为"瞬时"。
+- `[both]` 缓动：`--ease-out: cubic-bezier(0.16,1,0.3,1)`、quart `(0.25,1,0.5,1)`、expo；**禁 bounce `(0.34,1.56,0.64,1)` / elastic 过冲**（控制点越出 `[-0.1,1.1]` 即为过冲）。→ 改用上面那条真正被打磨过的 ease-out。
+- `[both]` `@media (prefers-reduced-motion)` 块必写；只用 transform/opacity 动，**禁 animate 宽/高/padding/margin**（会触发 layout）。
+- `[brand]` **把动效集中成一次编排式入场**：stagger `calc(var(--i)*50ms)` 封顶 500ms。
+- `[product]` **不要页面入场编排**：动效只确认用户动作（≤150ms）。dashboard 路由上出现 mount 动画/错峰 reveal 就是缺陷。
 
 **结构变化（AI 指纹的真正来源）**
-- "**对称读作'生成的'，非对称读作'有意的'**"。先选一个具名的**页面骨架/导航/页脚**原型再写代码；同一产品多页不要重复同一种骨架。
-- 图标当作排版：同一页只用一套图标库、同一描边粗细。
+- `[brand]` "**对称读作'生成的'，非对称读作'有意的'**"。先选一个具名的**页面骨架/导航/页脚**原型再写代码；同一产品多页不要重复同一种骨架。
+- `[product]` 反过来：**常规位置就是对的**——导航放在用户的手已经在的地方，别为了"不一样"而重排。
+- `[both]` 图标当作排版：**声明一套图标库 + 一种描边粗细**，全站不混用；禁 emoji 当图标；禁手搓装饰性 SVG。**具体选哪一套库是每个 pack / 每个产品自己的决定，没有全局默认**——一个被全体钦定的图标库本身就是"千篇一律"的来源。
 
 **文案 tells（出现即扣分）**
 - 营销空话：`streamline / empower / supercharge / world-class / enterprise-grade / seamless / cutting-edge`。
@@ -130,20 +148,27 @@
 `modern-minimal · editorial-clean · tech-utility(terminal/data-dense) · soft-warm · bold-geometric · brutalist-bold(swiss/tactical) · glass-aurora · premium-luxury` —— 选定后写一行 **AVOID**（明确这个产品**不**走哪个方向）。
 
 **10 条硬拒绝（出现即重做）**：
-1. 不用默认 teal `#16d5e6` / 默认 indigo-blue 作主色（除非 brief 点名）。
-2. **只用一个** accent；第二个强调色 = 失败。
-3. 容器嵌套深度 **≤2**（卡中卡中卡 = 失败）。
-4. 主字体不用 Inter/Roboto/Arial/Helvetica（brutalist 档的 Helvetica 例外）。
-5. Hero 里不放 3 列等宽 feature 卡网格。
-6. 一个页面只用**一套**图标库；能用纯排版表达就别堆图标网格。
-7. 深色背景上不放紫→粉/靛紫渐变。
-8. 不用"玻璃卡堆叠"当 hero（除非 glass-aurora 档且克制）。
-9. 动效只为表意，且必带 `prefers-reduced-motion`。
-10. 文案产品专属，不用占位/buzzword/编造指标。
+1. `[both]` 不用默认 teal `#16d5e6` / 默认 indigo-blue 作主色（除非 brief 点名）。
+2. `[both]` **只用一个** accent；第二个强调色 = 失败。
+3. `[both]` 容器嵌套深度 **≤2**（卡中卡中卡 = 失败）。
+4. `[brand]` 主字体不用 Inter/Roboto/Arial/Helvetica（brutalist 档的 Helvetica 例外）。`[product]` **本条不适用**——中性 UI 字体就是正解。
+5. `[brand]` Hero 里不放 3 列等宽 feature 卡网格。
+6. `[both]` 一个页面只用**一套**图标库、一种描边；能用纯排版表达就别堆图标网格。
+7. `[both]` 深色背景上不放紫→粉/靛紫渐变。
+8. `[brand]` 不用"玻璃卡堆叠"当 hero（除非 glass-aurora 档且克制）。
+9. `[both]` 动效只为表意，且必带 `prefers-reduced-motion`。`[product]` 额外：无入场编排。
+10. `[both]` 文案产品专属，不用占位/buzzword/编造指标。
 
 **成败判据（thumbnail test）**：把成品缩成缩略图，**不应与任何其它 AI 生成的项目雷同**——一眼能认出是"这个产品"，而不是"又一个 AI 页面"。
 
-**生成顺序（每步定了再下一步）**：① Design Read 一句话(什么页面/给谁/什么气质/选哪个家族) → ② 锁 token 表(OKLCH/hex + 字体 + 图标库 + 间距/圆角) → ③ 布局骨架(可先 ASCII 线框) + 动效规格 → ④ 才写实现，只引用已锁 token。
+**生成顺序（每步定了再下一步，不许跳步直接写 token）**：
+① **Visual direction**（写进 UIUX 文档的 `## Visual direction` 段，这是 `design-direction` 计划步的验收物）——
+  a. **Design read 一句话**：什么页面 / 给谁 / **register(`brand` 还是 `product`)** / 什么气质 / 选哪个家族。
+  b. **三个被逼出来的决定**：① 用色承诺度（`restrained | committed | full-palette | drenched`）；② 明暗由**一个物理场景句**决定（谁在用、在哪、什么环境光、什么情绪——如果这句话逼不出明或暗，就把场景写得更具体）；③ **2–3 个具名锚点参照，每个绑定到一个具体维度**（密度参照一个、排版参照另一个、留白参照第三个）——"modern / clean / 现代感"这类形容词一律不算数，会被打回。
+  c. **Anti-goals**：这个产品明确**不**走哪几个方向。
+② 锁 token 表（OKLCH + 每个 surface 配 `on-` 前景 + 字体 + 图标库/描边 + 间距/圆角/动效时长）。
+③ 布局骨架（可先 ASCII 线框）+ 动效规格。
+④ 才写实现，只引用已锁 token。
 
 ## 12. 交付前自评门（pre-emit self-critique，必做）
 

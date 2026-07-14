@@ -517,6 +517,20 @@ mod tests {
             // Continuous long-session path: CLI prints + TUI block notes + the
             // phase-progress and role-team review notes swept out of hard-coded
             // (mostly zh-only) literals in main.rs / tui lib.rs / continuous.rs.
+            // Workspace-integrity recovery: a run killed inside a temporary evidence
+            // rewind left the user's tracked source in the past; the next start puts
+            // it back and says so.
+            "checkpoint.temp_rewind_recovered",
+            "checkpoint.temp_rewind_recovered_with_edits",
+            "checkpoint.temp_rewind_recovery_failed",
+            "checkpoint.temp_rewind_unrecoverable",
+            // The heal snapshots the CURRENT tree before it resets it back to the
+            // present. A snapshot it could not take means it stands down (it must
+            // never overwrite work the user redid by hand while the tree sat in the
+            // past); an in-process restore it could not do means the run STOPS.
+            "checkpoint.temp_rewind_snapshot_failed",
+            "checkpoint.temp_rewind_restore_failed",
+            "checkpoint.workspace_in_past_halt",
             "continuous.session_active",
             "continuous.session_unavailable",
             "continuous.auto_gate_resumed",

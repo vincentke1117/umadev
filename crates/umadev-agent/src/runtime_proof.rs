@@ -160,6 +160,21 @@ pub struct RuntimeProof {
     pub routes: Vec<RouteProbe>,
     /// Optional e2e step outcome (`None` when no e2e suite was detected).
     pub e2e: Option<E2eResult>,
+    /// **FRESHNESS STAMP** — the fingerprint of the source tree this proof describes
+    /// ([`crate::freshness::workspace_fingerprint`]), taken when the proof was
+    /// produced.
+    ///
+    /// A runtime proof is a statement about a specific state of the code: *this* tree
+    /// booted and *these* routes answered. The moment the source changes, the proof
+    /// stops describing what we are about to ship. Consumers re-fingerprint the tree
+    /// and compare: a mismatch means the proof is STALE and must not be read as
+    /// today's evidence ([`crate::freshness::is_stale`]).
+    ///
+    /// `None` on an artifact written before the stamp existed (or where the tree could
+    /// not be walked) — an unknown, which fail-open treats as "not stale".
+    /// `#[serde(default)]` so an older `runtime-proof.json` still loads.
+    #[serde(default)]
+    pub source_fingerprint: Option<String>,
 }
 
 /// Outcome of the optional e2e suite (Playwright / Cypress / `test:e2e`).
@@ -188,7 +203,17 @@ impl RuntimeProof {
             ready_ms: None,
             routes: Vec::new(),
             e2e: None,
+            source_fingerprint: None,
         }
+    }
+
+    /// Whether this proof is STALE against `root` as the tree stands NOW — the source
+    /// changed after the proof was taken, so it no longer describes the code we are
+    /// about to ship. Fail-open: an unstamped proof is never stale (see
+    /// [`crate::freshness::is_stale`]).
+    #[must_use]
+    pub fn is_stale(&self, root: &Path) -> bool {
+        crate::freshness::is_stale(root, self.source_fingerprint.as_deref())
     }
 
     /// A neutral, language-agnostic one-line summary (the binary localizes the
@@ -213,7 +238,21 @@ impl RuntimeProof {
 /// [`RuntimeProof`] — on any failure it degrades to
 /// [`RuntimeStatus::NotVerified`] with a reason, never an `Err`/panic. This is
 /// the single entry point the CLI / runner call.
+///
+/// The returned proof is STAMPED with the fingerprint of the source tree it describes
+/// (`source_fingerprint`), so a later reader can tell whether the code moved after the
+/// proof was taken — see [`crate::freshness`]. The stamp is taken AFTER the probe
+/// (the tree as it stands at the moment the verdict is reached), so a proof that
+/// somehow raced a concurrent write reads as stale rather than falsely fresh.
 pub async fn run_runtime_proof(workspace: &Path) -> RuntimeProof {
+    let mut proof = run_runtime_proof_unstamped(workspace).await;
+    proof.source_fingerprint = crate::freshness::workspace_fingerprint(workspace);
+    proof
+}
+
+/// The runtime-proof flow itself (see [`run_runtime_proof`], which stamps its result
+/// with the source fingerprint).
+async fn run_runtime_proof_unstamped(workspace: &Path) -> RuntimeProof {
     // 0. `curl` is the readiness/probe transport. No curl → cannot verify.
     if !has_curl() {
         return RuntimeProof::not_verified("curl not found on PATH");
@@ -407,6 +446,8 @@ async fn finish_proof(
         ready_ms,
         routes: Vec::new(),
         e2e: None,
+        // Stamped by `run_runtime_proof` once the whole flow settles (see there).
+        source_fingerprint: None,
     };
 
     // Probe the documented routes (from the contract), else just the root.
@@ -1725,6 +1766,7 @@ mod tests {
     #[test]
     fn verified_summary_counts_ok_routes() {
         let proof = RuntimeProof {
+            source_fingerprint: None,
             timestamp: "2026-06-22T00:00:00Z".into(),
             status: RuntimeStatus::Verified,
             dev_server: Some("Vite dev server".into()),

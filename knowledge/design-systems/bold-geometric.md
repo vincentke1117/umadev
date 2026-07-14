@@ -5,8 +5,11 @@ domain: design-systems
 category: design-systems
 difficulty: intermediate
 tags: [bold, color, component, design-systems, geometric, layout, palette, patterns]
+register: [brand]
+icon-library: Tabler
+icon-stroke: 2
 quality_score: 70
-last_updated: 2026-06-15
+last_updated: 2026-07-14
 ---
 # Bold Geometric
 
@@ -20,33 +23,66 @@ Creative agencies, product launches, marketing landing pages, portfolios, brand 
 
 ```css
 :root {
-  --color-bg: #000000;
-  --color-surface: #111111;
-  --color-surface-elevated: #1a1a1a;
-  --color-surface-sunken: #000000;
-  --color-text: #ffffff;
-  --color-text-secondary: #999999;
-  --color-text-tertiary: #666666;
-  --color-primary: #ff6b35;
-  --color-primary-hover: #ff8555;
-  --color-primary-muted: rgba(255, 107, 53, 0.15);
-  --color-accent: #00d4aa;
-  --color-success: #00d4aa;
-  --color-warning: #ffb800;
-  --color-error: #ff4444;
-  --color-border: #222222;
-  --color-border-hover: #444444;
-  --color-border-focus: #ff6b35;
-  --shadow-glow: 0 0 40px rgba(255, 107, 53, 0.15);
+  /* Surfaces + paired foregrounds — every pair clears WCAG AA */
+  --color-bg: oklch(14.5% 0.002 286.1);          /* off-black, never pure #000 */
+  --color-on-bg: oklch(100% 0 0);
+  --color-surface: oklch(19.2% 0.004 286.0);
+  --color-on-surface: oklch(100% 0 0);
+  --color-card: oklch(22.8% 0.006 285.9);
+  --color-on-card: oklch(91.4% 0.004 286.3);
+  --color-muted: oklch(17.9% 0.004 286.0);
+  --color-on-muted: oklch(68.8% 0.009 286.2);
+
+  /* One dominant + one sharp accent (brand register: commit) */
+  --color-primary: oklch(70.5% 0.193 39.2);      /* signal orange */
+  --color-on-primary: oklch(19.2% 0.048 45.8);
+  --color-primary-hover: oklch(76.0% 0.170 39.2);
+  --color-accent: oklch(77.5% 0.151 171.7);      /* electric teal */
+  --color-on-accent: oklch(23.8% 0.041 176.1);
+
+  --color-success: oklch(77.5% 0.151 171.7);
+  --color-on-success: oklch(23.8% 0.041 176.1);
+  --color-warning: oklch(82.7% 0.171 80.5);
+  --color-on-warning: oklch(24.4% 0.050 85.4);
+  --color-error: oklch(69.1% 0.199 23.9);
+  --color-on-error: oklch(19.7% 0.063 25.1);
+
+  --color-border: oklch(24.0% 0.005 286.0);
+  --color-border-hover: oklch(37.0% 0.006 286.1);
+  --color-border-focus: oklch(70.5% 0.193 39.2);
+
+  /* Type scale — brand register: dramatic jumps carry the hierarchy */
+  --text-xs: 0.75rem; --text-sm: 0.875rem; --text-base: 1rem;
+  --text-lg: 1.25rem; --text-xl: 1.75rem; --text-2xl: 2.5rem;
+  --text-3xl: 3.75rem; --text-display: 6rem;
+
+  /* Spacing — 4pt grid */
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
+  --space-6: 24px; --space-8: 32px; --space-12: 48px; --space-16: 64px;
+  --space-24: 96px;
+
+  --radius-sm: 0px; --radius-md: 2px; --radius-lg: 4px; --radius-full: 9999px;
+
+  --duration-fast: 150ms;
+  --duration-normal: 260ms;
+  --duration-reveal: 700ms;
+  --ease-standard: cubic-bezier(0.16, 1, 0.3, 1);
+
+  --shadow-glow: 0 0 40px oklch(70.5% 0.193 39.2 / 0.15);
 }
 
 @media (prefers-color-scheme: light) {
   :root {
-    --color-bg: #ffffff;
-    --color-surface: #f5f5f5;
-    --color-text: #000000;
-    --color-text-secondary: #555555;
-    --color-border: #e0e0e0;
+    --color-bg: oklch(97.6% 0.003 106.4); --color-on-bg: oklch(14.5% 0.002 286.1);
+    --color-surface: oklch(100% 0 0); --color-on-surface: oklch(14.5% 0.002 286.1);
+    --color-card: oklch(100% 0 0); --color-on-card: oklch(35.0% 0.005 286.1);
+    --color-muted: oklch(94.9% 0.003 106.5); --color-on-muted: oklch(42.2% 0.007 286.1);
+    --color-primary: oklch(55.3% 0.174 38.4); --color-on-primary: oklch(100% 0 0);
+    --color-accent: oklch(47.2% 0.088 174.6); --color-on-accent: oklch(100% 0 0);
+    --color-success: oklch(47.2% 0.088 174.6); --color-on-success: oklch(100% 0 0);
+    --color-warning: oklch(50.8% 0.108 73.3); --color-on-warning: oklch(100% 0 0);
+    --color-error: oklch(52.6% 0.190 26.8); --color-on-error: oklch(100% 0 0);
+    --color-border: oklch(88.0% 0.003 106.4);
     --shadow-glow: none;
   }
 }
@@ -66,12 +102,6 @@ Creative agencies, product launches, marketing landing pages, portfolios, brand 
 | body-lg | 1.25rem (20px) | 400 | 1.6 | 0 | Lead paragraph |
 | body | 1rem (16px) | 400 | 1.6 | 0 | Default text |
 | overline | 0.75rem (12px) | 700 | 1.2 | 0.15em | Section label, ALL CAPS |
-
-## Spacing
-
-8px base: `8 / 16 / 32 / 48 / 64 / 96 / 128 / 160`
-
-Dramatic spacing. Hero sections: 160px+ vertical padding. Section gaps: 96-128px.
 
 ## Layout
 

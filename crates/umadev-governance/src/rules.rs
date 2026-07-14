@@ -84,6 +84,72 @@ pub struct ProjectContext {
     /// strict posture, never an accidental skip.
     #[serde(default)]
     pub static_frontend_only: bool,
+
+    /// The user's own words **authorized** a purple / violet / indigo brand.
+    ///
+    /// The banned-hue band is a DEFAULT-REJECT, never a censor, and this is the ONE
+    /// permission that stands it down. It has to travel with the write governor, not
+    /// just the design floor: [`check_ai_slop`] runs inside the PreToolUse hook and the
+    /// in-process write scan, so without it a user who ASKED for a violet brand has the
+    /// write of their own palette REJECTED, with no way to stand the rule down and no
+    /// convergent fix (the design floor accepts the tokens the write governor refuses).
+    ///
+    /// **Who decides this, and where.** Not this crate, and not a word list. "Did the user
+    /// authorize this color family?" is an INTENT question — the same class as "is this turn
+    /// chat, an edit, or a build" — so the run asks the borrowed brain ONE structured
+    /// question and records the verdict here (`umadev_agent::color_permission`). It is
+    /// computed exactly ONCE, at the run door where the requirement first becomes known, and
+    /// persisted; every later reader (the PreToolUse hook, the design floor, `umadev ci`) is
+    /// a separate process with no brain and MUST read this stored decision rather than
+    /// re-derive one. A lexical reader was tried for six review rounds and leaked on every
+    /// one — a prohibition has unboundedly many phrasings, and a word list that grows to
+    /// chase them is answering the wrong question.
+    ///
+    /// **Fail direction: STRICT.** Brain unreachable, offline runtime, malformed answer,
+    /// timeout, an unstamped context, a context that predates the field — every one of them
+    /// leaves this `false` and the rule ARMED. That is not a fail-open violation: it never
+    /// blocks or crashes the host, it only declines to stand a rule DOWN. A leak writes
+    /// AI-slop into the customer's repo irreversibly; a false block is one recoverable rework.
+    #[serde(default)]
+    pub purple_allowed: bool,
+
+    /// **Provenance**: [`requirement_fingerprint`] of the requirement this context was
+    /// derived from. `0` = unknown provenance (a legacy or hand-written file).
+    ///
+    /// Without this the context is two naked bools with nothing to date or attribute them
+    /// to, and a permission is not a fact — it is a fact *about a specific requirement*. A
+    /// `purple_allowed: true` left behind by last month's violet rebrand would otherwise
+    /// stand the banned-hue band down FOREVER, including for the next requirement, whose
+    /// first line is "no purple". See [`ProjectContext::if_current`].
+    #[serde(default)]
+    pub requirement_hash: u64,
+
+    /// **Provenance**: UNIX seconds at which this context was derived. `0` = unknown (a
+    /// legacy or hand-written file). See [`ProjectContext::if_current`].
+    #[serde(default)]
+    pub derived_at: u64,
+}
+
+/// A stable, dependency-light fingerprint of the requirement a [`ProjectContext`] was
+/// derived from (FNV-1a over the trimmed bytes).
+///
+/// Not a security hash — it answers exactly one question: *is the context on disk the one
+/// this workspace's current requirement produced?* Trimmed, so trailing whitespace from a
+/// paste does not read as a different requirement. Never returns `0`, which is reserved
+/// for "no provenance recorded".
+#[must_use]
+pub fn requirement_fingerprint(requirement: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in requirement.trim().as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // 0 means "unstamped"; a real fingerprint must never collide with it.
+    if h == 0 {
+        1
+    } else {
+        h
+    }
 }
 
 impl Default for ProjectContext {
@@ -96,12 +162,21 @@ impl Default for ProjectContext {
 }
 
 impl ProjectContext {
+    /// How long a context whose requirement we CANNOT check against still counts as
+    /// current (7 days). It only bounds the un-attributable case: a context that still
+    /// matches the workspace's live requirement is current whatever its age (a violet
+    /// brand does not expire), and one that matches nothing is not evidence for long.
+    pub const MAX_UNMATCHED_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+
     /// The conservative default — context unknown, so assume a server/security
     /// surface might exist and keep every context-relevant rule on.
     #[must_use]
     pub const fn unknown() -> Self {
         Self {
             static_frontend_only: false,
+            purple_allowed: false,
+            requirement_hash: 0,
+            derived_at: 0,
         }
     }
 
@@ -112,6 +187,68 @@ impl ProjectContext {
     pub const fn static_frontend() -> Self {
         Self {
             static_frontend_only: true,
+            purple_allowed: false,
+            requirement_hash: 0,
+            derived_at: 0,
+        }
+    }
+
+    /// The same context, with the user's explicit permission for a purple/violet brand
+    /// recorded (see [`ProjectContext::purple_allowed`]).
+    #[must_use]
+    pub const fn with_purple_allowed(mut self, allowed: bool) -> Self {
+        self.purple_allowed = allowed;
+        self
+    }
+
+    /// Stamp the context with the PROVENANCE of the requirement it was derived from —
+    /// which requirement, and when. Every producer of a persisted context calls this; a
+    /// context with no stamp cannot be trusted to stand a rule down (see
+    /// [`Self::if_current`]).
+    #[must_use]
+    pub fn derived_from(mut self, requirement: &str, now: u64) -> Self {
+        self.requirement_hash = requirement_fingerprint(requirement);
+        self.derived_at = now;
+        self
+    }
+
+    /// The context AS READ FROM DISK, downgraded to [`Self::unknown`] (full strictness)
+    /// unless it is provably CURRENT.
+    ///
+    /// A persisted context is a **permission** — it stands rules down. The gates that read
+    /// it back (`umadev ci` in the pre-commit hook, the PreToolUse hook) run in a separate
+    /// process, long after the run that wrote it, with no idea what it was derived from.
+    /// So a permission with no provenance is not honoured:
+    ///
+    /// - **No stamp** (empty hash / zero timestamp — a legacy or hand-written file) →
+    ///   strict. We cannot attribute it to anything.
+    /// - **A requirement to check against** (the caller read the workspace's live
+    ///   requirement): the hashes must match. A `purple_allowed: true` derived from last
+    ///   month's "make our brand violet" must NOT stand the band down for today's "no
+    ///   purple anywhere" — and a context that DOES match today's requirement is current
+    ///   regardless of age, so the violet-branded project never gets falsely blocked.
+    /// - **Nothing to check against** (no workspace requirement on record) → the age
+    ///   fallback ([`Self::MAX_UNMATCHED_AGE_SECS`]).
+    ///
+    /// The strict direction is the safe one here: a false block on a color is loud and one
+    /// re-run from fixed, while a silently-permitted AI palette ships.
+    #[must_use]
+    pub fn if_current(self, now: u64, requirement: Option<&str>) -> Self {
+        if self.requirement_hash == 0 || self.derived_at == 0 {
+            return Self::unknown();
+        }
+        match requirement.map(str::trim).filter(|r| !r.is_empty()) {
+            Some(req) => {
+                if requirement_fingerprint(req) == self.requirement_hash {
+                    self
+                } else {
+                    Self::unknown()
+                }
+            }
+            // `saturating_sub` also means a future timestamp (clock skew) reads as fresh —
+            // never as "so stale it must be ignored".
+            None if now.saturating_sub(self.derived_at) <= Self::MAX_UNMATCHED_AGE_SECS => self,
+            None => Self::unknown(),
         }
     }
 
@@ -430,7 +567,6 @@ pub fn scan_content_with_context(
         check_dart_dynamic,
         check_emoji,
         check_color_tokens,
-        check_ai_slop,
     ] {
         // A surface-bound rule guards nothing on a proven static frontend → skip
         // it (in place, so precedence is untouched for every other project).
@@ -446,6 +582,27 @@ pub fn scan_content_with_context(
             return d;
         }
     }
+
+    // The AI-slop rule runs LAST, exactly where it sat in the list above — but it is the
+    // one rule that needs to know what the USER asked for. It reads the banned indigo/
+    // violet band, and that band is a default-REJECT, not a censor: a requirement that
+    // asked for a purple brand (by name or by hex) stands it down, precisely as it stands
+    // down the token-level banned-hue rule and the source-level design lint. Without the
+    // stand-down this rule BLOCKS THE WRITE of a palette the user chose, and the design
+    // floor then accepts the very tokens the write governor refused — an unconvergeable
+    // build. Same fail-open guard as every other rule (a panic here can never take down
+    // the host).
+    let intent = crate::design::DesignIntent {
+        purple_allowed: ctx.purple_allowed,
+    };
+    let slop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_ai_slop_with_intent(file_path, content, intent)
+    }))
+    .unwrap_or_else(|_| Decision::pass());
+    if slop.block && !policy.is_disabled(&slop.clause) {
+        return slop;
+    }
+
     Decision::pass()
 }
 
@@ -1026,19 +1183,137 @@ pub fn check_color_tokens(file_path: &str, content: &str) -> Decision {
     Decision::block("UD-CODE-002", reason)
 }
 
+/// Every `linear-gradient(…)` / `radial-gradient(…)` / `conic-gradient(…)` argument list
+/// in `lower` — the gradient's OWN stops, not the file around it.
+///
+/// This is what makes the purple→pink test evidence-based. The old test asked whether the
+/// FILE contained a gradient anywhere, a purple anywhere, and a pink anywhere — so a
+/// neutral radial-gradient glow, plus a `--brand-violet` token, plus an `--accent-pink`
+/// token (three unrelated things, no purple→pink gradient in sight) had the write
+/// REJECTED. A rule that fires on co-occurrence is not detecting the tell; it is
+/// detecting the palette.
+///
+/// Bounded + panic-free: balanced-paren scan, at most [`MAX_GRADIENTS`] fragments per file.
+///
+/// There is deliberately **no per-gradient length cap**. There used to be one (2 KB), and it
+/// was a silent BYPASS: a gradient whose argument list ran past it never reached `depth == 0`,
+/// so the fragment was DROPPED and the file read as gradient-free. Padding a
+/// `linear-gradient(135deg, #8b5cf6 …, #ec4899)` past the cap — with perfectly legitimate
+/// stops, or just by minifying the stylesheet into one long line — walked the classic AI hero
+/// straight through the write governor. The cap also bought nothing: a fragment here is a
+/// BORROWED slice, not a copy, so its length costs no memory. The real bound is the file, and
+/// the scan is linear in it (`MAX_GRADIENTS` × file length, worst case).
+///
+/// An UNTERMINATED call yields the remainder of the file rather than nothing — the stops that
+/// are there are still the stops that are there.
+fn gradient_stops(lower: &str) -> Vec<&str> {
+    /// Cap on gradients examined per file.
+    const MAX_GRADIENTS: usize = 32;
+
+    let mut out: Vec<&str> = Vec::new();
+    let bytes = lower.as_bytes();
+    let mut from = 0usize;
+    while from < lower.len() && out.len() < MAX_GRADIENTS {
+        // The next gradient call of any flavour (`repeating-` prefixes match too).
+        let Some(rel) = lower[from..].find("-gradient(") else {
+            break;
+        };
+        let open = from + rel + "-gradient(".len(); // first byte INSIDE the parens
+        let mut depth = 1usize;
+        let mut i = open;
+        while i < lower.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        // Closed → the exact argument list. Unterminated → everything that is left (`i` is at
+        // the end of the string, a char boundary). Never silently nothing.
+        if lower.is_char_boundary(open) && i > open {
+            out.push(&lower[open..i]);
+        }
+        from = open;
+    }
+    out
+}
+
+/// Whether a gradient's own stop list carries a purple/violet hue — by name, or by any
+/// color literal ([`crate::color::parse_color`]) that lands in the same indigo/violet
+/// band ([`crate::color::is_ai_purple`]) the design rules read. One band, one answer: a
+/// stop written `rgb(124, 58, 237)` or `oklch(0.55 0.22 290)` is the same hue as
+/// `#7c3aed`, and a rule that only recognises the hex form is trivially side-stepped.
+fn stops_have_purple(stops: &str) -> bool {
+    stops.contains("purple")
+        || stops.contains("violet")
+        || crate::design::ai_purple_literal(stops).is_some()
+}
+
+/// Whether a gradient's own stop list carries a rose/pink/fuchsia hue — by name, or by any
+/// color literal that lands in the [`crate::color::is_ai_pink`] BAND.
+///
+/// A hex list is how this half of the rule was walked past: it knew `#ec4899` and `#f472b6`
+/// and nothing else, so `linear-gradient(#7c3aed, #db2777)` and `linear-gradient(#7c3aed,
+/// #f43f5e)` — the two commonest purple→pink heroes in the wild — did not block, while the
+/// purple half of the same rule had been a band for a while. Both ends read the same way now.
+fn stops_have_pink(stops: &str) -> bool {
+    stops.contains("pink")
+        || stops.contains("fuchsia")
+        || stops.contains("magenta")
+        || crate::design::ai_pink_literal(stops).is_some()
+}
+
 /// Check for common "AI slop" visual anti-patterns in UI source files.
 ///
 /// P0-level checks (cardinal sins that make output look AI-generated):
-/// - Purple/violet gradient backgrounds (`linear-gradient` containing purple hues)
+/// - A purple→pink gradient (the classic AI template hero) — scoped to the gradient's
+///   OWN stops, and stood down when the user asked for a purple brand
 /// - "Lorem ipsum" placeholder text
 /// - "Welcome to [App]" generic hero headings
+///
+/// The design intent is UNKNOWN on this path, so the banned-hue band applies at its
+/// default-reject strength. A caller that knows what the user asked for must use
+/// [`check_ai_slop_with_intent`] — a requested purple must stand this rule down exactly
+/// as it stands down the token-level and source-level design checks, or the three
+/// disagree and the build cannot converge.
 ///
 /// Implements an extension of **UD-CODE-001/002** focused on visual
 /// quality beyond just emoji and color tokens.
 #[must_use]
 pub fn check_ai_slop(file_path: &str, content: &str) -> Decision {
+    check_ai_slop_with_intent(file_path, content, crate::design::DesignIntent::default())
+}
+
+/// [`check_ai_slop`], honouring what the user already decided (see
+/// [`crate::design::DesignIntent`]).
+///
+/// This is the form the WRITE path uses ([`scan_content_with_context`] → the PreToolUse
+/// hook + the in-process write governor), because a write blocker with no stand-down is
+/// worse than a gate: the user who said "our brand is violet `#7c3aed`" cannot write the
+/// palette they asked for, and there is no fix — the design floor accepts the very tokens
+/// this rule refuses.
+#[must_use]
+pub fn check_ai_slop_with_intent(
+    file_path: &str,
+    content: &str,
+    intent: crate::design::DesignIntent,
+) -> Decision {
     let ext = extension_of(file_path);
-    if !UI_CODE_EXTS.contains(&ext.as_str()) {
+    // The gradient half of this rule is a COLOR rule, so it is scoped like one
+    // (`COLOR_GUARDED_EXTS` — which includes css/scss/sass). Gating the whole check on
+    // `UI_CODE_EXTS` meant the purple→pink gradient rule never ran on a STYLESHEET: the
+    // single most natural place in any codebase to write the gradient it exists to catch.
+    // The content half (lorem ipsum / "Welcome to" / console.log / placeholder copy) stays
+    // scoped to component source, where those tells actually live.
+    let is_ui_code = UI_CODE_EXTS.contains(&ext.as_str());
+    let is_color_guarded = COLOR_GUARDED_EXTS.contains(&ext.as_str());
+    if !is_ui_code && !is_color_guarded {
         return Decision::pass();
     }
     // Test / fixture / mock / story files legitimately carry the very patterns
@@ -1064,66 +1339,77 @@ pub fn check_ai_slop(file_path: &str, content: &str) -> Decision {
     let lower = body.to_ascii_lowercase();
 
     let mut issues: Vec<&str> = Vec::new();
-    if lower.contains("lorem ipsum") || lower.contains("dolor sit amet") {
+    if is_ui_code && (lower.contains("lorem ipsum") || lower.contains("dolor sit amet")) {
         issues.push("Lorem ipsum placeholder text");
     }
-    if lower.contains("welcome to")
+    if is_ui_code
+        && lower.contains("welcome to")
         && (lower.contains("<h1") || lower.contains("<h2") || lower.contains("heading"))
     {
         issues.push("Generic 'Welcome to [App]' heading");
     }
-    let has_gradient = lower.contains("linear-gradient") || lower.contains("radial-gradient");
-    if has_gradient {
-        let has_purple = lower.contains("#7c3aed")
-            || lower.contains("#8b5cf6")
-            || lower.contains("#a855f7")
-            || lower.contains("#9333ea")
-            || lower.contains("purple")
-            || lower.contains("violet");
-        let has_pink = lower.contains("#ec4899")
-            || lower.contains("#f472b6")
-            || lower.contains("pink")
-            || lower.contains("fuchsia");
-        if has_purple && has_pink {
-            issues.push("Purple-to-pink gradient (classic AI template pattern)");
+    // THE BANNED HUE — a DEFAULT-REJECT, not a censor.
+    //
+    // Two things make this safe to run on the WRITE path:
+    //
+    // 1. A requested purple stands it down (`intent.purple_allowed`), the same condition
+    //    the token-level banned-hue rule and the source-level design lint stand down on.
+    //    Three checks over one band must agree, or the fix for one is the violation of
+    //    another and the build cannot converge.
+    // 2. The test is scoped to a REAL gradient declaration — the tell is a purple→pink
+    //    gradient, so we look inside the gradient's own stops. A file-wide co-occurrence
+    //    (any gradient + any purple + any pink, anywhere) is not that tell: a neutral
+    //    radial-gradient glow next to a `--brand-violet` and an `--accent-pink` token is
+    //    a legitimately-chosen palette with no purple→pink gradient in it, and rejecting
+    //    that write leaves the author nothing to fix.
+    if !intent.purple_allowed {
+        for stops in gradient_stops(&lower) {
+            if stops_have_purple(stops) && stops_have_pink(stops) {
+                issues.push("Purple-to-pink gradient (classic AI template pattern)");
+                break;
+            }
         }
         // The single most recognizable AI-generated hero gradient — the
         // `#667eea → #764ba2` indigo-purple pairing (and its `#5a67d8` kin).
-        // These specific hexes co-occurring in a gradient are a near-certain
+        // These specific hexes co-occurring IN ONE GRADIENT's stops are a near-certain
         // AI tell on their own, no pink companion required.
-        let canonical_ai =
-            (lower.contains("#667eea") || lower.contains("#5a67d8")) && lower.contains("#764ba2");
-        if canonical_ai {
-            issues.push("Canonical AI hero gradient (#667eea→#764ba2 indigo-purple)");
+        for stops in gradient_stops(&lower) {
+            if (stops.contains("#667eea") || stops.contains("#5a67d8")) && stops.contains("#764ba2")
+            {
+                issues.push("Canonical AI hero gradient (#667eea→#764ba2 indigo-purple)");
+                break;
+            }
         }
     }
 
-    // Placeholder / fake-data patterns — half-finished markers that must
-    // never ship in commercial code.
-    if lower.contains("your code here")
-        || lower.contains("your message here")
-        || lower.contains("your text here")
-        || lower.contains("replace this")
-        || lower.contains("your-api-key-here")
-    {
-        issues.push("Unfilled placeholder text");
-    }
-    // Flag a bare `example.com` placeholder HOST (`https://example.com/…`) but
-    // NOT a subdomain reference like `docs.example.com` / `api.example.com`,
-    // which is a legitimate documentation host. The old `// docs.example.com`
-    // exemption was dead code (comments are already stripped from `lower`).
-    if lower.contains("://example.com") {
-        issues.push("example.com placeholder URL (use a real domain)");
-    }
-    if lower.contains("test@test.com")
-        || lower.contains("user@example")
-        || lower.contains("john@example")
-    {
-        issues.push("Fake placeholder email (use realistic sample data)");
-    }
-    // Debug residue left in shipped code.
-    if lower.contains("console.log(") {
-        issues.push("console.log() debug residue (remove before shipping)");
+    // Placeholder / fake-data / debug-residue tells — component-source concerns (a
+    // stylesheet has no `console.log` and its `content:` strings are not app copy).
+    if is_ui_code {
+        if lower.contains("your code here")
+            || lower.contains("your message here")
+            || lower.contains("your text here")
+            || lower.contains("replace this")
+            || lower.contains("your-api-key-here")
+        {
+            issues.push("Unfilled placeholder text");
+        }
+        // Flag a bare `example.com` placeholder HOST (`https://example.com/…`) but
+        // NOT a subdomain reference like `docs.example.com` / `api.example.com`,
+        // which is a legitimate documentation host. The old `// docs.example.com`
+        // exemption was dead code (comments are already stripped from `lower`).
+        if lower.contains("://example.com") {
+            issues.push("example.com placeholder URL (use a real domain)");
+        }
+        if lower.contains("test@test.com")
+            || lower.contains("user@example")
+            || lower.contains("john@example")
+        {
+            issues.push("Fake placeholder email (use realistic sample data)");
+        }
+        // Debug residue left in shipped code.
+        if lower.contains("console.log(") {
+            issues.push("console.log() debug residue (remove before shipping)");
+        }
     }
 
     if issues.is_empty() {
@@ -9156,6 +9442,244 @@ const x = 1;",
         assert!(d.reason.to_lowercase().contains("gradient"));
     }
 
+    /// A component that is a legitimately-chosen palette, not the AI tell: a NEUTRAL
+    /// radial-gradient glow, plus a violet brand token, plus a pink accent token. Three
+    /// unrelated things. There is no purple→pink gradient anywhere in it — and every
+    /// color comes from a design token, so nothing else in the rule engine fires either.
+    const REQUESTED_PALETTE_NO_AI_GRADIENT: &str = "\
+export const brandViolet = 'var(--brand-violet)';
+export const accentPink = 'var(--accent-pink)';
+export const heroGlow =
+  'radial-gradient(circle at 50% 0%, var(--surface-2), transparent 70%)';
+";
+
+    #[test]
+    fn slop_does_not_block_a_palette_just_because_a_gradient_exists_elsewhere_in_the_file() {
+        // B3-2. The old test was a FILE-WIDE co-occurrence: any gradient + any purple +
+        // any pink, anywhere in the file → block. `check_ai_slop` sits in the PreToolUse
+        // hook and the in-process write governor, so that co-occurrence REJECTED THE
+        // WRITE of a legitimate palette — a neutral radial-gradient glow next to a
+        // `--brand-violet` and an `--accent-pink` token — with nothing for the author to
+        // fix. The tell is a purple→PINK GRADIENT; scope the test to the gradient's stops.
+        let d = check_ai_slop("src/hero-theme.ts", REQUESTED_PALETTE_NO_AI_GRADIENT);
+        assert!(
+            !d.block,
+            "a neutral gradient + a violet token + a pink token is a palette, not the AI \
+             tell — and this rule BLOCKS WRITES: {}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn slop_keeps_its_teeth_on_a_real_purple_to_pink_gradient() {
+        // The scoping must not defang the rule: the stops themselves carry both hues.
+        assert!(
+            check_ai_slop(
+                "src/Hero.tsx",
+                "const hero = 'linear-gradient(135deg, var(--x) 0%, #7c3aed 40%, #ec4899 100%)';"
+            )
+            .block,
+            "a gradient that really does run purple→pink is still the tell"
+        );
+        // …including named hues, and a `conic-gradient`.
+        assert!(
+            check_ai_slop(
+                "src/Hero.tsx",
+                "const hero = 'conic-gradient(from 90deg, purple, pink)';"
+            )
+            .block
+        );
+        // …and a stop written as `rgb()` is the same hue as the hex: a rule that only
+        // recognises `#7c3aed` is side-stepped by writing it any other way.
+        assert!(
+            check_ai_slop(
+                "src/Hero.tsx",
+                "const hero = 'linear-gradient(90deg, rgb(124, 58, 237) 0%, var(--pink-500, #ec4899) 100%)';"
+            )
+            .block,
+            "a nested rgb()/var() in the stops neither breaks the paren scan nor hides the hue"
+        );
+    }
+
+    #[test]
+    fn slop_stands_down_when_the_user_asked_for_a_purple_brand() {
+        // B3-2, the other half. A DEFAULT-REJECT is not a censor. A user who asked for a
+        // violet brand gets one — and this rule blocks WRITES, so without the stand-down
+        // they cannot write the palette they chose, while the design floor happily accepts
+        // the very same tokens: the fix for one check is the violation of the other, and
+        // the build cannot converge.
+        let asked = crate::design::DesignIntent {
+            purple_allowed: true,
+        };
+        let purple_pink = "const hero = 'linear-gradient(135deg, #7c3aed, #ec4899)';";
+        assert!(
+            check_ai_slop("src/Hero.tsx", purple_pink).block,
+            "unasked-for: still blocked (the default-reject stands)"
+        );
+        assert!(
+            !check_ai_slop_with_intent("src/Hero.tsx", purple_pink, asked).block,
+            "asked-for: the rule stands down, exactly as the design floor does"
+        );
+        // The stand-down is scoped to the HUE, not to the rule: real slop still blocks.
+        assert!(
+            check_ai_slop_with_intent("src/Hero.tsx", "<p>Lorem ipsum dolor sit amet</p>", asked)
+                .block,
+            "a purple permission does not license placeholder text"
+        );
+    }
+
+    #[test]
+    fn the_write_governor_honours_a_requested_purple_and_defaults_to_reject() {
+        // The whole point of threading the intent: this is the path the PreToolUse hook
+        // and the in-process write governor take. (Named hues, so the ONLY rule with
+        // anything to say about this file is the AI-slop one.)
+        let policy = crate::policy::Policy::default();
+        let purple_pink = "export const hero = 'linear-gradient(135deg, purple, pink)';";
+
+        let asked = ProjectContext::unknown().with_purple_allowed(true);
+        assert!(
+            !scan_content_with_context("src/hero.ts", purple_pink, &policy, asked).block,
+            "a requested purple is not a governance violation — the write must go through"
+        );
+
+        let unasked = ProjectContext::unknown();
+        assert!(
+            scan_content_with_context("src/hero.ts", purple_pink, &policy, unasked).block,
+            "and the default is still REJECT — a purple nobody asked for is caught"
+        );
+
+        // The legitimate palette passes the write governor even with NO permission.
+        assert!(
+            !scan_content_with_context(
+                "src/hero-theme.ts",
+                REQUESTED_PALETTE_NO_AI_GRADIENT,
+                &policy,
+                ProjectContext::unknown(),
+            )
+            .block,
+            "no purple→pink gradient ⇒ no finding, whatever tokens sit next to each other"
+        );
+    }
+
+    #[test]
+    fn a_persisted_context_without_the_purple_field_defaults_to_reject() {
+        // The out-of-process hook reads `.umadev/governance-context.json`. A file written
+        // by an older build has no `purple_allowed` — it must deserialize to the strict
+        // default, never to an accidental permission.
+        let ctx: ProjectContext =
+            serde_json::from_str(r#"{"static_frontend_only":true}"#).expect("legacy context loads");
+        assert!(ctx.static_frontend_only);
+        assert!(
+            !ctx.purple_allowed,
+            "an absent permission is not a permission"
+        );
+    }
+
+    #[test]
+    fn gradient_stops_are_bounded_and_never_panic_on_junk() {
+        // Fail-open by construction: an unterminated gradient, a lone marker, unicode in
+        // the stops — none of it may panic (this rule runs on the WRITE path).
+        for junk in [
+            "linear-gradient(",
+            "-gradient()",
+            "const a = 'linear-gradient(90deg, 紫色, #ec4899';",
+            "radial-gradient(circle, linear-gradient(purple, pink))",
+            "",
+        ] {
+            let _ = gradient_stops(junk);
+            let _ = check_ai_slop("src/x.ts", junk);
+        }
+        // The nested case DOES resolve to a purple→pink stop list and must still block.
+        assert!(
+            check_ai_slop(
+                "src/x.ts",
+                "const g = 'radial-gradient(circle, linear-gradient(purple, pink))';"
+            )
+            .block
+        );
+    }
+
+    #[test]
+    fn a_long_gradient_cannot_evade_the_scan_by_being_long() {
+        // The cap used to DROP any gradient whose argument list ran past it (the balanced-
+        // paren scan never reached `depth == 0`, so the fragment was silently discarded and
+        // the file read as gradient-free). A minified stylesheet is one long line, so a
+        // purple→pink hero just had to be padded — with legitimate stops — to walk straight
+        // through the write governor. Truncate the window, never the finding.
+        let padding = "var(--x) 1%, ".repeat(4000); // ≫ the old 2 KB cap, by a lot
+        let long =
+            format!("const hero = 'linear-gradient(135deg, #8b5cf6 0%, {padding} #ec4899 100%)';");
+        assert!(
+            long.len() > 50_000,
+            "the fixture must dwarf any plausible cap ({})",
+            long.len()
+        );
+        assert!(
+            check_ai_slop("src/Hero.tsx", &long).block,
+            "a purple→pink gradient does not stop being one by being long"
+        );
+        // The truncated window is still a bounded read (no panic, no runaway).
+        let unterminated = format!("background: linear-gradient(90deg, #7c3aed, {padding} #ec4899");
+        let _ = check_ai_slop("src/Hero.tsx", &unterminated);
+    }
+
+    #[test]
+    fn the_gradient_rule_runs_on_stylesheets() {
+        // The purple→pink gradient rule was gated on `UI_CODE_EXTS`, which EXCLUDES css /
+        // scss / sass — so the rule never ran on the single most natural place in any
+        // codebase to write a gradient. It is a COLOR rule; it is scoped like one now.
+        for path in ["src/hero.css", "styles/app.scss", "styles/app.sass"] {
+            assert!(
+                check_ai_slop(
+                    path,
+                    ".hero { background: linear-gradient(135deg, #7c3aed, #ec4899); }"
+                )
+                .block,
+                "a purple→pink gradient in a stylesheet is the same tell: {path}"
+            );
+        }
+        // …and the stand-down travels with it: a requested purple is not a violation here
+        // either (or the stylesheet and the component disagree, and the build cannot converge).
+        let asked = crate::design::DesignIntent {
+            purple_allowed: true,
+        };
+        assert!(
+            !check_ai_slop_with_intent(
+                "src/hero.css",
+                ".hero { background: linear-gradient(135deg, #7c3aed, #ec4899); }",
+                asked
+            )
+            .block
+        );
+        // The component-source tells (placeholder copy, console.log) do NOT fire on a
+        // stylesheet — they aren't stylesheet defects, and a false block is a real cost.
+        assert!(!check_ai_slop("src/hero.css", ".a::after { content: 'lorem ipsum'; }").block);
+    }
+
+    #[test]
+    fn the_pink_half_of_the_gradient_rule_is_a_hue_band_not_a_hex_list() {
+        // `stops_have_pink` knew exactly `#ec4899` / `#f472b6` / the words. So the two
+        // commonest AI heroes in the wild — `#7c3aed → #db2777` (pink-600) and
+        // `#7c3aed → #f43f5e` (rose-500) — did NOT block, while their near-identical
+        // neighbour did. Both ends of the tell read as a BAND now.
+        for pink in ["#db2777", "#f43f5e", "#e11d48", "#d946ef", "#ff69b4"] {
+            let src = format!("const hero = 'linear-gradient(135deg, #7c3aed, {pink})';");
+            assert!(
+                check_ai_slop("src/Hero.tsx", &src).block,
+                "purple→{pink} is the same gradient the rule exists to catch"
+            );
+        }
+        // The band stops at pink: a purple→TRUE-RED or purple→amber gradient is a deliberate
+        // choice, not the AI template tell, and must not be swept up.
+        for not_pink in ["#dc2626", "#ef4444", "#f59e0b"] {
+            let src = format!("const hero = 'linear-gradient(135deg, #7c3aed, {not_pink})';");
+            assert!(
+                !check_ai_slop("src/Hero.tsx", &src).block,
+                "purple→{not_pink} is not the purple→pink tell — the band must not overreach"
+            );
+        }
+    }
+
     #[test]
     fn slop_passes_clean_code() {
         assert!(!check_ai_slop("src/Hero.tsx", "<h1>Ship faster</h1>").block);
@@ -14190,6 +14714,88 @@ const x = 1;",
             "auth.js",
             "import jwt from 'jsonwebtoken';"
         ));
+    }
+
+    /// A persisted context is a PERMISSION, and a permission belongs to the requirement it
+    /// was derived from. Two naked bools with no provenance could not be dated or
+    /// attributed, so a `purple_allowed: true` from one requirement stood the banned-hue
+    /// band down for every requirement that followed it — including one whose first line is
+    /// "no purple" — and there was nothing that could ever expire it.
+    #[test]
+    fn a_context_stands_a_rule_down_only_while_it_is_provably_current() {
+        const DAY: u64 = 24 * 60 * 60;
+        let now = 1_800_000_000;
+        let asked = "make our brand violet";
+        let ctx = ProjectContext::unknown()
+            .with_purple_allowed(true)
+            .derived_from(asked, now);
+
+        // The requirement it was derived from is still the one in force → honoured,
+        // however old it is. A violet brand does not expire, and blocking it at the commit
+        // gate is exactly the unconvergeable failure this whole mechanism exists to avoid.
+        assert!(ctx.if_current(now, Some(asked)).purple_allowed);
+        assert!(
+            ctx.if_current(now + 400 * DAY, Some(asked)).purple_allowed,
+            "a context that still matches the live requirement is current at any age"
+        );
+        // Whitespace from a paste is not a different requirement.
+        assert!(
+            ctx.if_current(now, Some("  make our brand violet\n"))
+                .purple_allowed
+        );
+
+        // A DIFFERENT requirement is in force now → the old permission is not evidence.
+        assert!(
+            !ctx.if_current(now, Some("rebrand: no purple anywhere"))
+                .purple_allowed,
+            "a permission from another requirement must not stand the band down"
+        );
+
+        // Nothing to match against (no run has recorded a requirement) → the age fallback.
+        assert!(ctx.if_current(now + DAY, None).purple_allowed);
+        assert!(
+            !ctx.if_current(now + ProjectContext::MAX_UNMATCHED_AGE_SECS + 1, None)
+                .purple_allowed,
+            "an un-attributable context stops being evidence once it is stale"
+        );
+
+        // NO PROVENANCE AT ALL (a legacy file, or one a user dropped in) → strict.
+        let unstamped = ProjectContext::unknown().with_purple_allowed(true);
+        assert_eq!(
+            unstamped.if_current(now, Some(asked)),
+            ProjectContext::unknown()
+        );
+        assert_eq!(unstamped.if_current(now, None), ProjectContext::unknown());
+        // …including the static-frontend leniency, which is a permission too.
+        let lenient = ProjectContext::static_frontend();
+        assert!(!lenient.if_current(now, None).static_frontend_only);
+        assert!(
+            lenient
+                .derived_from(asked, now)
+                .if_current(now, Some(asked))
+                .static_frontend_only,
+            "a stamped, current context still stands the surface rules down"
+        );
+    }
+
+    /// The fingerprint is stable, requirement-sensitive, and never collides with the
+    /// "unstamped" sentinel.
+    #[test]
+    fn requirement_fingerprint_is_stable_and_distinguishing() {
+        assert_eq!(
+            requirement_fingerprint("make our brand violet"),
+            requirement_fingerprint("  make our brand violet  ")
+        );
+        assert_ne!(
+            requirement_fingerprint("make our brand violet"),
+            requirement_fingerprint("make our brand teal")
+        );
+        assert_ne!(
+            requirement_fingerprint(""),
+            0,
+            "0 is reserved for unstamped"
+        );
+        assert_ne!(requirement_fingerprint("做一个紫色的品牌落地页"), 0);
     }
 
     /// The default ProjectContext is the conservative `unknown` (surface assumed

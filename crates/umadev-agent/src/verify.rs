@@ -228,6 +228,199 @@ pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifySte
     }
 }
 
+/// Wall-clock budget for ONE named-test run ([`run_named_test`]). A single test is a
+/// small question; it must never turn into an unbounded wait, and the red→green check
+/// runs it twice (once at the pre-state, once at head). A blown budget is
+/// [`NamedTestOutcome::Unavailable`] — inconclusive, never a verdict.
+pub const NAMED_TEST_TIMEOUT_SECS: u64 = 240;
+
+/// Wall-clock budget for the named test run *inside* a temporary rewind (the RED half
+/// of a red→green replay).
+///
+/// This one is not just a performance number, it is a BLAST-RADIUS number. For the
+/// duration of that run the user's tracked source tree is sitting in the past, and only
+/// a live process can put it back. Every second of the window is a second in which a
+/// SIGKILL / OOM / closed terminal leaves the tree reverted (the crash marker in
+/// `checkpoint` recovers it on the next start, but the smaller the window the less
+/// there is to recover from). A single test that has not answered in this long has
+/// already told us the only thing we can safely act on: nothing. Deliberately far below
+/// [`NAMED_TEST_TIMEOUT_SECS`]; a blown budget is `Unavailable`, which fails open to
+/// the ordinary green-half bar.
+pub const RED_TEST_TIMEOUT_SECS: u64 = 90;
+
+/// The verdict of running ONE named test in isolation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NamedTestOutcome {
+    /// The runner ran the named test and it PASSED.
+    Passed,
+    /// The runner ran the named test and it FAILED.
+    Failed,
+    /// The question could not be asked at all — no recognised project, no test runner
+    /// on PATH, a spawn error, or a timeout. **Not a verdict**: a caller must treat
+    /// this as "we could not check", never as a pass or a fail.
+    Unavailable,
+}
+
+/// Whether a test name is a plain identifier — letters, digits, `_`, and nothing else.
+///
+/// This matters because the "name filter" every runner advertises is NOT a name filter:
+/// Go's `-run` is a **regex**, pytest's `-k` is a boolean **expression**, and both
+/// treat ordinary test-name characters as syntax. A Go test named `Sum[int]` or a
+/// pytest case named `test-login-flow` is a *malformed pattern*, and a malformed
+/// pattern exits non-zero — which the naive reading turns into "the test does not
+/// pass", a FALSE FAILURE about code that is fine. So: a name we cannot pass through
+/// verbatim and safely is a name we refuse to ask about (`Unavailable` → the caller
+/// degrades). Never a fabricated verdict.
+fn is_plain_test_ident(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The JS runner a project's `test` script actually invokes, when we can tell.
+///
+/// `-t <name>` is a name filter in **jest** and **vitest** — and in **mocha** `-t` is
+/// `--timeout`, so passing a test name there silently sets a nonsense timeout and runs
+/// the WHOLE suite, whose result is then read as this one test's verdict. That is worse
+/// than not asking. Only a script we can positively identify as jest/vitest gets the
+/// filter; anything else (mocha, ava, node:test, a custom shell pipeline) is
+/// `Unavailable`.
+fn node_test_runner_takes_t_filter(workspace: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(workspace.join("package.json")) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let script = v
+        .get("scripts")
+        .and_then(|s| s.get("test"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    script.contains("jest") || script.contains("vitest")
+}
+
+/// The command that runs ONE named test — a test-name FILTER the project's own runner
+/// understands, never the whole suite. `None` for a project we cannot run a single
+/// test in, **or whose filter syntax cannot carry this particular name safely** (see
+/// [`is_plain_test_ident`]) — in which case the caller reports `Unavailable` and falls
+/// open, rather than reporting a failure the project did not have.
+///
+/// The filter is passed as a separate argument (never interpolated into a shell
+/// string), so a test name is data, not code.
+#[must_use]
+fn named_test_step(
+    kind: ProjectKind,
+    workspace: &Path,
+    test: &str,
+    timeout_secs: u64,
+) -> Option<VerifyStep> {
+    let step = |program: &str, args: Vec<String>| VerifyStep {
+        name: "named-test",
+        program: program.to_string(),
+        args,
+        skippable: true,
+        timeout_secs,
+    };
+    let t = test.to_string();
+    match kind {
+        // `cargo test <substring>` is a plain SUBSTRING match, not a pattern — any
+        // name is safe to pass verbatim.
+        ProjectKind::Rust => Some(step(
+            "cargo",
+            vec!["test".into(), "--quiet".into(), t, "--".into()],
+        )),
+        ProjectKind::Node => {
+            // Only meaningful when the project declares a test script AND that script
+            // runs a runner for which `-t` means "filter by name" (jest / vitest).
+            if !has_node_script(workspace, "test") || !node_test_runner_takes_t_filter(workspace) {
+                return None;
+            }
+            let (pm, _) = node_package_manager(workspace);
+            // `-t <name>` is a jest/vitest name filter (a regex there too, but they
+            // treat a non-matching pattern as "no tests ran", not as a syntax error);
+            // the `--` separates it from the package manager's own args.
+            Some(step(
+                pm,
+                vec!["run".into(), "test".into(), "--".into(), "-t".into(), t],
+            ))
+        }
+        // pytest `-k` is an EXPRESSION (`and` / `or` / `not` / parens). A `-`, a space,
+        // a bracket, or a parenthesis in the name is a syntax error → exit 4, which is
+        // NOT a failing test.
+        ProjectKind::Python => {
+            is_plain_test_ident(test).then(|| step("pytest", vec!["-k".into(), t, "-q".into()]))
+        }
+        // Go `-run` is a REGEX. A name carrying `[`, `(`, `+`, `.` … is either an
+        // invalid pattern (exit != 0) or a pattern that matches the wrong set.
+        ProjectKind::Go => is_plain_test_ident(test).then(|| {
+            step(
+                "go",
+                vec![
+                    "test".into(),
+                    "./...".into(),
+                    "-run".into(),
+                    format!("^{t}$"),
+                ],
+            )
+        }),
+        // `deno test --filter <name>` is a plain substring match unless it is written
+        // as `/re/`; a literal name is safe.
+        ProjectKind::Deno => Some(step("deno", vec!["test".into(), "--filter".into(), t])),
+        ProjectKind::None => None,
+    }
+}
+
+/// Run ONE named test in `workspace` and report whether it passed, failed, or could
+/// not be run at all.
+///
+/// This is deliberately NOT [`run_verify`]: answering "does *this* test pass?" must
+/// not cost a whole install/lint/typecheck/build sequence, and the red→green evidence
+/// check asks the question twice (at the step's pre-state and at head). Bounded by
+/// [`NAMED_TEST_TIMEOUT_SECS`] with the same process-group kill the rest of verify
+/// uses, so a wedged runner can never hang the director.
+///
+/// Fail-open: an unrecognised project, a missing runner, a spawn error, or a timeout
+/// is [`NamedTestOutcome::Unavailable`] — the caller must degrade, never block.
+pub async fn run_named_test(workspace: &Path, test: &str) -> NamedTestOutcome {
+    run_named_test_bounded(workspace, test, NAMED_TEST_TIMEOUT_SECS).await
+}
+
+/// [`run_named_test`] with an explicit wall-clock budget.
+///
+/// The red half of a red→green replay runs INSIDE a temporary rewind — the user's
+/// source tree is in the past for exactly as long as this call takes — so it passes
+/// [`RED_TEST_TIMEOUT_SECS`], not the ordinary budget. Same semantics otherwise; a
+/// blown budget is [`NamedTestOutcome::Unavailable`], never a verdict.
+pub async fn run_named_test_bounded(
+    workspace: &Path,
+    test: &str,
+    timeout_secs: u64,
+) -> NamedTestOutcome {
+    let test = test.trim();
+    if test.is_empty() {
+        return NamedTestOutcome::Unavailable;
+    }
+    let kind = detect_project(workspace);
+    let Some(step) = named_test_step(kind, workspace, test, timeout_secs) else {
+        return NamedTestOutcome::Unavailable;
+    };
+    if !which(&step.program) {
+        return NamedTestOutcome::Unavailable; // no runner on PATH → cannot ask
+    }
+    let command_str = format!("{} {}", step.program, step.args.join(" "));
+    let out = run_step_command(workspace, kind, &step, command_str, timeout_secs).await;
+    // A spawn failure / timeout records `exit_code == -1`; neither is a verdict about
+    // the test — they are our own inability to ask.
+    if out.exit_code < 0 {
+        return NamedTestOutcome::Unavailable;
+    }
+    if out.passed {
+        NamedTestOutcome::Passed
+    } else {
+        NamedTestOutcome::Failed
+    }
+}
+
 /// The dev-server configuration UmaDev uses for `/preview`, so the command
 /// does NOT depend on the worker recording a Preview URL. Detected from the
 /// project's manifest + scripts. Falls back to `None` when no dev server is
@@ -590,6 +783,19 @@ pub struct VerifyOutcome {
     /// `true` when the step was skipped because its binary wasn't on PATH.
     #[serde(default)]
     pub skipped: bool,
+    /// **FRESHNESS STAMP** — the fingerprint of the source tree this outcome describes
+    /// ([`crate::freshness::workspace_fingerprint`]), stamped when the step ran.
+    ///
+    /// A green verify is a statement about a specific state of the code. Once the
+    /// source moves, the statement is about a tree that no longer exists — reading it
+    /// as today's evidence is exactly how a broken build ships behind a passing
+    /// artifact. Stamping the outcome lets any later reader tell the difference
+    /// ([`crate::freshness::is_stale`]).
+    ///
+    /// `None` on rows written before the stamp existed — an unknown, which fail-open
+    /// treats as "not stale". `#[serde(default)]` so old audit rows still load.
+    #[serde(default)]
+    pub source_fingerprint: Option<String>,
 }
 
 /// Default value for the `step` field in old JSONL rows.
@@ -625,6 +831,7 @@ impl VerifyOutcome {
             stderr,
             passed: skippable,
             skipped: skippable,
+            source_fingerprint: None,
         }
     }
 
@@ -651,6 +858,7 @@ impl VerifyOutcome {
             stderr,
             passed: true,
             skipped: true,
+            source_fingerprint: None,
         }
     }
 
@@ -683,6 +891,7 @@ impl VerifyOutcome {
             stderr,
             passed: false,
             skipped: false,
+            source_fingerprint: None,
         }
     }
 }
@@ -800,6 +1009,16 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
         // `install_has_failed` on the next iteration, arming the dependent-step
         // short-circuit above (P1-8).
         outcomes.push(run_step_command(workspace, kind, &step, command_str, timeout_secs).await);
+    }
+
+    // FRESHNESS STAMP: record WHICH source tree these outcomes describe, so a later
+    // reader can tell a green run of today's code from a green run of code that has
+    // since changed underneath it (see [`crate::freshness`]). Taken once, after the
+    // sequence settles — the tree as it stands at the moment the verdict is reached.
+    // Fail-open: an unwalkable tree stamps `None` (an unknown, never a mismatch).
+    let fingerprint = crate::freshness::workspace_fingerprint(workspace);
+    for o in &mut outcomes {
+        o.source_fingerprint.clone_from(&fingerprint);
     }
 
     outcomes
@@ -945,6 +1164,7 @@ async fn run_step_command(
             stderr,
             passed: status.success(),
             skipped: false,
+            source_fingerprint: None,
         },
         Ok(Err(e)) => VerifyOutcome::from_spawn_error(
             kind,
@@ -1024,6 +1244,85 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
         assert_eq!(detect_project(tmp.path()), ProjectKind::Node);
+    }
+
+    // ── a "name filter" that is really a PATTERN must never fabricate a failure ──
+
+    #[test]
+    fn a_test_name_the_runners_filter_cannot_carry_is_unaskable_not_failing() {
+        // Go's `-run` is a REGEX and pytest's `-k` is an EXPRESSION. A Go test named
+        // `Sum[int]`, or a pytest case named `test-login-flow`, is a MALFORMED PATTERN —
+        // the runner exits non-zero because it could not parse the filter, and the naive
+        // reading turns that into "the test does not pass": a FALSE FAILURE about code
+        // that is fine, and a rework loop over a bug that does not exist. A name we
+        // cannot pass safely is a name we refuse to ask about.
+        let tmp = TempDir::new().unwrap();
+        for hostile in [
+            "TestSum[int]",
+            "test-login-flow",
+            "test_login (fast)",
+            "Test.*",
+            "a+b",
+            "test login",
+        ] {
+            assert!(
+                named_test_step(ProjectKind::Go, tmp.path(), hostile, 90).is_none(),
+                "go: `{hostile}` is not a safe -run regex → Unavailable, never a verdict"
+            );
+            assert!(
+                named_test_step(ProjectKind::Python, tmp.path(), hostile, 90).is_none(),
+                "pytest: `{hostile}` is not a safe -k expression → Unavailable"
+            );
+        }
+        // A plain identifier IS askable, and Go's pattern is anchored so it matches the
+        // one test rather than every test with that prefix.
+        let go = named_test_step(ProjectKind::Go, tmp.path(), "TestSum", 90).expect("askable");
+        assert!(go.args.contains(&"^TestSum$".to_string()), "{:?}", go.args);
+        assert!(named_test_step(ProjectKind::Python, tmp.path(), "test_sum", 90).is_some());
+        // Rust's filter is a plain SUBSTRING match — any name is safe there.
+        assert!(named_test_step(ProjectKind::Rust, tmp.path(), "sum[int]", 90).is_some());
+    }
+
+    #[test]
+    fn a_node_runner_whose_dash_t_is_not_a_name_filter_is_unaskable() {
+        // Under mocha `-t` means `--timeout`. Passing a test NAME there sets a nonsense
+        // timeout and silently runs the WHOLE SUITE — whose result is then read as this
+        // one test's verdict. That is worse than not asking.
+        let tmp = TempDir::new().unwrap();
+        let pkg = |script: &str| {
+            fs::write(
+                tmp.path().join("package.json"),
+                format!(r#"{{"name":"x","scripts":{{"test":"{script}"}}}}"#),
+            )
+            .unwrap();
+        };
+        pkg("mocha");
+        assert!(
+            named_test_step(ProjectKind::Node, tmp.path(), "renders_the_card", 90).is_none(),
+            "mocha's -t is --timeout, not a name filter → Unavailable"
+        );
+        pkg("node --test");
+        assert!(named_test_step(ProjectKind::Node, tmp.path(), "renders_the_card", 90).is_none());
+
+        // jest / vitest DO take `-t <name>`.
+        pkg("vitest run");
+        let s = named_test_step(ProjectKind::Node, tmp.path(), "renders_the_card", 90)
+            .expect("vitest takes -t");
+        assert!(s.args.contains(&"-t".to_string()));
+        pkg("jest --ci");
+        assert!(named_test_step(ProjectKind::Node, tmp.path(), "renders_the_card", 90).is_some());
+    }
+
+    #[test]
+    fn the_red_half_runs_on_a_much_smaller_budget_than_an_ordinary_named_test() {
+        // The red half runs INSIDE a temporary rewind: for its whole duration the user's
+        // tracked source tree is in the past, and only a live process can put it back. The
+        // window is a blast radius, so it is bounded far below the ordinary budget.
+        const { assert!(RED_TEST_TIMEOUT_SECS < NAMED_TEST_TIMEOUT_SECS) };
+        let tmp = TempDir::new().unwrap();
+        let s = named_test_step(ProjectKind::Rust, tmp.path(), "t", RED_TEST_TIMEOUT_SECS)
+            .expect("step");
+        assert_eq!(s.timeout_secs, RED_TEST_TIMEOUT_SECS);
     }
 
     #[test]
@@ -1188,6 +1487,7 @@ mod tests {
     async fn record_outcome_writes_jsonl_line() {
         let tmp = TempDir::new().unwrap();
         let outcome = VerifyOutcome {
+            source_fingerprint: None,
             project_kind: ProjectKind::Rust,
             step: "test".into(),
             command: "cargo test".into(),
@@ -1212,6 +1512,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         for i in 0..3 {
             let outcome = VerifyOutcome {
+                source_fingerprint: None,
                 project_kind: ProjectKind::Node,
                 step: "install".into(),
                 command: format!("npm install (run {i})"),
@@ -1401,6 +1702,7 @@ mod tests {
 
     fn outcome(step: &str, passed: bool, skipped: bool) -> VerifyOutcome {
         VerifyOutcome {
+            source_fingerprint: None,
             project_kind: ProjectKind::Node,
             step: step.to_string(),
             command: format!("npm {step}"),

@@ -503,6 +503,7 @@ mod tests {
     fn plan_posted_and_step_status_carry_summaries() {
         let plan = crate::plan_state::Plan {
             steps: vec![crate::plan_state::PlanStep {
+                files: crate::plan_state::StepFiles::default(),
                 id: "scaffold".to_string(),
                 title: "Scaffold the app".to_string(),
                 seat: crate::critics::Seat::FrontendEngineer,
@@ -553,6 +554,7 @@ mod tests {
         // (user-reported: after /continue the checklist showed 0/8 done with
         // every earlier step blank).
         let step = |id: &str, status: crate::plan_state::StepStatus| crate::plan_state::PlanStep {
+            files: crate::plan_state::StepFiles::default(),
             id: id.to_string(),
             title: format!("Step {id}"),
             seat: crate::critics::Seat::BackendEngineer,

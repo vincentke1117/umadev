@@ -5,8 +5,11 @@ domain: design-systems
 category: design-systems
 difficulty: intermediate
 tags: [luxury, premium, refined, elegant, serif, dark, single-accent, generous-space, design-systems, palette, patterns]
+register: [brand]
+icon-library: Heroicons
+icon-stroke: 1
 quality_score: 72
-last_updated: 2026-06-19
+last_updated: 2026-07-14
 last_note: high-end refined aesthetic
 ---
 # Premium Luxury
@@ -21,31 +24,66 @@ last_note: high-end refined aesthetic
 
 ```css
 :root {
-  --color-bg: #0b0b0c;
-  --color-surface: #131316;
-  --color-surface-elevated: #1b1b1f;
-  --color-text: #f5f3ef;               /* 暖白，非纯白 */
-  --color-text-secondary: #b8b3a8;
-  --color-text-tertiary: #76726a;
-  --color-primary: #c8a96a;            /* 单一精炼金 —— 唯一强调，面积极小 */
-  --color-primary-hover: #d9bd84;
-  --color-accent: #c8a96a;             /* 不引入第二强调色 */
-  --color-success: #7d9a76;
-  --color-error: #b5544e;
-  --color-border: #26262b;
-  --color-border-accent: rgba(200,169,106,0.4);
-  --radius: 4px;                        /* 极小圆角，克制 */
-  --shadow-soft: 0 24px 60px rgba(0,0,0,0.5);
+  /* Surfaces + paired foregrounds — 克制是奢华的本质 */
+  --color-bg: oklch(15.0% 0.002 286.1);
+  --color-on-bg: oklch(96.5% 0.006 84.6);        /* 暖白，非纯白 */
+  --color-surface: oklch(18.8% 0.006 285.8);
+  --color-on-surface: oklch(96.5% 0.006 84.6);
+  --color-card: oklch(22.4% 0.008 285.8);
+  --color-on-card: oklch(88.6% 0.012 84.6);
+  --color-muted: oklch(17.9% 0.006 285.8);
+  --color-on-muted: oklch(70.8% 0.012 76.6);
+
+  --color-primary: oklch(74.8% 0.089 84.2);      /* 单一精炼金 —— 唯一强调，面积极小 */
+  --color-on-primary: oklch(19.5% 0.024 84.0);
+  --color-primary-hover: oklch(80.0% 0.080 84.2);
+  --color-accent: oklch(74.8% 0.089 84.2);       /* 不引入第二强调色 */
+  --color-on-accent: oklch(19.5% 0.024 84.0);
+
+  --color-success: oklch(71.7% 0.065 139.3);
+  --color-on-success: oklch(19.9% 0.038 140.1);
+  --color-warning: oklch(75.5% 0.103 82.1);
+  --color-on-warning: oklch(22.4% 0.042 87.2);
+  --color-error: oklch(66.3% 0.123 25.2);
+  --color-on-error: oklch(20.0% 0.054 28.7);
+
+  --color-border: oklch(26.5% 0.006 285.8);
+  --color-border-accent: oklch(74.8% 0.089 84.2 / 0.4);
+
+  /* Type scale — 衬线标题 × 无衬线正文的对比 */
+  --text-xs: 0.75rem; --text-sm: 0.875rem; --text-base: 1rem;
+  --text-lg: 1.25rem; --text-xl: 1.625rem; --text-2xl: 2.25rem;
+  --text-3xl: 3.25rem; --text-display: 5rem;
+
+  /* Spacing — 4pt grid */
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
+  --space-6: 24px; --space-8: 32px; --space-12: 48px; --space-16: 64px;
+  --space-24: 96px;
+
+  --radius-sm: 2px; --radius-md: 4px; --radius-lg: 4px; --radius-full: 9999px;  /* 极小圆角，克制 */
+
+  --duration-fast: 200ms;
+  --duration-normal: 400ms;
+  --duration-reveal: 900ms;                       /* 慢而顺滑 */
+  --ease-standard: cubic-bezier(0.22, 1, 0.36, 1);
+
+  --shadow-soft: 0 24px 60px rgb(0 0 0 / 0.5);
 }
 
 @media (prefers-color-scheme: light) {
   :root {
-    --color-bg: #faf8f3;               /* 暖象牙白（非奶油 AI 米色——靠极低饱和的真象牙 + 金强调区分） */
-    --color-surface: #ffffff;
-    --color-text: #1a1814;
-    --color-text-secondary: #5c574d;
-    --color-primary: #9a7b3f;          /* 浅底下加深金以保对比 */
-    --color-border: #e7e2d6;
+    --color-bg: oklch(97.9% 0.007 88.6);         /* 暖象牙白（非奶油 AI 米色——极低饱和的真象牙 + 金强调区分） */
+    --color-on-bg: oklch(21.0% 0.008 84.6);
+    --color-surface: oklch(100% 0 0); --color-on-surface: oklch(21.0% 0.008 84.6);
+    --color-card: oklch(100% 0 0); --color-on-card: oklch(35.4% 0.017 82.3);
+    --color-muted: oklch(94.9% 0.012 91.5); --color-on-muted: oklch(41.1% 0.017 84.6);
+    --color-primary: oklch(54.9% 0.083 81.1);    /* 浅底下加深金以保对比 */
+    --color-on-primary: oklch(100% 0 0);
+    --color-accent: oklch(54.9% 0.083 81.1); --color-on-accent: oklch(100% 0 0);
+    --color-success: oklch(48.2% 0.091 141.4); --color-on-success: oklch(100% 0 0);
+    --color-warning: oklch(49.2% 0.096 80.3); --color-on-warning: oklch(100% 0 0);
+    --color-error: oklch(51.8% 0.135 26.8); --color-on-error: oklch(100% 0 0);
+    --color-border: oklch(90.5% 0.010 88.6);
   }
 }
 ```
@@ -64,10 +102,6 @@ last_note: high-end refined aesthetic
 | body-lg | 1.25rem (20px) | 400 | 1.7 | 0 | Lead（无衬线） |
 | body | 1rem (16px) | 400 | 1.7 | 0 | 正文 |
 | overline | 0.75rem (12px) | 500 | 1.2 | 0.18em | 标签，ALL CAPS，宽字距 |
-
-## Spacing
-
-8px 基，**慷慨**：`8 / 16 / 32 / 64 / 96 / 160 / 240`。Hero 与区块用 160px+ 垂直留白。留白是主角。
 
 ## Layout
 
