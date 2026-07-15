@@ -200,9 +200,9 @@ export const i18n = {
       cols: [
         { h: "产品", links: [{ t: "流水线设计" }, { t: "运行模式" }, { t: "治理规则" }, { t: "质量门" }, { t: "知识库" }] },
         { h: "文档", links: [{ t: "快速体验" }, { t: "命令大全" }, { t: "配置" }, { t: "Rust 架构" }, { t: "规范 SPEC" }] },
-        { h: "资源", links: [{ t: "更新日志" }, { t: "GitHub", u: "https://github.com/umacloud/umadev" }, { t: "npm", u: "https://www.npmjs.com/package/umadev" }, { t: "许可证 MIT" }, { t: "项目来源 super-dev", u: "https://github.com/shangyankeji/super-dev" }] },
+        { h: "资源", links: [{ t: "更新日志" }, { t: "GitHub", u: "https://github.com/umacloud/umadev" }, { t: "npm", u: "https://www.npmjs.com/package/umadev" }, { t: "许可证 MIT" }] },
       ],
-      rights: "MIT 许可 · 脱胎于 super-dev · © 2026 UmaDev",
+      rights: "MIT 许可 · © 2026 UmaDev",
     },
     demoScript: [
       { type: "prompt", text: "做一个课程预约小程序，用户预约/取消，管理员管理课程。" },
@@ -457,9 +457,9 @@ export const i18n = {
       cols: [
         { h: "Product", links: [{ t: "Pipeline" }, { t: "Run modes" }, { t: "Governance" }, { t: "Quality gate" }, { t: "Knowledge base" }] },
         { h: "Docs", links: [{ t: "Quick start" }, { t: "Command reference" }, { t: "Configuration" }, { t: "Rust architecture" }, { t: "Spec" }] },
-        { h: "Resources", links: [{ t: "Changelog" }, { t: "GitHub", u: "https://github.com/umacloud/umadev" }, { t: "npm", u: "https://www.npmjs.com/package/umadev" }, { t: "MIT license" }, { t: "Origin: super-dev", u: "https://github.com/shangyankeji/super-dev" }] },
+        { h: "Resources", links: [{ t: "Changelog" }, { t: "GitHub", u: "https://github.com/umacloud/umadev" }, { t: "npm", u: "https://www.npmjs.com/package/umadev" }, { t: "MIT license" }] },
       ],
-      rights: "MIT licensed · evolved from super-dev · © 2026 UmaDev",
+      rights: "MIT licensed · © 2026 UmaDev",
     },
     demoScript: [
       { type: "prompt", text: "Build a class-booking app: users book/cancel, admins manage classes." },
@@ -540,7 +540,7 @@ export const docs = {
             { c: "npm config set prefix ~/.npm-global\nexport PATH=\"$HOME/.npm-global/bin:$PATH\"   # 写进 ~/.zshrc 或 ~/.bashrc\nnpm install -g umadev" },
             { p: "或者不做全局安装，直接用 npx 跑（不改前缀、不用 sudo）。注意：不带 -g 的 npm i umadev 能装上，但 npm 按设计不会把本地命令挂到 PATH 上，直接敲 umadev 会提示 command not found —— 这不是装坏了，用 npx umadev 运行即可。已经踩了 sudo 的坑，就跑 umadev doctor，它会检出 root 属主的安装目录或 npm 缓存并打印修复命令。" },
             { c: "npx umadev" },
-            { p: "支持 macOS（Apple Silicon / Intel）、Linux（x86_64 / ARM64，glibc ≥ 2.18；musl/Alpine 需源码构建）、Windows x86_64。也可以从源码构建：" },
+            { p: "支持 macOS（Apple Silicon / Intel）、Linux（x86_64 / ARM64，glibc ≥ 2.31；musl/Alpine 需源码构建）、Windows x86_64。也可以从源码构建：" },
             { c: "git clone https://github.com/umacloud/umadev.git\ncd umadev\ncargo build --release\n./target/release/umadev --version" },
             { h: "准备一个 AI 编码底座" },
             { p: "UmaDev 推荐驱动你已经登录的 CLI，三选一即可，然后按它们自己的方式登录。UmaDev 不保存你的登录信息，只是把任务作为非交互命令发给它们。" },
@@ -626,7 +626,7 @@ export const docs = {
             { c: "npm config set prefix ~/.npm-global\nexport PATH=\"$HOME/.npm-global/bin:$PATH\"   # add to ~/.zshrc or ~/.bashrc\nnpm install -g umadev" },
             { p: "Or skip the global install and run it with npx — no prefix, no sudo. Note: npm i umadev without -g installs fine, but npm deliberately does not put a local command on PATH, so bare umadev says \"command not found\" — that is npm, not a broken install: run it as npx umadev. Already hit the sudo trap? umadev doctor detects a root-owned install or npm cache and prints the exact repair." },
             { c: "npx umadev" },
-            { p: "Supports macOS Apple Silicon / Intel, Linux x86_64 / ARM64 (glibc >= 2.18; musl/Alpine needs a source build), and Windows x86_64. Or build from source:" },
+            { p: "Supports macOS Apple Silicon / Intel, Linux x86_64 / ARM64 (glibc >= 2.31; musl/Alpine needs a source build), and Windows x86_64. Or build from source:" },
             { c: "git clone https://github.com/umacloud/umadev.git\ncd umadev\ncargo build --release\n./target/release/umadev --version" },
             { h: "Prepare an AI coding backend" },
             { p: "UmaDev drives a CLI you already logged into. Pick one of Claude Code, Codex, or OpenCode, then log in their own way." },

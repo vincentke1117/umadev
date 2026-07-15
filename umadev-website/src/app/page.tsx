@@ -1392,10 +1392,10 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
             width={30}
           />
           <span className={styles.spaceFooterBrandText}>
-            {lang === "zh" ? "UmaDev · 脱胎于 super-dev · MIT License" : "UmaDev · derived from super-dev · MIT License"}
+            {lang === "zh" ? "UmaDev · umacloud 开源项目 · MIT License" : "UmaDev · an umacloud open-source project · MIT License"}
           </span>
         </div>
-        <div className={`${styles.spaceFooterLink} ${styles.mono}`}>umadev.umayun.com</div>
+        <div className={`${styles.spaceFooterLink} ${styles.mono}`}>umadev.goder.ai</div>
       </footer>
     </div>
   );
@@ -1532,7 +1532,7 @@ const pageHeroVisuals: Record<PageHeroVariant, { art: string; ip: string; label:
     art: "/assets/umadev/vectors/changelog-flow.svg",
     ip: "/assets/umadev/generated/changelog-ip.png",
     label: "UmaDev / Release Stream",
-    metrics: ["CURRENT v1.0.55", "RUST BINARY", "VERIFIED RELEASES"],
+    metrics: [`CURRENT v${releases.en[0].ver}`, "RUST BINARY", "VERIFIED RELEASES"],
   },
 };
 
