@@ -49,7 +49,7 @@ jobs:
 
           target/release/umadev ci --report-only 2>&1 | tee umadev-governance.log
 
-          scanned=$(sed -nE 's/.*UmaDev: ([0-9]+) file\(s\) scanned.*/\1/p' \
+          scanned=$(sed -nE 's/.*UmaDev: [0-9]+ file\(s\) selected, ([0-9]+) scanned,.*/\1/p' \
             umadev-governance.log | tail -1)
           if [[ -z "$scanned" ]]; then
             echo "::error::governance scan did not report its candidate file count"
@@ -72,7 +72,7 @@ jobs:
 
           printf '%s\n' 'export const label = "Save";' > "$clean/app.ts"
           target/release/umadev ci --project-root "$clean" > clean-scan.log
-          grep -Eq 'UmaDev: 1 file\(s\) scanned, 0 blocked' clean-scan.log
+          grep -Eq 'UmaDev: 1 file\(s\) selected, 1 scanned, 0 unreadable/binary skipped; 0 file\(s\) with a governance hit, 0 first-hit finding\(s\)' clean-scan.log
 
           printf '%s\n' 'export const icon = "🚀";' > "$blocked/app.tsx"
           if target/release/umadev ci --project-root "$blocked" > blocked-scan.log 2>&1; then
@@ -80,7 +80,7 @@ jobs:
             exit 1
           fi
           grep -q 'BLOCK  UD-CODE-001' blocked-scan.log
-          grep -Eq 'UmaDev: 1 file\(s\) scanned, 1 blocked' blocked-scan.log
+          grep -Eq 'UmaDev: 1 file\(s\) selected, 1 scanned, 0 unreadable/binary skipped; 1 file\(s\) with a governance hit, 1 first-hit finding\(s\)' blocked-scan.log
 
       - name: Upload governance self-audit
         if: always()
