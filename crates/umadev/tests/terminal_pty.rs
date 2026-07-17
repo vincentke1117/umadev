@@ -221,8 +221,14 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     writer.write_all(&[0x03]).expect("clear pasted draft");
     writer.flush().expect("flush whole-draft clear key");
 
-    writer.write_all(b"/quit\r").expect("send /quit");
-    writer.flush().expect("flush /quit");
+    writer.write_all(b"/quit").expect("type /quit");
+    writer.flush().expect("flush /quit text");
+    // Windows intentionally treats a sub-30ms Enter as part of a raw console
+    // paste burst so an embedded pasted newline cannot submit a partial prompt.
+    // Model a real, distinct submit keypress outside that documented window.
+    thread::sleep(Duration::from_millis(75));
+    writer.write_all(b"\r").expect("press Enter after /quit");
+    writer.flush().expect("flush /quit submit key");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let (status, timed_out) = loop {
