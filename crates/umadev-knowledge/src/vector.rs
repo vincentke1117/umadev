@@ -15,7 +15,7 @@
 //! 3. **Cloud embedding is OFF by default — explicit opt-in only**: sending
 //!    corpus or query text to a REMOTE embeddings endpoint requires BOTH the
 //!    dedicated `OPENAI_EMBED_KEY` **and** an explicit `UMADEV_ALLOW_CLOUD_EMBED=1`
-//!    opt-in (the single decision seam is [`cloud_embed_key`]). The generic
+//!    opt-in (the single decision seam is the internal `cloud_embed_key`). The generic
 //!    `OPENAI_API_KEY` NEVER authorizes an upload — a user who set it for some
 //!    unrelated OpenAI tool must never have their curated corpus silently
 //!    shipped to the cloud.
@@ -24,7 +24,7 @@
 //! `is_enabled()` reports whether a vector *retrieval* channel is plausibly
 //! available (a local model, or any OpenAI key for a pre-built / remote store);
 //! it gates fusion, NOT uploads. The actual network embed calls are gated
-//! strictly by [`cloud_embed_key`], so when cloud embedding is not explicitly
+//! strictly by the internal `cloud_embed_key`, so when cloud embedding is not explicitly
 //! opted in the retriever transparently uses the local model or BM25 only —
 //! never the cloud.
 //!
@@ -53,7 +53,7 @@
 //! collisions when two H2 headings share a name). Re-embedding only happens
 //! for chunks whose `body_hash` differs from the cached value.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -78,7 +78,7 @@ const KNOWN_MODEL_DIMS: &[(&str, usize)] = &[
 /// 2. the bundled LOCAL backend's real width when it is the active vector
 ///    source (`vector-local` + a usable model on disk),
 /// 3. the known dimension for [`active_model`] (if it's a recognised model),
-/// 4. [`EMBED_DIM`] (1536, the small-model default).
+/// 4. 1536 (the small-model default).
 ///
 /// Returning the env override first lets a user force a non-standard dim
 /// even for an unknown model.
@@ -121,7 +121,7 @@ fn store_dim(entries: &[(u32, String, String, u64, Vec<f32>)]) -> usize {
 }
 
 /// The documented dimension for a known embedding model, or `None` when the
-/// model isn't in [`KNOWN_MODEL_DIMS`].
+/// model isn't in the internal known-model table.
 #[must_use]
 pub fn expected_dim_for_model(model: &str) -> Option<usize> {
     KNOWN_MODEL_DIMS
@@ -218,7 +218,7 @@ fn cloud_embed_key() -> Option<String> {
 /// vector store. True when a bundled local model is present OR any OpenAI key is
 /// configured.
 ///
-/// This is deliberately looser than the CLOUD-upload gate ([`cloud_embed_key`]):
+/// This is deliberately looser than the CLOUD-upload gate (`cloud_embed_key`):
 /// it may report `true` for a generic `OPENAI_API_KEY`, but that alone never
 /// causes a network embed — the actual embed calls ([`embed_query`] /
 /// [`embed_batch`]) authorize an upload strictly, so a generic key degrades to
@@ -313,8 +313,11 @@ impl VectorStore {
     /// (empty) when the file is missing or malformed — never errors.
     #[must_use]
     pub fn load(project_root: &Path) -> Self {
-        let path = vectors_path(project_root);
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Some(cache_dir) = crate::index::existing_managed_cache_dir(project_root) else {
+            return Self::disabled();
+        };
+        let Some(bytes) = crate::index::read_regular_file_no_follow(&cache_dir.join("vectors.bin"))
+        else {
             return Self::disabled();
         };
         serde_json::from_slice(&bytes).unwrap_or_else(|_| Self::disabled())
@@ -322,12 +325,11 @@ impl VectorStore {
 
     /// Persist the store to disk (best-effort; never errors).
     pub fn save(&self, project_root: &Path) {
-        let path = vectors_path(project_root);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(bytes) = serde_json::to_vec(self) {
-            let _ = std::fs::write(&path, bytes);
+        if let (Some(cache_dir), Ok(bytes)) = (
+            crate::index::ensure_managed_cache_dir(project_root),
+            serde_json::to_vec(self),
+        ) {
+            let _ = crate::index::write_atomic_in_real_dir(&cache_dir.join("vectors.bin"), &bytes);
         }
     }
 
@@ -464,8 +466,8 @@ impl VectorStore {
     }
 
     /// Replace all stored vectors from raw embedded tuples (used after a
-    /// rebuild). Takes the same shape as [`from_embedded`] to avoid leaking
-    /// the private [`StoredVector`] type.
+    /// rebuild). Takes the same shape as [`Self::from_embedded`] without
+    /// exposing the private stored-vector representation.
     pub fn replace(&mut self, model: &str, entries: Vec<(u32, String, String, u64, Vec<f32>)>) {
         self.model = model.to_string();
         // H3 fix: see [`from_embedded`] — dim follows the real vector width.
@@ -532,11 +534,6 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// On-disk path for the cached vector store.
-fn vectors_path(project_root: &Path) -> PathBuf {
-    project_root.join(super::KB_INDEX_DIR).join("vectors.bin")
-}
-
 // ---------------------------------------------------------------------------
 // HTTP transport — only compiled when the `vector` feature is on. Without
 // it, embed_query/embed_batch compile to stubs returning None, and the crate
@@ -591,7 +588,7 @@ pub async fn embed_query(text: &str) -> Option<Vec<f32>> {
 
 /// Embed many texts in one (or a few batched) API call(s). Returns vectors
 /// in input order, or `None` on any failure. Batches internally at
-/// [`EMBED_BATCH_MAX`] texts per request to stay within API limits.
+/// 100 texts per request to stay within API limits.
 #[cfg_attr(not(feature = "vector"), allow(clippy::unused_async))]
 pub async fn embed_batch(texts: &[String]) -> Option<Vec<Vec<f32>>> {
     // Local bundled model first (zero setup), off the async executor.
@@ -1239,12 +1236,16 @@ mod tests {
         let prev = std::env::var("UMADEV_EMBED_MODEL_DIR").ok();
         std::env::remove_var("UMADEV_EMBED_DIM");
         std::env::remove_var("UMADEV_EMBED_MODEL");
-        // A fake model dir advertising hidden_size 384 (the three files only
-        // need to EXIST for is_available()).
+        // A fake model dir advertising hidden_size 384. The weights need only
+        // satisfy the cheap cache-integrity check; inference is never invoked.
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("config.json"), r#"{"hidden_size":384}"#).unwrap();
         std::fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
-        std::fs::write(dir.path().join("model.safetensors"), b"").unwrap();
+        let header = br#"{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut weights = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        weights.extend_from_slice(header);
+        weights.resize(1024 * 1024 + 16, 0);
+        std::fs::write(dir.path().join("model.safetensors"), weights).unwrap();
         std::env::set_var("UMADEV_EMBED_MODEL_DIR", dir.path());
         assert_eq!(active_dim(), 384, "active_dim must follow the local width");
         match prev {

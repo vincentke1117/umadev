@@ -14,8 +14,9 @@
 //!
 //! ## What this does
 //!
-//! The whole `knowledge/` tree (~5.5M of markdown, text-only) is embedded into
-//! the binary at compile time via [`include_dir`]. On binary startup
+//! A build-time allowlisted snapshot of the `knowledge/` tree is embedded into
+//! the binary via [`include_dir::include_dir!`]. Hidden directories, symlinks, generated
+//! indexes, and binary caches are excluded before macro expansion. On startup
 //! [`ensure_staged`] extracts it once to `~/.umadev/knowledge` (guarded by a
 //! `.version` marker so an already-current corpus is skipped) and points
 //! `UMADEV_KNOWLEDGE_DIR` at it. Every later `knowledge_root` call — TUI, CLI,
@@ -32,10 +33,8 @@
 use include_dir::{include_dir, Dir};
 use std::path::{Path, PathBuf};
 
-/// The embedded corpus. Compiled in from the repo's `knowledge/` tree.
-/// Text-only (markdown / yaml), so this stays cheap to compile and ~5.5M on
-/// disk; the `.DS_Store` noise is stripped from the tree before release.
-static KNOWLEDGE: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../knowledge");
+/// The embedded, build-time-sanitized text corpus.
+static KNOWLEDGE: Dir<'static> = include_dir!("$OUT_DIR/embedded-knowledge");
 
 /// Marker filename written into the staged corpus recording which build's
 /// corpus is currently on disk. When the running binary's marker differs we
@@ -186,6 +185,10 @@ mod tests {
                 .get_file("backend/01-standards/application-layering-and-packaging.md")
                 .is_some(),
             "backend layering standard missing from embedded corpus"
+        );
+        assert!(
+            KNOWLEDGE.get_dir(".umadev").is_none(),
+            "generated knowledge indexes must never be embedded"
         );
     }
 

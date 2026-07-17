@@ -13,10 +13,9 @@
 //! `AgentRunner<R>`)
 //!
 //! `umadev-agent` deliberately does NOT depend on `umadev-host` — it only knows
-//! the [`BaseSession`] *trait* from `umadev-runtime`. The three concrete
-//! sessions (`ClaudeSession` / `CodexSession` / `OpenCodeSession`) are
-//! constructed by the host crate's `session_for(...)` factory and handed in as a
-//! trait object. The binary / TUI (the next step) owns the wiring + the
+//! the [`BaseSession`] *trait* from `umadev-runtime`. The host factory covers
+//! five bases: three native sessions plus the Grok Build and Kimi Code ACP sessions,
+//! all handed in as a trait object. The binary / TUI owns the wiring + the
 //! gradual-rollout switch; this module owns the deterministic driving loop.
 //!
 //! ## What is preserved (the moat — unchanged)
@@ -25,8 +24,8 @@
 //! zero-source HARD STOP + tool-call audit (`UD-EVID-002`) + trust-tiered
 //! approval + the single-writer run lock. The role-critic team reviews on
 //! read-only `BaseSession::fork()` sessions at each review node (see
-//! `run_review_team` / `ForkConsult` below) — parallel, isolated, advisory-only,
-//! and fail-open, so a critic never drives loop termination.
+//! `run_review_team` / `ForkConsult` below) — parallel, isolated, explicitly
+//! typed, and bounded so a failed reviewer cannot hang or masquerade as pass.
 //!
 //! ## Fail-open, by contract
 //!
@@ -42,14 +41,19 @@
 use std::sync::Arc;
 
 use umadev_runtime::{
-    ApprovalDecision, BaseSession, SessionError, SessionEvent, StreamEvent, TurnStatus,
+    ApprovalDecision, BaseSession, SessionError, SessionEvent, StreamEvent, ToolActivity,
+    TurnStatus,
 };
 use umadev_spec::Phase;
 
-use crate::critics::{CriticArtifacts, CriticConsult, RoleCritic, RoleVerdict};
+use crate::critics::{
+    CriticArtifacts, CriticConsult, ReviewStatus, RoleCritic, RoleVerdict, TeamReviewResult,
+};
 use crate::events::{EngineEvent, EventSink};
 use crate::gates::Gate;
+use crate::knowledge_feedback::{commit_sent_memories, SentReceiptGuard};
 use crate::runner::RunOptions;
+use crate::skills::{commit_skill_prompt_receipt, SkillPromptCandidate, SkillReceiptGuard};
 use crate::state::{write_workflow_state, WorkflowState};
 use crate::trust::requires_confirmation_with_ledger;
 
@@ -141,9 +145,9 @@ pub enum RunOutcome {
     /// The run drove all the way through delivery.
     Completed,
     /// The run stopped on a HARD signal (zero real source produced when the
-    /// plan demanded code, or a phase failed). Carries a human-readable reason.
-    /// **This is a deterministic, base-independent verdict — never disguised as
-    /// success.**
+    /// plan demanded code, a phase failed, or this legacy non-`Result` API was
+    /// asked to execute in plan mode). Carries a human-readable reason. **This is
+    /// a deterministic, base-independent verdict — never disguised as success.**
     HardStop(String),
 }
 
@@ -182,8 +186,9 @@ fn persist_state_impl(
 ) {
     // Carry the base session id (if any) forward across transitions so a
     // phase-transition write never erases a cross-session resume pointer.
-    let prior_base_session_id =
-        crate::state::read_workflow_state(&options.project_root).and_then(|s| s.base_session_id);
+    let prior_state = crate::state::read_workflow_state(&options.project_root);
+    let prior_base_session_id = prior_state.as_ref().and_then(|s| s.base_session_id.clone());
+    let prior_base_resume_identity = prior_state.and_then(|s| s.base_resume_identity);
     let state = WorkflowState {
         phase: phase.id().to_string(),
         active_gate: active_gate.to_string(),
@@ -196,6 +201,8 @@ fn persist_state_impl(
         ),
         backend: options.backend.clone(),
         base_session_id: prior_base_session_id,
+        base_resume_identity: prior_base_resume_identity,
+        permission_profile: Some(options.mode.base_permissions()),
         spec_version: umadev_spec::SPEC_VERSION.to_string(),
     };
     let _ = write_workflow_state(&options.project_root, &state);
@@ -213,11 +220,11 @@ fn persist_state_impl(
 /// The default is the director build loop ([`crate::director_loop`], the USB model):
 /// the base's body builds end to end, then UmaDev runs a read-only honesty/QC pass
 /// and feeds bounded fix directives back — the planner/phases are only an advisory
-/// prior. `run_block` is retained UNTOUCHED behind the explicit
+/// prior. `run_block` is retained behind the explicit
 /// `UMADEV_LEGACY_PIPELINE=1` opt-in ([`legacy_pipeline_from_env`]) so the field
-/// can revert with no code change. Its *capabilities* — [`review_and_rework`] /
-/// [`run_review_team`] / [`run_quality_gate`] / [`quality_floor`] / [`team_for`] /
-/// [`fork_with_timeout`] / [`Blackboard`] / [`drive_rework_turn`] — are KEPT and
+/// can revert with no routing change. Its internal review/rework, review-team,
+/// quality-gate, quality-floor, team-selection, fork-timeout, blackboard, and
+/// rework-turn capabilities are KEPT and
 /// REUSED as the director's tool underpinnings ([`crate::director`] /
 /// [`crate::director_loop`]); only the FIXED WALK below is legacy.
 ///
@@ -230,12 +237,24 @@ fn persist_state_impl(
 /// every block of the run — the caller owns its lifetime and `end()`s it once
 /// the whole run settles. Context flows research → docs → code without
 /// re-priming because it is the same session throughout.
+///
+/// Plan mode is rejected before planning, governance persistence, or any
+/// session call. Because this retained legacy surface predates `Result`, it
+/// carries the permission refusal as [`RunOutcome::HardStop`], never
+/// [`RunOutcome::Completed`]. New callers should prefer
+/// [`crate::runner::AgentRunner::run_continuous_block`], whose outer API returns
+/// a typed [`std::io::ErrorKind::PermissionDenied`].
 pub async fn run_block(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     start_after: Phase,
 ) -> RunOutcome {
+    if let Err(error) = options.require_execution() {
+        events.emit(EngineEvent::Note(error.to_string()));
+        return RunOutcome::HardStop(error.to_string());
+    }
+
     let plan = crate::planner::plan(&options.requirement);
     let produces_code = plan.includes(Phase::Frontend) || plan.includes(Phase::Backend);
 
@@ -315,11 +334,12 @@ pub async fn run_block(
             // frontend seats review the delivered frontend. Each seat reviews on
             // its OWN `BaseSession::fork()` read-only session (parallel, isolated,
             // never writes), and any blocking findings are folded into a bounded
-            // rework loop on the MAIN session (see §3.6). Fully advisory +
-            // fail-open: it NEVER drives the gate decision — the gate still pauses
-            // for the user exactly as before.
+            // rework loop on the MAIN session (see §3.6). The gate still pauses for
+            // the user, while unresolved or unavailable review state remains visible.
             let gate = gate_for_phase(phase);
-            review_and_rework(session, options, events, gate_review_kind(phase), deadline).await;
+            let _review =
+                review_and_rework(session, options, events, gate_review_kind(phase), deadline)
+                    .await;
             // P0-A: persist the OPEN-GATE state (phase = the gate phase, active_gate
             // = its id) so `umadev continue` / the TUI gate resume read the real door
             // and resume the continuous run from THIS gate — exactly the state shape
@@ -331,17 +351,6 @@ pub async fn run_block(
                 paused_at: Some(gate),
             });
             return RunOutcome::PausedAtGate(gate);
-        }
-
-        // Plan (read-only) mode never executes a code phase — it stops at the
-        // docs gate by design. The gate handling above already returns before
-        // any executing phase in the initial block, but guard the executing
-        // phases too so a resumed block can't slip past plan mode.
-        if !options.mode.executes() && is_executing(phase) {
-            events.emit(EngineEvent::Note(
-                umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
-            ));
-            return RunOutcome::Completed;
         }
 
         // P0-A: persist the EXECUTING-phase state (active_gate empty) before
@@ -379,8 +388,9 @@ pub async fn run_block(
         // phase (frontend / backend), scan the WHOLE real source tree for
         // governance violations (emoji-as-icon / hardcoded colors / AI-slop) and
         // drive ONE bounded rework round. Critically this is the ONLY governance
-        // path for bases WITHOUT a real-time PreToolUse hook (codex / opencode):
-        // in the continuous loop `govern_tool_call` only OBSERVES + audits the
+        // path for the seven bases WITHOUT a real-time PreToolUse hook (two
+        // native plus Grok Build): in the continuous loop `govern_tool_call` only
+        // OBSERVES + audits the
         // base's already-applied edits, it does not pre-screen them, so without
         // this catch-up a non-claude base's written files were never governed.
         // Fail-open + advisory: it re-delegates a fix but never stops the run.
@@ -418,10 +428,15 @@ pub async fn run_block(
         // DETERMINISTIC floor (coverage gaps + contract drift + governance
         // findings) as context so the LLM pass builds on real findings rather than
         // an empty floor. Any blocking findings drive a bounded rework on the main
-        // session. Advisory + fail-open; never blocks the run (the gate above is
-        // the hard signal).
+        // session. A required review must actually pass before this legacy path can
+        // claim completion; transport failure is incomplete, not acceptance.
         if phase == Phase::Quality {
-            review_and_rework(session, options, events, ReviewKind::Quality, deadline).await;
+            let review =
+                review_and_rework(session, options, events, ReviewKind::Quality, deadline).await;
+            if let Some(reason) = required_review_failure(ReviewKind::Quality, &review) {
+                events.emit(EngineEvent::Note(reason.clone()));
+                return RunOutcome::HardStop(reason);
+            }
         }
 
         // HARD STOP (git-independent): after the last code-producing phase, if
@@ -505,6 +520,11 @@ async fn drive_phase(
     // result yet) a long task (build / compile / install / test) is legitimately
     // silent for minutes, so the next wait uses the extended tool window.
     let mut in_tool_call = false;
+    let mut tool_activity = ToolActivity::default();
+    // The compatibility phase walk is opt-in, but it still owns a writer
+    // session. Keep its settle semantics aligned with the director/rework pumps:
+    // a clean turn end is not completion while known background agents are live.
+    let mut bg = crate::bg_agents::BgAgentTracker::new();
     loop {
         // Wall-clock budget reached DURING a phase turn. A base that stays ACTIVE
         // (keeps emitting, never trips the idle watchdog below) would otherwise run
@@ -525,6 +545,12 @@ async fn drive_phase(
                  on what's built (raise UMADEV_RUN_BUDGET_SECS for a longer run)"
                     .to_string(),
             ));
+            if bg.outstanding() > 0 {
+                let incomplete =
+                    umadev_i18n::tlf("bg.outstanding_note", &[&bg.outstanding().to_string()]);
+                events.emit(EngineEvent::Note(incomplete.clone()));
+                return PhaseResult::Failed(incomplete);
+            }
             return PhaseResult::Done;
         }
         let ev = match crate::director_loop::next_event_idle(
@@ -565,9 +591,9 @@ async fn drive_phase(
             }
         };
         // Arm/disarm the tool-grace from this event before handling it.
-        if let Some(t) = crate::director_loop::tool_phase_transition(&ev) {
-            in_tool_call = t;
-        }
+        in_tool_call = tool_activity.observe(&ev);
+        bg.observe(&ev);
+        let event_tool_call_id = ev.tool_call_id().map(str::to_owned);
         match ev {
             SessionEvent::TextDelta(text) => {
                 // Stream the assistant's words to the TUI (alive-feel) — but
@@ -590,12 +616,67 @@ async fn drive_phase(
                 // guess. Purely informational; drives no loop control.
                 events.emit(EngineEvent::BaseModel { id });
             }
-            SessionEvent::ToolCall { name, input } => {
-                govern_tool_call(options, events, &policy, phase, &name, &input);
+            SessionEvent::StateUpdate(update) => {
+                events.emit(EngineEvent::BaseSessionState {
+                    backend_id: options.backend.clone(),
+                    update,
+                });
+            }
+            SessionEvent::ToolCall { name, input }
+            | SessionEvent::ToolCallCorrelated { name, input, .. } => {
+                govern_tool_call(
+                    options,
+                    events,
+                    &policy,
+                    phase,
+                    event_tool_call_id.as_deref(),
+                    &name,
+                    &input,
+                );
+            }
+            SessionEvent::ToolProgressCorrelated { call_id, title } => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolProgressCorrelated { call_id, title },
+                });
+            }
+            SessionEvent::ToolOutputDelta(delta) => {
+                // Live command output is display-only. Keep the tool in flight;
+                // only the later terminal ToolResult may settle it.
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolOutputDelta { delta },
+                });
+            }
+            SessionEvent::ToolOutputDeltaCorrelated { call_id, delta } => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolOutputDeltaCorrelated { call_id, delta },
+                });
+            }
+            SessionEvent::ToolOutputSnapshot(output) => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolOutputSnapshot { output },
+                });
+            }
+            SessionEvent::ToolOutputSnapshotCorrelated { call_id, output } => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolOutputSnapshotCorrelated { call_id, output },
+                });
             }
             SessionEvent::ToolResult { ok, summary } => {
                 events.emit(EngineEvent::WorkerStream {
                     event: StreamEvent::ToolResult { ok, summary },
+                });
+            }
+            SessionEvent::ToolResultCorrelated {
+                call_id,
+                ok,
+                summary,
+            } => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolResultCorrelated {
+                        call_id,
+                        ok,
+                        summary,
+                    },
                 });
             }
             SessionEvent::NeedApproval {
@@ -616,13 +697,54 @@ async fn drive_phase(
                     return PhaseResult::Failed(format!("respond: {e}"));
                 }
             }
+            SessionEvent::HostRequest { req_id, request } => {
+                let response =
+                    crate::director_loop::resolve_host_request(options, events, &req_id, &request)
+                        .await;
+                if let Err(error) = session.respond_host(&req_id, response).await {
+                    return PhaseResult::Failed(format!("respond host request: {error}"));
+                }
+            }
             SessionEvent::BackgroundTask(_) => {
-                // Background-agent lifecycle frames drive the outstanding-agents
-                // settle guard on the modern pumps (director step pump / chat
-                // drain); the legacy env-gated phase walk ignores them (fail-open).
+                // Already folded into the tracker above; carries no render row.
+            }
+            SessionEvent::BackgroundProcess(_) => {
+                // A long-lived shell/monitor process is not a sub-agent. Its
+                // lifecycle is owned by the base and must never keep this phase
+                // turn open or enter the outstanding-agent re-drive guard.
+            }
+            SessionEvent::PromptQueueChanged(_) => {
+                // Queue snapshots are resident-chat state. Pipeline turns have
+                // no queue UI and must not turn the snapshot into transcript.
             }
             SessionEvent::TurnDone { status, .. } => {
-                return finish_turn(options, events, phase, status)
+                if matches!(status, TurnStatus::Completed)
+                    && std::time::Instant::now() < deadline
+                    && bg.begin_redrive()
+                {
+                    events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        "bg.redrive",
+                        &[
+                            &bg.outstanding().to_string(),
+                            &bg.redrives().to_string(),
+                            &crate::bg_agents::MAX_BG_REDRIVES.to_string(),
+                        ],
+                    )));
+                    if session.send_turn(bg.wait_directive()).await.is_ok() {
+                        in_tool_call = false;
+                        tool_activity.clear();
+                        continue;
+                    }
+                }
+                if matches!(status, TurnStatus::Completed | TurnStatus::Truncated)
+                    && bg.outstanding() > 0
+                {
+                    let incomplete =
+                        umadev_i18n::tlf("bg.outstanding_note", &[&bg.outstanding().to_string()]);
+                    events.emit(EngineEvent::Note(incomplete.clone()));
+                    return PhaseResult::Failed(incomplete);
+                }
+                return finish_turn(options, events, phase, status);
             }
         }
     }
@@ -671,6 +793,7 @@ fn govern_tool_call(
     events: &Arc<dyn EventSink>,
     policy: &umadev_governance::Policy,
     phase: Phase,
+    call_id: Option<&str>,
     name: &str,
     input: &serde_json::Value,
 ) {
@@ -712,12 +835,21 @@ fn govern_tool_call(
     // the base actually did. P1: a Write/Edit also forwards its structured
     // before/after so the TUI renders a diff card (fail-open: non-edit → None).
     let edit = umadev_runtime::ToolEdit::from_claude_tool_input(name, input);
-    events.emit(EngineEvent::WorkerStream {
-        event: StreamEvent::ToolUse {
+    let stream_event = match call_id {
+        None => StreamEvent::ToolUse {
             name: name.to_string(),
             detail: target.clone(),
             edit,
         },
+        Some(call_id) => StreamEvent::ToolUseCorrelated {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            detail: target.clone(),
+            edit,
+        },
+    };
+    events.emit(EngineEvent::WorkerStream {
+        event: stream_event,
     });
 
     let decision_word = if decision.block { "block" } else { "allow" };
@@ -783,8 +915,8 @@ fn evaluate_tool_call(
         // are unchanged (`content` / `new_string` / `new_str`).
         let content = umadev_runtime::write_scan_content(input);
         // Bypass-immune irreversible floor FIRST (ignores disabled clauses), so a
-        // non-Claude base (codex / opencode) — which has no PreToolUse hook — gets
-        // the SAME un-closable floor as the Claude hook for a leaked secret /
+        // non-Claude base (the two other native bases or Grok Build)
+        // gets the SAME un-closable floor as the Claude hook for a leaked secret /
         // credential / sensitive `.env`/`.ssh`/no-extension path. Only when it is
         // clean do we run the policy-aware, context-aware content scan.
         let floor = umadev_governance::pre_write_floor_decision(&path, &content);
@@ -836,8 +968,8 @@ fn approval_decision(options: &RunOptions, action: &str, target: &str) -> Approv
 /// produced usable output). But before, a truncated phase was reported with the
 /// SAME soft Note whether it left a complete deliverable or nothing at all, so a
 /// Docs phase truncated after writing only the PRD (no architecture / UI-UX)
-/// slipped past silently and the critic team then fail-open-ACCEPTed the empty
-/// surfaces. Now a truncation is split: if the phase's KEY artifacts exist, it is
+/// slipped past silently and the critic team had no trustworthy surface to read.
+/// Now a truncation is split: if the phase's KEY artifacts exist, it is
 /// the benign "ran long but finished the deliverable" case (the soft Note); if
 /// they are MISSING, it is a genuinely incomplete phase, surfaced with a stronger
 /// DEGRADED warning so the operator (and the downstream gates) treat the output
@@ -1071,11 +1203,12 @@ async fn run_quality_gate(
 /// `run_governance_catchup` and the quality gate use).
 ///
 /// This is the ONLY governance feedback loop for bases WITHOUT a real-time
-/// PreToolUse hook: only `claude-code` installs one, so codex / opencode write
-/// files that the continuous loop's `govern_tool_call` merely OBSERVES (it can't
-/// pre-screen an already-applied edit). For those bases this catch-up closes the
-/// gap; for `claude-code` it is skipped (the hook already blocked these at write
-/// time). Keyed off the backend id — a deterministic, host-free check.
+/// PreToolUse hook: only `claude-code` installs one, so the other two native bases
+/// and Grok Build write files that the continuous loop's `govern_tool_call`
+/// merely OBSERVES (it can't pre-screen an already-applied edit). This catch-up
+/// closes the gap; for `claude-code` it is skipped (the hook already blocked
+/// these at write time). Keyed off the backend id — a deterministic, host-free
+/// check.
 ///
 /// **Fail-open + advisory:** a clean scan returns immediately; a rework turn that
 /// fails just leaves the findings for the quality gate to catch — never stops the
@@ -1329,15 +1462,6 @@ fn phase_order(phase: Phase) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// Whether a phase is one that writes real code (and so is subject to plan-mode
-/// read-only suppression + the zero-source hard gate).
-fn is_executing(phase: Phase) -> bool {
-    matches!(
-        phase,
-        Phase::Spec | Phase::Frontend | Phase::Backend | Phase::Quality | Phase::Delivery
-    )
-}
-
 /// The last code-producing phase actually in the plan — the hard-gate anchor.
 fn last_code_phase(plan: &crate::planner::PhasePlan) -> Phase {
     if plan.includes(Phase::Backend) {
@@ -1571,10 +1695,9 @@ fn lean_directive(
 // decides — any `blocking[]` non-empty folds into ONE imperative rework directive
 // injected back into the MAIN session, then re-reviews; all-accept proceeds. The
 // loop is BOUNDED (`MAX_REWORK_ROUNDS` + a stall counter that stops when the
-// blocking count stops dropping). Fully fail-open + advisory: a base with no fork
-// / an offline brain / a parse failure yields empty accepting verdicts → no
-// blocking → proceed. A critic NEVER drives termination; the only hard stops are
-// the deterministic floor + the user gate elsewhere.
+// blocking count stops dropping). A base with no fork, an offline brain, or a
+// parse failure yields an explicit unavailable verdict. The legacy loop keeps
+// running, but never emits a false team-pass signal.
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Which review node is running — selects the team + the blackboard surface.
@@ -1600,53 +1723,63 @@ fn gate_review_kind(phase: Phase) -> ReviewKind {
 /// Run the cross-review team for a node, then drive a BOUNDED rework loop on the
 /// main session. Deterministic control: the loop continues only while a seat
 /// reports a NEW blocking finding AND the round budget + stall counter allow it.
-/// Advisory + fail-open throughout — it never returns a verdict that blocks the
-/// run; the gate/floor decide that elsewhere.
+/// Every failure settles within the Rust-side bound and returns its typed state;
+/// the caller decides whether that state can claim completion.
 async fn review_and_rework(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     kind: ReviewKind,
     deadline: std::time::Instant,
-) {
+) -> TeamReviewResult {
     // Scale the team to the task; an empty team (lean / no-UI / docs-only paths)
     // means "no cross-review here" — return immediately, the floor stands.
     let team = team_for(kind, &options.requirement, &options.project_root);
     if team.is_empty() {
-        return;
+        return TeamReviewResult::default();
     }
 
     let mut prev_blocking = usize::MAX;
     for round in 0..=MAX_REWORK_ROUNDS {
         // 1. Read the blackboard FRESH each round (the rework may have rewritten
         //    it) and run the team in parallel on read-only forks.
-        let blocking = run_review_team(session, options, events, kind, &team, round).await;
+        let review = run_review_team(session, options, events, kind, &team, round).await;
 
-        // 2. All-accept (or fail-open empty) → proceed. This is the only success
-        //    exit; everything else is bounded rework.
-        if blocking.is_empty() {
+        // An unavailable required seat is not a pass and cannot be repaired by
+        // rewriting product files. Surface the operationally incomplete review.
+        if review.status() == ReviewStatus::Unavailable {
+            events.emit(EngineEvent::Note(format!(
+                "team · {} review unavailable: {}",
+                kind_label(kind),
+                review.unavailable.join("; ")
+            )));
+            return review;
+        }
+
+        // 2. Every convened seat actually accepted → proceed.
+        if review.status() == ReviewStatus::Pass {
             if round > 0 {
                 events.emit(EngineEvent::Note(umadev_i18n::tlf(
                     "continuous.team.passed_after_rework",
                     &[kind_label(kind), &round.to_string()],
                 )));
             }
-            return;
+            return review;
         }
 
         // 3. Deterministic stall / budget guard: stop reworking when we've spent
         //    the round budget OR the blocking count did not DROP (no progress —
         //    the base can't satisfy a seat, or a flapping verdict). Either way we
-        //    proceed: the critic is advisory and must never wedge the run.
-        let made_progress = blocking.len() < prev_blocking;
+        //    settle with the blockers preserved; the critic must never wedge the run.
+        let made_progress = review.blocking.len() < prev_blocking;
         if round == MAX_REWORK_ROUNDS || !made_progress {
             events.emit(EngineEvent::Note(umadev_i18n::tlf(
                 "continuous.team.unresolved_advisory",
-                &[kind_label(kind), &blocking.len().to_string()],
+                &[kind_label(kind), &review.blocking.len().to_string()],
             )));
-            return;
+            return review;
         }
-        prev_blocking = blocking.len();
+        prev_blocking = review.blocking.len();
 
         // 4. Fold every blocking finding into ONE imperative rework directive and
         //    inject it into the MAIN session — the base fixes the files in the
@@ -1655,18 +1788,43 @@ async fn review_and_rework(
             "continuous.team.inject_rework",
             &[
                 kind_label(kind),
-                &blocking.len().to_string(),
+                &review.blocking.len().to_string(),
                 &(round + 1).to_string(),
             ],
         )));
-        let directive = rework_directive(kind, &blocking);
+        let directive = rework_directive(kind, &review.blocking);
         if !drive_rework_turn(session, options, events, directive, deadline).await {
             // The rework turn failed / the session died — stop reworking (the
             // outer loop's phase/turn handling already surfaced the failure path).
-            // Fail-open: leave the findings as advisory and proceed.
-            return;
+            // Preserve the findings instead of manufacturing a clean result.
+            return review;
         }
     }
+    TeamReviewResult {
+        blocking: Vec::new(),
+        unavailable: vec!["bounded review loop ended without a verdict".to_string()],
+    }
+}
+
+/// Evidence-bearing reason for a required review that did not settle cleanly.
+fn review_incomplete_reason(kind: ReviewKind, review: &TeamReviewResult) -> String {
+    let mut evidence = review.blocking.clone();
+    evidence.extend(
+        review
+            .unavailable
+            .iter()
+            .map(|item| format!("review unavailable: {item}")),
+    );
+    format!(
+        "{} review incomplete: {}",
+        kind_phase_label(kind),
+        evidence.join("; ")
+    )
+}
+
+/// Convert a required non-clean review into an evidence-bearing failure reason.
+fn required_review_failure(kind: ReviewKind, review: &TeamReviewResult) -> Option<String> {
+    (review.status() != ReviewStatus::Pass).then(|| review_incomplete_reason(kind, review))
 }
 
 /// The team for a review node, scaled to the task via the planner's tiering, plus
@@ -1699,10 +1857,9 @@ pub(crate) fn team_for(
 }
 
 /// Run the whole team in PARALLEL — one read-only `BaseSession::fork()` per seat
-/// — and return the deduped union of every seat's `blocking[]`, tagged with the
-/// seat. Each verdict is recorded to the team ledger. Fully fail-open: a base
-/// that can't fork, an offline brain, or a parse failure yields empty accepting
-/// verdicts → no blocking.
+/// — and return semantic blockers separately from seats that could not produce a
+/// verdict. Each verdict is recorded to the team ledger; an unavailable seat is
+/// never collapsed into a clean pass.
 pub(crate) async fn run_review_team(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -1710,7 +1867,7 @@ pub(crate) async fn run_review_team(
     kind: ReviewKind,
     team: &[Box<dyn RoleCritic>],
     round: usize,
-) -> Vec<String> {
+) -> TeamReviewResult {
     // Read the on-disk blackboard ONCE (every seat reviews the same snapshot).
     let bb = Blackboard::read(options, kind);
     let arts = bb.artifacts(&options.requirement);
@@ -1726,10 +1883,9 @@ pub(crate) async fn run_review_team(
     // so the REVIEW turns below run CONCURRENTLY (`join_all_ordered`), which is where
     // the wall-clock actually goes (a fork handshake is cheap, a judge turn is a full
     // base round-trip). Each `fork()` is bounded by a TIMEOUT so a base whose fork
-    // handshake wedges (codex/opencode never returning `initialize`, whose reader
-    // only errors when the base closes) can NEVER freeze the whole gate: a timed-out
-    // fork degrades to an `Err`, which `review_one` already treats as a fail-open
-    // ACCEPT (that seat consults nothing). `fork()` is independent per call, so the
+    // handshake never completes can NEVER freeze the whole gate: a timed-out
+    // fork degrades to an `Err`, which `review_one` records as unavailable.
+    // `fork()` is independent per call, so the
     // reviews never collide and never touch the main writer (single-writer invariant).
     let mut forks = Vec::with_capacity(team.len());
     for _ in team {
@@ -1752,7 +1908,7 @@ pub(crate) async fn run_review_team(
     // Sequentially (deterministic order) record + fold blocking — the seat order
     // is the team order regardless of which fork finished first.
     let phase_label = kind_phase_label(kind);
-    let mut blocking: Vec<String> = Vec::new();
+    let mut result = TeamReviewResult::default();
     for verdict in verdicts {
         crate::critics::append_team_ledger(&options.project_root, phase_label, round + 1, &verdict);
         let seat = verdict.role.clone();
@@ -1763,50 +1919,59 @@ pub(crate) async fn run_review_team(
         // switches to the panel) — both are observational, neither drives the loop
         // (verdicts stay advisory — invariant 2).
         events.emit(EngineEvent::critic_verdict(&verdict));
-        if verdict.accepts && verdict.blocking.is_empty() {
-            events.emit(EngineEvent::Note(umadev_i18n::tlf(
+        match verdict.status() {
+            ReviewStatus::Pass => events.emit(EngineEvent::Note(umadev_i18n::tlf(
                 "continuous.team.seat_passed",
                 &[&seat],
-            )));
-        } else if !verdict.blocking.is_empty() {
-            events.emit(EngineEvent::Note(umadev_i18n::tlf(
-                "continuous.team.seat_blocking",
-                &[&seat, &verdict.blocking.len().to_string()],
-            )));
-            for b in verdict.blocking {
-                let item = format!("[{seat}] {}", b.trim());
-                if item.len() > 6 && !blocking.contains(&item) {
-                    blocking.push(item);
+            ))),
+            ReviewStatus::Fail => {
+                events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                    "continuous.team.seat_blocking",
+                    &[&seat, &verdict.blocking.len().to_string()],
+                )));
+                for b in verdict.blocking {
+                    let item = format!("[{seat}] {}", b.trim());
+                    if item.len() > 6 && !result.blocking.contains(&item) {
+                        result.blocking.push(item);
+                    }
+                }
+            }
+            ReviewStatus::Unavailable => {
+                let reason = verdict
+                    .unavailable_reason()
+                    .unwrap_or("review produced no usable verdict");
+                let item = format!("[{seat}] {reason}");
+                events.emit(EngineEvent::Note(format!(
+                    "team · review unavailable · {item}"
+                )));
+                if !result.unavailable.contains(&item) {
+                    result.unavailable.push(item);
                 }
             }
         }
     }
-    blocking
+    result
 }
 
 /// Establish ONE read-only fork, bounded by [`fork_establish_timeout`]. A fork
-/// handshake that wedges (e.g. a codex/opencode base that never returns its
-/// `initialize`, whose stdout reader only errors once the base CLOSES) would
+/// handshake that wedges on any native or ACP base would
 /// otherwise hang here forever and freeze the entire gate — `judge` has its own
 /// turn timeout, but it never runs if the fork never finishes opening. The
 /// timeout converts that hang into a [`SessionError::Start`], which `review_one`
-/// already treats as a fail-open ACCEPT (the seat consults nothing). Fail-open by
-/// contract: a wedged fork degrades one seat to advisory-accept, never blocks.
+/// records as an unavailable review. The timeout preserves liveness without
+/// inventing a pass.
 pub(crate) async fn fork_with_timeout(
     session: &mut dyn BaseSession,
 ) -> Result<Box<dyn BaseSession>, SessionError> {
     match tokio::time::timeout(fork_establish_timeout(), session.fork()).await {
         Ok(res) => res,
-        Err(_) => Err(SessionError::Start(
-            "fork handshake timed out — seat fail-open ACCEPT".to_string(),
-        )),
+        Err(_) => Err(SessionError::Start("fork handshake timed out".to_string())),
     }
 }
 
-/// Drive ONE critic over its (possibly failed) fork, fail-open to an accepting
-/// empty verdict. The critic's `review` runs its strict-JSON judge turn through a
-/// [`ForkConsult`] that owns the fork; a fork that didn't open routes to a
-/// fail-open consult that simply ACCEPTS.
+/// Drive ONE critic over its (possibly failed) fork. The critic's `review` runs
+/// its strict-JSON judge turn through a [`ForkConsult`] that owns the fork; a fork
+/// that did not open produces an explicit unavailable verdict.
 ///
 /// `cold` is `Some(surface)` only for an ADVERSARIAL seat under a host-scoped
 /// fresh judge surface: the review then runs through a [`ColdConsult`] (fresh
@@ -1821,14 +1986,14 @@ async fn review_one(
 ) -> RoleVerdict {
     // Panic isolation (parity with `runner::run_critics_concurrently`): a critic that
     // PANICS (e.g. a slice/unwrap on a malformed brain reply) must collapse to its
-    // empty accepting verdict, NOT unwind through the shared `join_all_ordered` driver
-    // and abort the entire /run. The review is already fail-open for value errors; this
+    // unavailable verdict, NOT unwind through the shared `join_all_ordered` driver
+    // and abort the entire /run. The review already isolates value errors; this
     // extends that to a panic on the flagship director path too.
     let role = critic.role().to_string();
     if let Some(surface) = cold {
         let consult = ColdConsult::new(surface, ForkConsult::new(fork));
         let verdict = crate::runner::catch_unwind_future(critic.review(&consult, arts), || {
-            RoleVerdict::empty(&role)
+            RoleVerdict::unavailable(&role, "critic panicked")
         })
         .await;
         consult.end().await;
@@ -1836,7 +2001,7 @@ async fn review_one(
     }
     let consult = ForkConsult::new(fork);
     let verdict = crate::runner::catch_unwind_future(critic.review(&consult, arts), || {
-        RoleVerdict::empty(&role)
+        RoleVerdict::unavailable(&role, "critic panicked")
     })
     .await;
     // Best-effort close the fork session (release the process / HTTP session).
@@ -1864,6 +2029,16 @@ pub(crate) struct ReworkTurn {
     pub text: String,
     /// Summaries of every FAILED tool result this turn produced (the pitfall feed).
     pub pitfalls: Vec<String>,
+    /// Base-native child agents observed through structured lifecycle frames or
+    /// the bounded marker fallback. Raw ids remain in memory only.
+    pub base_agents: crate::bg_agents::BaseAgentObservation,
+    /// Receipt armed only after the initial doer directive was accepted by the
+    /// host. The step scheduler owns settlement after its mechanical verifier;
+    /// any cancellation/error before then drops this guard as Unknown.
+    pub memory_receipt: Option<SentReceiptGuard>,
+    /// Receipt for exact reusable-skill blocks in the accepted directive. It is
+    /// settled by the same mechanical verifier as the knowledge receipt.
+    pub skill_receipt: Option<SkillReceiptGuard>,
 }
 
 /// Inject the rework directive into the MAIN session and pump its turn through
@@ -1906,6 +2081,31 @@ pub(crate) async fn drive_rework_turn_capturing(
     .await
 }
 
+/// Memory-aware serial doer variant that also carries the exact skill blocks
+/// selected during final directive assembly. Neither candidate kind records a
+/// use until this pump has successfully sent the directive.
+pub(crate) async fn drive_rework_turn_capturing_with_memories_and_skills(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    directive: String,
+    memories: Vec<umadev_knowledge::MemoryRef>,
+    skill_candidate: Option<SkillPromptCandidate>,
+    deadline: std::time::Instant,
+) -> ReworkTurn {
+    drive_rework_turn_with_idle_and_memories(
+        session,
+        options,
+        events,
+        directive,
+        memories,
+        skill_candidate,
+        crate::director_loop::IdleBudget::from_env(),
+        deadline,
+    )
+    .await
+}
+
 /// [`drive_rework_turn`] with an explicit idle window — the env read is hoisted
 /// to the wrapper so this core is deterministic for the idle-watchdog test.
 ///
@@ -1922,11 +2122,35 @@ async fn drive_rework_turn_with_idle(
     idle: crate::director_loop::IdleBudget,
     deadline: std::time::Instant,
 ) -> ReworkTurn {
+    drive_rework_turn_with_idle_and_memories(
+        session,
+        options,
+        events,
+        directive,
+        Vec::new(),
+        None,
+        idle,
+        deadline,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_rework_turn_with_idle_and_memories(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    directive: String,
+    memories: Vec<umadev_knowledge::MemoryRef>,
+    skill_candidate: Option<SkillPromptCandidate>,
+    idle: crate::director_loop::IdleBudget,
+    deadline: std::time::Instant,
+) -> ReworkTurn {
     // Estimate this turn's token cost up front (the session stream carries no usage
     // on TurnDone) so the summon-driven step path records usage on the DEFAULT loop,
     // for every base — recorded once at TurnDone. Mirrors `drive_one_turn`.
     let mut est_tokens: u64 = crate::director_loop::approx_tokens(&directive);
-    if session.send_turn(directive).await.is_err() {
+    if session.send_turn(directive.clone()).await.is_err() {
         return ReworkTurn {
             done: false,
             // The directive never reached the base — a DEFINITE no-turn, not a
@@ -1934,8 +2158,19 @@ async fn drive_rework_turn_with_idle(
             send_failed: true,
             text: String::new(),
             pitfalls: Vec::new(),
+            base_agents: crate::bg_agents::BaseAgentObservation::default(),
+            memory_receipt: None,
+            skill_receipt: None,
         };
     }
+    let memory_receipt = commit_sent_memories(&options.project_root, &directive, &memories)
+        .map(|receipt| SentReceiptGuard::new(&options.project_root, receipt));
+    let skill_receipt = skill_candidate
+        .as_ref()
+        .and_then(|candidate| {
+            commit_skill_prompt_receipt(&options.project_root, &directive, candidate)
+        })
+        .map(|receipt| SkillReceiptGuard::new(&options.project_root, receipt));
     let policy = umadev_governance::Policy::load(&options.project_root);
     let mut text = String::new();
     let mut pitfalls: Vec<String> = Vec::new();
@@ -1943,13 +2178,15 @@ async fn drive_rework_turn_with_idle(
     // base re-runs its build/test to fix the cause), which go silent for minutes, so
     // an in-flight tool gets the extended window before the watchdog calls it a hang.
     let mut in_tool_call = false;
+    let mut tool_activity = ToolActivity::default();
     // Outstanding-background-agents guard (the premature-final-report fix): this
     // pump drives the director loop's DOER steps (`director::summon`), where the
     // base may dispatch its own background sub-agents and then end the turn while
     // they still run. A `Completed` settle with agents outstanding becomes a
     // bounded "wait for your agents, collect their results, THEN report" re-drive
     // (at most `bg_agents::MAX_BG_REDRIVES` per turn, never past the deadline).
-    // Fail-open: no background signal → zero count → today's behavior.
+    // A positive live set after the bound makes the rework incomplete; no
+    // background signal still preserves today's fail-open behavior.
     let mut bg = crate::bg_agents::BgAgentTracker::new();
     // Idle watchdog (P1-11): this rework pump (reused by `governance_catchup` /
     // `review_and_rework` / the director's `summon`) was a naked
@@ -1985,6 +2222,9 @@ async fn drive_rework_turn_with_idle(
                 send_failed: false,
                 text,
                 pitfalls,
+                base_agents: bg.observation(),
+                memory_receipt,
+                skill_receipt,
             };
         }
         let ev = match crate::director_loop::next_event_idle(
@@ -2016,6 +2256,9 @@ async fn drive_rework_turn_with_idle(
                     send_failed: false,
                     text,
                     pitfalls,
+                    base_agents: bg.observation(),
+                    memory_receipt,
+                    skill_receipt,
                 };
             }
             crate::director_loop::IdleEvent::IdleTimedOut { exit, stderr_tail } => {
@@ -2030,15 +2273,17 @@ async fn drive_rework_turn_with_idle(
                     send_failed: false,
                     text,
                     pitfalls,
+                    base_agents: bg.observation(),
+                    memory_receipt,
+                    skill_receipt,
                 };
             }
         };
         // Arm/disarm the tool-grace from this event before handling it.
-        if let Some(t) = crate::director_loop::tool_phase_transition(&ev) {
-            in_tool_call = t;
-        }
+        in_tool_call = tool_activity.observe(&ev);
         // Feed the outstanding-background-agents guard (cheap, fail-open).
         bg.observe(&ev);
+        let event_tool_call_id = ev.tool_call_id().map(str::to_owned);
         match ev {
             SessionEvent::TextDelta(delta) => {
                 est_tokens = est_tokens.saturating_add(crate::director_loop::approx_tokens(&delta));
@@ -2060,10 +2305,50 @@ async fn drive_rework_turn_with_idle(
                 // guess. Informational only; drives no rework control.
                 events.emit(EngineEvent::BaseModel { id });
             }
-            SessionEvent::ToolCall { name, input } => {
+            SessionEvent::StateUpdate(update) => {
+                events.emit(EngineEvent::BaseSessionState {
+                    backend_id: options.backend.clone(),
+                    update,
+                });
+            }
+            SessionEvent::ToolCall { name, input }
+            | SessionEvent::ToolCallCorrelated { name, input, .. } => {
                 // Rework writes real files — govern + audit them exactly like a
                 // phase turn (the rework runs on the main writer session).
-                govern_tool_call(options, events, &policy, Phase::Quality, &name, &input);
+                govern_tool_call(
+                    options,
+                    events,
+                    &policy,
+                    Phase::Quality,
+                    event_tool_call_id.as_deref(),
+                    &name,
+                    &input,
+                );
+            }
+            SessionEvent::ToolProgressCorrelated { call_id, title } => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolProgressCorrelated { call_id, title },
+                });
+            }
+            SessionEvent::ToolOutputDelta(delta) => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolOutputDelta { delta },
+                });
+            }
+            SessionEvent::ToolOutputDeltaCorrelated { call_id, delta } => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolOutputDeltaCorrelated { call_id, delta },
+                });
+            }
+            SessionEvent::ToolOutputSnapshot(output) => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolOutputSnapshot { output },
+                });
+            }
+            SessionEvent::ToolOutputSnapshotCorrelated { call_id, output } => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolOutputSnapshotCorrelated { call_id, output },
+                });
             }
             SessionEvent::ToolResult { ok, summary } => {
                 if !ok {
@@ -2074,6 +2359,22 @@ async fn drive_rework_turn_with_idle(
                 }
                 events.emit(EngineEvent::WorkerStream {
                     event: StreamEvent::ToolResult { ok, summary },
+                });
+            }
+            SessionEvent::ToolResultCorrelated {
+                call_id,
+                ok,
+                summary,
+            } => {
+                if !ok {
+                    pitfalls.push(summary.clone());
+                }
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolResultCorrelated {
+                        call_id,
+                        ok,
+                        summary,
+                    },
                 });
             }
             SessionEvent::NeedApproval {
@@ -2095,11 +2396,37 @@ async fn drive_rework_turn_with_idle(
                         send_failed: false,
                         text,
                         pitfalls,
+                        base_agents: bg.observation(),
+                        memory_receipt,
+                        skill_receipt,
+                    };
+                }
+            }
+            SessionEvent::HostRequest { req_id, request } => {
+                let response =
+                    crate::director_loop::resolve_host_request(options, events, &req_id, &request)
+                        .await;
+                if session.respond_host(&req_id, response).await.is_err() {
+                    return ReworkTurn {
+                        done: false,
+                        send_failed: false,
+                        text,
+                        pitfalls,
+                        base_agents: bg.observation(),
+                        memory_receipt,
+                        skill_receipt,
                     };
                 }
             }
             SessionEvent::BackgroundTask(_) => {
                 // Already folded into the tracker above; carries no render row.
+            }
+            SessionEvent::BackgroundProcess(_) => {
+                // Ordinary background processes may outlive this rework turn;
+                // do not count them as unfinished sub-agent work.
+            }
+            SessionEvent::PromptQueueChanged(_) => {
+                // State-only resident-chat event; rework execution is unchanged.
             }
             SessionEvent::TurnDone { status, usage } => {
                 // Outstanding-background-agents guard: a CLEAN finish while the
@@ -2126,13 +2453,15 @@ async fn drive_rework_turn_with_idle(
                         est_tokens.saturating_add(crate::director_loop::approx_tokens(&wait));
                     if session.send_turn(wait).await.is_ok() {
                         in_tool_call = false;
+                        tool_activity.clear();
                         continue;
                     }
                     // Send failed → the session is going away; settle honestly.
                 }
-                if matches!(status, TurnStatus::Completed | TurnStatus::Truncated)
-                    && bg.outstanding() > 0
-                {
+                let known_incomplete =
+                    matches!(status, TurnStatus::Completed | TurnStatus::Truncated)
+                        && bg.outstanding() > 0;
+                if known_incomplete {
                     events.emit(EngineEvent::Note(umadev_i18n::tlf(
                         "bg.outstanding_note",
                         &[&bg.outstanding().to_string()],
@@ -2142,17 +2471,18 @@ async fn drive_rework_turn_with_idle(
                 // prefer the base's REAL reported usage (claude/codex), falling
                 // back to the chars/4 estimate (opencode, or any base that didn't
                 // report). Mirrors `director_loop::drive_one_turn`.
-                crate::director_loop::record_estimated_usage(
-                    &options.backend,
-                    crate::director_loop::real_or_estimated_tokens(usage, est_tokens),
-                );
+                crate::director_loop::record_turn_usage(options, events, usage, est_tokens);
                 // Completed / Truncated → accept and re-review; Interrupted /
                 // Failed → stop reworking (fail-open, advisory).
                 return ReworkTurn {
-                    done: matches!(status, TurnStatus::Completed | TurnStatus::Truncated),
+                    done: matches!(status, TurnStatus::Completed | TurnStatus::Truncated)
+                        && !known_incomplete,
                     send_failed: false,
                     text,
                     pitfalls,
+                    base_agents: bg.observation(),
+                    memory_receipt,
+                    skill_receipt,
                 };
             }
         }
@@ -2428,10 +2758,11 @@ fn is_test_file(path: &std::path::Path) -> bool {
         || name.ends_with("_test.py")
 }
 
-/// A [`CriticConsult`] that routes a seat's strict-JSON judge turn to a READ-ONLY
-/// `BaseSession::fork()`. The fork is owned for the seat's lifetime; a fork that
-/// failed to open (or an offline brain) makes `judge` fail-open to the empty
-/// (accepting) verdict — an absent critic can NEVER block (invariant 1).
+/// An owner for the fresh READ-ONLY child returned by `BaseSession::fork()`.
+/// Critic callers run a strict-JSON judge turn on it; the intent router runs its
+/// typed pre-action decision and may recover the same child for a read-only user
+/// turn. A child that failed to open (or an offline brain) makes each caller take
+/// its own safe fallback; an absent critic can NEVER block (invariant 1).
 pub(crate) struct ForkConsult {
     /// The read-only fork, or the error that prevented opening one. `Mutex` so
     /// the `&self` `judge` can drive the `&mut` session.
@@ -2452,13 +2783,21 @@ impl ForkConsult {
         }
     }
 
+    /// Recover the healthy read-only session after a typed consult. The intent
+    /// router uses this to answer a Chat/Explain turn on the SAME sandboxed child,
+    /// so a read-only semantic decision is also enforced by the execution surface.
+    /// A failed/unsupported fork yields `None`.
+    pub(crate) fn into_session(self) -> Option<Box<dyn BaseSession>> {
+        self.fork.into_inner().ok()
+    }
+
     /// Run ONE strict-JSON consult on the read-only fork and return the extracted
     /// JSON object text (NOT parsed into a [`RoleVerdict`]) — the generic primitive
     /// the router / planner use to get a typed artifact of their OWN shape over the
     /// borrowed brain. Same fork → judge-turn → `extract_json_object` path as
     /// [`CriticConsult::judge`], same fail-open contract: a missing fork, an offline
     /// brain, a timeout, or a reply with no JSON object yields `None`, so the caller
-    /// degrades to its deterministic floor.
+    /// takes its domain-specific safe fallback.
     ///
     /// `label` is only used for the bounded-turn log line; `system` pins the schema,
     /// `user` carries the payload. The caller `serde_json::from_str`s the result.
@@ -2516,23 +2855,17 @@ impl ForkConsult {
 }
 
 /// Maker-checker INDEPENDENCE firewall — the clean-room preamble prepended to
-/// every critic's judge directive so the reviewer evaluates the ARTIFACT on a
-/// clean context, never the maker's reasoning.
+/// every critic's judge directive so the reviewer evaluates the ARTIFACT, never
+/// the maker's narrative.
 ///
-/// WHY THIS EXISTS: a read-only critic fork inherits the MAIN session's context
-/// on two of the three bases — claude resumes + branches it (`--fork-session`),
-/// codex forks the live thread (`thread/fork`), so the fork carries the doer's
-/// full deliberation / chain-of-thought (opencode alone opens a fresh independent
-/// session, so it is already clean). A reviewer that reads the maker's reasoning
-/// unconsciously ADOPTS its framing and misses exactly what that framing hides —
-/// a self-preference leak that degrades review quality. UmaDev keeps the
-/// read-only forked-parallel-critique mechanism (the fork is what fences the
-/// single-writer invariant), but quarantines any inherited author reasoning at
-/// the prompt boundary: the reviewer is told to disregard prior conversation and
-/// judge ONLY the artifact + acceptance criteria + requirement supplied below,
-/// from its own seat. This makes the independence uniform across all three bases
-/// without changing the review mechanism — the change is WHAT CONTEXT the critic
-/// acts on, not how it is convened.
+/// All five first-class bases open a fresh, independent read-only session:
+/// the three native drivers use their clean-session mechanisms, and Grok Build's ACP
+/// bases use a fresh shared-driver session. None resumes or branches the writer
+/// transcript. This prompt remains defense in depth: it pins the artifact-only
+/// contract if a future driver regresses, a generic driver supplies unexpected
+/// context, or the artifact payload itself contains author commentary. Reviewers
+/// judge only the supplied artifact, acceptance criteria, and requirement from
+/// their own seat.
 const INDEPENDENT_REVIEW_FIREWALL: &str = "You are opening an INDEPENDENT, clean-room review. \
      If any earlier conversation, plan, author commentary, or chain-of-thought appears in your \
      context, treat it as the MAKER's private notes and DISREGARD it — adopting the author's \
@@ -2542,8 +2875,8 @@ const INDEPENDENT_REVIEW_FIREWALL: &str = "You are opening an INDEPENDENT, clean
      and does — not what its author intended, narrated, or claimed.";
 
 /// Compose the full judge directive sent to a critic's read-only fork: the
-/// maker-checker [`INDEPENDENT_REVIEW_FIREWALL`] FIRST (so the reviewer
-/// quarantines any inherited maker reasoning before it reads anything), then the
+/// maker-checker [`INDEPENDENT_REVIEW_FIREWALL`] FIRST (so the reviewer rejects
+/// maker framing before it reads anything), then the
 /// role's strict-JSON `system` prompt + the JSON-shape instruction, then the
 /// artifact-only `user` payload. Extracted as a pure fn so the clean-context
 /// invariant is directly testable: the directive is built from ONLY the firewall,
@@ -2561,34 +2894,36 @@ impl CriticConsult for ForkConsult {
     async fn judge(&self, role: &str, system: &str, user: String) -> RoleVerdict {
         let mut guard = self.fork.lock().await;
         let Ok(fork) = guard.as_mut() else {
-            // No fork (unsupported / failed) → fail-open ACCEPT.
-            return RoleVerdict::empty(role);
+            let reason = guard
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "review fork unavailable".to_string());
+            return RoleVerdict::unavailable(role, reason);
         };
         // One strict-JSON judge turn on the read-only fork. The directive pins the
         // role + the JSON shape (the critic's `system`) and carries the artifacts
-        // (`user`), behind the maker-checker independence firewall so the reviewer
-        // judges the artifact on a CLEAN context (not the doer's inherited
-        // reasoning); we drain the fork's events for the assistant text, then parse.
+        // (`user`), behind the maker-checker independence firewall. The host child
+        // is already fresh; the prompt independently locks the same artifact-only
+        // contract. We drain the child's events for the assistant text, then parse.
         let directive = compose_review_directive(system, &user);
-        if fork.send_turn(directive).await.is_err() {
-            return RoleVerdict::empty(role);
+        if let Err(error) = fork.send_turn(directive).await {
+            return RoleVerdict::unavailable(role, format!("review turn failed to start: {error}"));
         }
         // Bound the judge turn so one wedged fork can't hang the whole gate.
         match tokio::time::timeout(review_turn_timeout(), drain_review_text(fork)).await {
             // A clean TurnDone with the collected text → parse the verdict.
             Ok(Some(text)) => parse_verdict(role, &text),
-            // Timed out / session ended without a clean TurnDone → fail-open ACCEPT.
-            _ => RoleVerdict::empty(role),
+            Ok(None) => RoleVerdict::unavailable(role, "review session ended before a verdict"),
+            Err(_) => RoleVerdict::unavailable(role, "review turn timed out"),
         }
     }
 }
 
-/// The cold-context preamble prepended to a COLD seat's judge directive. Unlike
-/// the fork's [`INDEPENDENT_REVIEW_FIREWALL`] (which must QUARANTINE inherited
-/// maker reasoning), a cold surface has no prior context by construction — the
-/// preamble instead frames the review as an external clean-room audit so the
-/// seat digs for what the artifact itself proves rather than expecting a
-/// narrative to lean on.
+/// The preamble for the optional one-shot COLD judge surface. Both this surface
+/// and the normal host child are clean by construction; this variant explicitly
+/// frames the seat as an external audit so it digs for what the artifact proves
+/// rather than expecting a narrative to lean on.
 const COLD_REVIEW_PREAMBLE: &str = "You are an INDEPENDENT external reviewer brought in with \
      NO prior context on this project's conversation or its author's reasoning. Everything you \
      may consider is provided below: the artifact, the acceptance criteria, and the requirement. \
@@ -2597,10 +2932,10 @@ const COLD_REVIEW_PREAMBLE: &str = "You are an INDEPENDENT external reviewer bro
 
 /// A [`CriticConsult`] for a **COLD-context** seat (B2#1): the judge turn runs on
 /// the host-scoped FRESH, STATELESS one-shot surface
-/// ([`crate::critics::cold_surface`] — the same `Runtime::complete` primitive the
-/// chat router's triage uses), seeded ONLY with the seat's system prompt + the
-/// blackboard artifacts. The main session's transcript is NEVER an input, so the
-/// reviewer shares none of the doer's framing or blind spots.
+/// ([`crate::critics::cold_surface`]), seeded ONLY with the seat's system prompt +
+/// the blackboard artifacts. The main session's transcript is NEVER an input, so
+/// the reviewer shares none of the doer's framing or blind spots. Ordinary intent
+/// routing uses the continuous fresh-child surface, not this one-shot path.
 ///
 /// Fail-open at every edge (invariant 1): a surface call that times out, errors,
 /// returns nothing, or returns unparseable JSON falls back to the read-only FORK
@@ -2671,10 +3006,12 @@ async fn drain_review_text(fork: &mut Box<dyn BaseSession>) -> Option<String> {
     None
 }
 
-/// Parse a fork's judge reply into a [`RoleVerdict`], fail-open to the empty
-/// (accepting) verdict when no JSON object is found / it doesn't deserialize.
+/// Parse a fork's judge reply into a [`RoleVerdict`]. Malformed output is an
+/// explicit unavailable review, never a clean pass.
 fn parse_verdict(role: &str, text: &str) -> RoleVerdict {
-    try_parse_verdict(role, text).unwrap_or_else(|| RoleVerdict::empty(role))
+    try_parse_verdict(role, text).unwrap_or_else(|| {
+        RoleVerdict::unavailable(role, "review reply was not valid verdict JSON")
+    })
 }
 
 /// [`parse_verdict`] without the fail-open collapse: `None` when the reply holds
@@ -2730,8 +3067,8 @@ fn in_string_step(b: u8, esc: &mut bool) -> bool {
     }
 }
 
-/// Timeout for one read-only judge turn. Advisory reviews are discardable, so a
-/// wedged fork must never hang the gate — it fails open to ACCEPT. Overridable
+/// Timeout for one read-only judge turn. A wedged fork must never hang the gate;
+/// the seat becomes unavailable instead of accepting. Overridable
 /// via `UMADEV_REVIEW_TURN_TIMEOUT_SECS` for slow machines / CI.
 fn review_turn_timeout() -> std::time::Duration {
     std::env::var("UMADEV_REVIEW_TURN_TIMEOUT_SECS")
@@ -2744,10 +3081,11 @@ fn review_turn_timeout() -> std::time::Duration {
         )
 }
 
-/// Timeout for ESTABLISHING one read-only fork (the `initialize`/`thread/fork`/
-/// `POST /session` handshake), distinct from the per-turn judge timeout above. A
+/// Timeout for ESTABLISHING one fresh read-only child (Claude process startup,
+/// Codex `initialize` + `thread/start`, or OpenCode `POST /session` + SSE ready),
+/// distinct from the per-turn judge timeout above. A
 /// fork that never completes its handshake must not freeze the gate, so a stuck
-/// `fork()` is bounded and degraded to a fail-open ACCEPT. Kept short (the
+/// `fork()` is bounded and reported unavailable. Kept short (the
 /// handshake is cheap when healthy) but overridable via
 /// `UMADEV_FORK_ESTABLISH_TIMEOUT_SECS` for slow machines / CI.
 fn fork_establish_timeout() -> std::time::Duration {
@@ -2846,14 +3184,14 @@ mod tests {
         /// Verdict JSON the SUCCESSIVE `fork()` calls hand back — one per call,
         /// front-to-back. `Some(json)` → that fork emits the JSON as its judge
         /// reply then `TurnDone`; `None` → that fork FAILS (`ForkUnsupported`),
-        /// exercising the per-seat fail-open path. Shared so a test can assert the
+        /// exercising the per-seat unavailable path. Shared so a test can assert the
         /// fork count and the main session can mutate it from `&self`-ish `fork`.
         fork_script: Arc<Mutex<std::collections::VecDeque<Option<String>>>>,
         /// How many forks were opened (asserted by tests).
         forks_opened: Arc<Mutex<usize>>,
         /// When true, `fork()` AWAITS FOREVER instead of returning — models a base
         /// whose fork handshake wedges (never returns `initialize`). The
-        /// `fork_with_timeout` wrapper must bound it and fail-open to ACCEPT.
+        /// `fork_with_timeout` wrapper must bound it and report it unavailable.
         fork_hangs: bool,
         /// When true, `next_event` AWAITS FOREVER after `send_turn` (the base
         /// holds the pipe open but emits nothing, never exits) — the P1-11 hang
@@ -2949,13 +3287,13 @@ mod tests {
         async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
             *self.forks_opened.lock().unwrap() += 1;
             // A wedged fork handshake: await forever so `fork_with_timeout` must be
-            // the thing that ends the wait (fail-open ACCEPT), not this returning.
+            // the thing that ends the wait, not this returning.
             if self.fork_hangs {
                 std::future::pending::<()>().await;
             }
             // Pop the next scripted fork outcome. An empty script → a default
-            // accepting verdict (so a test that doesn't care still gets a clean,
-            // fail-open ACCEPT). `None` → this fork fails (fail-open path).
+            // accepting verdict (so unrelated tests get a clean review). `None`
+            // makes the seat explicitly unavailable.
             let next = self.fork_script.lock().unwrap().pop_front();
             match next {
                 Some(Some(json)) => Ok(Box::new(Self::verdict_fork(&json))),
@@ -3344,8 +3682,9 @@ mod tests {
 
     #[tokio::test]
     async fn floor_blocks_env_write_even_with_clauses_disabled() {
-        // A non-Claude base (codex / opencode — no PreToolUse hook) writing to
-        // `.env` must be blocked by the bypass-immune floor even when the project
+        // A non-Claude base (two native alternatives or Grok Build)
+        // writing to `.env` must be blocked by the bypass-immune floor even when
+        // the project
         // DISABLED the secret/path clauses. `.env` has no source extension, so a
         // content-only scan would miss it; the floor's path guard blocks it.
         let policy = umadev_governance::Policy {
@@ -3627,22 +3966,32 @@ mod tests {
         assert_eq!(r[1], ("r2".to_string(), ApprovalDecision::Deny));
     }
 
-    // ── Plan (read-only) mode never executes a code phase ──────────────────
+    // ── Plan (read-only) mode never opens the legacy execution path ────────
 
     #[tokio::test]
-    async fn plan_mode_does_not_execute_spec_phase() {
+    async fn plan_mode_is_a_hard_nonexecution_before_session_or_disk_effects() {
         let tmp = tempfile::tempdir().unwrap();
         let options = opts(tmp.path(), "build a dashboard app", TrustMode::Plan);
         let (events, _rec) = sink();
         let mut session = FakeBaseSession::new(vec![vec![done()]]);
         let sent = session.sent_handle();
+        let forks = session.forks_handle();
 
-        // Resume at Spec under plan mode → must refuse to execute.
+        // Direct callers can bypass AgentRunner's Result boundary, so the legacy
+        // enum carries the same refusal as a hard non-success outcome.
         let outcome = run_block(&mut session, &options, &events, Phase::Spec).await;
-        assert_eq!(outcome, RunOutcome::Completed);
+        assert!(
+            matches!(outcome, RunOutcome::HardStop(ref reason) if reason.contains("[plan]")),
+            "plan must never be disguised as Completed: {outcome:?}"
+        );
         assert!(
             sent.lock().unwrap().is_empty(),
-            "plan mode sent no executing directive"
+            "plan mode sent no directive"
+        );
+        assert_eq!(*forks.lock().unwrap(), 0, "plan mode opened no child");
+        assert!(
+            std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
+            "plan mode wrote no workflow, governance, or artifact files"
         );
     }
 
@@ -3811,10 +4160,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_verdict_fail_open_on_garbage() {
-        // Garbage / no JSON → the empty accepting verdict (fail-open).
+    fn parse_verdict_marks_garbage_unavailable() {
         let v = parse_verdict("architect", "the base rambled with no json");
-        assert!(v.accepts && v.blocking.is_empty());
+        assert_eq!(v.status(), ReviewStatus::Unavailable);
+        assert!(!v.accepts && v.blocking.is_empty());
         assert_eq!(v.role, "architect");
         // A real blocking verdict parses + is tagged with the role.
         let v = parse_verdict(
@@ -3822,8 +4171,59 @@ mod tests {
             r#"{"accepts":false,"blocking":["no tests"]}"#,
         );
         assert!(!v.accepts);
+        assert_eq!(v.status(), ReviewStatus::Fail);
         assert_eq!(v.role, "qa-engineer");
         assert_eq!(v.blocking, vec!["no tests".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn legacy_review_preserves_blockers_alongside_unavailable_seats() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_source(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Auto,
+        );
+        let (events, _rec) = sink();
+        let seats = team_for(ReviewKind::Quality, &options.requirement, tmp.path()).len();
+        assert!(seats >= 2);
+        let mut script = vec![Some(r#"{"accepts":true}"#.to_string()); seats];
+        script[0] = Some(r#"{"accepts":false,"blocking":["missing regression test"]}"#.to_string());
+        script[1] = None;
+        let mut session = FakeBaseSession::new(vec![]).with_fork_script(script);
+
+        let review = review_and_rework(
+            &mut session,
+            &options,
+            &events,
+            ReviewKind::Quality,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        assert_eq!(review.status(), ReviewStatus::Unavailable);
+        assert!(review
+            .blocking
+            .iter()
+            .any(|b| b.contains("regression test")));
+        assert!(!review.unavailable.is_empty());
+        let reason = required_review_failure(ReviewKind::Quality, &review)
+            .expect("required mixed review cannot complete");
+        assert!(reason.contains("regression test"));
+        assert!(reason.contains("review unavailable"));
+    }
+
+    #[test]
+    fn legacy_required_review_pass_is_the_only_non_failure() {
+        let clean = TeamReviewResult::default();
+        assert!(required_review_failure(ReviewKind::Quality, &clean).is_none());
+
+        let failed = TeamReviewResult {
+            blocking: vec!["[qa] missing test".to_string()],
+            unavailable: Vec::new(),
+        };
+        assert!(required_review_failure(ReviewKind::Quality, &failed).is_some());
     }
 
     #[test]
@@ -3968,7 +4368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn docs_gate_fork_failure_fails_open_to_accept() {
+    async fn docs_gate_fork_failure_reports_unavailable_without_rework() {
         let tmp = tempfile::tempdir().unwrap();
         seed_docs(tmp.path());
         let options = opts(
@@ -3976,9 +4376,9 @@ mod tests {
             "build a SaaS dashboard web app with login and charts",
             TrustMode::Guarded,
         );
-        let (events, _rec) = sink();
-        // EVERY fork FAILS (`None`) → each seat fail-opens to ACCEPT → no
-        // blocking → no rework → the gate proceeds normally.
+        let (events, rec) = sink();
+        // EVERY fork FAILS (`None`) → each seat is unavailable. The legacy gate
+        // remains live, but it must not claim that the review passed.
         let mut session = FakeBaseSession::new(vec![vec![done()], vec![done()]])
             .with_fork_script(vec![None, None, None]);
         let forks = session.forks_handle();
@@ -3994,15 +4394,19 @@ mod tests {
         assert_eq!(
             sent.lock().unwrap().len(),
             2,
-            "fork-fail fail-open → no rework"
+            "an unavailable review is not a product-file rework"
         );
+        assert!(rec.events().iter().any(|event| matches!(
+            event,
+            EngineEvent::Note(note) if note.contains("review unavailable")
+        )));
     }
 
     #[tokio::test]
-    async fn fork_with_timeout_fails_open_accept_on_wedged_handshake() {
+    async fn fork_with_timeout_reports_unavailable_on_wedged_handshake() {
         // P2-4: a base whose fork handshake WEDGES (never returns) must not freeze
-        // the gate. `fork_with_timeout` bounds it; the timed-out fork degrades to an
-        // Err → `review_one` fail-open ACCEPTs → no blocking → the gate proceeds.
+        // the gate. `fork_with_timeout` bounds it; the timed-out fork becomes an
+        // unavailable review instead of a fabricated acceptance.
         // Use a tiny timeout via the env override so the test is fast; restore it.
         let tmp = tempfile::tempdir().unwrap();
         seed_docs(tmp.path());
@@ -4030,25 +4434,25 @@ mod tests {
         .await
         .expect("run must not hang on a wedged fork — the timeout must fire");
 
-        // The gate still PAUSED (the wedged forks all fail-open ACCEPT → no rework).
+        // The legacy gate still pauses normally; reviewer unavailability is surfaced.
         assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
         // Forks WERE attempted (one per seat), and no rework was injected.
         assert!(*forks.lock().unwrap() >= 1, "forks were attempted");
         assert_eq!(
             sent.lock().unwrap().len(),
             2,
-            "wedged-fork fail-open → research + docs only, no rework"
+            "wedged reviewer transport must not trigger a product-file rework"
         );
     }
 
-    // ── Maker-checker independence: the critic reviews the ARTIFACT on a CLEAN
-    //    context, never the doer's inherited reasoning ─────────────────────────
+    // ── Maker-checker independence: the critic reviews the ARTIFACT on a FRESH
+    //    child, and the prompt independently rejects maker framing ─────────────
 
     #[test]
     fn review_directive_is_clean_room_artifact_only() {
         // The judge directive a critic sends to its read-only fork must (1) lead
-        // with the maker-checker independence firewall so any inherited author
-        // reasoning is quarantined, and (2) carry the clean artifact seed — the
+        // with the maker-checker independence firewall so any unexpected author
+        // framing is rejected, and (2) carry the clean artifact seed — the
         // role prompt + the requirement + the produced artifact + the acceptance
         // criteria — and NOTHING the doer deliberated.
         let system = "You are a STRICT senior QA engineer. JSON shape: {\"accepts\": <bool>}";
@@ -4077,7 +4481,7 @@ mod tests {
         );
         assert!(
             lower.contains("chain-of-thought") || lower.contains("conversation"),
-            "the inherited deliberation is named"
+            "unexpected prior deliberation is explicitly rejected"
         );
         assert!(
             d.find(INDEPENDENT_REVIEW_FIREWALL).unwrap() < d.find(system).unwrap(),
@@ -4128,10 +4532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn judge_with_firewall_still_fails_open_on_no_fork() {
-        // The independence firewall must not change the fail-open contract: a critic
-        // whose fork never opened still ACCEPTs (an absent critic can NEVER block —
-        // invariant 1), exactly as before the firewall was added.
+    async fn judge_with_firewall_marks_no_fork_unavailable() {
         let consult = ForkConsult::new(Err(SessionError::ForkUnsupported("no fork".into())));
         let v = consult
             .judge(
@@ -4140,7 +4541,8 @@ mod tests {
                 "## Requirement\nx\n\n## Delivered code\ny".to_string(),
             )
             .await;
-        assert!(v.accepts, "no fork → fail-open ACCEPT, firewall or not");
+        assert_eq!(v.status(), ReviewStatus::Unavailable);
+        assert!(!v.accepts);
         assert_eq!(v.role, "security-engineer");
         assert!(v.blocking.is_empty());
     }
@@ -4522,7 +4924,7 @@ mod tests {
     // These exercise the four moat functions wired back into `run_block`:
     // (1) the quality HARD GATE (`run_quality_gate`), (2) the contract/coverage
     // critic floor (`quality_floor`), (3) the post-write governance catch-up
-    // (`governance_catchup`, the codex/opencode no-hook gap), and that the LLM
+    // (`governance_catchup`, the seven-base no-hook gap), and that the LLM
     // critic stays advisory while the deterministic gate is the hard signal.
 
     /// A source file with a hardcoded (non-token) color — trips the governance
@@ -4736,7 +5138,7 @@ mod tests {
 
     #[test]
     fn quality_blackboard_grounds_critics_with_real_file_listing() {
-        // GROUNDING: the Quality critics review a forked session with only the
+        // GROUNDING: the Quality critics review on a fresh child with only the
         // blackboard + a source digest, so they can hallucinate absent files. The
         // review context must carry the ACTUAL relative paths of the real test +
         // source (incl. backend) files so a critic SEES them and cannot claim
@@ -5056,6 +5458,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drive_phase_waits_for_background_agents_before_settling() {
+        use umadev_runtime::BackgroundTaskSignal;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![
+            vec![
+                SessionEvent::BackgroundTask(BackgroundTaskSignal::Started {
+                    id: "agent-1".to_string(),
+                }),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ],
+            vec![
+                SessionEvent::BackgroundTask(BackgroundTaskSignal::Finished {
+                    id: "agent-1".to_string(),
+                }),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ],
+        ]);
+        let sent = session.sent_handle();
+
+        let result = drive_phase(
+            &mut session,
+            &options,
+            &events,
+            Phase::Frontend,
+            false,
+            crate::planner::TaskKind::Greenfield,
+            crate::director_loop::IdleBudget::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        )
+        .await;
+
+        assert!(matches!(result, PhaseResult::Done));
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 2, "phase directive plus one wait re-drive");
+        assert!(sent[1].contains("native blocking wait/inspect mechanism"));
+    }
+
+    #[tokio::test]
+    async fn session_state_updates_flow_through_phase_and_rework_pumps() {
+        use umadev_runtime::{SessionMode, SessionStateUpdate};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        options.backend = "grok-build".to_string();
+        let (events, rec) = sink();
+        let mut phase_session = FakeBaseSession::new(vec![vec![
+            SessionEvent::StateUpdate(SessionStateUpdate::ModeChanged {
+                mode: SessionMode::Plan,
+            }),
+            done(),
+        ]]);
+
+        let result = drive_phase(
+            &mut phase_session,
+            &options,
+            &events,
+            Phase::Frontend,
+            false,
+            crate::planner::TaskKind::Greenfield,
+            crate::director_loop::IdleBudget::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        )
+        .await;
+        assert!(matches!(result, PhaseResult::Done));
+
+        let mut rework_session = FakeBaseSession::new(vec![vec![
+            SessionEvent::StateUpdate(SessionStateUpdate::ModeChanged {
+                mode: SessionMode::Ask,
+            }),
+            done(),
+        ]]);
+        let turn = drive_rework_turn_with_idle(
+            &mut rework_session,
+            &options,
+            &events,
+            "fix it".to_string(),
+            crate::director_loop::IdleBudget::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        )
+        .await;
+        assert!(turn.done);
+
+        let state = rec
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                EngineEvent::BaseSessionState { backend_id, update } => Some((backend_id, update)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(state.len(), 2);
+        assert!(matches!(
+            &state[0],
+            (backend_id, SessionStateUpdate::ModeChanged { mode: SessionMode::Plan })
+                if backend_id == "grok-build"
+        ));
+        assert!(matches!(
+            &state[1],
+            (backend_id, SessionStateUpdate::ModeChanged { mode: SessionMode::Ask })
+                if backend_id == "grok-build"
+        ));
+    }
+
+    #[tokio::test]
     async fn drive_rework_turn_idle_watchdog_settles_a_hung_base() {
         // P1-11: the rework pump (governance_catchup / review_and_rework / the
         // director's summon all flow through here) must also be idle-guarded — a
@@ -5093,11 +5617,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drive_rework_turn_redrives_on_outstanding_bg_agents_then_settles_bounded() {
+    async fn drive_rework_turn_redrives_on_outstanding_bg_agents_then_fails_bounded() {
         // Report-1 fix on the DOER pump (`director::summon` flows through here): a
         // step turn that completes while the base's own background sub-agents still
         // run is re-driven with a "wait for your agents" directive; agents that never
-        // resolve exhaust MAX_BG_REDRIVES and the turn settles (terminating) as done.
+        // resolve exhaust MAX_BG_REDRIVES and the turn terminates as incomplete.
         use umadev_runtime::BackgroundTaskSignal;
         let tmp = tempfile::tempdir().unwrap();
         let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
@@ -5130,7 +5654,10 @@ mod tests {
         )
         .await;
 
-        assert!(turn.done, "the bounded settle still completes the turn");
+        assert!(
+            !turn.done,
+            "known live sub-agents must keep the rework turn incomplete"
+        );
         let sent = sent.lock().unwrap().clone();
         assert_eq!(
             sent.len(),
@@ -5142,11 +5669,90 @@ mod tests {
             "the re-drive is the wait-for-your-agents corrective: {}",
             sent[1]
         );
-        // The settle is honest about the still-outstanding agent.
+        // The incomplete result is visible to the user too.
         assert!(
             rec.count(|e| matches!(e, EngineEvent::Note(n) if n.contains("git status"))) >= 1,
-            "settling with outstanding agents must say so"
+            "failing with outstanding agents must say so"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_receipt_commits_once_after_send_not_for_background_wait_redrive() {
+        use umadev_runtime::BackgroundTaskSignal;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let memory = umadev_knowledge::MemoryRef::from_parts(
+            "frontend/forms.md",
+            "Validation",
+            "Validate on blur.",
+        );
+        let directive = format!(
+            "{}\nUse the recalled validation practice and implement the form.",
+            crate::knowledge_feedback::sent_memory_marker(&memory.id)
+        );
+        let mut session = FakeBaseSession::new(vec![
+            vec![
+                SessionEvent::BackgroundTask(BackgroundTaskSignal::Started {
+                    id: "agent-1".to_string(),
+                }),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ],
+            vec![
+                SessionEvent::BackgroundTask(BackgroundTaskSignal::Finished {
+                    id: "agent-1".to_string(),
+                }),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ],
+        ]);
+        let sent = session.sent_handle();
+
+        let turn = drive_rework_turn_with_idle_and_memories(
+            &mut session,
+            &options,
+            &events,
+            directive,
+            vec![memory],
+            None,
+            crate::director_loop::IdleBudget::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+        )
+        .await;
+
+        assert!(turn.done);
+        assert!(turn.memory_receipt.is_some());
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "initial send + wait re-drive"
+        );
+        let receipts = std::fs::read_dir(
+            tmp.path()
+                .join(crate::lessons::RAW_DIR)
+                .join(crate::knowledge_feedback::RECEIPTS_DIR),
+        )
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().to_string_lossy().ends_with(".receipt.json"))
+        .count();
+        assert_eq!(receipts, 1, "the background wait is not a knowledge send");
+
+        // Unknown is durable project-locally but intentionally never publishes a
+        // user-level usefulness update, so the test can disarm the guard cleanly.
+        let _ = turn
+            .memory_receipt
+            .expect("sent memory receipt")
+            .settle(crate::knowledge_feedback::TurnOutcome::Unknown);
     }
 
     #[tokio::test]

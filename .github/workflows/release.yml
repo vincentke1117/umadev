@@ -8,10 +8,295 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  # A release tag must pass the same source and distribution checks as an
+  # ordinary pull request. The artifact build and every publish job wait for
+  # this gate plus the macOS/Windows release-test matrix.
+  quality:
+    name: release quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Checkout audited Grok Build source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: xai-org/grok-build
+          ref: 8adf9013a0929e5c7f1d4e849492d2387837a28d
+          path: _upstream/grok-build
+          fetch-depth: 1
+
+      - name: Checkout audited Kimi Code source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: MoonshotAI/kimi-code
+          ref: 36b05820cba24e09fdff19a059afc08ccea2c35e
+          path: _upstream/kimi-code
+          fetch-depth: 1
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-features --all-targets --no-fail-fast
+
+      - name: cargo test (doctests)
+        run: cargo test --workspace --all-features --doc --no-fail-fast
+
+      - name: Verify pinned Grok Build source contract
+        env:
+          UMADEV_GROK_SOURCE_DIR: ${{ github.workspace }}/_upstream/grok-build
+        run: cargo test -p umadev-host --test grok_source_drift -- --nocapture
+
+      - name: Verify pinned Kimi Code source contract
+        env:
+          UMADEV_KIMI_SOURCE_DIR: ${{ github.workspace }}/_upstream/kimi-code
+        run: cargo test -p umadev-host --test kimi_source_drift -- --nocapture
+
+      - name: Verify cross-platform npm update contracts
+        run: node --test npm/scripts/terminal-contract.test.cjs
+
+      - name: strict rustdoc (all features)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --all-features --no-deps
+
+      - name: Verify Cargo, npm, website, and tag versions
+        run: node npm/scripts/verify-version-lock.mjs
+
+      - name: Verify npm launcher, updater, and split-version repair
+        run: ./npm/scripts/smoke.sh
+
+      - name: Install website dependencies from the exact lockfile
+        run: npm --prefix umadev-website ci
+
+      - name: Audit website production dependencies
+        run: npm --prefix umadev-website audit --omit=dev --audit-level=moderate
+
+      - name: Lint website
+        run: npm --prefix umadev-website run lint
+
+      - name: Build website before any package can be published
+        env:
+          GITHUB_PAGES: "true"
+          GITHUB_PAGES_REPO: umadev
+          GITHUB_PAGES_DOMAIN: umadev.goder.ai
+        run: npm --prefix umadev-website run build
+
+  grok-published-contract:
+    name: release Grok Build ACP (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: grok-0.2.101-linux-x86_64
+            sha256: 2556299cded37f81e54c02420cfa7f1a2df9feab72a445869a0f5596e143b333
+            binary: grok
+          - os: macos-latest
+            artifact: grok-0.2.101-macos-aarch64
+            sha256: 8431538dbd99379240f558b48b779c651d668b06d793c87311ad532c4395a4e2
+            binary: grok
+          - os: windows-latest
+            artifact: grok-0.2.101-windows-x86_64.exe
+            sha256: fc4351df2e13b6bf99534f52296800ab90d09252e028907453d4f1586b2f0991
+            binary: grok.exe
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Download and verify the exact official Grok artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d "$RUNNER_TEMP/umadev-grok-contract"
+          binary="$RUNNER_TEMP/umadev-grok-contract/${{ matrix.binary }}"
+          if ! curl --fail --location --silent --show-error --retry 3 \
+            "https://x.ai/cli/${{ matrix.artifact }}" --output "$binary"; then
+            curl --fail --location --silent --show-error --retry 3 \
+              "https://storage.googleapis.com/grok-build-public-artifacts/cli/${{ matrix.artifact }}" \
+              --output "$binary"
+          fi
+          printf '%s  %s\n' '${{ matrix.sha256 }}' "$binary" | shasum -a 256 --check
+          chmod +x "$binary"
+          version=$("$binary" --version)
+          [[ "$version" =~ ^grok\ 0\.2\.101\ \([0-9a-f]+\)$ ]]
+          printf 'UMADEV_GROK_BIN=%s\n' "$binary" >> "$GITHUB_ENV"
+      - name: Download and verify the exact official Grok artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'umadev-grok-contract'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $binary = Join-Path $dir '${{ matrix.binary }}'
+          try {
+            Invoke-WebRequest -Uri 'https://x.ai/cli/${{ matrix.artifact }}' -OutFile $binary
+          } catch {
+            Invoke-WebRequest -Uri 'https://storage.googleapis.com/grok-build-public-artifacts/cli/${{ matrix.artifact }}' -OutFile $binary
+          }
+          $actual = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
+          if ($actual -ne '${{ matrix.sha256 }}') { throw "Grok artifact SHA-256 mismatch: $actual" }
+          $version = (& $binary --version | Out-String).Trim()
+          if ($version -notmatch '^grok 0\.2\.101 \([0-9a-f]+\)$') { throw "Unexpected Grok version: $version" }
+          "UMADEV_GROK_BIN=$binary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Verify real ACP identity and explicit authentication boundary
+        env:
+          UMADEV_GROK_PUBLISHED_CONTRACT: "1"
+        run: cargo test -p umadev-host --test grok_published_contract -- --nocapture
+
+  kimi-published-contract:
+    name: release Kimi Code ACP (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.19.0"
+      - name: Install the exact audited npm package
+        run: npm install -g @moonshot-ai/kimi-code@0.26.0
+      - name: Verify real ACP identity and terminal-owned authentication
+        env:
+          KIMI_CODE_HOME: ${{ runner.temp }}/umadev-kimi-code-home
+          UMADEV_KIMI_BIN: kimi
+          UMADEV_KIMI_PUBLISHED_CONTRACT: "1"
+        run: cargo test -p umadev-host --test kimi_published_contract -- --nocapture
+
+  release-credentials:
+    name: release signing credentials
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require native signing and publishing credentials for tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          required=(
+            APPLE_CERTIFICATE_P12_BASE64
+            APPLE_CERTIFICATE_PASSWORD
+            APPLE_SIGNING_IDENTITY
+            APPLE_ID
+            APPLE_TEAM_ID
+            APPLE_APP_SPECIFIC_PASSWORD
+            WINDOWS_CERTIFICATE_PFX_BASE64
+            WINDOWS_CERTIFICATE_PASSWORD
+            NPM_TOKEN
+          )
+          missing=()
+          for name in "${required[@]}"; do
+            [[ -n "${!name:-}" ]] || missing+=("$name")
+          done
+          if (( ${#missing[@]} > 0 )); then
+            printf '::error::missing required release secret: %s\n' "${missing[@]}"
+            exit 1
+          fi
+          if [[ "$APPLE_SIGNING_IDENTITY" != "Developer ID Application:"* ]]; then
+            echo '::error::APPLE_SIGNING_IDENTITY must name a Developer ID Application certificate'
+            exit 1
+          fi
+
+  msrv:
+    name: release MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install minimum supported Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-msrv-1.88
+      - name: Verify the declared MSRV
+        run: cargo check --workspace --all-targets --locked
+
+  rustsec:
+    name: release RustSec audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Audit the exact release lockfile
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  platform-tests:
+    name: release tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+      - name: Verify Windows Job Object process-tree teardown
+        if: runner.os == 'Windows'
+        run: cargo test -p umadev-process --lib --locked -- --test-threads=1
+      - name: cargo test
+        run: cargo test --workspace --all-features --all-targets --no-fail-fast
+      - name: cargo test (doctests)
+        run: cargo test --workspace --all-features --doc --no-fail-fast
+      - name: Verify deterministic TUI terminal contracts
+        run: cargo test -p umadev-tui --lib terminal_contract_ -- --test-threads=1
+      - name: Verify native PTY / ConPTY startup, input, and teardown
+        run: cargo test -p umadev --test terminal_pty -- --test-threads=1
+      - name: Verify cross-platform npm update contracts
+        run: node --test npm/scripts/terminal-contract.test.cjs
+
   build:
     name: build (${{ matrix.target }})
+    needs: [quality, grok-published-contract, kimi-published-contract, release-credentials, msrv, rustsec, platform-tests]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -46,7 +331,7 @@ jobs:
             ext: ".exe"
             npm_platform: win32-x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Verify release tag matches the source version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -57,10 +342,13 @@ jobs:
             exit 1
           }
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # Both linux-gnu targets build via `cross`: aarch64 needs it for the
       # sysroot, and x86_64 uses it to link against an old glibc. Pin the
@@ -81,6 +369,103 @@ jobs:
       - name: Build (cross)
         if: matrix.cross == true
         run: cross build --release --bin umadev --features vector-local --target ${{ matrix.target }}
+
+      - name: Developer ID sign and notarize (macOS)
+        if: startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'apple-darwin')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/umadev"
+          certificate="$RUNNER_TEMP/umadev-developer-id.p12"
+          keychain="$RUNNER_TEMP/umadev-signing.keychain-db"
+          archive="$RUNNER_TEMP/umadev-${{ matrix.target }}.zip"
+          keychain_password="$(uuidgen)$(uuidgen)"
+          cleanup() {
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+            rm -f "$certificate" "$archive"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 -D > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain"
+          security find-identity -v -p codesigning "$keychain"
+
+          codesign --force --options runtime --timestamp \
+            --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+          codesign --display --verbose=4 "$binary"
+
+          ditto -c -k --keepParent "$binary" "$archive"
+          xcrun notarytool submit "$archive" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+          spctl --assess --type execute --verbose=4 "$binary"
+
+      - name: Authenticode sign and timestamp (Windows)
+        if: startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'windows-msvc')
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = "target/${{ matrix.target }}/release/umadev.exe"
+          $certificate = Join-Path $env:RUNNER_TEMP 'umadev-authenticode.pfx'
+          try {
+            [IO.File]::WriteAllBytes(
+              $certificate,
+              [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX_BASE64)
+            )
+            $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+            $signTool = Get-ChildItem -Path $sdkRoot -Filter signtool.exe -Recurse |
+              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if (-not $signTool) {
+              throw 'signtool.exe was not found in the Windows SDK'
+            }
+
+            $signArgs = @(
+              'sign', '/fd', 'SHA256', '/td', 'SHA256',
+              '/tr', 'http://timestamp.digicert.com',
+              '/f', $certificate,
+              '/p', $env:WINDOWS_CERTIFICATE_PASSWORD,
+              '/d', 'UmaDev',
+              '/du', 'https://github.com/umacloud/umadev',
+              $binary
+            )
+            & $signTool.FullName @signArgs
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool sign failed with exit code $LASTEXITCODE"
+            }
+            & $signTool.FullName verify /pa /v $binary
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool verify failed with exit code $LASTEXITCODE"
+            }
+            $signature = Get-AuthenticodeSignature -FilePath $binary
+            if ($signature.Status -ne 'Valid') {
+              throw "Authenticode status is $($signature.Status)"
+            }
+          }
+          finally {
+            Remove-Item -LiteralPath $certificate -Force -ErrorAction SilentlyContinue
+          }
 
       # Self-verify the glibc floor: a linux binary that requires a symbol
       # newer than GLIBC_2.31 would break older distros (the GLIBC_2.39 report
@@ -103,22 +488,72 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/umadev${{ matrix.ext }}" \
-             "dist/umadev-${{ matrix.target }}${{ matrix.ext }}"
+          asset="dist/umadev-${{ matrix.target }}${{ matrix.ext }}"
+          cp "target/${{ matrix.target }}/release/umadev${{ matrix.ext }}" "$asset"
+          # Publish a per-binary integrity sidecar. The standalone updater
+          # requires this exact `SHA256  filename` contract before replacing an
+          # installed executable; a release missing it is refused.
+          node - "$asset" <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const file = process.argv[2];
+          const hash = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+          fs.writeFileSync(`${file}.sha256`, `${hash}  ${path.basename(file)}\n`);
+          NODE
           # Also stage into the matching npm sub-package so the publish
           # job downstream finds binaries ready to ship.
           ./npm/scripts/stage.sh "${{ matrix.npm_platform }}" \
               "target/${{ matrix.target }}/release/umadev${{ matrix.ext }}"
 
+      - name: Verify staged package and native binary version
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_version=$(node -p "require('./npm/umadev/package.json').version")
+          package_version=$(node -p "require('./npm/cli-${{ matrix.npm_platform }}/package.json').version")
+          test "$package_version" = "$source_version" || {
+            echo "::error::platform package $package_version != main package $source_version"
+            exit 1
+          }
+
+          node - \
+            "dist/umadev-${{ matrix.target }}${{ matrix.ext }}" \
+            "npm/cli-${{ matrix.npm_platform }}/bin/umadev${{ matrix.ext }}" <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+          if (digest(process.argv[2]) !== digest(process.argv[3])) {
+            throw new Error('the npm binary differs from the GitHub Release binary');
+          }
+          NODE
+
+          host_platform="$(node -p "process.platform + '-' + process.arch")"
+          if [ "$host_platform" = "${{ matrix.npm_platform }}" ]; then
+            actual=$(node npm/umadev/bin/cli.js --version)
+            case "$actual" in
+              *"$source_version"*) ;;
+              *) echo "::error::native binary reported '$actual', expected $source_version"; exit 1 ;;
+            esac
+          else
+            echo "cross-architecture artifact: hash verified; runtime smoke deferred ($host_platform)"
+          fi
+
+      - name: Attest binary provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/umadev-${{ matrix.target }}${{ matrix.ext }}
+
       - name: Upload binary (GitHub Releases artifact)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: umadev-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
       - name: Upload staged npm sub-package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: npm-${{ matrix.npm_platform }}
           path: npm/cli-${{ matrix.npm_platform }}/
@@ -126,18 +561,73 @@ jobs:
 
   publish-github:
     name: publish github release
-    needs: build
+    needs: [quality, platform-tests, build]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
           pattern: umadev-*
+      - name: Prepare SBOM output directory
+        run: mkdir -p sbom
+      - name: Generate release SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom/umadev-${{ github.ref_name }}.spdx.json
+          artifact-name: umadev-${{ github.ref_name }}.spdx.json
+          syft-version: v1.46.0
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Verify and attest the release SBOM
+        run: |
+          set -euo pipefail
+          file="umadev-${GITHUB_REF_NAME}.spdx.json"
+          test -s "sbom/$file"
+          (cd sbom && sha256sum "$file" > "$file.sha256" && sha256sum -c "$file.sha256")
+      - name: Attest release SBOM provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: sbom/*
+      - name: Verify binary artifact set and checksums
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const expected = [
+            'umadev-aarch64-apple-darwin',
+            'umadev-aarch64-unknown-linux-gnu',
+            'umadev-x86_64-apple-darwin',
+            'umadev-x86_64-pc-windows-msvc.exe',
+            'umadev-x86_64-unknown-linux-gnu',
+          ];
+          const binaries = fs.readdirSync('dist')
+            .filter((name) => !name.endsWith('.sha256'))
+            .sort();
+          if (JSON.stringify(binaries) !== JSON.stringify(expected)) {
+            throw new Error(`release binary set mismatch: ${binaries.join(', ')}`);
+          }
+          for (const name of binaries) {
+            const file = path.join('dist', name);
+            const sidecar = `${file}.sha256`;
+            if (!fs.existsSync(sidecar)) throw new Error(`missing ${sidecar}`);
+            const expected = fs.readFileSync(sidecar, 'utf8').trim().split(/\s+/)[0];
+            const actual = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+            if (actual !== expected) throw new Error(`checksum mismatch for ${name}`);
+          }
+          console.log('verified 5 release binaries and checksum sidecars');
+          NODE
       # The fp16 embedding model is too large for npm (~224MB > npm's limit), so
       # it ships as a GitHub Release ASSET. The umadev npm wrapper (bin/cli.js)
       # downloads it on first launch into ~/.umadev/embed-model — auto-installed,
@@ -146,43 +636,163 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p model
-          BASE=https://huggingface.co/intfloat/multilingual-e5-small/resolve/main
+          # Immutable upstream revision. Never build a release from mutable
+          # `main`: the same UmaDev tag must always start from the same model.
+          MODEL_REV=614241f622f53c4eeff9890bdc4f31cfecc418b3
+          BASE="https://huggingface.co/intfloat/multilingual-e5-small/resolve/$MODEL_REV"
           # --retry-all-errors retries a transient HuggingFace 429/5xx (it once
           # failed the whole Release); 5 tries with a 15s backoff is plenty.
           DL="curl --retry 5 --retry-delay 15 --retry-all-errors -fsSL"
           $DL "$BASE/config.json"       -o model/config.json
           $DL "$BASE/tokenizer.json"    -o model/tokenizer.json
           $DL "$BASE/model.safetensors" -o model/model.f32.safetensors
-          python3 -m pip install --quiet safetensors numpy
+          # Verify the immutable upstream bytes, not only the files produced by
+          # this run. The model hash is the Git-LFS object oid at MODEL_REV.
+          printf '%s  %s\n' \
+            '69137736cab8b8903a07fe8afaafdda25aac55415a12a55d1bffa9f581abf959' \
+            'model/config.json' \
+            '083bb50ba05fa52910a76877aa9973b1c6f0415ba478a775d448901378bd828f' \
+            'model/tokenizer.json' \
+            '1a55775f53449dac10a2bcbc312469fac40b96d53198c407081a831f81c98477' \
+            'model/model.f32.safetensors' | sha256sum -c -
+          python3 -m pip install --quiet safetensors==0.5.3 numpy==2.2.6
           python3 npm/scripts/quantize-model.py model/model.f32.safetensors model/model.safetensors
           rm -f model/model.f32.safetensors
+          (cd model && for file in config.json tokenizer.json model.safetensors; do
+            sha256sum "$file" > "$file.sha256"
+          done)
+          (cd model && sha256sum -c config.json.sha256 tokenizer.json.sha256 model.safetensors.sha256)
           ls -la model
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Attest embedding model provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
-          files: |
-            dist/*
+          subject-path: model/*
+      # Keep a new Release private until every asset has uploaded and its bytes
+      # match the locally verified set. If a retry sees an already-public
+      # Release, it is treated as immutable: identical content is a no-op, while
+      # a partial or different Release fails instead of silently rewriting what
+      # users may already have downloaded.
+      - name: Publish complete GitHub Release atomically
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_files=(
+            dist/umadev-x86_64-unknown-linux-gnu
+            dist/umadev-x86_64-unknown-linux-gnu.sha256
+            dist/umadev-aarch64-unknown-linux-gnu
+            dist/umadev-aarch64-unknown-linux-gnu.sha256
+            dist/umadev-aarch64-apple-darwin
+            dist/umadev-aarch64-apple-darwin.sha256
+            dist/umadev-x86_64-apple-darwin
+            dist/umadev-x86_64-apple-darwin.sha256
+            dist/umadev-x86_64-pc-windows-msvc.exe
+            dist/umadev-x86_64-pc-windows-msvc.exe.sha256
             model/config.json
+            model/config.json.sha256
             model/tokenizer.json
+            model/tokenizer.json.sha256
             model/model.safetensors
-          generate_release_notes: true
+            model/model.safetensors.sha256
+            sbom/umadev-${GITHUB_REF_NAME}.spdx.json
+            sbom/umadev-${GITHUB_REF_NAME}.spdx.json.sha256
+          )
+
+          for file in "${release_files[@]}"; do
+            test -f "$file" || {
+              echo "::error::local Release asset is missing: $file"
+              exit 1
+            }
+          done
+
+          state=missing
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            state=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft --jq 'if .isDraft then "draft" else "published" end')
+          fi
+
+          if [[ "$state" == "missing" ]]; then
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --generate-notes \
+              --verify-tag
+            state=draft
+          fi
+
+          if [[ "$state" == "draft" ]]; then
+            # A failed earlier attempt may have left extra or stale assets on
+            # the hidden draft. Clear them first so every retry reconstructs
+            # the same manifest instead of preserving an unpublishable draft.
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              --jq '.assets[].id' | while read -r asset_id; do
+                [[ -z "$asset_id" ]] || gh api --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+              done
+            gh release upload "$GITHUB_REF_NAME" "${release_files[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          fi
+
+          expected_names=$(printf '%s\n' "${release_files[@]##*/}" | sort)
+          actual_names=$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[].name' | sort)
+          if [[ "$actual_names" != "$expected_names" ]]; then
+            echo "::error::GitHub Release asset set differs from the verified 18-file manifest"
+            diff -u <(printf '%s\n' "$expected_names") <(printf '%s\n' "$actual_names") || true
+            exit 1
+          fi
+
+          verify_dir=$(mktemp -d)
+          trap 'rm -rf "$verify_dir"' EXIT
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$verify_dir"
+          for file in "${release_files[@]}"; do
+            remote="$verify_dir/$(basename "$file")"
+            cmp -s "$file" "$remote" || {
+              echo "::error::published asset bytes differ: $(basename "$file")"
+              exit 1
+            }
+          done
+
+          if [[ "$state" == "draft" ]]; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft=false \
+              --latest
+          fi
+
+          published_state=$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft \
+            --jq '.isDraft')
+          test "$published_state" = "false" || {
+            echo "::error::GitHub Release remained a draft after verification"
+            exit 1
+          }
 
   publish-npm:
     name: publish to npm
-    needs: build
+    # The npm launcher fetches this exact version's model from GitHub Releases.
+    # Never expose the main npm package until those assets are verified public.
+    needs: [build, publish-github]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
       # Pull every staged platform sub-package back into npm/cli-<plat>/.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: npm-staging
           pattern: npm-*
@@ -210,4 +820,15 @@ jobs:
       - name: npm publish (platforms + main)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
         run: ./npm/scripts/publish.sh
+
+  deploy-website:
+    name: deploy release website
+    needs: publish-npm
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/website-pages.yml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write

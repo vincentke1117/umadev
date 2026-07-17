@@ -23,8 +23,16 @@ case "$(uname -s)-$(uname -m)" in
     ;;
 esac
 
-echo "▶ smoke.sh: building umadev (release) for $PLATFORM..."
-(cd "$REPO_ROOT" && cargo build --release --bin umadev --quiet)
+if [[ "${UMADEV_SMOKE_SKIP_BUILD:-0}" == "1" ]]; then
+  [[ -x "$REPO_ROOT/target/release/umadev" ]] || {
+    echo "smoke.sh: UMADEV_SMOKE_SKIP_BUILD=1 but target/release/umadev is missing" >&2
+    exit 1
+  }
+  echo "▶ smoke.sh: reusing target/release/umadev for $PLATFORM..."
+else
+  echo "▶ smoke.sh: building umadev (release) for $PLATFORM..."
+  (cd "$REPO_ROOT" && cargo build --release --bin umadev --quiet)
+fi
 
 echo "▶ smoke.sh: staging into npm/cli-$PLATFORM/"
 "$SCRIPT_DIR/stage.sh" "$PLATFORM" "$REPO_ROOT/target/release/umadev"
@@ -75,6 +83,7 @@ DEAD_REGISTRY="https://127.0.0.1:1"
 # Materialize a fake global install of umadev rooted at $1 (which must be a
 # `node_modules` dir — that is what marks an install as package-manager-owned).
 make_install() {
+  rm -rf "$1/umadev" "$1/@umacloud/cli-$PLATFORM"
   mkdir -p "$1/umadev/bin" "$1/@umacloud/cli-$PLATFORM/bin"
   cp "$NPM_ROOT/umadev/bin/cli.js" "$1/umadev/bin/"
   cp "$NPM_ROOT/umadev/package.json" "$1/umadev/"
@@ -104,9 +113,11 @@ if [ -n "\${SMOKE_INSTALL_ROOT:-}" ]; then
       fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\\n");
     }
   ' "\$SMOKE_INSTALL_ROOT/umadev" "\$SMOKE_INSTALL_ROOT/@umacloud/cli-$PLATFORM" "$2"
-  printf '%s\n' '#!/bin/sh' 'echo "umadev $2"' > \
-    "\$SMOKE_INSTALL_ROOT/@umacloud/cli-$PLATFORM/bin/umadev"
-  chmod +x "\$SMOKE_INSTALL_ROOT/@umacloud/cli-$PLATFORM/bin/umadev"
+  SMOKE_BIN="\$SMOKE_INSTALL_ROOT/@umacloud/cli-$PLATFORM/bin/umadev"
+  SMOKE_BIN_TMP="\${SMOKE_BIN}.tmp.\$\$"
+  printf '%s\n' '#!/bin/sh' 'echo "umadev $2"' > "\$SMOKE_BIN_TMP"
+  chmod +x "\$SMOKE_BIN_TMP"
+  mv -f "\$SMOKE_BIN_TMP" "\$SMOKE_BIN"
 fi
 echo "$1-called: \$*"
 STUB
@@ -124,13 +135,19 @@ make_install "$UPD_TMP/node_modules"
 mkdir -p "$UPD_TMP/node_modules/.umadev-vv1jMlhy" \
          "$UPD_TMP/node_modules/@umacloud/.cli-win32-x64-AbC123"
 
-# The shim finds no platform sub-package under this fake prefix, so if it ever
-# tried to exec the binary it would say so — which is exactly what we assert
-# against. A `y` on stdin carries it past the confirmation.
-UPD_OUT="$(cd "$UPD_TMP" && echo y | PATH="$UPD_TMP/bin:$PATH" \
+# If the shim launched the platform binary for `update`, the stand-in manager
+# would never be called. A `y` on stdin carries the shim past confirmation.
+if UPD_OUT="$(cd "$UPD_TMP" && echo y | PATH="$UPD_TMP/bin:$PATH" \
   SMOKE_INSTALL_ROOT="$UPD_TMP/node_modules" \
   UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
-  node "$UPD_TMP/node_modules/umadev/bin/cli.js" update 2>&1)"
+  node "$UPD_TMP/node_modules/umadev/bin/cli.js" update 2>&1)"; then
+  :
+else
+  STATUS=$?
+  echo "✗ smoke.sh: npm-owned update exited with status $STATUS" >&2
+  echo "$UPD_OUT" >&2
+  exit "$STATUS"
+fi
 
 if [[ "$UPD_OUT" != *"npm-called: install -g umadev@latest"* ]]; then
   echo "✗ smoke.sh: the shim did not run the npm upgrade" >&2
@@ -209,7 +226,9 @@ echo "✓ smoke.sh: a bun-owned install upgrades via bun"
 # ── 5. Already on the latest version: say so and reinstall NOTHING.
 make_install "$UPD_TMP/node_modules"
 mkdir -p "$UPD_TMP/latest-bin"
-cat > "$UPD_TMP/latest-bin/npm" <<STUB
+LATEST_NPM="$UPD_TMP/latest-bin/npm"
+LATEST_NPM_TMP="${LATEST_NPM}.tmp.$$"
+cat > "$LATEST_NPM_TMP" <<STUB
 #!/bin/sh
 case "\$1" in
   --version) echo "9.9.9"; exit 0 ;;
@@ -217,7 +236,8 @@ case "\$1" in
 esac
 echo "npm-called: \$*"
 STUB
-chmod +x "$UPD_TMP/latest-bin/npm"
+chmod +x "$LATEST_NPM_TMP"
+mv -f "$LATEST_NPM_TMP" "$LATEST_NPM"
 UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/latest-bin:$PATH" \
   UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
   node "$UPD_TMP/node_modules/umadev/bin/cli.js" update -y 2>&1)"
@@ -268,33 +288,116 @@ echo "✓ smoke.sh: a nested replacement platform package is resolved first"
 # ── 7. The exact reported split: package.json is current but the optional
 # platform executable is stale. This MUST repair, never short-circuit on the
 # main package and never print success before executing the replacement binary.
-cat > "$UPD_TMP/node_modules/@umacloud/cli-$PLATFORM/bin/umadev" <<STUB
+SPLIT_BIN="$UPD_TMP/node_modules/@umacloud/cli-$PLATFORM/bin/umadev"
+SPLIT_TMP="${SPLIT_BIN}.tmp.$$"
+cat > "$SPLIT_TMP" <<STUB
 #!/bin/sh
 echo "umadev 0.0.1"
 STUB
-chmod +x "$UPD_TMP/node_modules/@umacloud/cli-$PLATFORM/bin/umadev"
-cat > "$UPD_TMP/latest-bin/npm" <<STUB
+chmod +x "$SPLIT_TMP"
+mv -f "$SPLIT_TMP" "$SPLIT_BIN"
+LATEST_NPM_TMP="${LATEST_NPM}.tmp.$$"
+cat > "$LATEST_NPM_TMP" <<STUB
 #!/bin/sh
 case "\$1" in
   --version) echo "9.9.9"; exit 0 ;;
   view)      echo "$INSTALLED_VERSION"; exit 0 ;;
 esac
-cp "$NPM_ROOT/cli-$PLATFORM/bin/umadev" \
-  "$UPD_TMP/node_modules/@umacloud/cli-$PLATFORM/bin/umadev"
+case " \$* " in
+  *" --force "*)
+    REPAIR_BIN="$UPD_TMP/node_modules/@umacloud/cli-$PLATFORM/bin/umadev"
+    REPAIR_TMP="\${REPAIR_BIN}.tmp.\$\$"
+    cp "$NPM_ROOT/cli-$PLATFORM/bin/umadev" "\$REPAIR_TMP"
+    chmod +x "\$REPAIR_TMP"
+    mv -f "\$REPAIR_TMP" "\$REPAIR_BIN"
+    ;;
+esac
 echo "npm-called: \$*"
 STUB
-chmod +x "$UPD_TMP/latest-bin/npm"
+chmod +x "$LATEST_NPM_TMP"
+mv -f "$LATEST_NPM_TMP" "$LATEST_NPM"
 UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/latest-bin:$PATH" \
   UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
   node "$UPD_TMP/node_modules/umadev/bin/cli.js" update -y 2>&1)"
 if [[ "$UPD_OUT" == *"Nothing to do"* ]] ||
    [[ "$UPD_OUT" != *"Version split detected"* ]] ||
-   [[ "$UPD_OUT" != *"upgraded and verified"* ]]; then
+   [[ "$UPD_OUT" != *"npm-called: install -g umadev@latest --force"* ]] ||
+   [[ "$UPD_OUT" != *"repaired and verified"* ]]; then
   echo "✗ smoke.sh: a current package with a stale executable was not repaired" >&2
   echo "$UPD_OUT" >&2
   exit 1
 fi
-echo "✓ smoke.sh: a package/executable version split is detected and repaired"
+echo "✓ smoke.sh: a package/executable version split forces a real reinstall"
+
+# ── 7b. An ordinary version upgrade can exit 0 after replacing package.json but
+# leave an optional native package stale. Verification must catch that partial
+# success and make exactly one forced repair attempt before reporting success.
+PARTIAL_ROOT="$UPD_TMP/partial/node_modules"
+make_install "$PARTIAL_ROOT"
+node -e '
+  const fs = require("node:fs");
+  const path = require("node:path");
+  for (const dir of [process.argv[1], process.argv[2]]) {
+    const file = path.join(dir, "package.json");
+    const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+    pkg.version = "0.0.1";
+    fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
+  }
+' "$PARTIAL_ROOT/umadev" "$PARTIAL_ROOT/@umacloud/cli-$PLATFORM"
+PARTIAL_BIN="$PARTIAL_ROOT/@umacloud/cli-$PLATFORM/bin/umadev"
+PARTIAL_TMP="${PARTIAL_BIN}.tmp.$$"
+cat > "$PARTIAL_TMP" <<'STUB'
+#!/bin/sh
+echo "umadev 0.0.1"
+STUB
+chmod +x "$PARTIAL_TMP"
+mv -f "$PARTIAL_TMP" "$PARTIAL_BIN"
+
+PARTIAL_NPM="$UPD_TMP/partial-npm/npm"
+mkdir -p "$(dirname "$PARTIAL_NPM")"
+PARTIAL_NPM_TMP="${PARTIAL_NPM}.tmp.$$"
+cat > "$PARTIAL_NPM_TMP" <<STUB
+#!/bin/sh
+case "\$1" in
+  --version) echo "9.9.9"; exit 0 ;;
+  view)      echo "$INSTALLED_VERSION"; exit 0 ;;
+esac
+node -e '
+  const fs = require("node:fs");
+  const path = require("node:path");
+  for (const dir of [process.argv[1], process.argv[2]]) {
+    const file = path.join(dir, "package.json");
+    const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+    pkg.version = process.argv[3];
+    fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\\n");
+  }
+' "$PARTIAL_ROOT/umadev" "$PARTIAL_ROOT/@umacloud/cli-$PLATFORM" "$INSTALLED_VERSION"
+case " \$* " in
+  *" --force "*)
+    REPAIR_TMP="$PARTIAL_BIN.tmp.\$\$"
+    cp "$NPM_ROOT/cli-$PLATFORM/bin/umadev" "\$REPAIR_TMP"
+    chmod +x "\$REPAIR_TMP"
+    mv -f "\$REPAIR_TMP" "$PARTIAL_BIN"
+    ;;
+esac
+echo "npm-called: \$*"
+STUB
+chmod +x "$PARTIAL_NPM_TMP"
+mv -f "$PARTIAL_NPM_TMP" "$PARTIAL_NPM"
+
+UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/partial-npm:$PATH" \
+  UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
+  node "$PARTIAL_ROOT/umadev/bin/cli.js" update -y 2>&1)"
+NORMAL_COUNT="$(printf '%s\n' "$UPD_OUT" | grep -Fxc 'npm-called: install -g umadev@latest' || true)"
+FORCE_COUNT="$(printf '%s\n' "$UPD_OUT" | grep -Fxc 'npm-called: install -g umadev@latest --force' || true)"
+if [[ "$NORMAL_COUNT" -ne 1 ]] || [[ "$FORCE_COUNT" -ne 1 ]] ||
+   [[ "$UPD_OUT" != *"The first upgrade left inconsistent artifacts"* ]] ||
+   [[ "$UPD_OUT" != *"repaired and verified"* ]]; then
+  echo "✗ smoke.sh: a partial optional-dependency upgrade was not repaired once" >&2
+  echo "$UPD_OUT" >&2
+  exit 1
+fi
+echo "✓ smoke.sh: a partial optional-dependency upgrade is verified and retried once"
 
 # ── 8. A ROOT-OWNED install (`sudo npm i -g`) must be REFUSED with the repair, not
 # handed to a package manager that dies with EACCES half-way through and aborts the
@@ -369,3 +472,83 @@ node -e '
   assert.ok(!versionAtLeast("1.0.40", "1.1.0"));
 ' "$NPM_ROOT/umadev/bin/cli.js"
 echo "✓ smoke.sh: package-manager ownership is detected from the install layout"
+
+# ── 9. Model artifacts must come from the versioned official release (unless an
+# administrator explicitly opts into one same-origin HTTPS source), and every
+# accepted download must be bound to the exact filename by a SHA-256 sidecar.
+node -e '
+  const assert = require("node:assert");
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const {
+    releaseBases,
+    isOfficialModelUrl,
+    isAllowedCustomModelUrl,
+    parseSha256Sidecar,
+    sha256File,
+  } = require(process.argv[1]);
+  delete process.env.UMADEV_MODEL_BASE_URL;
+  assert.deepStrictEqual(
+    releaseBases("1.2.3"),
+    ["https://github.com/umacloud/umadev/releases/download/v1.2.3"],
+  );
+  assert.ok(isOfficialModelUrl(
+    "https://github.com/umacloud/umadev/releases/download/v1.2.3/config.json",
+  ));
+  assert.ok(!isOfficialModelUrl(
+    "https://github.example/umacloud/umadev/releases/download/v1.2.3/config.json",
+  ));
+  assert.ok(!isOfficialModelUrl(
+    "http://github.com/umacloud/umadev/releases/download/v1.2.3/config.json",
+  ));
+  assert.ok(isAllowedCustomModelUrl(
+    "https://models.example/release/config.json",
+    "https://models.example",
+  ));
+  assert.ok(!isAllowedCustomModelUrl(
+    "https://redirect.example/config.json",
+    "https://models.example",
+  ));
+  const digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+  assert.strictEqual(parseSha256Sidecar(digest + "  config.json\n", "config.json"), digest);
+  assert.throws(() => parseSha256Sidecar(digest + "  other.json\n", "config.json"));
+  const tmp = path.join(os.tmpdir(), "umadev-sha-" + process.pid);
+  try {
+    fs.writeFileSync(tmp, "abc");
+    assert.strictEqual(sha256File(tmp), digest);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (_) {}
+  }
+' "$NPM_ROOT/umadev/bin/cli.js"
+echo "✓ smoke.sh: model sources and SHA-256 sidecars are pinned"
+
+# ── 10. If the owner manager is missing, never fall back to npm. That would
+# install a second copy into npm's global prefix while this pnpm-owned launcher
+# remains on PATH, recreating the reported "package says new, binary stays old"
+# split under a different prefix.
+MISSING_OWNER_ROOT="$UPD_TMP/missing-manager/pnpm/global/5/node_modules"
+make_install "$MISSING_OWNER_ROOT"
+mkdir -p "$UPD_TMP/npm-only-bin"
+cp "$UPD_TMP/bin/npm" "$UPD_TMP/npm-only-bin/npm"
+NODE_BIN="$(command -v node)"
+set +e
+MISSING_OWNER_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/npm-only-bin:/usr/bin:/bin" \
+  UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
+  "$NODE_BIN" "$MISSING_OWNER_ROOT/umadev/bin/cli.js" update -y 2>&1)"
+MISSING_OWNER_RC=$?
+set -e
+if [[ "$MISSING_OWNER_RC" -eq 0 ]] ||
+   [[ "$MISSING_OWNER_OUT" != *"owns this install but is not runnable"* ]] ||
+   [[ "$MISSING_OWNER_OUT" != *"pnpm add -g umadev@latest"* ]] ||
+   [[ "$MISSING_OWNER_OUT" != *"shadowed UmaDev install"* ]]; then
+  echo "✗ smoke.sh: a missing owner manager was not refused clearly" >&2
+  echo "$MISSING_OWNER_OUT" >&2
+  exit 1
+fi
+if [[ "$MISSING_OWNER_OUT" == *"npm-called: install"* ]]; then
+  echo "✗ smoke.sh: a pnpm-owned install fell back to npm" >&2
+  echo "$MISSING_OWNER_OUT" >&2
+  exit 1
+fi
+echo "✓ smoke.sh: a missing owner manager cannot create a shadow npm install"

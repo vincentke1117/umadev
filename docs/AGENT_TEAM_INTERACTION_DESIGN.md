@@ -16,22 +16,29 @@ the code already does.
   academic failure literature converge on: **parallelize reads, serialize
   writes, centralize decision-making, and never relay work between agents as
   lossy prose.** UmaDev already does exactly this (blackboard + single-writer
-  doers on one continuous session + parallel read-only forked critics + a
+  doers on one continuous session + parallel fresh read-only critics + a
   deterministic director).
 - **Standardized document vs. direct transmission is NOT either/or — it is a
   layering, and conflating the two layers is the classic trap:**
   - **Relay *decisions* as standardized, versioned, typed documents** (PRD,
     architecture, API contract, acceptance criteria, `RoleVerdict`). Durable,
     machine-verifiable, provenance-bearing, survives a context reset.
-  - **Relay *context / reasoning trace* as the raw forked session** (the "why,"
-    the tool outputs, the rejected options). A `fork()` is lossless transmission
-    with zero telephone-game.
-  - **Never summarize the trace into prose to hand between roles.** That is where
-    provenance dies and errors cascade.
+  - **Preserve raw context inside the serial doer line.** The writable main
+    session carries its own tool results and decisions across phases, avoiding a
+    lossy prose handoff between consecutive doing steps.
+  - **Do not give reviewers the maker's trace.** Each critic starts a fresh,
+    independent, read-only session and receives the typed artifacts + acceptance
+    criteria. Clean context prevents self-preference and framing leakage; the
+    blackboard preserves the evidence the reviewer actually needs.
 - The highest-leverage reliability findings in the field — **centralized
   orchestration, per-step verification, isolated worker context** — are all
   already in the codebase. The enhancements below are refinements, not a
   rewrite.
+
+This verdict is about the **interaction architecture**, not a declaration that
+the whole product has reached enterprise maturity. The open governance,
+cross-platform sign-off, modularity, rustdoc, release, and hermetic-test debt is
+tracked in the dated enterprise maturity audit.
 
 ---
 
@@ -54,20 +61,50 @@ Read from `umadev-agent`: `director`, `director_loop`, `critics`, `plan_state`,
    engineers drive the *same* base session through every step (via
    `continuous::drive_rework_turn`, under the run-lock). They inherit their own
    accumulated context — direct, not re-primed.
-4. **Critics = parallel read-only `fork()`s.** Each reviewing seat forks the
-   session (isolated, read-only), runs ONE strict-JSON judge turn, and returns
-   `RoleVerdict { accepts, blocking, advisory, evidence }`. Fail-open (a critic
-   that errors/can't-fork returns a neutral accept).
+4. **Critics = parallel fresh read-only children.** Each reviewing seat opens a
+   clean child session in the same workspace, seeded from the typed artifact
+   bundle rather than the writer transcript, runs ONE strict-JSON judge turn,
+   and returns `RoleVerdict { accepts, blocking, advisory, evidence }`. The
+   historical `fork()` API name means “spawn a child,” not “branch context.”
+   Fail-open: a critic that errors/cannot start returns a neutral accept.
 5. **Deterministic floor governs the loop.** Coverage (FR→task) / contract
    (`umadev-contract` OpenAPI cross-check) / verify (real build+test+route probe)
    are computed *before* the team runs and OWN loop control. Critic verdicts are
-   **advisory only** — they never drive termination.
+   **advisory only** — they never drive termination. A Blocked, Active/Pending,
+   incomplete, dirty-QC, or budget-exhausted run with residual findings settles
+   as `Failed` with bounded evidence; only a mechanically clean terminal plan is
+   `Done`.
 6. **Deterministic aggregation → one typed rework directive.** Blocking findings
    fold into a single diagnosed, evidence-bearing rework directive injected back
    into the main session ("diagnosed, not 'go fix it'"), bounded by gap + stall
    counters.
 7. **The router (L1) is a separate concern** — it classifies the turn; it is not
-   the inter-role fabric.
+   the inter-role fabric. Its admission boundary is exact: `Chat`/`Explain`
+   remain read-only; `QuickEdit`/`Fast Debug` use the resident single-writer
+   lane and may complete a code write only after an observed successful targeted
+   verification following the last code write; writing alone does not imply
+   Director or full completion. Every `Build` and `Standard`/`Deep Debug` enters
+   the Director with proportional planning and gates. Only a healthy typed model
+   decision (`RouteSource::Brain`) with the exact legal authorization
+   `mutating` may authorize a model-selected writer route; missing/blank/invalid
+   authorization fails closed to read-only, and Plan mode remains read-only
+   regardless of the model class. Only such a healthy decision may cross into
+   the Director. `DeterministicFallback` never inherits authority from the
+   invalid model verdict: it may recognize only an unmistakable, explicitly
+   scoped current-user request on the proportional resident path and cannot by
+   itself launch the Director, a role team, or full post-build QC. Prior
+   plans, TODOs, run notes, specifications, blackboard artifacts and base
+   transcripts may inform routing, but only the current request authorizes new
+   work.
+8. **Live user input has authority-separated lanes.** An explicit correction to
+   the current task enters step-boundary steer; questions and future/ambiguous
+   tasks queue FIFO for fresh routing after the run. At an open gate, a question
+   uses a separate read-only query and leaves the gate untouched. `GateOpened`
+   becomes actionable only after the writer session has ended its boundary.
+9. **Cancellation is a memory boundary.** Cancelling clears the native resume /
+   hand-back session and appends a control boundary to conversation memory, so a
+   later model turn cannot continue the cancelled request by accident. Deferred
+   FIFO work is not discarded.
 
 So UmaDev is already a **hybrid**: *decision/contract handoffs and reviews use
 standardized documents (the blackboard); doer continuity uses direct context
@@ -120,24 +157,26 @@ Two opposed 2025 flagship results, reconciled:
 
 **Therefore, the answer to "标准化文档接力 vs 直接传输":**
 
-> **Relay *decisions* as standardized documents. Relay *context* as the raw
-> forked session. Never prose-summarize the trace to hand between agents.**
+> **Relay decisions as standardized documents; keep raw context within the
+> serial writer; give independent reviewers a clean context plus typed evidence.**
 
-- **Direct/raw is better for the reasoning trace.** When a critic reviews the
-  doer's work it should inherit the *full forked session* — the why, the tool
-  outputs, the rejected options — not a hand-written recap. `fork()` = raw
-  transmission with zero telephone-game.
+- **Direct/raw is right for continuity inside the doing line.** Consecutive
+  writable steps stay on the same main session, so the doer retains tool results,
+  rejected options, and implicit decisions without a hand-written recap.
+- **Clean-room context is right for maker-checker review.** A critic must not
+  inherit the writer's deliberation: that framing creates self-preference and can
+  hide the same blind spot the critic is meant to find. Each first-class base now
+  opens a fresh read-only child and seeds it with the requirement, typed
+  blackboard artifacts, acceptance criteria, and deterministic-floor evidence.
 - **Standardized documents are better for the decision/contract layer.** PRD,
   architecture, the API contract, acceptance criteria, `RoleVerdict` are
   *canonical, versioned, machine-verifiable ground truth* — they make
   frontend↔backend alignment checkable and survive a context reset.
-- **A document is *worse* only when used as a substitute for the trace** — a
-  linear phase-to-phase prose summary that drops the causal structure. *Beyond
-  Compaction* shows prose summaries destroy provenance ("a tool call produced an
-  output, that output informed a decision" collapses into narrative) and the
-  loss is undetectable from the summary alone. If you must compress for length,
-  compress to **structured/event-preserving records (typed logs, diffs, decision
-  entries)**, not prose, and keep the raw trace retrievable.
+- **A prose summary is still a poor substitute for either layer.** Within the
+  writer it drops causal structure; for a reviewer it supplies maker narrative
+  without machine-checkable evidence. If context must be compacted, retain
+  structured/event-preserving records (typed logs, diffs, decision entries) and
+  keep the raw writer trace retrievable for audit, not as critic framing.
 
 ---
 
@@ -153,7 +192,7 @@ Two opposed 2025 flagship results, reconciled:
 | Type every handoff (MetaGPT anti-hallucination) | `RoleVerdict {accepts,blocking,advisory,evidence}` + `umadev-contract` OpenAPI derivation ✔ |
 | Handoff/routing only for triage, never the inter-role fabric | Swarm-style routing confined to the L1 router ✔ |
 | Bound the loop | rework bounded by gap + stall counters ✔ |
-| Budget cost; scale team to task | `*_team_for_kind` (a bugfix convenes no team) ✔ |
+| Budget cost; scale team to task | fast, narrowly scoped bugfixes stay team-free; deliberate Debug and Build use proportional Director scheduling ✔ |
 
 **Nothing in the SOTA says "refactor toward agents chatting." The evidence
 endorses what we have.**
@@ -191,11 +230,12 @@ endorses what we have.**
   a late eval fires. This is the highest-leverage error-containment add.
 
 ### P0 — protect the two properties that already make us strong
-- **Guarantee critics inherit the FULL forked session trace, not a compressed
-  recap.** This is the single biggest lever against telephone-game degradation.
-  Add a test/invariant that a critic's input is the forked session (+ typed
-  `CriticArtifacts`), and treat any future move to feed critics a prose summary
-  as a **regression**, not an optimization.
+- **Guarantee critics never inherit the writer transcript.** The three host
+  drivers now lock this at the wire boundary: Claude uses a new session id,
+  Codex uses a fresh read-only `thread/start` on a separate app-server, and
+  OpenCode creates a fresh deny-by-default session. Keep argv/RPC/permission
+  tests for those forms, seed only typed `CriticArtifacts`, and treat either a
+  resume/branch or a prose maker recap as a **regression**, not an optimization.
 - **Keep decisions typed end-to-end.** Where a handoff is still prose inside an
   `output/*.md` doc (e.g. the API table), keep deriving the machine-checkable
   form (`umadev-contract` already renders OpenAPI). Extend the same "prose →

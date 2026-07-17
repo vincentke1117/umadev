@@ -2,14 +2,11 @@
 //! pipeline implements.
 //!
 //! UmaDev is the **project-director Agent**. The actual coding work happens in one
-//! of three "brain" implementations behind this trait:
+//! of five first-class host CLI "brain" implementations behind this trait:
 //!
-//! - a logged-in host CLI (`claude` / `codex` / `opencode`) driven as a subprocess, from
-//!   [`umadev-host`]; or
+//! - a logged-in host CLI driven as a subprocess by the `umadev-host` crate; or
 //! - [`OfflineRuntime`], which returns empty bodies so the pipeline falls back
 //!   to deterministic templates when no brain is selected.
-//!
-//! [`umadev-host`]: umadev_host
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, clippy::all, clippy::pedantic)]
@@ -22,6 +19,9 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::fmt;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub use umadev_spec::RuntimeKind;
@@ -68,20 +68,174 @@ pub struct CompletionResponse {
     /// Effective model name reported by the backend (or whatever the
     /// caller asked for).
     pub model: String,
-    /// Approximate token usage; defaults to zero when the backend does
-    /// not report it (host CLIs typically do not).
+    /// Whole-prompt usage. The default is explicitly incomplete/unknown when a
+    /// backend does not report it; it is never interpreted as a free turn.
     #[serde(default)]
     pub usage: Usage,
 }
 
-/// Approximate token usage. Fields default to 0 when the backend does
-/// not report them.
+/// The accounting scope of a reported usage snapshot.
+///
+/// A [`Usage`] is deliberately never a last-model-call sample. Host adapters may
+/// observe such samples internally, but must not surface them as a completed
+/// turn's usage because doing so silently under-counts multi-call prompts.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageScope {
+    /// Aggregate for the complete logical prompt/turn.
+    #[default]
+    WholePrompt,
+}
+
+/// Base-reported usage for one complete logical prompt/turn.
+///
+/// Token totals are `u64` because vendor ledgers use `u64`; narrowing them to
+/// `u32` can turn a valid long-lived session into a fabricated smaller number.
+/// Cache reads/writes are subsets of input and reasoning is a subset of output,
+/// so none is added again when computing [`Self::total_tokens`].
+///
+/// `usage_incomplete` means the counters are a lower bound. A missing cost is
+/// unknown, never free. Cost is trustworthy only when present and both
+/// `usage_incomplete` and `cost_partial` are false.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
-    /// Tokens consumed from the request.
-    pub input_tokens: u32,
-    /// Tokens produced in the response.
-    pub output_tokens: u32,
+    /// Full input token count, including cache reads/writes after normalization.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Full output token count, including reasoning when the base reports it.
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// `input_tokens + output_tokens`, saturating at `u64::MAX`.
+    #[serde(default)]
+    pub total_tokens: u64,
+    /// Cache-read subset of [`Self::input_tokens`].
+    #[serde(default)]
+    pub cached_read_tokens: u64,
+    /// Cache-write/creation subset of [`Self::input_tokens`].
+    #[serde(default)]
+    pub cached_write_tokens: u64,
+    /// Reasoning subset of [`Self::output_tokens`].
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// Number of model calls folded into this whole-prompt report.
+    #[serde(default)]
+    pub model_calls: u64,
+    /// Number of main-agent loop turns folded into this report.
+    #[serde(default)]
+    pub num_turns: u64,
+    /// Exact USD cost ticks (`10^10` ticks = USD 1), when trustworthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_ticks: Option<i64>,
+    /// The token counters may under-count work still in flight or not applied.
+    #[serde(default)]
+    pub usage_incomplete: bool,
+    /// At least one folded model call omitted cost information.
+    #[serde(default)]
+    pub cost_partial: bool,
+    /// Explicitly prevents a last-call sample from masquerading as a turn total.
+    #[serde(default)]
+    pub scope: UsageScope,
+}
+
+impl Default for Usage {
+    fn default() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cached_read_tokens: 0,
+            cached_write_tokens: 0,
+            reasoning_tokens: 0,
+            model_calls: 0,
+            num_turns: 0,
+            cost_usd_ticks: None,
+            // `Usage::default()` is used by completion surfaces whose backend did
+            // not report usage. Preserve that uncertainty instead of inventing an
+            // exact free, zero-token turn.
+            usage_incomplete: true,
+            cost_partial: false,
+            scope: UsageScope::WholePrompt,
+        }
+    }
+}
+
+impl Usage {
+    /// Construct an exact whole-prompt token report without a cost claim.
+    #[must_use]
+    pub const fn exact(input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+            cached_read_tokens: 0,
+            cached_write_tokens: 0,
+            reasoning_tokens: 0,
+            model_calls: 0,
+            num_turns: 0,
+            cost_usd_ticks: None,
+            usage_incomplete: false,
+            cost_partial: false,
+            scope: UsageScope::WholePrompt,
+        }
+    }
+
+    /// Return the exact cost only when every quality flag permits trusting it.
+    #[must_use]
+    pub const fn trusted_cost_usd_ticks(self) -> Option<i64> {
+        if self.usage_incomplete || self.cost_partial {
+            return None;
+        }
+        match self.cost_usd_ticks {
+            Some(ticks) if ticks > 0 => Some(ticks),
+            _ => None,
+        }
+    }
+
+    /// Whether this value carries no known token lower bound.
+    #[must_use]
+    pub const fn has_empty_lower_bound(self) -> bool {
+        self.total_tokens == 0
+    }
+
+    /// Fold two distinct whole-prompt reports without overstating quality.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self {
+        let usage_incomplete = self.usage_incomplete || other.usage_incomplete;
+        let cost_partial = self.cost_partial || other.cost_partial;
+        let cost_usd_ticks = if usage_incomplete || cost_partial {
+            None
+        } else {
+            self.trusted_cost_usd_ticks()
+                .zip(other.trusted_cost_usd_ticks())
+                .and_then(|(left, right)| left.checked_add(right))
+        };
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+            cached_read_tokens: self
+                .cached_read_tokens
+                .saturating_add(other.cached_read_tokens),
+            cached_write_tokens: self
+                .cached_write_tokens
+                .saturating_add(other.cached_write_tokens),
+            reasoning_tokens: self.reasoning_tokens.saturating_add(other.reasoning_tokens),
+            model_calls: self.model_calls.saturating_add(other.model_calls),
+            num_turns: self.num_turns.saturating_add(other.num_turns),
+            cost_usd_ticks,
+            usage_incomplete,
+            cost_partial,
+            scope: UsageScope::WholePrompt,
+        }
+    }
+
+    /// Mark an otherwise known lower bound as incomplete and scrub its cost.
+    #[must_use]
+    pub const fn into_incomplete(mut self) -> Self {
+        self.usage_incomplete = true;
+        self.cost_usd_ticks = None;
+        self
+    }
 }
 
 /// Errors any runtime may return.
@@ -135,8 +289,8 @@ pub struct BrainCapabilities {
 ///
 /// In practice the implementations are:
 /// - [`OfflineRuntime`] in this crate — returns empty bodies.
-/// - `ClaudeCodeDriver` / `CodexDriver` / `OpenCodeDriver` in `umadev-host`
-///   — drive a logged-in host CLI base as a subprocess.
+/// - the five first-class subprocess drivers in `umadev-host` — drive a
+///   logged-in host CLI base without owning a model credential or provider SDK.
 #[async_trait]
 pub trait Runtime: Send + Sync {
     /// Stable runtime kind (drives audit identifiers).
@@ -392,7 +546,7 @@ impl AskUserQuestion {
     }
 
     /// Parse just the input value (no tool-name guard) — the shared body of
-    /// [`from_tool_input`], also handy when the name was already matched upstream.
+    /// [`Self::from_tool_input`], also handy when the name was already matched upstream.
     #[must_use]
     pub fn parse_value(input: &serde_json::Value) -> Option<Self> {
         let questions: Vec<AskQuestion> =
@@ -579,7 +733,7 @@ impl ExitPlanMode {
     }
 
     /// Parse just the input value (no tool-name guard) — the shared body of
-    /// [`from_tool_input`], handy when the name was already matched upstream.
+    /// [`Self::from_tool_input`], handy when the name was already matched upstream.
     #[must_use]
     pub fn parse_value(input: &serde_json::Value) -> Option<Self> {
         let plan = input
@@ -690,7 +844,7 @@ fn one_line_clip(s: &str, max: usize) -> String {
 /// Host CLI drivers (Claude Code `--output-format stream-json`, Codex
 /// `--json`) emit newline-delimited JSON. Each line is parsed into one of
 /// these variants so the TUI can show live progress — the user sees
-/// "[tool] Reading src/app.tsx..." and "[write] Writing..." instead of a blank spinner.
+/// `[tool] Reading src/app.tsx...` and `[write] Writing...` instead of a blank spinner.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum StreamEvent {
     /// A chunk of assistant text (partial — concatenate for the full message).
@@ -713,12 +867,79 @@ pub enum StreamEvent {
         /// **Fail-open:** `None` simply degrades to the plain tool row.
         edit: Option<ToolEdit>,
     },
-    /// The worker received a result from a tool call.
-    /// `ok` = success/failure; `summary` is a truncated result preview.
+    /// A tool invocation whose base protocol supplies a stable call id.
+    ///
+    /// Keeping the id through the presentation boundary is what lets a client
+    /// attach interleaved progress, output, and terminal results to the exact
+    /// row that owns them instead of guessing from FIFO order.
+    ToolUseCorrelated {
+        /// Stable, base-supplied tool-call id.
+        call_id: String,
+        /// Tool name (e.g. "Read", "Write", "Bash").
+        name: String,
+        /// Human-readable description (file path, command).
+        detail: String,
+        /// Structured edit exposed by the base, when available.
+        edit: Option<ToolEdit>,
+    },
+    /// A non-terminal status-title replacement for one running tool card.
+    ///
+    /// This is neither stdout nor a completion verdict. Kimi Code uses it for
+    /// `tool.progress` status updates such as "Reading dependencies".
+    ToolProgressCorrelated {
+        /// Stable id of the running tool call.
+        call_id: String,
+        /// Complete replacement for the tool's current status title.
+        title: String,
+    },
+    /// An incremental output chunk from a tool that is **still running**.
+    ///
+    /// This is display-only progress: consumers must not treat it as completion,
+    /// advance a tool-call FIFO, or use it as verification evidence. A later
+    /// [`StreamEvent::ToolResult`] is the sole terminal verdict for the call.
+    ToolOutputDelta {
+        /// UTF-8 output emitted since the previous progress event.
+        delta: String,
+    },
+    /// Incremental output for one identified, still-running tool call.
+    ToolOutputDeltaCorrelated {
+        /// Stable id of the tool call producing this output.
+        call_id: String,
+        /// UTF-8 output emitted since the previous progress event.
+        delta: String,
+    },
+    /// A complete replacement snapshot for the currently running tool output.
+    ///
+    /// Some machine protocols periodically send the whole terminal buffer, or
+    /// explicitly reset it, instead of an append-only byte stream. Consumers
+    /// must replace the visible log with `output`; they must not append it.
+    ToolOutputSnapshot {
+        /// Complete safe UTF-8 terminal buffer; an empty string clears it.
+        output: String,
+    },
+    /// A complete output-buffer replacement for one identified tool call.
+    ToolOutputSnapshotCorrelated {
+        /// Stable id of the tool call producing this snapshot.
+        call_id: String,
+        /// Complete safe UTF-8 terminal buffer; an empty string clears it.
+        output: String,
+    },
+    /// The worker received the **terminal** result from a tool call.
+    /// `ok` = success/failure; `summary` is a truncated result preview. Exactly
+    /// this event, never [`StreamEvent::ToolOutputDelta`], settles the call.
     ToolResult {
         /// Whether the tool call succeeded.
         ok: bool,
         /// Truncated result preview (first ~200 chars).
+        summary: String,
+    },
+    /// The terminal verdict for one identified tool call.
+    ToolResultCorrelated {
+        /// Stable id of the tool call this result settles.
+        call_id: String,
+        /// Whether the tool call succeeded.
+        ok: bool,
+        /// Truncated result preview.
         summary: String,
     },
     /// Non-fatal warning from the worker (rate limit, retried call, …).
@@ -933,6 +1154,737 @@ pub enum TurnStatus {
     Failed(String),
 }
 
+/// A binary decision handed back to a base for an approval-style request.
+///
+/// This remains the payload of the legacy [`BaseSession::respond`] method and
+/// is also embedded in the richer [`HostResponse`] contract. Keeping this type
+/// unchanged preserves every existing approval caller while newer drivers can
+/// retain a vendor option id, feedback, or a structured answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    /// Allow the action.
+    Allow,
+    /// Deny the action (the base gets an error result and continues / stops).
+    Deny,
+}
+
+/// The semantic meaning of one approval option offered by a base.
+///
+/// ACP bases commonly distinguish one-turn and persistent choices. The raw
+/// option id remains authoritative; this classification lets a surface render
+/// and policy-check it without comparing vendor labels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostApprovalOptionKind {
+    /// Permit this occurrence only.
+    AllowOnce,
+    /// Permit this class of action for subsequent occurrences too.
+    AllowAlways,
+    /// Reject this occurrence only.
+    RejectOnce,
+    /// Reject this class of action for subsequent occurrences too.
+    RejectAlways,
+    /// A vendor-specific option whose semantic kind is not standardised.
+    Other(String),
+}
+
+/// One selectable option in a typed host approval request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostApprovalOption {
+    /// Stable option id that must be echoed to protocols such as ACP.
+    pub id: String,
+    /// Human-readable label supplied by the base.
+    pub label: String,
+    /// Policy-relevant meaning of this option.
+    pub kind: HostApprovalOptionKind,
+}
+
+/// The answer shape expected by a structured host question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostQuestionKind {
+    /// Arbitrary visible text.
+    Text,
+    /// Sensitive text that a UI should mask while it is entered.
+    Secret,
+    /// Exactly one offered option.
+    SingleChoice,
+    /// Zero or more offered options.
+    MultiChoice,
+    /// A yes/no-style confirmation.
+    Confirmation,
+    /// A vendor-specific question type.
+    Other(String),
+}
+
+/// One selectable value in a structured host question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostQuestionOption {
+    /// Protocol value returned when this option is selected.
+    pub value: String,
+    /// Human-readable option label.
+    pub label: String,
+    /// Optional explanatory text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional content shown while this option is focused. Hosts such as
+    /// Grok Build use this for code, mock-up, or diff previews; keeping it
+    /// typed avoids burying interactive content in opaque metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// One typed question a host asks the user during an in-flight turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostQuestion {
+    /// Stable question id used to correlate its answer.
+    pub id: String,
+    /// Optional compact heading for picker-style surfaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// Full prompt shown to the user.
+    pub prompt: String,
+    /// Expected answer shape.
+    pub kind: HostQuestionKind,
+    /// Whether the base requires a non-empty answer.
+    #[serde(default)]
+    pub required: bool,
+    /// Offered choices; empty for free-text questions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<HostQuestionOption>,
+}
+
+/// One answer to a [`HostQuestion`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostAnswer {
+    /// The question id being answered.
+    pub question_id: String,
+    /// Selected option values or one free-text value.
+    #[serde(default)]
+    pub values: Vec<String>,
+}
+
+/// Optional presentation and free-form context attached to one answer.
+///
+/// `question_id` is the host-local correlation key. Protocol drivers translate
+/// it back to the vendor's required key (for Grok Build, the original question
+/// text) and never expose it as an answer value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostQuestionAnnotation {
+    /// Local question id associated with this annotation.
+    pub question_id: String,
+    /// Verbatim preview for the selected single-choice option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    /// Optional free-form notes entered alongside the selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// Rich outcome of a blocking questionnaire.
+///
+/// The ordinary [`HostResponse::UserInput`] shape remains available for the
+/// other bases. This outcome preserves the four-path interview contract used
+/// by Grok Build without coercing “chat about this” or “skip interview” into a
+/// completed answer submission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum HostUserInputOutcome {
+    /// Submit the current answers and optional annotations.
+    Accepted {
+        /// Answers correlated by local question id.
+        answers: Vec<HostAnswer>,
+        /// Preview/notes annotations correlated by local question id.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        annotations: Vec<HostQuestionAnnotation>,
+    },
+    /// Return partial answers so the agent can discuss/reformulate them.
+    ChatAboutThis {
+        /// Answered questions only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        partial_answers: Vec<HostAnswer>,
+    },
+    /// End the interview and let the agent plan from the available answers.
+    SkipInterview {
+        /// Answered questions only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        partial_answers: Vec<HostAnswer>,
+    },
+    /// Dismiss the questionnaire without treating it as an infrastructure error.
+    Cancelled,
+}
+
+/// Three-way outcome of a base plan-approval interaction.
+///
+/// `Abandoned` is deliberately distinct from `Cancelled`: the former exits
+/// plan mode without starting implementation, while the latter keeps planning
+/// and may carry revision feedback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum HostPlanOutcome {
+    /// Approve the plan and begin implementation.
+    Approved,
+    /// Keep planning, optionally incorporating the user's feedback.
+    Cancelled {
+        /// Revision feedback supplied by the user.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
+    },
+    /// Leave plan mode without implementing the proposed plan.
+    Abandoned,
+}
+
+/// One permission or scope a base wants to add for the current operation.
+///
+/// `kind` and `target` cover the portable policy surface; `metadata` preserves
+/// non-secret vendor fields needed to formulate an exact protocol response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostPermission {
+    /// Permission class, for example `filesystem_write` or `network`.
+    pub kind: String,
+    /// Optional path, host, process, or other concrete scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Vendor-specific, non-secret permission details.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+}
+
+/// The outcome defined by the MCP elicitation protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostElicitationAction {
+    /// Accept the request and return structured content.
+    Accept,
+    /// Explicitly decline the request.
+    Decline,
+    /// Cancel without an affirmative or negative answer.
+    Cancel,
+}
+
+/// Human-only outcome for a base's folder-trust gate.
+///
+/// This is intentionally not [`ApprovalDecision`]: a generic auto-approval or
+/// remembered tool permission must never become authority to trust a workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostFolderTrustDecision {
+    /// The live user explicitly trusted the validated folder scope.
+    Trust,
+    /// Reject, cancel, time out, or otherwise leave the base gated.
+    KeepGated,
+}
+
+/// A typed request from a live base session to its UmaDev host.
+///
+/// These variants deliberately separate permission, question, and elicitation
+/// protocols. Treating every server request as binary approval loses user
+/// answers and can accidentally authorise an unknown request. [`Unknown`](Self::Unknown)
+/// is therefore first-class and must be rejected unless a newer, understood
+/// contract handles it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostRequest {
+    /// A tool/action approval request (legacy `NeedApproval` plus ACP options).
+    Approval {
+        /// Tool id or action class.
+        action: String,
+        /// File, command, resource, or other target.
+        target: String,
+        /// Optional explanation supplied by the base.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// Selectable protocol options. Empty means binary allow/deny.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<HostApprovalOption>,
+        /// Vendor-specific, non-secret request fields.
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        metadata: serde_json::Value,
+    },
+    /// One or more structured questions that require actual user answers.
+    UserInput {
+        /// Questions in presentation order.
+        questions: Vec<HostQuestion>,
+        /// Vendor-specific, non-secret request fields.
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        metadata: serde_json::Value,
+    },
+    /// A request to expand the session's current permissions or sandbox scope.
+    PermissionExpansion {
+        /// Concrete permissions the base wants to add.
+        permissions: Vec<HostPermission>,
+        /// Optional reason shown to the user or policy layer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Vendor-specific, non-secret request fields.
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        metadata: serde_json::Value,
+    },
+    /// An MCP server asks the user for structured information.
+    McpElicitation {
+        /// MCP server name when the base reports it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_name: Option<String>,
+        /// Prompt supplied by the MCP server.
+        message: String,
+        /// JSON Schema for the expected response content.
+        requested_schema: serde_json::Value,
+        /// Vendor-specific, non-secret request fields.
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        metadata: serde_json::Value,
+    },
+    /// The base drafted a plan and asks before beginning execution.
+    PlanConfirmation {
+        /// Full plan text or markdown.
+        plan: String,
+        /// Optional confirmation prompt supplied by the base.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// Vendor-specific, non-secret request fields.
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        metadata: serde_json::Value,
+    },
+    /// Grok Build asks the live user whether source-computed configuration in a
+    /// validated folder may be loaded.
+    FolderTrust {
+        /// Exact validated session cwd, for display only.
+        cwd: PathBuf,
+        /// Grok-computed git/worktree-aware trust key, for display only.
+        workspace: PathBuf,
+        /// Bounded configuration categories that caused the gate.
+        config_kinds: Vec<String>,
+    },
+    /// A request method the current UmaDev version does not understand.
+    Unknown {
+        /// Vendor method name, retained for diagnostics and capability gating.
+        method: String,
+        /// Original request payload after secret redaction.
+        payload: serde_json::Value,
+    },
+}
+
+impl HostRequest {
+    /// Build the safest protocol-shaped response for this request.
+    ///
+    /// Approval, permission, and plan requests are denied; MCP elicitation is
+    /// declined; questions and unknown methods receive an explicit rejection.
+    /// This is the host-interaction security floor, distinct from governance's
+    /// fail-open content scanning: an unrecognised permission request must never
+    /// become authority by accident.
+    #[must_use]
+    pub fn safe_rejection(&self, reason: impl Into<String>) -> HostResponse {
+        let reason = reason.into();
+        match self {
+            Self::Approval { .. } => HostResponse::Approval {
+                decision: ApprovalDecision::Deny,
+                selected_option_id: None,
+                message: Some(reason),
+            },
+            Self::PermissionExpansion { .. } => HostResponse::PermissionExpansion {
+                decision: ApprovalDecision::Deny,
+                granted: Vec::new(),
+                message: Some(reason),
+            },
+            Self::McpElicitation { .. } => HostResponse::McpElicitation {
+                action: HostElicitationAction::Decline,
+                content: None,
+            },
+            Self::PlanConfirmation { metadata, .. }
+                if metadata
+                    .get("responseContract")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("grok_exit_plan_mode_v1") =>
+            {
+                HostResponse::PlanOutcome {
+                    outcome: HostPlanOutcome::Cancelled {
+                        feedback: Some(reason),
+                    },
+                }
+            }
+            Self::PlanConfirmation { .. } => HostResponse::PlanConfirmation {
+                decision: ApprovalDecision::Deny,
+                feedback: Some(reason),
+            },
+            Self::FolderTrust { .. } => HostResponse::FolderTrust {
+                decision: HostFolderTrustDecision::KeepGated,
+            },
+            Self::UserInput { metadata, .. }
+                if metadata
+                    .get("responseContract")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("grok_ask_user_question_v1") =>
+            {
+                HostResponse::UserInputOutcome {
+                    outcome: HostUserInputOutcome::Cancelled,
+                }
+            }
+            Self::UserInput { metadata, .. }
+                if metadata
+                    .get("responseContract")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("kimi_plan_review_permission_v1") =>
+            {
+                HostResponse::Cancelled {
+                    reason: Some(reason),
+                }
+            }
+            Self::UserInput { .. } | Self::Unknown { .. } => HostResponse::Rejected { reason },
+        }
+    }
+}
+
+/// A typed reply to a [`HostRequest`].
+///
+/// Drivers must validate that the response variant matches the pending request
+/// before writing it to the base. A mismatch or unknown request is rejected,
+/// never coerced into an affirmative response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostResponse {
+    /// Reply to [`HostRequest::Approval`].
+    Approval {
+        /// Binary policy decision.
+        decision: ApprovalDecision,
+        /// Exact vendor option id to echo, when one was selected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_option_id: Option<String>,
+        /// Optional denial explanation or audit note.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// Reply to [`HostRequest::UserInput`].
+    UserInput {
+        /// Answers correlated by question id.
+        answers: Vec<HostAnswer>,
+    },
+    /// Rich four-path reply to [`HostRequest::UserInput`].
+    UserInputOutcome {
+        /// Accepted/chat/skip/cancel outcome without semantic coercion.
+        outcome: HostUserInputOutcome,
+    },
+    /// Reply to [`HostRequest::PermissionExpansion`].
+    PermissionExpansion {
+        /// Whether any requested scope may be granted.
+        decision: ApprovalDecision,
+        /// Exact granted subset; empty when denied.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        granted: Vec<HostPermission>,
+        /// Optional explanation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// Reply to [`HostRequest::McpElicitation`].
+    McpElicitation {
+        /// Accept, decline, or cancel outcome.
+        action: HostElicitationAction,
+        /// Schema-conforming content when accepted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<serde_json::Value>,
+    },
+    /// Reply to [`HostRequest::PlanConfirmation`].
+    PlanConfirmation {
+        /// Whether execution may begin.
+        decision: ApprovalDecision,
+        /// Optional user feedback for a rejected or revised plan.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
+    },
+    /// Rich three-path reply to [`HostRequest::PlanConfirmation`].
+    PlanOutcome {
+        /// Approved/cancelled/abandoned outcome.
+        outcome: HostPlanOutcome,
+    },
+    /// Reply to [`HostRequest::FolderTrust`]. Only an explicit live-user action
+    /// may construct `Trust`; every fallback uses `KeepGated`.
+    FolderTrust {
+        /// Trust or remain gated.
+        decision: HostFolderTrustDecision,
+    },
+    /// Explicit cancellation of an interaction.
+    Cancelled {
+        /// Optional cancellation reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Explicit rejection used for unknown or unsupported request types.
+    Rejected {
+        /// Human-readable, non-secret reason.
+        reason: String,
+    },
+}
+
+/// Canonical reasoning effort reported by a live session.
+///
+/// This is deliberately a closed wire-value set. A driver must ignore an
+/// unknown future value instead of guessing that it is equivalent to one of
+/// today's levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionReasoningEffort {
+    /// Disable explicit reasoning effort.
+    None,
+    /// Minimal reasoning effort.
+    Minimal,
+    /// Low reasoning effort.
+    Low,
+    /// Medium reasoning effort.
+    Medium,
+    /// High reasoning effort.
+    High,
+    /// Extra-high reasoning effort. The canonical wire spelling is `xhigh`.
+    Xhigh,
+}
+
+impl SessionReasoningEffort {
+    /// Exact canonical wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
+}
+
+impl TryFrom<&str> for SessionReasoningEffort {
+    type Error = &'static str;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            _ => Err("unknown session reasoning effort"),
+        }
+    }
+}
+
+impl fmt::Display for SessionReasoningEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One selectable reasoning-effort entry advertised for a model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReasoningEffortOption {
+    /// Stable user-selectable option id.
+    pub id: String,
+    /// Canonical value sent to the base.
+    pub value: SessionReasoningEffort,
+    /// Human-readable label.
+    pub label: String,
+    /// Optional explanatory text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether this is the model's advertised default.
+    #[serde(default)]
+    pub default: bool,
+}
+
+/// One model in a session's complete replacement catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModelInfo {
+    /// Stable catalog key used by [`BaseSession::set_model`].
+    pub model_id: String,
+    /// Human-readable model name.
+    pub name: String,
+    /// Optional model description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Advertised total context window, in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_context_tokens: Option<u64>,
+    /// Vendor agent implementation selected by this model, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// Whether the model accepts a reasoning-effort selection.
+    #[serde(default)]
+    pub supports_reasoning_effort: bool,
+    /// Current/default effort included in this catalog snapshot, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<SessionReasoningEffort>,
+    /// Model-specific selectable effort menu.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<SessionReasoningEffortOption>,
+}
+
+/// Closed session interaction mode.
+///
+/// Unknown values are never coerced to `Default`; a future base mode remains
+/// unsupported until its semantics are explicitly modeled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionMode {
+    /// Normal interactive work.
+    Default,
+    /// Read-only planning work.
+    Plan,
+    /// Ask-first interaction mode.
+    Ask,
+}
+
+impl SessionMode {
+    /// Exact canonical wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Plan => "plan",
+            Self::Ask => "ask",
+        }
+    }
+}
+
+impl TryFrom<&str> for SessionMode {
+    type Error = &'static str;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "default" => Ok(Self::Default),
+            "plan" => Ok(Self::Plan),
+            "ask" => Ok(Self::Ask),
+            _ => Err("unknown session mode"),
+        }
+    }
+}
+
+impl fmt::Display for SessionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One slash command in a session's complete replacement catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCommandInfo {
+    /// Command name without a leading slash.
+    pub name: String,
+    /// Human-readable command description.
+    pub description: String,
+    /// Optional argument/input hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
+    /// Optional source-defined command scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Optional source path for a skill-backed command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
+/// Closed status vocabulary for one base-owned ACP plan entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPlanEntryStatus {
+    /// The base has not started this item.
+    Pending,
+    /// The base is actively working on this item.
+    InProgress,
+    /// The base completed this item.
+    Completed,
+}
+
+/// Closed priority vocabulary from the stable ACP plan update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPlanEntryPriority {
+    /// Highest relative priority.
+    High,
+    /// Normal relative priority.
+    Medium,
+    /// Lowest relative priority.
+    Low,
+}
+
+/// One item in a base-owned, whole-snapshot ACP plan update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPlanEntry {
+    /// User-facing task text supplied by the base.
+    pub content: String,
+    /// Relative priority supplied by the base.
+    pub priority: SessionPlanEntryPriority,
+    /// Current execution status supplied by the base.
+    pub status: SessionPlanEntryStatus,
+}
+
+/// Typed dynamic state replacement or transition from a live base session.
+///
+/// Catalog variants are snapshots, not deltas: consumers must replace their
+/// local list even when the new list is empty. Duplicate transition events are
+/// idempotent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionStateUpdate {
+    /// Replace the entire model catalog and its advertised current model.
+    ModelCatalogReplaced {
+        /// Current model id for this snapshot.
+        current_model_id: String,
+        /// Complete replacement model list.
+        available_models: Vec<SessionModelInfo>,
+    },
+    /// The active session model changed explicitly.
+    ModelChanged {
+        /// New model catalog id.
+        model_id: String,
+        /// Effective reasoning effort, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<SessionReasoningEffort>,
+    },
+    /// The base replaced an unavailable persisted model automatically.
+    ModelAutoSwitched {
+        /// Previously persisted model id.
+        previous_model_id: String,
+        /// Replacement model id; it may be empty when no fallback exists.
+        new_model_id: String,
+        /// Human-readable reason supplied by the base.
+        reason: String,
+    },
+    /// The active interaction mode changed.
+    ModeChanged {
+        /// Exact closed mode.
+        mode: SessionMode,
+    },
+    /// Replace the base's independent thinking configuration.
+    ///
+    /// This is deliberately not a [`SessionReasoningEffort`]: bases such as
+    /// Kimi expose a distinct on/off axis whose enabled effort remains
+    /// model-owned. `None` means the complete configuration snapshot omitted
+    /// the control for the current model. The two capability bits preserve
+    /// locked-on models instead of presenting a switch that cannot work.
+    ThinkingChanged {
+        /// Whether native thinking is enabled, or unavailable for this model.
+        enabled: Option<bool>,
+        /// Whether the current model advertises a selectable on state.
+        can_enable: bool,
+        /// Whether the current model advertises a selectable off state.
+        can_disable: bool,
+    },
+    /// Replace the entire slash-command catalog and tool-name snapshot.
+    CommandCatalogReplaced {
+        /// Complete replacement command list.
+        commands: Vec<SessionCommandInfo>,
+        /// Complete tool-name snapshot attached to the command update.
+        tools: Vec<String>,
+    },
+    /// Replace the base's entire native plan snapshot.
+    ///
+    /// This remains separate from UmaDev's director plan: a base may publish a
+    /// short local todo list while executing one director-owned step.
+    PlanReplaced {
+        /// Complete replacement plan; an empty list explicitly clears it.
+        entries: Vec<SessionPlanEntry>,
+    },
+}
+
 /// A single event observed from a live [`BaseSession`] turn.
 ///
 /// `ToolCall` (and the file system it mutates) is the SOURCE OF TRUTH for what
@@ -960,6 +1912,9 @@ pub enum SessionEvent {
     /// **Fail-open:** a base whose init frame carries no model id simply never
     /// emits this; an unparseable frame is skipped, never a panic.
     SessionModel(String),
+    /// A typed state snapshot or transition. This is state-only and should not
+    /// create a transcript row or toast by itself.
+    StateUpdate(SessionStateUpdate),
     /// The base invoked a tool — `name` is the tool id (`Write`/`Edit`/`Bash`/
     /// `Read`/…), `input` the raw tool input (e.g. `{"file_path": "..."}`).
     /// This is where a real file write shows up.
@@ -969,8 +1924,65 @@ pub enum SessionEvent {
         /// Raw tool input as the base reported it.
         input: serde_json::Value,
     },
-    /// A tool returned. `ok` = success/failure, `summary` a truncated preview.
+    /// A tool invocation with the base's stable call id.
+    ///
+    /// New multi-tool protocols should emit this variant so interleaved updates
+    /// and results never depend on FIFO ordering. Legacy drivers keep emitting
+    /// [`SessionEvent::ToolCall`] unchanged when their stream exposes no id.
+    ToolCallCorrelated {
+        /// Stable, base-supplied tool-call id.
+        call_id: String,
+        /// Tool id (`Write`, `Edit`, `Bash`, `Read`, …).
+        name: String,
+        /// Raw tool input as the base reported it.
+        input: serde_json::Value,
+    },
+    /// A non-terminal status-title replacement for one identified tool call.
+    ///
+    /// The title is presentation state, not tool output. Consumers must update
+    /// the matching running card in place and must not settle the call.
+    ToolProgressCorrelated {
+        /// Stable id of the running tool call.
+        call_id: String,
+        /// Complete replacement for the tool's current status title.
+        title: String,
+    },
+    /// An incremental output chunk from a tool that is **still running**.
+    ///
+    /// This event is non-terminal and display-only. Consumers must not pop a
+    /// pending tool call, disarm an in-tool timeout, or count verification as
+    /// passed until the matching terminal [`SessionEvent::ToolResult`] arrives.
+    ToolOutputDelta(String),
+    /// Complete replacement for an uncorrelated running tool's visible output.
+    /// An empty string clears the buffer without settling the tool call.
+    ToolOutputSnapshot(String),
+    /// Incremental output for one identified, still-running tool call.
+    ToolOutputDeltaCorrelated {
+        /// Stable id of the tool call producing this output.
+        call_id: String,
+        /// UTF-8 output emitted since the previous progress event.
+        delta: String,
+    },
+    /// A complete output-buffer replacement for one identified tool call.
+    ToolOutputSnapshotCorrelated {
+        /// Stable id of the tool call producing this snapshot.
+        call_id: String,
+        /// Complete safe UTF-8 terminal buffer; an empty string clears it.
+        output: String,
+    },
+    /// A tool returned its **terminal** verdict. `ok` = success/failure,
+    /// `summary` a truncated preview. This is the sole event that settles the
+    /// pending tool call.
     ToolResult {
+        /// Whether the tool call succeeded.
+        ok: bool,
+        /// Truncated result preview.
+        summary: String,
+    },
+    /// The terminal verdict for one identified tool call.
+    ToolResultCorrelated {
+        /// Stable id of the tool call this result settles.
+        call_id: String,
         /// Whether the tool call succeeded.
         ok: bool,
         /// Truncated result preview.
@@ -988,18 +2000,47 @@ pub enum SessionEvent {
         /// The target (file path / command / resource).
         target: String,
     },
-    /// A lifecycle signal for one of the base's OWN background **sub-agents**
-    /// (claude's `Agent`/`Task` tool with `run_in_background`). Claude emits
-    /// these as stream-json `system` frames: `task_started` (edge),
+    /// A typed in-flight request that needs a host response.
+    ///
+    /// `req_id` is the stable protocol correlation id and must be passed back to
+    /// [`BaseSession::respond_host`]. Unlike [`SessionEvent::NeedApproval`], the
+    /// request preserves questions, permission expansion, MCP elicitation, plan
+    /// confirmation, and unknown methods instead of flattening all of them into
+    /// an unsafe binary approval.
+    HostRequest {
+        /// Stable, base-supplied request id.
+        req_id: String,
+        /// Typed request payload.
+        request: HostRequest,
+    },
+    /// A lifecycle signal for one of the base's OWN background **sub-agents**.
+    /// Claude emits these as stream-json `system` frames: `task_started` (edge),
     /// `task_notification` (terminal edge: completed / failed / stopped) and
     /// `background_tasks_changed` (level: the full live set). The orchestrator
-    /// uses them to refuse to settle a turn as "done" while the base's own
+    /// also normalizes OpenCode child-session SSE/status reconciliation into the
+    /// same edges/level. Codex maps app-server `collabAgentToolCall` items and
+    /// their `agentsStates` onto the same level signal while filtering child
+    /// `threadId` output from the main transcript.
+    /// The orchestrator uses these signals to refuse to settle a turn as "done"
+    /// while the base's own
     /// background agents are still outstanding (the premature-final-report
     /// fix) — background SHELLS (a dev server) are deliberately NOT surfaced,
     /// so a long-running server can never wedge a settle. **Fail-open:** a
     /// base that emits no such frames simply never produces this event; an
     /// unparseable frame is skipped, never a panic.
     BackgroundTask(BackgroundTaskSignal),
+    /// Lifecycle state for an ordinary background shell process or monitor.
+    ///
+    /// This is deliberately separate from [`SessionEvent::BackgroundTask`]: a
+    /// dev server may remain alive after its creating turn completes, and must
+    /// never make the orchestrator wait for a sub-agent or redrive that turn.
+    BackgroundProcess(BackgroundProcessSignal),
+    /// Complete server-authoritative replacement of the live prompt queue.
+    ///
+    /// This event is state-only: consumers replace their queue mirror without
+    /// creating a transcript row. A mutation request never edits the mirror
+    /// optimistically; only this event may do so.
+    PromptQueueChanged(PromptQueueSnapshot),
     /// The current turn ended — see [`TurnStatus`]. After this the orchestrator
     /// either sends the next phase's directive (same session, context retained)
     /// or stops at a gate.
@@ -1007,15 +2048,417 @@ pub enum SessionEvent {
         /// How the turn ended.
         status: TurnStatus,
         /// REAL token usage reported by the base for this turn, when the base's
-        /// live protocol carries it (claude's stream-json `result` line; codex's
-        /// `turn/completed` / `thread/tokenUsage/updated` notification). `None`
-        /// when the base does not report per-turn usage on its live stream
-        /// (opencode's SSE carries none) — the consumer then falls back to a
-        /// deterministic `chars/4` estimate so `/usage` stays non-empty but
-        /// honest. **Fail-open:** an unparseable usage payload yields `None`,
-        /// never a wrong number and never a panic.
+        /// live protocol carries it (Claude's stream-json `result` line, Codex's
+        /// `turn/completed` / `thread/tokenUsage/updated` notification, or
+        /// OpenCode's assistant `message.updated` token totals). `None` when the
+        /// selected base or installed version does not report exact per-turn usage;
+        /// the consumer then falls back to a deterministic `chars/4` estimate so
+        /// `/usage` stays non-empty but honest. **Fail-open:** an unparseable usage
+        /// payload yields `None`, never a wrong number and never a panic.
         usage: Option<Usage>,
     },
+}
+
+/// Bounded tracker for every tool invocation that is still in flight.
+///
+/// Modern ACP/app-server streams can interleave several calls, so a single
+/// `in_tool_call` boolean is incorrect: the first completed result would disarm
+/// the long-tool watchdog while sibling calls are still running. Correlated
+/// calls are tracked by their stable id; legacy id-less calls use a conservative
+/// counter. The set is bounded against an adversarial base, and any overflow
+/// remains active until a terminal turn/reset rather than falsely declaring the
+/// tools finished.
+#[derive(Debug, Default, Clone)]
+pub struct ToolActivity {
+    legacy_open: usize,
+    correlated_open: HashSet<String>,
+    overflowed: bool,
+}
+
+impl ToolActivity {
+    const MAX_CORRELATED: usize = 1_024;
+
+    /// Fold one session event into the tracker and return whether any tool is
+    /// still active afterwards. Duplicate correlated starts are idempotent;
+    /// unmatched results are ignored.
+    pub fn observe(&mut self, event: &SessionEvent) -> bool {
+        match event {
+            SessionEvent::ToolCall { .. } => {
+                self.legacy_open = self.legacy_open.saturating_add(1);
+            }
+            SessionEvent::ToolCallCorrelated { call_id, .. } => {
+                if self.correlated_open.len() < Self::MAX_CORRELATED {
+                    self.correlated_open.insert(call_id.clone());
+                } else if !self.correlated_open.contains(call_id) {
+                    self.overflowed = true;
+                }
+            }
+            SessionEvent::ToolResult { .. } => {
+                self.legacy_open = self.legacy_open.saturating_sub(1);
+            }
+            SessionEvent::ToolResultCorrelated { call_id, .. } => {
+                self.correlated_open.remove(call_id);
+            }
+            SessionEvent::TurnDone { .. } => self.clear(),
+            _ => {}
+        }
+        self.is_active()
+    }
+
+    /// Whether at least one observed call has not produced its matching terminal
+    /// result yet.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.overflowed || self.legacy_open > 0 || !self.correlated_open.is_empty()
+    }
+
+    /// Forget all calls at a known turn/retry boundary.
+    pub fn clear(&mut self) {
+        self.legacy_open = 0;
+        self.correlated_open.clear();
+        self.overflowed = false;
+    }
+}
+
+impl SessionEvent {
+    /// Return the stable tool-call id carried by a correlated tool event.
+    ///
+    /// Legacy FIFO-only tool events return `None`; callers must retain their
+    /// existing ordering fallback for those variants.
+    #[must_use]
+    pub fn tool_call_id(&self) -> Option<&str> {
+        match self {
+            Self::ToolCallCorrelated { call_id, .. }
+            | Self::ToolProgressCorrelated { call_id, .. }
+            | Self::ToolOutputDeltaCorrelated { call_id, .. }
+            | Self::ToolOutputSnapshotCorrelated { call_id, .. }
+            | Self::ToolResultCorrelated { call_id, .. } => Some(call_id),
+            _ => None,
+        }
+    }
+}
+
+/// Permissions granted to a long-lived host session.
+///
+/// Filesystem/network/process access and approval automation are separate axes:
+/// Guarded can run a normal development environment while still surfacing
+/// consequential actions for review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BasePermissionProfile {
+    /// Request planning/research behavior and the base's strongest available
+    /// read-only boundary. Effective enforcement remains vendor- and
+    /// platform-specific and requires separate attestation.
+    Plan,
+    /// Request full development access while keeping host approval events active.
+    #[default]
+    Guarded,
+    /// Request full development access with ordinary host approvals pre-authorized.
+    Auto,
+}
+
+impl BasePermissionProfile {
+    /// Whether UmaDev requests unrestricted filesystem, process, network, and
+    /// local-port access from the host.
+    ///
+    /// This is an **intent**, not evidence that the base actually obtained those
+    /// capabilities. Enterprise policy, an inherited parent sandbox, or a
+    /// platform-specific vendor downgrade may still restrict the live process.
+    #[must_use]
+    pub const fn full_access(self) -> bool {
+        !matches!(self, Self::Plan)
+    }
+
+    /// Whether UmaDev requests full development access from the base.
+    ///
+    /// Prefer this name in new code: unlike the compatibility
+    /// [`full_access`](Self::full_access) accessor, it cannot be mistaken for an
+    /// attestation of the effective process boundary.
+    #[must_use]
+    pub const fn requests_full_access(self) -> bool {
+        self.full_access()
+    }
+
+    /// Whether ordinary host approval requests should be pre-authorized.
+    #[must_use]
+    pub const fn auto_approve(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+/// Sandbox profile UmaDev asked a base to use at process launch.
+///
+/// A requested profile is never itself proof of enforcement. Use
+/// [`EffectiveSandboxEvidence`] before making a user-facing safety or capability
+/// claim.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseSandboxRequest {
+    /// Explicitly request no vendor sandbox.
+    Off,
+    /// Request a filesystem read-only sandbox.
+    ReadOnly,
+    /// Request writes inside the selected workspace only.
+    WorkspaceWrite,
+    /// Request the vendor's unrestricted/danger-full-access profile.
+    DangerFullAccess,
+    /// Vendor-specific profile not covered by the portable variants.
+    Vendor(String),
+}
+
+impl BaseSandboxRequest {
+    /// Stable launch request currently used for one first-class base/profile.
+    ///
+    /// This records UmaDev's intent only. It deliberately does not model the
+    /// request as effective state; use [`EffectiveSandboxEvidence`] for claims.
+    #[must_use]
+    pub fn for_base_launch(backend: &str, permissions: BasePermissionProfile) -> Self {
+        match (backend, permissions) {
+            ("grok-build", BasePermissionProfile::Plan) => Self::ReadOnly,
+            ("grok-build", BasePermissionProfile::Guarded | BasePermissionProfile::Auto) => {
+                Self::Off
+            }
+            (_, BasePermissionProfile::Plan) => Self::Vendor("umadev-plan".to_string()),
+            (_, BasePermissionProfile::Guarded) => Self::Vendor("umadev-guarded".to_string()),
+            (_, BasePermissionProfile::Auto) => Self::Vendor("umadev-auto".to_string()),
+        }
+    }
+}
+
+/// Whether the vendor's requested sandbox was actually applied.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxEffectiveStatus {
+    /// No trustworthy effective-state report was received.
+    #[default]
+    Unknown,
+    /// The reported sandbox profile is actively enforced.
+    Enforced,
+    /// A trustworthy report says sandboxing is disabled.
+    Disabled,
+    /// The requested boundary could not be fully applied or was overridden.
+    Degraded,
+}
+
+/// Provenance of an effective sandbox report.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxEvidenceSource {
+    /// No evidence beyond UmaDev's own launch request.
+    #[default]
+    None,
+    /// UmaDev knows only the argv/config value it requested.
+    LaunchRequestOnly,
+    /// The base reported its post-policy, post-platform effective state over its
+    /// machine protocol.
+    VendorProtocol,
+    /// The vendor's native resume preflight verified the persisted profile before
+    /// the irreversible process sandbox was applied. This proves only profile
+    /// consistency; it is not evidence that the OS sandbox was applied.
+    NativeResumePreflight,
+}
+
+impl SandboxEvidenceSource {
+    /// Whether this source attests the post-policy, post-application effective
+    /// process boundary. A native resume preflight is intentionally excluded: it
+    /// compares configurations but cannot prove the later OS operation succeeded.
+    #[must_use]
+    pub const fn attests_effective_state(self) -> bool {
+        matches!(self, Self::VendorProtocol)
+    }
+}
+
+/// Effective filesystem write boundary reported for a live base process.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveFilesystemAccess {
+    /// The live boundary is not known.
+    #[default]
+    Unknown,
+    /// Project files are read-only.
+    ReadOnly,
+    /// Writes are limited to the selected workspace (plus vendor runtime paths).
+    WorkspaceWrite,
+    /// No vendor filesystem restriction was reported.
+    Unrestricted,
+}
+
+/// Effective network or local-listener capability reported for a live process.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveIoAccess {
+    /// The live capability is not known.
+    #[default]
+    Unknown,
+    /// The capability is available to spawned development commands.
+    Allowed,
+    /// The capability is blocked for spawned development commands.
+    Blocked,
+}
+
+/// Post-policy, post-platform evidence for a base process's real sandbox.
+///
+/// `status=unknown` with `source=launch_request_only` is the normal value when a
+/// base accepts a flag but does not expose any machine-readable attestation. It
+/// must never be projected as either "hard read-only" or "full access".
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Default)]
+pub struct EffectiveSandboxEvidence {
+    /// Whether the requested sandbox was applied.
+    pub status: SandboxEffectiveStatus,
+    /// Resolved profile after vendor configuration/enterprise policy, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_profile: Option<BaseSandboxRequest>,
+    /// Trustworthy origin of this report.
+    pub source: SandboxEvidenceSource,
+    /// Effective filesystem write boundary.
+    pub filesystem: EffectiveFilesystemAccess,
+    /// Effective outbound network capability for spawned commands.
+    pub network: EffectiveIoAccess,
+    /// Effective bind/listen capability for local development servers.
+    pub local_ports: EffectiveIoAccess,
+    /// Bounded, non-secret diagnostic supplied by the reporting boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl EffectiveSandboxEvidence {
+    /// Record that only a launch request is known; no effective claim is safe.
+    #[must_use]
+    pub fn requested_only(requested: BaseSandboxRequest) -> Self {
+        Self {
+            status: SandboxEffectiveStatus::Unknown,
+            resolved_profile: Some(requested),
+            source: SandboxEvidenceSource::LaunchRequestOnly,
+            filesystem: EffectiveFilesystemAccess::Unknown,
+            network: EffectiveIoAccess::Unknown,
+            local_ports: EffectiveIoAccess::Unknown,
+            detail: Some("vendor effective sandbox state was not reported".to_string()),
+        }
+    }
+
+    /// Whether the evidence proves an unrestricted development process.
+    #[must_use]
+    pub fn proves_full_access(&self) -> bool {
+        self.status == SandboxEffectiveStatus::Disabled
+            && self.source.attests_effective_state()
+            && self.filesystem == EffectiveFilesystemAccess::Unrestricted
+            && self.network == EffectiveIoAccess::Allowed
+            && self.local_ports == EffectiveIoAccess::Allowed
+    }
+
+    /// Whether the evidence proves a hard read-only project filesystem.
+    #[must_use]
+    pub fn proves_read_only_filesystem(&self) -> bool {
+        self.status == SandboxEffectiveStatus::Enforced
+            && self.source.attests_effective_state()
+            && self.filesystem == EffectiveFilesystemAccess::ReadOnly
+    }
+
+    /// Whether this is trustworthy evidence for the exact requested profile.
+    #[must_use]
+    pub fn verifies_profile(&self, requested: &BaseSandboxRequest) -> bool {
+        self.source.attests_effective_state()
+            && matches!(
+                self.status,
+                SandboxEffectiveStatus::Enforced | SandboxEffectiveStatus::Disabled
+            )
+            && self.resolved_profile.as_ref() == Some(requested)
+    }
+}
+
+/// Immutable authority identity attached to a resumable vendor session id.
+///
+/// A vendor id may be loaded only under the same base, canonical workspace,
+/// permission profile, and sandbox request. Grok Build additionally requires a
+/// trustworthy effective sandbox report and its native pre-start resume
+/// preflight; ACP `session/load` alone runs too late to enforce that invariant.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct BaseResumeIdentity {
+    /// Stable UmaDev backend id that minted the vendor session.
+    pub backend: String,
+    /// Canonical absolute workspace used by the session.
+    pub canonical_workspace: PathBuf,
+    /// Immutable UmaDev permission profile used at launch.
+    pub permission_profile: BasePermissionProfile,
+    /// Sandbox profile requested at launch.
+    pub requested_sandbox: BaseSandboxRequest,
+    /// Effective sandbox report captured for that process.
+    pub effective_sandbox: EffectiveSandboxEvidence,
+    /// Whether the vendor must run its native pre-start resume/profile check before
+    /// any protocol-level load is permitted.
+    #[serde(default)]
+    pub native_resume_preflight_required: bool,
+}
+
+impl BaseResumeIdentity {
+    /// Resolve a requested-only launch identity for a real workspace.
+    ///
+    /// Canonicalization is fail-closed: if the root cannot be resolved, no
+    /// authority-bearing resume identity is minted.
+    #[must_use]
+    pub fn requested_for_launch(
+        backend: &str,
+        workspace: &Path,
+        permission_profile: BasePermissionProfile,
+    ) -> Option<Self> {
+        let canonical_workspace = std::fs::canonicalize(workspace).ok()?;
+        Some(Self::requested_only(
+            backend,
+            canonical_workspace,
+            permission_profile,
+            BaseSandboxRequest::for_base_launch(backend, permission_profile),
+            backend == "grok-build",
+        ))
+    }
+
+    /// Construct a launch identity when UmaDev has no effective vendor report.
+    #[must_use]
+    pub fn requested_only(
+        backend: impl Into<String>,
+        canonical_workspace: PathBuf,
+        permission_profile: BasePermissionProfile,
+        requested_sandbox: BaseSandboxRequest,
+        native_resume_preflight_required: bool,
+    ) -> Self {
+        let effective_sandbox = EffectiveSandboxEvidence::requested_only(requested_sandbox.clone());
+        Self {
+            backend: backend.into(),
+            canonical_workspace,
+            permission_profile,
+            requested_sandbox,
+            effective_sandbox,
+            native_resume_preflight_required,
+        }
+    }
+
+    /// Whether a persisted vendor id may be loaded for this requested launch.
+    ///
+    /// `native_resume_preflight_satisfied` must come from the launch path, never a
+    /// persisted project file. Grok identities fail closed until both the saved
+    /// effective state is attested and the native preflight is wired.
+    #[must_use]
+    pub fn permits_resume_as(
+        &self,
+        requested: &Self,
+        native_resume_preflight_satisfied: bool,
+    ) -> bool {
+        let immutable_match = self.backend == requested.backend
+            && self.canonical_workspace == requested.canonical_workspace
+            && self.permission_profile == requested.permission_profile
+            && self.requested_sandbox == requested.requested_sandbox;
+        if !immutable_match {
+            return false;
+        }
+        if self.backend != "grok-build" {
+            return true;
+        }
+        self.native_resume_preflight_required
+            && requested.native_resume_preflight_required
+            && native_resume_preflight_satisfied
+            && self
+                .effective_sandbox
+                .verifies_profile(&self.requested_sandbox)
+    }
 }
 
 /// One background sub-agent lifecycle signal (see
@@ -1050,13 +2493,602 @@ pub enum BackgroundTaskSignal {
     },
 }
 
-/// A decision handed back to the base for a [`SessionEvent::NeedApproval`].
+/// Kind of ordinary background process reported by a base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundProcessKind {
+    /// A shell command running independently of the current turn.
+    Bash,
+    /// A long-lived monitor process.
+    Monitor,
+}
+
+/// Safe, bounded identity for one live background process.
+///
+/// Commands, working directories, output paths, and captured output are not
+/// carried here. They may contain secrets or host paths and are unnecessary
+/// for lifecycle reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundProcessInfo {
+    /// Base-assigned background task id.
+    pub task_id: String,
+    /// Tool call that transitioned into background execution.
+    pub tool_call_id: String,
+    /// Whether the process is an ordinary shell or monitor.
+    pub kind: BackgroundProcessKind,
+    /// Optional redacted human description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Ordinary background process lifecycle.
+///
+/// Consumers may display this state or replace a task pane from [`Self::Live`],
+/// but must not feed it into sub-agent completion waits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BackgroundProcessSignal {
+    /// A process transitioned to background execution.
+    Started {
+        /// Safe process identity and display metadata.
+        process: BackgroundProcessInfo,
+    },
+    /// A process reached a terminal state.
+    Finished {
+        /// Base-assigned task id.
+        task_id: String,
+        /// Process kind from the terminal snapshot.
+        kind: BackgroundProcessKind,
+        /// Exit status when the base observed one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// Redacted termination signal, when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<String>,
+        /// Whether the base truncated captured output.
+        truncated: bool,
+        /// Whether the base queued its own model wake-up after completion.
+        will_wake: bool,
+    },
+    /// Complete replacement set reconstructed during session replay.
+    Live {
+        /// All ordinary background processes still live after replay.
+        processes: Vec<BackgroundProcessInfo>,
+    },
+}
+
+/// One task in a base-owned, server-authoritative background-process snapshot.
+///
+/// The snapshot deliberately excludes commands, captured output, working
+/// directories, and output-file paths. Those fields are present in some vendor
+/// protocols but may contain secrets and are unnecessary for list/stop control.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundProcessSnapshotEntry {
+    /// Base-assigned task id used by the native stop operation.
+    pub task_id: String,
+    /// Whether the task is an ordinary shell or a monitor.
+    pub kind: BackgroundProcessKind,
+    /// Whether the base reports that the task has reached a terminal state.
+    pub completed: bool,
+    /// Exit status when the base has observed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Redacted termination signal, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    /// Whether the base truncated the task's captured output.
+    pub truncated: bool,
+}
+
+/// Complete background-process replacement returned by the owning base.
+///
+/// `session_id` is the exact live vendor session used for the native query.
+/// Drivers must exclude foreign-session tasks before constructing this value;
+/// callers can therefore render or stop only tasks belonging to their session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundProcessSnapshot {
+    /// Exact live vendor session that owns every returned task.
+    pub session_id: String,
+    /// Complete bounded set of tasks currently retained by the base, including
+    /// terminal tombstones when the base returns them.
+    pub processes: Vec<BackgroundProcessSnapshotEntry>,
+}
+
+/// Native result of asking the base to stop one background process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundProcessStopOutcome {
+    /// The base stopped a process that was live when it handled the request.
+    Killed,
+    /// The process had already reached a terminal state.
+    AlreadyExited,
+    /// No task owned by the live session was available under that id.
+    ///
+    /// Drivers intentionally use the same result for a missing id and a foreign
+    /// session's id so the API cannot become a cross-session discovery oracle.
+    NotFound,
+}
+
+/// Native list/stop semantics exposed by a live base session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundProcessControlCapability {
+    /// No native background-process control surface is available.
+    #[default]
+    Unsupported,
+    /// Each list is a complete server snapshot and every stop is preceded by an
+    /// exact live-session ownership check against a fresh snapshot.
+    ServerAuthoritativeOwned,
+}
+
+/// One row in a base-owned prompt queue.
+///
+/// The queue is a server-authoritative collaboration surface. Callers must
+/// replace their entire visible mirror from each [`PromptQueueSnapshot`] and
+/// must not treat a locally requested mutation as committed until a later
+/// snapshot confirms it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptQueueEntry {
+    /// Stable base-assigned prompt id.
+    pub id: String,
+    /// Monotonic edit version used by version-checked mutations.
+    pub version: u64,
+    /// Client that originally enqueued the prompt, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Client that most recently edited the prompt, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_editor: Option<String>,
+    /// Base-defined display kind such as `prompt`, `bash`, or `command`.
+    pub kind: String,
+    /// Plain queue text supplied by the base.
+    pub text: String,
+    /// Zero-based position in the complete queued set.
+    pub position: usize,
+}
+
+/// Complete server-authoritative prompt-queue replacement for one session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptQueueSnapshot {
+    /// Exact live session id that owns the queue.
+    pub session_id: String,
+    /// Complete ordered set of prompts that have not begun running.
+    pub entries: Vec<PromptQueueEntry>,
+    /// Prompt currently draining, when the base reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_prompt_id: Option<String>,
+}
+
+/// A version-aware mutation of a base-owned prompt queue.
+///
+/// Mutation delivery is fire-and-forget. Success means only that the complete
+/// protocol frame was written; the next [`PromptQueueSnapshot`] remains the
+/// sole authority for whether the mutation applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum PromptQueueMutation {
+    /// Remove one queued prompt if its version still matches.
+    Remove {
+        /// Stable prompt id.
+        id: String,
+        /// Last server version the user acted on.
+        expected_version: u64,
+    },
+    /// Replace the ordering with the complete visible id set.
+    Reorder {
+        /// Complete ordered prompt-id list.
+        ordered_ids: Vec<String>,
+    },
+    /// Clear prompts owned by this client.
+    Clear,
+    /// Edit one queued prompt in place.
+    Edit {
+        /// Stable prompt id.
+        id: String,
+        /// Non-empty replacement text.
+        new_text: String,
+    },
+    /// Atomically promote one queued prompt, optionally replacing its text.
+    Interject {
+        /// Stable prompt id.
+        id: String,
+        /// Last server version the user acted on.
+        expected_version: u64,
+        /// Optional non-empty replacement text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_text: Option<String>,
+    },
+}
+
+/// How a newly submitted prompt should enter a live base-owned queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptQueuePlacement {
+    /// Append behind prompts already waiting.
+    Tail,
+    /// Ask the base to promote this prompt according to its native send-now
+    /// semantics. This can cancel the current turn; it is not a local reorder.
+    SendNow,
+}
+
+/// Native prompt-queue semantics exposed by a live session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptQueueCapability {
+    /// No native queue surface is available.
+    #[default]
+    Unsupported,
+    /// Complete snapshots are server-authoritative and stale-sensitive
+    /// mutations carry the last observed entry version.
+    ServerAuthoritativeVersioned,
+}
+
+/// One optional behavior a long-lived [`BaseSession`] may implement.
+///
+/// Capabilities are intentionally typed rather than inferred from the selected
+/// backend id. A caller can therefore choose an explicit fallback without
+/// sending a vendor method to a session that never advertised it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalDecision {
-    /// Allow the action.
-    Allow,
-    /// Deny the action (the base gets an error result and continues / stops).
-    Deny,
+pub enum SessionCapability {
+    /// Submit through a native live steering operation instead of having the
+    /// caller open an unrelated turn.
+    MidTurnSteer,
+    /// Switch the current model through the base's native session protocol.
+    SetModel,
+    /// Switch the current interaction mode through the base's native protocol.
+    SetMode,
+    /// Switch the current model-owned thinking toggle through the base's native
+    /// session protocol.
+    SetThinking,
+    /// Submit and mutate prompts through a server-authoritative queue.
+    PromptQueue,
+    /// List and stop base-owned background processes through native methods.
+    BackgroundProcessControl,
+}
+
+/// Stable kind tag for one ordered [`TurnInputBlock`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnInputBlockKind {
+    /// UTF-8 text supplied directly by the user.
+    Text,
+    /// A local image attachment.
+    Image,
+    /// A local generic-file attachment.
+    File,
+}
+
+impl fmt::Display for TurnInputBlockKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text => f.write_str("text"),
+            Self::Image => f.write_str("image"),
+            Self::File => f.write_str("file"),
+        }
+    }
+}
+
+/// Caller policy for a generic file when a base has no native file part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FileInputMode {
+    /// Require a native file/resource part. No text fallback is permitted.
+    #[default]
+    NativeOnly,
+    /// Permit the driver to read a bounded UTF-8 file and materialize it as an
+    /// explicitly labelled text block.
+    MaterializeText,
+}
+
+/// One block in a user turn. Vector order is wire order.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TurnInputBlock {
+    /// Plain UTF-8 text.
+    Text {
+        /// Text body. Empty text is retained so ordering is never rewritten.
+        text: String,
+    },
+    /// A local image. The driver validates and reads it immediately before the
+    /// protocol write; callers never provide MIME or base64 claims.
+    Image {
+        /// Local filesystem path.
+        path: PathBuf,
+    },
+    /// A local generic file.
+    File {
+        /// Local filesystem path.
+        path: PathBuf,
+        /// Whether an explicit bounded-text fallback is acceptable.
+        mode: FileInputMode,
+    },
+}
+
+impl fmt::Debug for TurnInputBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text { text } => f
+                .debug_struct("Text")
+                .field("text", &format_args!("[redacted; {} bytes]", text.len()))
+                .finish(),
+            Self::Image { .. } => f
+                .debug_struct("Image")
+                .field("path", &"[local path redacted]")
+                .finish(),
+            Self::File { mode, .. } => f
+                .debug_struct("File")
+                .field("path", &"[local path redacted]")
+                .field("mode", mode)
+                .finish(),
+        }
+    }
+}
+
+impl TurnInputBlock {
+    /// Stable kind tag without exposing an attachment path.
+    #[must_use]
+    pub const fn kind(&self) -> TurnInputBlockKind {
+        match self {
+            Self::Text { .. } => TurnInputBlockKind::Text,
+            Self::Image { .. } => TurnInputBlockKind::Image,
+            Self::File { .. } => TurnInputBlockKind::File,
+        }
+    }
+}
+
+/// Ordered input for one base turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TurnInput {
+    /// Input blocks in exact user order.
+    pub blocks: Vec<TurnInputBlock>,
+}
+
+impl TurnInput {
+    /// Construct one plain-text turn.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            blocks: vec![TurnInputBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// Construct an input from an already ordered block vector.
+    #[must_use]
+    pub const fn new(blocks: Vec<TurnInputBlock>) -> Self {
+        Self { blocks }
+    }
+
+    /// Return the sole text body when this is exactly one text block.
+    #[must_use]
+    pub fn sole_text(&self) -> Option<&str> {
+        match self.blocks.as_slice() {
+            [TurnInputBlock::Text { text }] => Some(text),
+            _ => None,
+        }
+    }
+}
+
+impl From<String> for TurnInput {
+    fn from(value: String) -> Self {
+        Self::text(value)
+    }
+}
+
+impl From<&str> for TurnInput {
+    fn from(value: &str) -> Self {
+        Self::text(value)
+    }
+}
+
+/// How one input kind is delivered by a live session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InputDelivery {
+    /// The live protocol has no safe implementation.
+    #[default]
+    Unsupported,
+    /// The protocol carries this as a native structured part.
+    Native,
+    /// Only explicit bounded UTF-8 materialization is available.
+    MaterializedText,
+}
+
+/// Live steering semantics of a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SteerSemantics {
+    /// The protocol has no distinct live steering operation.
+    #[default]
+    Unsupported,
+    /// Input is appended to the currently active turn.
+    SameTurn,
+    /// Input is queued for the active turn's next model safe point, or for the
+    /// head of the immediately following turn when that safe point was missed.
+    ///
+    /// A successful steering method proves only that the input was queued by
+    /// the protocol. It does not prove that the model has observed the input.
+    SameTurnOrImmediateNext,
+}
+
+/// Cross-process conversation recovery exposed by a live session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeCapability {
+    /// No resumable conversation surface is available.
+    #[default]
+    Unsupported,
+    /// Vendor-native resume outside ACP.
+    Native,
+    /// ACP `session/resume` was negotiated.
+    AcpResume,
+    /// ACP `session/load` was negotiated as the compatibility fallback.
+    AcpLoad,
+}
+
+/// Visibility of native sub-agent work in the event stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentVisibility {
+    /// No native lifecycle signal is exposed.
+    #[default]
+    None,
+    /// Start/finish events are visible but no authoritative level is promised.
+    Lifecycle,
+    /// The driver emits an authoritative live-set level signal.
+    AuthoritativeLiveSet,
+}
+
+/// Delivery result for one ordered input block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockDeliveryReport {
+    /// Zero-based position in [`TurnInput::blocks`].
+    pub index: usize,
+    /// Stable block kind; attachment paths are deliberately absent.
+    pub kind: TurnInputBlockKind,
+    /// Actual delivery mode used for this block.
+    pub delivery: InputDelivery,
+    /// Validated raw bytes represented by this block.
+    pub source_bytes: usize,
+    /// Validated MIME type when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+}
+
+/// Strongest receipt stage proven for one outbound input frame.
+///
+/// A receipt is deliberately narrower than model progress: even a
+/// [`ProtocolAcknowledged`](Self::ProtocolAcknowledged) frame proves only that
+/// the base protocol echoed/accepted the correlated input. It never means the
+/// model started, processed, or completed the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryReceiptStage {
+    /// UmaDev wrote and flushed one complete frame to the base transport.
+    #[default]
+    TransportWritten,
+    /// The base emitted its documented, exactly correlated protocol ACK.
+    ProtocolAcknowledged,
+}
+
+/// Receipt returned after a complete protocol frame was accepted for writing,
+/// optionally upgraded when the base exposes an exact correlated ACK. It
+/// contains no local attachment paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DeliveryReport {
+    /// Per-block results in exact input order.
+    pub blocks: Vec<BlockDeliveryReport>,
+    /// Encoded protocol-frame size checked before writing. `None` is reserved
+    /// for legacy text-only implementations that cannot observe their framing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded_bytes: Option<usize>,
+    /// Strongest proven delivery boundary. This is not model-processing state.
+    #[serde(default)]
+    pub receipt: DeliveryReceiptStage,
+}
+
+impl fmt::Display for SessionCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MidTurnSteer => f.write_str("mid-turn steer"),
+            Self::SetModel => f.write_str("set model"),
+            Self::SetMode => f.write_str("set mode"),
+            Self::SetThinking => f.write_str("set thinking"),
+            Self::PromptQueue => f.write_str("server-authoritative prompt queue"),
+            Self::BackgroundProcessControl => {
+                f.write_str("server-authoritative background-process control")
+            }
+        }
+    }
+}
+
+/// Optional behaviors exposed by a live [`BaseSession`].
+///
+/// The conservative default advertises only the required text turn. Drivers
+/// opt into richer protocol operations explicitly; opening another turn is
+/// never treated as steering.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCapabilities {
+    /// The session implements [`BaseSession::steer`] as a native live operation.
+    pub mid_turn_steer: bool,
+    /// The session implements [`BaseSession::set_model`].
+    pub set_model: bool,
+    /// The session implements [`BaseSession::set_mode`].
+    pub set_mode: bool,
+    /// The session implements [`BaseSession::set_thinking`].
+    pub set_thinking: bool,
+    /// Text delivery mode.
+    pub text_input: InputDelivery,
+    /// Image delivery mode.
+    pub image_input: InputDelivery,
+    /// Generic-file delivery mode.
+    pub file_input: InputDelivery,
+    /// Exact live steering semantics.
+    pub steer: SteerSemantics,
+    /// Cross-process resume semantics.
+    pub resume: ResumeCapability,
+    /// Native sub-agent event visibility.
+    pub subagents: SubagentVisibility,
+    /// Native prompt-queue semantics.
+    pub prompt_queue: PromptQueueCapability,
+    /// Native background-process list/stop semantics.
+    pub background_process_control: BackgroundProcessControlCapability,
+}
+
+impl Default for SessionCapabilities {
+    fn default() -> Self {
+        Self {
+            mid_turn_steer: false,
+            set_model: false,
+            set_mode: false,
+            set_thinking: false,
+            text_input: InputDelivery::Native,
+            image_input: InputDelivery::Unsupported,
+            file_input: InputDelivery::Unsupported,
+            steer: SteerSemantics::Unsupported,
+            resume: ResumeCapability::Unsupported,
+            subagents: SubagentVisibility::None,
+            prompt_queue: PromptQueueCapability::Unsupported,
+            background_process_control: BackgroundProcessControlCapability::Unsupported,
+        }
+    }
+}
+
+impl SessionCapabilities {
+    /// Delivery mode for one input block kind.
+    #[must_use]
+    pub const fn delivery_for(self, kind: TurnInputBlockKind) -> InputDelivery {
+        match kind {
+            TurnInputBlockKind::Text => self.text_input,
+            TurnInputBlockKind::Image => self.image_input,
+            TurnInputBlockKind::File => self.file_input,
+        }
+    }
+
+    /// Whether this capability set includes `capability`.
+    #[must_use]
+    pub const fn supports(self, capability: SessionCapability) -> bool {
+        match capability {
+            SessionCapability::MidTurnSteer => {
+                self.mid_turn_steer
+                    && matches!(
+                        self.steer,
+                        SteerSemantics::SameTurn | SteerSemantics::SameTurnOrImmediateNext
+                    )
+            }
+            SessionCapability::SetModel => self.set_model,
+            SessionCapability::SetMode => self.set_mode,
+            SessionCapability::SetThinking => self.set_thinking,
+            SessionCapability::PromptQueue => matches!(
+                self.prompt_queue,
+                PromptQueueCapability::ServerAuthoritativeVersioned
+            ),
+            SessionCapability::BackgroundProcessControl => matches!(
+                self.background_process_control,
+                BackgroundProcessControlCapability::ServerAuthoritativeOwned
+            ),
+        }
+    }
 }
 
 /// Errors a continuous session can surface.
@@ -1072,12 +3104,43 @@ pub enum SessionError {
     /// The session has ended (process exited / EOF) and can take no more turns.
     #[error("session closed")]
     Closed,
-    /// This base can't open a read-only fork (the underlying CLI has no native
-    /// fork / read-only-session form, or the fork attempt failed). **Fail-open
-    /// signal:** the caller degrades to the existing single-runtime consult path,
-    /// never blocks. The string is a human-readable reason.
+    /// A cancellation request was accepted by the transport but the active turn
+    /// did not reach a terminal event within the driver's bounded wait. The
+    /// session must not be reused until the caller tears it down.
+    #[error("session interrupt did not settle: {0}")]
+    InterruptPending(String),
+    /// This base does not implement the fresh read-only child-session surface.
+    /// **Fail-open signal:** callers choose their domain-safe fallback (for
+    /// example, deterministic intent routing or an explicit unavailable review) and
+    /// never block. A child that is implemented but fails to start may instead
+    /// surface [`SessionError::Start`]. The string is a human-readable reason.
     #[error("session fork unsupported: {0}")]
     ForkUnsupported(String),
+    /// The selected base has no native implementation for an optional session
+    /// capability. Callers may match this variant and apply a visible, safe
+    /// fallback instead of guessing from an error string.
+    #[error("session capability unsupported: {0}")]
+    CapabilityUnsupported(SessionCapability),
+    /// A structured input kind cannot be delivered without changing meaning.
+    #[error("turn input block {index} ({kind}) is unsupported: {reason}")]
+    InputUnsupported {
+        /// Zero-based block position; never an attachment path.
+        index: usize,
+        /// Stable block kind.
+        kind: TurnInputBlockKind,
+        /// Path-free diagnostic.
+        reason: String,
+    },
+    /// An input or attachment failed bounded validation.
+    #[error("turn input block {index} ({kind}) is invalid: {reason}")]
+    InputInvalid {
+        /// Zero-based block position; never an attachment path.
+        index: usize,
+        /// Stable block kind.
+        kind: TurnInputBlockKind,
+        /// Path-free diagnostic.
+        reason: String,
+    },
 }
 
 /// A long-lived base session that the 9-phase runner drives one phase at a
@@ -1085,11 +3148,18 @@ pub enum SessionError {
 /// code without re-priming. See `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`.
 ///
 /// Contract:
+/// - [`capabilities`](Self::capabilities) reports optional native operations.
 /// - [`send_turn`](Self::send_turn) injects a phase directive (imperative).
+/// - [`steer`](Self::steer) submits live input with the advertised
+///   [`SteerSemantics`]. UmaDev must not emulate it by opening a new turn;
+///   vendor-native safe-point steering may itself place a missed input at the
+///   head of the immediately following turn.
 /// - [`next_event`](Self::next_event) is then polled until it yields a
 ///   [`SessionEvent::TurnDone`]; that marks the phase complete. `None` means
 ///   the session itself ended (process dead) — treat as a failed turn.
 /// - [`respond`](Self::respond) answers a [`SessionEvent::NeedApproval`].
+/// - [`respond_host`](Self::respond_host) answers a typed
+///   [`SessionEvent::HostRequest`].
 /// - [`interrupt`](Self::interrupt) aborts the in-flight turn (ESC / timeout).
 /// - [`end`](Self::end) closes the session.
 ///
@@ -1098,24 +3168,41 @@ pub enum SessionError {
 /// bug must never crash the host.
 #[async_trait]
 pub trait BaseSession: Send {
-    /// Open a READ-ONLY forked session for a review role (the critic team).
+    /// Optional native operations supported by this live session.
     ///
-    /// The fork is a SEPARATE, isolated session a critic seat drives to review
-    /// the main line's on-disk output — it MUST never write the workspace and
-    /// MUST never collide with the main writer session (the single-writer
-    /// invariant). Each base implements it with its own native read-only form:
-    /// claude `--fork-session` + `--permission-mode plan`, codex
-    /// `thread/fork {ephemeral:true}`, opencode a fresh independent read-only
-    /// `POST /session`. The returned session is a normal [`BaseSession`]: the
-    /// caller injects one strict-JSON judge directive via
-    /// [`send_turn`](Self::send_turn), drains [`next_event`](Self::next_event)
-    /// for the verdict text, then [`end`](Self::end)s it.
+    /// The default is conservative so existing and third-party implementations
+    /// remain source compatible. A driver that opts into a capability must also
+    /// override the corresponding method with the real protocol operation.
+    fn capabilities(&self) -> SessionCapabilities {
+        SessionCapabilities::default()
+    }
+
+    /// Open a fresh, independent, READ-ONLY child session.
     ///
-    /// **Fail-open by contract:** a base with no fork form — or a fork that
-    /// fails to start — returns [`SessionError::ForkUnsupported`]. The caller
-    /// degrades to its existing single-runtime read-only consult path and NEVER
-    /// blocks. The default impl returns `ForkUnsupported` so a session that
-    /// hasn't implemented a fork still compiles and degrades safely.
+    /// Despite the historical method name, this MUST NOT resume or branch the
+    /// writer transcript. It is a clean model context in the same workspace and
+    /// with the same selected model/default, so it may inspect on-disk artifacts
+    /// but can never mutate them or collide with the writer. The first-class
+    /// drivers implement this as:
+    ///
+    /// - Claude: a new `--session-id`, `--permission-mode plan`, and only
+    ///   `Read,Grep,Glob` tools;
+    /// - Codex: a separate app-server with a new `thread/start` in a `read-only`
+    ///   sandbox (never `thread/fork` or `thread/resume`);
+    /// - OpenCode: a new `POST /session` with a deny-by-default ruleset that only
+    ///   allows local source inspection.
+    /// - Grok Build: a fresh ACP session launched in its read-only Plan profile.
+    ///
+    /// The unified surface serves both pre-action intent routing and independent
+    /// role critics. A caller may run one strict-JSON turn and close it, or reuse
+    /// the healthy child to execute a Chat/Explain turn so the semantic read-only
+    /// decision is also enforced by the host permissions.
+    ///
+    /// **Fail-open by contract:** the default returns
+    /// [`SessionError::ForkUnsupported`], and any setup failure is returned to the
+    /// caller. The router falls back conservatively; critic callers retain an
+    /// explicit unavailable result. A missing child surface therefore never
+    /// wedges a host, grants write authority, or masquerades as review success.
     ///
     /// Takes `&mut self` (not `&self`) so the returned future is `Send` without
     /// requiring `Self: Sync` — the host sessions hold non-`Sync` channels
@@ -1127,8 +3214,185 @@ pub trait BaseSession: Send {
         ))
     }
 
+    /// Switch the current model through the base's native session operation.
+    ///
+    /// The default is a typed unsupported result; it never restarts a session
+    /// or pretends that changing local display state changed the base.
+    async fn set_model(
+        &mut self,
+        _model_id: String,
+        _reasoning_effort: Option<SessionReasoningEffort>,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::CapabilityUnsupported(
+            SessionCapability::SetModel,
+        ))
+    }
+
+    /// Switch the current interaction mode through the base's native session
+    /// operation. The default is a typed unsupported result.
+    async fn set_mode(&mut self, _mode: SessionMode) -> Result<(), SessionError> {
+        Err(SessionError::CapabilityUnsupported(
+            SessionCapability::SetMode,
+        ))
+    }
+
+    /// Switch the base's independent thinking toggle through its native session
+    /// operation. The default is a typed unsupported result. A successful
+    /// implementation returns the exact full-snapshot state confirmed by the
+    /// base, including locked-model availability.
+    async fn set_thinking(&mut self, _enabled: bool) -> Result<SessionStateUpdate, SessionError> {
+        Err(SessionError::CapabilityUnsupported(
+            SessionCapability::SetThinking,
+        ))
+    }
+
     /// Inject one phase directive into the live session, starting a turn.
     async fn send_turn(&mut self, directive: String) -> Result<(), SessionError>;
+
+    /// Inject an ordered structured input, starting a turn.
+    ///
+    /// The compatibility default accepts exactly one text block and delegates
+    /// to [`send_turn`](Self::send_turn). It rejects every richer shape rather
+    /// than silently flattening it.
+    async fn send_input(&mut self, input: TurnInput) -> Result<DeliveryReport, SessionError> {
+        let Some(text) = input.sole_text() else {
+            let (index, kind) = input
+                .blocks
+                .iter()
+                .enumerate()
+                .find(|(_, block)| !matches!(block, TurnInputBlock::Text { .. }))
+                .map_or((0, TurnInputBlockKind::Text), |(index, block)| {
+                    (index, block.kind())
+                });
+            return Err(SessionError::InputUnsupported {
+                index,
+                kind,
+                reason: "this session accepts only one text block".to_string(),
+            });
+        };
+        let text = text.to_string();
+        let source_bytes = text.len();
+        self.send_turn(text).await?;
+        Ok(DeliveryReport {
+            blocks: vec![BlockDeliveryReport {
+                index: 0,
+                kind: TurnInputBlockKind::Text,
+                delivery: InputDelivery::Native,
+                source_bytes,
+                media_type: Some("text/plain; charset=utf-8".to_string()),
+            }],
+            encoded_bytes: None,
+            receipt: DeliveryReceiptStage::TransportWritten,
+        })
+    }
+
+    /// Submit user input through the session's native live steering operation.
+    ///
+    /// Drivers must override this only for a machine-protocol operation whose
+    /// behavior is described exactly by [`SessionCapabilities::steer`]. Method
+    /// success proves transport/protocol queuing only, never that the model has
+    /// observed the input. The conservative default returns a typed capability
+    /// error, allowing callers to queue the input visibly or choose another safe
+    /// fallback. It deliberately does not call [`send_turn`](Self::send_turn).
+    async fn steer(&mut self, _directive: String) -> Result<(), SessionError> {
+        Err(SessionError::CapabilityUnsupported(
+            SessionCapability::MidTurnSteer,
+        ))
+    }
+
+    /// Submit ordered structured input through native live steering.
+    ///
+    /// The compatibility default accepts exactly one text block and delegates
+    /// to [`steer`](Self::steer). Rich input is rejected explicitly.
+    async fn steer_input(&mut self, input: TurnInput) -> Result<DeliveryReport, SessionError> {
+        let Some(text) = input.sole_text() else {
+            let (index, kind) = input
+                .blocks
+                .iter()
+                .enumerate()
+                .find(|(_, block)| !matches!(block, TurnInputBlock::Text { .. }))
+                .map_or((0, TurnInputBlockKind::Text), |(index, block)| {
+                    (index, block.kind())
+                });
+            return Err(SessionError::InputUnsupported {
+                index,
+                kind,
+                reason: "this session can steer only one text block".to_string(),
+            });
+        };
+        let text = text.to_string();
+        let source_bytes = text.len();
+        self.steer(text).await?;
+        Ok(DeliveryReport {
+            blocks: vec![BlockDeliveryReport {
+                index: 0,
+                kind: TurnInputBlockKind::Text,
+                delivery: InputDelivery::Native,
+                source_bytes,
+                media_type: Some("text/plain; charset=utf-8".to_string()),
+            }],
+            encoded_bytes: None,
+            receipt: DeliveryReceiptStage::TransportWritten,
+        })
+    }
+
+    /// Submit input to a native, server-authoritative prompt queue while a turn
+    /// is already active.
+    ///
+    /// Implementations must preserve the base's prompt id and keep the protocol
+    /// response alive until the queued prompt drains or is removed. Returning
+    /// success proves only that the frame was written. The default is a typed
+    /// unsupported result and never emulates a queue in local memory.
+    async fn enqueue_input(
+        &mut self,
+        _input: TurnInput,
+        _placement: PromptQueuePlacement,
+    ) -> Result<DeliveryReport, SessionError> {
+        Err(SessionError::CapabilityUnsupported(
+            SessionCapability::PromptQueue,
+        ))
+    }
+
+    /// Send one native queue mutation.
+    ///
+    /// The server's next [`SessionEvent::PromptQueueChanged`] event is the only
+    /// commit signal. Implementations must not report a fire-and-forget write as
+    /// a successful queue-state change.
+    async fn mutate_prompt_queue(
+        &mut self,
+        _mutation: PromptQueueMutation,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::CapabilityUnsupported(
+            SessionCapability::PromptQueue,
+        ))
+    }
+
+    /// Fetch the base's complete native background-process snapshot.
+    ///
+    /// Implementations must scope every returned task to the exact live session
+    /// and must not synthesize task ids from transcript or tool-call text. The
+    /// conservative default is a typed unsupported result.
+    async fn list_background_processes(
+        &mut self,
+    ) -> Result<BackgroundProcessSnapshot, SessionError> {
+        Err(SessionError::CapabilityUnsupported(
+            SessionCapability::BackgroundProcessControl,
+        ))
+    }
+
+    /// Stop one background process through the base's native operation.
+    ///
+    /// A driver must perform its advertised ownership check before sending a
+    /// destructive stop request. The default never attempts local PID killing or
+    /// any other emulation.
+    async fn stop_background_process(
+        &mut self,
+        _task_id: &str,
+    ) -> Result<BackgroundProcessStopOutcome, SessionError> {
+        Err(SessionError::CapabilityUnsupported(
+            SessionCapability::BackgroundProcessControl,
+        ))
+    }
 
     /// Pull the next event of the in-flight turn. Yields events until a
     /// [`SessionEvent::TurnDone`]; `None` once the underlying session ends.
@@ -1141,7 +3405,39 @@ pub trait BaseSession: Send {
         decision: ApprovalDecision,
     ) -> Result<(), SessionError>;
 
-    /// Abort the in-flight turn (ESC / abort / timeout).
+    /// Answer a typed [`SessionEvent::HostRequest`].
+    ///
+    /// New protocol drivers override this method to encode structured answers,
+    /// selected permission-option ids, MCP elicitation outcomes, and plan
+    /// feedback. The default is intentionally backward compatible and safe:
+    /// an [`HostResponse::Approval`] is forwarded to the legacy
+    /// [`respond`](Self::respond) method, while every richer or mismatched reply
+    /// is converted to `Deny`. Thus adding this method does not break any
+    /// existing session implementation and an unsupported request can never be
+    /// accidentally authorised.
+    async fn respond_host(
+        &mut self,
+        req_id: &str,
+        response: HostResponse,
+    ) -> Result<(), SessionError> {
+        let decision = match response {
+            HostResponse::Approval { decision, .. } => decision,
+            HostResponse::UserInput { .. }
+            | HostResponse::UserInputOutcome { .. }
+            | HostResponse::PermissionExpansion { .. }
+            | HostResponse::McpElicitation { .. }
+            | HostResponse::PlanConfirmation { .. }
+            | HostResponse::PlanOutcome { .. }
+            | HostResponse::FolderTrust { .. }
+            | HostResponse::Cancelled { .. }
+            | HostResponse::Rejected { .. } => ApprovalDecision::Deny,
+        };
+        self.respond(req_id, decision).await
+    }
+
+    /// Abort the in-flight turn (ESC / abort / timeout). `Ok(())` means the turn
+    /// is terminal and the session can safely accept another turn; a driver must
+    /// return an error instead of claiming success while cancellation is pending.
     async fn interrupt(&mut self) -> Result<(), SessionError>;
 
     /// Close the session and release the underlying process / server.
@@ -1186,11 +3482,204 @@ pub trait BaseSession: Send {
     fn session_id(&self) -> Option<&str> {
         None
     }
+
+    /// Immutable authority/effective-sandbox identity for [`Self::session_id`].
+    ///
+    /// The default is deliberately absent: a caller may persist the id only with
+    /// a separately constructed requested-only identity, which is insufficient
+    /// to resume Grok Build. A driver that can report post-policy effective state
+    /// and complete the vendor's native pre-start resume preflight can override
+    /// this seam with attested evidence.
+    fn resume_identity(&self) -> Option<&BaseResumeIdentity> {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_default_is_unknown_and_whole_prompt_merge_preserves_quality() {
+        let unknown = Usage::default();
+        assert!(unknown.usage_incomplete);
+        assert!(unknown.has_empty_lower_bound());
+        assert_eq!(unknown.trusted_cost_usd_ticks(), None);
+        assert_eq!(unknown.scope, UsageScope::WholePrompt);
+
+        let exact = Usage {
+            cached_read_tokens: 3,
+            cached_write_tokens: 2,
+            reasoning_tokens: 1,
+            model_calls: 2,
+            num_turns: 1,
+            cost_usd_ticks: Some(10),
+            ..Usage::exact(8, 2)
+        };
+        let partial = Usage {
+            model_calls: 1,
+            num_turns: 1,
+            cost_usd_ticks: Some(20),
+            cost_partial: true,
+            ..Usage::exact(4, 1)
+        };
+        let merged = exact.merge(partial);
+        assert_eq!(merged.total_tokens, 15);
+        assert_eq!(merged.cached_read_tokens, 3);
+        assert_eq!(merged.cached_write_tokens, 2);
+        assert_eq!(merged.reasoning_tokens, 1);
+        assert_eq!(merged.model_calls, 3);
+        assert_eq!(merged.num_turns, 2);
+        assert!(merged.cost_partial);
+        assert_eq!(merged.cost_usd_ticks, None);
+    }
+
+    #[test]
+    fn exact_usage_costs_merge_without_narrowing_or_rounding() {
+        let above_u32 = u64::from(u32::MAX) + 1;
+        let left = Usage {
+            cost_usd_ticks: Some(7),
+            ..Usage::exact(above_u32, 2)
+        };
+        let right = Usage {
+            cost_usd_ticks: Some(11),
+            ..Usage::exact(3, 4)
+        };
+        let merged = left.merge(right);
+        assert_eq!(merged.input_tokens, above_u32 + 3);
+        assert_eq!(merged.total_tokens, above_u32 + 9);
+        assert_eq!(merged.trusted_cost_usd_ticks(), Some(18));
+    }
+
+    fn grok_resume_identity(effective_sandbox: EffectiveSandboxEvidence) -> BaseResumeIdentity {
+        BaseResumeIdentity {
+            backend: "grok-build".to_string(),
+            canonical_workspace: PathBuf::from("/canonical/workspace"),
+            permission_profile: BasePermissionProfile::Guarded,
+            requested_sandbox: BaseSandboxRequest::Off,
+            effective_sandbox,
+            native_resume_preflight_required: true,
+        }
+    }
+
+    #[test]
+    fn requested_sandbox_is_not_effective_access_evidence() {
+        for requested in [
+            BaseSandboxRequest::Off,
+            BaseSandboxRequest::ReadOnly,
+            BaseSandboxRequest::DangerFullAccess,
+        ] {
+            let evidence = EffectiveSandboxEvidence::requested_only(requested);
+            assert!(!evidence.proves_full_access());
+            assert!(!evidence.proves_read_only_filesystem());
+            assert_eq!(evidence.network, EffectiveIoAccess::Unknown);
+            assert_eq!(evidence.local_ports, EffectiveIoAccess::Unknown);
+        }
+    }
+
+    #[test]
+    fn native_resume_preflight_never_attests_os_sandbox_application() {
+        let claimed_full = EffectiveSandboxEvidence {
+            status: SandboxEffectiveStatus::Disabled,
+            resolved_profile: Some(BaseSandboxRequest::Off),
+            source: SandboxEvidenceSource::NativeResumePreflight,
+            filesystem: EffectiveFilesystemAccess::Unrestricted,
+            network: EffectiveIoAccess::Allowed,
+            local_ports: EffectiveIoAccess::Allowed,
+            detail: None,
+        };
+        assert!(!claimed_full.proves_full_access());
+        let saved = grok_resume_identity(claimed_full);
+        let requested = BaseResumeIdentity::requested_only(
+            "grok-build",
+            PathBuf::from("/canonical/workspace"),
+            BasePermissionProfile::Guarded,
+            BaseSandboxRequest::Off,
+            true,
+        );
+        assert!(
+            !saved.permits_resume_as(&requested, true),
+            "configuration preflight alone cannot authorize Grok session/load"
+        );
+
+        let claimed_read_only = EffectiveSandboxEvidence {
+            status: SandboxEffectiveStatus::Enforced,
+            resolved_profile: Some(BaseSandboxRequest::ReadOnly),
+            source: SandboxEvidenceSource::NativeResumePreflight,
+            filesystem: EffectiveFilesystemAccess::ReadOnly,
+            network: EffectiveIoAccess::Blocked,
+            local_ports: EffectiveIoAccess::Blocked,
+            detail: None,
+        };
+        assert!(!claimed_read_only.proves_read_only_filesystem());
+    }
+
+    #[test]
+    fn grok_resume_requires_exact_identity_effective_attestation_and_live_preflight() {
+        let effective = EffectiveSandboxEvidence {
+            status: SandboxEffectiveStatus::Disabled,
+            resolved_profile: Some(BaseSandboxRequest::Off),
+            source: SandboxEvidenceSource::VendorProtocol,
+            filesystem: EffectiveFilesystemAccess::Unrestricted,
+            network: EffectiveIoAccess::Allowed,
+            local_ports: EffectiveIoAccess::Allowed,
+            detail: Some("post-policy effective state".to_string()),
+        };
+        let saved = grok_resume_identity(effective);
+        let requested = BaseResumeIdentity::requested_only(
+            "grok-build",
+            PathBuf::from("/canonical/workspace"),
+            BasePermissionProfile::Guarded,
+            BaseSandboxRequest::Off,
+            true,
+        );
+        assert!(!saved.permits_resume_as(&requested, false));
+        assert!(saved.permits_resume_as(&requested, true));
+
+        let mut mismatch = requested.clone();
+        mismatch.permission_profile = BasePermissionProfile::Auto;
+        assert!(!saved.permits_resume_as(&mismatch, true));
+        mismatch = requested.clone();
+        mismatch.canonical_workspace = PathBuf::from("/other/workspace");
+        assert!(!saved.permits_resume_as(&mismatch, true));
+        mismatch = requested;
+        mismatch.backend = "codex".to_string();
+        assert!(!saved.permits_resume_as(&mismatch, true));
+    }
+
+    #[test]
+    fn effective_io_is_modeled_separately_from_filesystem_and_degradation() {
+        let mac_like = EffectiveSandboxEvidence {
+            status: SandboxEffectiveStatus::Enforced,
+            resolved_profile: Some(BaseSandboxRequest::ReadOnly),
+            source: SandboxEvidenceSource::VendorProtocol,
+            filesystem: EffectiveFilesystemAccess::ReadOnly,
+            network: EffectiveIoAccess::Allowed,
+            local_ports: EffectiveIoAccess::Allowed,
+            detail: Some("platform permits network and listeners".to_string()),
+        };
+        let linux_like = EffectiveSandboxEvidence {
+            network: EffectiveIoAccess::Blocked,
+            local_ports: EffectiveIoAccess::Blocked,
+            ..mac_like.clone()
+        };
+        assert!(mac_like.proves_read_only_filesystem());
+        assert!(linux_like.proves_read_only_filesystem());
+        assert_ne!(mac_like.network, linux_like.network);
+        assert_ne!(mac_like.local_ports, linux_like.local_ports);
+
+        for status in [
+            SandboxEffectiveStatus::Unknown,
+            SandboxEffectiveStatus::Degraded,
+        ] {
+            let unresolved = EffectiveSandboxEvidence {
+                status,
+                ..mac_like.clone()
+            };
+            assert!(!unresolved.proves_read_only_filesystem());
+            assert!(!unresolved.proves_full_access());
+        }
+    }
 
     fn req(messages: Vec<(&str, &str)>) -> CompletionRequest {
         CompletionRequest {
@@ -1347,6 +3836,548 @@ mod tests {
         let rt = OfflineRuntime::default();
         let resp = rt.complete(req(vec![("user", "hi")])).await.unwrap();
         assert!(resp.text.is_empty());
+    }
+
+    // ── typed host interaction + correlated tool events ───────────────────
+
+    #[derive(Default)]
+    struct LegacyApprovalSession {
+        turns: Vec<String>,
+        responses: Vec<(String, ApprovalDecision)>,
+    }
+
+    #[async_trait]
+    impl BaseSession for LegacyApprovalSession {
+        async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
+            self.turns.push(directive);
+            Ok(())
+        }
+
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            None
+        }
+
+        async fn respond(
+            &mut self,
+            req_id: &str,
+            decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            self.responses.push((req_id.to_string(), decision));
+            Ok(())
+        }
+
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn base_session_defaults_to_detectable_unsupported_steer() {
+        let mut session = LegacyApprovalSession::default();
+        let capabilities = session.capabilities();
+        assert!(!capabilities.mid_turn_steer);
+        assert!(!capabilities.supports(SessionCapability::MidTurnSteer));
+        assert!(!capabilities.supports(SessionCapability::SetModel));
+        assert!(!capabilities.supports(SessionCapability::SetMode));
+        assert!(!capabilities.supports(SessionCapability::PromptQueue));
+        assert!(!capabilities.supports(SessionCapability::BackgroundProcessControl));
+        assert_eq!(
+            capabilities.delivery_for(TurnInputBlockKind::Text),
+            InputDelivery::Native
+        );
+        assert_eq!(
+            capabilities.delivery_for(TurnInputBlockKind::Image),
+            InputDelivery::Unsupported
+        );
+
+        let error = session
+            .steer("append this to the active turn".to_string())
+            .await
+            .expect_err("legacy sessions must not fake steer with a new turn");
+        assert!(matches!(
+            error,
+            SessionError::CapabilityUnsupported(SessionCapability::MidTurnSteer)
+        ));
+        assert!(
+            session.turns.is_empty(),
+            "the default steer implementation must not delegate to send_turn"
+        );
+
+        let error = session
+            .set_model(
+                "catalog-model".to_string(),
+                Some(SessionReasoningEffort::High),
+            )
+            .await
+            .expect_err("legacy sessions must not fake a model switch");
+        assert!(matches!(
+            error,
+            SessionError::CapabilityUnsupported(SessionCapability::SetModel)
+        ));
+        let error = session
+            .set_mode(SessionMode::Plan)
+            .await
+            .expect_err("legacy sessions must not fake a mode switch");
+        assert!(matches!(
+            error,
+            SessionError::CapabilityUnsupported(SessionCapability::SetMode)
+        ));
+        let error = session
+            .enqueue_input(TurnInput::text("queued"), PromptQueuePlacement::Tail)
+            .await
+            .expect_err("legacy sessions must not emulate a native prompt queue");
+        assert!(matches!(
+            error,
+            SessionError::CapabilityUnsupported(SessionCapability::PromptQueue)
+        ));
+        let error = session
+            .list_background_processes()
+            .await
+            .expect_err("legacy sessions must not synthesize a process list");
+        assert!(matches!(
+            error,
+            SessionError::CapabilityUnsupported(SessionCapability::BackgroundProcessControl)
+        ));
+        let error = session
+            .stop_background_process("task-1")
+            .await
+            .expect_err("legacy sessions must not kill a local pid as an emulation");
+        assert!(matches!(
+            error,
+            SessionError::CapabilityUnsupported(SessionCapability::BackgroundProcessControl)
+        ));
+        let error = session
+            .mutate_prompt_queue(PromptQueueMutation::Clear)
+            .await
+            .expect_err("legacy sessions must not claim a local clear is server state");
+        assert!(matches!(
+            error,
+            SessionError::CapabilityUnsupported(SessionCapability::PromptQueue)
+        ));
+    }
+
+    #[test]
+    fn session_mode_and_reasoning_effort_are_closed_exact_wire_sets() {
+        assert_eq!(SessionMode::try_from("default"), Ok(SessionMode::Default));
+        assert_eq!(SessionMode::try_from("plan"), Ok(SessionMode::Plan));
+        assert_eq!(SessionMode::try_from("ask"), Ok(SessionMode::Ask));
+        assert!(SessionMode::try_from("bypassPermissions").is_err());
+        assert!(SessionMode::try_from("Plan").is_err());
+
+        assert_eq!(
+            SessionReasoningEffort::try_from("xhigh"),
+            Ok(SessionReasoningEffort::Xhigh)
+        );
+        assert!(SessionReasoningEffort::try_from("max").is_err());
+        assert!(SessionReasoningEffort::try_from("future-tier").is_err());
+    }
+
+    #[test]
+    fn safe_point_steer_is_supported_but_not_strict_same_turn() {
+        let safe_point = SessionCapabilities {
+            mid_turn_steer: true,
+            steer: SteerSemantics::SameTurnOrImmediateNext,
+            ..SessionCapabilities::default()
+        };
+        assert!(safe_point.supports(SessionCapability::MidTurnSteer));
+        assert_ne!(safe_point.steer, SteerSemantics::SameTurn);
+        assert_eq!(
+            serde_json::to_string(&safe_point.steer).unwrap(),
+            "\"same_turn_or_immediate_next\""
+        );
+
+        let disabled = SessionCapabilities {
+            mid_turn_steer: false,
+            ..safe_point
+        };
+        assert!(!disabled.supports(SessionCapability::MidTurnSteer));
+    }
+
+    #[test]
+    fn prompt_queue_contract_round_trips_versions_and_never_implies_a_commit() {
+        let snapshot = PromptQueueSnapshot {
+            session_id: "s1".to_string(),
+            entries: vec![PromptQueueEntry {
+                id: "p1".to_string(),
+                version: 7,
+                owner: Some("client-a".to_string()),
+                last_editor: Some("client-b".to_string()),
+                kind: "prompt".to_string(),
+                text: "fix it".to_string(),
+                position: 0,
+            }],
+            running_prompt_id: Some("p0".to_string()),
+        };
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PromptQueueSnapshot>(&encoded).unwrap(),
+            snapshot
+        );
+        let mutation = PromptQueueMutation::Interject {
+            id: "p1".to_string(),
+            expected_version: 7,
+            new_text: Some("fix it now".to_string()),
+        };
+        let encoded = serde_json::to_string(&mutation).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PromptQueueMutation>(&encoded).unwrap(),
+            mutation
+        );
+        let capabilities = SessionCapabilities {
+            prompt_queue: PromptQueueCapability::ServerAuthoritativeVersioned,
+            ..SessionCapabilities::default()
+        };
+        assert!(capabilities.supports(SessionCapability::PromptQueue));
+    }
+
+    #[test]
+    fn background_process_control_is_scoped_typed_and_opt_in() {
+        let snapshot = BackgroundProcessSnapshot {
+            session_id: "session-1".to_string(),
+            processes: vec![BackgroundProcessSnapshotEntry {
+                task_id: "task-1".to_string(),
+                kind: BackgroundProcessKind::Monitor,
+                completed: true,
+                exit_code: None,
+                signal: Some("killed".to_string()),
+                truncated: false,
+            }],
+        };
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_str::<BackgroundProcessSnapshot>(&encoded).unwrap(),
+            snapshot
+        );
+        assert!(!encoded.contains("command"));
+        assert!(!encoded.contains("output"));
+
+        let capabilities = SessionCapabilities {
+            background_process_control:
+                BackgroundProcessControlCapability::ServerAuthoritativeOwned,
+            ..SessionCapabilities::default()
+        };
+        assert!(capabilities.supports(SessionCapability::BackgroundProcessControl));
+        assert_eq!(
+            serde_json::to_string(&BackgroundProcessStopOutcome::AlreadyExited).unwrap(),
+            "\"already_exited\""
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_input_default_is_text_compatible_and_never_flattens_files() {
+        let mut session = LegacyApprovalSession::default();
+        let report = session.send_input(TurnInput::text("hello")).await.unwrap();
+        assert_eq!(session.turns, vec!["hello"]);
+        assert_eq!(report.blocks[0].delivery, InputDelivery::Native);
+        assert_eq!(report.receipt, DeliveryReceiptStage::TransportWritten);
+
+        let error = session
+            .send_input(TurnInput::new(vec![
+                TurnInputBlock::Text {
+                    text: "before".into(),
+                },
+                TurnInputBlock::File {
+                    path: PathBuf::from("never-read.txt"),
+                    mode: FileInputMode::MaterializeText,
+                },
+            ]))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SessionError::InputUnsupported {
+                index: 1,
+                kind: TurnInputBlockKind::File,
+                ..
+            }
+        ));
+        assert_eq!(session.turns, vec!["hello"]);
+    }
+
+    #[test]
+    fn delivery_receipt_stage_is_backward_compatible_and_never_implies_processing() {
+        let legacy = r#"{"blocks":[],"encoded_bytes":12}"#;
+        let report: DeliveryReport = serde_json::from_str(legacy).unwrap();
+        assert_eq!(report.receipt, DeliveryReceiptStage::TransportWritten);
+
+        let acknowledged = DeliveryReport {
+            blocks: Vec::new(),
+            encoded_bytes: Some(12),
+            receipt: DeliveryReceiptStage::ProtocolAcknowledged,
+        };
+        let encoded = serde_json::to_string(&acknowledged).unwrap();
+        assert!(encoded.contains(r#""receipt":"protocol_acknowledged""#));
+    }
+
+    #[test]
+    fn structured_input_roundtrip_preserves_block_order() {
+        let input = TurnInput::new(vec![
+            TurnInputBlock::Text { text: "甲".into() },
+            TurnInputBlock::Image {
+                path: PathBuf::from("图片 空格.png"),
+            },
+            TurnInputBlock::Text { text: "乙".into() },
+        ]);
+        let encoded = serde_json::to_string(&input).unwrap();
+        let decoded: TurnInput = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, input);
+        assert_eq!(decoded.blocks[1].kind(), TurnInputBlockKind::Image);
+        assert!(!format!("{decoded:?}").contains("图片 空格.png"));
+    }
+
+    #[tokio::test]
+    async fn respond_host_preserves_legacy_approval_and_rejects_richer_replies() {
+        let mut session = LegacyApprovalSession::default();
+        session
+            .respond_host(
+                "approval-1",
+                HostResponse::Approval {
+                    decision: ApprovalDecision::Allow,
+                    selected_option_id: Some("allow_once".into()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+        session
+            .respond_host(
+                "question-1",
+                HostResponse::UserInput {
+                    answers: vec![HostAnswer {
+                        question_id: "database".into(),
+                        values: vec!["Postgres".into()],
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.responses,
+            vec![
+                ("approval-1".into(), ApprovalDecision::Allow),
+                ("question-1".into(), ApprovalDecision::Deny),
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_host_request_round_trips_and_has_a_safe_protocol_rejection() {
+        let request = HostRequest::PermissionExpansion {
+            permissions: vec![HostPermission {
+                kind: "filesystem_write".into(),
+                target: Some("/outside/workspace".into()),
+                metadata: serde_json::json!({"scope": "recursive"}),
+            }],
+            reason: Some("write generated output".into()),
+            metadata: serde_json::Value::Null,
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            serde_json::from_value::<HostRequest>(encoded).unwrap(),
+            request
+        );
+        assert!(matches!(
+            request.safe_rejection("not approved"),
+            HostResponse::PermissionExpansion {
+                decision: ApprovalDecision::Deny,
+                granted,
+                message: Some(reason),
+            } if granted.is_empty() && reason == "not approved"
+        ));
+
+        let unknown = HostRequest::Unknown {
+            method: "vendor/futureAction".into(),
+            payload: serde_json::json!({"redacted": true}),
+        };
+        assert_eq!(
+            unknown.safe_rejection("unsupported method"),
+            HostResponse::Rejected {
+                reason: "unsupported method".into()
+            }
+        );
+    }
+
+    #[test]
+    fn grok_interaction_contract_round_trips_preview_notes_and_typed_rejections() {
+        let question = HostQuestion {
+            id: "local-q1".into(),
+            header: Some("Database".into()),
+            prompt: "Which database?".into(),
+            kind: HostQuestionKind::SingleChoice,
+            required: true,
+            options: vec![HostQuestionOption {
+                value: "option-1".into(),
+                label: "Postgres".into(),
+                description: Some("Relational".into()),
+                preview: Some("CREATE TABLE users (...)".into()),
+            }],
+        };
+        let response = HostResponse::UserInputOutcome {
+            outcome: HostUserInputOutcome::Accepted {
+                answers: vec![HostAnswer {
+                    question_id: question.id.clone(),
+                    values: vec!["option-1".into()],
+                }],
+                annotations: vec![HostQuestionAnnotation {
+                    question_id: question.id.clone(),
+                    preview: question.options[0].preview.clone(),
+                    notes: Some("Keep migrations reversible".into()),
+                }],
+            },
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serde_json::from_value::<HostResponse>(encoded).unwrap(),
+            response
+        );
+
+        let grok_question = HostRequest::UserInput {
+            questions: vec![question.clone()],
+            metadata: serde_json::json!({
+                "responseContract":"grok_ask_user_question_v1"
+            }),
+        };
+        assert_eq!(
+            grok_question.safe_rejection("closed"),
+            HostResponse::UserInputOutcome {
+                outcome: HostUserInputOutcome::Cancelled
+            }
+        );
+        let generic_question = HostRequest::UserInput {
+            questions: vec![question],
+            metadata: serde_json::json!({
+                "responseContract":"grok_ask_user_question_v2"
+            }),
+        };
+        assert_eq!(
+            generic_question.safe_rejection("closed"),
+            HostResponse::Rejected {
+                reason: "closed".into()
+            }
+        );
+
+        let kimi_plan_review = HostRequest::UserInput {
+            questions: Vec::new(),
+            metadata: serde_json::json!({
+                "responseContract":"kimi_plan_review_permission_v1"
+            }),
+        };
+        assert_eq!(
+            kimi_plan_review.safe_rejection("closed"),
+            HostResponse::Cancelled {
+                reason: Some("closed".into())
+            }
+        );
+
+        let grok_plan = HostRequest::PlanConfirmation {
+            plan: "Deploy safely".into(),
+            message: None,
+            metadata: serde_json::json!({
+                "responseContract":"grok_exit_plan_mode_v1"
+            }),
+        };
+        assert!(matches!(
+            grok_plan.safe_rejection("closed"),
+            HostResponse::PlanOutcome {
+                outcome: HostPlanOutcome::Cancelled {
+                    feedback: Some(reason)
+                }
+            } if reason == "closed"
+        ));
+    }
+
+    #[test]
+    fn correlated_tool_events_keep_parallel_call_ids_without_changing_legacy_shapes() {
+        let first = SessionEvent::ToolCallCorrelated {
+            call_id: "tool-a".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"path": "a.rs"}),
+        };
+        let second = SessionEvent::ToolResultCorrelated {
+            call_id: "tool-b".into(),
+            ok: true,
+            summary: "done".into(),
+        };
+        assert_eq!(first.tool_call_id(), Some("tool-a"));
+        assert_eq!(second.tool_call_id(), Some("tool-b"));
+
+        // Existing constructors and pattern shapes remain exactly valid for
+        // streams that expose no stable id.
+        let legacy = SessionEvent::ToolCall {
+            name: "Read".into(),
+            input: serde_json::json!({"path": "legacy.rs"}),
+        };
+        assert_eq!(legacy.tool_call_id(), None);
+    }
+
+    #[test]
+    fn tool_activity_keeps_parallel_calls_active_until_every_matching_result() {
+        let mut activity = ToolActivity::default();
+        assert!(activity.observe(&SessionEvent::ToolCallCorrelated {
+            call_id: "tool-a".into(),
+            name: "Read".into(),
+            input: serde_json::Value::Null,
+        }));
+        assert!(activity.observe(&SessionEvent::ToolCallCorrelated {
+            call_id: "tool-b".into(),
+            name: "Bash".into(),
+            input: serde_json::Value::Null,
+        }));
+        assert!(activity.observe(&SessionEvent::ToolResultCorrelated {
+            call_id: "tool-a".into(),
+            ok: true,
+            summary: "first finished".into(),
+        }));
+        assert!(!activity.observe(&SessionEvent::ToolResultCorrelated {
+            call_id: "tool-b".into(),
+            ok: true,
+            summary: "second finished".into(),
+        }));
+    }
+
+    #[test]
+    fn tool_activity_counts_legacy_calls_and_resets_at_turn_boundary() {
+        let mut activity = ToolActivity::default();
+        for name in ["Read", "Bash"] {
+            assert!(activity.observe(&SessionEvent::ToolCall {
+                name: name.into(),
+                input: serde_json::Value::Null,
+            }));
+        }
+        assert!(activity.observe(&SessionEvent::ToolResult {
+            ok: true,
+            summary: "one finished".into(),
+        }));
+        assert!(!activity.observe(&SessionEvent::TurnDone {
+            status: TurnStatus::Completed,
+            usage: None,
+        }));
+    }
+
+    #[test]
+    fn tool_activity_overflow_stays_conservatively_active_until_clear() {
+        let mut activity = ToolActivity::default();
+        for index in 0..=ToolActivity::MAX_CORRELATED {
+            assert!(activity.observe(&SessionEvent::ToolCallCorrelated {
+                call_id: format!("tool-{index}"),
+                name: "Read".into(),
+                input: serde_json::Value::Null,
+            }));
+        }
+        for index in 0..ToolActivity::MAX_CORRELATED {
+            assert!(activity.observe(&SessionEvent::ToolResultCorrelated {
+                call_id: format!("tool-{index}"),
+                ok: true,
+                summary: String::new(),
+            }));
+        }
+        activity.clear();
+        assert!(!activity.is_active());
     }
 
     // ── AskUserQuestion parsing / rendering / reply-resolution ──────────────

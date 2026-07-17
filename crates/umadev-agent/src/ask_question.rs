@@ -19,7 +19,7 @@
 //!    observed ([`surface`]), so the user sees exactly what's being asked.
 //! 2. **Relay** the user's choice back to the base as the next turn of the SAME
 //!    session ([`relay_directive`]) — the base kept the question in its own
-//!    context when it asked it, so a follow-up "the user chose: <option>" turn
+//!    context when it asked it, so a follow-up "the user chose: `<option>`" turn
 //!    lets it continue with the answer instead of a silent cancel.
 //!
 //! Fail-open throughout: a non-question tool call, or an input shape we can't

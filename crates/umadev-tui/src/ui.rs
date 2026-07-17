@@ -376,7 +376,7 @@ use crate::app::{
 };
 
 /// Set the terminal's light/dark classification, probed once at launch
-/// Re-exported from [`theme`] for startup and asynchronous terminal detection.
+/// Re-exported from the private theme module for startup and asynchronous terminal detection.
 pub fn set_light_theme(is_light: bool) {
     theme::set_light_theme(is_light);
 }
@@ -420,12 +420,12 @@ pub fn render(frame: &mut Frame, app: &App) {
 /// `None` (overlay / help / picker / too-small) → nothing to do: ratatui's own
 /// `hide_cursor()` already left the caret hidden.
 ///
-/// Fail-open: an `io::Error` from a caret write is returned to the caller, which
-/// ignores it — a caret hiccup must never kill the render loop.
+/// Fail-open: a backend error from a caret write is returned to the caller,
+/// which ignores it — a caret hiccup must never kill the render loop.
 pub fn place_caret<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     app: &App,
-) -> std::io::Result<()> {
+) -> Result<(), B::Error> {
     if let Some((x, y)) = app.caret.get() {
         terminal.set_cursor_position((x, y))?;
         terminal.show_cursor()?;
@@ -1440,6 +1440,7 @@ fn message_content_hash(msg: &crate::app::ChatMessage) -> u64 {
             t.arg.hash(&mut h);
             std::mem::discriminant(&t.status).hash(&mut h);
             t.result.hash(&mut h);
+            t.progress.hash(&mut h);
             t.merged.hash(&mut h);
             t.count.hash(&mut h);
             t.collapsed.hash(&mut h);
@@ -2774,10 +2775,29 @@ fn render_chat(frame: &mut Frame, app: &App) {
     // the input box while a base action is paused awaiting the user's decision,
     // so the approval entry point can never scroll out of view with the
     // transcript. 0 rows (hidden) in the common no-pause case.
-    let approval_h = u16::from(app.pending_approval.is_some());
-    let prompt_h = prompt_block_height(&app.input, inner.width, mode_prefix_width(app))
+    let requested_interaction_h = app.auth_ui.as_ref().map_or_else(
+        || {
+            if app.pending_approval.is_some() {
+                1
+            } else {
+                app.pending_host_input.as_ref().map_or(
+                    0,
+                    crate::app::host_input::PendingHostInputView::panel_height,
+                )
+            }
+        },
+        crate::auth_ui::AuthUiState::panel_height,
+    );
+    let approval_h = requested_interaction_h.min(inner.height.saturating_sub(5));
+    let rendered_input = app.rendered_input();
+    let prompt_h = prompt_block_height(&rendered_input, inner.width, mode_prefix_width(app))
         .min(inner.height.saturating_sub(3 + approval_h))
         .max(2);
+    let queue_h = app.prompt_queue.panel_height().min(
+        inner
+            .height
+            .saturating_sub(1 + 3 + 1 + prompt_h + approval_h),
+    );
     // Wave-1 live plan + team-review panel — a fixed region between the
     // transcript and the prompt, shown only when a plan / review is live and the
     // terminal is tall enough to spare the rows (so it NEVER crushes the
@@ -2797,7 +2817,7 @@ fn render_chat(frame: &mut Frame, app: &App) {
             .saturating_add(1);
         let headroom = inner
             .height
-            .saturating_sub(1 + 3 + 1 + prompt_h + approval_h); // title + min transcript + spacer + approval bar + prompt
+            .saturating_sub(1 + 3 + queue_h + 1 + prompt_h + approval_h); // title + min transcript + queue + spacer + approval bar + prompt
         want.min(headroom).min(PLAN_PANEL_MAX_ROWS)
     };
     let chunks = Layout::default()
@@ -2806,6 +2826,7 @@ fn render_chat(frame: &mut Frame, app: &App) {
             Constraint::Length(1),          // title row (borderless)
             Constraint::Min(1),             // transcript (grows; ≥1 guaranteed)
             Constraint::Length(panel_h),    // live plan / team-review panel (0 = hidden)
+            Constraint::Length(queue_h),    // native prompt queue (0 = hidden)
             Constraint::Length(1),          // spacer — breathing room above the prompt
             Constraint::Length(approval_h), // sticky approval bar (0 = hidden)
             Constraint::Length(prompt_h), // prompt: input(N) + border(1) + meta(1, live status pinned bottom-right)
@@ -2817,45 +2838,108 @@ fn render_chat(frame: &mut Frame, app: &App) {
     if panel_h > 0 {
         render_plan_panel(frame, chunks[2], &panel_lines, app.lang);
     }
-    // chunks[3] is an intentional blank spacer row — it separates the transcript
+    if queue_h > 0 {
+        render_prompt_queue(frame, chunks[3], app);
+    }
+    // chunks[4] is an intentional blank spacer row — it separates the transcript
     // / live plan panel from the input box so the prompt no longer sits jammed
     // against the content above it. The live status that used to burn its own
     // footer row now rides the bottom-right of the prompt's meta row instead, so
     // this gap costs no net vertical space.
     if approval_h > 0 {
-        render_approval_bar(frame, chunks[4], app);
+        render_approval_bar(frame, chunks[5], app);
     }
-    render_prompt(frame, chunks[5], app);
+    render_prompt(frame, chunks[6], app);
 
     // Feature B — when the search bar is open it OWNS the input mode, so it
     // replaces the popovers entirely: render the one-row search bar in the spacer
     // above the prompt (no extra vertical cost) and skip the mention/palette
     // typeahead (they read the unchanged input box behind the bar).
     if app.search.is_some() {
-        render_search_bar(frame, chunks[3], app);
+        render_search_bar(frame, chunks[4], app);
         return;
     }
     // I3 — the reverse prompt-history search (Ctrl+R) likewise owns the input
     // mode: render its one-row bar (label + query + live preview of the focused
     // entry) in the same spacer and skip the popovers.
     if app.history_search.is_some() {
-        render_history_search_bar(frame, chunks[3], app);
+        render_history_search_bar(frame, chunks[4], app);
         return;
     }
 
     // A popover floats above the prompt: the `@`-file-mention typeahead takes
     // precedence over the slash palette so the two are mutually exclusive — only
     // one opens, chosen by what is under the cursor.
+    if app.pending_host_input.is_some() || app.auth_ui.is_some() {
+        return;
+    }
     let mention = app.mention_matches();
     if mention.is_empty() {
         // Slash-command palette popover when typing a `/`-prefixed command.
         let palette = app.palette_matches();
         if !palette.is_empty() {
-            render_palette_popover(frame, chunks[5], app, &palette);
+            render_palette_popover(frame, chunks[6], app, &palette);
         }
     } else {
-        render_mention_popover(frame, chunks[5], app, &mention);
+        render_mention_popover(frame, chunks[6], app, &mention);
     }
+}
+
+/// Render at most three rows from the base's complete prompt-queue snapshot.
+/// Pending mutations keep the old rows visible until a replacement arrives.
+fn render_prompt_queue(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let count = app.prompt_queue.entries().len().to_string();
+    let pending = if app.prompt_queue.awaiting_snapshot() {
+        format!(" · {}", umadev_i18n::t(app.lang, "prompt_queue.pending"))
+    } else {
+        String::new()
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            umadev_i18n::tf(app.lang, "prompt_queue.title", &[&count]),
+            Style::default()
+                .fg(theme::PRIMARY())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(pending, Style::default().fg(theme::WARNING())),
+    ])];
+    for entry in app.prompt_queue.visible_entries() {
+        let selected = app.prompt_queue.selected_id() == Some(entry.id.as_str());
+        let marker = if selected { "› " } else { "  " };
+        let text = entry.text.replace(['\n', '\r'], " ");
+        let row = truncate_to_width_cjk(
+            &format!("{marker}{} · {text}", entry.kind),
+            usize::from(area.width),
+        );
+        lines.push(Line::from(Span::styled(
+            row,
+            Style::default()
+                .fg(if selected {
+                    theme::TEXT()
+                } else {
+                    theme::TEXT_MUTED()
+                })
+                .add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        truncate_to_width_cjk(
+            umadev_i18n::t(app.lang, "prompt_queue.hint"),
+            usize::from(area.width),
+        ),
+        Style::default().fg(theme::TEXT_MUTED()),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme::BG_ELEMENT())),
+        area,
+    );
 }
 
 /// A2#5 — render the STICKY approval bar: one warning-colored row pinned
@@ -2868,7 +2952,81 @@ fn render_chat(frame: &mut Frame, app: &App) {
 /// and the user faced dead keys with no visible approval entry point.
 /// Fail-open: no pending approval renders nothing.
 fn render_approval_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let Some((action, target)) = &app.pending_approval else {
+    if let Some(auth) = &app.auth_ui {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let bar_bg = theme::BG_ELEMENT();
+        frame.render_widget(Block::default().style(Style::default().bg(bar_bg)), area);
+        let width = usize::from(area.width);
+        let lines = auth
+            .panel_lines(app.lang)
+            .into_iter()
+            .take(usize::from(area.height))
+            .enumerate()
+            .map(|(index, line)| {
+                let shown = truncate_to_width_cjk(&format!(" {line}"), width);
+                Line::from(Span::styled(
+                    shown,
+                    Style::default()
+                        .fg(if index == 0 {
+                            theme::WARNING()
+                        } else {
+                            theme::TEXT()
+                        })
+                        .bg(bar_bg)
+                        .add_modifier(if index == 0 {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+    if let Some(input) = &app.pending_host_input {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let bar_bg = theme::BG_ELEMENT();
+        frame.render_widget(Block::default().style(Style::default().bg(bar_bg)), area);
+        let width = usize::from(area.width);
+        let lines = input
+            .panel_lines(app.lang)
+            .into_iter()
+            .take(usize::from(area.height))
+            .enumerate()
+            .map(|(index, line)| {
+                let shown = truncate_to_width_cjk(&format!(" {line}"), width);
+                Line::from(Span::styled(
+                    shown,
+                    Style::default()
+                        .fg(if index == 0 {
+                            theme::WARNING()
+                        } else {
+                            theme::TEXT()
+                        })
+                        .bg(bar_bg)
+                        .add_modifier(if index == 0 {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+    let (label_key, item, hint_key) = if let Some((action, target)) = &app.pending_approval {
+        (
+            "approval.bar.label",
+            format!(" {action} -> {target}  "),
+            "approval.bar.hint",
+        )
+    } else {
         return;
     };
     if area.height == 0 || area.width == 0 {
@@ -2879,10 +3037,9 @@ fn render_approval_bar(frame: &mut Frame, area: Rect, app: &App) {
     let bar_bg = theme::BG_ELEMENT();
     frame.render_widget(Block::default().style(Style::default().bg(bar_bg)), area);
 
-    let label = umadev_i18n::t(lang, "approval.bar.label");
+    let label = umadev_i18n::t(lang, label_key);
     let label = format!(" {label} ");
-    let hint = umadev_i18n::t(lang, "approval.bar.hint");
-    let item = format!(" {action} -> {target}  ");
+    let hint = umadev_i18n::t(lang, hint_key);
     // Budget by worst-case display width (CJK-ambiguous glyphs count 2): the
     // label always shows; the item is truncated to what remains; the hint only
     // renders if it still fits in full (a truncated hint would misteach keys).
@@ -3115,8 +3272,9 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let has_plan = !app.plan_steps.is_empty();
+    let has_base_plan = !app.base_session_plan.is_empty();
     let has_review = !app.critic_verdicts.is_empty();
-    if !has_plan && !has_review {
+    if !has_plan && !has_base_plan && !has_review {
         return lines;
     }
 
@@ -3185,6 +3343,41 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                     ),
                 ]));
             }
+        }
+    }
+
+    // A base-owned ACP plan is scoped inside the selected base session. Keep it
+    // visually separate from UmaDev's director plan so neither overwrites the
+    // other when both are active.
+    if has_base_plan {
+        lines.push(Line::from(Span::styled(
+            format!(" {}", umadev_i18n::t(app.lang, "base.plan.panel.title")),
+            Style::default()
+                .fg(theme::ACCENT())
+                .add_modifier(Modifier::BOLD),
+        )));
+        for entry in &app.base_session_plan {
+            let status = match entry.status {
+                umadev_runtime::SessionPlanEntryStatus::Pending => "pending",
+                umadev_runtime::SessionPlanEntryStatus::InProgress => "active",
+                umadev_runtime::SessionPlanEntryStatus::Completed => "done",
+            };
+            let (mark, color) = checklist_glyph(status);
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {mark} "), Style::default().fg(color)),
+                Span::styled(
+                    truncate_display(&entry.content, 56),
+                    if status == "done" {
+                        Style::default().fg(theme::TEXT_MUTED())
+                    } else if status == "active" {
+                        Style::default()
+                            .fg(theme::TEXT())
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::TEXT())
+                    },
+                ),
+            ]));
         }
     }
 
@@ -4003,6 +4196,18 @@ fn render_tool_row(
             Style::default().fg(theme::TEXT_MUTED()),
         ));
     }
+    if tool.status == ToolStatus::Running {
+        if let Some(progress) = tool
+            .progress
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            head.push(Span::styled(
+                format!(" · {progress}"),
+                Style::default().fg(theme::TEXT_MUTED()),
+            ));
+        }
+    }
     // A row settled by an interrupt carries an explicit dim `[aborted]` tag so
     // the user reads it as stopped-mid-flight (not a silent neutral dot), mirror
     // of how a failed row's red glyph signals failure — no emoji, theme colour.
@@ -4231,40 +4436,74 @@ fn fmt_token_count(n: u64) -> String {
     }
 }
 
+/// Format Grok's exact integer USD ticks without floating-point rounding.
+/// `10^10` ticks = USD 1; trailing fractional zeroes are omitted.
+fn fmt_usd_ticks(ticks: i64) -> String {
+    const TICKS_PER_USD: i64 = 10_000_000_000;
+    let whole = ticks / TICKS_PER_USD;
+    let fraction = ticks % TICKS_PER_USD;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let fraction = format!("{fraction:010}");
+    format!("{whole}.{}", fraction.trim_end_matches('0'))
+}
+
 /// Below this terminal width the persistent token/cost gauge is the FIRST chrome
 /// dropped from the meta row, so the backend / trust-chip / hint / live-status
 /// always win the space on a narrow terminal (matching the status-drop policy).
 const GAUGE_MIN_COLS: u16 = 60;
 
-/// The persistent token/cost gauge for the meta row: cumulative REAL session
-/// token spend (the base's own per-turn `TurnUsage` numbers, summed on `App`)
-/// and — once the blended reference rate rounds to something visible — a rough
-/// advisory cost. Returns `None` until the first real usage lands, so a fresh
-/// session shows no gauge (no `≈$0.00` clutter, never a fabricated number).
+/// The persistent token/cost gauge for the meta row. Exact totals, incomplete
+/// lower bounds, and unknown reports render differently. Cost is shown only from
+/// trustworthy source ticks; missing/partial/incomplete cost is explicitly
+/// unknown and never replaced with a fabricated price estimate.
 ///
-/// No "% of context" indicator: `session_tokens` is cumulative SPEND across the
+/// No "% of context" indicator: session tokens are cumulative SPEND across the
 /// whole session (input+output summed every turn), not live context occupancy,
 /// and UmaDev derives no per-base context-window size — a percentage here would
 /// be a misleading number, so it is deliberately omitted (honest over decorative).
 fn token_gauge_text(app: &App) -> Option<String> {
-    if app.session_tokens == 0 {
+    if !app.session_usage.has_report() {
         return None;
     }
+    if app.session_usage.is_incomplete() && app.session_usage.tokens() == 0 {
+        return Some(umadev_i18n::t(app.lang, "tui.gauge.usage_unknown").to_string());
+    }
+    let token_key = if app.session_usage.is_incomplete() {
+        "tui.gauge.tokens_lower_bound"
+    } else {
+        "tui.gauge.tokens"
+    };
     let tokens = umadev_i18n::tf(
         app.lang,
-        "tui.gauge.tokens",
-        &[&fmt_token_count(app.session_tokens)],
+        token_key,
+        &[&fmt_token_count(app.session_usage.tokens())],
     );
-    // Rough advisory cost — the SAME flat blended reference rate `umadev usage`
-    // prints, clearly an estimate (`≈`). Shown only once it rounds to a visible
-    // amount so a small session isn't cluttered with a `$0.00`.
-    let cost = umadev_agent::runner::rough_cost_usd(app.session_tokens);
-    if cost >= 0.01 {
-        let cost = umadev_i18n::tf(app.lang, "tui.gauge.cost", &[&format!("{cost:.2}")]);
-        Some(format!("{tokens} · {cost}"))
-    } else {
-        Some(tokens)
+    let cost = app.session_usage.exact_cost_usd_ticks().map_or_else(
+        || umadev_i18n::t(app.lang, "tui.gauge.cost_unknown").to_string(),
+        |ticks| umadev_i18n::tf(app.lang, "tui.gauge.cost_exact", &[&fmt_usd_ticks(ticks)]),
+    );
+    Some(format!("{tokens} · {cost}"))
+}
+
+fn waiting_usage_text(app: &App) -> Option<String> {
+    if !app.session_usage.has_report() {
+        return None;
     }
+    if app.session_usage.is_incomplete() && app.session_usage.tokens() == 0 {
+        return Some(umadev_i18n::t(app.lang, "tui.wait.usage_unknown").to_string());
+    }
+    let key = if app.session_usage.is_incomplete() {
+        "tui.wait.tokens_lower_bound"
+    } else {
+        "tui.wait.tokens"
+    };
+    Some(umadev_i18n::tf(
+        app.lang,
+        key,
+        &[&fmt_token_count(app.session_usage.tokens())],
+    ))
 }
 
 /// The live context-occupancy gauge for the meta row — how full the base's
@@ -4688,13 +4927,9 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             umadev_i18n::t(app.lang, "status.esc_cancel")
         };
-        // Cumulative REAL token consumption (read from the usage ledger), not a
-        // per-turn character guess — shows true total spend (e.g. `≈452K tok`).
-        let tok_part = if app.session_tokens > 0 {
-            format!(" · ≈{} token", fmt_token_count(app.session_tokens))
-        } else {
-            String::new()
-        };
+        let tok_part = waiting_usage_text(app)
+            .map(|usage| format!(" · {usage}"))
+            .unwrap_or_default();
         let elapsed = format!("  ({secs}s{tok_part} · {esc_hint})");
         rendered.push(RenderedRow::plain(Line::from(""), 0));
         let mut think_spans = vec![Span::styled(
@@ -5861,6 +6096,8 @@ fn highlight_row_bg(line: &Line<'static>, from: usize, to: usize, bg: Color) -> 
 fn mode_prefix_width(app: &App) -> u16 {
     if app.pending_approval.is_some() {
         6 // "[y/n]" + space
+    } else if app.pending_host_input.is_some() {
+        4 // "[?]" + space
     } else if app.active_gate.is_some() {
         7
     } else if app.run_started && !app.finished {
@@ -5905,12 +6142,14 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     // by one wrapped visual row inside a multi-line prompt (CC parity).
     app.input_text_cols.set(text_width);
     // Wrap the real input so the box height + underline track the content.
-    let all_rows = wrap_input_rows(&app.input, text_width);
+    let rendered_input = app.rendered_input();
+    let all_rows = wrap_input_rows(&rendered_input, text_width);
     let total_rows = u16::try_from(all_rows.len()).unwrap_or(INPUT_MAX_ROWS);
     let visible_rows = total_rows.clamp(1, INPUT_MAX_ROWS);
     // Caret's absolute (row, col) in the wrapped layout — computed BEFORE the
     // scroll so the scroll can keep it on screen.
-    let (cursor_row_abs, cursor_col) = caret_in_wrapped(&app.input, app.input_cursor, text_width);
+    let (cursor_row_abs, cursor_col) =
+        caret_in_wrapped(&rendered_input, app.input_cursor, text_width);
     // Scroll so the caret's row stays visible. The box only ever shows
     // `visible_rows` of the `total_rows`; when the user edits ABOVE the bottom of
     // a tall (>6-row) input, the old "always scroll to bottom" pinned the caret
@@ -5929,7 +6168,10 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
 
     // Border color: muted gray normally (Claude Code's promptBorder
     // rgb(136,136,136)), warm yellow at a gate or while an approval is pending.
-    let border_color = if app.active_gate.is_some() || app.pending_approval.is_some() {
+    let border_color = if app.active_gate.is_some()
+        || app.pending_approval.is_some()
+        || app.pending_host_input.is_some()
+    {
         theme::WARNING()
     } else {
         theme::BORDER_ACTIVE()
@@ -5947,6 +6189,8 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         // A2#5 — a paused approval owns the prompt: the marker mirrors the two
         // fast keys so the decision surface is visible at the caret itself.
         "[y/n]"
+    } else if app.pending_host_input.is_some() {
+        umadev_i18n::t(app.lang, "host.input.marker")
     } else if app.active_gate.is_some() {
         "[gate]"
     } else if app.is_pipeline_active() {
@@ -5958,7 +6202,10 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     // cursor and the wrap width (above) all use it, so they can never drift apart
     // as the terminal resizes or the mode marker changes.
     let prefix_w = usize::from(mode_prefix_width(app));
-    let mode_color = if app.active_gate.is_some() || app.pending_approval.is_some() {
+    let mode_color = if app.active_gate.is_some()
+        || app.pending_approval.is_some()
+        || app.pending_host_input.is_some()
+    {
         theme::WARNING()
     } else {
         theme::PRIMARY()
@@ -6090,6 +6337,7 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     // `None` mid-turn (the activity indicator above the input already proves
     // motion). Reused by both the gate-branch meta row and the normal one.
     let status = status_text_and_color(app);
+    let status_priority = app.copy_toast_text().is_some();
     // Context line beneath the input box: model / backend / state tag. `None`
     // when idle — the keyboard / `/help` hints that used to sit here
     // permanently now rotate through the input-box placeholder instead
@@ -6117,7 +6365,14 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
             gate_parts.push(("·".into(), theme::BORDER()));
             gate_parts.push((model, theme::TEXT_MUTED()));
         }
-        return meta_row(frame, prompt_chunks[1], border_color, &gate_parts, status);
+        return meta_row(
+            frame,
+            prompt_chunks[1],
+            border_color,
+            &gate_parts,
+            status,
+            status_priority,
+        );
     } else if app.input.contains('\n') {
         Some(umadev_i18n::t(app.lang, "tui.hint.multiline").into())
     } else if !app.input.is_empty() {
@@ -6226,7 +6481,14 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
             parts.push((gauge, color));
         }
     }
-    meta_row(frame, prompt_chunks[1], border_color, &parts, status);
+    meta_row(
+        frame,
+        prompt_chunks[1],
+        border_color,
+        &parts,
+        status,
+        status_priority,
+    );
 }
 
 /// The input-box placeholder for the current app state. Precedence: an open
@@ -6243,6 +6505,8 @@ fn input_placeholder(app: &App) -> std::borrow::Cow<'static, str> {
         // answer surface right where the user is about to type. Wins over every
         // other state — the pause is the one thing blocking progress.
         umadev_i18n::t(app.lang, "input.approval").into()
+    } else if app.pending_host_input.is_some() {
+        umadev_i18n::t(app.lang, "input.host_response").into()
     } else if app.active_gate.is_some() {
         umadev_i18n::t(app.lang, "input.gate").into()
     } else if app.thinking || app.tool_in_progress {
@@ -6310,16 +6574,27 @@ fn meta_row_fit(parts: &[(String, Color)], width: usize) -> (usize, usize) {
 /// chunk (right-aligning by the narrow table would push its tail past the
 /// terminal edge on an ambiguous-wide terminal). Under-filling is safe —
 /// ratatui pads; overflow is the corruption. Fail-open: on a terminal too
-/// narrow for even a sliver of status, the meta info wins.
+/// narrow for even a sliver of status, the meta info wins. A short-lived copy
+/// confirmation is the exception: `status_priority` reserves its full width by
+/// dropping right-most chrome first, because invisible copy feedback is no
+/// feedback at all.
 fn meta_row(
     frame: &mut Frame,
     area: Rect,
     _bar: Color,
     parts: &[(String, Color)],
     status: Option<(String, Color)>,
+    status_priority: bool,
 ) {
     let total = usize::from(area.width);
-    let (kept, used) = meta_row_fit(parts, total);
+    let status_reserve = if status_priority {
+        status.as_ref().map_or(0, |(text, _)| {
+            disp_width_cjk(text).min(total.saturating_sub(1))
+        })
+    } else {
+        0
+    };
+    let (kept, used) = meta_row_fit(parts, total.saturating_sub(status_reserve));
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
     for (text, color) in &parts[..kept] {
         spans.push(Span::styled(text.clone(), Style::default().fg(*color)));
@@ -6545,6 +6820,9 @@ fn render_mention_popover(frame: &mut Frame, input_area: Rect, app: &App, matche
 /// line just to print one word; `meta_row` now right-aligns this onto the same
 /// line as the backend / trust-mode / hint chrome.
 fn status_text_and_color(app: &App) -> Option<(String, Color)> {
+    if let Some(toast) = app.copy_toast_text() {
+        return Some((toast.to_string(), theme::SUCCESS()));
+    }
     if app.thinking {
         // The activity indicator above the input speaks for the live turn; the
         // bottom-right stays empty so there's no duplicate / lingering tool name.
@@ -6774,6 +7052,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use umadev_agent::{EngineEvent, Gate};
+    use umadev_runtime::Usage;
     use umadev_spec::Phase;
 
     #[test]
@@ -7380,11 +7659,16 @@ mod tests {
     #[test]
     fn picker_renders_all_workers() {
         let mut app = app_with(None);
-        // Base CLIs live in step 3 of the guided setup.
+        // The backend step renders all five product-supported bases.
         app.goto_picker_step(crate::app::PickerStep::BaseCli);
         let out = render_to_string(&app);
         assert!(out.contains("Claude Code CLI") || out.contains("Claude Code"));
         assert!(out.contains("Codex CLI") || out.contains("Codex"));
+        assert!(out.contains("OpenCode"));
+        assert!(out.contains("Grok Build"));
+        for retired in ["Cursor Agent", "CodeBuddy", "Droid CLI", "Qwen Code"] {
+            assert!(!out.contains(retired), "picker still lists {retired}");
+        }
     }
 
     #[test]
@@ -7597,6 +7881,62 @@ mod tests {
         assert!(out.contains("login route"), "second step shown");
         // The done glyph is the check codepoint (no emoji).
         assert!(out.contains('\u{2713}'), "done tick rendered");
+    }
+
+    #[test]
+    fn kimi_native_plan_renders_without_replacing_the_director_plan() {
+        let mut app = app_with(Some("kimi-code"));
+        app.lang = umadev_i18n::Lang::En;
+        app.apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            statuses: vec!["active".into()],
+            steps: vec!["s1 · director-owned step (backend)".into()],
+            done: 0,
+            total: 1,
+        });
+        app.apply_engine(umadev_agent::EngineEvent::BaseSessionState {
+            backend_id: "kimi-code".to_string(),
+            update: umadev_runtime::SessionStateUpdate::PlanReplaced {
+                entries: vec![
+                    umadev_runtime::SessionPlanEntry {
+                        content: "Kimi completed inspection".to_string(),
+                        priority: umadev_runtime::SessionPlanEntryPriority::Medium,
+                        status: umadev_runtime::SessionPlanEntryStatus::Completed,
+                    },
+                    umadev_runtime::SessionPlanEntry {
+                        content: "Kimi is implementing".to_string(),
+                        priority: umadev_runtime::SessionPlanEntryPriority::High,
+                        status: umadev_runtime::SessionPlanEntryStatus::InProgress,
+                    },
+                ],
+            },
+        });
+
+        let text = panel_text(&app);
+        assert!(
+            text.contains("director-owned step"),
+            "director plan survives: {text}"
+        );
+        assert!(text.contains("Base plan"), "native plan is labeled: {text}");
+        assert!(
+            text.contains("Kimi completed inspection"),
+            "completed item shown: {text}"
+        );
+        assert!(
+            text.contains("Kimi is implementing"),
+            "active item shown: {text}"
+        );
+        assert!(
+            text.lines()
+                .find(|line| line.contains("Kimi completed inspection"))
+                .is_some_and(|line| line.contains('\u{2713}')),
+            "completed native item carries a check: {text}"
+        );
+        assert!(
+            text.lines()
+                .find(|line| line.contains("Kimi is implementing"))
+                .is_some_and(|line| line.contains("[~]")),
+            "active native item carries an in-progress marker: {text}"
+        );
     }
 
     #[test]
@@ -8175,42 +8515,51 @@ mod tests {
     }
 
     impl ratatui::backend::Backend for CursorOpLog {
-        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        type Error = std::convert::Infallible;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
         where
             I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
         {
             self.ops.borrow_mut().push("cells");
             self.inner.draw(content)
         }
-        fn hide_cursor(&mut self) -> std::io::Result<()> {
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
             self.ops.borrow_mut().push("hide");
             self.inner.hide_cursor()
         }
-        fn show_cursor(&mut self) -> std::io::Result<()> {
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
             self.ops.borrow_mut().push("show");
             self.inner.show_cursor()
         }
-        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+        fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
             self.inner.get_cursor_position()
         }
         fn set_cursor_position<P: Into<ratatui::layout::Position>>(
             &mut self,
             position: P,
-        ) -> std::io::Result<()> {
+        ) -> Result<(), Self::Error> {
             self.ops.borrow_mut().push("move");
             self.inner.set_cursor_position(position)
         }
-        fn clear(&mut self) -> std::io::Result<()> {
+        fn clear(&mut self) -> Result<(), Self::Error> {
             self.ops.borrow_mut().push("clear");
             self.inner.clear()
         }
-        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+        fn clear_region(
+            &mut self,
+            clear_type: ratatui::backend::ClearType,
+        ) -> Result<(), Self::Error> {
+            self.ops.borrow_mut().push("clear");
+            self.inner.clear_region(clear_type)
+        }
+        fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
             self.inner.size()
         }
-        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+        fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
             self.inner.window_size()
         }
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> Result<(), Self::Error> {
             self.inner.flush()
         }
     }
@@ -8431,8 +8780,8 @@ mod tests {
 
     #[test]
     fn help_overlay_does_not_advertise_phantom_backends() {
-        // The worker list is derived from the real driver registry — none of
-        // the old hard-coded phantom CLIs should appear.
+        // Help is product-registry-only: neither retired bases nor arbitrary
+        // transport names may appear as commands.
         let mut app = app_with(Some("offline"));
         let _ = app.apply_key(KeyCode::F(1));
         let backend = TestBackend::new(120, 90);
@@ -8445,7 +8794,18 @@ mod tests {
                 out.push_str(buf[(x, y)].symbol());
             }
         }
-        for phantom in ["/gemini", "/droid", "/qwen", "/copilot", "/kimi", "/qoder"] {
+        for phantom in [
+            "/cursor",
+            "/codebuddy",
+            "/cbc",
+            "/droid",
+            "/qwen",
+            "/qwen-code",
+            "/gemini",
+            "/copilot",
+            "/qoder",
+            "/antigravity",
+        ] {
             assert!(!out.contains(phantom), "help still lists phantom {phantom}");
         }
     }
@@ -8766,17 +9126,28 @@ mod tests {
             }
             out
         };
-        // At the top, the bottom group is cropped… (the group title is localized,
-        // so assert against the resolved value).
-        let editing = umadev_i18n::t(app.lang, "tui.help.group.editing")
+        // At the top, the final keyboard row is cropped. Assert against its
+        // localized description rather than the group heading: when the group
+        // itself is taller than the viewport, its heading is correctly above
+        // the viewport at the absolute bottom.
+        let editing_tail = umadev_i18n::t(app.lang, "tui.help.edit.esc")
+            .split('·')
+            .next()
+            .unwrap_or_default()
             .trim()
             .to_string();
-        assert!(!render(&app).contains(&editing));
-        // …but scrolling down reveals it.
-        for _ in 0..6 {
+        assert!(!render(&app).contains(&editing_tail));
+        // …but scrolling to the renderer-published bottom reveals it. Derive
+        // the count from the real content height so adding another command or
+        // backend cannot make this regression test stale.
+        let max_scroll = app.help_max_scroll.get();
+        assert!(max_scroll > 0);
+        for _ in 0..=(max_scroll / 10) {
             let _ = app.apply_key(KeyCode::PageDown);
         }
-        assert!(render(&app).contains(&editing));
+        assert_eq!(app.help_scroll, max_scroll);
+        let bottom = render(&app);
+        assert!(bottom.contains(&editing_tail), "{bottom}");
     }
 
     #[test]
@@ -8829,6 +9200,7 @@ mod tests {
                     theme::BORDER(),
                     &[],
                     status_text_and_color(app),
+                    app.copy_toast_text().is_some(),
                 );
             })
             .unwrap();
@@ -8980,7 +9352,9 @@ mod tests {
             let backend = TestBackend::new(width, 1);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
-                .draw(|f| meta_row(f, f.area(), theme::BORDER(), &parts, status.clone()))
+                .draw(|f| {
+                    meta_row(f, f.area(), theme::BORDER(), &parts, status.clone(), false);
+                })
                 .unwrap();
             let buffer = terminal.backend().buffer().clone();
             let is_padding = |x: u16| {
@@ -9152,6 +9526,64 @@ mod tests {
     }
 
     #[test]
+    fn copy_toast_uses_the_status_area_while_idle_or_thinking() {
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::En;
+        app.show_copy_toast(9);
+        let expected = umadev_i18n::tf(app.lang, "tui.copied", &["9"]);
+
+        assert_eq!(
+            status_text_and_color(&app),
+            Some((expected.clone(), theme::SUCCESS()))
+        );
+        app.thinking = true;
+        assert_eq!(
+            status_text_and_color(&app),
+            Some((expected, theme::SUCCESS()))
+        );
+    }
+
+    #[test]
+    fn copy_toast_reserves_status_space_on_a_narrow_cjk_terminal() {
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::ZhCn;
+        app.show_copy_toast(80);
+        let parts = cjk_meta_parts();
+        let width = 24u16;
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                meta_row(
+                    f,
+                    f.area(),
+                    theme::BORDER(),
+                    &parts,
+                    status_text_and_color(&app),
+                    true,
+                );
+            })
+            .unwrap();
+        let cells: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+
+        assert_eq!(cells.len(), usize::from(width));
+        assert!(
+            col_of(&cells, "已").is_some() && col_of(&cells, "符").is_some(),
+            "the complete localized copy confirmation must survive before optional chrome: {cells:?}"
+        );
+        assert!(
+            col_of(&cells, "U").is_some(),
+            "the brand still fits alongside the reserved status at this width"
+        );
+    }
+
+    #[test]
     fn status_row_aborted_branch_is_independent_of_app_status() {
         // P2-F: an aborted round must render `[aborted]` from a DEDICATED status
         // branch, not by relying on `app.status` text. Proof: blank out app.status
@@ -9199,7 +9631,7 @@ mod tests {
         let render = |parts: &[(String, Color)], status: Option<(String, Color)>, w: u16| {
             let backend = TestBackend::new(w, 1);
             let mut term = Terminal::new(backend).unwrap();
-            term.draw(|f| meta_row(f, f.area(), theme::BORDER(), parts, status))
+            term.draw(|f| meta_row(f, f.area(), theme::BORDER(), parts, status, false))
                 .unwrap();
             let buf = term.backend().buffer().clone();
             buf.content()
@@ -9240,7 +9672,7 @@ mod tests {
         // get split across cells in the test buffer).
         app.lang = umadev_i18n::Lang::En;
         // Real cumulative usage has landed → the gauge has something to meter.
-        app.session_tokens = 94_000;
+        app.session_usage.apply(Some(Usage::exact(94_000, 0)));
 
         // Wide terminal: the gauge shows the token count (and its bar glyph) in
         // the meta row. 130 cols — the meta row is now budgeted by WORST-CASE
@@ -9270,10 +9702,47 @@ mod tests {
         let app = app_with(Some("claude-code"));
         // A fresh session has spent nothing — no gauge, no `≈$0.00` clutter and
         // never a fabricated number.
-        assert_eq!(app.session_tokens, 0);
+        assert_eq!(app.session_usage.tokens(), 0);
         assert!(
             token_gauge_text(&app).is_none(),
             "no gauge before any usage"
+        );
+    }
+
+    #[test]
+    fn token_gauge_distinguishes_exact_lower_bound_and_unknown_cost() {
+        let mut app = app_with(Some("grok-build"));
+        app.lang = umadev_i18n::Lang::En;
+        app.session_usage.apply(None);
+        assert_eq!(token_gauge_text(&app).as_deref(), Some("▍ usage unknown"));
+
+        app.session_usage.reset();
+        app.session_usage.apply(Some(Usage {
+            usage_incomplete: true,
+            cost_usd_ticks: Some(999),
+            ..Usage::exact(1_000, 250)
+        }));
+        assert_eq!(
+            token_gauge_text(&app).as_deref(),
+            Some("▍ ≥1.2K tok · cost unknown")
+        );
+
+        app.session_usage.reset();
+        app.session_usage.apply(Some(Usage {
+            cost_usd_ticks: Some(1_250_000_000),
+            ..Usage::exact(1_000, 250)
+        }));
+        assert_eq!(
+            token_gauge_text(&app).as_deref(),
+            Some("▍ 1.2K tok · $0.125")
+        );
+
+        app.session_usage.reset();
+        app.session_usage.apply(Some(Usage::exact(1_000, 250)));
+        assert_eq!(
+            token_gauge_text(&app).as_deref(),
+            Some("▍ 1.2K tok · cost unknown"),
+            "missing source cost is unknown, not a free or estimated bill"
         );
     }
 
@@ -9283,7 +9752,7 @@ mod tests {
         app.lang = umadev_i18n::Lang::ZhCn;
         app.base_model = Some("claude-sonnet-4-5-20250929".to_string());
         app.base_context_window = None;
-        app.last_turn_input_tokens = 2_500;
+        app.session_usage.apply(Some(Usage::exact(2_500, 0)));
 
         let out = render_chat_to_string(&app, 110, 16);
         let compact = out.replace(' ', "");
@@ -9631,6 +10100,15 @@ mod tests {
         let (logical, gutter) = logical_row_and_gutter(&plain);
         assert_eq!(logical, "plain content");
         assert_eq!(gutter, 0);
+
+        // A CR left behind by a Windows CRLF producer is a line terminator, not
+        // selectable content. The cached logical row must never leak it into the
+        // clipboard (the extractor itself joins logical rows with `\n`).
+        let crlf_tail = Line::from(Span::raw("Windows 行\r   "));
+        let (logical, gutter) = logical_row_and_gutter(&crlf_tail);
+        assert_eq!(logical, "Windows 行");
+        assert_eq!(gutter, 0);
+        assert!(!logical.contains('\r'));
     }
 
     #[test]
@@ -10109,10 +10587,12 @@ mod tests {
         let mk = |status: ToolStatus| ChatMessage {
             role: ChatRole::Host,
             kind: MessageBody::Tool(ToolCall {
+                call_id: None,
                 name: "Bash".into(),
                 arg: "npm test".into(),
                 status,
                 result: None,
+                progress: None,
                 merged: false,
                 count: 1,
                 collapsed: false,
@@ -10926,6 +11406,7 @@ mod tests {
             })
             .collect();
         let d = FileDiff {
+            call_id: None,
             path: "big.rs".into(),
             added: u32::try_from(n).unwrap_or(0),
             removed: 0,
@@ -11023,10 +11504,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let tool = ToolCall {
+            call_id: None,
             name: "Read".into(),
             arg: "big.txt".into(),
             status: ToolStatus::Ok,
             result: Some(result),
+            progress: None,
             merged: false,
             count: 1,
             collapsed: true,
@@ -11064,10 +11547,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let tool = ToolCall {
+            call_id: None,
             name: "Bash".into(),
             arg: "build".into(),
             status: ToolStatus::Fail,
             result: Some(result),
+            progress: None,
             merged: false,
             count: 1,
             collapsed: false,
@@ -11136,6 +11621,7 @@ mod tests {
         let tool_msg = |marker: &str| ChatMessage {
             role: ChatRole::Host,
             kind: MessageBody::Tool(ToolCall {
+                call_id: None,
                 name: "Read".into(),
                 arg: format!("{marker}.txt"),
                 status: ToolStatus::Ok,
@@ -11145,6 +11631,7 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 ),
+                progress: None,
                 merged: false,
                 count: 1,
                 collapsed: true,
@@ -11387,5 +11874,31 @@ mod tests {
             flat.iter().any(|s| s.style.fg == Some(num)),
             "number colored in the rendered fenced block"
         );
+    }
+
+    #[test]
+    fn grok_plan_picker_keeps_plan_and_all_decisions_visible_at_40x10() {
+        let mut app = app_with(Some("grok-build"));
+        app.lang = umadev_i18n::Lang::ZhCn;
+        app.set_pending_host_input(Some(crate::app::host_input::HostInputDescriptor {
+            token: 99,
+            request: umadev_runtime::HostRequest::PlanConfirmation {
+                plan: "第一步：检查终端宽字符和 emoji 🚀。第二步：运行跨平台测试。".to_string(),
+                message: Some("请审阅".to_string()),
+                metadata: serde_json::json!({
+                    "responseContract":"grok_exit_plan_mode_v1"
+                }),
+            },
+        }));
+
+        let rendered = render_chat_to_string(&app, 40, 10);
+        let compact = rendered.replace(' ', "");
+        assert!(
+            compact.contains("第一步"),
+            "plan content must remain visible: {rendered}"
+        );
+        assert!(compact.contains("批准并开始实施"), "{rendered}");
+        assert!(compact.contains("要求修改计划"), "{rendered}");
+        assert!(compact.contains("放弃且不实施"), "{rendered}");
     }
 }

@@ -5,7 +5,8 @@
 //! — but capture also swallows the terminal's *own* click-drag selection, so
 //! native copy stops working. To get BOTH wheel-scroll AND drag-to-copy we run
 //! our own selection layer over the alt screen: the renderer caches each
-//! rendered transcript row as plain text + the transcript [`Rect`] + the index
+//! rendered transcript row as plain text + the transcript
+//! [`ratatui::layout::Rect`] + the index
 //! of the first visible row, the event loop turns mouse down/drag/up into a
 //! [`Selection`] over those cached rows, the renderer paints the selected span
 //! with a selection background, and on mouse-up we extract the selected text and
@@ -17,6 +18,61 @@
 //! selection, and nothing here can panic on adversarial input. The actual mouse
 //! wiring (in `lib.rs`) and the highlight rendering (in `ui.rs`) stay thin; this
 //! module is where the testable logic lives.
+
+/// How long the transient clipboard confirmation remains in the status area.
+pub(crate) const COPY_TOAST_TTL: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Ephemeral clipboard feedback. It lives with selection state instead of the
+/// main application state machine because it never enters chat history or the
+/// persisted transcript.
+#[derive(Debug, Clone)]
+pub(crate) struct CopyToast {
+    message: String,
+    expires_at: std::time::Instant,
+}
+
+impl CopyToast {
+    fn new(lang: umadev_i18n::Lang, count: usize, now: std::time::Instant) -> Self {
+        Self {
+            message: umadev_i18n::tf(lang, "tui.copied", &[&count.to_string()]),
+            expires_at: now + COPY_TOAST_TTL,
+        }
+    }
+
+    fn text(&self) -> &str {
+        &self.message
+    }
+
+    fn expired_at(&self, now: std::time::Instant) -> bool {
+        now >= self.expires_at
+    }
+}
+
+impl crate::app::App {
+    pub(crate) fn show_copy_toast_at(&mut self, count: usize, now: std::time::Instant) {
+        self.copy_toast = Some(CopyToast::new(self.lang, count, now));
+    }
+
+    pub(crate) fn show_copy_toast(&mut self, count: usize) {
+        self.show_copy_toast_at(count, std::time::Instant::now());
+    }
+
+    pub(crate) fn copy_toast_text(&self) -> Option<&str> {
+        self.copy_toast.as_ref().map(CopyToast::text)
+    }
+
+    pub(crate) fn expire_copy_toast(&mut self, now: std::time::Instant) -> bool {
+        if self
+            .copy_toast
+            .as_ref()
+            .is_some_and(|toast| toast.expired_at(now))
+        {
+            self.copy_toast = None;
+            return true;
+        }
+        false
+    }
+}
 
 /// A point in transcript-content coordinates: `(content_row, col)` where
 /// `content_row` indexes the renderer's cached `transcript_rows` (one entry per
@@ -349,6 +405,14 @@ pub fn clipboard_path(is_remote: bool, _os: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn copy_toast_expires_at_two_and_a_half_seconds() {
+        let started = std::time::Instant::now();
+        let toast = CopyToast::new(umadev_i18n::Lang::En, 7, started);
+        assert!(!toast.expired_at(started + std::time::Duration::from_secs(2)));
+        assert!(toast.expired_at(started + COPY_TOAST_TTL));
+    }
+
     // ── Coordinate mapping ────────────────────────────────────────────────
     #[test]
     fn screen_to_content_maps_inside_the_area() {
@@ -479,6 +543,25 @@ mod tests {
             screen_to_content(20, 0, area, 0, &rows, &gutters),
             Some((0, 4)),
             "a click past the text clamps to the row's char length"
+        );
+    }
+
+    #[test]
+    fn screen_to_content_keeps_combining_marks_with_their_base_glyph() {
+        // `e` + COMBINING ACUTE occupies one terminal cell but two char indices.
+        // A click immediately after that cell must land after both code points,
+        // otherwise the copied range can split the visible grapheme.
+        let rows = vec!["e\u{301}好".to_string()];
+        let area = (0u16, 0u16, 20u16, 1u16);
+        assert_eq!(
+            screen_to_content(1, 0, area, 0, &rows, &[]),
+            Some((0, 2)),
+            "cell 1 is after the complete e-accent grapheme"
+        );
+        assert_eq!(
+            screen_to_content(3, 0, area, 0, &rows, &[]),
+            Some((0, 3)),
+            "the following wide CJK glyph consumes two cells"
         );
     }
 

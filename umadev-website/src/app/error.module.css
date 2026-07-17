@@ -1,0 +1,76 @@
+.shell {
+  display: grid;
+  min-height: 100svh;
+  padding: clamp(24px, 6vw, 72px);
+  color: var(--text);
+  background: var(--bg);
+  place-items: center;
+}
+
+.panel {
+  width: min(100%, 680px);
+  padding: clamp(28px, 5vw, 52px);
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: 18px;
+  box-shadow: var(--shadow-cyan);
+}
+
+.eyebrow {
+  margin: 0 0 14px;
+  color: var(--cyan);
+  font-family: var(--font-mono), monospace;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.panel h1 {
+  margin: 0;
+  font-family: var(--font-space), sans-serif;
+  font-size: clamp(28px, 6vw, 48px);
+  line-height: 1.08;
+}
+
+.description {
+  margin: 22px 0 0;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1.75;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 30px;
+}
+
+.retry,
+.home {
+  display: inline-flex;
+  min-height: 44px;
+  padding: 0 18px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.retry {
+  color: var(--bg);
+  background: var(--cyan);
+}
+
+.home {
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+
+.retry:focus-visible,
+.home:focus-visible {
+  outline: 2px solid var(--magenta);
+  outline-offset: 3px;
+}

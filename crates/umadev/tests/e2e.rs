@@ -11,13 +11,89 @@ fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_umadev"))
 }
 
-fn run(args: &[&str], cwd: &Path) {
-    let status = Command::new(bin())
-        .args(args)
+/// Build a child process that cannot observe the developer/CI user's UmaDev
+/// installation, credentials, or local embedding model.
+///
+/// The all-features binary enables the local vector backend. Letting E2E
+/// children inherit a real `HOME` made every parallel `umadev continue` load
+/// `~/.umadev/embed-model` (roughly 1 GiB per process) and made the suite's
+/// runtime/OOM behaviour depend on the machine running it. Give each test
+/// workspace its own home and point the explicit model override at a known-empty
+/// directory; production defaults remain covered by unit tests, while these CLI
+/// flow tests stay focused on orchestration and artifacts.
+fn hermetic_command(cwd: &Path) -> Command {
+    // Keep the sandbox under UmaDev's own ignored state tree. A top-level
+    // `.e2e-home` would make the `init` E2E fixture look brownfield before the
+    // command even starts, weakening its empty-project coverage.
+    let home = cwd.join(".umadev").join("e2e-home");
+    let empty_model = home.join("empty-embed-model");
+    std::fs::create_dir_all(&empty_model).expect("create hermetic E2E home");
+
+    let mut command = Command::new(bin());
+    command
         .current_dir(cwd)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("UMADEV_EMBED_MODEL_DIR", &empty_model)
+        .env_remove("OPENAI_EMBED_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("UMADEV_ALLOW_CLOUD_EMBED")
+        .env_remove("OPENAI_EMBED_BASE");
+    command
+}
+
+fn run(args: &[&str], cwd: &Path) {
+    let status = hermetic_command(cwd)
+        .args(args)
         .status()
         .expect("umadev binary should be invocable");
     assert!(status.success(), "umadev {:?} failed: {status}", args);
+}
+
+#[test]
+fn requested_deploy_and_pr_failures_return_nonzero() {
+    let deploy_tmp = TempDir::new().unwrap();
+    let deploy_root = deploy_tmp.path();
+
+    // Detection-only is informational and succeeds even when there is no target.
+    run(&["deploy"], deploy_root);
+    // Once the user explicitly requests an outward action, “nothing happened”
+    // must not be reported as process success to a script or CI job.
+    let no_target = hermetic_command(deploy_root)
+        .args(["deploy", "--run", "--yes"])
+        .status()
+        .expect("deploy command should be invocable");
+    assert!(
+        !no_target.success(),
+        "a requested deploy with no target failed"
+    );
+
+    let missing_cli = hermetic_command(deploy_root)
+        .args([
+            "deploy",
+            "--run",
+            "--yes",
+            "--command",
+            "umadev-command-that-does-not-exist",
+        ])
+        .status()
+        .expect("deploy command should be invocable");
+    assert!(!missing_cli.success(), "a failed deploy must exit non-zero");
+    let proof = std::fs::read_to_string(deploy_root.join(".umadev/audit/deploy-proof.json"))
+        .expect("the failure proof is still persisted");
+    assert!(proof.contains("not_deployed"));
+
+    let pr_tmp = TempDir::new().unwrap();
+    let pr_status = hermetic_command(pr_tmp.path())
+        .args(["pr", "--create", "--yes"])
+        .status()
+        .expect("PR command should be invocable");
+    assert!(
+        !pr_status.success(),
+        "a requested PR that fails readiness must exit non-zero"
+    );
 }
 
 #[test]
@@ -91,9 +167,8 @@ fn full_pipeline_offline_end_to_end() {
     );
 
     // Step 4 — verify reports a coherent final state
-    let verify_out = Command::new(bin())
+    let verify_out = hermetic_command(root)
         .args(["verify"])
-        .current_dir(root)
         .output()
         .expect("verify should run");
     assert!(verify_out.status.success());
@@ -197,7 +272,7 @@ fn run_with_backend_drives_a_fake_host_cli() {
     // (it orchestrates freely and produces no fixed phase artifacts), so pin the
     // legacy fixed pipeline explicitly with `UMADEV_LEGACY_PIPELINE=1` — this test
     // is the legacy pipeline's coverage, and the director path has its own.
-    let status = Command::new(bin())
+    let status = hermetic_command(root)
         .args([
             "run",
             "build a login page",
@@ -206,7 +281,6 @@ fn run_with_backend_drives_a_fake_host_cli() {
             "--backend",
             "claude-code",
         ])
-        .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
         .env("UMADEV_LEGACY_PIPELINE", "1")
         // Pin the per-phase legacy path (not the continuous session): a fake
@@ -221,9 +295,8 @@ fn run_with_backend_drives_a_fake_host_cli() {
     assert!(status.success(), "run --backend failed: {status}");
 
     // run pauses at clarify; continue to reach research → docs.
-    let status2 = Command::new(bin())
+    let status2 = hermetic_command(root)
         .args(["continue", "--backend", "claude-code"])
-        .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
         .env("UMADEV_LEGACY_PIPELINE", "1")
         // Pin the per-phase legacy path (not the continuous session): a fake
@@ -281,9 +354,8 @@ echo 'driven via fake claude across all phases'
     // director-driven agentic path the default for `/run`, which produces no fixed
     // phase artifacts. This test is the legacy pipeline's full-chain coverage.
     let run_with_host = |args: &[&str]| {
-        let status = Command::new(bin())
+        let status = hermetic_command(root)
             .args(args)
-            .current_dir(root)
             .env("UMADEV_CLAUDE_BIN", &fake)
             .env("UMADEV_RETRY_BASE_MS", "1")
             .env("UMADEV_WORKER_TIMEOUT", "30")
@@ -361,7 +433,7 @@ fn backend_captures_stdout_and_tolerates_stderr() {
     // Asserts on the fixed-pipeline research artifact, so pin the legacy pipeline
     // (`UMADEV_LEGACY_PIPELINE=1`) — the director-driven default produces no fixed
     // phase artifacts (Wave 1). This is the legacy path's stdout/stderr coverage.
-    let status = Command::new(bin())
+    let status = hermetic_command(root)
         .args([
             "run",
             "build x",
@@ -370,7 +442,6 @@ fn backend_captures_stdout_and_tolerates_stderr() {
             "--backend",
             "claude-code",
         ])
-        .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
         .env("UMADEV_LEGACY_PIPELINE", "1")
         // Pin the per-phase legacy path (not the continuous session): a fake
@@ -387,9 +458,8 @@ fn backend_captures_stdout_and_tolerates_stderr() {
         "run with stderr-writing backend failed: {status}"
     );
     // run pauses at clarify; continue to reach research.
-    let s2 = Command::new(bin())
+    let s2 = hermetic_command(root)
         .args(["continue", "--backend", "claude-code"])
-        .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
         .env("UMADEV_LEGACY_PIPELINE", "1")
         // Pin the per-phase legacy path (not the continuous session): a fake
@@ -415,24 +485,34 @@ fn backend_captures_stdout_and_tolerates_stderr() {
 
 #[test]
 #[cfg(unix)]
-#[ignore = "requires real subprocess timeout (sleeps 30s); run with --ignored"]
-fn backend_timeout_falls_back_without_hanging() {
+fn backend_timeout_pauses_bounded_with_an_explicit_offline_placeholder() {
     use std::os::unix::fs::PermissionsExt;
-    // A fake `claude` that sleeps longer than the worker timeout. Proves the
-    // timeout path fires (RuntimeError::Timeout) and the pipeline falls back
-    // to offline templates instead of hanging forever.
+    use std::time::{Duration, Instant};
+
+    // Pass the installation and authentication probes, then wedge only the
+    // real model invocation. This exercises the worker timeout rather than the
+    // separate ten-second health-probe ceiling.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     let fake = root.join("fake-claude");
-    // Sleep 30s — the test sets a 1s timeout, so this always times out.
-    std::fs::write(&fake, "#!/bin/sh\nsleep 30\necho 'should never reach'\n").unwrap();
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then echo '2.1.0'; exit 0; fi\n\
+         if [ \"$1\" = \"auth\" ]; then echo '{\"loggedIn\":true}'; exit 0; fi\n\
+         sleep 30\n\
+         echo 'should never reach'\n",
+    )
+    .unwrap();
     let mut perms = std::fs::metadata(&fake).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&fake, perms).unwrap();
 
-    // Use a 1s worker timeout so the test fails fast. The run must still
-    // complete (offline fallback), not hang.
-    let status = Command::new(bin())
+    // The legacy pipeline may create a deterministic placeholder after its
+    // bounded retries, but it must say so visibly and pause at a gate. It must
+    // never describe the placeholder as a base-authored completed build.
+    let started = Instant::now();
+    let output = hermetic_command(root)
         .args([
             "run",
             "build x",
@@ -441,9 +521,9 @@ fn backend_timeout_falls_back_without_hanging() {
             "--backend",
             "claude-code",
         ])
-        .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
         .env("UMADEV_WORKER_TIMEOUT", "1")
+        .env("UMADEV_RETRY_BASE_MS", "1")
         // Pins the legacy fixed pipeline: this asserts the pipeline's offline
         // timeout-fallback artifact (`output/timeout-research.md`), which the
         // director-driven default (Wave 1) does not produce.
@@ -455,30 +535,47 @@ fn backend_timeout_falls_back_without_hanging() {
         // these fixed-pipeline tests flaky. `UMADEV_CONTINUOUS=0` makes them
         // deterministically drive the intended per-phase pipeline.
         .env("UMADEV_CONTINUOUS", "0")
-        .status();
-    // The process must have terminated (either success via fallback, or a
-    // bounded exit) — the key assertion is "did not hang". A timeout of the
-    // test binary itself would manifest as an Err.
+        .output()
+        .expect("spawn the timeout contract run");
     assert!(
-        status.is_ok(),
-        "umadev run hung past the 30s test cap (timeout fallback broken)"
+        started.elapsed() < Duration::from_secs(25),
+        "the wedged base was not terminated within the bounded retry budget"
     );
-    if let Ok(s) = status {
-        assert!(
-            s.success(),
-            "run should succeed via offline fallback after worker timeout: {s}"
-        );
-    }
-    // The offline template fallback should still produce the research artifact.
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
-        root.join("output/timeout-research.md").is_file(),
-        "offline fallback must still write the research artifact after a timeout"
+        output.status.success(),
+        "the explicit gate pause failed: {diagnostic}"
     );
+    assert!(
+        diagnostic.contains("timed out"),
+        "the bounded failure must retain the real timeout cause: {diagnostic}"
+    );
+    assert!(diagnostic.contains("pipeline paused") || diagnostic.contains("Pipeline paused"));
+    assert!(
+        diagnostic.contains("离线骨架") && diagnostic.contains("非真实生成"),
+        "the fallback must be disclosed as a non-generated placeholder: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("Pipeline complete"),
+        "a placeholder must never be rendered as completed work: {diagnostic}"
+    );
+    let placeholder = root.join("output/timeout-clarify.md");
+    assert!(
+        placeholder.is_file(),
+        "the disclosed placeholder should remain available for gate review"
+    );
+    let placeholder = std::fs::read_to_string(placeholder).unwrap();
+    assert!(placeholder.contains("##") && placeholder.len() > 100);
 }
 
 #[test]
 fn spec_clauses_subcommand_lists_every_clause() {
-    let out = Command::new(bin())
+    let tmp = TempDir::new().unwrap();
+    let out = hermetic_command(tmp.path())
         .args(["spec", "--clauses"])
         .output()
         .expect("spec --clauses should run");
@@ -507,7 +604,9 @@ fn spec_clauses_subcommand_lists_every_clause() {
 /// the hook's stdout (the permission-decision JSON).
 fn run_hook_pre_write(payload: &str, govern_root: Option<&Path>) -> String {
     use std::io::Write;
-    let mut cmd = Command::new(bin());
+    let scratch = TempDir::new().unwrap();
+    let cwd = govern_root.unwrap_or_else(|| scratch.path());
+    let mut cmd = hermetic_command(cwd);
     cmd.args(["hook", "pre-write"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -581,7 +680,7 @@ fn hook_pre_write_allows_clean() {
 #[test]
 fn install_writes_claude_hook() {
     let tmp = TempDir::new().unwrap();
-    let out = Command::new(bin())
+    let out = hermetic_command(tmp.path())
         .args(["install", "--host", "claude-code", "--project-root"])
         .arg(tmp.path())
         .output()
@@ -603,16 +702,87 @@ fn install_writes_claude_hook() {
     );
 }
 
+#[test]
+fn install_and_uninstall_manage_only_scoped_kimi_native_hooks() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let home = root.join(".umadev/e2e-home");
+    let config = home.join(".kimi-code/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        "[[hooks]]\nevent = \"Notification\"\ncommand = \"keep-user-hook\"\n",
+    )
+    .unwrap();
+
+    let install = hermetic_command(root)
+        .args(["install", "--base", "kimi-code", "--project-root"])
+        .arg(root)
+        .output()
+        .expect("install Kimi hook");
+    assert!(
+        install.status.success(),
+        "Kimi hook install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let installed = std::fs::read_to_string(&config).unwrap();
+    assert!(installed.contains("keep-user-hook"));
+    assert_eq!(installed.matches("umadev hook ").count(), 3);
+    assert!(installed.contains("--project-root"));
+
+    let uninstall = hermetic_command(root)
+        .args(["uninstall", "--base", "kimi-code", "--project-root"])
+        .arg(root)
+        .output()
+        .expect("uninstall Kimi hook");
+    assert!(uninstall.status.success());
+    let cleaned = std::fs::read_to_string(&config).unwrap();
+    assert!(cleaned.contains("keep-user-hook"));
+    assert!(!cleaned.contains("umadev hook "));
+}
+
+#[test]
+fn kimi_user_level_hook_row_fails_open_outside_its_project_scope() {
+    use std::io::Write;
+
+    let scoped = TempDir::new().unwrap();
+    let unrelated = TempDir::new().unwrap();
+    let payload = format!(
+        r#"{{"hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{{"path":"{}","content":"SECRET=x"}}}}"#,
+        unrelated.path().join(".env").display()
+    );
+    let mut command = hermetic_command(unrelated.path());
+    command
+        .args(["hook", "pre-write", "--project-root"])
+        .arg(scoped.path())
+        .env("UMADEV_GOVERN_ROOT", unrelated.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("allow"),
+        "another project's global Kimi hook row must be a no-op"
+    );
+}
+
 /// `umadev uninstall` removes the hook.
 #[test]
 fn uninstall_removes_claude_hook() {
     let tmp = TempDir::new().unwrap();
-    Command::new(bin())
+    hermetic_command(tmp.path())
         .args(["install", "--host", "claude-code", "--project-root"])
         .arg(tmp.path())
         .output()
         .expect("install");
-    Command::new(bin())
+    hermetic_command(tmp.path())
         .args(["uninstall", "--host", "claude-code", "--project-root"])
         .arg(tmp.path())
         .output()
@@ -634,7 +804,7 @@ fn uninstall_pre_commit_preserves_user_hook() {
     std::fs::create_dir_all(&hooks).unwrap();
     let hook = hooks.join("pre-commit");
     std::fs::write(&hook, "#!/bin/sh\necho USER_HOOK_RAN\n").unwrap();
-    Command::new(bin())
+    hermetic_command(tmp.path())
         .args(["install", "--base", "pre-commit", "--project-root"])
         .arg(tmp.path())
         .output()
@@ -648,7 +818,7 @@ fn uninstall_pre_commit_preserves_user_hook() {
         after_install.contains("umadev pre-commit governance hook"),
         "install added our block"
     );
-    Command::new(bin())
+    hermetic_command(tmp.path())
         .args(["uninstall", "--base", "pre-commit", "--project-root"])
         .arg(tmp.path())
         .output()
@@ -670,12 +840,12 @@ fn uninstall_pre_commit_preserves_user_hook() {
 fn uninstall_pre_commit_removes_our_own_hook() {
     let tmp = TempDir::new().unwrap();
     std::fs::create_dir_all(tmp.path().join(".git/hooks")).unwrap();
-    Command::new(bin())
+    hermetic_command(tmp.path())
         .args(["install", "--base", "pre-commit", "--project-root"])
         .arg(tmp.path())
         .output()
         .expect("install");
-    Command::new(bin())
+    hermetic_command(tmp.path())
         .args(["uninstall", "--base", "pre-commit", "--project-root"])
         .arg(tmp.path())
         .output()
@@ -690,7 +860,7 @@ fn uninstall_pre_commit_removes_our_own_hook() {
 #[test]
 fn report_shows_health_on_empty_workspace() {
     let tmp = TempDir::new().unwrap();
-    let out = Command::new(bin())
+    let out = hermetic_command(tmp.path())
         .args(["report", "--project-root"])
         .arg(tmp.path())
         .output()
@@ -712,7 +882,7 @@ fn report_shows_health_on_empty_workspace() {
 #[test]
 fn doctor_runs_all_checks() {
     let tmp = TempDir::new().unwrap();
-    let out = Command::new(bin())
+    let out = hermetic_command(tmp.path())
         .args(["doctor", "--project-root"])
         .arg(tmp.path())
         .output()
@@ -729,7 +899,8 @@ fn doctor_runs_all_checks() {
 
 #[test]
 fn examples_command_prints_cheatsheet() {
-    let out = Command::new(bin())
+    let tmp = TempDir::new().unwrap();
+    let out = hermetic_command(tmp.path())
         .args(["examples"])
         .output()
         .expect("examples should run");
@@ -748,7 +919,8 @@ fn examples_command_prints_cheatsheet() {
 
 #[test]
 fn guide_command_prints_walkthrough() {
-    let out = Command::new(bin())
+    let tmp = TempDir::new().unwrap();
+    let out = hermetic_command(tmp.path())
         .args(["guide"])
         .output()
         .expect("guide should run");
@@ -763,7 +935,8 @@ fn guide_command_prints_walkthrough() {
 
 #[test]
 fn run_help_includes_examples() {
-    let out = Command::new(bin())
+    let tmp = TempDir::new().unwrap();
+    let out = hermetic_command(tmp.path())
         .args(["run", "--help"])
         .output()
         .expect("run --help should run");
@@ -777,7 +950,8 @@ fn run_help_includes_examples() {
 #[test]
 fn unknown_subcommand_suggests_a_correction() {
     // clap's typo / "did you mean" suggestion is on by default.
-    let out = Command::new(bin())
+    let tmp = TempDir::new().unwrap();
+    let out = hermetic_command(tmp.path())
         .args(["rin"]) // "rin" → run
         .output()
         .expect("unknown command should run");
@@ -835,9 +1009,8 @@ fn revise_keeps_gate_and_regenerates() {
 fn history_lists_snapshots() {
     // After a run, `history` must list at least one rollback snapshot.
     let tmp = workspace_at_docs_gate("hist");
-    let out = Command::new(bin())
+    let out = hermetic_command(tmp.path())
         .args(["history"])
-        .current_dir(tmp.path())
         .output()
         .expect("history should run");
     assert!(out.status.success(), "history failed: {:?}", out.status);
@@ -885,9 +1058,8 @@ fn init_writes_manifest_and_scaffolds_design() {
         "init must write umadev.yaml"
     );
     // Re-running init must be safe (no panic, leaves a valid manifest).
-    let second = Command::new(bin())
+    let second = hermetic_command(root)
         .args(["init"])
-        .current_dir(root)
         .status()
         .expect("second init should run without crashing");
     // Whether it succeeds (overwrite) or fails (AlreadyExists) is an

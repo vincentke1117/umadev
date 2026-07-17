@@ -1,3 +1,5 @@
+@import "../theme/page-colors.css";
+
 :root {
   --bg: #050508;
   --bg-2: #090a10;
@@ -17,6 +19,15 @@
   --line: rgba(0, 210, 255, 0.2);
   --line-strong: rgba(0, 210, 255, 0.45);
   --shadow-cyan: 0 34px 86px -42px rgba(0, 210, 255, 0.6);
+  --selection-text: var(--text);
+  --selection-background: rgba(0, 210, 255, 0.4);
+  --scrollbar-thumb: rgba(0, 210, 255, 0.3);
+  --scrollbar-thumb-hover: rgba(0, 210, 255, 0.6);
+  --accent-cyan-soft: rgba(0, 210, 255, 0.16);
+  --accent-magenta-soft: rgba(255, 42, 133, 0.16);
+  --terminal-close: #ff5f56;
+  --terminal-minimize: #ffbd2e;
+  --terminal-expand: #27c93f;
 }
 
 * {
@@ -31,7 +42,7 @@ html {
 body {
   min-height: 100%;
   margin: 0;
-  overflow-x: hidden;
+  overflow-x: clip;
   color: var(--text);
   background: var(--bg);
   font-family: var(--font-manrope), "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -60,8 +71,8 @@ img {
 }
 
 ::selection {
-  color: #fff;
-  background: rgba(0, 210, 255, 0.4);
+  color: var(--selection-text);
+  background: var(--selection-background);
 }
 
 ::-webkit-scrollbar {
@@ -74,11 +85,11 @@ img {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(0, 210, 255, 0.3);
+  background: var(--scrollbar-thumb);
   border: 2px solid var(--bg);
   border-radius: 8px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 210, 255, 0.6);
+  background: var(--scrollbar-thumb-hover);
 }

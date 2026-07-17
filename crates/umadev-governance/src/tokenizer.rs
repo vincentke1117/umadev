@@ -135,53 +135,7 @@ impl Tokenized {
                 refined.push((s, e, region));
                 continue;
             }
-            let slice: String = bytes[s..e].iter().collect();
-            let mut cursor = 0usize;
-            let bytes_slice: Vec<char> = slice.chars().collect();
-            let mut last = 0usize;
-            while cursor < bytes_slice.len() {
-                if bytes_slice[cursor] == '>' {
-                    // Look ahead for a `<` — the text between is JSX text.
-                    let mut j = cursor + 1;
-                    // Skip whitespace immediately after `>` is NOT done — we
-                    // want to know if there's any text at all.
-                    while j < bytes_slice.len() && bytes_slice[j] != '<' {
-                        j += 1;
-                    }
-                    let text_len = j - (cursor + 1);
-                    if text_len > 0 {
-                        let text_slice = &bytes_slice[cursor + 1..j];
-                        let has_content = text_slice.iter().any(|c| !c.is_whitespace());
-                        // Heuristic to avoid misclassifying TypeScript generics
-                        // (`<T,>` ... `>`) as JSX tag-open/close: real JSX text
-                        // between tags is prose (`Search`, `🚀 Launch`), which
-                        // does NOT contain code punctuation. If the span has
-                        // any of these code indicators, treat it as Code, not
-                        // JsxText. This is conservative — a JSX text node
-                        // containing a literal `;`/`{`/`}`/`=`/`(` would be
-                        // mis-scanned as code (no false BLOCK, just a missed
-                        // emoji-in-text case), which is far less common than
-                        // generics.
-                        let looks_like_code = text_slice
-                            .iter()
-                            .any(|c| matches!(c, ';' | '{' | '}' | '(' | ')' | '=' | '\''));
-                        if has_content && !looks_like_code {
-                            // Emit code up to cursor+1, then JSX text.
-                            if cursor + 1 > last {
-                                refined.push((s + last, s + cursor + 1, Region::Code));
-                            }
-                            refined.push((s + cursor + 1, s + j, Region::JsxText));
-                            last = j;
-                        }
-                    }
-                    cursor = j;
-                } else {
-                    cursor += 1;
-                }
-            }
-            if last < e - s {
-                refined.push((s + last, e, Region::Code));
-            }
+            refine_code_span(s, e, &bytes, &mut refined);
         }
 
         Self { spans: refined }
@@ -214,6 +168,41 @@ impl Tokenized {
         out
     }
 
+    /// Executable-code spans only, with strings, comments, and JSX text
+    /// removed.  This is the right view for structural rules such as nesting:
+    /// braces shown in a diagnostic string or a comment are data, not syntax.
+    #[must_use]
+    pub fn code_only(&self, src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        for piece in self.regions(src, Region::Code) {
+            out.push_str(piece);
+            // Keep adjacent regions from accidentally forming a new token.
+            out.push(' ');
+        }
+        out
+    }
+
+    /// Return executable code while preserving the source's line structure.
+    ///
+    /// Non-code regions become spaces, except that their newlines are retained.
+    /// Rules that report a source line can therefore analyze the sanitized view
+    /// without letting comments, strings, or JSX text influence the result.
+    #[must_use]
+    pub fn code_only_preserving_lines(&self, src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        for &(start, end, region) in &self.spans {
+            for &ch in &chars[start..end] {
+                if region == Region::Code || ch == '\n' {
+                    out.push(ch);
+                } else {
+                    out.push(' ');
+                }
+            }
+        }
+        out
+    }
+
     /// Only JSX text spans concatenated — where emoji-as-icon violations live.
     #[must_use]
     pub fn jsx_text(&self, src: &str) -> String {
@@ -222,6 +211,43 @@ impl Tokenized {
             out.push_str(piece);
         }
         out
+    }
+}
+
+fn refine_code_span(
+    start: usize,
+    end: usize,
+    source: &[char],
+    refined: &mut Vec<(usize, usize, Region)>,
+) {
+    let span = &source[start..end];
+    let mut cursor = 0usize;
+    let mut last = 0usize;
+    while cursor < span.len() {
+        if span[cursor] != '>' {
+            cursor += 1;
+            continue;
+        }
+        let mut next_tag = cursor + 1;
+        while next_tag < span.len() && span[next_tag] != '<' {
+            next_tag += 1;
+        }
+        let text = &span[cursor + 1..next_tag];
+        let has_content = text.iter().any(|ch| !ch.is_whitespace());
+        let looks_like_code = text
+            .iter()
+            .any(|ch| matches!(ch, ';' | '{' | '}' | '(' | ')' | '=' | '\''));
+        if has_content && !looks_like_code {
+            if cursor + 1 > last {
+                refined.push((start + last, start + cursor + 1, Region::Code));
+            }
+            refined.push((start + cursor + 1, start + next_tag, Region::JsxText));
+            last = next_tag;
+        }
+        cursor = next_tag;
+    }
+    if last < span.len() {
+        refined.push((start + last, end, Region::Code));
     }
 }
 
@@ -264,6 +290,27 @@ fn char_slice_to_str(src: &str, start: usize, end: usize) -> &str {
     &src[start_byte..end_byte]
 }
 
+/// Strip Rust double-quoted string content while leaving apostrophes alone.
+/// Rust apostrophes introduce chars, labels, or lifetimes, so a generic
+/// JavaScript-style single-quote stripper can erase real Rust syntax.
+pub(crate) fn strip_double_quoted_literals(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_str = false;
+    let mut prev = '\0';
+    for ch in line.chars() {
+        if ch == '"' && prev != '\\' {
+            in_str = !in_str;
+            out.push(' ');
+        } else if in_str {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+        prev = ch;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +338,29 @@ mod tests {
         let t = Tokenized::new("const c = '#9333ea';");
         let no_comments = t.without_comments("const c = '#9333ea';");
         assert!(no_comments.contains("#9333ea"));
+    }
+
+    #[test]
+    fn code_only_excludes_strings_comments_and_jsx_text() {
+        let src = "if (ready) { /* { */ const shown = \"}\"; <p>Label</p>; }";
+        let t = Tokenized::new(src);
+        let code = t.code_only(src);
+        assert!(!code.contains("/*"));
+        assert!(!code.contains("Label"));
+        assert!(!code.contains('"'));
+        assert_eq!(code.matches('{').count(), 1);
+        assert_eq!(code.matches('}').count(), 1);
+    }
+
+    #[test]
+    fn line_preserving_code_view_keeps_diagnostic_coordinates() {
+        let src = "fn f() {\n  // hidden\n  let text = \"hidden\nvalue\";\n  if ready {}\n}\n";
+        let t = Tokenized::new(src);
+        let code = t.code_only_preserving_lines(src);
+        assert_eq!(code.lines().count(), src.lines().count());
+        assert_eq!(code.lines().nth(4).map(str::trim), Some("if ready {}"));
+        assert!(!code.contains("hidden"));
+        assert!(!code.contains("value"));
     }
 
     #[test]
@@ -331,6 +401,15 @@ mod tests {
         let t = Tokenized::new(src);
         let no_comments = t.without_comments(src);
         assert!(no_comments.contains("#fff"));
+    }
+
+    #[test]
+    fn rust_double_quote_strip_keeps_lifetimes() {
+        let line = "struct Owner<'a> { host: &'a str, url: \"http://localhost\" }";
+        let stripped = strip_double_quoted_literals(line);
+        assert!(stripped.contains("Owner<'a>"));
+        assert!(stripped.contains("host: &'a str"));
+        assert!(!stripped.contains("localhost"));
     }
 
     #[test]

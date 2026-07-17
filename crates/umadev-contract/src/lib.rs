@@ -7,7 +7,7 @@
 //! path alignment).
 //!
 //! ## What this crate does
-//! - [`api_spec`] — the in-memory contract: a set of endpoints, each with
+//! - [`ApiSpec`] — the in-memory contract: a set of endpoints, each with
 //!   method, path template, operationId, request/response shapes, security.
 //! - [`parse`] — extract an [`ApiSpec`] from the architecture markdown doc
 //!   (upgrading the existing `|`-splitting parser to typed validation).

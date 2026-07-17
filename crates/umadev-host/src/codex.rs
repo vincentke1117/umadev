@@ -3,7 +3,7 @@
 //! Shells out to:
 //!
 //! ```text
-//! <prompt on stdin> | codex exec --skip-git-repo-check --sandbox workspace-write --color never --json
+//! <prompt on stdin> | codex exec --skip-git-repo-check --sandbox <profile> --color never --json
 //! ```
 //!
 //! IMPORTANT — the prompt goes on STDIN, not as a positional arg. codex 0.141's
@@ -20,7 +20,9 @@
 //! Flag rationale:
 //!
 //! - `--skip-git-repo-check`: UmaDev workspaces are often `output/` + `.umadev/` scratch dirs without a git repo. Codex otherwise refuses to run.
-//! - `--sandbox workspace-write`: required for headless use. Without it codex enters interactive approval mode and hangs waiting for stdin confirmation. `workspace-write` permits reads + writes scoped to cwd, no network or system mutation.
+//! - `--sandbox <profile>`: Plan is always `read-only`; Guarded/Auto receive the
+//!   full development environment unless an explicit project restriction
+//!   narrows it.
 //! - `--color never`: don't emit ANSI escape sequences. (`run_subprocess` strips them anyway; this is cleaner at the source.)
 //!
 //! ## Known environment requirements
@@ -32,7 +34,8 @@
 //! (with a `tracing::warn!`). The driver itself is correct; the failure
 //! is environmental.
 //!
-//! Per-call timeout is [`DEFAULT_TIMEOUT`] (5 minutes). If your codex CLI
+//! Per-call timeout defaults to [`crate::DEFAULT_TIMEOUT`] (10 minutes) and can
+//! be overridden with `UMADEV_WORKER_TIMEOUT`. If your codex CLI
 //! is hanging (e.g. `codex login` hasn't completed), the call falls back
 //! to the offline template after the timeout fires.
 //!
@@ -41,11 +44,13 @@
 //! - `UMADEV_CODEX_BIN`       — program name (default `codex`)
 //! - `UMADEV_CODEX_EXEC_SUBCMD` — exec subcommand (default `exec`)
 
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use umadev_runtime::{
-    CompletionRequest, CompletionResponse, Runtime, RuntimeError, RuntimeKind, Usage,
+    BasePermissionProfile, CompletionRequest, CompletionResponse, Runtime, RuntimeError,
+    RuntimeKind, Usage,
 };
 
 use crate::{
@@ -59,9 +64,19 @@ pub struct CodexDriver {
     program: String,
     exec_subcmd: String,
     timeout: Duration,
-    /// When `true`, the next `complete` resumes the most recent `codex`
-    /// session (`codex exec resume --last`) so the base keeps its own memory.
+    /// Permission posture for this legacy one-shot driver. Defaults to Plan so
+    /// an omitted profile cannot silently create a writable subprocess.
+    permissions: BasePermissionProfile,
+    /// When `true`, a later `complete` may resume only the exact Codex thread id
+    /// captured by this driver (or explicitly restored by its owner). With no
+    /// pinned id the call is deliberately fresh: UmaDev never uses `--last`,
+    /// because "most recent" may be a user's unrelated Codex conversation.
     continue_session: bool,
+    /// Exact native Codex thread id. A successful fresh `codex exec --json`
+    /// captures it from the authoritative `thread.started` event; subsequent
+    /// calls resume that id explicitly. The lock is shared across sequential
+    /// calls on one driver while [`Runtime::fork`] replaces it with a fresh cell.
+    session_id: Arc<RwLock<Option<String>>>,
     /// The cwd the `codex` subprocess runs in (the pipeline project root).
     workspace: Option<std::path::PathBuf>,
 }
@@ -73,7 +88,9 @@ impl Default for CodexDriver {
             exec_subcmd: std::env::var("UMADEV_CODEX_EXEC_SUBCMD")
                 .unwrap_or_else(|_| "exec".to_string()),
             timeout: crate::worker_timeout_from_env(),
+            permissions: BasePermissionProfile::Plan,
             continue_session: false,
+            session_id: Arc::new(RwLock::new(None)),
             workspace: None,
         }
     }
@@ -96,6 +113,13 @@ impl CodexDriver {
         self
     }
 
+    /// Select the access/approval posture for this one-shot driver.
+    #[must_use]
+    pub fn with_permissions(mut self, permissions: BasePermissionProfile) -> Self {
+        self.permissions = permissions;
+        self
+    }
+
     /// Builder form of [`HostDriver::set_continue_session`] (mainly for tests).
     #[must_use]
     pub fn with_continue_session(mut self, continue_session: bool) -> Self {
@@ -103,9 +127,35 @@ impl CodexDriver {
         self
     }
 
-    /// Argument vector for resuming the most recent session. `codex exec
-    /// resume --last` continues the last recorded session in this workspace so
-    /// the base answers with its own prior context.
+    /// Builder form of [`HostDriver::set_session_id`] (mainly for tests and an
+    /// explicit persisted-session restore).
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+        // Replace the cell rather than mutating a shared clone: a fork must reset
+        // only itself and must never erase its parent's captured thread id.
+        let session_id = session_id.filter(|id| valid_codex_thread_id(id));
+        self.session_id = Arc::new(RwLock::new(session_id));
+        self
+    }
+
+    fn pinned_session_id(&self) -> Option<String> {
+        self.session_id
+            .read()
+            .ok()
+            .and_then(|session_id| session_id.clone())
+    }
+
+    fn remember_session_id(&self, session_id: &str) {
+        if !valid_codex_thread_id(session_id) {
+            return;
+        }
+        if let Ok(mut slot) = self.session_id.write() {
+            *slot = Some(session_id.to_string());
+        }
+    }
+
+    /// Argument vector for resuming one exact native Codex thread. UmaDev never
+    /// emits `--last`; an absent id always means a brand-new `codex exec`.
     ///
     /// CRITICAL ordering: codex parses flags per-subcommand. Exec-parent flags
     /// (`--skip-git-repo-check`, `--sandbox`, `--color`, `--json`, `--dangerously-
@@ -113,26 +163,24 @@ impl CodexDriver {
     /// placed after it, codex's clap rejects them with "unexpected argument" and
     /// the whole resume call errors out. So resume = the full exec flag set
     /// (`base_args`, which already carries `--json` + the bypass) followed by
-    /// `resume --last`. `--model` is appended at the call site (global flag).
+    /// `resume <thread-id>`. `--model` is appended at the call site (global flag).
     #[must_use]
-    pub fn resume_args(&self) -> Vec<String> {
+    pub fn resume_args(&self, session_id: &str) -> Vec<String> {
         let mut args = self.base_args();
         args.push("resume".to_string());
-        args.push("--last".to_string());
+        args.push(session_id.to_string());
         args
     }
 
-    /// The full argument vector for a `complete` call — resume args when
-    /// [`Self::continue_session`] is set, otherwise a fresh `exec`. Exposed for
-    /// tests. The prompt is appended by the subprocess layer as the last
-    /// positional argument.
+    /// The full argument vector for a `complete` call. Continuation requires an
+    /// exact native id; `continue_session=true` with no captured id is the first
+    /// fresh call and never falls back to Codex's ambient `--last` selection.
     #[must_use]
     pub fn call_args(&self) -> Vec<String> {
-        if self.continue_session {
-            self.resume_args()
-        } else {
-            self.base_args()
-        }
+        self.continue_session
+            .then(|| self.pinned_session_id())
+            .flatten()
+            .map_or_else(|| self.base_args(), |id| self.resume_args(&id))
     }
 
     /// The argument vector preceding the prompt. Exposed for tests.
@@ -141,27 +189,53 @@ impl CodexDriver {
     /// - `--skip-git-repo-check`: UmaDev workspaces are frequently
     ///   `output/` + `.umadev/` scratch dirs that aren't git repos;
     ///   codex otherwise refuses to run.
-    /// - `--sandbox workspace-write`: required for headless use,
-    ///   otherwise codex enters interactive approval mode and hangs
-    ///   waiting for user input on stdin. `workspace-write` permits
-    ///   reads + writes scoped to cwd, no network or system mutation.
-    /// - `--dangerously-bypass-approvals-and-sandbox`: skip ALL
-    ///   confirmation prompts so the pipeline is fully autonomous.
-    ///   Without this, codex pauses on every tool call waiting for a
-    ///   y/n that never arrives in non-interactive subprocess mode.
-    ///   UmaDev's governance layer (112 rules + quality gate) is the
-    ///   safety net that replaces codex's built-in approval system.
-    ///   Set `UMADEV_NO_SKIP_PERMS=1` to disable.
+    /// - `--sandbox`: Plan is hard-pinned to `read-only`; Guarded/Auto use the
+    ///   complete development environment unless `.umadevrc` restricts it.
+    /// - `--dangerously-bypass-approvals-and-sandbox`: Auto only, and only when
+    ///   the resolved sandbox is already `danger-full-access`. It is never
+    ///   allowed to erase a project restriction. `UMADEV_NO_SKIP_PERMS=1`
+    ///   tightens Auto back to ordinary host approvals.
     /// - `--color never`: don't emit ANSI escape sequences that would
     ///   later need stripping. (`run_subprocess` strips them anyway,
     ///   but this is cleaner at the source.)
     #[must_use]
     pub fn base_args(&self) -> Vec<String> {
+        self.base_args_for(std::env::var("UMADEV_NO_SKIP_PERMS").as_deref() == Ok("1"))
+    }
+
+    fn base_args_for(&self, no_skip: bool) -> Vec<String> {
+        let sandbox = crate::codex_session::codex_sandbox_mode(self.permissions);
+        self.base_args_with_sandbox(no_skip, sandbox)
+    }
+
+    fn base_args_with_sandbox(&self, no_skip: bool, sandbox: &str) -> Vec<String> {
+        // A Plan driver has a second local fence even if a future caller hands
+        // this helper an unsafe value. Explicit project restrictions also stay
+        // effective in Auto: the dangerous bypass is only valid with the actual
+        // full-access sandbox, otherwise it would silently nullify that override.
+        let sandbox = if matches!(self.permissions, BasePermissionProfile::Plan) {
+            "read-only"
+        } else {
+            sandbox
+        };
+        let effective_auto = self.permissions.auto_approve() && !no_skip;
+        let bypass = effective_auto && sandbox == "danger-full-access";
+        // Exec has no dedicated `--ask-for-approval` option, but its `-c`
+        // override is authoritative over user/project config. This prevents a
+        // local `approval_policy = "never"` from widening Plan/Guarded.
+        let approval = if matches!(self.permissions, BasePermissionProfile::Plan) || effective_auto
+        {
+            "never"
+        } else {
+            "on-request"
+        };
         let mut args = vec![
             self.exec_subcmd.clone(),
             "--skip-git-repo-check".to_string(),
             "--sandbox".to_string(),
-            "workspace-write".to_string(),
+            sandbox.to_string(),
+            "--config".to_string(),
+            format!("approval_policy=\"{approval}\""),
             "--color".to_string(),
             "never".to_string(),
             // Emit newline-delimited JSON events so BOTH the streaming path AND
@@ -171,9 +245,7 @@ impl CodexDriver {
             // `complete` returned that whole banner as the "answer".
             "--json".to_string(),
         ];
-        // Bypass all approval prompts so the pipeline runs unattended.
-        // UmaDev's governance replaces the host's permission system.
-        if std::env::var("UMADEV_NO_SKIP_PERMS").as_deref() != Ok("1") {
+        if bypass {
             args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
         }
         args
@@ -182,9 +254,14 @@ impl CodexDriver {
 
 #[async_trait]
 impl Runtime for CodexDriver {
-    /// Concurrent-safe fork: clone with a FRESH session (no `resume --last`).
+    /// Concurrent-safe fork: clone with a FRESH session and an independent id
+    /// cell, so a critic can neither resume nor erase the parent's native thread.
     fn fork(&self) -> Option<Box<dyn Runtime>> {
-        Some(Box::new(self.clone().with_continue_session(false)))
+        Some(Box::new(
+            self.clone()
+                .with_continue_session(false)
+                .with_session_id(None),
+        ))
     }
 
     fn kind(&self) -> RuntimeKind {
@@ -225,6 +302,10 @@ impl Runtime for CodexDriver {
         .await
         .map_err(crate::map_subprocess_error)?;
 
+        if let Some(session_id) = extract_codex_thread_id(&out.stdout) {
+            self.remember_session_id(&session_id);
+        }
+
         // base_args carries `--json`, so stdout is a JSONL event stream — extract
         // the `agent_message` text(s). Fall back to raw stdout only if extraction
         // yields nothing (so an unexpected format never silently empties the run).
@@ -235,12 +316,14 @@ impl Runtime for CodexDriver {
         if text.trim().is_empty() && !out.stdout.trim().is_empty() {
             text = out.stdout;
         }
-        Ok(CompletionResponse {
-            text,
-            id: "codex-cli".to_string(),
-            model: req.model,
-            usage,
-        })
+        Ok(crate::redaction::sanitize_completion_response(
+            &CompletionResponse {
+                text,
+                id: "codex-cli".to_string(),
+                model: req.model,
+                usage,
+            },
+        ))
     }
 
     /// Streaming completion via `codex exec --json`.
@@ -250,11 +333,11 @@ impl Runtime for CodexDriver {
     /// - `{"type":"thread.started"}` / `{"type":"turn.started"}` — lifecycle,
     ///   skipped.
     /// - `{"type":"item.completed","item":{"type":"agent_message","text":"…"}}`
-    ///   → [`StreamEvent::Text`].
+    ///   → [`umadev_runtime::StreamEvent::Text`].
     /// - `{"type":"item.completed","item":{"type":"command_execution","command":"sed …"}}`
-    ///   → [`StreamEvent::ToolUse`] with name "Bash" + the command.
+    ///   → [`umadev_runtime::StreamEvent::ToolUse`] with name "Bash" + the command.
     /// - `{"type":"item.completed","item":{"type":"file_change",...}}`
-    ///   → [`StreamEvent::ToolUse`] with name "Write" + the path.
+    ///   → [`umadev_runtime::StreamEvent::ToolUse`] with name "Write" + the path.
     /// - `{"type":"turn.completed",...}` → done.
     ///
     /// Falls back to non-streaming `complete` on any error.
@@ -302,6 +385,9 @@ impl Runtime for CodexDriver {
 
         match result {
             Ok(out) => {
+                if let Some(session_id) = extract_codex_thread_id(&out.stdout) {
+                    self.remember_session_id(&session_id);
+                }
                 // Real token usage from the terminal `turn.completed` line
                 // (captured before `out.stdout` may be moved into `final_text`).
                 let usage = extract_codex_usage(&out.stdout);
@@ -310,12 +396,14 @@ impl Runtime for CodexDriver {
                 if final_text.trim().is_empty() && !out.stdout.trim().is_empty() {
                     final_text = out.stdout;
                 }
-                Ok(CompletionResponse {
-                    text: final_text,
-                    id: "codex-cli".to_string(),
-                    model,
-                    usage,
-                })
+                Ok(crate::redaction::sanitize_completion_response(
+                    &CompletionResponse {
+                        text: final_text,
+                        id: "codex-cli".to_string(),
+                        model,
+                        usage,
+                    },
+                ))
             }
             Err(e) => {
                 // Routine self-healing (often the base being SIGTERM/SIGALRM'd —
@@ -326,12 +414,14 @@ impl Runtime for CodexDriver {
                 let salvaged = extract_codex_messages(&partial);
                 if !salvaged.trim().is_empty() {
                     let usage = extract_codex_usage(&partial);
-                    return Ok(CompletionResponse {
-                        text: salvaged,
-                        id: "codex-cli".to_string(),
-                        model,
-                        usage,
-                    });
+                    return Ok(crate::redaction::sanitize_completion_response(
+                        &CompletionResponse {
+                            text: salvaged,
+                            id: "codex-cli".to_string(),
+                            model,
+                            usage,
+                        },
+                    ));
                 }
                 drop(args);
                 drop(prompt);
@@ -349,6 +439,10 @@ impl Runtime for CodexDriver {
 /// `command_execution` (not `tool_call`) for shell commands, and the
 /// command is in the `command` field.
 fn parse_codex_stream_line(line: &str) -> Option<umadev_runtime::StreamEvent> {
+    parse_codex_stream_line_raw(line).map(crate::redaction::sanitize_stream_event)
+}
+
+fn parse_codex_stream_line_raw(line: &str) -> Option<umadev_runtime::StreamEvent> {
     let line = line.trim();
     if line.is_empty() || !line.starts_with('{') {
         return None;
@@ -498,13 +592,10 @@ fn codex_model_args(model: &str) -> Vec<String> {
 /// The terminal `{"type":"turn.completed","usage":{"input_tokens":…,
 /// "cached_input_tokens":…,"output_tokens":…,"reasoning_output_tokens":…}}`
 /// line carries real usage (verified against live `codex exec --json` output).
-/// We fold `cached_input_tokens` into input (cached reads ARE consumed input,
-/// mirroring the claude driver) and `reasoning_output_tokens` into output
-/// (reasoning tokens are billed output), so `/usage` reflects true spend
-/// instead of the previous hard-coded zeros. If several `turn.completed` lines
-/// appear (a resumed multi-turn run), the LAST one wins — codex reports
-/// cumulative usage. Returns [`Usage::default`] (zeros) when no usable line is
-/// present (fail-open).
+/// Cached input and reasoning output are subsets of Codex's input/output totals,
+/// so they are preserved as breakdowns but never added twice. If several
+/// `turn.completed` lines appear, the LAST valid one wins. Returns incomplete
+/// [`Usage::default`] when no usable line is present.
 fn extract_codex_usage(stdout: &str) -> Usage {
     let mut usage = Usage::default();
     for line in stdout.lines() {
@@ -515,12 +606,39 @@ fn extract_codex_usage(stdout: &str) -> Usage {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             if v.get("type").and_then(|t| t.as_str()) == Some("turn.completed") {
                 if let Some(u) = v.get("usage") {
-                    let field = |k: &str| u.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-                    let input = field("input_tokens") + field("cached_input_tokens");
-                    let output = field("output_tokens") + field("reasoning_output_tokens");
+                    let required = |key: &str| u.get(key)?.as_u64();
+                    let optional = |key: &str| -> Option<Option<u64>> {
+                        match u.get(key) {
+                            None | Some(serde_json::Value::Null) => Some(None),
+                            Some(value) => value.as_u64().map(Some),
+                        }
+                    };
+                    let Some(input_tokens) = required("input_tokens") else {
+                        continue;
+                    };
+                    let Some(output_tokens) = required("output_tokens") else {
+                        continue;
+                    };
+                    let Some(cached_read_tokens) = optional("cached_input_tokens") else {
+                        continue;
+                    };
+                    let Some(reasoning_tokens) = optional("reasoning_output_tokens") else {
+                        continue;
+                    };
+                    let Some(total_tokens) = input_tokens.checked_add(output_tokens) else {
+                        continue;
+                    };
+                    if cached_read_tokens.unwrap_or(0) > input_tokens
+                        || reasoning_tokens.unwrap_or(0) > output_tokens
+                        || optional("total_tokens")
+                            .is_none_or(|value| value.is_some_and(|total| total != total_tokens))
+                    {
+                        continue;
+                    }
                     usage = Usage {
-                        input_tokens: u32::try_from(input).unwrap_or(u32::MAX),
-                        output_tokens: u32::try_from(output).unwrap_or(u32::MAX),
+                        cached_read_tokens: cached_read_tokens.unwrap_or(0),
+                        reasoning_tokens: reasoning_tokens.unwrap_or(0),
+                        ..Usage::exact(input_tokens, output_tokens)
                     };
                 }
             }
@@ -529,27 +647,57 @@ fn extract_codex_usage(stdout: &str) -> Usage {
     usage
 }
 
-/// Extract all `agent_message` texts from a codex `--json` JSONL stream.
-fn extract_codex_messages(stdout: &str) -> String {
-    let mut texts = Vec::new();
-    for line in stdout.lines() {
-        let line = line.trim();
-        if !line.starts_with('{') {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if v.get("type").and_then(|t| t.as_str()) == Some("item.completed") {
-                if let Some(item) = v.get("item") {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("agent_message") {
-                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                            texts.push(text.to_string());
-                        }
-                    }
-                }
-            }
-        }
+/// Capture the exact native thread id emitted by `codex exec --json`.
+/// Workspace recency and caller-generated UUIDs are never guessed as Codex
+/// threads; only the base's authoritative `thread.started` event can mint the
+/// continuation pointer.
+fn extract_codex_thread_id(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .filter_map(codex_thread_id_from_line)
+        .next_back()
+}
+
+fn codex_thread_id_from_line(line: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("thread.started") {
+        return None;
     }
-    texts.join("\n")
+    let id = value.get("thread_id").and_then(serde_json::Value::as_str)?;
+    valid_codex_thread_id(id).then(|| id.to_string())
+}
+
+fn valid_codex_thread_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Extract all `agent_message` texts from a codex `--json` JSONL stream.
+fn codex_message_from_line(line: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("item.completed") {
+        return None;
+    }
+    let item = value.get("item")?;
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("agent_message") {
+        return None;
+    }
+    item.get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn extract_codex_messages(stdout: &str) -> String {
+    stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with('{'))
+        .filter_map(codex_message_from_line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[async_trait]
@@ -562,8 +710,17 @@ impl HostDriver for CodexDriver {
         "Codex CLI"
     }
 
+    fn permission_profile(&self) -> BasePermissionProfile {
+        self.permissions
+    }
+
     fn set_continue_session(&mut self, continue_session: bool) {
         self.continue_session = continue_session;
+    }
+
+    fn set_session_id(&mut self, session_id: Option<String>) {
+        let session_id = session_id.filter(|id| valid_codex_thread_id(id));
+        self.session_id = Arc::new(RwLock::new(session_id));
     }
 
     fn set_workspace(&mut self, workspace: std::path::PathBuf) {
@@ -797,25 +954,36 @@ mod tests {
 
     #[test]
     fn extract_codex_usage_reads_tokens_from_turn_completed() {
-        // Verified against live `codex exec --json` output: the terminal
-        // `turn.completed` line carries usage with input/cached/output/reasoning
-        // token counts.
+        // Official Codex semantics: cached_input_tokens is already included in
+        // input_tokens and reasoning_output_tokens is already included in
+        // output_tokens. These captured values must therefore remain 31_751 / 2_367,
+        // not be double-counted as 46_471 / 2_780.
         let stdout = concat!(
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"PONG"}}"#,
             "\n",
-            r#"{"type":"turn.completed","usage":{"input_tokens":17162,"cached_input_tokens":5504,"output_tokens":6,"reasoning_output_tokens":4}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":31751,"cached_input_tokens":14720,"output_tokens":2367,"reasoning_output_tokens":413,"total_tokens":34118}}"#,
         );
         let u = extract_codex_usage(stdout);
-        // cached_input_tokens folds into input (consumed input).
-        assert_eq!(u.input_tokens, 17162 + 5504);
-        // reasoning_output_tokens folds into output (billed output).
-        assert_eq!(u.output_tokens, 6 + 4);
-        // No turn.completed line → zeros (graceful / fail-open).
-        assert_eq!(extract_codex_usage("plain text").input_tokens, 0);
-        assert_eq!(
-            extract_codex_usage(r#"{"type":"turn.started"}"#).output_tokens,
-            0
-        );
+        assert_eq!(u.input_tokens, 31_751);
+        assert_eq!(u.output_tokens, 2_367);
+        assert_eq!(u.total_tokens, 34_118);
+        assert_eq!(u.cached_read_tokens, 14_720);
+        assert_eq!(u.cached_write_tokens, 0);
+        assert_eq!(u.reasoning_tokens, 413);
+        assert!(!u.usage_incomplete);
+
+        // Missing or malformed terminal usage is unknown, never an exact zero.
+        for invalid in [
+            "plain text",
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"turn.completed","usage":{}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":99}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":5,"cached_input_tokens":6,"output_tokens":2}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":2,"reasoning_output_tokens":3}}"#,
+        ] {
+            let usage = extract_codex_usage(invalid);
+            assert_eq!(usage, Usage::default(), "invalid fixture: {invalid}");
+        }
     }
 
     #[test]
@@ -851,38 +1019,106 @@ mod tests {
         assert_eq!(d.backend_id(), "codex");
         assert_eq!(d.display_name(), "Codex CLI");
         assert_eq!(d.kind(), RuntimeKind::Openai);
-        let args = d.base_args();
-        // Stable prefix (the bypass flag is appended conditionally).
-        assert_eq!(
-            &args[..6],
-            &[
-                "exec".to_string(),
-                "--skip-git-repo-check".to_string(),
-                "--sandbox".to_string(),
-                "workspace-write".to_string(),
-                "--color".to_string(),
-                "never".to_string(),
-            ]
-        );
-        assert!(
-            args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()),
-            "base_args should include bypass flag by default: {args:?}"
-        );
+        assert_eq!(d.permission_profile(), BasePermissionProfile::Plan);
     }
 
     #[test]
-    fn continue_session_switches_to_resume_subcommand() {
+    fn permission_profiles_shape_legacy_args_and_no_skip_only_tightens() {
+        let cases = [
+            (BasePermissionProfile::Plan, "read-only", "never", false),
+            (
+                BasePermissionProfile::Guarded,
+                "danger-full-access",
+                "on-request",
+                false,
+            ),
+            (
+                BasePermissionProfile::Auto,
+                "danger-full-access",
+                "never",
+                true,
+            ),
+        ];
+        for (profile, sandbox, approval, bypass) in cases {
+            let args = CodexDriver::default()
+                .with_permissions(profile)
+                .base_args_with_sandbox(false, sandbox);
+            assert!(args
+                .windows(2)
+                .any(|w| w[0] == "--sandbox" && w[1] == sandbox));
+            assert!(args
+                .iter()
+                .any(|a| a == &format!("approval_policy=\"{approval}\"")));
+            assert_eq!(
+                args.iter()
+                    .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+                bypass,
+                "profile {profile:?}: {args:?}"
+            );
+        }
+
+        let tightened = CodexDriver::default()
+            .with_permissions(BasePermissionProfile::Auto)
+            .base_args_with_sandbox(true, "danger-full-access");
+        assert!(tightened
+            .iter()
+            .any(|a| a == "approval_policy=\"on-request\""));
+        assert!(!tightened
+            .iter()
+            .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+
+        let hostile_override = CodexDriver::default()
+            .with_permissions(BasePermissionProfile::Plan)
+            .base_args_with_sandbox(false, "danger-full-access");
+        assert!(hostile_override
+            .windows(2)
+            .any(|w| w[0] == "--sandbox" && w[1] == "read-only"));
+        assert!(!hostile_override
+            .iter()
+            .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+
+        let restricted_auto = CodexDriver::default()
+            .with_permissions(BasePermissionProfile::Auto)
+            .base_args_with_sandbox(false, "workspace-write");
+        assert!(restricted_auto
+            .iter()
+            .any(|a| a == "approval_policy=\"never\""));
+        assert!(!restricted_auto
+            .iter()
+            .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
+    fn continuation_is_fresh_until_an_exact_native_thread_is_known() {
         // Fresh: a normal `codex exec ...` (no resume).
         let fresh = CodexDriver::default();
         let args = fresh.call_args();
         assert_eq!(args.first().map(String::as_str), Some("exec"));
         assert!(!args.contains(&"resume".to_string()));
 
-        // Continued: `codex exec <exec-parent flags> resume --last …`.
+        // `continue=true` without an exact id is still fresh. It must never select
+        // Codex's ambient most-recent conversation.
+        let mut first = CodexDriver::default();
+        first.set_continue_session(true);
+        let args = first.call_args();
+        assert!(!args.contains(&"resume".to_string()));
+        assert!(!args.contains(&"--last".to_string()));
+
+        // A corrupt persisted/caller id cannot smuggle Codex's ambient selector
+        // back in through the positional thread-id slot.
+        let mut forged = CodexDriver::default().with_session_id(Some("--last".to_string()));
+        forged.set_continue_session(true);
+        let args = forged.call_args();
+        assert!(!args.contains(&"resume".to_string()));
+        assert!(!args.contains(&"--last".to_string()));
+
+        // Once Codex itself reports a native thread id, continuation is exact:
+        // `codex exec <exec-parent flags> resume <id> …`.
         // CRITICAL: every exec-parent flag (--skip-git-repo-check / --sandbox /
         // --color / --json) MUST come BEFORE the `resume` token, or codex's clap
         // rejects it with "unexpected argument" and the resume call errors out.
-        let mut resumed = CodexDriver::default();
+        let mut resumed = CodexDriver::default()
+            .with_session_id(Some("019bf92c-6a90-76e1-8f84-40d4abc6e840".to_string()));
         resumed.set_continue_session(true);
         let args = resumed.call_args();
         assert_eq!(args.first().map(String::as_str), Some("exec"));
@@ -890,7 +1126,11 @@ mod tests {
             .iter()
             .position(|a| a == "resume")
             .expect("resume args contain `resume`");
-        assert_eq!(args.get(resume_idx + 1).map(String::as_str), Some("--last"));
+        assert_eq!(
+            args.get(resume_idx + 1).map(String::as_str),
+            Some("019bf92c-6a90-76e1-8f84-40d4abc6e840")
+        );
+        assert!(!args.contains(&"--last".to_string()));
         for flag in ["--skip-git-repo-check", "--sandbox", "--color", "--json"] {
             let idx = args
                 .iter()
@@ -898,6 +1138,37 @@ mod tests {
                 .unwrap_or_else(|| panic!("resume args missing {flag}: {args:?}"));
             assert!(idx < resume_idx, "{flag} must precede `resume`: {args:?}");
         }
+    }
+
+    #[test]
+    fn thread_started_is_the_only_continuation_id_authority() {
+        let stream = concat!(
+            "not json\n",
+            "{\"type\":\"item.completed\",\"thread_id\":\"wrong\"}\n",
+            "{\"type\":\"thread.started\",\"thread_id\":\"thr-old-project\"}\n",
+            "{\"type\":\"thread.started\",\"thread_id\":\"../../escape\"}\n"
+        );
+        assert_eq!(
+            extract_codex_thread_id(stream).as_deref(),
+            Some("thr-old-project")
+        );
+        assert_eq!(
+            extract_codex_thread_id("{\"type\":\"thread.started\"}"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fork_never_inherits_or_clears_the_parent_thread() {
+        let parent = CodexDriver::default()
+            .with_continue_session(true)
+            .with_session_id(Some("thr-parent".to_string()));
+        let child = parent
+            .clone()
+            .with_continue_session(false)
+            .with_session_id(None);
+        assert_eq!(parent.pinned_session_id().as_deref(), Some("thr-parent"));
+        assert!(child.pinned_session_id().is_none());
     }
 
     #[test]
@@ -1051,5 +1322,32 @@ mod tests {
             resp.text
         );
         assert_eq!(resp.model, "gpt-5-codex");
+    }
+
+    #[test]
+    fn stream_events_redact_synthetic_secrets() {
+        const SECRET: &str = "SYNTH_CODEX_SECRET_DO_NOT_LEAK_72";
+        let text = serde_json::json!({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": format!("password={SECRET}")}
+        })
+        .to_string();
+        let tool = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": format!("curl -H 'Authorization: Bearer {SECRET}' example.test")
+            }
+        })
+        .to_string();
+        let rendered = format!(
+            "{:?}{:?}",
+            parse_codex_stream_line(&text),
+            parse_codex_stream_line(&tool)
+        );
+        assert!(
+            !rendered.contains(SECRET),
+            "stream event leaked: {rendered}"
+        );
     }
 }

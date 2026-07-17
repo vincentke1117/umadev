@@ -27,19 +27,64 @@
 //! [`BgAgentTracker`] fuses these into one `outstanding()` count; the turn
 //! pumps consult it at `TurnDone{Completed}` and, instead of settling, re-drive
 //! the base with a bounded "wait for your agents, collect their results, THEN
-//! report" directive ([`wait_directive`]) — at most [`MAX_BG_REDRIVES`] times
-//! per turn, after which the turn settles with an honest note. **Fail-open by
-//! contract:** a base that emits none of these signals keeps a zero count and
-//! byte-for-byte today's behavior; the guard can only ADD bounded turns, never
-//! block a settle indefinitely.
+//! report" directive ([`BgAgentTracker::wait_directive`]) — at most
+//! [`MAX_BG_REDRIVES`] times per turn. If known agents are still live after the
+//! bound, the caller must settle the turn as incomplete/failed rather than
+//! publishing a false success. **Fail-open by contract:** a base that emits no
+//! lifecycle signal keeps a zero count and today's behavior; a positive live set
+//! is evidence and may never be silently discarded.
 
 use std::collections::BTreeSet;
 
 use umadev_runtime::{BackgroundTaskSignal, SessionEvent};
 
+/// Base-native child work observed during one logical turn.
+///
+/// Raw vendor task identifiers are kept only in memory. Callers that persist
+/// this observation must derive opaque hashes instead of writing the identifiers
+/// themselves: a vendor is free to put account or session material in an id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BaseAgentObservation {
+    agent_ids: BTreeSet<String>,
+    anonymous_count: u32,
+}
+
+impl BaseAgentObservation {
+    /// Merge another turn's observations without double-counting stable ids.
+    pub fn merge(&mut self, other: Self) {
+        self.agent_ids.extend(other.agent_ids);
+        self.anonymous_count = self.anonymous_count.saturating_add(other.anonymous_count);
+    }
+
+    /// Stable vendor ids observed through structured lifecycle frames.
+    pub(crate) fn agent_ids(&self) -> impl Iterator<Item = &str> {
+        self.agent_ids.iter().map(String::as_str)
+    }
+
+    /// Launches known only through a count-bearing fallback marker.
+    #[must_use]
+    pub(crate) fn anonymous_count(&self) -> u32 {
+        self.anonymous_count
+    }
+
+    /// Whether no base-native child work was observed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.agent_ids.is_empty() && self.anonymous_count == 0
+    }
+
+    /// Total observed child count, saturating at the platform's `usize` range.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.agent_ids
+            .len()
+            .saturating_add(usize::try_from(self.anonymous_count).unwrap_or(usize::MAX))
+    }
+}
+
 /// Maximum "wait for your background agents" re-drives per logical turn. The
-/// hard bound that keeps the settle path terminating: after this many, the
-/// turn settles regardless (with an honest incomplete-work note).
+/// hard bound keeps the settle path terminating; exhausting it turns the
+/// logical turn into an incomplete result, never a successful settle.
 pub const MAX_BG_REDRIVES: u8 = 2;
 
 /// The immediate tool_result placeholder claude returns when the `Agent`/`Task`
@@ -71,6 +116,10 @@ const COLLECTED_MARKER: &str = "<retrieval_status>success";
 pub struct BgAgentTracker {
     /// Live background sub-agent task ids (the frame channel).
     live: BTreeSet<String>,
+    /// Every structured id seen during the turn, including already-finished
+    /// children. `live` alone is empty at the successful settle boundary and
+    /// therefore cannot support durable task history.
+    seen: BTreeSet<String>,
     /// Whether ANY task frame was seen — once true, the frame channel is
     /// authoritative and the marker channel is ignored (avoids double count).
     saw_frames: bool,
@@ -97,18 +146,24 @@ impl BgAgentTracker {
                 match signal {
                     BackgroundTaskSignal::Started { id } => {
                         self.live.insert(id.clone());
+                        self.seen.insert(id.clone());
                     }
                     BackgroundTaskSignal::Finished { id } => {
                         self.live.remove(id);
+                        self.seen.insert(id.clone());
                     }
                     BackgroundTaskSignal::Live { agent_ids } => {
                         // The LEVEL signal REPLACES the set (claude's own
                         // contract) — a missed edge can never wedge a stale id.
+                        self.seen.extend(agent_ids.iter().cloned());
                         self.live = agent_ids.iter().cloned().collect();
                     }
                 }
             }
-            SessionEvent::ToolResult { ok: true, summary } => {
+            SessionEvent::ToolResult { ok: true, summary }
+            | SessionEvent::ToolResultCorrelated {
+                ok: true, summary, ..
+            } => {
                 // The launch placeholder / the collection ack. `contains` (not
                 // starts_with): a nested sub-agent's result row carries a
                 // visual attribution prefix.
@@ -130,6 +185,21 @@ impl BgAgentTracker {
             self.live.len()
         } else {
             self.marker_launched.saturating_sub(self.marker_collected) as usize
+        }
+    }
+
+    /// Snapshot every base-native child observed during this turn.
+    ///
+    /// Structured ids win when present. Marker-only launches have no id, so the
+    /// unmatched remainder is represented as an anonymous count. This preserves
+    /// honest cardinality without inventing vendor identities.
+    #[must_use]
+    pub fn observation(&self) -> BaseAgentObservation {
+        let seen_count = u32::try_from(self.seen.len()).unwrap_or(u32::MAX);
+        let anonymous_count = self.marker_launched.saturating_sub(seen_count);
+        BaseAgentObservation {
+            agent_ids: self.seen.clone(),
+            anonymous_count,
         }
     }
 
@@ -162,8 +232,9 @@ impl BgAgentTracker {
             "REALITY CHECK: you ended your turn while {n} of your own background \
              sub-agent(s) are still running — their results were never collected, so \
              any \"final report\" you wrote is premature and the work is NOT done. Do \
-             this now, in this turn: (1) check each outstanding background agent \
-             (TaskOutput with block=true) and WAIT for it to finish; (2) collect every \
+             this now, in this turn: (1) use this base's native blocking wait/inspect \
+             mechanism for each outstanding background agent and WAIT for it to \
+             finish; (2) collect every \
              result and fold it into the actual work products on disk; (3) only after \
              ALL background agents are resolved, write the real final report. If an \
              agent is stuck or no longer needed, say so explicitly and stop it. Never \
@@ -277,10 +348,48 @@ mod tests {
         t.observe(&started("a3"));
         let d = t.wait_directive();
         assert!(d.contains('3'), "names the outstanding count: {d}");
-        assert!(d.contains("TaskOutput"), "names the collection tool: {d}");
+        assert!(
+            d.contains("native blocking wait/inspect mechanism"),
+            "requires the base-native blocking collection mechanism: {d}"
+        );
         assert!(
             d.contains("Never conclude or report completion"),
             "carries the discipline: {d}"
+        );
+    }
+
+    #[test]
+    fn observation_keeps_finished_ids_without_persisting_only_the_live_set() {
+        let mut tracker = BgAgentTracker::new();
+        tracker.observe(&started("child-account-shaped-id"));
+        tracker.observe(&finished("child-account-shaped-id"));
+
+        assert_eq!(tracker.outstanding(), 0);
+        let observed = tracker.observation();
+        assert_eq!(
+            observed.agent_ids().collect::<Vec<_>>(),
+            ["child-account-shaped-id"]
+        );
+        assert_eq!(observed.anonymous_count(), 0);
+    }
+
+    #[test]
+    fn observation_preserves_marker_only_cardinality_and_merges_turns() {
+        let mut first = BgAgentTracker::new();
+        first.observe(&tool_result(true, ASYNC_LAUNCH_MARKER));
+        first.observe(&tool_result(true, ASYNC_LAUNCH_MARKER));
+        let mut observed = first.observation();
+
+        let mut second = BgAgentTracker::new();
+        second.observe(&started("structured-child"));
+        second.observe(&finished("structured-child"));
+        observed.merge(second.observation());
+
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed.anonymous_count(), 2);
+        assert_eq!(
+            observed.agent_ids().collect::<Vec<_>>(),
+            ["structured-child"]
         );
     }
 }

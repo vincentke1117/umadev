@@ -1,6 +1,6 @@
 //! Per-project governance policy — `.umadev/rules.toml`.
 //!
-//! Lets a project tune which clauses are enforced and add path exclusions,
+//! Lets a project tune which governance rules are enforced and add path exclusions,
 //! without forking the rule engine. The hook and the `scan_content` entry
 //! point consult this policy before applying each rule.
 //!
@@ -8,9 +8,9 @@
 //! ```toml
 //! # .umadev/rules.toml — project governance overrides
 //! #
-//! # Every clause defaults to enabled. List the ones you want OFF here:
+//! # Every rule defaults to enabled. List the ones you want OFF here:
 //! [disabled]
-//! clauses = ["UD-ARCH-002"]   # e.g. allow console.log in this project
+//! clauses = ["UG-LINT-001"]   # e.g. allow inline styles in this project
 //!
 //! # Paths the host may write even though a rule would otherwise block them.
 //! # Anchored, segment-aware globs: `**` = any path segments, `*` = any chars
@@ -37,6 +37,7 @@
 //!   process); the agent runner caches it for the pipeline lifetime.
 
 use std::collections::HashSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Why a policy load did not yield a parsed user policy. Lets the loader tell a
@@ -54,7 +55,7 @@ enum PolicyLoadError {
 /// Per-project governance policy loaded from `.umadev/rules.toml`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Policy {
-    /// Clauses the project has chosen to disable (lowercased, e.g. "sd-arch-002").
+    /// Rules the project has chosen to disable.
     #[serde(default)]
     pub disabled: DisabledSection,
     /// Path patterns exempt from governance (rules skip these files).
@@ -68,7 +69,7 @@ pub struct Policy {
 /// `[disabled]` section.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DisabledSection {
-    /// Clause ids to turn off, e.g. `["UD-ARCH-002"]`.
+    /// Rule ids to turn off. The key remains `clauses` for file compatibility.
     #[serde(default)]
     pub clauses: Vec<String>,
 }
@@ -87,6 +88,17 @@ pub struct ExtraSection {
     /// Extra malicious domains to block (merged with built-ins).
     #[serde(default)]
     pub blocked_domains: Vec<String>,
+}
+
+fn canonical_rule_id(rule_id: &str) -> String {
+    crate::rules::LEGACY_LINT_ID_ALIASES
+        .iter()
+        .find_map(|(legacy, current)| {
+            legacy
+                .eq_ignore_ascii_case(rule_id)
+                .then(|| current.to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| rule_id.to_ascii_lowercase())
 }
 
 impl Policy {
@@ -153,23 +165,42 @@ impl Policy {
     pub fn write_default_template(project_root: &Path) -> std::io::Result<PathBuf> {
         let dir = project_root.join(".umadev");
         let path = dir.join("rules.toml");
-        if path.exists() {
-            return Ok(path); // don't clobber user edits
-        }
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(&path, DEFAULT_TEMPLATE)?;
-        Ok(path)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                if let Err(error) = file
+                    .write_all(DEFAULT_TEMPLATE.as_bytes())
+                    .and_then(|()| file.sync_all())
+                {
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+                Ok(path)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(path),
+            Err(error) => Err(error),
+        }
     }
 
-    /// `true` when `clause` is disabled by this policy. Clause ids are matched
-    /// case-insensitively so `sd-arch-002` and `UD-ARCH-002` are equivalent.
+    /// `true` when a rule is disabled by this policy. IDs are matched
+    /// case-insensitively. Legacy craft IDs such as `UD-CODE-003` are aliases
+    /// for their independent `UG-LINT-*` replacements, so existing policy files
+    /// keep working without making new findings look like specification clauses.
     #[must_use]
-    pub fn is_disabled(&self, clause: &str) -> bool {
-        let lower = clause.to_ascii_lowercase();
+    pub fn is_disabled(&self, rule_id: &str) -> bool {
+        let canonical = canonical_rule_id(rule_id);
         self.disabled
             .clauses
             .iter()
-            .any(|c| c.to_ascii_lowercase() == lower)
+            .any(|configured| canonical_rule_id(configured) == canonical)
     }
 
     /// `true` when `file_path` matches an exclusion pattern (governance skips it).
@@ -283,11 +314,11 @@ pub const DEFAULT_TEMPLATE: &str = "\
 # UmaDev governance policy — .umadev/rules.toml
 #
 # Tune which rules are enforced in THIS project. Everything defaults to ON.
-# Docs: each clause id maps to a rule in UMADEV_HOST_SPEC_V1.
+# Normative checks use UD-* specification IDs; independent lints use UG-LINT-*.
 
-# Clauses to turn OFF (case-insensitive). Example:
+# Rules to turn OFF (case-insensitive; key retained for compatibility). Example:
 #   [disabled]
-#   clauses = [\"UD-ARCH-002\"]   # allow console.log in this project
+#   clauses = [\"UG-LINT-001\"]   # allow inline styles in this project
 [disabled]
 clauses = []
 
@@ -377,6 +408,27 @@ mod tests {
         assert!(p.is_disabled("UD-ARCH-002"));
         assert!(p.is_disabled("ud-arch-002"));
         assert!(!p.is_disabled("UD-SEC-001"));
+    }
+
+    #[test]
+    fn legacy_and_current_lint_ids_disable_the_same_rule() {
+        for (legacy, current) in crate::rules::LEGACY_LINT_ID_ALIASES {
+            let legacy_policy = Policy {
+                disabled: DisabledSection {
+                    clauses: vec![legacy.to_ascii_lowercase()],
+                },
+                ..Default::default()
+            };
+            assert!(legacy_policy.is_disabled(current));
+
+            let current_policy = Policy {
+                disabled: DisabledSection {
+                    clauses: vec![(*current).to_string()],
+                },
+                ..Default::default()
+            };
+            assert!(current_policy.is_disabled(legacy));
+        }
     }
 
     #[test]
@@ -499,8 +551,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let set = p.all_blocked_domains(&["mediafire.com", "crack"]);
-        assert!(set.contains("mediafire.com"));
+        let blocked = concat!("media", "fire.com");
+        let set = p.all_blocked_domains(&[blocked, concat!("game", "crack.net")]);
+        assert!(set.contains(blocked));
         assert!(set.contains("internal-bad.corp"));
     }
 

@@ -2,13 +2,13 @@
 //!
 //! # The swallow this addresses
 //!
-//! A base (`claude` / `codex` / `opencode`) runs a long shell command — a Maven
-//! / Gradle / `npm`/`cargo` build, a `spring-boot:run`, a dependency install —
+//! A native base (`claude` / `codex` / `opencode`) runs a long shell command —
+//! a Maven / Gradle / `npm`/`cargo` build, a `spring-boot:run`, a dependency install —
 //! inside its OWN agentic tool loop and its OWN sandbox. The base CAPTURES that
 //! command's stdout/stderr internally and only hands UmaDev a single, structured
 //! `tool_result` (codex: a `commandExecution` item's `aggregatedOutput`) when the
 //! command FINISHES — and each driver then clips that preview to a tight
-//! [`DEFAULT_TOOL_OUTPUT_CAP`] chars. So during a multi-minute build the user sees
+//! the internal default cap of 200 characters. So during a multi-minute build the user sees
 //! a silent "thinking" with no log lines, and even at the end only a 200-char
 //! clip — the logs feel "swallowed by the sandbox redirect."
 //!
@@ -26,8 +26,8 @@
 //! launch. The live flag, however, is process-wide **thread-safe shared state**
 //! (an [`AtomicBool`]), NOT the process env: the TUI seeds it from the saved
 //! preference / env at startup and flips it live via the `/logs` command through
-//! [`set_show_process_logs`], while the three base drivers read it per streaming
-//! event via [`show_process_logs`]. **OFF by default**: every driver behaves
+//! [`set_show_process_logs`], while the three native base drivers read it per
+//! streaming event via [`show_process_logs`]. **OFF by default**: every driver behaves
 //! exactly as before.
 //!
 //! ## Why not the env
@@ -110,8 +110,8 @@ fn is_truthy(raw: Option<&str>) -> bool {
 }
 
 /// Pure mapping from the on/off flag to the per-command output preview cap: the
-/// generous [`VERBOSE_TOOL_OUTPUT_CAP`] when ON, else the tight
-/// [`DEFAULT_TOOL_OUTPUT_CAP`]. Takes the flag explicitly so a caller that already
+/// generous 16 KiB cap when ON, else the tight 200-character cap. Takes the
+/// flag explicitly so a caller that already
 /// resolved [`show_process_logs`] once (e.g. a per-line dispatch) doesn't re-read
 /// the env — and so it is unit-testable without mutating process env.
 #[must_use]
@@ -124,8 +124,8 @@ pub fn cap_for(on: bool) -> usize {
 }
 
 /// The per-command output preview cap the drivers truncate to, resolved from the
-/// live [`show_process_logs`] toggle. Single source of truth so all three drivers
-/// stay in lockstep.
+/// live [`show_process_logs`] toggle. Single source of truth so all three native
+/// drivers stay in lockstep.
 #[must_use]
 pub fn tool_output_cap() -> usize {
     cap_for(show_process_logs())
@@ -139,7 +139,7 @@ const LOG_TAIL_MARKER: &str = "[... log tail ...]\n";
 /// Truncate a tool-result preview to at most `max` chars, **char-boundary-safe**,
 /// with a direction that depends on which path is active:
 ///
-/// - `verbose = true` (process logs ON, the generous [`VERBOSE_TOOL_OUTPUT_CAP`]):
+/// - `verbose = true` (process logs ON, the generous 16 KiB cap):
 ///   keep the **TAIL** — the LAST `max` chars. Each `item/updated` frame carries
 ///   the CUMULATIVE growing output, so head-truncation would pin every frame past
 ///   the cap to the same first 16 KiB and the live stream would FREEZE; and the
@@ -147,8 +147,8 @@ const LOG_TAIL_MARKER: &str = "[... log tail ...]\n";
 ///   lives at the END, which head-truncation clips off. Keeping the tail makes the
 ///   stream advance as the build runs and preserves the error tail. The kept tail
 ///   is trimmed to start at a clean line boundary and prefixed with
-///   [`LOG_TAIL_MARKER`].
-/// - `verbose = false` (process logs OFF, the tight [`DEFAULT_TOOL_OUTPUT_CAP`]):
+///   the `"[... log tail ...]"` marker.
+/// - `verbose = false` (process logs OFF, the tight 200-character cap):
 ///   keep the **HEAD** — it is a short summary/preview, where the first chars are
 ///   the signal; the historical behaviour, unchanged.
 ///

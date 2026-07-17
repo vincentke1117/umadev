@@ -1,5 +1,5 @@
-//! Coach mode — writes a self-contained instruction file per phase
-//! that the selected base (Claude Code / Codex / OpenCode) executes.
+//! Coach mode — writes a self-contained instruction file per phase that the
+//! selected one of five bases executes (three native plus Grok Build/Kimi Code over ACP).
 //!
 //! UmaDev does not need an API key when running inside a host that
 //! already has model access. Instead of calling the model itself, the
@@ -104,7 +104,7 @@ pub fn render_coach_prompt(opts: &RunOptions, phase: Phase) -> String {
 }
 
 /// Pure renderer with an optional pre-embedded query vector. Threads the
-/// vector into [`phase_knowledge_digest_with_vector`] so the expert-knowledge
+/// vector into [`crate::phases::phase_knowledge_digest_with_vector`] so the expert-knowledge
 /// section gets RRF fusion when hybrid + vectors are available.
 #[must_use]
 pub fn render_coach_prompt_with_vector(
@@ -189,12 +189,12 @@ enum ChannelItem {
     /// A BM25 (or BM25+vector) knowledge chunk.
     Knowledge {
         rank: usize,
-        hit: umadev_knowledge::ScoredChunk,
+        hit: Box<umadev_knowledge::ScoredChunk>,
     },
     /// A fingerprint-decay-ranked prior-run lesson.
     Lesson {
         rank: usize,
-        lesson: crate::lessons::Lesson,
+        lesson: Box<crate::lessons::Lesson>,
     },
 }
 
@@ -212,13 +212,42 @@ impl ChannelItem {
     /// Render this item into its prompt fragment.
     fn render(&self) -> String {
         match self {
-            ChannelItem::Knowledge { hit, .. } => format!(
-                "### `{}` — *{}*\n\n{}\n\n",
-                hit.chunk.meta.path,
-                hit.chunk.meta.section,
-                hit.chunk.excerpt(400)
-            ),
-            ChannelItem::Lesson { lesson, .. } => crate::lessons::render_lesson_for_prompt(lesson),
+            ChannelItem::Knowledge { hit, .. } => {
+                let content = hit.chunk.excerpt(400);
+                let rendered =
+                    umadev_knowledge::render_prompt_reference(umadev_knowledge::PromptReference {
+                        kind: umadev_knowledge::PromptReferenceKind::KnowledgeChunk,
+                        corpus_origin: hit.chunk.meta.corpus_origin,
+                        corpus_scope: hit.chunk.meta.corpus_scope,
+                        source: &hit.chunk.meta.path,
+                        section: Some(&hit.chunk.meta.section),
+                        content: &content,
+                    });
+                format!("{rendered}\n\n")
+            }
+            ChannelItem::Lesson { lesson, .. } => {
+                let content = crate::lessons::render_lesson_for_prompt(lesson);
+                let source = if lesson.signature.trim().is_empty() {
+                    "project-lesson-ledger"
+                } else {
+                    &lesson.signature
+                };
+                let kind = if lesson.kind == crate::lessons::LessonKind::DevError {
+                    umadev_knowledge::PromptReferenceKind::Pitfall
+                } else {
+                    umadev_knowledge::PromptReferenceKind::Lesson
+                };
+                let rendered =
+                    umadev_knowledge::render_prompt_reference(umadev_knowledge::PromptReference {
+                        kind,
+                        corpus_origin: umadev_knowledge::CorpusOrigin::ProjectLearned,
+                        corpus_scope: umadev_knowledge::CorpusScope::Project,
+                        source,
+                        section: Some(&lesson.domain),
+                        content: &content,
+                    });
+                format!("{rendered}\n\n")
+            }
         }
     }
 }
@@ -253,29 +282,20 @@ fn structured_knowledge_hits(
     query_vec: Option<&[f32]>,
     expansion: Option<&str>,
 ) -> Vec<umadev_knowledge::ScoredChunk> {
-    let base = crate::phases::knowledge_root(&opts.project_root);
-    if !base.is_dir() || matches!(phase, Phase::DocsConfirm | Phase::PreviewConfirm) {
+    if matches!(phase, Phase::DocsConfirm | Phase::PreviewConfirm) {
         return Vec::new();
     }
-    let cfg = crate::config::load_project_config(&opts.project_root).knowledge;
-    if !cfg.enabled {
+    let rcfg = crate::phases::knowledge_retrieval_config(&opts.project_root);
+    if !rcfg.enabled {
         return Vec::new();
     }
-    let rcfg = umadev_knowledge::RetrievalConfig {
-        enabled: true,
-        engine: match cfg.engine.as_str() {
-            "hybrid" => umadev_knowledge::RetrievalEngine::Hybrid,
-            _ => umadev_knowledge::RetrievalEngine::Bm25,
-        },
-        top_k: cfg.top_k,
-        custom_dirs: Vec::new(),
-    };
+    let corpus = crate::phases::knowledge_corpus_for_config(&opts.project_root, &rcfg);
     // HyDE: when the runner generated a hypothetical answer, its BM25 ranking is
     // RRF-fused with the requirement's (see the knowledge crate). `None` →
     // identical to the prior `retrieve_for_phase_with_vector` behaviour.
-    umadev_knowledge::retrieve_for_phase_with_expansion(
+    umadev_knowledge::retrieve_corpus_with_vector_and_expansion(
         &opts.project_root,
-        &base,
+        &corpus,
         &rcfg,
         &opts.requirement,
         phase,
@@ -355,10 +375,16 @@ fn merge_dual_channel(
 ) -> String {
     let mut items: Vec<ChannelItem> = Vec::with_capacity(knowledge.len() + lessons.len());
     for (rank, hit) in knowledge.into_iter().enumerate() {
-        items.push(ChannelItem::Knowledge { rank, hit });
+        items.push(ChannelItem::Knowledge {
+            rank,
+            hit: Box::new(hit),
+        });
     }
     for (rank, lesson) in lessons {
-        items.push(ChannelItem::Lesson { rank, lesson });
+        items.push(ChannelItem::Lesson {
+            rank,
+            lesson: Box::new(lesson),
+        });
     }
     if items.is_empty() {
         return String::new();
@@ -961,7 +987,12 @@ pub(crate) fn load_design_system_inject(opts: &RunOptions, phase: Phase) -> Stri
              - 在 UIUX 文档里用 `## Visual direction` 声明此方向并说明为何契合本产品。\n\
              - 只有有充分理由才可改档,改了也必须**仍是一套完整 token 契约**,绝不退回 generic(无 token、系统默认字体、紫渐变、emoji 图标)。\n\n",
         );
-        inject.push_str(&content);
+        inject.push_str(&render_knowledge_file_reference(
+            opts,
+            &path,
+            &content,
+            umadev_knowledge::PromptReferenceKind::DesignSystem,
+        ));
 
         // The taste / anti-AI-slop rules. They matter most at IMPLEMENTATION
         // time, so the full hard-spec file is inlined for the FRONTEND phase
@@ -974,7 +1005,12 @@ pub(crate) fn load_design_system_inject(opts: &RunOptions, phase: Phase) -> Stri
         if phase == Phase::Frontend {
             if let Ok(slop) = fs::read_to_string(&slop_path) {
                 inject.push_str("\n\n");
-                inject.push_str(&slop);
+                inject.push_str(&render_knowledge_file_reference(
+                    opts,
+                    &slop_path,
+                    &slop,
+                    umadev_knowledge::PromptReferenceKind::DesignSystem,
+                ));
             }
         } else if slop_path.exists() {
             inject.push_str(
@@ -1018,10 +1054,55 @@ pub(crate) fn load_design_system_inject(opts: &RunOptions, phase: Phase) -> Stri
             inject.push_str("The user selected this template via `/template ");
             inject.push_str(&opts.seed_template);
             inject.push_str("`. Follow its page structure and quality gates.\n\n");
-            inject.push_str(&content);
+            inject.push_str(&render_knowledge_file_reference(
+                opts,
+                &path,
+                &content,
+                umadev_knowledge::PromptReferenceKind::SeedTemplate,
+            ));
         }
     }
     inject
+}
+
+fn render_knowledge_file_reference(
+    opts: &RunOptions,
+    path: &std::path::Path,
+    content: &str,
+    kind: umadev_knowledge::PromptReferenceKind,
+) -> String {
+    let canonical = std::fs::canonicalize(path).ok();
+    let corpus = crate::phases::knowledge_corpus(&opts.project_root);
+    let files = corpus.markdown_files();
+    let found = files.iter().find(|file| {
+        canonical
+            .as_ref()
+            .is_some_and(|expected| file.path() == expected)
+            || file.path() == path
+    });
+    let source = found.map_or_else(
+        || {
+            path.strip_prefix(&opts.project_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        },
+        |file| file.relative_path().to_string(),
+    );
+    umadev_knowledge::render_prompt_reference(umadev_knowledge::PromptReference {
+        kind,
+        corpus_origin: found.map_or(
+            umadev_knowledge::CorpusOrigin::Unknown,
+            umadev_knowledge::CorpusFile::origin,
+        ),
+        corpus_scope: found.map_or(
+            umadev_knowledge::CorpusScope::Unknown,
+            umadev_knowledge::CorpusFile::scope,
+        ),
+        source: &source,
+        section: None,
+        content,
+    })
 }
 
 fn render_docs(slug: &str, req: &str, design_inject: &str) -> String {
@@ -1749,6 +1830,9 @@ mod tests {
                     domain: "d".to_string(),
                     difficulty: None,
                     is_learned: false,
+                    is_safe_learned_pitfall: false,
+                    corpus_origin: umadev_knowledge::CorpusOrigin::Unknown,
+                    corpus_scope: umadev_knowledge::CorpusScope::Unknown,
                 },
                 body: body.to_string(),
                 tokens: vec![],
@@ -1799,6 +1883,7 @@ mod tests {
         // renderer (additive-only contract). Use an isolated root whose local
         // knowledge directory is intentionally empty so process-global test env
         // (`UMADEV_KNOWLEDGE_DIR`, staged corpora) cannot make this flaky.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("knowledge")).unwrap();
         std::fs::write(tmp.path().join("knowledge/.keep"), "").unwrap();
@@ -1827,6 +1912,9 @@ mod tests {
         ];
         let out = merge_dual_channel(knowledge, lessons, RRF_K, EVOLUTION_BUDGET_TOKENS);
         assert!(out.contains("Evolution memory"));
+        assert!(out.contains("<umadev_reference_data_v1>"));
+        assert!(out.contains("\"authority\":\"none\""));
+        assert!(out.contains("\"corpus_origin\":\"project_learned\""));
         // Both channels are represented.
         assert!(out.contains("k0.md"), "knowledge present: {out}");
         assert!(out.contains("lesson-A"), "lesson present: {out}");

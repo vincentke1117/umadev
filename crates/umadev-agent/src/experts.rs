@@ -1,11 +1,11 @@
 //! Expert prompts — the system/user messages each phase hands to a
-//! [`Runtime`] to produce real LLM-driven artifacts.
+//! [`umadev_runtime::Runtime`] to produce real LLM-driven artifacts.
 //!
 //! Each expert builds one message pair: a `system` prompt that pins the
 //! expert's role + the UmaDev spec constraints, plus a `user`
 //! message carrying the requirement and any prior artifacts. The
 //! returned [`Prompt`] is provider-agnostic — runners hand it to any
-//! [`Runtime`] implementation.
+//! [`umadev_runtime::Runtime`] implementation.
 //!
 //! Why prompts live here:
 //! - They are *part of the agent's policy*, not a runtime concern.
@@ -147,7 +147,7 @@ break symmetry to look interesting.\n\
 /// landing page every one of those is right. For a dashboard / admin / devtool
 /// every one of those is WRONG — we were actively making product UIs worse.
 ///
-/// So the law now splits: a register-independent [`DESIGN_LAW_CORE`] (token
+/// So the law now splits: a register-independent design-law core (token
 /// discipline, paired foregrounds + measured contrast, the banned AI hue, one
 /// icon system, real content, component states) plus exactly ONE register half.
 ///
@@ -627,7 +627,8 @@ pub fn delivery_prompt(slug: &str, requirement: &str, arch_excerpt: &str) -> Pro
 /// continuous driver injects it as the first lean directive's preamble.
 ///
 /// Kept deliberately SHORT: the whole point of the lean path is speed, so this is
-/// a few sentences, not the multi-paragraph [`SPEC_PREAMBLE`] + [`anti_slop_law`]
+/// a few sentences, not the multi-paragraph internal specification preamble +
+/// [`anti_slop_law`]
 /// that the heavyweight document phases carry.
 #[must_use]
 pub fn lean_priming() -> &'static str {
@@ -1075,13 +1076,18 @@ pub fn agentic_team_identity() -> &'static str {
      and done well. Bring the right seat to whatever they ask. When something \
      needs building or fixing, drive it the way a strong director would: scope it \
      yourself, build to your team's bar, proportionate to the task. When it's just \
-     conversation, be warm and quick — you don't run a process for small talk."
+     conversation, be warm and quick — you don't run a process for small talk. \
+     The user's latest message is the objective for THIS turn, subject to safety \
+     and repository conventions. Earlier conversation, plans, CURRENT.md, run \
+     notes, and output documents are context — never permission to continue old \
+     work, widen scope, or fix adjacent issues. Resume them only when the user \
+     explicitly asks to continue or resume."
 }
 
 /// The COMPACT craft-and-taste block for work-class agentic turns (a turn that
 /// reads / changes / builds something — NOT small talk).
 ///
-/// A deliberately TERSE distillation of the heavyweight [`SPEC_PREAMBLE`] +
+/// A deliberately TERSE distillation of the heavyweight internal specification preamble +
 /// [`anti_slop_law`] the document phases carry — the core of how this team's work
 /// looks when it's good, framed as the director's OWN standards and taste, not a
 /// compliance checklist. So a routine "fix this" turn carries the team's bar
@@ -1711,6 +1717,11 @@ mod tests {
         assert!(lower.contains("director") && lower.contains("team"));
         assert!(
             lower.contains("judgment") || lower.contains("ownership") || lower.contains("decide")
+        );
+        assert!(
+            lower.contains("latest message")
+                && lower.contains("never permission")
+                && lower.contains("explicitly asks")
         );
         // Always-on identity is short — it must not read like the heavy preamble.
         assert!(p.len() < SPEC_PREAMBLE.len(), "identity must stay short");

@@ -59,7 +59,7 @@ pub struct ErrorInsight {
 /// - **WEAK markers** are tokens that legitimately appear in BENIGN output
 ///   (`not found`, `missing`, `undefined`, `fail`, `denied`, `rejected`,
 ///   `no such`). They only count as an error when the text is NOT clearly a
-///   success/benign line (see [`looks_benign`]) — so `0 missing`,
+///   success/benign line (see the internal benign-output classifier) — so `0 missing`,
 ///   `no undefined behavior`, `up to date` no longer mint a bogus pitfall.
 ///
 /// Case-insensitive substring scan over common error markers across JS / TS /
@@ -179,6 +179,41 @@ pub fn classify_error(text: &str) -> ErrorInsight {
     }
 
     generic_fallback(&lower, &line)
+}
+
+/// Return trusted, classifier-owned guidance for a cross-project error family.
+///
+/// The input is a family key, never raw project text. Each key is classified
+/// from a fixed synthetic probe, then checked against the requested family
+/// before its static root-cause and fix strings are returned. This lets global
+/// memory reuse the classifier's maintained advice without copying potentially
+/// hand-edited `Lesson.fix` / `Lesson.root_cause` fields across projects.
+pub(crate) fn classifier_owned_family_guidance(family: &str) -> Option<(String, String)> {
+    let probe = match family {
+        "windows/powershell-execution-policy" => {
+            "npm.ps1 cannot be loaded because running scripts is disabled on this system"
+        }
+        "dependency/test-deps-missing" => "pytest: command not found",
+        "dependency/module-not-found" => "Error: Cannot find module 'umadev-redacted-placeholder'",
+        "dependency/package-manager" => "npm ERR! ERESOLVE unable to resolve dependency tree",
+        "runtime/permission" => "Error: EACCES: permission denied",
+        "type/type-mismatch" => "error[E0308]: mismatched types",
+        "runtime/undefined-access" => "TypeError: Cannot read properties of undefined",
+        "runtime/panic" => "thread 'main' panicked at synthetic.rs:1",
+        "runtime/port-in-use" => "Error: listen EADDRINUSE: address already in use",
+        "network/cors" => "Access to fetch blocked by CORS policy",
+        "network/connection-refused" => "Error: ECONNREFUSED 127.0.0.1",
+        "api/http-error" => "Request failed with status code 500 (Internal Server Error)",
+        "config/env-missing" => "Error: required environment variable is not set",
+        "build/syntax" => "SyntaxError: Unexpected token",
+        "test/assertion" => "AssertionError: assertion failed",
+        "build/build-failed" => "Build failed with 1 error",
+        _ => return None,
+    };
+    let insight = classify_error(probe);
+    let mut parts = insight.signature.split('/');
+    let detected_family = format!("{}/{}", parts.next()?, parts.next()?);
+    (insight.recognized && detected_family == family).then_some((insight.root_cause, insight.fix))
 }
 
 // ---------------------------------------------------------------------------
@@ -1099,5 +1134,33 @@ mod tests {
         let a2 = classify_error("Module not found: Error: Can't resolve 'lodash'");
         assert_eq!(a1.signature, "dependency/module-not-found/lodash");
         assert_eq!(a2.signature, "dependency/module-not-found/lodash");
+    }
+
+    #[test]
+    fn classifier_owned_global_guidance_covers_only_known_families() {
+        for family in [
+            "windows/powershell-execution-policy",
+            "dependency/test-deps-missing",
+            "dependency/module-not-found",
+            "dependency/package-manager",
+            "runtime/permission",
+            "type/type-mismatch",
+            "runtime/undefined-access",
+            "runtime/panic",
+            "runtime/port-in-use",
+            "network/cors",
+            "network/connection-refused",
+            "api/http-error",
+            "config/env-missing",
+            "build/syntax",
+            "test/assertion",
+            "build/build-failed",
+        ] {
+            let (cause, fix) = classifier_owned_family_guidance(family)
+                .unwrap_or_else(|| panic!("missing trusted guidance for {family}"));
+            assert!(!cause.is_empty(), "{family}");
+            assert!(!fix.is_empty(), "{family}");
+        }
+        assert!(classifier_owned_family_guidance("general/error").is_none());
     }
 }

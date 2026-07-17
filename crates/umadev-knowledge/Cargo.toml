@@ -10,6 +10,7 @@ description = "UmaDev knowledge base — BM25 + optional vector retrieval, repla
 
 [dependencies]
 umadev-spec = { workspace = true }
+umadev-state = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,6 +26,7 @@ regex = { workspace = true }
 # fixed by spec, so the cache survives Rust-stdlib hasher changes that would
 # otherwise invalidate the whole .umadev/kb-index/ between toolchain bumps.
 sha2 = { workspace = true }
+getrandom = { workspace = true }
 
 # Real embeddings HTTP transport (OpenAI-compatible /v1/embeddings + Ollama
 # local /api/embeddings). On by DEFAULT — the shipped binary already links

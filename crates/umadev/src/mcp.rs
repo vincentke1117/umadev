@@ -12,11 +12,11 @@
 //! - `initialize` → server capabilities
 //! - `tools/list` → the governance tools (`govern_file` / `govern_command`)
 //!   plus the read-mostly director tools (`plan_status` / `contract_check` /
-//!   `lessons_recall` / `governance_summary`)
+//!   `lessons_recall` / `pitfalls_recall` / `governance_summary`)
 //! - `tools/call` → run the named tool over a project root
 //!
 //! ## Safety contract
-//! The two `govern_*` tools are content-scoped pure checks. The four director
+//! The two `govern_*` tools are content-scoped pure checks. The five director
 //! tools are **read-mostly + fail-open by contract**: each calls an existing
 //! pure agent/contract entry point over the project root and, on ANY failure
 //! (missing/corrupt artifact, unreadable dir), returns an empty / "unavailable"
@@ -41,8 +41,10 @@ const TOOL_GOVERN_COMMAND: &str = "govern_command";
 const TOOL_PLAN_STATUS: &str = "plan_status";
 /// Tool name: cross-check frontend calls against the API contract (read-only).
 const TOOL_CONTRACT_CHECK: &str = "contract_check";
-/// Tool name: recall recorded pitfalls + corrective strategies from memory.
+/// Tool name: recall curated reusable rules from memory.
 const TOOL_LESSONS_RECALL: &str = "lessons_recall";
+/// Tool name: inspect concrete pitfall incidents and their fix lifecycle.
+const TOOL_PITFALLS_RECALL: &str = "pitfalls_recall";
 /// Tool name: summarise the active rule policy + the audit-trail tail.
 const TOOL_GOVERNANCE_SUMMARY: &str = "governance_summary";
 
@@ -304,12 +306,23 @@ fn handle_request(req: &JsonRpcRequest, policy: &Policy) -> Option<JsonRpcRespon
                     },
                     {
                         "name": TOOL_LESSONS_RECALL,
-                        "description": "Recall recorded pitfalls + corrective strategies from UmaDev's self-evolving memory for a project. Optionally filter by a free-text query; on-stack pitfalls (matching the project's dependency fingerprint) surface too. Returns each pitfall's signature, hit count, fix-lifecycle status, recorded fix and already-tried-but-failed fixes, plus validated success patterns. Read-only.",
+                        "description": "Recall only curated reusable rules from UmaDev memory. Returns typed rules (pitfall / belief / mechanically validated pattern) once each; concrete incidents are deliberately excluded and available through pitfalls_recall. Passive recall is read-only and is not credited with later outcomes unless an exact repair-attempt token exists.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "project_root": { "type": "string", "description": "Project root directory. Defaults to the server's current directory." },
-                                "query": { "type": "string", "description": "Free-text query to filter pitfalls by (title / signature / fix / tech-stack context). Optional — omit to get the worst-first top pitfalls." }
+                                "query": { "type": "string", "description": "Free-text query to filter curated rules by title, rule, root cause, source type or source signature. Optional." }
+                            }
+                        }
+                    },
+                    {
+                        "name": TOOL_PITFALLS_RECALL,
+                        "description": "Inspect concrete pitfall incidents separately from curated lessons. Returns episode-deduped hit counts, UTC first/latest/verified timestamps, bounded evidence provenance, exact repair-attempt lifecycle, failed fixes, privacy-safe unclassified candidates and quarantined legacy-generic audit counts. Read-only.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "project_root": { "type": "string", "description": "Project root directory. Defaults to the server's current directory." },
+                                "query": { "type": "string", "description": "Free-text query to filter actionable incidents by title, exact signature, fix or tech-stack context. Optional — omit to get the worst-first incidents." }
                             }
                         }
                     },
@@ -350,7 +363,7 @@ fn handle_request(req: &JsonRpcRequest, policy: &Policy) -> Option<JsonRpcRespon
 /// present — `tools/call` is never a notification in this server).
 ///
 /// Dispatches to the named tool. The two `govern_*` tools are content-scoped
-/// pure checks; the four director tools are read-mostly + fail-open (any
+/// pure checks; the five director tools are read-mostly + fail-open (any
 /// failure degrades to an empty/"unavailable" result, never an error response).
 /// Each tool yields `(text, is_error)`; only an UNKNOWN tool name is a protocol
 /// error (`-32602`).
@@ -367,6 +380,7 @@ fn handle_tool_call(req: &JsonRpcRequest, id: &Value, policy: &Policy) -> JsonRp
         TOOL_PLAN_STATUS => Some(plan_status_tool(&args)),
         TOOL_CONTRACT_CHECK => Some(contract_check_tool(&args)),
         TOOL_LESSONS_RECALL => Some(lessons_recall_tool(&args)),
+        TOOL_PITFALLS_RECALL => Some(pitfalls_recall_tool(&args)),
         TOOL_GOVERNANCE_SUMMARY => Some(governance_summary_tool(&args)),
         _ => None,
     };
@@ -600,11 +614,14 @@ fn violation_kind_str(kind: umadev_contract::validate::ViolationKind) -> &'stati
     }
 }
 
-/// `lessons_recall`: recall recorded pitfalls + corrective strategies from the
-/// self-evolving memory. Uses the PURE-READ [`umadev_agent::lessons_report`]
-/// (never the prompt-assembly recall, which mutates efficacy bookkeeping), then
-/// filters by the optional query + the project's tech-stack fingerprint.
-/// Fail-open: an empty KB yields `has_lessons:false`.
+/// `lessons_recall`: recall curated reusable rules only. Concrete pitfall
+/// incidents belong to [`pitfalls_recall_tool`], so one validated pattern or
+/// pitfall cannot appear twice under overlapping response fields.
+///
+/// Passive recall is a pure read and carries an explicit attribution boundary:
+/// UmaDev does not credit a later pass/fail to a rule merely because it was
+/// eligible for prompt assembly. Only exact repair-attempt tokens settle a
+/// pitfall fix lifecycle.
 fn lessons_recall_tool(args: &Value) -> (String, bool) {
     let root = arg_root(args);
     let query = args
@@ -613,24 +630,101 @@ fn lessons_recall_tool(args: &Value) -> (String, bool) {
         .unwrap_or("")
         .to_ascii_lowercase();
     let report = umadev_agent::lessons_report(&root);
-    if report.is_empty() {
-        return (
-            json_text(&json!({
-                "has_lessons": false,
-                "message": "No lessons recorded yet for this project.",
-                "pitfalls": [],
-                "validated_patterns": [],
-            })),
-            false,
-        );
-    }
-    // Build the relevance filter from the query words PLUS the project's real
-    // dependency fingerprint (so an on-stack pitfall surfaces without a textual
-    // query). With NO query and NO detectable stack there is nothing to filter
-    // on → return the worst-first top pitfalls as-is.
     let q_tokens: Vec<String> = query
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.len() >= 2)
+        .map(str::to_string)
+        .collect();
+    let relevant = |lesson: &umadev_agent::CuratedLessonEntry| -> bool {
+        if q_tokens.is_empty() {
+            return true;
+        }
+        let hay = format!(
+            "{} {} {} {} {}",
+            lesson.title,
+            lesson.rule,
+            lesson.root_cause,
+            lesson.source_kind,
+            lesson.source_signatures.join(" ")
+        )
+        .to_ascii_lowercase();
+        q_tokens.iter().any(|token| hay.contains(token.as_str()))
+    };
+    let lessons: Vec<Value> = report
+        .curated_lessons
+        .iter()
+        .filter(|lesson| relevant(lesson))
+        .map(|lesson| {
+            json!({
+                "title": lesson.title,
+                "rule": lesson.rule,
+                "root_cause": lesson.root_cause,
+                "evidence_count": lesson.evidence_count,
+                "status": curated_lesson_status_str(lesson.status),
+                "source_kind": lesson.source_kind,
+                "source_signatures": lesson.source_signatures,
+                "first_observed_at": lesson.first_observed_at,
+                "last_observed_at": lesson.last_observed_at,
+                "last_verified_at": lesson.last_verified_at,
+                "timeline_complete": lesson.timeline_complete,
+            })
+        })
+        .collect();
+    let has_lessons = !lessons.is_empty();
+    let candidate_only_empty =
+        !has_lessons && report.curated_lessons.is_empty() && report.has_unclassified_candidates();
+    let out = json!({
+        "schema_version": 3,
+        "kind": "curated_lessons",
+        "has_lessons": has_lessons,
+        "lessons": lessons,
+        "empty_state": if candidate_only_empty {
+            json!({
+                "reason": "unclassified_candidates_not_curated",
+                "unclassified_candidates": report.efficacy.unclassified_candidates,
+                "independent_failure_episodes": report.efficacy.unclassified_candidate_hits,
+                "actionable": false,
+                "fix_generated": false,
+                "inspect_with": "pitfalls_recall",
+            })
+        } else {
+            Value::Null
+        },
+        "outcome_attribution": {
+            "passive_recall": "not_attributed",
+            "pitfall_repair_attempts": "exact_attempt_token",
+            "unknown_or_unsettled": "no_state_change",
+        },
+        "message": if has_lessons {
+            Value::Null
+        } else if candidate_only_empty {
+            Value::String(format!(
+                "No curated reusable lesson exists yet. {} privacy-safe unclassified candidate(s) record {} independent failure episode(s), but UmaDev will not invent a fix or promote them to rules before precise classification; inspect them with pitfalls_recall.",
+                report.efficacy.unclassified_candidates,
+                report.efficacy.unclassified_candidate_hits,
+            ))
+        } else {
+            Value::String("No curated reusable lessons matched this project/query; inspect concrete incidents with pitfalls_recall.".to_string())
+        },
+    });
+    (json_text(&out), false)
+}
+
+/// `pitfalls_recall`: inspect the concrete incident ledger independently from
+/// reusable lessons. Uses the pure-read report, then filters actionable
+/// incidents by the optional query plus the project's current stack. Unknown
+/// candidates remain hash/time/count-only and never carry advice.
+fn pitfalls_recall_tool(args: &Value) -> (String, bool) {
+    let root = arg_root(args);
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let report = umadev_agent::lessons_report(&root);
+    let q_tokens: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() >= 2)
         .map(str::to_string)
         .collect();
     let stack: std::collections::HashSet<String> =
@@ -638,67 +732,134 @@ fn lessons_recall_tool(args: &Value) -> (String, bool) {
             .into_iter()
             .collect();
     let has_filter = !q_tokens.is_empty() || !stack.is_empty();
-    let relevant = |e: &umadev_agent::PitfallEntry| -> bool {
+    let relevant = |incident: &umadev_agent::PitfallEntry| -> bool {
         if !has_filter {
             return true;
         }
         let hay = format!(
             "{} {} {} {}",
-            e.title,
-            e.signature,
-            e.fix,
-            e.context.join(" ")
+            incident.title,
+            incident.signature,
+            incident.fix,
+            incident.context.join(" ")
         )
         .to_ascii_lowercase();
-        let by_query = q_tokens.iter().any(|t| hay.contains(t.as_str()));
-        let by_stack = e
-            .context
-            .iter()
-            .any(|c| stack.contains(&c.to_ascii_lowercase()));
-        by_query || by_stack
+        q_tokens.iter().any(|token| hay.contains(token.as_str()))
+            || incident
+                .context
+                .iter()
+                .any(|context| stack.contains(&context.to_ascii_lowercase()))
     };
-    let pitfalls: Vec<Value> = report
-        .top_pitfalls
+    let incidents: Vec<Value> = report
+        .incidents
         .iter()
-        .filter(|e| relevant(e))
-        .map(|e| {
+        .filter(|incident| relevant(incident))
+        .map(|incident| {
             json!({
-                "title": e.title,
-                "signature": e.signature,
-                "hits": e.hits,
-                "status": pitfall_status_str(e.status),
-                "fix": e.fix,
-                "context": e.context,
-                "failed_fixes": e.failed_fixes,
+                "title": incident.title,
+                "signature": incident.signature,
+                "hits": incident.hits,
+                "status": pitfall_status_str(incident.status),
+                "fix": incident.fix,
+                "root_cause": incident.root_cause,
+                "context": incident.context,
+                "failed_fixes": incident.failed_fixes,
+                "first_observed_at": incident.first_observed_at,
+                "last_observed_at": incident.last_observed_at,
+                "last_recurred_at": incident.last_recurred_at,
+                "last_verified_at": incident.last_verified_at,
+                "recent_evidence_count": incident.recent_evidence_count,
+                "timeline_complete": incident.timeline_complete,
+                "recent_observations": incident.recent_observations.iter().map(|observation| json!({
+                    "observed_at": observation.observed_at,
+                    "episode_id": observation.episode_id,
+                    "evidence_hash": observation.evidence_hash,
+                    "source": observation.source,
+                    "base": observation.base,
+                    "base_version": observation.base_version,
+                    "workspace_scope": observation.workspace_scope,
+                    "outcome": observation.outcome,
+                    "causal_attempt_id": observation.causal_attempt_id,
+                })).collect::<Vec<_>>(),
             })
         })
         .collect();
-    let validated: Vec<Value> = report
-        .validated_patterns
+    let unclassified_candidates: Vec<Value> = report
+        .unclassified_candidates
         .iter()
-        .map(|v| json!({ "title": v.title, "summary": v.summary }))
+        .map(|candidate| {
+            json!({
+                "fingerprint": candidate.fingerprint,
+                "hits": candidate.hits,
+                "first_observed_at": candidate.first_observed_at,
+                "last_observed_at": candidate.last_observed_at,
+                "recent_evidence_count": candidate.recent_evidence_count,
+                "timeline_complete": candidate.timeline_complete,
+                "recent_observations": candidate.recent_observations.iter().map(|observation| json!({
+                    "observed_at": observation.observed_at,
+                    "episode_id": observation.episode_id,
+                    "evidence_hash": observation.evidence_hash,
+                    "source": observation.source,
+                    "base": observation.base,
+                    "base_version": observation.base_version,
+                    "workspace_scope": observation.workspace_scope,
+                    "outcome": observation.outcome,
+                    "causal_attempt_id": observation.causal_attempt_id,
+                })).collect::<Vec<_>>(),
+                "actionable": false,
+                "curated": false,
+            })
+        })
         .collect();
     let out = json!({
-        "has_lessons": true,
-        "efficacy": {
+        "schema_version": 3,
+        "kind": "pitfall_incidents",
+        "has_incidents": report.has_incidents(),
+        "has_unclassified_candidates": report.has_unclassified_candidates(),
+        "counting_model": "one_historical_hit_per_signature_per_unique_evidence_id",
+        "fix_lifecycle": {
             "total": report.efficacy.total,
+            "hypothesis": report.efficacy.hypothesis,
+            "corroborated": report.efficacy.corroborated,
             "validated": report.efficacy.validated,
+            "invalidated": report.efficacy.invalidated,
+            // Compatibility counters for schema-v2 clients.
             "recurring": report.efficacy.recurring,
             "active": report.efficacy.active,
+            "quarantined_records": report.efficacy.quarantined_records,
+            "quarantined_hits": report.efficacy.quarantined_hits,
+            "unclassified_candidates": report.efficacy.unclassified_candidates,
+            "unclassified_candidate_hits": report.efficacy.unclassified_candidate_hits,
         },
-        "pitfalls": pitfalls,
-        "validated_patterns": validated,
+        "incidents": incidents,
+        "unclassified_candidates": unclassified_candidates,
+        "outcome_attribution": {
+            "repair_attempts": "exact_attempt_token",
+            "passive_recall": "not_attributed",
+            "unknown_or_unsettled": "no_state_change",
+        },
     });
     (json_text(&out), false)
+}
+
+fn curated_lesson_status_str(status: umadev_agent::CuratedLessonStatus) -> &'static str {
+    use umadev_agent::CuratedLessonStatus;
+    match status {
+        CuratedLessonStatus::Hypothesis => "hypothesis",
+        CuratedLessonStatus::Corroborated => "corroborated",
+        CuratedLessonStatus::Validated => "validated",
+        CuratedLessonStatus::Invalidated => "invalidated",
+    }
 }
 
 /// Stable wire string for a pitfall's fix-lifecycle status.
 fn pitfall_status_str(status: umadev_agent::PitfallStatus) -> &'static str {
     use umadev_agent::PitfallStatus;
     match status {
-        PitfallStatus::Active => "active",
+        PitfallStatus::Hypothesis => "hypothesis",
+        PitfallStatus::Corroborated => "corroborated",
         PitfallStatus::Validated => "validated",
-        PitfallStatus::Recurring => "recurring",
+        PitfallStatus::Invalidated => "invalidated",
     }
 }
 
@@ -1100,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_all_six_tools() {
+    fn tools_list_exposes_all_seven_tools() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!(2)),
@@ -1113,12 +1274,13 @@ mod tests {
         // The two original governance tools stay intact …
         assert!(names.contains(&"govern_file"));
         assert!(names.contains(&"govern_command"));
-        // … plus the four new director tools.
+        // … plus the five director tools (lessons and incidents are distinct).
         assert!(names.contains(&"plan_status"));
         assert!(names.contains(&"contract_check"));
         assert!(names.contains(&"lessons_recall"));
+        assert!(names.contains(&"pitfalls_recall"));
         assert!(names.contains(&"governance_summary"));
-        assert_eq!(names.len(), 6, "exactly six tools are registered");
+        assert_eq!(names.len(), 7, "exactly seven tools are registered");
         // Every tool advertises a valid object input schema.
         for t in &tools {
             assert_eq!(t["inputSchema"]["type"], "object", "tool {t:?}");
@@ -1274,36 +1436,76 @@ mod tests {
     }
 
     #[test]
-    fn lessons_recall_returns_the_recorded_pitfall() {
+    fn lessons_and_pitfalls_recall_have_non_overlapping_payloads() {
         let tmp = tempfile::tempdir().unwrap();
         seed_pitfall(tmp.path());
 
-        // Query matches the signature/fix/title.
-        let out = director_tool("lessons_recall", tmp.path(), json!({ "query": "router" }));
-        assert_eq!(out["has_lessons"], true);
-        assert_eq!(out["efficacy"]["total"], 1);
-        let pits = out["pitfalls"].as_array().unwrap();
+        // The repeated incident produces one curated rule, with no incident or
+        // duplicated validated-pattern fields in the lessons contract.
+        let lessons = director_tool("lessons_recall", tmp.path(), json!({ "query": "router" }));
+        assert_eq!(lessons["kind"], "curated_lessons");
+        assert_eq!(lessons["has_lessons"], true);
+        assert_eq!(lessons["lessons"].as_array().unwrap().len(), 1);
+        assert_eq!(lessons["schema_version"], 3);
+        assert_eq!(lessons["lessons"][0]["status"], "hypothesis");
+        assert_eq!(lessons["lessons"][0]["evidence_count"], 0);
+        assert!(lessons.get("incidents").is_none());
+        assert!(lessons.get("pitfalls").is_none());
+        assert!(lessons.get("validated_patterns").is_none());
+        assert_eq!(
+            lessons["outcome_attribution"]["passive_recall"],
+            "not_attributed"
+        );
+
+        // Concrete episode/timeline data lives only in the incident tool.
+        let out = director_tool("pitfalls_recall", tmp.path(), json!({ "query": "router" }));
+        assert_eq!(out["kind"], "pitfall_incidents");
+        assert_eq!(out["fix_lifecycle"]["total"], 1);
+        assert!(out.get("lessons").is_none());
+        let pits = out["incidents"].as_array().unwrap();
         assert_eq!(pits.len(), 1);
         assert!(pits[0]["title"]
             .as_str()
             .unwrap()
             .contains("react-router-dom"));
         assert_eq!(pits[0]["hits"], 3);
-        assert_eq!(pits[0]["status"], "active");
+        assert_eq!(pits[0]["status"], "hypothesis");
         assert!(pits[0]["fix"].as_str().unwrap().contains("npm i"));
 
         // No query → the worst-first top pitfalls still surface.
-        let all = director_tool("lessons_recall", tmp.path(), json!({}));
-        assert_eq!(all["pitfalls"].as_array().unwrap().len(), 1);
+        let all = director_tool("pitfalls_recall", tmp.path(), json!({}));
+        assert_eq!(all["incidents"].as_array().unwrap().len(), 1);
 
         // A query that matches nothing on this (manifest-less → no stack) project
         // filters the pitfall out — honest empty, not a crash.
         let none = director_tool(
-            "lessons_recall",
+            "pitfalls_recall",
             tmp.path(),
             json!({ "query": "kubernetes" }),
         );
-        assert!(none["pitfalls"].as_array().unwrap().is_empty());
+        assert!(none["incidents"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lessons_recall_returns_a_validated_pattern_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = umadev_contract::parse_architecture(
+            "| Method | Path | Request | Response | Auth | Description |\n\
+             |---|---|---|---|---|---|\n\
+             | GET | /api/articles | - | - | none | List |\n",
+            "demo",
+        );
+        umadev_agent::capture_validated_patterns(tmp.path(), "demo", "blog", &spec, &[], true);
+
+        let out = director_tool("lessons_recall", tmp.path(), json!({}));
+        let lessons = out["lessons"].as_array().unwrap();
+        assert_eq!(lessons.len(), 1);
+        assert_eq!(lessons[0]["source_kind"], "validated_pattern");
+        assert_eq!(lessons[0]["status"], "hypothesis");
+        assert!(out.get("validated_patterns").is_none());
+
+        let incidents = director_tool("pitfalls_recall", tmp.path(), json!({}));
+        assert!(incidents["incidents"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -1311,7 +1513,116 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let out = director_tool("lessons_recall", tmp.path(), json!({ "query": "anything" }));
         assert_eq!(out["has_lessons"], false);
-        assert!(out["pitfalls"].as_array().unwrap().is_empty());
+        assert!(out["lessons"].as_array().unwrap().is_empty());
+        let incidents = director_tool("pitfalls_recall", tmp.path(), json!({}));
+        assert_eq!(incidents["has_incidents"], false);
+        assert!(incidents["incidents"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_incident_remains_an_explicit_hypothesis_in_both_views() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_pitfall(tmp.path());
+        let path = tmp.path().join(".umadev/learned/_raw/dev-errors.jsonl");
+        let mut row: Value = serde_json::from_str(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        row["occurrences"] = json!(1);
+        std::fs::write(&path, format!("{}\n", serde_json::to_string(&row).unwrap())).unwrap();
+
+        let lessons = director_tool("lessons_recall", tmp.path(), json!({}));
+        assert_eq!(lessons["has_lessons"], true);
+        assert_eq!(lessons["lessons"][0]["status"], "hypothesis");
+        assert_eq!(lessons["lessons"][0]["evidence_count"], 0);
+
+        let out = director_tool("pitfalls_recall", tmp.path(), json!({}));
+        assert_eq!(out["has_incidents"], true);
+        assert_eq!(out["fix_lifecycle"]["total"], 1);
+        assert_eq!(out["fix_lifecycle"]["hypothesis"], 1);
+        assert_eq!(out["fix_lifecycle"]["active"], 1);
+        assert_eq!(out["incidents"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            out["counting_model"],
+            "one_historical_hit_per_signature_per_unique_evidence_id"
+        );
+        assert!(out["incidents"][0].get("first_observed_at").is_some());
+        assert!(out["incidents"][0].get("timeline_complete").is_some());
+    }
+
+    #[test]
+    fn two_precise_episodes_create_one_corroborated_mcp_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        for _ in 0..2 {
+            let _ = umadev_agent::capture_dev_errors_detailed(
+                tmp.path(),
+                std::slice::from_ref(&error),
+                "demo",
+                "requirement",
+            );
+        }
+        let lessons = director_tool("lessons_recall", tmp.path(), json!({}));
+        assert_eq!(lessons["has_lessons"], true);
+        assert_eq!(lessons["lessons"].as_array().unwrap().len(), 1);
+        assert_eq!(lessons["lessons"][0]["status"], "corroborated");
+        assert_eq!(lessons["lessons"][0]["evidence_count"], 2);
+        let pitfalls = director_tool("pitfalls_recall", tmp.path(), json!({}));
+        assert_eq!(pitfalls["incidents"][0]["hits"], 2);
+    }
+
+    #[test]
+    fn pitfalls_recall_exposes_repeated_unknown_as_non_actionable_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = "frobnicator failed while applying quux protocol".to_string();
+        for _ in 0..2 {
+            let _ = umadev_agent::capture_dev_errors_detailed(
+                tmp.path(),
+                std::slice::from_ref(&error),
+                "demo",
+                "requirement",
+            );
+        }
+        let lessons = director_tool("lessons_recall", tmp.path(), json!({}));
+        assert_eq!(lessons["has_lessons"], false);
+        assert_eq!(
+            lessons["empty_state"]["reason"],
+            "unclassified_candidates_not_curated"
+        );
+        assert_eq!(lessons["empty_state"]["unclassified_candidates"], 1);
+        assert_eq!(lessons["empty_state"]["independent_failure_episodes"], 2);
+        assert_eq!(lessons["empty_state"]["actionable"], false);
+        assert_eq!(lessons["empty_state"]["fix_generated"], false);
+        assert!(lessons["message"]
+            .as_str()
+            .unwrap()
+            .contains("will not invent a fix"));
+        assert!(lessons["message"]
+            .as_str()
+            .unwrap()
+            .contains("pitfalls_recall"));
+        let out = director_tool("pitfalls_recall", tmp.path(), json!({}));
+        assert_eq!(out["has_incidents"], false);
+        assert_eq!(out["has_unclassified_candidates"], true);
+        assert_eq!(out["fix_lifecycle"]["unclassified_candidates"], 1);
+        assert_eq!(out["fix_lifecycle"]["unclassified_candidate_hits"], 2);
+        assert!(out["incidents"].as_array().unwrap().is_empty());
+        let candidates = out["unclassified_candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["hits"], 2);
+        assert_eq!(candidates[0]["actionable"], false);
+        assert_eq!(candidates[0]["curated"], false);
+        assert!(candidates[0]["last_observed_at"].is_string());
+        let observations = candidates[0]["recent_observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(observations
+            .iter()
+            .all(|observation| observation["observed_at"].is_string()));
+        assert!(!out.to_string().contains("frobnicator failed"));
     }
 
     #[test]
@@ -1352,6 +1663,8 @@ mod tests {
         assert_eq!(contract["has_contract"], false);
         let lessons = director_tool("lessons_recall", missing, json!({}));
         assert_eq!(lessons["has_lessons"], false);
+        let pitfalls = director_tool("pitfalls_recall", missing, json!({}));
+        assert_eq!(pitfalls["has_incidents"], false);
         // governance_summary still answers (default policy + empty tail).
         let gov = director_tool("governance_summary", missing, json!({}));
         assert!(gov["total_clauses"].as_u64().unwrap() > 0);

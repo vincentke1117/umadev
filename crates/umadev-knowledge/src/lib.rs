@@ -20,10 +20,10 @@
 //!   with mixed ASCII + CJK-bigram tokenisation. Serialised to
 //!   `.umadev/kb-index/bm25.bin` and rebuilt only when source files
 //!   change (mtime-checked).
-//! - **`vector`** — an OPTIONAL semantic layer. When `OPENAI_EMBED_KEY` is
-//!   present it embeds each chunk via the `/v1/embeddings` endpoint the
-//!   user's existing subscription already covers (no new dependency) and
-//!   stores the vectors. No key → falls back to BM25 silently.
+//! - **`vector`** — an optional semantic layer. A locally cached candle model
+//!   is preferred. Sending text to a remote `/v1/embeddings` endpoint requires
+//!   both `OPENAI_EMBED_KEY` and `UMADEV_ALLOW_CLOUD_EMBED=1`; otherwise it
+//!   stays local or falls back to BM25.
 //! - **`retrieve`** — one entry point that picks the configured engine and
 //!   returns ranked [`Chunk`] hits with scores, ready for the agent to
 //!   format into a prompt or a TUI panel.
@@ -32,6 +32,8 @@
 //! - Pure functions over on-disk data. Retrieval NEVER blocks the
 //!   pipeline: a corrupt/missing index returns an empty result, not an
 //!   error (fail-open, same as the governance kernel).
+//! - Retrieved text reaches a model only through [`render_prompt_reference`]:
+//!   provenance is retained, but no corpus source carries instruction authority.
 //! - The optional vector layer touches the network only when explicitly
 //!   enabled by an env var; the default engine is fully offline.
 
@@ -59,11 +61,16 @@
 )]
 
 pub mod chunker;
+pub mod corpus;
+pub mod eval;
 pub mod index;
 /// Bundled local embedding backend (candle, pure Rust). Only compiled with the
-/// `vector-local` feature; the npm package ships the model so it works offline.
+/// `vector-local` feature; the launcher fetches and verifies the model once,
+/// after which inference is offline.
 #[cfg(feature = "vector-local")]
 pub mod local_embed;
+pub mod prompt_reference;
+pub mod query_expansion;
 pub mod repomap;
 pub mod retrieve;
 pub mod tokenizer;
@@ -72,22 +79,41 @@ pub mod tokenizer;
 pub mod usefulness;
 pub mod vector;
 
-pub use chunker::{chunk_file, chunk_text, Chunk, ChunkMeta};
+pub use chunker::{
+    chunk_file, chunk_text, front_matter_field, front_matter_value, Chunk, ChunkMeta,
+    FrontMatterField,
+};
+pub use corpus::{
+    knowledge_roots, knowledge_roots_with_recall_policy, CorpusFile, CorpusOrigin, CorpusRoot,
+    CorpusScope, CorpusSet,
+};
+pub use eval::{
+    evaluate_abstentions, evaluate_rankings, AbstentionEvalReport, AbstentionJudgment,
+    RetrievalEvalReport, RetrievalJudgment,
+};
 pub use index::{
     bm25_search, build_index, build_vector_store_if_enabled, invalidate_cache, load_or_build_index,
-    load_or_build_index_multi, Bm25Index, Posting,
+    load_or_build_index_corpus, load_or_build_index_multi, Bm25Index, Posting,
 };
+pub use prompt_reference::{
+    render_prompt_reference, truncate_prompt_reference_block, PromptReference, PromptReferenceKind,
+};
+pub use query_expansion::expand_bilingual_query;
 pub use repomap::{
     invalidate_cache as invalidate_repomap_cache, repo_map, symbol_index, FileSymbols, Symbol,
     SymbolIndex, SymbolKind, REPOMAP_CACHE_DIR,
 };
 pub use retrieve::{
-    corpus_dirs, retrieve, retrieve_for_phase, retrieve_for_phase_with_expansion,
-    retrieve_for_phase_with_vector, retrieve_with_vector, retrieve_with_vector_and_expansion,
-    RetrievalConfig, RetrievalEngine, ScoredChunk,
+    corpus_dirs, corpus_set, retrieve, retrieve_corpus, retrieve_corpus_with_vector,
+    retrieve_corpus_with_vector_and_expansion, retrieve_for_phase,
+    retrieve_for_phase_with_expansion, retrieve_for_phase_with_vector, retrieve_with_vector,
+    retrieve_with_vector_and_expansion, RetrievalConfig, RetrievalEngine, ScoredChunk,
 };
 pub use tokenizer::{cjk_trigrams_only, tokenize, tokenize_trigram};
-pub use usefulness::{record_chunk_outcomes, record_chunk_outcomes_in, UsefulnessStore};
+pub use usefulness::{
+    memory_id, record_chunk_outcomes, record_chunk_outcomes_in, record_receipt_outcome,
+    record_receipt_outcome_in, MemoryRef, ReceiptOutcomeWrite, UsefulnessStore,
+};
 pub use vector::VectorStore;
 
 /// Knowledge base index storage location, relative to the project root.

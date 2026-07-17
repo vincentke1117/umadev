@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use umadev_runtime::{
-    CompletionRequest, CompletionResponse, Runtime, RuntimeError, RuntimeKind, Usage,
+    BasePermissionProfile, CompletionRequest, CompletionResponse, Runtime, RuntimeError,
+    RuntimeKind, Usage,
 };
 
 use crate::{
@@ -31,6 +32,9 @@ pub struct ClaudeCodeDriver {
     program: String,
     print_flag: String,
     timeout: Duration,
+    /// Permission posture for this legacy one-shot driver. The safe default is
+    /// [`BasePermissionProfile::Plan`]; mutating callers must opt in explicitly.
+    permissions: BasePermissionProfile,
     /// When `true`, the next `complete` resumes the `claude` conversation
     /// instead of starting cold. Set per-call by the TUI for chat turns 2+, and
     /// by the run path so every phase after the first reuses ONE base session
@@ -159,6 +163,7 @@ impl Default for ClaudeCodeDriver {
             print_flag: std::env::var("UMADEV_CLAUDE_PRINT_FLAG")
                 .unwrap_or_else(|_| "--print".to_string()),
             timeout: crate::worker_timeout_from_env(),
+            permissions: BasePermissionProfile::Plan,
             continue_session: false,
             session_id: None,
             session_started: None,
@@ -181,6 +186,13 @@ impl ClaudeCodeDriver {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Select the access/approval posture for this one-shot driver.
+    #[must_use]
+    pub fn with_permissions(mut self, permissions: BasePermissionProfile) -> Self {
+        self.permissions = permissions;
         self
     }
 
@@ -280,13 +292,12 @@ impl ClaudeCodeDriver {
     ///
     /// Flag rationale:
     /// - `--print` (or `-p`): non-interactive single-shot mode.
-    /// - `--dangerously-skip-permissions`: bypass all tool permission prompts
-    ///   so the pipeline runs fully autonomously — Claude can read/write
-    ///   files and run bash without waiting for per-call approval. This is
-    ///   essential because UmaDev drives the host as an unattended
-    ///   subprocess; without it, every `Write` / `Bash` call would hang
-    ///   waiting for a y/n that never comes. UmaDev's own governance
-    ///   layer (112 rules, `PreToolUse` hook, quality gate) is the safety net.
+    /// - `--permission-mode`: Plan is Claude's hard read-only boundary; Guarded
+    ///   leaves mutations to the host's approval policy; Auto permits the full
+    ///   development posture. `--allowedTools` only pre-approves named tools
+    ///   without a prompt; it is not a deny-list or a second sandbox.
+    /// - `--dangerously-skip-permissions`: Auto only. It is never emitted by
+    ///   Plan/Guarded and is removed when `UMADEV_NO_SKIP_PERMS=1`.
     /// - `--output-format text`: explicit text output — no JSON envelope
     ///   so the existing `clean_output` pipeline gets plain markdown.
     ///
@@ -297,8 +308,8 @@ impl ClaudeCodeDriver {
     /// keychain MUST be reachable — `--bare` would break the very
     /// users we exist to serve.
     ///
-    /// Permission bypass can be disabled by setting
-    /// `UMADEV_NO_SKIP_PERMS=1` (e.g. if a corporate policy blocks it).
+    /// `UMADEV_NO_SKIP_PERMS=1` can only tighten `Auto` to the guarded posture;
+    /// it can never widen `Plan` or `Guarded`.
     #[must_use]
     pub fn base_args(&self) -> Vec<String> {
         self.base_args_with_format("text")
@@ -310,14 +321,41 @@ impl ClaudeCodeDriver {
     /// rationale.
     #[must_use]
     pub fn base_args_with_format(&self, output_format: &str) -> Vec<String> {
+        self.base_args_with_format_for(
+            output_format,
+            std::env::var("UMADEV_NO_SKIP_PERMS").as_deref() == Ok("1"),
+        )
+    }
+
+    fn base_args_with_format_for(&self, output_format: &str, no_skip: bool) -> Vec<String> {
+        // The environment switch is a one-way safety latch. It never upgrades a
+        // less-trusted profile and is sampled when the subprocess args are built.
+        let permissions = if self.permissions.auto_approve() && no_skip {
+            BasePermissionProfile::Guarded
+        } else {
+            self.permissions
+        };
+        let (permission_mode, allowed_tools) = match permissions {
+            BasePermissionProfile::Plan => ("plan", "Read,Grep,Glob,WebSearch,WebFetch"),
+            BasePermissionProfile::Guarded => (
+                "default",
+                "Read,Grep,Glob,WebSearch,WebFetch,TodoWrite,Agent,Task,TaskOutput,BashOutput,AgentOutput",
+            ),
+            BasePermissionProfile::Auto => (
+                "bypassPermissions",
+                "Read,Edit,Write,Bash,Grep,Glob,WebSearch,WebFetch,TodoWrite,NotebookEdit,Agent,Task,TaskOutput,BashOutput,AgentOutput",
+            ),
+        };
         let mut args = vec![
             self.print_flag.clone(),
             "--output-format".to_string(),
             output_format.to_string(),
+            "--permission-mode".to_string(),
+            permission_mode.to_string(),
+            "--allowedTools".to_string(),
+            allowed_tools.to_string(),
         ];
-        // Auto-skip permission prompts so the pipeline is fully autonomous.
-        // UmaDev's governance layer replaces the host's permission system.
-        if std::env::var("UMADEV_NO_SKIP_PERMS").as_deref() != Ok("1") {
+        if permissions.auto_approve() {
             args.push("--dangerously-skip-permissions".to_string());
         }
         args
@@ -395,21 +433,23 @@ impl Runtime for ClaudeCodeDriver {
                 assistant
             }
         });
-        Ok(CompletionResponse {
-            text,
-            id: "claude-code-cli".to_string(),
-            model: req.model,
-            usage,
-        })
+        Ok(crate::redaction::sanitize_completion_response(
+            &CompletionResponse {
+                text,
+                id: "claude-code-cli".to_string(),
+                model: req.model,
+                usage,
+            },
+        ))
     }
 
     /// Streaming completion via `claude --output-format stream-json --verbose`.
     ///
     /// Each newline-delimited JSON line is parsed in real time:
     /// - `{"type":"assistant","message":{"content":[{"type":"text","text":"…"}]}}`
-    ///   → [`StreamEvent::Text`] with the delta.
+    ///   → [`umadev_runtime::StreamEvent::Text`] with the delta.
     /// - `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{...}}]}}`
-    ///   → [`StreamEvent::ToolUse`] with the tool name + a human summary.
+    ///   → [`umadev_runtime::StreamEvent::ToolUse`] with the tool name + a human summary.
     /// - `{"type":"result","result":"…"}` → final assembled text.
     ///
     /// Non-JSON lines (rare stray output) are silently skipped. If parsing
@@ -492,12 +532,14 @@ impl Runtime for ClaudeCodeDriver {
                 if let Some(msg) = abort {
                     on_event(umadev_runtime::StreamEvent::Warning { message: msg });
                 }
-                Ok(CompletionResponse {
-                    text: final_text,
-                    id: "claude-code-cli".to_string(),
-                    model,
-                    usage,
-                })
+                Ok(crate::redaction::sanitize_completion_response(
+                    &CompletionResponse {
+                        text: final_text,
+                        id: "claude-code-cli".to_string(),
+                        model,
+                        usage,
+                    },
+                ))
             }
             Err(e) => {
                 // Streaming broke mid-flight (commonly the base subprocess being
@@ -510,12 +552,14 @@ impl Runtime for ClaudeCodeDriver {
                 let partial = stream_buf.into_inner().unwrap_or_default();
                 if let Some(text) = salvage_partial_stream(&partial) {
                     let usage = extract_usage(&partial);
-                    return Ok(CompletionResponse {
-                        text,
-                        id: "claude-code-cli".to_string(),
-                        model,
-                        usage,
-                    });
+                    return Ok(crate::redaction::sanitize_completion_response(
+                        &CompletionResponse {
+                            text,
+                            id: "claude-code-cli".to_string(),
+                            model,
+                            usage,
+                        },
+                    ));
                 }
                 drop(args);
                 drop(prompt);
@@ -542,6 +586,10 @@ fn salvage_partial_stream(stdout: &str) -> Option<String> {
 /// [`StreamEvent`]. Returns `None` for lines that aren't JSON or don't
 /// carry displayable content (system init, rate-limit events, etc.).
 fn parse_claude_stream_line(line: &str) -> Option<umadev_runtime::StreamEvent> {
+    parse_claude_stream_line_raw(line).map(crate::redaction::sanitize_stream_event)
+}
+
+fn parse_claude_stream_line_raw(line: &str) -> Option<umadev_runtime::StreamEvent> {
     let line = line.trim();
     if line.is_empty() || !line.starts_with('{') {
         return None;
@@ -710,9 +758,9 @@ fn result_error(stdout: &str) -> Option<String> {
 ///
 /// The final `{"type":"result", "usage":{"input_tokens":…,"output_tokens":…},
 /// "total_cost_usd":…,"num_turns":…}` line carries real usage. We surface the
-/// headline input/output token counts (cache tokens folded into input) so
-/// `/usage` reflects true spend instead of zeros. Returns [`Usage::default`]
-/// (zeros) when no usable result line is present.
+/// headline input/output token counts with cache read/creation folded into full
+/// input and preserved as separate subsets. Returns incomplete
+/// [`Usage::default`] when no valid result usage is present.
 fn extract_usage(stdout: &str) -> Usage {
     for line in stdout.lines() {
         let line = line.trim();
@@ -722,15 +770,35 @@ fn extract_usage(stdout: &str) -> Usage {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             if v.get("type").and_then(|t| t.as_str()) == Some("result") {
                 if let Some(u) = v.get("usage") {
-                    let field = |k: &str| u.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-                    // Fold cache reads/writes into input — they ARE consumed input.
-                    let input = field("input_tokens")
-                        + field("cache_read_input_tokens")
-                        + field("cache_creation_input_tokens");
-                    let output = field("output_tokens");
+                    let required = |key: &str| u.get(key)?.as_u64();
+                    let optional = |key: &str| -> Option<u64> {
+                        match u.get(key) {
+                            None => Some(0),
+                            Some(value) => value.as_u64(),
+                        }
+                    };
+                    let Some(input) = required("input_tokens") else {
+                        continue;
+                    };
+                    let Some(output) = required("output_tokens") else {
+                        continue;
+                    };
+                    let Some(cached_read_tokens) = optional("cache_read_input_tokens") else {
+                        continue;
+                    };
+                    let Some(cached_write_tokens) = optional("cache_creation_input_tokens") else {
+                        continue;
+                    };
+                    let Some(input_tokens) = input
+                        .checked_add(cached_read_tokens)
+                        .and_then(|sum| sum.checked_add(cached_write_tokens))
+                    else {
+                        continue;
+                    };
                     return Usage {
-                        input_tokens: u32::try_from(input).unwrap_or(u32::MAX),
-                        output_tokens: u32::try_from(output).unwrap_or(u32::MAX),
+                        cached_read_tokens,
+                        cached_write_tokens,
+                        ..Usage::exact(input_tokens, output)
                     };
                 }
             }
@@ -741,6 +809,24 @@ fn extract_usage(stdout: &str) -> Usage {
 
 /// Concatenate all assistant text blocks from stream-json lines.
 /// Used as a fallback when no `result` line is found.
+fn assistant_text_from_line(line: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return Vec::new();
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    value
+        .pointer("/message/content")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn extract_all_assistant_text(stdout: &str) -> String {
     let mut texts = Vec::new();
     for line in stdout.lines() {
@@ -748,23 +834,7 @@ fn extract_all_assistant_text(stdout: &str) -> String {
         if !line.starts_with('{') {
             continue;
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {
-                if let Some(content) = v
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_array())
-                {
-                    for block in content {
-                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                texts.push(text.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        texts.extend(assistant_text_from_line(line));
     }
     texts.join("\n")
 }
@@ -865,6 +935,10 @@ impl HostDriver for ClaudeCodeDriver {
 
     fn display_name(&self) -> &'static str {
         "Claude Code CLI"
+    }
+
+    fn permission_profile(&self) -> BasePermissionProfile {
+        self.permissions
     }
 
     fn set_continue_session(&mut self, continue_session: bool) {
@@ -1083,13 +1157,23 @@ mod tests {
         let stdout = concat!(
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#,
             "\n",
-            r#"{"type":"result","subtype":"success","usage":{"input_tokens":1200,"cache_read_input_tokens":300,"output_tokens":450},"total_cost_usd":0.02,"num_turns":4}"#,
+            r#"{"type":"result","subtype":"success","usage":{"input_tokens":1200,"cache_read_input_tokens":300,"cache_creation_input_tokens":50,"output_tokens":450},"total_cost_usd":0.02,"num_turns":4}"#,
         );
         let u = extract_usage(stdout);
-        assert_eq!(u.input_tokens, 1500); // 1200 + 300 cache read
+        assert_eq!(u.input_tokens, 1550);
         assert_eq!(u.output_tokens, 450);
-        // No result line → zeros (graceful).
-        assert_eq!(extract_usage("plain text").input_tokens, 0);
+        assert_eq!(u.cached_read_tokens, 300);
+        assert_eq!(u.cached_write_tokens, 50);
+        assert!(!u.usage_incomplete);
+
+        // An empty or malformed usage envelope is unknown, never exact zero.
+        for invalid in [
+            "plain text",
+            r#"{"type":"result","subtype":"success","usage":{}}"#,
+            r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":"3"}}"#,
+        ] {
+            assert_eq!(extract_usage(invalid), Usage::default());
+        }
     }
 
     #[test]
@@ -1360,25 +1444,53 @@ mod tests {
         assert_eq!(d.backend_id(), "claude-code");
         assert_eq!(d.display_name(), "Claude Code CLI");
         assert_eq!(d.kind(), RuntimeKind::Anthropic);
-        // base_args always starts with these stable flags; the permission
-        // bypass flag is appended conditionally (tested below in the same
-        // function to avoid env-var races between parallel tests).
-        let args = d.base_args();
-        assert_eq!(
-            &args[..3],
-            &[
-                "--print".to_string(),
-                "--output-format".to_string(),
-                "text".to_string(),
-            ]
-        );
-        // By default (no UMADEV_NO_SKIP_PERMS) the bypass flag is present.
-        // We check contains rather than exact equality because env state is
-        // shared across parallel tests.
-        assert!(
-            args.contains(&"--dangerously-skip-permissions".to_string()),
-            "base_args should include --dangerously-skip-permissions by default: {args:?}"
-        );
+        assert_eq!(d.permission_profile(), BasePermissionProfile::Plan);
+    }
+
+    #[test]
+    fn permission_profiles_shape_legacy_args_and_no_skip_only_tightens() {
+        let cases = [
+            (BasePermissionProfile::Plan, "plan", false),
+            (BasePermissionProfile::Guarded, "default", false),
+            (BasePermissionProfile::Auto, "bypassPermissions", true),
+        ];
+        for (profile, expected_mode, expected_bypass) in cases {
+            let args = ClaudeCodeDriver::default()
+                .with_permissions(profile)
+                .base_args_with_format_for("text", false);
+            let mode = args
+                .windows(2)
+                .find(|w| w[0] == "--permission-mode")
+                .map(|w| w[1].as_str());
+            assert_eq!(mode, Some(expected_mode), "profile {profile:?}: {args:?}");
+            assert_eq!(
+                args.iter().any(|a| a == "--dangerously-skip-permissions"),
+                expected_bypass,
+                "profile {profile:?}: {args:?}"
+            );
+        }
+
+        let tightened = ClaudeCodeDriver::default()
+            .with_permissions(BasePermissionProfile::Auto)
+            .base_args_with_format_for("text", true);
+        assert!(tightened
+            .windows(2)
+            .any(|w| { w[0] == "--permission-mode" && w[1] == "default" }));
+        assert!(!tightened
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions"));
+
+        let plan = ClaudeCodeDriver::default()
+            .with_permissions(BasePermissionProfile::Plan)
+            .base_args_with_format_for("text", false);
+        let allowed = plan
+            .windows(2)
+            .find(|w| w[0] == "--allowedTools")
+            .map(|w| w[1].as_str())
+            .unwrap_or_default();
+        for mutating in ["Write", "Edit", "Bash", "NotebookEdit", "Agent", "Task"] {
+            assert!(!allowed.split(',').any(|tool| tool == mutating));
+        }
     }
 
     #[tokio::test]
@@ -1645,6 +1757,8 @@ mod tests {
         // input = 1200 + 300 cache read + 50 cache creation.
         assert_eq!(resp.usage.input_tokens, 1550);
         assert_eq!(resp.usage.output_tokens, 42);
+        assert_eq!(resp.usage.cached_read_tokens, 300);
+        assert_eq!(resp.usage.cached_write_tokens, 50);
     }
 
     #[tokio::test]
@@ -1709,5 +1823,36 @@ mod tests {
         };
         let err = d.complete(req).await.unwrap_err();
         assert!(matches!(err, RuntimeError::HostProcess(_)));
+    }
+
+    #[test]
+    fn stream_events_redact_synthetic_secrets() {
+        const SECRET: &str = "SYNTH_CLAUDE_SECRET_DO_NOT_LEAK_71";
+        let text = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "text",
+                "text": format!("Authorization: Bearer {SECRET}")
+            }]}
+        })
+        .to_string();
+        let tool = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": format!("OPENAI_API_KEY={SECRET} cargo test")}
+            }]}
+        })
+        .to_string();
+        let rendered = format!(
+            "{:?}{:?}",
+            parse_claude_stream_line(&text),
+            parse_claude_stream_line(&tool)
+        );
+        assert!(
+            !rendered.contains(SECRET),
+            "stream event leaked: {rendered}"
+        );
     }
 }

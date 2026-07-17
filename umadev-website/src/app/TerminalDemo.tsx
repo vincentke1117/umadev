@@ -107,7 +107,13 @@ export function TerminalDemo({ slideIndex, lang }: { slideIndex: number, lang?: 
             <span />
           </div>
           <span>umadev — bash</span>
-          <button type="button" onClick={() => setStep(0)}>{lang === "zh" ? "重新开始" : "RESTART"}</button>
+          <button
+            aria-label={lang === "zh" ? "重新播放终端演示" : "Restart terminal demo"}
+            type="button"
+            onClick={() => setStep(0)}
+          >
+            {lang === "zh" ? "重新开始" : "RESTART"}
+          </button>
         </div>
         <div className={styles.terminalBody}>
           {lines.slice(0, step).map((line, i) => (

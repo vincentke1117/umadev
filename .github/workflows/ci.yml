@@ -11,14 +11,17 @@ env:
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-D warnings"
 
+permissions:
+  contents: read
+
 jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
         with:
           components: rustfmt
       - name: cargo fmt --check
@@ -28,14 +31,27 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+  docs:
+    name: strict rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: cargo doc (all features, warnings denied)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --all-features --no-deps
 
   test:
     name: test (${{ matrix.os }})
@@ -45,33 +61,203 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Verify Windows Job Object process-tree teardown
+        if: runner.os == 'Windows'
+        run: cargo test -p umadev-process --lib --locked -- --test-threads=1
       - name: cargo test
-        run: cargo test --workspace --all-targets --no-fail-fast
+        run: cargo test --workspace --all-features --all-targets --no-fail-fast
       - name: cargo test (doctests)
-        run: cargo test --workspace --doc --no-fail-fast
+        run: cargo test --workspace --all-features --doc --no-fail-fast
+
+  grok-source-contract:
+    name: pinned Grok Build source contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Checkout audited Grok Build source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: xai-org/grok-build
+          ref: 8adf9013a0929e5c7f1d4e849492d2387837a28d
+          path: _upstream/grok-build
+          fetch-depth: 1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Verify source identity and audited wire markers
+        env:
+          UMADEV_GROK_SOURCE_DIR: ${{ github.workspace }}/_upstream/grok-build
+        run: cargo test -p umadev-host --test grok_source_drift -- --nocapture
+
+  grok-published-contract:
+    name: published Grok Build ACP (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: grok-0.2.101-linux-x86_64
+            sha256: 2556299cded37f81e54c02420cfa7f1a2df9feab72a445869a0f5596e143b333
+            binary: grok
+          - os: macos-latest
+            artifact: grok-0.2.101-macos-aarch64
+            sha256: 8431538dbd99379240f558b48b779c651d668b06d793c87311ad532c4395a4e2
+            binary: grok
+          - os: windows-latest
+            artifact: grok-0.2.101-windows-x86_64.exe
+            sha256: fc4351df2e13b6bf99534f52296800ab90d09252e028907453d4f1586b2f0991
+            binary: grok.exe
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Download and verify the exact official Grok artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d "$RUNNER_TEMP/umadev-grok-contract"
+          binary="$RUNNER_TEMP/umadev-grok-contract/${{ matrix.binary }}"
+          if ! curl --fail --location --silent --show-error --retry 3 \
+            "https://x.ai/cli/${{ matrix.artifact }}" --output "$binary"; then
+            curl --fail --location --silent --show-error --retry 3 \
+              "https://storage.googleapis.com/grok-build-public-artifacts/cli/${{ matrix.artifact }}" \
+              --output "$binary"
+          fi
+          printf '%s  %s\n' '${{ matrix.sha256 }}' "$binary" | shasum -a 256 --check
+          chmod +x "$binary"
+          version=$("$binary" --version)
+          [[ "$version" =~ ^grok\ 0\.2\.101\ \([0-9a-f]+\)$ ]]
+          printf 'UMADEV_GROK_BIN=%s\n' "$binary" >> "$GITHUB_ENV"
+      - name: Download and verify the exact official Grok artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'umadev-grok-contract'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $binary = Join-Path $dir '${{ matrix.binary }}'
+          try {
+            Invoke-WebRequest -Uri 'https://x.ai/cli/${{ matrix.artifact }}' -OutFile $binary
+          } catch {
+            Invoke-WebRequest -Uri 'https://storage.googleapis.com/grok-build-public-artifacts/cli/${{ matrix.artifact }}' -OutFile $binary
+          }
+          $actual = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
+          if ($actual -ne '${{ matrix.sha256 }}') { throw "Grok artifact SHA-256 mismatch: $actual" }
+          $version = (& $binary --version | Out-String).Trim()
+          if ($version -notmatch '^grok 0\.2\.101 \([0-9a-f]+\)$') { throw "Unexpected Grok version: $version" }
+          "UMADEV_GROK_BIN=$binary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Verify real ACP identity and explicit authentication boundary
+        env:
+          UMADEV_GROK_PUBLISHED_CONTRACT: "1"
+        run: cargo test -p umadev-host --test grok_published_contract -- --nocapture
+
+  kimi-source-contract:
+    name: pinned Kimi Code source contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Checkout audited Kimi Code source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: MoonshotAI/kimi-code
+          ref: 36b05820cba24e09fdff19a059afc08ccea2c35e
+          path: _upstream/kimi-code
+          fetch-depth: 1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Verify source identity and audited ACP markers
+        env:
+          UMADEV_KIMI_SOURCE_DIR: ${{ github.workspace }}/_upstream/kimi-code
+        run: cargo test -p umadev-host --test kimi_source_drift -- --nocapture
+
+  kimi-published-contract:
+    name: published Kimi Code ACP (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.19.0"
+      - name: Install the exact audited npm package
+        run: npm install -g @moonshot-ai/kimi-code@0.26.0
+      - name: Verify real ACP identity and terminal-owned authentication
+        env:
+          KIMI_CODE_HOME: ${{ runner.temp }}/umadev-kimi-code-home
+          UMADEV_KIMI_BIN: kimi
+          UMADEV_KIMI_PUBLISHED_CONTRACT: "1"
+        run: cargo test -p umadev-host --test kimi_published_contract -- --nocapture
+
+  terminal-contract:
+    name: terminal contract (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+      - name: Verify native PTY / ConPTY startup, input, and teardown
+        run: cargo test -p umadev --test terminal_pty -- --test-threads=1
+      - name: Verify deterministic TUI terminal contracts
+        run: cargo test -p umadev-tui --lib terminal_contract_ -- --test-threads=1
+      - name: Verify cross-platform npm update contracts
+        run: node --test npm/scripts/terminal-contract.test.cjs
+
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install minimum supported Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: msrv-1.88
+      - name: Verify the declared MSRV
+        run: cargo check --workspace --all-targets --locked
 
   npm-shim:
     name: npm distribution smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
+      - name: Verify Cargo, npm, and website versions
+        run: node npm/scripts/verify-version-lock.mjs
       - name: Verify launcher, updater, and split-version repair
         run: ./npm/scripts/smoke.sh
 
   build-release:
     name: build release (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: [fmt, clippy, test, npm-shim]
+    needs: [fmt, clippy, docs, test, grok-source-contract, grok-published-contract, kimi-source-contract, kimi-published-contract, terminal-contract, msrv, npm-shim]
     strategy:
       fail-fast: false
       matrix:
@@ -86,38 +272,32 @@ jobs:
             artifact: umadev-windows-x86_64
             ext: ".exe"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: cargo build --release
         run: cargo build --release --bin umadev
       # A startup-panic guard: the unit suite never runs the real TUI event loop,
       # so a launch crash (e.g. an eager-evaluated `tokio::select!` branch arg)
       # shipped in 1.0.17/1.0.18 undetected. PTY-launch the built binary and fail
       # if it panics before/at the event loop.
-      - name: Launch smoke test (no startup panic)
+      - name: Launch release smoke test (no startup panic)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -uo pipefail
-          # A configured backend so the TUI skips the first-run picker and enters
-          # the main chat event loop — the exact path that panicked on launch.
           mkdir -p "$HOME/.umadev"
           printf 'backend = "offline"\nlang = "en"\n' > "$HOME/.umadev/config.toml"
           BIN=target/release/umadev
-          echo "PTY-launching $BIN to verify it reaches the event loop without panicking..."
-          # `script` gives the TUI a PTY; stdin is held open ~6s so it enters and
-          # stays in the loop, then EOF -> a clean quit. `timeout` is a hard backstop.
           OUT=$(timeout 25 script -q -e -c "$BIN" /dev/null < <(sleep 6) 2>&1 || true)
           if printf '%s' "$OUT" | grep -qE 'panicked at'; then
-            echo "::error::umadev panicked on launch -- a startup crash must never ship"
+            echo "::error::umadev panicked on release launch"
             printf '%s\n' "$OUT" | tail -60
             exit 1
           fi
-          echo "Launch smoke OK: no startup panic."
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact }}
           path: target/release/umadev${{ matrix.ext }}

@@ -1,15 +1,17 @@
-# UmaDev governance gate — runs on every push / PR.
+# UmaDev governance-engine conformance + repository self-audit.
 #
-# Scans all source files for governance violations (emoji icons, hardcoded
-# secrets, dangerous commands, bare catches, missing input validation, etc.)
-# and FAILS the build if any are found. This is the CI equivalent of the
-# real-time PreToolUse hook — catching violations before they reach main.
+# The repository contains the rule engine's own adversarial fixtures and legacy
+# migration sources, so applying product-output policy to the whole tree as a
+# blocking gate is self-referential and produces known false positives. CI
+# therefore blocks on executable clean/dirty scanner contracts and publishes a
+# non-vacuous full-tree audit for debt tracking. Rust fmt/clippy/test remain the
+# blocking quality gate for UmaDev's own implementation.
 #
 # To use in YOUR project:
 #   1. Install umadev in CI (build from source or download a release).
 #   2. Copy this file to .github/workflows/umadev-governance.yml.
 #   3. Optionally add a .umadev/rules.toml to tune which clauses apply.
-name: UmaDev Governance
+name: UmaDev Governance Conformance
 
 on:
   push:
@@ -17,29 +19,77 @@ on:
   pull_request:
     branches: [main, master]
 
+permissions:
+  contents: read
+
 jobs:
   govern:
-    name: Governance Gate
+    name: Governance conformance and self-audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          fetch-depth: 0  # full history for git-diff changed-file detection
+          fetch-depth: 0
 
-      - name: Install UmaDev
+      # The repository must govern the code that is actually being proposed.
+      # Installing the last npm release would leave changes to the CLI and its
+      # rules untested, so build the checked-out commit instead.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build UmaDev from this commit
+        run: cargo build --locked --release --bin umadev
+
+      - name: Run non-vacuous repository self-audit
+        shell: bash
         run: |
-          # Install the published CLI (prebuilt binary via npm).
-          npm install -g umadev
+          set -euo pipefail
 
-      - name: Run governance scan
-        run: umadev ci --changed-only
-        # --changed-only scans just the files in this PR (faster than
-        # scanning the whole repo). Remove it to scan everything.
+          target/release/umadev ci --report-only 2>&1 | tee umadev-governance.log
 
-      - name: Upload governance report (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
+          scanned=$(sed -nE 's/.*UmaDev: [0-9]+ file\(s\) selected, ([0-9]+) scanned,.*/\1/p' \
+            umadev-governance.log | tail -1)
+          if [[ -z "$scanned" ]]; then
+            echo "::error::governance scan did not report its candidate file count"
+            exit 1
+          fi
+          if [[ "$scanned" -eq 0 ]]; then
+            echo "::error::governance scan selected 0 files from a source repository"
+            exit 1
+          fi
+
+          echo "Governance self-audit scanned $scanned file(s) from commit $GITHUB_SHA."
+
+      - name: Verify clean and blocking scanner contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          clean=$(mktemp -d)
+          blocked=$(mktemp -d)
+          trap 'rm -rf "$clean" "$blocked"' EXIT
+
+          printf '%s\n' 'export const label = "Save";' > "$clean/app.ts"
+          target/release/umadev ci --project-root "$clean" > clean-scan.log
+          grep -Eq 'UmaDev: 1 file\(s\) selected, 1 scanned, 0 unreadable/binary skipped; 0 file\(s\) with a governance hit, 0 first-hit finding\(s\)' clean-scan.log
+
+          printf '%s\n' 'export const icon = "🚀";' > "$blocked/app.tsx"
+          if target/release/umadev ci --project-root "$blocked" > blocked-scan.log 2>&1; then
+            echo "::error::known governance violation unexpectedly passed"
+            exit 1
+          fi
+          grep -q 'BLOCK  UD-CODE-001' blocked-scan.log
+          grep -Eq 'UmaDev: 1 file\(s\) selected, 1 scanned, 0 unreadable/binary skipped; 1 file\(s\) with a governance hit, 1 first-hit finding\(s\)' blocked-scan.log
+
+      - name: Upload governance self-audit
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: governance-report
-          path: .umadev/audit/
+          path: |
+            .umadev/audit/
+            umadev-governance.log
+            clean-scan.log
+            blocked-scan.log
           if-no-files-found: ignore

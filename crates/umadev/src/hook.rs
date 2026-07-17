@@ -1,10 +1,10 @@
 //! Governance hook entry point — the `umadev hook pre-write` command.
 //!
-//! This is invoked by Claude Code's `PreToolUse` hook (registered via
-//! `umadev install`). It reads a PreToolUse JSON payload from stdin,
+//! This is invoked by Claude Code or Kimi Code's `PreToolUse` hook
+//! (registered via `umadev install`). It reads a PreToolUse JSON payload from stdin,
 //! extracts the target file path + new content, runs the governance rules
 //! (emoji / color / AI-slop), and prints a permission-decision JSON object
-//! that Claude Code honours to allow or deny the write.
+//! that both hosts honour to allow or deny the write.
 //!
 //! ## Claude Code PreToolUse payload shape (simplified)
 //! ```json
@@ -254,7 +254,7 @@ fn run_pre_write_scoped(
 /// written the context for the requirement in flight while `workflow-state.json` may still
 /// name the previous one. Matching there would strictly-block the very requirement the run
 /// is honouring. The age fallback is the right bound for this surface, and the stakes are
-/// low: the hook blocks nothing but the irreversible floor anyway (see [`pre_write`]).
+/// low: the hook blocks nothing but the irreversible floor anyway (see [`run_pre_write`]).
 fn load_project_context(file_path: &str) -> ProjectContext {
     let Some(root) = find_project_root(file_path) else {
         return ProjectContext::unknown();
@@ -517,6 +517,10 @@ struct PostToolUsePayload {
 
 #[derive(Debug, Default, Deserialize)]
 struct ToolInput {
+    /// Kimi Code's native Write/Edit tools use `path`; Claude uses
+    /// `file_path`. Both are normalized into the same governance scope.
+    #[serde(default)]
+    path: Option<String>,
     #[serde(default)]
     file_path: Option<String>,
     #[serde(default)]
@@ -560,6 +564,7 @@ impl ToolInput {
     fn scan_path(&self) -> &str {
         self.file_path
             .as_deref()
+            .or(self.path.as_deref())
             .or(self.notebook_path.as_deref())
             .unwrap_or("")
     }
@@ -840,6 +845,191 @@ pub fn uninstall_claude_hook(project_root: &std::path::Path) -> std::io::Result<
     Ok(())
 }
 
+/// Kimi Code reads lifecycle hooks from its user-level config.toml. UmaDev
+/// therefore writes scoped commands: the hook process receives the exact
+/// project root and immediately allows events from every other workspace.
+const KIMI_HOOK_SPECS: [(&str, &str, &str); 3] = [
+    ("PreToolUse", "^(Write|Edit)$", "pre-write"),
+    ("PreToolUse", "^Bash$", "pre-bash"),
+    ("PostToolUse", "^(Write|Edit|Bash)$", "tool-audit"),
+];
+
+fn absolute_project_scope(project_root: &Path) -> PathBuf {
+    std::fs::canonicalize(project_root).unwrap_or_else(|_| {
+        if project_root.is_absolute() {
+            project_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(project_root)
+        }
+    })
+}
+
+fn posix_shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn kimi_hook_command(check: &str, project_root: &Path) -> String {
+    let scope = absolute_project_scope(project_root);
+    // Kimi Code uses bash on every supported OS (Git Bash on Windows).
+    // Forward slashes keep a Windows absolute path executable as a bash arg.
+    let scope = scope.to_string_lossy().replace('\\', "/");
+    format!(
+        "umadev hook {check} --project-root {}",
+        posix_shell_quote(&scope)
+    )
+}
+
+fn kimi_config_path() -> std::io::Result<PathBuf> {
+    if let Some(home) = std::env::var_os("KIMI_CODE_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(home).join("config.toml"));
+    }
+    home_dir()
+        .map(|home| home.join(".kimi-code").join("config.toml"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot locate Kimi Code config: HOME/USERPROFILE is unset",
+            )
+        })
+}
+
+fn parse_kimi_config(content: &str) -> std::io::Result<toml_edit::DocumentMut> {
+    content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn kimi_hooks_mut(
+    document: &mut toml_edit::DocumentMut,
+) -> std::io::Result<&mut toml_edit::ArrayOfTables> {
+    if !document.contains_key("hooks") {
+        document["hooks"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+    }
+    document["hooks"].as_array_of_tables_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Kimi Code config key 'hooks' is not an array of tables; refusing to overwrite it",
+        )
+    })
+}
+
+fn install_kimi_hook_at(config_path: &Path, project_root: &Path) -> std::io::Result<()> {
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let mut document = parse_kimi_config(&content)?;
+    let commands = KIMI_HOOK_SPECS.map(|(_, _, check)| kimi_hook_command(check, project_root));
+    let hooks = kimi_hooks_mut(&mut document)?;
+    hooks.retain(|table| {
+        table
+            .get("command")
+            .and_then(toml_edit::Item::as_str)
+            .is_none_or(|command| !commands.iter().any(|ours| ours == command))
+    });
+    for ((event, matcher, _), command) in KIMI_HOOK_SPECS.into_iter().zip(commands) {
+        let mut table = toml_edit::Table::new();
+        table["event"] = toml_edit::value(event);
+        table["matcher"] = toml_edit::value(matcher);
+        table["command"] = toml_edit::value(command);
+        table["timeout"] = toml_edit::value(10);
+        hooks.push(table);
+    }
+    let mut output = document.to_string();
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    umadev_state::fs::atomic_write(config_path, output.as_bytes())
+}
+
+/// Install project-scoped Kimi Code Pre/PostToolUse hooks without replacing
+/// any existing user hook. Returns None when invoked from the user's home,
+/// where the scope would unintentionally cover every nested project.
+pub fn install_kimi_hook(project_root: &Path) -> std::io::Result<Option<PathBuf>> {
+    if is_home_claude(project_root) {
+        return Ok(None);
+    }
+    let path = kimi_config_path()?;
+    install_kimi_hook_at(&path, project_root)?;
+    Ok(Some(path))
+}
+
+/// Inspect whether all three exact UmaDev rows for `project_root` are present
+/// in Kimi Code's user-level hook registry. This is read-only and deliberately
+/// validates the event + matcher + command tuple rather than substring-searching
+/// hand-edited TOML. Used by `umadev doctor` to avoid false confidence.
+pub(crate) fn kimi_hook_registration(project_root: &Path) -> std::io::Result<(PathBuf, bool)> {
+    let path = kimi_config_path()?;
+    let installed = kimi_hook_registration_at(&path, project_root)?;
+    Ok((path, installed))
+}
+
+fn kimi_hook_registration_at(config_path: &Path, project_root: &Path) -> std::io::Result<bool> {
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    let document = parse_kimi_config(&content)?;
+    let Some(hooks) = document
+        .get("hooks")
+        .and_then(toml_edit::Item::as_array_of_tables)
+    else {
+        return Ok(false);
+    };
+    let installed = KIMI_HOOK_SPECS.iter().all(|(event, matcher, check)| {
+        let expected_command = kimi_hook_command(check, project_root);
+        hooks.iter().any(|table| {
+            table.get("event").and_then(toml_edit::Item::as_str) == Some(*event)
+                && table.get("matcher").and_then(toml_edit::Item::as_str) == Some(*matcher)
+                && table.get("command").and_then(toml_edit::Item::as_str)
+                    == Some(expected_command.as_str())
+        })
+    });
+    Ok(installed)
+}
+
+fn uninstall_kimi_hook_at(config_path: &Path, project_root: &Path) -> std::io::Result<()> {
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return Ok(());
+    };
+    let Ok(mut document) = parse_kimi_config(&content) else {
+        // Never damage a hand-edited or newer config shape during cleanup.
+        return Ok(());
+    };
+    let commands = KIMI_HOOK_SPECS.map(|(_, _, check)| kimi_hook_command(check, project_root));
+    let Some(hooks) = document["hooks"].as_array_of_tables_mut() else {
+        return Ok(());
+    };
+    hooks.retain(|table| {
+        table
+            .get("command")
+            .and_then(toml_edit::Item::as_str)
+            .is_none_or(|command| !commands.iter().any(|ours| ours == command))
+    });
+    if hooks.is_empty() {
+        document.remove("hooks");
+    }
+    let mut output = document.to_string();
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    umadev_state::fs::atomic_write(config_path, output.as_bytes())
+}
+
+/// Remove only the three Kimi Code hook rows scoped to project_root.
+pub fn uninstall_kimi_hook(project_root: &Path) -> std::io::Result<()> {
+    uninstall_kimi_hook_at(&kimi_config_path()?, project_root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,6 +1063,82 @@ mod tests {
     /// `root` (scope present) — the production gate is the same `driving` flag.
     fn post_tool_in(payload: &str, root: &Path) -> Option<ToolCallRecord> {
         run_post_tool_scoped(payload, root, true)
+    }
+
+    #[test]
+    fn kimi_native_hooks_merge_idempotently_and_uninstall_only_the_project_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project with ' quote");
+        std::fs::create_dir_all(&project).unwrap();
+        let config = temp.path().join("kimi-home/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "# keep this comment\ndefault_model = \"custom/model\"\n\n[[hooks]]\nevent = \"Notification\"\nmatcher = \"task\\\\.completed\"\ncommand = \"notify-me\"\ntimeout = 7\n",
+        )
+        .unwrap();
+
+        install_kimi_hook_at(&config, &project).unwrap();
+        install_kimi_hook_at(&config, &project).unwrap();
+        assert!(kimi_hook_registration_at(&config, &project).unwrap());
+
+        let installed = std::fs::read_to_string(&config).unwrap();
+        assert!(installed.contains("# keep this comment"));
+        assert!(installed.contains("default_model = \"custom/model\""));
+        assert!(installed.contains("notify-me"));
+        assert!(installed.contains("umadev hook pre-write --project-root"));
+        assert_eq!(posix_shell_quote("a'b"), "'a'\"'\"'b'");
+        let document = parse_kimi_config(&installed).unwrap();
+        let hooks = document["hooks"].as_array_of_tables().unwrap();
+        assert_eq!(hooks.len(), 4, "reinstall duplicated scoped Kimi hooks");
+        assert_eq!(
+            hooks
+                .iter()
+                .filter(|table| {
+                    table
+                        .get("command")
+                        .and_then(toml_edit::Item::as_str)
+                        .is_some_and(|command| command.starts_with("umadev hook "))
+                })
+                .count(),
+            3
+        );
+
+        uninstall_kimi_hook_at(&config, &project).unwrap();
+        assert!(!kimi_hook_registration_at(&config, &project).unwrap());
+        let uninstalled = std::fs::read_to_string(&config).unwrap();
+        assert!(uninstalled.contains("notify-me"));
+        assert!(!uninstalled.contains("umadev hook "));
+        assert_eq!(
+            parse_kimi_config(&uninstalled).unwrap()["hooks"]
+                .as_array_of_tables()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn kimi_write_and_edit_path_fields_enter_the_same_governance_floor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let secret = serde_json::json!({
+            "tool_name": "Write",
+            "tool_input": {"path": root.join(".env"), "content": "TOKEN=secret"}
+        })
+        .to_string();
+        assert!(pre_write_in(&secret, &root).block);
+
+        let edit = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {
+                "path": root.join(".ssh/id_rsa"),
+                "old_string": "x",
+                "new_string": "PRIVATE KEY"
+            }
+        })
+        .to_string();
+        assert!(pre_write_in(&edit, &root).block);
     }
 
     // --- self-limiting: UmaDev only governs ITS OWN runs ------------------

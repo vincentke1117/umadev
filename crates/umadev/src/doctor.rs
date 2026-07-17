@@ -11,7 +11,8 @@
 //!    headless credential (`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`)
 //!    is available — an interactive `claude login` alone can 401 on UmaDev's
 //!    background calls.
-//! 7. Claude Code PreToolUse governance hook installed (if `.claude/` exists).
+//! 7. Native real-time governance hooks: Claude Code's project settings and
+//!    Kimi Code's exact project-scoped rows in its user-level registry.
 //! 8. Delivery / deployment readiness (after a run completes): delivery notes
 //!    present with a deploy command, build output exists, and a deploy CLI
 //!    (vercel / netlify / wrangler) is on PATH.
@@ -25,9 +26,8 @@
 //!     longer identify makes every `umadev run` abort on every start, forever. This is the
 //!     only check that can REPAIR (with `--fix`), and it repairs only that.
 //!
-//! The hook check (7) was added in 4.6 alongside the restored real-time
-//! governance hook (`umadev install`). When `.claude/settings.json` exists
-//! but the hook isn't registered, the doctor suggests running `umadev install`.
+//! The hook checks never rely on substring matches: they parse the vendor's
+//! native configuration and validate the exact rows UmaDev owns.
 
 use std::fs;
 use std::io::Write;
@@ -99,6 +99,8 @@ pub async fn run_all(workspace: &Path, fix: bool) -> Vec<CheckResult> {
     results.push(check_git());
     results.push(check_user_config());
     results.push(check_claude_hook(workspace));
+    results.push(check_kimi_hook(workspace, configured_backend.as_deref()));
+    results.push(check_kimi_windows_shell(configured_backend.as_deref()));
     results.push(check_delivery_readiness(workspace));
     results.push(check_ecosystem(workspace));
     results.push(check_npm_install());
@@ -228,6 +230,132 @@ fn check_claude_hook(workspace: &Path) -> CheckResult {
     }
 }
 
+/// Check the three exact Kimi Code native hook rows for this project. Kimi's
+/// registry is user-level, so the commands themselves carry a canonical project
+/// scope; rows belonging to another project must not satisfy this check.
+fn check_kimi_hook(workspace: &Path, backend: Option<&str>) -> CheckResult {
+    let name = "Kimi Code hooks".to_string();
+    if backend != Some("kimi-code") {
+        return CheckResult {
+            name,
+            status: Status::Passed,
+            detail: "not applicable — Kimi Code is not the selected backend".to_string(),
+        };
+    }
+    match crate::hook::kimi_hook_registration(workspace) {
+        Ok((path, true)) if which_on_path("umadev") => CheckResult {
+            name,
+            status: Status::Passed,
+            detail: format!(
+                "project-scoped PreToolUse/PostToolUse rows active: {}",
+                path.display()
+            ),
+        },
+        Ok((path, true)) => CheckResult {
+            name,
+            status: Status::Warning,
+            detail: format!(
+                "the exact project-scoped rows exist in {}, but their upgrade-safe `umadev` command is not on PATH. Repair PATH, then run `umadev install --host kimi-code`.",
+                path.display()
+            ),
+        },
+        Ok((path, false)) => CheckResult {
+            name,
+            status: Status::Warning,
+            detail: format!(
+                "the exact hook rows for this project are absent from {}. Run `umadev install --host kimi-code` from this project.",
+                path.display()
+            ),
+        },
+        Err(error) => CheckResult {
+            name,
+            status: Status::Warning,
+            detail: format!(
+                "Kimi Code hook configuration cannot be verified ({error}). Fix its config.toml, then run `umadev install --host kimi-code`."
+            ),
+        },
+    }
+}
+
+/// Kimi Code executes tools and hooks through Git Bash on Windows. Its own ACP
+/// process can initialize before the first shell tool exposes a missing/custom
+/// shell, so surface this prerequisite in doctor rather than during a build.
+fn check_kimi_windows_shell(backend: Option<&str>) -> CheckResult {
+    let name = "Kimi Code shell".to_string();
+    if backend != Some("kimi-code") {
+        return CheckResult {
+            name,
+            status: Status::Passed,
+            detail: "not applicable — Kimi Code is not the selected backend".to_string(),
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        CheckResult {
+            name,
+            status: Status::Passed,
+            detail: "native shell available (Git Bash is required only on Windows)".to_string(),
+        }
+    }
+    #[cfg(windows)]
+    {
+        match find_kimi_windows_shell() {
+            Some(path) => CheckResult {
+                name,
+                status: Status::Passed,
+                detail: format!("Git Bash available: {}", path.display()),
+            },
+            None => CheckResult {
+                name,
+                status: Status::Warning,
+                detail: "Git Bash was not found. Install Git for Windows; for a custom install set KIMI_SHELL_PATH to the absolute bash.exe path before starting UmaDev."
+                    .to_string(),
+            },
+        }
+    }
+}
+
+#[cfg(windows)]
+fn find_kimi_windows_shell() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("KIMI_SHELL_PATH")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path);
+    }
+    let mut candidates = Vec::new();
+    for root in [
+        std::env::var_os("ProgramFiles"),
+        std::env::var_os("ProgramFiles(x86)"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        candidates.push(std::path::PathBuf::from(root.clone()).join("Git/bin/bash.exe"));
+        candidates.push(std::path::PathBuf::from(root).join("Git/usr/bin/bash.exe"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(std::path::PathBuf::from(&local).join("Programs/Git/bin/bash.exe"));
+        candidates.push(std::path::PathBuf::from(local).join("Programs/Git/usr/bin/bash.exe"));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            candidates.push(dir.join("bash.exe"));
+            if dir
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("cmd"))
+            {
+                if let Some(root) = dir.parent() {
+                    candidates.push(root.join("bin/bash.exe"));
+                    candidates.push(root.join("usr/bin/bash.exe"));
+                }
+            }
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
 /// Does this UmaDev hook `command` point at a program that resolves on disk? The
 /// program token is everything before the `hook <sub>` tail; an absolute/relative
 /// path must be an existing file, a bare name must be on `PATH`. Fail-open: an
@@ -277,7 +405,7 @@ fn check_spec_manifest(workspace: &Path) -> CheckResult {
     }
 }
 
-/// Check which host CLIs (claude-code, codex, opencode) are installed and
+/// Check which of the five first-class host CLIs are installed and
 /// usable. This is the most important doctor check for enterprise use —
 /// without a backend, UmaDev falls back to offline templates.
 ///
@@ -287,8 +415,8 @@ fn check_spec_manifest(workspace: &Path) -> CheckResult {
 /// `umadev_host::resolve_program` (PATH first, then known install dirs:
 /// Homebrew / volta / `~/.<base>/bin` / `…/Programs`, plus the
 /// `UMADEV_<NAME>_BIN` override) and then runs a real `--version`, which is the
-/// final installed-or-not arbiter. Fail-open: an unhealthy probe is surfaced as
-/// detail, never a hard FAIL.
+/// final installed-or-not arbiter. An unhealthy probe is surfaced with its exact
+/// diagnostic (including an unsafe-version upgrade command), never a hard FAIL.
 async fn check_ai_backends() -> CheckResult {
     let statuses = umadev_host::probe_all().await;
 
@@ -299,46 +427,57 @@ async fn check_ai_backends() -> CheckResult {
         .collect();
     // Found-but-broken bases (e.g. an old `--version` that errors): worth
     // surfacing so the user fixes the install rather than thinking it's missing.
-    let unhealthy: Vec<&str> = statuses
+    let unhealthy: Vec<String> = statuses
         .iter()
-        .filter(|s| matches!(s.probe, umadev_host::ProbeResult::Unhealthy { .. }))
-        .map(|s| s.id)
+        .filter_map(|s| match &s.probe {
+            umadev_host::ProbeResult::Unhealthy { detail } => Some(format!("{}: {detail}", s.id)),
+            _ => None,
+        })
         .collect();
 
     if ready.is_empty() {
         let mut detail = String::from(
-            "No base CLI (claude / codex / opencode) detected. Install one and log in — it brings its OWN model (your login or your own API). Without a base, UmaDev falls back to offline templates.",
+            "No supported base CLI detected. Install and authenticate one of: claude-code, codex, opencode, grok-build, kimi-code. It brings its OWN model and credentials; without a base, UmaDev falls back to offline templates.",
         );
         if !unhealthy.is_empty() {
             detail.push_str(&format!(
-                " Found but not responding to --version: {} (reinstall / check PATH, or set UMADEV_<NAME>_BIN).",
-                unhealthy.join(", ")
+                " Found but unavailable: {}",
+                unhealthy.join(" | ")
             ));
         }
-        CheckResult {
+        return CheckResult {
             name: "AI host backends".to_string(),
             status: Status::Warning,
             detail,
-        }
-    } else {
-        let mut detail = format!(
-            "{} backend(s) detected: {}. Use --backend {} for real AI generation. (Login is verified when a run starts — make sure you've logged into the CLI.)",
-            ready.len(),
-            ready.join(", "),
-            ready[0]
-        );
-        if !unhealthy.is_empty() {
-            detail.push_str(&format!(
-                " Also found but unhealthy: {}.",
-                unhealthy.join(", ")
-            ));
-        }
-        CheckResult {
-            name: "AI host backends".to_string(),
-            status: Status::Passed,
-            detail,
-        }
+        };
     }
+
+    let mut detail = ready_backends_detail(&ready);
+    if !unhealthy.is_empty() {
+        detail.push_str(&format!(
+            " Also found but unhealthy: {}.",
+            unhealthy.join(" | ")
+        ));
+    }
+    let status = if unhealthy.is_empty() {
+        Status::Passed
+    } else {
+        Status::Warning
+    };
+    CheckResult {
+        name: "AI host backends".to_string(),
+        status,
+        detail,
+    }
+}
+
+fn ready_backends_detail(ready: &[&str]) -> String {
+    format!(
+        "{} backend(s) detected: {}. Start `umadev` to use or switch bases in the TUI, or run `umadev run \"<requirement>\" --backend {}` for a one-shot pipeline. (Login is verified when a run starts — make sure you've logged into the CLI.)",
+        ready.len(),
+        ready.join(", "),
+        ready[0]
+    )
 }
 
 /// Environment credentials that let `claude` authenticate in UmaDev's
@@ -379,8 +518,8 @@ fn env_is_set(key: &str) -> bool {
 /// not-yet-picked `None`) it is an informational PASS.
 fn check_claude_noninteractive_auth(backend: Option<&str>) -> CheckResult {
     let name = "Claude non-interactive auth".to_string();
-    // Only meaningful when claude-code is the selected backend. codex / opencode
-    // / offline / not-yet-picked are unaffected (fail-open: never a spurious WARN
+    // Only meaningful when claude-code is the selected backend. Every other base,
+    // offline, and not-yet-picked are unaffected (fail-open: never a spurious WARN
     // for a backend that doesn't use this credential).
     if backend != Some("claude-code") {
         return CheckResult {
@@ -970,6 +1109,14 @@ mod tests {
     }
 
     #[test]
+    fn backend_guidance_names_a_real_command_path() {
+        let detail = ready_backends_detail(&["codex", "kimi-code"]);
+        assert!(detail.contains("Start `umadev`"));
+        assert!(detail.contains("`umadev run \"<requirement>\" --backend codex`"));
+        assert!(!detail.contains("Use --backend"));
+    }
+
+    #[test]
     fn workspace_writable_pass_in_tmp() {
         let tmp = TempDir::new().unwrap();
         let r = check_workspace_writable(tmp.path());
@@ -977,22 +1124,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_all_returns_thirteen_checks_on_empty_workspace() {
+    async fn run_all_returns_fifteen_checks_on_empty_workspace() {
         let tmp = TempDir::new().unwrap();
         let results = run_all(tmp.path(), false).await;
-        assert_eq!(results.len(), 13);
+        assert_eq!(results.len(), 15);
         // No FAILs on a clean workspace — only a manifest WARN.
         assert!(results.iter().all(|r| r.status != Status::Failed));
         // The "AI host backends" check warns iff no base CLI is on PATH, and the
-        // "Claude non-interactive auth" check warns iff claude-code is the ambient
-        // configured backend with no token env — both differ between dev machines
-        // and CI, so exclude them; the only env-independent WARN asserted here is
-        // the missing manifest.
+        // auth / native-hook checks depend on the ambient selected backend and
+        // credentials, so exclude them; the only env-independent WARN asserted
+        // here is the missing manifest.
         assert_eq!(
             results
                 .iter()
                 .filter(|r| r.name != "AI host backends")
                 .filter(|r| r.name != "Claude non-interactive auth")
+                .filter(|r| r.name != "Kimi Code hooks")
                 .filter(|r| r.status == Status::Warning)
                 .count(),
             1

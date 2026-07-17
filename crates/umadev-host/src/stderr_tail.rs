@@ -1,5 +1,5 @@
-//! Shared, bounded STDERR-tail capture for the three continuous-session base
-//! drivers (`claude_session` / `codex_session` / `opencode_session`).
+//! Shared, bounded STDERR-tail capture for all five continuous-session bases:
+//! three native drivers plus the Grok Build ACP driver.
 //!
 //! Each driver drains its base child's STDERR on its own task so a chatty /
 //! stuck base can never backpressure the stdout reader. Historically that drain
@@ -21,8 +21,12 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::task::JoinHandle;
+
+use crate::redaction::redact_text;
 
 /// Keep at most this many trailing stderr lines.
 const MAX_LINES: usize = 20;
@@ -31,6 +35,8 @@ const MAX_LINES: usize = 20;
 /// first evicts the oldest line). ~4 KB is plenty for a base's error banner
 /// while staying a hard cap on memory.
 const MAX_BYTES: usize = 4 * 1024;
+
+const DRAIN_SHUTDOWN_BUDGET: Duration = Duration::from_millis(250);
 
 /// The largest index `<= max` that lands on a UTF-8 char boundary of `s`, so a
 /// `String::truncate` at that index never splits a multibyte char (CJK / emoji)
@@ -64,6 +70,54 @@ struct TailBuf {
     bytes: usize,
 }
 
+/// Owns one stderr drain task for exactly as long as its base session.
+pub(crate) struct StderrDrain {
+    task: Option<JoinHandle<()>>,
+}
+
+impl StderrDrain {
+    pub(crate) fn spawn<R>(stderr: R, tail: StderrTail) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        Self {
+            task: Some(tokio::spawn(drain_stderr_into(stderr, tail))),
+        }
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self { task: None }
+    }
+
+    pub(crate) async fn shutdown(&mut self) {
+        self.shutdown_with_budget(DRAIN_SHUTDOWN_BUDGET).await;
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn is_active(&self) -> bool {
+        self.task.is_some()
+    }
+
+    async fn shutdown_with_budget(&mut self, budget: Duration) {
+        let Some(mut task) = self.task.take() else {
+            return;
+        };
+        if tokio::time::timeout(budget, &mut task).await.is_ok() {
+            return;
+        }
+        task.abort();
+        let _ = tokio::time::timeout(budget, &mut task).await;
+    }
+}
+
+impl Drop for StderrDrain {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 impl StderrTail {
     /// A fresh, empty tail buffer.
     #[must_use]
@@ -74,7 +128,7 @@ impl StderrTail {
     /// Push one captured stderr line, evicting the oldest line(s) until both the
     /// line-count and byte bounds hold. Fail-open: a poisoned lock is recovered
     /// (a prior panic while holding it must not wedge the drain task).
-    fn push(&self, line: String) {
+    pub(crate) fn push(&self, line: impl AsRef<str>) {
         let mut buf = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -84,7 +138,7 @@ impl StderrTail {
         // `String::truncate(MAX_BYTES)` PANICS when the byte index splits a
         // multibyte char (a CJK / emoji stderr banner straddling the cut) —
         // which would violate this module's "capture never panics" contract.
-        let mut line = line;
+        let mut line = redact_text(line.as_ref());
         if line.len() > MAX_BYTES {
             line.truncate(floor_char_boundary(&line, MAX_BYTES));
         }
@@ -139,7 +193,7 @@ where
             Ok(0) | Err(_) => break,
             Ok(_) => {
                 let line = String::from_utf8_lossy(&buf);
-                tail.push(line.trim_end_matches(['\n', '\r']).to_string());
+                tail.push(line.trim_end_matches(['\n', '\r']));
             }
         }
     }
@@ -148,6 +202,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn empty_tail_is_none() {
@@ -157,9 +212,19 @@ mod tests {
     #[test]
     fn snapshot_joins_lines_in_order() {
         let t = StderrTail::new();
-        t.push("first".to_string());
-        t.push("second".to_string());
+        t.push("first");
+        t.push("second");
         assert_eq!(t.snapshot().as_deref(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn snapshot_never_stores_synthetic_secrets() {
+        const SECRET: &str = "SYNTH_STDERR_SECRET_DO_NOT_LEAK_92";
+        let t = StderrTail::new();
+        t.push(format!("Authorization: Bearer {SECRET}"));
+        let snapshot = t.snapshot().expect("redacted diagnostic");
+        assert!(!snapshot.contains(SECRET));
+        assert!(snapshot.contains("[redacted]"));
     }
 
     #[test]
@@ -251,5 +316,29 @@ mod tests {
         let snap = tail.snapshot().unwrap();
         assert!(snap.contains("err line one"));
         assert!(snap.contains("err line two"));
+    }
+
+    #[tokio::test]
+    async fn owned_drain_finishes_normally_at_eof() {
+        let (reader, mut writer) = tokio::io::duplex(64);
+        let tail = StderrTail::new();
+        let mut drain = StderrDrain::spawn(reader, tail.clone());
+        writer.write_all(b"normal eof\n").await.unwrap();
+        drop(writer);
+        drain.shutdown_with_budget(Duration::from_secs(1)).await;
+        assert_eq!(tail.snapshot().as_deref(), Some("normal eof"));
+    }
+
+    #[tokio::test]
+    async fn owned_drain_aborts_when_a_writer_keeps_the_pipe_open() {
+        let (reader, mut inherited_writer) = tokio::io::duplex(64);
+        let tail = StderrTail::new();
+        let mut drain = StderrDrain::spawn(reader, tail);
+        inherited_writer.write_all(b"held open\n").await.unwrap();
+        drain.shutdown_with_budget(Duration::from_millis(20)).await;
+        assert!(
+            inherited_writer.write_all(b"after shutdown").await.is_err(),
+            "aborted drain must drop the pipe reader"
+        );
     }
 }

@@ -5,8 +5,10 @@
 #   - Local smoke testing (no need to publish first)
 #   - The release pipeline (CI builds N platforms, calls this N times)
 #
-# Idempotent: re-running with the same args is a no-op apart from the
-# file copy.
+# Idempotent: re-running with the same args atomically replaces the staged
+# executable.  Do not overwrite an executable in place: on macOS a previously
+# executed Mach-O can retain vnode/code-signing state and make the next launch
+# stall, while Windows commonly refuses an in-place write to a mapped image.
 
 set -euo pipefail
 
@@ -52,7 +54,11 @@ DEST_DIR="$NPM_ROOT/cli-$PLATFORM/bin"
   exit 1
 }
 mkdir -p "$DEST_DIR"
-cp "$BINARY" "$DEST_DIR/$BIN_NAME"
-chmod +x "$DEST_DIR/$BIN_NAME"
+STAGED_TMP="$DEST_DIR/.${BIN_NAME}.tmp.$$"
+trap 'rm -f "$STAGED_TMP"' EXIT
+cp "$BINARY" "$STAGED_TMP"
+chmod +x "$STAGED_TMP"
+mv -f "$STAGED_TMP" "$DEST_DIR/$BIN_NAME"
+trap - EXIT
 
 echo "stage.sh: $BINARY → $DEST_DIR/$BIN_NAME"

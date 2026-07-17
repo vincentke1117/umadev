@@ -218,12 +218,13 @@ pub const CLAUSES: &[Clause] = &[
     },
     // Architecture-fitness floor. `UD-CODE-005` is deliberately SKIPPED — that
     // slot stays reserved for the §10 accessibility candidate — so this family
-    // lands on 006. One clause entry carries three sub-rules (the data model
+    // lands on 006. One clause entry carries four sub-rules (the data model
     // has no variant ids; `parts[2]` must be exactly three digits): the
     // god-file gate (`006a`, blocking), the architecture-doc layer-dependency
-    // rules verified against import edges (`006b`, blocking), and added-code
-    // clone detection (`006c`, advisory). Sub-rule ids live in the prose
-    // (§3.6) and in `umadev_agent::arch_fitness`.
+    // rules verified against import edges (`006b`, blocking), added-code clone
+    // detection (`006c`, advisory), and diff-aware comment hygiene (`006d`,
+    // advisory). Sub-rule ids live in the prose (§3.6) and in
+    // `umadev_agent::arch_fitness`.
     Clause {
         id: "UD-CODE-006",
         layer: Layer::Code,
@@ -465,18 +466,25 @@ pub fn clauses_in_layer(layer: Layer) -> Vec<&'static Clause> {
     CLAUSES.iter().filter(|c| c.layer == layer).collect()
 }
 
-/// Officially supported host runtimes — the two families with first-
-/// party Agent SDKs.
+/// Legacy, coarse wire-family compatibility tag.
 ///
-/// Hosts outside this enum are explicitly out of scope for UmaDev 3.x;
-/// they require shallow rules-only adaptation which UmaDev does not
-/// pursue.
+/// This enum is serialized in existing run/config data, so its two stable values
+/// are retained for backward compatibility. It is **not** the supported-base
+/// list, a provider selector, or evidence that UmaDev embeds an Agent SDK. The
+/// reference implementation drives logged-in base CLIs as subprocesses; the
+/// authoritative first-class base list is `umadev_host::BACKEND_IDS`.
+///
+/// In particular, every non-Claude first-class subprocess driver reports
+/// [`RuntimeKind::Openai`] through this coarse compatibility tag. Callers that
+/// need host identity or capabilities must use the host id/capability table
+/// rather than branching on `RuntimeKind`.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeKind {
-    /// Anthropic Claude — Claude Agent SDK; surfaces: Claude Code, Claude Desktop.
+    /// Anthropic-compatible wire-family tag (currently used by Claude Code).
     Anthropic,
-    /// `OpenAI` Codex — `OpenAI` Agents SDK; surfaces: Codex CLI, Codex Desktop.
+    /// OpenAI-compatible legacy wire-family tag used by the non-Claude
+    /// subprocess drivers for backward compatibility.
     Openai,
 }
 
@@ -494,8 +502,8 @@ impl RuntimeKind {
     #[must_use]
     pub const fn display_name(self) -> &'static str {
         match self {
-            Self::Anthropic => "Anthropic (Claude Agent SDK)",
-            Self::Openai => "OpenAI (Agents SDK)",
+            Self::Anthropic => "Anthropic-compatible wire tag",
+            Self::Openai => "OpenAI-compatible wire tag",
         }
     }
 }
@@ -509,6 +517,16 @@ mod tests {
     fn clause_ids_are_unique() {
         let ids: HashSet<_> = CLAUSES.iter().map(|c| c.id).collect();
         assert_eq!(ids.len(), CLAUSES.len(), "duplicate clause IDs");
+        assert_eq!(CLAUSES.len(), 34, "V1 clause count drifted");
+    }
+
+    #[test]
+    fn runtime_kind_is_a_neutral_compatibility_tag() {
+        for kind in [RuntimeKind::Anthropic, RuntimeKind::Openai] {
+            let label = kind.display_name();
+            assert!(label.contains("wire tag"));
+            assert!(!label.contains("SDK"));
+        }
     }
 
     #[test]

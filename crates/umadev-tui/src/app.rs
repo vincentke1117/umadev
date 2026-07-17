@@ -8,30 +8,64 @@
 //!   scrolling message history above (user / umadev / host outputs /
 //!   gate prompts), status bar on top.
 //!
-//! Slash commands inside Chat (`/claude` `/codex` `/opencode` `/offline`
+//! Slash commands inside Chat (`/claude` `/codex` `/opencode` `/grok` `/kimi` `/offline`
 //! `/init` `/continue` `/revise` `/diff` `/spec` `/verify`
 //! `/doctor` `/help` `/quit` `/clear` `/history` `/commands`) plus normal
 //! text.
 //!
-//! Plain text is NOT classified by the shell. When a gate is open it is a
+//! Plain text is normally routed to the selected base. The only local exception
+//! is a small, exact set of live progress/change questions, which the shell can
+//! answer from its own task, plan, and diff state without steering the running
+//! agent. When a gate is open other text is a
 //! gate reply (approve / revise); otherwise it is routed to the selected
-//! **base** (Claude Code / Codex / `OpenCode`), which decides
+//! **base** — one of five first-class choices —
+//! which decides
 //! for itself whether the message is conversation or a build request and
 //! replies accordingly — UmaDev is only the shell around that base. The
 //! running dialogue is kept in [`App::conversation`] and handed to the base
 //! on every turn, so chat has memory instead of being amnesiac one-shots.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use crossterm::event::KeyCode;
 use umadev_agent::{EngineEvent, Gate, GateChoice, GateDecision};
+use umadev_runtime::{
+    BaseResumeIdentity, FileInputMode, PromptQueueMutation, PromptQueuePlacement,
+    SessionCommandInfo, SessionMode, SessionModelInfo, SessionPlanEntry, SessionStateUpdate,
+    TurnInput, TurnInputBlock,
+};
 use umadev_spec::{Phase, PHASE_CHAIN};
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthChar;
 
 use crate::config::UserConfig;
+use crate::prompt_queue_ui::PromptQueueUi;
+
+mod backend;
+pub(crate) mod host_input;
+mod lessons_view;
+mod memory_view;
+mod read_only_metric;
+mod submission;
+mod task_control;
+mod usage_meter;
+
+pub(crate) use backend::{parse_probe_detail, PROBE_AUTH_SENTINEL};
+use backend::{refresh_picker_with_probes, step_items};
+use lessons_view::{format_lessons_report, format_pitfalls_report};
+use memory_view::{compact_audit_id, MemoryParseError, MemoryTuiCommand, MemoryViewScope};
+use read_only_metric::read_only_metric;
+use submission::{append_text_block, submitted_content_end};
+use usage_meter::SessionUsageMeter;
 
 /// Max lines kept in the chat history (older lines roll off).
 const HISTORY_CAP: usize = 1000;
+const INPUT_HISTORY_CAP: usize = 100;
+const MAX_INPUT_HISTORY_BYTES: u64 = 1024 * 1024;
+const MAX_CHAT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const CLAUDE_SUBAGENT_STEM: &str = "↳ 子代理";
+const CLAUDE_SUBAGENT_WORKING: &str = "工作中…";
 /// Max background-run tasks kept in the registry. Single-writer means at most one
 /// is live; the rest are recent finished/stopped history rows shown by `/tasks`.
 /// The oldest settled task is dropped once the registry exceeds this.
@@ -111,6 +145,419 @@ const PASTE_CHIP_MIN_LINES: usize = 12;
 /// catches a huge single-line paste (one 5 KB line is just as much noise as 40
 /// short ones). Either trigger fires the chip.
 const PASTE_CHIP_MIN_CHARS: usize = 1200;
+
+/// TUI-side fast rejection mirrors the host protocol's hard attachment envelope.
+/// The host re-validates immediately before every write, so these values are UX
+/// feedback, never the security boundary.
+const MAX_TURN_ATTACHMENTS: usize = 16;
+const MAX_ATTACHMENT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct MemoryOptions {
+    positional: Vec<String>,
+    scope: Option<String>,
+    store: Option<String>,
+    days: Option<String>,
+    output: Option<String>,
+    yes: bool,
+    clear: bool,
+    run: bool,
+}
+
+fn tokenize_memory_args(input: &str) -> Result<Vec<String>, MemoryParseError> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut started = false;
+    for ch in input.chars() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            started = true;
+        } else if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            started = true;
+        } else if ch.is_whitespace() {
+            if started {
+                tokens.push(std::mem::take(&mut current));
+                started = false;
+            }
+        } else {
+            current.push(ch);
+            started = true;
+        }
+    }
+    if quote.is_some() {
+        return Err(MemoryParseError::UnclosedQuote);
+    }
+    if started {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+fn set_memory_option(
+    slot: &mut Option<String>,
+    value: String,
+    name: &str,
+) -> Result<(), MemoryParseError> {
+    if slot.replace(value).is_some() {
+        return Err(MemoryParseError::InvalidArgument(format!(
+            "duplicate --{name}"
+        )));
+    }
+    Ok(())
+}
+
+fn memory_option_value(
+    tokens: &[String],
+    index: &mut usize,
+    inline: Option<&str>,
+    name: &str,
+) -> Result<String, MemoryParseError> {
+    if let Some(value) = inline {
+        if value.is_empty() {
+            return Err(MemoryParseError::InvalidArgument(format!(
+                "--{name} requires a value"
+            )));
+        }
+        return Ok(value.to_string());
+    }
+    *index += 1;
+    let Some(value) = tokens.get(*index) else {
+        return Err(MemoryParseError::InvalidArgument(format!(
+            "--{name} requires a value"
+        )));
+    };
+    if value.starts_with("--") {
+        return Err(MemoryParseError::InvalidArgument(format!(
+            "--{name} requires a value"
+        )));
+    }
+    Ok(value.clone())
+}
+
+fn parse_memory_options(tokens: &[String]) -> Result<MemoryOptions, MemoryParseError> {
+    let mut parsed = MemoryOptions::default();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let Some(option) = token.strip_prefix("--") else {
+            parsed.positional.push(token.clone());
+            index += 1;
+            continue;
+        };
+        let (name, inline) = option
+            .split_once('=')
+            .map_or((option, None), |(name, value)| (name, Some(value)));
+        match name {
+            "scope" | "store" | "days" | "output" => {
+                let value = memory_option_value(tokens, &mut index, inline, name)?;
+                match name {
+                    "scope" => set_memory_option(&mut parsed.scope, value, name)?,
+                    "store" => set_memory_option(&mut parsed.store, value, name)?,
+                    "days" => set_memory_option(&mut parsed.days, value, name)?,
+                    "output" => set_memory_option(&mut parsed.output, value, name)?,
+                    _ => unreachable!(),
+                }
+            }
+            "yes" | "clear" | "run" => {
+                if inline.is_some() {
+                    return Err(MemoryParseError::InvalidArgument(token.clone()));
+                }
+                let slot = match name {
+                    "yes" => &mut parsed.yes,
+                    "clear" => &mut parsed.clear,
+                    "run" => &mut parsed.run,
+                    _ => unreachable!(),
+                };
+                if std::mem::replace(slot, true) {
+                    return Err(MemoryParseError::InvalidArgument(format!(
+                        "duplicate --{name}"
+                    )));
+                }
+            }
+            _ => return Err(MemoryParseError::InvalidArgument(token.clone())),
+        }
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+fn parse_memory_view_scope(value: Option<&str>) -> Result<MemoryViewScope, MemoryParseError> {
+    match value
+        .unwrap_or("project")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "project" | "项目" | "專案" => Ok(MemoryViewScope::Project),
+        "global" | "全局" | "全域" => Ok(MemoryViewScope::Global),
+        "all" | "全部" => Ok(MemoryViewScope::All),
+        other => Err(MemoryParseError::InvalidArgument(other.to_string())),
+    }
+}
+
+fn parse_memory_mutation_scope(
+    value: Option<&str>,
+) -> Result<umadev_agent::memory_control::MemoryScope, MemoryParseError> {
+    let Some(value) = value else {
+        return Err(MemoryParseError::MissingScope);
+    };
+    if value.eq_ignore_ascii_case("all") || value == "全部" {
+        return Err(MemoryParseError::OneScopeRequired);
+    }
+    umadev_agent::memory_control::MemoryScope::parse(value)
+        .ok_or_else(|| MemoryParseError::InvalidArgument(value.to_string()))
+}
+
+fn parse_memory_selector(
+    value: &str,
+) -> Result<umadev_agent::memory_control::MemorySelector, MemoryParseError> {
+    umadev_agent::memory_control::MemorySelector::parse(value)
+        .ok_or_else(|| MemoryParseError::UnknownSelector(value.to_string()))
+}
+
+fn parse_exact_memory_store(
+    value: Option<&str>,
+) -> Result<umadev_agent::memory_control::MemoryStore, MemoryParseError> {
+    let Some(value) = value else {
+        return Err(MemoryParseError::MissingStore);
+    };
+    match parse_memory_selector(value)? {
+        umadev_agent::memory_control::MemorySelector::Store(store) => Ok(store),
+        umadev_agent::memory_control::MemorySelector::Group(_) => {
+            Err(MemoryParseError::ExactStoreRequired)
+        }
+    }
+}
+
+fn parse_memory_command(input: &str) -> Result<MemoryTuiCommand, MemoryParseError> {
+    let mut tokens = tokenize_memory_args(input)?;
+    if tokens.is_empty() {
+        return Ok(MemoryTuiCommand::Inventory {
+            scope: MemoryViewScope::Project,
+        });
+    }
+    let operation = tokens.remove(0).to_ascii_lowercase();
+    let options = parse_memory_options(&tokens)?;
+    match operation.as_str() {
+        "inventory" => {
+            if !options.positional.is_empty()
+                || options.store.is_some()
+                || options.days.is_some()
+                || options.output.is_some()
+                || options.yes
+                || options.clear
+                || options.run
+            {
+                return Err(MemoryParseError::Usage);
+            }
+            Ok(MemoryTuiCommand::Inventory {
+                scope: parse_memory_view_scope(options.scope.as_deref())?,
+            })
+        }
+        "capture" | "recall" => {
+            if options.positional.len() != 1
+                || options.days.is_some()
+                || options.output.is_some()
+                || options.yes
+                || options.clear
+                || options.run
+            {
+                return Err(MemoryParseError::Usage);
+            }
+            let enabled = match options.positional[0].to_ascii_lowercase().as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(MemoryParseError::Usage),
+            };
+            let scope = parse_memory_mutation_scope(options.scope.as_deref())?;
+            let selector = options
+                .store
+                .as_deref()
+                .map(parse_memory_selector)
+                .transpose()?;
+            if operation == "capture" {
+                Ok(MemoryTuiCommand::Capture {
+                    scope,
+                    selector,
+                    enabled,
+                })
+            } else {
+                Ok(MemoryTuiCommand::Recall {
+                    scope,
+                    selector,
+                    enabled,
+                })
+            }
+        }
+        "retention" => {
+            if !options.positional.is_empty() || options.output.is_some() {
+                return Err(MemoryParseError::Usage);
+            }
+            let changes = usize::from(options.days.is_some())
+                + usize::from(options.clear)
+                + usize::from(options.run);
+            if changes > 1 || (options.yes && !options.run) {
+                return Err(MemoryParseError::Usage);
+            }
+            if changes == 0 {
+                let store = options
+                    .store
+                    .as_deref()
+                    .map(|value| parse_exact_memory_store(Some(value)))
+                    .transpose()?;
+                return Ok(MemoryTuiCommand::RetentionView {
+                    scope: parse_memory_view_scope(options.scope.as_deref())?,
+                    store,
+                });
+            }
+            let scope = parse_memory_mutation_scope(options.scope.as_deref())?;
+            let store = parse_exact_memory_store(options.store.as_deref())?;
+            if let Some(days) = options.days {
+                let days = days
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|days| *days > 0)
+                    .ok_or(MemoryParseError::InvalidDays)?;
+                Ok(MemoryTuiCommand::RetentionSet { scope, store, days })
+            } else if options.clear {
+                Ok(MemoryTuiCommand::RetentionClear { scope, store })
+            } else {
+                Ok(MemoryTuiCommand::RetentionRun {
+                    scope,
+                    store,
+                    confirmed: options.yes,
+                })
+            }
+        }
+        "export" => {
+            if !options.positional.is_empty()
+                || options.days.is_some()
+                || options.clear
+                || options.run
+            {
+                return Err(MemoryParseError::Usage);
+            }
+            let scope = parse_memory_mutation_scope(options.scope.as_deref())?;
+            let selector = options.store.as_deref().map_or_else(
+                || {
+                    Ok(umadev_agent::memory_control::MemorySelector::Group(
+                        umadev_agent::memory_control::MemoryGroup::All,
+                    ))
+                },
+                parse_memory_selector,
+            )?;
+            let Some(destination) = options.output.map(PathBuf::from) else {
+                return Err(MemoryParseError::MissingOutput);
+            };
+            if !destination.is_absolute() {
+                return Err(MemoryParseError::AbsoluteOutputRequired);
+            }
+            Ok(MemoryTuiCommand::Export {
+                scope,
+                selector,
+                destination,
+                confirmed: options.yes,
+            })
+        }
+        "forget" => {
+            if !options.positional.is_empty()
+                || options.days.is_some()
+                || options.output.is_some()
+                || options.clear
+                || options.run
+            {
+                return Err(MemoryParseError::Usage);
+            }
+            let scope = parse_memory_mutation_scope(options.scope.as_deref())?;
+            let selector = parse_memory_selector(
+                options
+                    .store
+                    .as_deref()
+                    .ok_or(MemoryParseError::MissingStore)?,
+            )?;
+            Ok(MemoryTuiCommand::Forget {
+                scope,
+                selector,
+                confirmed: options.yes,
+            })
+        }
+        "clear-cache" => {
+            if options.days.is_some()
+                || options.output.is_some()
+                || options.clear
+                || options.run
+                || options.store.is_some()
+                || options.positional.len() != 1
+            {
+                return Err(MemoryParseError::Usage);
+            }
+            let scope = parse_memory_mutation_scope(options.scope.as_deref())?;
+            if scope != umadev_agent::memory_control::MemoryScope::Project {
+                return Err(MemoryParseError::ProjectScopeRequired);
+            }
+            let store = parse_exact_memory_store(options.positional.first().map(String::as_str))?;
+            if !store.clearable_cache() {
+                return Err(MemoryParseError::InvalidArgument(store.id().to_string()));
+            }
+            Ok(MemoryTuiCommand::ClearCache {
+                store,
+                confirmed: options.yes,
+            })
+        }
+        _ => Err(MemoryParseError::Usage),
+    }
+}
+
+/// One composed user turn after visible chips have been resolved, but before the
+/// editor state is cleared. `text` is safe for transcript/history display: it has
+/// attachment labels, never local paths. `input` preserves exact block order for
+/// the selected base's structured transport.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SubmittedTurn {
+    pub(crate) text: String,
+    pub(crate) input: TurnInput,
+}
+
+/// One serialized resident-session input waiting for the sole base writer.
+/// Native commands stay typed while queued so they can never be reclassified as
+/// chat, live steering, or a Director request when the preceding turn settles.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum ResidentDispatch {
+    /// A normal natural-language turn that must go through model-first routing.
+    RoutedChat(String),
+    /// An advertised or explicitly wrapped base command sent byte-for-byte.
+    NativeCommand(String),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum QueuedResidentKind {
+    RoutedChat,
+    NativeCommand,
+}
+
+impl SubmittedTurn {
+    pub(crate) fn text(text: String) -> Self {
+        Self {
+            input: TurnInput::text(text.clone()),
+            text,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn has_attachments(&self) -> bool {
+        self.input
+            .blocks
+            .iter()
+            .any(|block| !matches!(block, TurnInputBlock::Text { .. }))
+    }
+}
 
 /// Max entries kept in the kill-ring (Ctrl+U/K/W feed it; Ctrl+Y / Alt+Y read
 /// it). The oldest entry falls off the back when a fresh, distinct kill pushes
@@ -232,6 +679,20 @@ pub(crate) struct CompactionJob {
     pub(crate) generation: u64,
 }
 
+/// Origin of a terminal routing failure.
+///
+/// Chat failures may suppress an exact duplicate retry. Director failures must
+/// never use the chat dispatch key: an explicit `/run` does not dispatch that
+/// text at all, and a model-promoted run leaves the original chat key stale once
+/// it crosses the Director boundary.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum FailedRouteOrigin {
+    /// An ordinary non-Director chat/agentic route.
+    Chat,
+    /// An explicit or model-promoted Director run.
+    Director,
+}
+
 /// What the event loop should do after a key press.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Action {
@@ -271,9 +732,47 @@ pub enum Action {
     /// User submitted natural language — ask the selected worker to decide
     /// whether this is normal chat or a pipeline requirement.
     Route(String),
+    /// Send an advertised base slash command directly through the resident
+    /// session, bypassing semantic routing and UmaDev directive composition.
+    NativeCommand(String),
+    /// Change Kimi Code's model-owned thinking toggle through the resident ACP
+    /// configuration channel. This is configuration, never chat text.
+    SetThinking(bool),
+    /// User submitted another turn while an ordinary resident base turn is
+    /// active. The event loop dispatches this through the live session's typed
+    /// steering surface when it is advertised; otherwise it queues the same
+    /// structured snapshot for the next turn with vendor-specific wording.
+    LiveInput(SubmittedTurn),
+    /// Submit typed content through Grok Build's native prompt queue. The typed
+    /// block sequence is retained intact; a failed dispatch restores it.
+    PromptQueueEnqueue {
+        /// Exact composed turn, including typed attachments.
+        turn: SubmittedTurn,
+        /// Append normally or use the base's native send-now operation.
+        placement: PromptQueuePlacement,
+    },
+    /// Request one server-authoritative prompt-queue mutation. The App mirror
+    /// remains unchanged until a later complete snapshot arrives.
+    PromptQueueMutate(PromptQueueMutation),
+    /// Ask the resident base for its complete, server-authoritative background
+    /// process snapshot. Unsupported bases report that capability honestly.
+    ListBackgroundProcesses,
+    /// Stop one base-owned background process after the driver performs a fresh
+    /// live-session ownership check.
+    StopBackgroundProcess(String),
     /// User submitted text while a gate was active — record as a revision and
     /// re-run the most recent block.
     Revise(String),
+    /// User asked a read-only question while a confirmation gate remains open.
+    /// The event loop answers it on a fresh Plan-permission base surface without
+    /// resolving, revising, or otherwise advancing the parked run.
+    GateQuery {
+        /// Monotonic app-local query generation. Late results from an aborted or
+        /// superseded query are ignored instead of mutating a newer run.
+        epoch: u64,
+        /// The user's read-only question at the still-open gate.
+        question: String,
+    },
     /// The user TYPED the decision for a paused consequential-action approval
     /// (「批准」/"approve"/"y" → `true`, 「拒绝」/"deny"/"n" → `false`) while
     /// [`App::pending_approval`] was live. The event loop resolves the shared
@@ -291,6 +790,13 @@ pub enum Action {
     /// Backend was switched (saved to config); the engine task should be
     /// restarted on next `StartRun`.
     BackendChanged,
+    /// The active Codex sandbox changed. A resident app-server thread keeps the
+    /// permissions it was started with, so the event loop must close and
+    /// immediately pre-load the session again before the next turn.
+    SandboxChanged,
+    /// `/init` changed project guidance or the effective slug. Re-prime the
+    /// resident base so it reads the initialized workspace before the next turn.
+    WorkspaceInitialized,
     /// `/setup` — re-open the first-run guide (language + worker picker). The
     /// event loop re-probes the host CLIs so their ready-state is current.
     Reconfigure,
@@ -338,6 +844,361 @@ pub enum Action {
 #[must_use]
 pub(crate) fn classify_approval_reply(text: &str) -> Option<bool> {
     umadev_agent::classify_approval_reply(text)
+}
+
+/// Read-only questions the TUI can answer from state it already owns.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LiveMetaIntent {
+    Progress,
+    Changes,
+}
+
+/// Bounded, trilingual live-meta classifier. It accepts polite/natural variants,
+/// but rejects multiline, future-work, and chained-action requests so a status
+/// lookup cannot swallow real work.
+fn classify_live_meta(text: &str) -> Option<LiveMetaIntent> {
+    const CHANGES: &[&str] = &[
+        "这次改了什么",
+        "这次改了啥",
+        "这次都改了什么",
+        "这次都改了啥",
+        "这次改动都做了什么",
+        "这次改动都做了啥",
+        "本次改了什么",
+        "本次改了啥",
+        "本次改动",
+        "本轮改动",
+        "这轮改动",
+        "改了哪些文件",
+        "这次改了哪些文件",
+        "這次改了什麼",
+        "這次都改了什麼",
+        "這次改動都做了什麼",
+        "本次改動",
+        "本輪改動",
+        "這輪改動",
+        "改了哪些檔案",
+        "這次改了哪些檔案",
+        "what changed",
+        "what did you change",
+        "what have you changed",
+        "what changes did you make",
+        "what files changed",
+        "show me the changes",
+        "what did this turn change",
+    ];
+    const PROGRESS: &[&str] = &[
+        "当前进度",
+        "目前进度",
+        "现在进度",
+        "进度怎么样",
+        "进度怎么样了",
+        "现在做到哪了",
+        "做到哪了",
+        "进行到哪了",
+        "现在在做什么",
+        "当前在做什么",
+        "任务进度",
+        "當前進度",
+        "目前進度",
+        "現在進度",
+        "進度怎麼樣",
+        "進度怎麼樣了",
+        "現在做到哪了",
+        "進行到哪了",
+        "現在在做什麼",
+        "當前在做什麼",
+        "任務進度",
+        "current progress",
+        "progress update",
+        "what's the progress",
+        "what is the progress",
+        "where are we",
+        "where are you at",
+        "what are you doing",
+        "what are you working on",
+        "current status",
+        "status update",
+    ];
+
+    let lowered = text.trim().to_lowercase();
+    let normalized = lowered
+        .trim_matches(|c: char| {
+            c.is_ascii_punctuation()
+                || matches!(c, '，' | '。' | '？' | '！' | '：' | '；' | '、' | '～')
+        })
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if CHANGES.contains(&normalized.as_str()) {
+        return Some(LiveMetaIntent::Changes);
+    }
+    if PROGRESS.contains(&normalized.as_str()) {
+        return Some(LiveMetaIntent::Progress);
+    }
+
+    // Natural variants stay deliberately bounded. A longer instruction or a
+    // second requested action belongs to the normal intent router.
+    if text.contains(['\n', '\r']) || normalized.chars().count() > 120 {
+        return None;
+    }
+    let compact = normalized.split_whitespace().collect::<String>();
+    let contains_any =
+        |haystack: &str, needles: &[&str]| needles.iter().any(|n| haystack.contains(n));
+    let chained_work = contains_any(
+        &compact,
+        &[
+            "然后修",
+            "然后改",
+            "然后写",
+            "然后跑",
+            "然后测试",
+            "然後修",
+            "然後改",
+            "然後寫",
+            "然後測試",
+            "并修",
+            "并改",
+            "并写",
+            "并补",
+            "并测试",
+            "並修",
+            "並改",
+            "並寫",
+            "並補",
+            "並測試",
+            "顺便修",
+            "顺便改",
+            "順便修",
+            "順便改",
+            "接着修",
+            "接着改",
+            "接著修",
+            "接著改",
+        ],
+    ) || contains_any(
+        &normalized,
+        &[
+            " and then ",
+            " then fix",
+            " then update",
+            " then edit",
+            " then run",
+            " and fix",
+            " and update",
+            " and edit",
+            " and run",
+            " also fix",
+            " also update",
+        ],
+    );
+    if chained_work {
+        return None;
+    }
+
+    let zh_scope = contains_any(
+        &compact,
+        &[
+            "这次", "本次", "此次", "这轮", "本轮", "刚才", "刚刚", "這次", "此次", "這輪", "本輪",
+            "剛才", "剛剛",
+        ],
+    );
+    let zh_completed_change = contains_any(
+        &compact,
+        &[
+            "改了",
+            "修改了",
+            "更新了",
+            "变更了",
+            "變更了",
+            "改动",
+            "改動",
+            "变更",
+            "變更",
+            "的修改",
+            "的更新",
+        ],
+    );
+    let zh_change_question = contains_any(
+        &compact,
+        &[
+            "什么",
+            "什麼",
+            "啥",
+            "哪些",
+            "哪几",
+            "哪幾",
+            "改了些什",
+            "做了些什",
+        ],
+    );
+    let zh_present = contains_any(
+        &compact,
+        &[
+            "说下",
+            "說下",
+            "说说",
+            "說說",
+            "讲下",
+            "講下",
+            "告诉我",
+            "告訴我",
+            "总结",
+            "總結",
+            "列出",
+            "展示",
+            "说明",
+            "說明",
+            "介绍",
+            "介紹",
+        ],
+    );
+    let zh_future_change = contains_any(
+        &compact,
+        &[
+            "要改", "需改", "需要", "应该", "應該", "计划", "計劃", "打算", "要求", "目标", "目標",
+            "任务", "任務",
+        ],
+    );
+    if !zh_future_change
+        && zh_completed_change
+        && (zh_change_question || zh_present)
+        && (zh_scope || compact.contains("你改了") || compact.contains("您改了"))
+    {
+        return Some(LiveMetaIntent::Changes);
+    }
+
+    let english_future_change = contains_any(
+        &normalized,
+        &[
+            "should change",
+            "should update",
+            "need to change",
+            "need to update",
+            "plan to change",
+            "changes to make",
+            "change requirements",
+        ],
+    );
+    let english_change_question = contains_any(
+        &normalized,
+        &[
+            "what changed",
+            "what did you change",
+            "what have you changed",
+            "what you changed",
+            "what files did you change",
+            "which files did you change",
+            "what did you update",
+            "changes you made",
+            "changes did you make",
+            "summarize the changes",
+            "summarise the changes",
+            "summary of the changes",
+            "show me the changes",
+            "list the changes",
+            "what was changed",
+            "what got changed",
+        ],
+    );
+    if english_change_question && !english_future_change {
+        return Some(LiveMetaIntent::Changes);
+    }
+
+    let zh_progress = contains_any(&compact, &["进度", "進度", "进展", "進展"]);
+    let zh_progress_question = contains_any(
+        &compact,
+        &[
+            "怎么样",
+            "怎麼樣",
+            "如何",
+            "到哪",
+            "哪一步",
+            "多少",
+            "什么情况",
+            "什麼情況",
+            "啥情况",
+            "嗎",
+            "吗",
+        ],
+    );
+    let zh_progress_where = contains_any(
+        &compact,
+        &[
+            "做到哪",
+            "进行到哪",
+            "進行到哪",
+            "处理到哪",
+            "處理到哪",
+            "弄到哪",
+        ],
+    );
+    let zh_work_object = contains_any(
+        &compact,
+        &[
+            "组件", "組件", "页面", "頁面", "代码", "代碼", "函数", "函數", "接口", "文件", "檔案",
+            "配置", "测试", "測試",
+        ],
+    );
+    if !zh_work_object
+        && ((zh_progress && (zh_progress_question || zh_present)) || zh_progress_where)
+    {
+        return Some(LiveMetaIntent::Progress);
+    }
+
+    let english_progress = contains_any(
+        &normalized,
+        &[
+            "how is it going",
+            "how far along",
+            "what's the progress",
+            "what is the progress",
+            "current progress",
+            "progress update",
+            "where are we",
+            "where are you at",
+            "what are you doing",
+            "what are you working on",
+            "current status",
+            "status update",
+            "what stage are we",
+            "what stage are you",
+            "what step are we on",
+            "what step are you on",
+            "tell me the current progress",
+            "give me a progress update",
+            "show me the current progress",
+        ],
+    );
+    let english_progress_prompt = contains_any(
+        &normalized,
+        &[
+            "what",
+            "where",
+            "how",
+            "tell me",
+            "show me",
+            "give me",
+            "can you",
+            "could you",
+            "please",
+        ],
+    );
+    let english_work_object = contains_any(
+        &normalized,
+        &[
+            " component",
+            " page",
+            " function",
+            " endpoint",
+            " widget",
+            " source file",
+            " code",
+            " api",
+        ],
+    );
+    (english_progress && english_progress_prompt && !english_work_object)
+        .then_some(LiveMetaIntent::Progress)
 }
 
 /// Status of one pipeline phase.
@@ -396,7 +1257,7 @@ impl AuthMark {
 /// Availability of one host backend.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BackendInfo {
-    /// Stable backend id (`claude-code` / `codex` / `opencode`).
+    /// Stable id of one of the registered host backends.
     pub id: String,
     /// `true` when the host CLI is installed and reachable.
     pub ready: bool,
@@ -414,12 +1275,12 @@ pub struct BackendInfo {
 }
 
 /// Which group a picker item belongs to — drives the section headers in the
-/// first-launch picker so a user sees the three runtime paths at a glance.
+/// first-launch picker so a user sees the runtime choices at a glance.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum PickerGroup {
     /// First-run UI language choice (zh-CN / zh-TW / en), rendered first.
     Language,
-    /// Drive a logged-in host CLI subprocess (Claude Code / Codex / `OpenCode`).
+    /// Drive one of the five supported logged-in host CLIs.
     HostCli,
 }
 
@@ -550,6 +1411,39 @@ impl TaskStatus {
     }
 }
 
+fn agent_task_status_label(
+    lang: umadev_i18n::Lang,
+    state: umadev_agent::task_lifecycle::AgentTaskState,
+) -> &'static str {
+    use umadev_agent::task_lifecycle::AgentTaskState;
+    let key = match state {
+        AgentTaskState::Queued => "tasks.agent.status.queued",
+        AgentTaskState::Running => "tasks.status.running",
+        AgentTaskState::Waiting => "tasks.agent.status.waiting",
+        AgentTaskState::Succeeded => "tasks.status.done",
+        AgentTaskState::Failed => "tasks.status.failed",
+        AgentTaskState::Cancelled => "tasks.status.stopped",
+        AgentTaskState::Unavailable => "tasks.agent.status.unavailable",
+        AgentTaskState::Superseded => "tasks.agent.status.superseded",
+        AgentTaskState::Interrupted => "tasks.agent.status.interrupted",
+    };
+    umadev_i18n::t(lang, key)
+}
+
+fn agent_run_status_label(
+    lang: umadev_i18n::Lang,
+    readiness: &umadev_agent::task_lifecycle::RunReadiness,
+) -> &'static str {
+    use umadev_agent::task_lifecycle::RunReadiness;
+    let key = match readiness {
+        RunReadiness::NotTracked => "tasks.agent.status.untracked",
+        RunReadiness::InProgress => "tasks.status.running",
+        RunReadiness::Succeeded => "tasks.status.done",
+        RunReadiness::Blocked(_) => "tasks.status.failed",
+    };
+    umadev_i18n::t(lang, key)
+}
+
 /// Serde DTO for persisting one [`BackgroundTask`] row to `.umadev/tasks.json`.
 /// Mirrors the in-memory task but stores `started_at` as a wall-clock unix stamp
 /// (an `Instant` isn't serializable across launches) and the status as its
@@ -610,7 +1504,7 @@ fn instant_from_age(started_at_unix: u64) -> std::time::Instant {
 /// can list, stop, and resume via `/tasks` while they keep scrolling / chatting.
 ///
 /// Single-writer (the run-lock) means only one mutating run is `Running` at a
-/// time; finished tasks are kept as a short history (capped by [`TASKS_CAP`]).
+/// time; finished tasks are kept as a bounded short history.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BackgroundTask {
     /// Stable, short display id (`t1`, `t2`, …) minted when the run registers.
@@ -623,7 +1517,7 @@ pub struct BackgroundTask {
     pub started_at: std::time::Instant,
     /// Wall-clock unix-seconds stamp of registration. An [`std::time::Instant`]
     /// can't be serialized (no portable epoch), so this is what
-    /// [`App::persist_tasks`] writes; on reload [`App::load_tasks`] turns it back
+    /// the app's internal task persistence writes; on reload the task loader turns it back
     /// into a `started_at` offset by the task's age. `0` when the clock is
     /// unavailable (fail-open).
     pub started_at_unix: u64,
@@ -837,7 +1731,7 @@ fn merge_seat_status(acc: SeatStatus, role: &str, status: &str) -> SeatStatus {
 /// Source of a chat message — used to colour the role label.
 ///
 /// Serde-derived (Wave 3): the visible display transcript is persisted inside
-/// [`ChatSession`] so a relaunch rebuilds the same screen; an unknown variant
+/// the private persisted chat-session representation so a relaunch rebuilds the same screen; an unknown variant
 /// in a newer file simply fails that one row's lenient parse (fail-open).
 #[derive(Debug, Copy, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ChatRole {
@@ -902,6 +1796,11 @@ impl ToolStatus {
 /// structured across a relaunch instead of flattening them to prose.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
+    /// Stable base-protocol call id. Older persisted rows and legacy stream
+    /// drivers have none; correlated ACP rows retain it so interleaved updates
+    /// can never settle the wrong card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     /// The tool's name as the base reports it (`Read` / `Edit` / `Bash` …).
     pub name: String,
     /// The primary argument (a path, a query, a command) — already truncated
@@ -911,6 +1810,10 @@ pub struct ToolCall {
     pub status: ToolStatus,
     /// The result summary once the call returns (`None` while in flight).
     pub result: Option<String>,
+    /// Complete non-terminal status-title replacement reported by the base.
+    /// Kept separate from `result`: it is card state, not stdout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
     /// `true` when a low-signal read/grep/glob batch was merged into this one
     /// line; `count` then carries how many calls folded together.
     pub merged: bool,
@@ -1000,16 +1903,15 @@ pub struct SlashCommand {
 
 /// One palette autocomplete row: the verb, its localized description, and an
 /// optional argument hint rendered as dim ghost text. Built per-keystroke by
-/// [`App::palette_matches`] from [`App::COMMANDS`] (+ the dynamic per-backend
-/// verbs) for the active language.
+/// [`App::palette_matches`] from [`App::COMMANDS`] for the active language.
 #[derive(Debug, Clone)]
-pub struct PaletteEntry {
+pub struct PaletteEntry<'a> {
     /// The verb to insert on autocomplete (no leading slash).
-    pub verb: &'static str,
+    pub verb: &'a str,
     /// Localized one-line description (already resolved for the active language).
-    pub desc: &'static str,
+    pub desc: &'a str,
     /// Optional dim ghost-text argument hint.
-    pub arg_hint: Option<&'static str>,
+    pub arg_hint: Option<&'a str>,
 }
 
 /// One rendered line of a diff card. The `tag` is the gutter marker; `line_no`
@@ -1055,6 +1957,10 @@ pub struct DiffHunk {
 /// `Write src/app.tsx` row.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileDiff {
+    /// Stable base-protocol call id, when the edit came from a correlated tool
+    /// stream. It is presentation-only routing metadata and renders nowhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     /// The edited file's path (rendered in the header + used for the language
     /// hint that drives syntax highlighting).
     pub path: String,
@@ -1082,7 +1988,7 @@ impl FileDiff {
     /// Build a diff card from a structured [`umadev_runtime::ToolEdit`].
     ///
     /// Runs a line-level diff (`similar`, pure-Rust Myers) over `before → after`,
-    /// groups the changes into hunks with ±[`DIFF_CONTEXT`] lines of surrounding
+    /// groups the changes into hunks with a bounded number of surrounding lines
     /// context, counts the +/- lines for the header, and pre-folds a big diff to
     /// its header (`collapsed`). The line numbers track the AFTER file for
     /// add/context rows and the BEFORE file for deletions, so each number points
@@ -1226,6 +2132,7 @@ impl FileDiff {
         let collapsed = total_rows > DIFF_FOLD_THRESHOLD;
 
         Self {
+            call_id: None,
             path: edit.path.clone(),
             added,
             removed,
@@ -1628,6 +2535,28 @@ fn is_image_path(s: &str) -> bool {
         .any(|ext| l.ends_with(ext))
 }
 
+fn supported_image_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP")
+}
+
+fn image_extension_matches(path: &std::path::Path, bytes: &[u8]) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("png") => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        Some("jpg" | "jpeg") => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        Some("gif") => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        Some("webp") => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
 /// Normalise a pasted path token the way a terminal mangles a dragged file:
 /// drop a `file://` scheme, strip one layer of matching outer quotes, and (on
 /// unix) undo shell backslash-escapes (`my\ pic.png` → `my pic.png`). Leaves a
@@ -1725,7 +2654,13 @@ impl MessageBody {
                     .filter(|r| !r.trim().is_empty())
                     .map(|r| format!(" — {r}"))
                     .unwrap_or_default();
-                std::borrow::Cow::Owned(format!("{mark} {}{count}{arg}{result}", t.name))
+                let progress = t
+                    .progress
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| format!(" · {value}"))
+                    .unwrap_or_default();
+                std::borrow::Cow::Owned(format!("{mark} {}{count}{arg}{progress}{result}", t.name))
             }
             MessageBody::Diff(d) => {
                 // Flat text (export / brain transcript / history preview): a
@@ -1738,7 +2673,7 @@ impl MessageBody {
 }
 
 /// One row in the chat history. Serde-derived (Wave 3) — the unit the
-/// persisted display transcript ([`ChatSession::display`]) stores and the
+/// persisted display transcript stores and the
 /// relaunch rebuild restores, so the reopened screen matches the closed one.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
@@ -1926,15 +2861,18 @@ pub struct App {
     /// `0` = before first char; `chars().count()` = after last char.
     pub input_cursor: usize,
     /// Image attachments for the turn being composed. A dragged/pasted image path
-    /// is stored here (absolute, verified) and shown in `input` as an `[图片 N]`
-    /// chip (N = 1-based index into this Vec); on submit the chip is rewritten to
-    /// an `@<abs-path>` mention the base ingests as an image. Cleared with the input.
+    /// is stored here and shown in `input` as an `[图片 N]` chip. Submission turns
+    /// the chip into a typed image block; the local path is never copied into text.
     pub attachments: Vec<std::path::PathBuf>,
+    /// Generic files selected from the `@` picker. These use `[文件 N]` chips and
+    /// become typed file blocks with explicit bounded-text fallback permission.
+    /// Keeping them separate from images preserves their delivery contract.
+    pub file_attachments: Vec<std::path::PathBuf>,
     /// Large-paste text stash for the turn being composed. A bracketed paste over
-    /// [`PASTE_CHIP_MIN_LINES`] / [`PASTE_CHIP_MIN_CHARS`] is collapsed to a single
+    /// the internal line/character thresholds is collapsed to a single
     /// `[粘贴 N 行]` chip in `input` and its full text parked here, so a bulky
     /// paste doesn't flood the box into unscrollable noise. On submit the chip is
-    /// expanded back to the full text inline (see [`Self::expand_attachments`]).
+    /// expanded back to the full text inline by the internal attachment expander.
     /// Cleared with the input. Same proven pattern as `attachments`, for text.
     pub text_stash: Vec<String>,
     /// Past submitted texts. ↑↓ in an empty input box recalls them.
@@ -1957,7 +2895,7 @@ pub struct App {
     pub mention_dismissed: bool,
     /// Lazily-built, cached list of repo-relative file paths (`/`-separated,
     /// sorted) — the `@`-mention candidate source. `None` until the first
-    /// `@`-token is typed, then built once by [`Self::ensure_mention_files`] and
+    /// `@`-token is typed, then built once by the internal mention-file indexer and
     /// reused (the filesystem scan is NOT re-run per keystroke). Interior-mutable
     /// so the pure `&App` renderer can populate it on first use.
     pub mention_files: std::cell::RefCell<Option<Vec<String>>>,
@@ -1966,8 +2904,8 @@ pub struct App {
     /// VISIBLE rendered surface (prose + tool rows + diff cards + plan memos +
     /// notes) — distinct from the base-facing [`Self::conversation`] /
     /// [`Self::full_transcript`]. Wave 3: persisted as
-    /// [`ChatSession::display`] on the same cadence as the transcript and
-    /// REBUILT by [`Self::load_chat`] on reopen, so a relaunch shows the same
+    /// the persisted display transcript on the same cadence as the transcript and
+    /// REBUILT by the internal chat loader on reopen, so a relaunch shows the same
     /// screen instead of an empty conversation.
     pub history: VecDeque<ChatMessage>,
 
@@ -2007,7 +2945,7 @@ pub struct App {
     /// so the renderer requests a full repaint via
     /// [`Self::request_transcript_repaint`]. `0` until the first render (a first
     /// frame never counts as a shrink). See
-    /// [`crate::transcript_reflow_needs_repaint`].
+    /// the crate's internal transcript-reflow detector.
     pub transcript_prev_total: std::cell::Cell<usize>,
     /// P3 — the **terminal-contamination flag**: a one-shot request, raised from
     /// anywhere (interior-mutable `Cell`, so the pure `&App` renderer, the scroll
@@ -2211,8 +3149,7 @@ pub struct App {
     /// older turns into one structured summary block here (the base then sees
     /// `[summary] + [recent verbatim tail]`), while the FULL transcript lives
     /// untouched in [`Self::full_transcript`] (persisted to disk). Bounded by
-    /// [`COMPACTION_TOKEN_BUDGET`] (the compaction trigger) with a
-    /// [`CONVERSATION_HARD_CAP`] FIFO safety net.
+    /// bounded compaction trigger with a hard FIFO safety net.
     pub conversation: Vec<umadev_runtime::Message>,
 
     /// **Full, append-only transcript** — every recorded chat turn (user + base
@@ -2249,12 +3186,17 @@ pub struct App {
     /// pipeline run. Ignored by `Offline` and bases without a session id.
     pub host_chat_session_active: bool,
 
-    /// A stable UUID pinning THIS chat's base session, minted lazily on the
-    /// first host-CLI turn. Lets `claude` resume our own conversation by id
-    /// (`--session-id` / `--resume <uuid>`) instead of "the most recent in this
-    /// dir", so a parallel `claude` session in the same folder can't bleed in.
-    /// Reset (to `None`) at the same points as [`Self::host_chat_session_active`].
+    /// The exact native session id returned by the base after a successful turn,
+    /// or restored through an explicit `/resume <chat-id>`. UmaDev never derives
+    /// this from the logical chat-file id and never synthesizes a Codex/OpenCode
+    /// id. Reset (to `None`) with [`Self::host_chat_session_active`].
     pub chat_session_id: Option<String>,
+
+    /// Immutable authority identity for [`Self::chat_session_id`]. Grok ids are
+    /// resumable only when this contains a fully attested effective sandbox and
+    /// the native resume preflight is active; legacy/unknown identities fall back
+    /// to a fresh session plus transcript handoff.
+    pub chat_resume_identity: Option<BaseResumeIdentity>,
 
     /// One-shot signal that the **resident chat session** (the host-CLI base process
     /// the event loop keeps alive across the conversation — `lib.rs`'s
@@ -2276,18 +3218,17 @@ pub struct App {
     /// failure or corrupt file degrades to the live in-memory buffer, never a crash.
     pub(crate) chat_id: String,
 
-    /// `true` once the run loop has handed a finished `/run` director session back
-    /// to chat (Wave 5 deliverable 2). The NEXT chat turn then resumes the base's
-    /// most-recent session in this dir (`--continue`, i.e. `session_id = None` +
-    /// `continue_session = true`) so "why did you build it that way?" continues the
-    /// SAME session that did the build — not a disjoint cold one. Consumed (reset)
-    /// once that first post-run chat turn fires. Fail-open: if the resume misses,
-    /// the base starts fresh (today's behaviour).
+    /// `true` once a director build has handed its finished native session back to
+    /// chat (Wave 5 deliverable 2). The exact base session id is captured into
+    /// [`Self::chat_session_id`]; the NEXT chat turn resumes that id so "why did you
+    /// build it that way?" continues the SAME conversation, not whichever session
+    /// happens to be newest in the directory. Consumed once that turn fires.
+    /// Fail-open: a base without resume support gets the bounded transcript replay.
     pub(crate) run_session_handed_to_chat: bool,
 
-    /// `true` while an explicit `/run` **director build** is the in-flight agentic
-    /// turn (Wave 5 deliverable 2). Set when the `/run` director loop is launched and
-    /// cleared on any terminal turn.
+    /// `true` while any **director build** (explicit `/run` or a model-promoted
+    /// natural-language turn) is in flight. Set when the director boundary is
+    /// crossed and cleared on any terminal turn.
     ///
     /// It NO LONGER decides the Wave-5 session hand-back: the chat surface classifies
     /// chat-vs-build INSIDE the spawned task (after the slow brain-router consult), so
@@ -2304,6 +3245,25 @@ pub struct App {
     /// approval / revision routing on it — a director pause resumes via
     /// `drive_director_loop_resume`, never a legacy gate block.
     pub(crate) director_gate_paused: bool,
+    /// A Director `GateOpened` event that arrived before the Director session was
+    /// fully ended. The gate is staged here and becomes interactive only when the
+    /// matching terminal `RunPausedAtGate` decision lands, preventing approval or
+    /// picker input from racing a still-live writer session.
+    pub(crate) pending_director_gate: Option<(Gate, Option<GateChoice>)>,
+    /// A read-only model answer to a question at an open gate is in flight. The
+    /// gate itself stays armed; additional submitted text remains in the editor
+    /// until the answer lands so two gate-query sessions can never race.
+    pub(crate) gate_query_in_flight: bool,
+    /// Monotonic generation source for gate queries. It is intentionally never
+    /// reset when a run/conversation is cleared, so an old async result can never
+    /// alias a later query in the same process.
+    pub(crate) gate_query_epoch: u64,
+    /// The sole gate query whose terminal event may currently update app state.
+    pub(crate) active_gate_query_epoch: Option<u64>,
+    /// Number of chat turns already waiting before the current route dispatch.
+    /// If the route becomes Director, only the later tail may be promoted into
+    /// that task's steering; the older FIFO backlog remains independent work.
+    pub(crate) route_backlog_len: usize,
 
     /// Currently active backend id (matches `config.backend`).
     /// `None` means offline / no host CLI.
@@ -2318,6 +3278,23 @@ pub struct App {
     pub(crate) base_model_live: bool,
     /// Exact context window read from the base config when available.
     pub(crate) base_context_window: Option<u64>,
+    /// Complete model catalog published by the current live base session.
+    pub(crate) base_session_models: Vec<SessionModelInfo>,
+    /// Current model id published by the live session, distinct from the static
+    /// base-config fallback held in [`Self::base_model`].
+    pub(crate) base_session_model: Option<String>,
+    /// Current native interaction mode reported by the live base session.
+    pub(crate) base_session_mode: Option<SessionMode>,
+    /// Current independent thinking toggle reported by the live base session.
+    pub(crate) base_session_thinking: Option<bool>,
+    pub(crate) base_session_thinking_can_enable: bool,
+    pub(crate) base_session_thinking_can_disable: bool,
+    /// Complete slash-command catalog published by the current live session.
+    pub(crate) base_session_commands: Vec<SessionCommandInfo>,
+    /// Complete tool-name snapshot attached to the command catalog.
+    pub(crate) base_session_tools: Vec<String>,
+    /// Complete native plan snapshot published by the current live base.
+    pub(crate) base_session_plan: Vec<SessionPlanEntry>,
 
     /// Workspace slug (filled in by the caller).
     pub slug: String,
@@ -2339,11 +3316,24 @@ pub struct App {
     /// (e.g. `("Bash", "npm install")`). Mirrored each event-loop iteration from
     /// the shared approval holder (lib.rs) via [`Self::set_pending_approval`], so
     /// the renderer pins a STICKY approval bar directly above the input box and
-    /// [`Self::submit_text`] can classify a typed 「批准」/「拒绝」 as the decision
+    /// the internal submit path can classify a typed 「批准」/「拒绝」 as the decision
     /// (A2#5 — the pause used to surface only as one scrolling Note, with every
     /// key silently consumed and no visible approval entry point). `None` = no
     /// pause (the common case).
     pub pending_approval: Option<(String, String)>,
+    /// Same-RPC typed input state, including contract-specific picker progress.
+    /// Secret input is never copied into chat history or durable transcripts.
+    pub pending_host_input: Option<host_input::PendingHostInputView>,
+    /// Explicit Grok Build pre-session authentication state. It is separate from
+    /// the ordinary composer, so a draft typed while the base was opening is
+    /// preserved byte-for-byte and no trust/Auto mode can answer on the user's
+    /// behalf. Sensitive fields have redacted `Debug` output and are never
+    /// persisted.
+    pub(crate) auth_ui: Option<crate::auth_ui::AuthUiState>,
+    /// Ordinary chat draft displaced by [`Self::pending_host_input`]. Restored
+    /// after the same-RPC response settles; never rendered or submitted while the
+    /// host question owns the composer.
+    host_input_draft: Option<host_input::HostInputDraft>,
     /// `true` once a delivery proof-pack has landed.
     pub finished: bool,
     /// `true` once the user has kicked off a pipeline run in this session.
@@ -2360,7 +3350,7 @@ pub struct App {
     /// [`TaskStatus::Running`] task here so it reads as a manageable background
     /// task (listed / stopped / resumed via `/tasks`) instead of a modal
     /// lock-out. Single-writer (the run-lock) keeps at most one `Running` task;
-    /// the rest are settled rows, capped to [`TASKS_CAP`]. Newest is last.
+    /// the rest are settled rows, capped to the internal task-history limit. Newest is last.
     pub tasks: Vec<BackgroundTask>,
     /// Monotonic counter minting the short display id (`t1`, `t2`, …) for each
     /// registered task. Never reset within a session.
@@ -2372,7 +3362,7 @@ pub struct App {
     /// racing process env.
     pub bell_enabled: bool,
     /// A completion bell is armed and waiting to ride the next between-frames
-    /// gap. Set by [`Self::arm_completion_bell`] on a terminal transition (a run
+    /// gap. Set by the internal completion-bell armer on a terminal transition (a run
     /// finished / aborted, a long agentic turn settled, or a gate paused needing
     /// the user) that took long enough that the user may have stepped away;
     /// drained + emitted by the event loop via [`Self::take_bell`] through the
@@ -2426,13 +3416,13 @@ pub struct App {
     /// hand-editing config or losing it on restart-of-flow.
     ///
     /// Kept as the compatibility surface for the binary `/auto` `/manual`
-    /// toggle; [`trust_mode_override`] is the richer three-tier control that
+    /// toggle; `trust_mode_override` is the richer three-tier control that
     /// supersedes it. The two stay consistent — flipping one updates the other.
     pub auto_approve_override: Option<bool>,
 
     /// Session-level trust / autonomy tier override (`/mode plan|guarded|auto`).
     /// `None` → derive from `.umadevrc` (`auto_approve_gates`). When `Some`, it
-    /// takes precedence and also drives the legacy [`auto_approve_override`].
+    /// takes precedence and also drives the legacy `auto_approve_override`.
     /// The default tier is `guarded` (the existing human-in-the-loop behaviour).
     pub trust_mode_override: Option<umadev_agent::TrustMode>,
 
@@ -2469,13 +3459,13 @@ pub struct App {
     pub overlay: Option<Overlay>,
     /// **Feature B — in-transcript search.** `Some` while the Ctrl+F search bar
     /// is open. Its own modal mode: the chat key handler routes EVERY keystroke
-    /// to [`Self::search_key`] while this is `Some`, so search never collides
+    /// to the internal search-key handler while this is `Some`, so search never collides
     /// with the slash palette, the `@`-mention popover, history recall, or an
     /// overlay (each of those is checked/skipped while search owns the input).
     pub search: Option<SearchState>,
     /// **I3 — reverse prompt-history search.** `Some` while the Ctrl+R history
     /// search owns the input. Its own modal mode: the chat key handler routes
-    /// EVERY keystroke to [`Self::history_search_key`] while this is `Some`, so it
+    /// EVERY keystroke to the internal history-search handler while this is `Some`, so it
     /// never collides with the transcript search, the slash palette, the
     /// `@`-mention popover, or `↑↓` history recall (each is skipped while it owns
     /// the keyboard). `None` when closed.
@@ -2505,7 +3495,7 @@ pub struct App {
 
     /// Kill-ring (I1): text removed by Ctrl+U / Ctrl+K / Ctrl+W is PUSHED here
     /// (most-recent at the front) instead of being destroyed, so Ctrl+Y can yank
-    /// it back and Alt+Y can cycle older entries. Capped at [`KILL_RING_CAP`].
+    /// it back and Alt+Y can cycle older entries. Capped at the internal ring limit.
     pub kill_ring: VecDeque<String>,
     /// Direction of the LAST kill, or `None` when the last action was not a kill.
     /// Drives readline-style coalescing: a consecutive same-direction kill folds
@@ -2530,19 +3520,8 @@ pub struct App {
     /// edit always opens a clean step).
     last_snapshot_at: Option<std::time::Instant>,
 
-    /// REAL token usage for THIS session (input+output), accumulated from the
-    /// base's own per-turn reports (`EngineEvent::TurnUsage`, F3) — true
-    /// consumption, the base's numbers, NOT an estimate or the all-time ledger.
-    /// Starts at 0 each launch and grows per turn; shown on the waiting indicator.
-    pub session_tokens: u64,
-
-    /// The base's REAL input-token count from the LAST turn (`EngineEvent::TurnUsage`).
-    /// This is the live **context-occupancy** proxy: the input tokens the base READ
-    /// that turn ≈ how full its context is right now (distinct from cumulative
-    /// [`Self::session_tokens`] spend). 0 until the first turn reports usage → the
-    /// context gauge then falls back to a transcript estimate, or shows nothing.
-    /// Reset to 0 on `/clear`. Numerator of the meta-row context-usage gauge.
-    pub last_turn_input_tokens: u64,
+    /// Typed exact/lower-bound/unknown usage state for this conversation.
+    pub(crate) session_usage: SessionUsageMeter,
 
     /// Whether the proactive `/compact` nudge has already fired for the current
     /// threshold crossing, so the one-line hint surfaces ONCE when context first
@@ -2553,6 +3532,7 @@ pub struct App {
 
     /// One-line status shown in the top bar.
     pub status: String,
+    pub(crate) copy_toast: Option<crate::selection::CopyToast>,
     /// Spinner animation tick.
     pub tick: u8,
     /// **P5d — animation master switch.** `true` (default) animates every spinner
@@ -2596,44 +3576,57 @@ pub struct App {
     /// `apply_engine_event` returns and fires `Action::Continue`.
     pub pending_auto_continue: Option<Gate>,
 
-    /// Messages the user typed WHILE the pipeline was mid-phase. We can't
-    /// inject them into the running base subprocess, so (like Claude Code queuing
-    /// a turn) we hold them until the next gap — a gate / phase boundary. FIFO:
-    /// each extra steer the user types while a phase runs is appended, and all of
-    /// them are folded into the next gate's revision in order. A single `Option`
-    /// here used to silently OVERWRITE an earlier un-fired steer (and the
-    /// `queued N` chip stayed stuck at 1), losing input.
+    /// Explicit adjustments to the CURRENT task typed while a pipeline is
+    /// mid-phase. They wait FIFO for the next step/gate boundary. Questions,
+    /// later tasks and ambiguity belong to [`Self::queued_chat`] instead.
     pub queued_steer: VecDeque<String>,
 
-    /// Set by the gate handler when a [`queued_steer`] message is ready to fire
+    /// Set by the gate handler when a `queued_steer` message is ready to fire
     /// at the just-opened gate. The event loop consumes it and re-runs the
     /// producing block with the queued text folded in as a revision.
     pub pending_steer: Option<String>,
 
-    /// Chat turns the user typed WHILE a routed turn was still in flight
-    /// (`thinking == true`). We never spawn a second `spawn_route` against the
-    /// same chat session concurrently — that would resume one `session_id` in
-    /// two base subprocesses at once and scramble the reply order / memory.
-    /// Instead each extra turn is parked here (FIFO) and the event loop fires
-    /// the next one only after the current route result lands. Kept distinct
-    /// from [`queued_steer`], which is the *pipeline-run* queue (fires at a
-    /// gate), not the chat-routing queue.
+    /// Ordinary model turns waiting behind an active writer/route: questions,
+    /// later tasks, ambiguous input, or any turn typed while a chat response is
+    /// in flight. They stay FIFO and run only after the active turn/run settles,
+    /// so one base session is never resumed concurrently. Kept distinct from
+    /// [`Self::queued_steer`], which may alter the CURRENT pipeline at a boundary.
     pub queued_chat: std::collections::VecDeque<String>,
 
-    /// The EXACT text of the chat turn most recently dispatched to the base (a fresh
-    /// `Action::Route`, or a drained queued turn). On a terminal route failure this is
-    /// the authoritative "what just failed" key — [`Self::drop_failed_route_duplicate_queued_chat`]
-    /// drops queued turns equal to THIS (not the fragile "last user turn in
-    /// conversation" heuristic, which a relayed / reframed turn or an intervening
-    /// record could skew). `None` until the first dispatch.
-    pub last_dispatched_chat: Option<String>,
+    /// Dispatch kind positionally aligned with [`Self::queued_chat`]. Legacy
+    /// hand-built state without tags is normalized to routed chat before use.
+    queued_dispatch_kinds: VecDeque<QueuedResidentKind>,
 
-    /// One-shot dedup guard armed by [`Self::record_route_failed`] with the just-failed
-    /// turn's text. If the user's VERY NEXT submit is that same text (a reflexive
-    /// re-send / a double-Enter that outran the failure note), [`Self::submit_text`]
-    /// swallows it ONCE so a failed turn never silently auto-duplicates. Consumed on
-    /// the next submit regardless of match (a later deliberate re-send is untouched).
-    pub suppress_route_dup: Option<String>,
+    /// Published by the event loop immediately before key handling. Tests and
+    /// pre-classification turns default false, preserving serial queue semantics;
+    /// a live resident endpoint enables `Action::LiveInput`.
+    pub(crate) live_input_ready: bool,
+
+    /// Grok Build's native prompt-queue pane/editor. This is a mirror of base
+    /// snapshots, never a second client-owned queue.
+    pub(crate) prompt_queue: PromptQueueUi,
+
+    /// Structured snapshots for every queued chat turn, positionally aligned
+    /// with [`Self::queued_chat`]. Keeping text-only snapshots too is essential:
+    /// two queued turns may have the same display text while only one carries an
+    /// attachment, so matching an attachment snapshot by text can deliver it to
+    /// the wrong turn.
+    queued_turn_inputs: VecDeque<SubmittedTurn>,
+
+    /// Structured snapshot belonging to the next `Action::Route(String)`. The
+    /// action payload stays source-compatible for the large command/test surface;
+    /// the event loop takes this immediately before spawning the route task.
+    pending_route_input: Option<SubmittedTurn>,
+
+    /// The EXACT text of the chat turn most recently dispatched to the base (a fresh
+    /// `Action::Route`, or a drained queued turn). On an ordinary non-Director route
+    /// failure this is the authoritative "what just failed" key —
+    /// the internal failed-route deduplicator drops queued turns equal to
+    /// THIS (not the fragile "last user turn in conversation" heuristic, which a
+    /// relayed / reframed turn or an intervening record could skew). A Director
+    /// terminal outcome clears it because `/run` has no corresponding chat dispatch
+    /// and a model promotion makes this key stale. `None` until the first dispatch.
+    pub last_dispatched_chat: Option<String>,
 
     /// **Streaming throttle** — tracks the last tool-use name + count so
     /// consecutive same-type tool calls (e.g. 10 × Read) collapse into one
@@ -2745,7 +3738,7 @@ pub struct App {
     /// **Handoff timeline** (Wave C) — one entry per plan step that flipped to
     /// `done`, in completion order (a seat handing its finished deliverable
     /// downstream). Recorded from real DONE transitions (anti-theater: never a
-    /// narration), bounded to the most recent [`HANDOFFS_CAP`]. Surfaced by
+    /// narration), bounded to the most recent handoff-history limit. Surfaced by
     /// `/team`; cleared with the rest of the live-run panel state.
     pub handoffs: Vec<Handoff>,
 
@@ -2759,7 +3752,7 @@ pub struct App {
     /// I9 — how many prompts the user has submitted *this session* (any submit:
     /// chat / slash / bang). `0` until the first interaction, which is exactly
     /// the "first-run" window in which the rotating example tip
-    /// ([`Self::first_run_example_tip`]) is offered above the idle placeholder.
+    /// (through the internal first-run tip renderer) is offered above the idle placeholder.
     /// Incremented in [`Self::remember_submission`]; NOT persisted (a fresh
     /// session re-offers the tip, with a rotated example).
     pub session_turns: usize,
@@ -2769,6 +3762,148 @@ pub struct App {
     /// so the pure `&App` renderer can populate it on first use; the bounded FS
     /// walk then runs at most once per session. Outer `None` = not yet computed.
     pub example_file: std::cell::RefCell<Option<Option<String>>>,
+}
+
+fn memory_state_label(lang: umadev_i18n::Lang, value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => umadev_i18n::t(lang, "memory.state.on"),
+        Some(false) => umadev_i18n::t(lang, "memory.state.off"),
+        None => "—",
+    }
+}
+
+fn memory_retention_label(
+    lang: umadev_i18n::Lang,
+    entry: &umadev_agent::memory_control::MemoryInventoryEntry,
+) -> String {
+    use umadev_agent::memory_control::RetentionEnforcement;
+    match entry.retention_enforcement {
+        RetentionEnforcement::Fixed => umadev_i18n::t(lang, "memory.retention.fixed").to_string(),
+        RetentionEnforcement::PolicyOnly => entry.retention_days.map_or_else(
+            || umadev_i18n::t(lang, "memory.retention.not_configured").to_string(),
+            |days| umadev_i18n::tf(lang, "memory.retention.configured", &[&days.to_string()]),
+        ),
+        RetentionEnforcement::Unsupported => {
+            umadev_i18n::t(lang, "memory.retention.unsupported").to_string()
+        }
+    }
+}
+
+fn format_memory_inventory(
+    lang: umadev_i18n::Lang,
+    inventory: &umadev_agent::memory_control::MemoryInventory,
+    scope: umadev_agent::memory_control::MemoryScope,
+    retention_only: bool,
+    store: Option<umadev_agent::memory_control::MemoryStore>,
+) -> String {
+    let mut out = umadev_i18n::tf(lang, "memory.inventory.title", &[scope.id()]);
+    if inventory.policy_error.is_some() {
+        out.push_str("\n[warn] ");
+        out.push_str(umadev_i18n::t(lang, "memory.policy_unavailable"));
+    }
+    let entries: Vec<_> = inventory
+        .entries
+        .iter()
+        .filter(|entry| store.is_none_or(|selected| entry.store == selected))
+        .collect();
+    if entries.is_empty() {
+        out.push('\n');
+        out.push_str(umadev_i18n::t(lang, "memory.inventory.empty"));
+        return out;
+    }
+    for entry in entries {
+        let retention = memory_retention_label(lang, entry);
+        out.push('\n');
+        if retention_only {
+            out.push_str(&umadev_i18n::tf(
+                lang,
+                "memory.retention.entry",
+                &[entry.store.id(), &retention],
+            ));
+            continue;
+        }
+        out.push_str(&umadev_i18n::tf(
+            lang,
+            "memory.inventory.entry",
+            &[
+                entry.store.id(),
+                &entry.files.to_string(),
+                &entry.bytes.to_string(),
+                memory_state_label(lang, entry.capture),
+                memory_state_label(lang, entry.recall),
+                &retention,
+            ],
+        ));
+        if !entry.locations.is_empty() {
+            out.push('\n');
+            out.push_str(&umadev_i18n::tf(
+                lang,
+                "memory.inventory.paths",
+                &[&entry.locations.join(", ")],
+            ));
+        }
+    }
+    out
+}
+
+fn format_memory_parse_error(lang: umadev_i18n::Lang, error: &MemoryParseError) -> String {
+    match error {
+        MemoryParseError::Usage => umadev_i18n::t(lang, "memory.error.usage").to_string(),
+        MemoryParseError::UnclosedQuote => {
+            umadev_i18n::t(lang, "memory.error.unclosed_quote").to_string()
+        }
+        MemoryParseError::InvalidArgument(value) => {
+            umadev_i18n::tf(lang, "memory.error.invalid_argument", &[value])
+        }
+        MemoryParseError::MissingScope => {
+            umadev_i18n::t(lang, "memory.error.missing_scope").to_string()
+        }
+        MemoryParseError::OneScopeRequired => {
+            umadev_i18n::t(lang, "memory.error.one_scope").to_string()
+        }
+        MemoryParseError::ProjectScopeRequired => {
+            umadev_i18n::t(lang, "memory.error.project_scope").to_string()
+        }
+        MemoryParseError::MissingStore => {
+            umadev_i18n::t(lang, "memory.error.missing_store").to_string()
+        }
+        MemoryParseError::ExactStoreRequired => {
+            umadev_i18n::t(lang, "memory.error.exact_store").to_string()
+        }
+        MemoryParseError::UnknownSelector(value) => {
+            umadev_i18n::tf(lang, "memory.error.unknown_selector", &[value])
+        }
+        MemoryParseError::MissingOutput => {
+            umadev_i18n::t(lang, "memory.error.missing_output").to_string()
+        }
+        MemoryParseError::AbsoluteOutputRequired => {
+            umadev_i18n::t(lang, "memory.error.absolute_output").to_string()
+        }
+        MemoryParseError::InvalidDays => {
+            umadev_i18n::t(lang, "memory.error.invalid_days").to_string()
+        }
+    }
+}
+
+fn memory_store_summary(
+    lang: umadev_i18n::Lang,
+    stores: &[umadev_agent::memory_control::MemoryStore],
+) -> String {
+    const DISPLAY_CAP: usize = 8;
+    let mut summary = stores
+        .iter()
+        .take(DISPLAY_CAP)
+        .map(|store| store.id())
+        .collect::<Vec<_>>()
+        .join(",");
+    if stores.len() > DISPLAY_CAP {
+        summary.push_str(&umadev_i18n::tf(
+            lang,
+            "memory.stores.more",
+            &[&(stores.len() - DISPLAY_CAP).to_string()],
+        ));
+    }
+    summary
 }
 
 impl App {
@@ -2791,7 +3926,15 @@ impl App {
                 status: PhaseStatus::Pending,
             })
             .collect();
-        let backend = config.backend.clone().filter(|b| b != "offline");
+        // A config value is allowed into live TUI state only when it is one of the
+        // four product-supported bases. `offline` remains an explicit internal
+        // fallback; retired/unknown ids reopen setup instead of silently driving a
+        // transport that is not exposed by the product.
+        let explicit_offline = config.backend.as_deref() == Some("offline");
+        let backend = config
+            .backend
+            .clone()
+            .filter(|b| crate::FIRST_CLASS_BACKEND_IDS.contains(&b.as_str()));
         let backend_label = backend.clone().unwrap_or_else(|| "offline".to_string());
         let base_model = backend
             .as_deref()
@@ -2813,10 +3956,11 @@ impl App {
         // Publish the project's Codex launch-sandbox choice (`.umadevrc`
         // `[codex] sandbox_mode`) into the codex driver's thread-safe shared
         // override so the driver honors it, mirroring the model-tier publish above.
-        // Default stays the safe `workspace-write`; an override seeded from the env
-        // at launch (advanced / CI) wins.
+        // Main-worker default is `danger-full-access`; an explicit project or
+        // launch override can restrict it. Plan mode is forced read-only by the
+        // session driver regardless of this execution default.
         let codex_sandbox = resolve_and_publish_codex_sandbox(&project_root);
-        let mode = if config.has_backend() {
+        let mode = if backend.is_some() || explicit_offline {
             AppMode::Chat
         } else {
             AppMode::Picker
@@ -2835,6 +3979,7 @@ impl App {
             input: String::new(),
             input_cursor: 0,
             attachments: Vec::new(),
+            file_attachments: Vec::new(),
             text_stash: Vec::new(),
             input_history: VecDeque::new(),
             input_history_idx: None,
@@ -2883,18 +4028,34 @@ impl App {
             conversation_generation: 0,
             host_chat_session_active: false,
             chat_session_id: None,
+            chat_resume_identity: None,
             chat_session_dirty: false,
-            // A fresh persistent-chat id; `load_chat_for_launch` below may replace
-            // it with the most-recent saved chat so a restart reopens the dialogue.
+            // A genuinely fresh logical chat id for every launch. Saved chats remain
+            // available through `/sessions` + explicit `/resume <id>`; startup never
+            // silently imports an old task or its native base-session pointer.
             chat_id: new_chat_session_id(),
             run_session_handed_to_chat: false,
             director_run_in_flight: false,
             director_gate_paused: false,
+            pending_director_gate: None,
+            gate_query_in_flight: false,
+            gate_query_epoch: 0,
+            active_gate_query_epoch: None,
+            route_backlog_len: 0,
             backend,
             backend_label,
             base_model,
             base_model_live: false,
             base_context_window,
+            base_session_models: Vec::new(),
+            base_session_model: None,
+            base_session_mode: None,
+            base_session_thinking: None,
+            base_session_thinking_can_enable: false,
+            base_session_thinking_can_disable: false,
+            base_session_commands: Vec::new(),
+            base_session_tools: Vec::new(),
+            base_session_plan: Vec::new(),
             slug: slug.into(),
             requirement: String::new(),
             phases,
@@ -2902,6 +4063,9 @@ impl App {
             gate_choice: None,
             gate_choice_sel: 0,
             pending_approval: None,
+            pending_host_input: None,
+            auth_ui: None,
+            host_input_draft: None,
             finished: false,
             run_started: false,
             aborted: false,
@@ -2940,10 +4104,10 @@ impl App {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_snapshot_at: None,
-            session_tokens: 0,
-            last_turn_input_tokens: 0,
+            session_usage: SessionUsageMeter::default(),
             context_nudge_shown: false,
             status: String::new(),
+            copy_toast: None,
             tick: 0,
             animations: animations_enabled_default(),
             verbose: false,
@@ -2959,8 +4123,12 @@ impl App {
             queued_steer: VecDeque::new(),
             pending_steer: None,
             queued_chat: std::collections::VecDeque::new(),
+            queued_dispatch_kinds: VecDeque::new(),
+            live_input_ready: false,
+            prompt_queue: PromptQueueUi::default(),
+            queued_turn_inputs: VecDeque::new(),
+            pending_route_input: None,
             last_dispatched_chat: None,
-            suppress_route_dup: None,
             stream_tool_batch: None,
             stream_text_active: false,
             stream_md_cache: std::cell::RefCell::new(crate::ui::StreamMarkdownCache::default()),
@@ -2986,10 +4154,10 @@ impl App {
         app.load_tasks();
         if app.mode == AppMode::Chat {
             app.push_greeting();
-            // Wave 5 / G11: reopen the most-recent saved chat so a restart keeps
-            // the conversation instead of amnesia. Fail-open: no saved chat (or a
-            // corrupt one) leaves the fresh empty buffer + freshly-minted id.
-            app.load_chat_for_launch();
+            // Launch is a NEW conversation. Persistence is still durable and
+            // discoverable, but only an explicit `/resume <id>` may restore its
+            // transcript/native thread. This keeps closing/reopening UmaDev from
+            // turning an old project task into authority for the user's new ask.
             app.maybe_push_resume_hint();
             app.maybe_push_goal_continuity();
             // Liability notice: if codex is the active base AND the high-risk
@@ -2999,6 +4167,23 @@ impl App {
         }
         app.refresh_status();
         app
+    }
+
+    /// Surface the one-time retired-backend migration and take the user directly
+    /// to the five-base picker. The notice exists only for this process launch;
+    /// the migration version persisted by `config` prevents it recurring.
+    pub(crate) fn show_retired_backend_migration(&mut self, retired_backend: Option<&str>) {
+        let Some(retired_backend) = retired_backend else {
+            return;
+        };
+        self.mode = AppMode::Picker;
+        self.goto_picker_step(PickerStep::BaseCli);
+        self.picker_notice = Some(umadev_i18n::tf(
+            self.lang,
+            "backend.migration.retired",
+            &[retired_backend],
+        ));
+        self.refresh_status();
     }
 
     /// Resolve which "brain" runs the pipeline: the selected base CLI, or the
@@ -3013,12 +4198,55 @@ impl App {
         crate::BrainSpec::Offline
     }
 
+    fn memory_capture_enabled(&self, store: umadev_agent::memory_control::MemoryStore) -> bool {
+        umadev_agent::memory_control::capture_enabled(
+            &self.project_root,
+            umadev_agent::memory_control::MemoryScope::Project,
+            store,
+        )
+    }
+
+    fn memory_recall_enabled(&self, store: umadev_agent::memory_control::MemoryStore) -> bool {
+        umadev_agent::memory_control::recall_enabled(
+            &self.project_root,
+            umadev_agent::memory_control::MemoryScope::Project,
+            store,
+        )
+    }
+
+    fn existing_project_umadev_dir(&self) -> Option<std::path::PathBuf> {
+        let root = std::fs::canonicalize(&self.project_root).ok()?;
+        if !umadev_state::fs::real_dir(&root) {
+            return None;
+        }
+        let umadev = root.join(".umadev");
+        umadev_state::fs::real_dir(&umadev).then_some(umadev)
+    }
+
+    fn ensure_project_umadev_dir(&self) -> Option<std::path::PathBuf> {
+        let root = std::fs::canonicalize(&self.project_root).ok()?;
+        if !umadev_state::fs::real_dir(&root) {
+            return None;
+        }
+        umadev_state::fs::ensure_real_child_dir(&root, ".umadev").ok()
+    }
+
     fn history_path(&self) -> std::path::PathBuf {
         self.project_root.join(".umadev").join("input-history.txt")
     }
 
     fn load_history(&mut self) {
-        let Ok(body) = std::fs::read_to_string(self.history_path()) else {
+        if !self.memory_recall_enabled(umadev_agent::memory_control::MemoryStore::InputHistory) {
+            return;
+        }
+        let Some(umadev) = self.existing_project_umadev_dir() else {
+            return;
+        };
+        let path = umadev.join("input-history.txt");
+        let Ok(bytes) = umadev_state::fs::read_bounded(&path, MAX_INPUT_HISTORY_BYTES) else {
+            return;
+        };
+        let Ok(body) = String::from_utf8(bytes) else {
             return;
         };
         // Prefer the JSON-array form so a MULTI-LINE submitted entry (a wrapped
@@ -3028,7 +4256,7 @@ impl App {
         // history file — or a hand-edited one — still loads (each line an entry).
         let entries: Vec<String> = serde_json::from_str::<Vec<String>>(&body)
             .unwrap_or_else(|_| body.lines().map(str::to_string).collect());
-        for entry in entries.into_iter().rev().take(50) {
+        for entry in entries.into_iter().rev().take(INPUT_HISTORY_CAP) {
             if !entry.is_empty() {
                 self.input_history.push_front(entry);
             }
@@ -3036,28 +4264,54 @@ impl App {
     }
 
     fn persist_history(&self) {
-        let path = self.history_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if !self.memory_capture_enabled(umadev_agent::memory_control::MemoryStore::InputHistory) {
+            return;
         }
+        let Some(parent) = self.ensure_project_umadev_dir() else {
+            return;
+        };
+        let path = parent.join("input-history.txt");
         // Serialize the ring as a JSON array so a multi-line entry round-trips as
         // a single entry (the newline-join would otherwise re-split it on load).
         // Fail-open: a serialize error skips the write rather than corrupting the
         // file. The ring is already capped at `HISTORY_CAP_PROMPTS` on submit.
         let entries: Vec<&String> = self.input_history.iter().collect();
         if let Ok(json) = serde_json::to_string(&entries) {
-            let _ = std::fs::write(path, json);
+            if json.len() <= usize::try_from(MAX_INPUT_HISTORY_BYTES).unwrap_or(usize::MAX) {
+                let _ = umadev_state::fs::atomic_write(&path, json.as_bytes());
+            }
         }
     }
 
     /// Directory holding this project's persisted chats (Wave 5 / G11):
-    /// `.umadev/chat/`. One `<id>.json` per saved chat so a restart can reopen
-    /// the dialogue and `/sessions` can list them.
+    /// `.umadev/chat/`. One `<id>.json` per saved chat so `/sessions` can list it
+    /// and an explicit `/resume <id>` can reopen it after a restart.
+    #[cfg(test)]
     fn chat_dir(&self) -> std::path::PathBuf {
         self.project_root.join(".umadev").join("chat")
     }
 
+    fn ensure_chat_dir(&self) -> Option<std::path::PathBuf> {
+        let umadev = self.ensure_project_umadev_dir()?;
+        umadev_state::fs::ensure_real_child_dir(&umadev, "chat").ok()
+    }
+
+    fn existing_chat_dir(&self) -> Option<std::path::PathBuf> {
+        let umadev = self.existing_project_umadev_dir()?;
+        let chat = umadev.join("chat");
+        umadev_state::fs::real_dir(&chat).then_some(chat)
+    }
+
+    fn valid_chat_id(id: &str) -> bool {
+        !id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }
+
     /// The on-disk path for a chat by id: `.umadev/chat/<id>.json`.
+    #[cfg(test)]
     fn chat_path(&self, id: &str) -> std::path::PathBuf {
         self.chat_dir().join(format!("{id}.json"))
     }
@@ -3071,7 +4325,10 @@ impl App {
     /// must never block a chat turn or crash the TUI. Called after every recorded
     /// turn (user + assistant) so the saved transcript tracks the live one.
     pub(crate) fn persist_chat(&self) {
-        if self.full_transcript.is_empty() {
+        if self.full_transcript.is_empty()
+            || !Self::valid_chat_id(&self.chat_id)
+            || !self.memory_capture_enabled(umadev_agent::memory_control::MemoryStore::ChatSessions)
+        {
             return;
         }
         let session = ChatSession {
@@ -3083,6 +4340,7 @@ impl App {
             // resume the base's deep context, not just replay the transcript. `None`
             // (opencode / offline / no host turn yet) writes `null` — fail-open.
             base_session_id: self.chat_session_id.clone(),
+            base_resume_identity: self.chat_resume_identity.clone(),
             // The FULL, append-only transcript — never the compacted working view —
             // so the on-disk history survives in full and is never mutated by
             // compaction. `/resume` reopens the complete conversation.
@@ -3095,16 +4353,14 @@ impl App {
         let Ok(body) = serde_json::to_string_pretty(&session) else {
             return;
         };
-        let dir = self.chat_dir();
-        if std::fs::create_dir_all(&dir).is_err() {
+        if body.len() > usize::try_from(MAX_CHAT_FILE_BYTES).unwrap_or(usize::MAX) {
             return;
         }
-        let final_path = self.chat_path(&self.chat_id);
-        // Temp sibling in the SAME dir so the rename is atomic on POSIX/Windows.
-        let tmp = dir.join(format!("{}.json.tmp-{}", self.chat_id, std::process::id()));
-        if std::fs::write(&tmp, body).is_ok() {
-            let _ = std::fs::rename(&tmp, &final_path);
-        }
+        let Some(dir) = self.ensure_chat_dir() else {
+            return;
+        };
+        let final_path = dir.join(format!("{}.json", self.chat_id));
+        let _ = umadev_state::fs::atomic_write(&final_path, body.as_bytes());
     }
 
     /// Remove this chat's persisted file (best-effort, **fail-open**). Used when a
@@ -3114,7 +4370,12 @@ impl App {
     /// chat would survive on disk and a relaunch `/resume` would restore the very
     /// conversation the rewind dropped. A missing file / IO error is swallowed.
     fn discard_persisted_chat(&self) {
-        let _ = std::fs::remove_file(self.chat_path(&self.chat_id));
+        if Self::valid_chat_id(&self.chat_id) {
+            if let Some(dir) = self.existing_chat_dir() {
+                let path = dir.join(format!("{}.json", self.chat_id));
+                let _ = umadev_state::fs::remove_regular_file(&path);
+            }
+        }
     }
 
     /// List persisted chats for this project, most-recently-updated first (Wave 5).
@@ -3122,7 +4383,10 @@ impl App {
     /// dir / unreadable / corrupt file yields an empty list (never an error).
     pub(crate) fn list_chats(&self) -> Vec<(String, String, usize, String)> {
         let mut out: Vec<(String, String, usize, String)> = Vec::new();
-        let Ok(entries) = std::fs::read_dir(self.chat_dir()) else {
+        let Some(chat_dir) = self.existing_chat_dir() else {
+            return out;
+        };
+        let Ok(entries) = std::fs::read_dir(chat_dir) else {
             return out;
         };
         for entry in entries.flatten() {
@@ -3130,12 +4394,24 @@ impl App {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Some(file_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
-            let Ok(session) = serde_json::from_str::<ChatSession>(&text) else {
+            if !Self::valid_chat_id(file_id)
+                || !std::fs::symlink_metadata(&path)
+                    .is_ok_and(|metadata| umadev_state::fs::metadata_is_real_file(&metadata))
+            {
+                continue;
+            }
+            let Ok(bytes) = umadev_state::fs::read_bounded(&path, MAX_CHAT_FILE_BYTES) else {
                 continue;
             };
+            let Ok(session) = serde_json::from_slice::<ChatSession>(&bytes) else {
+                continue;
+            };
+            if session.id != file_id {
+                continue;
+            }
             // First user message as a short preview so the list is recognisable.
             let preview = session
                 .messages
@@ -3171,15 +4447,30 @@ impl App {
     /// and re-pinned to the bottom, so reopening shows the conversation, never
     /// an empty screen.
     pub(crate) fn load_chat(&mut self, id: &str) -> bool {
-        let Ok(text) = std::fs::read_to_string(self.chat_path(id)) else {
-            return false;
-        };
-        let Ok(session) = serde_json::from_str::<ChatSession>(&text) else {
-            return false;
-        };
-        if session.messages.is_empty() {
+        if !Self::valid_chat_id(id) {
             return false;
         }
+        let Some(chat_dir) = self.existing_chat_dir() else {
+            return false;
+        };
+        let path = chat_dir.join(format!("{id}.json"));
+        let Ok(bytes) = umadev_state::fs::read_bounded(&path, MAX_CHAT_FILE_BYTES) else {
+            return false;
+        };
+        let Ok(session) = serde_json::from_slice::<ChatSession>(&bytes) else {
+            return false;
+        };
+        if session.id != id || session.messages.is_empty() {
+            return false;
+        }
+        let saved_backend = session.backend.trim().to_string();
+        let current_backend = self
+            .backend
+            .as_deref()
+            .filter(|backend| !backend.is_empty())
+            .unwrap_or("offline")
+            .to_string();
+        let cross_backend = saved_backend != current_backend;
         // Restore the full durable transcript AND the working view from it. A new
         // generation invalidates any in-flight compaction from the prior chat, and
         // the safety net bounds the working view; the next turn re-triggers
@@ -3194,12 +4485,34 @@ impl App {
         // RESUMES the base's deep context (the resident pre-load opens it via
         // `--resume <id>` / `thread/resume`) instead of cold-starting and replaying
         // only the ≤16-message transcript. Fail-open: an old chat file (or an
-        // opencode / offline chat) has `None` here — leave `host_chat_session_active`
-        // untouched so it degrades cleanly to today's fresh-session behavior.
-        self.chat_session_id = session.base_session_id;
-        if self.chat_session_id.is_some() {
-            self.host_chat_session_active = true;
-        }
+        // opencode / offline chat) has `None` here and cleanly takes the fresh-session
+        // path.
+        let requested_identity = crate::session_slot::requested_resume_identity(
+            &current_backend,
+            &self.project_root,
+            self.effective_trust_mode().base_permissions(),
+        );
+        let resume_allowed = chat_resume_identity_allows_load(
+            &saved_backend,
+            &current_backend,
+            session.base_resume_identity.as_ref(),
+            requested_identity.as_ref(),
+        );
+        self.chat_session_id = (!cross_backend && resume_allowed)
+            .then_some(session.base_session_id)
+            .flatten()
+            .filter(|id| !id.trim().is_empty());
+        self.chat_resume_identity = self
+            .chat_session_id
+            .as_ref()
+            .and(session.base_resume_identity);
+        self.host_chat_session_active = self.chat_session_id.is_some();
+        // Loading replaces the logical conversation even when the backend id is
+        // unchanged. The resident process may still hold the chat we are leaving,
+        // so it must be closed before the restored context is driven.
+        self.chat_session_dirty = true;
+        self.reset_base_session_state();
+        self.clear_transient_routing_state();
         // Wave 3 — rebuild the VISIBLE display transcript. Prefer the persisted
         // rich rows (tool rows / diff cards / notes survive verbatim; any row
         // saved mid-flight settles to Aborted so nothing spins forever); an old
@@ -3226,6 +4539,17 @@ impl App {
         self.selection = None;
         self.selection_dragging = false;
         self.search = None;
+        if cross_backend {
+            let from = if saved_backend.is_empty() {
+                "unknown"
+            } else {
+                saved_backend.as_str()
+            };
+            let handoff = umadev_i18n::tf(self.lang, "backend.handoff", &[from, &current_backend]);
+            self.record_turn("system", handoff.clone());
+            self.push(ChatRole::System, handoff);
+            self.persist_chat();
+        }
         // The restore boundary: the reopened conversation ends here and new turns
         // continue below — the same affordance as the run-resume separator, so
         // the transcript reads as one continuous history to scroll back through.
@@ -3239,23 +4563,6 @@ impl App {
         self.transcript_prev_hidden.set(0);
         self.request_transcript_repaint();
         true
-    }
-
-    /// On launch (Chat mode), reopen the most-recently-updated saved chat so the
-    /// dialogue survives a restart (Wave 5 / G11). Fail-open: no saved chat leaves
-    /// the fresh empty buffer + freshly-minted [`Self::chat_id`]. Surfaces a short
-    /// system note so the user knows prior context was restored.
-    fn load_chat_for_launch(&mut self) {
-        let Some((id, _, _, _)) = self.list_chats().into_iter().next() else {
-            return;
-        };
-        if self.load_chat(&id) {
-            let n = self.conversation.len();
-            self.push(
-                ChatRole::System,
-                umadev_i18n::tf(self.lang, "chat.restored", &[&n.to_string()]),
-            );
-        }
     }
 
     /// If a `.umadev/workflow-state.json` exists in the workspace
@@ -3381,6 +4688,30 @@ impl App {
     fn push_tool_use(&mut self, name: &str, detail: &str) {
         let lang = self.lang;
         let arg: String = detail.chars().take(80).collect();
+        if let Some((label, false)) = claude_subagent_row(name) {
+            let working = self.history.iter_mut().rev().find_map(|message| {
+                let MessageBody::Tool(tool) = &mut message.kind else {
+                    return None;
+                };
+                let Some((candidate, true)) = claude_subagent_row(&tool.name) else {
+                    return None;
+                };
+                (message.role == ChatRole::Host
+                    && tool.status == ToolStatus::Running
+                    && candidate == label)
+                    .then_some(tool)
+            });
+            if let Some(tool) = working {
+                tool.name = name.to_string();
+                tool.arg = arg;
+                tool.result = None;
+                tool.merged = false;
+                tool.count = 1;
+                tool.collapsed = false;
+                self.stream_tool_batch = None;
+                return;
+            }
+        }
         let low_signal = is_low_signal_tool(name);
 
         // Merge a contiguous low-signal run into one row. We only merge when the
@@ -3417,10 +4748,12 @@ impl App {
             self.history.push_back(ChatMessage {
                 role: ChatRole::Host,
                 kind: MessageBody::Tool(ToolCall {
+                    call_id: None,
                     name: name.to_string(),
                     arg: summary,
                     status: ToolStatus::Running,
                     result: None,
+                    progress: None,
                     merged: true,
                     count,
                     collapsed: false,
@@ -3439,10 +4772,37 @@ impl App {
         self.history.push_back(ChatMessage {
             role: ChatRole::Host,
             kind: MessageBody::Tool(ToolCall {
+                call_id: None,
                 name: name.to_string(),
                 arg,
                 status: ToolStatus::Running,
                 result: None,
+                progress: None,
+                merged: false,
+                count: 1,
+                collapsed: false,
+            }),
+            collapsed: false,
+        });
+        while self.history.len() > HISTORY_CAP {
+            self.history.pop_front();
+        }
+    }
+
+    /// Push one independently addressable tool row. Correlated calls are never
+    /// merged into the low-signal batch: retaining a one-id/one-row mapping is
+    /// required for correct interleaved progress and terminal updates.
+    fn push_tool_use_correlated(&mut self, call_id: &str, name: &str, detail: &str) {
+        self.stream_tool_batch = None;
+        self.history.push_back(ChatMessage {
+            role: ChatRole::Host,
+            kind: MessageBody::Tool(ToolCall {
+                call_id: Some(call_id.to_string()),
+                name: name.to_string(),
+                arg: detail.chars().take(80).collect(),
+                status: ToolStatus::Running,
+                result: None,
+                progress: None,
                 merged: false,
                 count: 1,
                 collapsed: false,
@@ -3462,7 +4822,16 @@ impl App {
     /// Fail-open: a no-op edit (identical before/after → zero hunks) degrades to
     /// the plain tool row instead of an empty card.
     fn push_diff(&mut self, edit: &umadev_runtime::ToolEdit) {
-        let diff = FileDiff::from_tool_edit(edit);
+        self.push_diff_with_call_id(edit, None);
+    }
+
+    fn push_diff_correlated(&mut self, call_id: &str, edit: &umadev_runtime::ToolEdit) {
+        self.push_diff_with_call_id(edit, Some(call_id));
+    }
+
+    fn push_diff_with_call_id(&mut self, edit: &umadev_runtime::ToolEdit, call_id: Option<&str>) {
+        let mut diff = FileDiff::from_tool_edit(edit);
+        diff.call_id = call_id.map(str::to_string);
         if diff.hunks.is_empty() {
             // Nothing actually changed (or unreadable) — keep the plain row so the
             // activity is still visible, never an empty card.
@@ -3471,7 +4840,11 @@ impl App {
             } else {
                 "Edit"
             };
-            self.push_tool_use(name, &edit.path);
+            if let Some(call_id) = call_id {
+                self.push_tool_use_correlated(call_id, name, &edit.path);
+            } else {
+                self.push_tool_use(name, &edit.path);
+            }
             return;
         }
         // Defensive: never render the SAME diff card twice in a row. UmaDev's own
@@ -3506,6 +4879,14 @@ impl App {
     /// metric in rather than dumping the raw output. Fail-open: with no trailing
     /// tool row (e.g. a result with no preceding use) it pushes a bare line.
     fn attach_tool_result(&mut self, ok: bool, summary: &str) {
+        self.attach_tool_result_for(None, ok, summary);
+    }
+
+    fn attach_tool_result_correlated(&mut self, call_id: &str, ok: bool, summary: &str) {
+        self.attach_tool_result_for(Some(call_id), ok, summary);
+    }
+
+    fn attach_tool_result_for(&mut self, call_id: Option<&str>, ok: bool, summary: &str) {
         let lang = self.lang;
         let status = if ok { ToolStatus::Ok } else { ToolStatus::Fail };
         // Update the trailing tool row, then carry whether it was a merged batch
@@ -3519,10 +4900,35 @@ impl App {
         // auto-collapsing to a checkmark. OFF (the default) keeps the tight 200-char
         // clip + auto-collapse, exactly as before.
         let show_logs = self.show_process_logs;
-        if let Some(last) = self.history.back_mut() {
+        let target = if let Some(call_id) = call_id {
+            self.history.iter().rposition(|message| {
+                message.role == ChatRole::Host
+                    && matches!(
+                        &message.kind,
+                        MessageBody::Tool(tool)
+                            if tool.status == ToolStatus::Running
+                                && tool.call_id.as_deref() == Some(call_id)
+                    )
+            })
+        } else if is_claude_subagent_result(summary) {
+            self.history.iter().rposition(|message| {
+                message.role == ChatRole::Host
+                    && matches!(
+                        &message.kind,
+                        MessageBody::Tool(tool)
+                            if tool.status == ToolStatus::Running
+                                && claude_subagent_row(&tool.name)
+                                    .is_some_and(|(_, working)| !working)
+                    )
+            })
+        } else {
+            self.history.len().checked_sub(1)
+        };
+        if let Some(last) = target.and_then(|idx| self.history.get_mut(idx)) {
             if last.role == ChatRole::Host {
                 if let MessageBody::Tool(t) = &mut last.kind {
                     t.status = status;
+                    t.progress = None;
                     let verbose_cmd = show_logs && t.name == "Bash";
                     let cap = if verbose_cmd {
                         PROCESS_LOG_PREVIEW_CHARS
@@ -3572,12 +4978,23 @@ impl App {
         // written") is implied by the card itself, so absorb a SUCCESS silently
         // (no redundant `[ok]` line). A FAILURE still surfaces below so a failed
         // write is never hidden.
-        if ok {
-            if let Some(last) = self.history.back() {
-                if matches!(last.kind, MessageBody::Diff(_)) {
-                    return;
-                }
-            }
+        let matching_diff = call_id.map_or_else(
+            || {
+                self.history
+                    .back()
+                    .is_some_and(|last| matches!(last.kind, MessageBody::Diff(_)))
+            },
+            |call_id| {
+                self.history.iter().any(|message| {
+                    matches!(
+                        &message.kind,
+                        MessageBody::Diff(diff) if diff.call_id.as_deref() == Some(call_id)
+                    )
+                })
+            },
+        );
+        if ok && matching_diff {
+            return;
         }
         // No trailing tool row — fail-open to a plain status line (old look).
         let mark = if ok { "[ok]" } else { "[fail]" };
@@ -3585,6 +5002,149 @@ impl App {
         if !preview.trim().is_empty() {
             self.push(ChatRole::Host, format!("  {mark} {preview}"));
         }
+    }
+
+    /// Append live output to the newest running tool row without settling it.
+    ///
+    /// Unlike [`Self::attach_tool_result`], this never changes the status,
+    /// collapses the row, or clears the in-flight marker. The rolling tail is
+    /// bounded so a noisy long-running build cannot grow the transcript without
+    /// limit. A missing start frame degrades to a plain running Bash row; the
+    /// later terminal result will still settle that row normally.
+    fn attach_tool_output_delta(&mut self, delta: &str) {
+        self.attach_tool_output_delta_for(None, delta);
+    }
+
+    fn attach_tool_output_delta_correlated(&mut self, call_id: &str, delta: &str) {
+        self.attach_tool_output_delta_for(Some(call_id), delta);
+    }
+
+    fn attach_tool_output_delta_for(&mut self, call_id: Option<&str>, delta: &str) {
+        if delta.trim().is_empty() {
+            return;
+        }
+        let target = self.history.iter().rposition(|message| {
+            message.role == ChatRole::Host
+                && matches!(
+                    &message.kind,
+                    MessageBody::Tool(tool)
+                        if tool.status == ToolStatus::Running
+                            && call_id.is_none_or(|id| tool.call_id.as_deref() == Some(id))
+                )
+        });
+        let target = target.unwrap_or_else(|| {
+            if let Some(call_id) = call_id {
+                self.push_tool_use_correlated(call_id, "Bash", "");
+            } else {
+                self.push_tool_use("Bash", "");
+            }
+            self.history.len().saturating_sub(1)
+        });
+        let Some(message) = self.history.get_mut(target) else {
+            return;
+        };
+        let MessageBody::Tool(tool) = &mut message.kind else {
+            return;
+        };
+        let output = tool.result.get_or_insert_with(String::new);
+        output.push_str(delta);
+        let chars = output.chars().count();
+        if chars > PROCESS_LOG_PREVIEW_CHARS {
+            let drop_chars = chars - PROCESS_LOG_PREVIEW_CHARS;
+            if let Some((byte, _)) = output.char_indices().nth(drop_chars) {
+                output.drain(..byte);
+            }
+        }
+        tool.collapsed = false;
+    }
+
+    /// Replace the newest running tool's visible output with a complete buffer.
+    /// This is distinct from a delta: ACP peers use snapshots to reconcile a
+    /// truncated terminal buffer and an empty snapshot explicitly clears it.
+    fn attach_tool_output_snapshot(&mut self, snapshot: &str) {
+        self.attach_tool_output_snapshot_for(None, snapshot);
+    }
+
+    fn attach_tool_output_snapshot_correlated(&mut self, call_id: &str, snapshot: &str) {
+        self.attach_tool_output_snapshot_for(Some(call_id), snapshot);
+    }
+
+    fn attach_tool_output_snapshot_for(&mut self, call_id: Option<&str>, snapshot: &str) {
+        let target = self.history.iter().rposition(|message| {
+            message.role == ChatRole::Host
+                && matches!(
+                    &message.kind,
+                    MessageBody::Tool(tool)
+                        if tool.status == ToolStatus::Running
+                            && call_id.is_none_or(|id| tool.call_id.as_deref() == Some(id))
+                )
+        });
+        let Some(target) = target else {
+            if snapshot.is_empty() {
+                return;
+            }
+            if let Some(call_id) = call_id {
+                self.push_tool_use_correlated(call_id, "Bash", "");
+            } else {
+                self.push_tool_use("Bash", "");
+            }
+            return self.attach_tool_output_snapshot_for(call_id, snapshot);
+        };
+        let Some(message) = self.history.get_mut(target) else {
+            return;
+        };
+        let MessageBody::Tool(tool) = &mut message.kind else {
+            return;
+        };
+        let mut output = snapshot.to_string();
+        let chars = output.chars().count();
+        if chars > PROCESS_LOG_PREVIEW_CHARS {
+            let drop_chars = chars - PROCESS_LOG_PREVIEW_CHARS;
+            if let Some((byte, _)) = output.char_indices().nth(drop_chars) {
+                output.drain(..byte);
+            }
+        }
+        tool.result = (!output.is_empty()).then_some(output);
+        tool.collapsed = false;
+    }
+
+    /// Replace the non-terminal status title on the exact running tool card.
+    /// Unknown/settled ids are ignored fail-open: creating a second card from a
+    /// late progress frame would be more misleading than omitting that frame.
+    fn attach_tool_progress_correlated(&mut self, call_id: &str, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            return;
+        }
+        if let Some(tool) = self.history.iter_mut().rev().find_map(|message| {
+            let MessageBody::Tool(tool) = &mut message.kind else {
+                return None;
+            };
+            (message.role == ChatRole::Host
+                && tool.status == ToolStatus::Running
+                && tool.call_id.as_deref() == Some(call_id))
+            .then_some(tool)
+        }) {
+            tool.progress = Some(title.chars().take(160).collect());
+            tool.collapsed = false;
+        }
+    }
+
+    fn refresh_running_tool_flags(&mut self) {
+        let mut running = false;
+        let mut long_running = false;
+        for message in &self.history {
+            let MessageBody::Tool(tool) = &message.kind else {
+                continue;
+            };
+            if tool.status != ToolStatus::Running {
+                continue;
+            }
+            running = true;
+            long_running |= tool.name == "Bash" && is_long_running_command(&tool.arg);
+        }
+        self.tool_in_progress = running;
+        self.long_op_in_progress = long_running;
     }
 
     /// Toggle the fold state of the most recent collapsible row (Ctrl+R — the
@@ -3727,222 +5287,15 @@ impl App {
         self.run_started && !self.finished && !self.aborted
     }
 
-    // ---- background-run task registry ------------------------------------
-
-    /// `true` when a workspace-mutating run is in flight by ANY path: the legacy
-    /// pipeline (`is_pipeline_active`), the director/agentic build
-    /// (`agentic_in_flight`), or a live registry task. The single source of truth
-    /// for the second-run guard (`/run` / `/goal` / `/quick` while one is active)
-    /// and `/tasks stop`. Fail-open: a stale flag only over-reports "busy", which
-    /// politely rejects rather than risking two writers on the workspace.
+    /// Shared truth for Esc, Ctrl-C, and `/cancel`. A Director paused at a gate
+    /// has already ended its writer process, so `thinking` and `agentic_in_flight`
+    /// are false even though the run remains live and cancellable.
     #[must_use]
-    pub fn has_active_run(&self) -> bool {
-        self.is_pipeline_active() || self.agentic_in_flight || self.active_task().is_some()
-    }
-
-    /// The live (`Running`) registry task, if any. At most one exists at a time
-    /// (single-writer).
-    #[must_use]
-    pub fn active_task(&self) -> Option<&BackgroundTask> {
-        self.tasks.iter().rev().find(|t| t.status.is_active())
-    }
-
-    /// Mutable handle to the live (`Running`) registry task, if any.
-    fn active_task_mut(&mut self) -> Option<&mut BackgroundTask> {
-        self.tasks.iter_mut().rev().find(|t| t.status.is_active())
-    }
-
-    /// **Ensure** a live background-run task exists for the run that's starting.
-    /// Idempotent: if a `Running` task is already live (e.g. a `/run` that posted
-    /// its plan, then a gate-anchored `Continue` block re-emits `PipelineStarted`)
-    /// it is REUSED — its summary is filled in if it was empty — so one logical
-    /// run is one task. Otherwise a fresh task is minted with a new id and the
-    /// oldest settled row is dropped past [`TASKS_CAP`]. Fail-open: pure state.
-    pub fn register_run_task(&mut self, requirement: &str) {
-        let summary = task_summary(requirement);
-        if let Some(active) = self.active_task_mut() {
-            if active.requirement.is_empty() && !summary.is_empty() {
-                active.requirement = summary;
-                // The filled-in summary is worth persisting so a relaunch keeps it.
-                self.persist_tasks();
-            }
-            return;
-        }
-        self.task_seq += 1;
-        self.tasks.push(BackgroundTask {
-            id: format!("t{}", self.task_seq),
-            requirement: summary,
-            status: TaskStatus::Running,
-            started_at: std::time::Instant::now(),
-            started_at_unix: unix_now(),
-            done: 0,
-            total: 0,
-        });
-        // Drop the oldest SETTLED row(s) once over cap — never evict the live one.
-        while self.tasks.len() > TASKS_CAP {
-            if let Some(pos) = self.tasks.iter().position(|t| !t.status.is_active()) {
-                self.tasks.remove(pos);
-            } else {
-                break;
-            }
-        }
-        // Persist so a relaunch surfaces this run (a `Running` row reloads as an
-        // interrupted task that can be resumed). Fail-open.
-        self.persist_tasks();
-    }
-
-    /// Path of the persisted task registry: `<root>/.umadev/tasks.json`.
-    fn tasks_path(&self) -> std::path::PathBuf {
-        self.project_root.join(".umadev").join("tasks.json")
-    }
-
-    /// Persist the task registry to `.umadev/tasks.json` so an interrupted /
-    /// recent run survives a relaunch. Atomic (write a PID-qualified temp, then
-    /// rename), bounded to [`TASKS_CAP`] rows, and fully **fail-open**: any IO /
-    /// serialization error is swallowed so the registry never blocks a run.
-    fn persist_tasks(&self) {
-        let path = self.tasks_path();
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-        // Bounded: keep only the most-recent TASKS_CAP rows (the in-memory list
-        // is already capped, but guard regardless so a corrupt over-long list
-        // can't grow the file without bound).
-        let start = self.tasks.len().saturating_sub(TASKS_CAP);
-        let rows: Vec<PersistedTask> = self.tasks[start..]
-            .iter()
-            .map(|t| PersistedTask {
-                id: t.id.clone(),
-                requirement: t.requirement.clone(),
-                status: t.status.persist_id().to_string(),
-                started_at_unix: t.started_at_unix,
-                done: t.done,
-                total: t.total,
-            })
-            .collect();
-        let snapshot = PersistedTasks {
-            seq: self.task_seq,
-            tasks: rows,
-        };
-        let Ok(body) = serde_json::to_string_pretty(&snapshot) else {
-            return;
-        };
-        // PID-qualify the temp name so two umadev processes in the same workspace
-        // can't clobber each other's partial write before the rename.
-        let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-        if std::fs::write(&tmp, body).is_err() {
-            return;
-        }
-        if std::fs::rename(&tmp, &path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
-
-    /// Reload the task registry from `.umadev/tasks.json` at launch so recent runs
-    /// survive a relaunch. A row that was still `Running` when the app last exited
-    /// is no longer live (the single-writer run-lock is gone), so it reloads as
-    /// [`TaskStatus::Stopped`] — an interrupted run, surfaced for resume (resume
-    /// itself is driven off the on-disk workflow state, not this row). Fully
-    /// **fail-open**: a missing / corrupt / empty file leaves the registry as-is.
-    fn load_tasks(&mut self) {
-        let Ok(body) = std::fs::read_to_string(self.tasks_path()) else {
-            return;
-        };
-        let Ok(snapshot) = serde_json::from_str::<PersistedTasks>(&body) else {
-            return;
-        };
-        let mut max_seq = self.task_seq.max(snapshot.seq);
-        let mut restored = Vec::new();
-        for p in snapshot.tasks.into_iter().take(TASKS_CAP) {
-            let status = match TaskStatus::from_persist_id(&p.status) {
-                // A previously-live run can't still be running after a relaunch.
-                Some(TaskStatus::Running) | None => TaskStatus::Stopped,
-                Some(s) => s,
-            };
-            // Keep ids monotonic so a freshly-minted `t<n>` never reuses an old id.
-            if let Some(n) = p.id.strip_prefix('t').and_then(|s| s.parse::<u64>().ok()) {
-                max_seq = max_seq.max(n);
-            }
-            restored.push(BackgroundTask {
-                id: p.id,
-                requirement: p.requirement,
-                status,
-                started_at: instant_from_age(p.started_at_unix),
-                started_at_unix: p.started_at_unix,
-                done: p.done,
-                total: p.total,
-            });
-        }
-        // Only adopt the restored rows if we parsed any — never wipe the current
-        // (usually empty at construction) in-memory list with nothing.
-        if !restored.is_empty() {
-            self.tasks = restored;
-        }
-        self.task_seq = max_seq;
-    }
-
-    /// Refresh the live task's `done/total` from the current plan checklist so
-    /// `/tasks` and the compact `[run X/Y]` chip track real progress. No-op when
-    /// no task is live (fail-open).
-    fn sync_active_task_progress(&mut self) {
-        let done = self
-            .plan_steps
-            .iter()
-            .filter(|s| s.status == "done")
-            .count();
-        let total = self.plan_steps.len();
-        if let Some(active) = self.active_task_mut() {
-            active.done = done;
-            active.total = total;
-        }
-    }
-
-    /// Settle the live task to a terminal `status` (Done / Failed / Stopped). The
-    /// single chokepoint every run-terminal path funnels through. No-op when no
-    /// task is live, so a plain chat turn's terminal cleanup never invents one.
-    fn mark_active_task(&mut self, status: TaskStatus) {
-        if let Some(active) = self.active_task_mut() {
-            active.status = status;
-            // A terminal settle is worth persisting so a relaunch sees the run's
-            // real outcome (done/failed/stopped), not a stale `running`. Fail-open.
-            self.persist_tasks();
-        }
-    }
-
-    /// Render the `/tasks` list body: the live run (if any) plus recent settled
-    /// rows, each `[status] id · requirement · X/Y · elapsed`. Empty registry →
-    /// the localized "no tasks yet" line.
-    #[must_use]
-    fn render_tasks(&self) -> String {
-        if self.tasks.is_empty() {
-            return umadev_i18n::t(self.lang, "tasks.empty").to_string();
-        }
-        let mut body = umadev_i18n::t(self.lang, "tasks.header").to_string();
-        // Newest first so the live run is on top.
-        for t in self.tasks.iter().rev() {
-            let label = umadev_i18n::t(self.lang, t.status.label_key());
-            let progress = if t.total > 0 {
-                format!(" · {}/{}", t.done, t.total)
-            } else {
-                String::new()
-            };
-            let elapsed = fmt_elapsed(t.started_at.elapsed().as_secs());
-            let req = if t.requirement.is_empty() {
-                umadev_i18n::t(self.lang, "tasks.untitled").to_string()
-            } else {
-                t.requirement.clone()
-            };
-            body.push_str(&format!(
-                "\n  [{label}] {} · {req}{progress} · {elapsed}",
-                t.id
-            ));
-        }
-        body.push('\n');
-        body.push_str(umadev_i18n::t(self.lang, "tasks.actions_hint"));
-        body
+    fn has_interruptible_work(&self) -> bool {
+        self.has_active_run()
+            || self.active_gate.is_some()
+            || self.director_gate_paused
+            || self.gate_query_in_flight
     }
 
     /// `true` when the interrupt is ARMED (a first Esc landed recently) — a second
@@ -4275,7 +5628,7 @@ impl App {
     }
 
     /// Mouse-up (left button) — finish the selection and copy it. When there is
-    /// a non-empty selection, extracts its text, pushes a "copied N chars" toast
+    /// a non-empty selection, extracts its text, shows a "copied N chars" toast
     /// (kept private to this module) and returns `Some(text)` for the caller to
     /// hand to `copy_to_clipboard` (which owns the native-command-vs-OSC 52
     /// decision). The selection is KEPT highlighted so the user sees what was
@@ -4303,10 +5656,7 @@ impl App {
             return None;
         }
         let count = text.chars().count();
-        self.push(
-            ChatRole::System,
-            umadev_i18n::tf(self.lang, "tui.copied", &[&count.to_string()]),
-        );
+        self.show_copy_toast(count);
         Some(text)
     }
 
@@ -4375,6 +5725,17 @@ impl App {
     /// caller then routes to the transcript layer). Beginning an input selection
     /// retires any TRANSCRIPT selection so the two highlights never coexist.
     pub fn input_selection_begin(&mut self, col: u16, row: u16) -> bool {
+        // A secret host answer is intentionally painted as bullets. Selecting
+        // those bullets must never copy the hidden plaintext through the native
+        // clipboard path, so the composer selection layer is disabled for the
+        // lifetime of the secret prompt.
+        if self
+            .pending_host_input
+            .as_ref()
+            .is_some_and(host_input::PendingHostInputView::is_secret)
+        {
+            return false;
+        }
         let Some(p) = self.map_input_point(col, row) else {
             return false;
         };
@@ -4409,13 +5770,22 @@ impl App {
     }
 
     /// Mouse-up (left button) — finish an input-box selection and copy it. Mirrors
-    /// [`Self::selection_finish_copy`]: extracts the dragged text, pushes the
+    /// [`Self::selection_finish_copy`]: extracts the dragged text, shows the
     /// "copied N chars" toast and returns `Some(text)` for the caller's clipboard
     /// path (OSC 52 / native). The span stays highlighted so the user sees what was
     /// copied; a later down elsewhere clears it. Returns `None` when nothing was
     /// selected — fail-open.
     #[must_use]
     pub fn input_selection_finish_copy(&mut self) -> Option<String> {
+        if self
+            .pending_host_input
+            .as_ref()
+            .is_some_and(host_input::PendingHostInputView::is_secret)
+        {
+            self.input_selection = None;
+            self.input_selection_dragging = false;
+            return None;
+        }
         // The button released: the drag is over (the span stays highlighted).
         self.input_selection_dragging = false;
         let sel = self.input_selection?;
@@ -4427,10 +5797,7 @@ impl App {
             return None;
         }
         let count = text.chars().count();
-        self.push(
-            ChatRole::System,
-            umadev_i18n::tf(self.lang, "tui.copied", &[&count.to_string()]),
-        );
+        self.show_copy_toast(count);
         Some(text)
     }
 
@@ -4631,7 +5998,7 @@ impl App {
     /// Insert a whole string at the cursor (bracketed paste / CJK IME commit).
     /// Newlines are kept (multi-line prompts); other control characters are
     /// dropped so a pasted terminal escape sequence can't corrupt the buffer or
-    /// the render. Honors [`INPUT_CAP`] and advances the char-cursor by the
+    /// the render. Honors the internal input limit and advances the char-cursor by the
     /// number of characters actually inserted.
     pub fn insert_str_at_cursor(&mut self, text: &str) {
         // Filter to insertable chars + enforce the cap ONCE, then do a SINGLE
@@ -5092,7 +6459,7 @@ impl App {
 
     /// Request a FULL clear + redraw on the next frame because the TRANSCRIPT
     /// reflowed / re-based / scrolled (see
-    /// [`crate::transcript_reflow_needs_repaint`]) — an alias of
+    /// the crate's internal transcript-reflow detector) — an alias of
     /// [`Self::contaminate_terminal`] kept for the renderer / scroll callers.
     pub fn request_transcript_repaint(&self) {
         self.contaminate_terminal();
@@ -5111,7 +6478,7 @@ impl App {
     /// the prompt actually grew/shrank (the clamp means recalling a 3-line vs a
     /// 10-line entry both cap at the same box height → no needless repaint).
     pub(crate) fn input_block_height(&self) -> u16 {
-        crate::ui::input_block_rows(&self.input, self.input_text_cols.get())
+        crate::ui::input_block_rows(&self.rendered_input(), self.input_text_cols.get())
     }
 
     /// Clear the input buffer + reset cursor + history-recall index.
@@ -5121,16 +6488,21 @@ impl App {
         self.input_history_idx = None;
         self.input_history_draft = None;
         self.attachments.clear();
+        self.file_attachments.clear();
         self.text_stash.clear();
         self.mention_selected = 0;
         self.mention_dismissed = false;
     }
 
     /// The chip token shown in the input box for image attachment `n` (1-based),
-    /// e.g. `[图片 1]`. Used both when inserting on paste and when rewriting to an
-    /// `@<path>` mention on submit — one definition keeps the two in lockstep.
+    /// e.g. `[图片 1]`. The path remains only in the typed backing vector.
     fn image_chip(&self, n: usize) -> String {
         format!("[{} {n}]", umadev_i18n::t(self.lang, "attach.image"))
+    }
+
+    /// Visible token for a generic file selected through the `@` picker.
+    fn file_chip(&self, n: usize) -> String {
+        format!("[{} {n}]", umadev_i18n::t(self.lang, "attach.file"))
     }
 
     /// Line count used in a large-paste chip label. `lines()` ignores a trailing
@@ -5229,8 +6601,8 @@ impl App {
     /// Handle a bracketed-paste payload. If it is one (or several newline-separated)
     /// IMAGE file path(s) — how every terminal delivers a dragged-in image — attach
     /// each as an `[图片 N]` chip; otherwise insert the text verbatim (the common
-    /// case). Fail-open: a path that can't be canonicalised / read falls back to
-    /// plain text, so a normal paste containing a `.png` word is never swallowed.
+    /// case). A path-shaped image that fails validation is rejected without being
+    /// echoed as prompt text; ordinary prose that merely mentions PNG stays text.
     pub fn handle_paste(&mut self, text: &str) {
         // A paste is an edit — close the kill-coalesce + yank-pop windows so a
         // following kill starts fresh and Alt+Y isn't mistaken for valid.
@@ -5254,6 +6626,7 @@ impl App {
                 // nothing more can be typed either).
                 let need = self.image_chip(self.attachments.len() + 1).chars().count();
                 if INPUT_CAP.saturating_sub(self.input_len()) < need {
+                    self.push_attachment_rejection("attach.reason.input_full");
                     continue;
                 }
                 if let Some(n) = self.attach_image(&p) {
@@ -5268,8 +6641,11 @@ impl App {
             // backing ref even if a chip failed to land whole. Fail-open bookkeeping.
             if any {
                 self.reconcile_attachments();
-                return;
             }
+            // Every line was intentionally an image attachment. A rejected file
+            // remains rejected; never fall through and paste its private path as
+            // ordinary prompt text.
+            return;
         }
         // A BULKY text paste (many lines or a huge single line) collapses to a
         // `[粘贴 N 行]` chip with the full text parked in `text_stash`, so it
@@ -5299,41 +6675,177 @@ impl App {
         self.insert_str_at_cursor(&text);
     }
 
-    /// Canonicalise + validate a candidate image path; on success push it to
-    /// `attachments` and return its 1-based chip number. `None` (skip) if the path
-    /// doesn't resolve, isn't a regular file, or is empty.
+    /// Validate a candidate image without ever echoing its local path. The host
+    /// performs the authoritative MIME/identity recheck immediately before the
+    /// protocol write; this early pass gives the user a useful error at paste time.
     fn attach_image(&mut self, path: &str) -> Option<usize> {
-        let abs = std::fs::canonicalize(path).ok()?;
-        let meta = std::fs::metadata(&abs).ok()?;
-        if !meta.is_file() || meta.len() == 0 {
-            return None;
-        }
+        let abs = match self.validate_attachment(path, true) {
+            Ok(path) => path,
+            Err(key) => {
+                self.push_attachment_rejection(key);
+                return None;
+            }
+        };
         self.attachments.push(abs);
         Some(self.attachments.len())
     }
 
-    /// Rewrite every composed-turn chip in `raw` back to what the base should
-    /// actually receive: each `[图片 N]` image chip becomes an `@<abs-path>`
-    /// mention (the base reads the file itself — UmaDev never base64s), and each
-    /// `[粘贴 N 行]` large-paste chip is replaced by its stashed full text inline.
-    /// A chip with no backing attachment / stash entry is left as-is. No-op when
-    /// nothing is attached or stashed.
-    fn expand_attachments(&self, raw: &str) -> String {
-        let mut out = raw.to_string();
-        for (i, path) in self.attachments.iter().enumerate() {
-            out = out.replace(&self.image_chip(i + 1), &format!("@{}", path.display()));
+    /// Add one generic file selected by the `@` picker.
+    fn attach_file(&mut self, path: &std::path::Path) -> Option<usize> {
+        let candidate = path.to_string_lossy();
+        let abs = match self.validate_attachment(&candidate, false) {
+            Ok(path) => path,
+            Err(key) => {
+                self.push_attachment_rejection(key);
+                return None;
+            }
+        };
+        self.file_attachments.push(abs);
+        Some(self.file_attachments.len())
+    }
+
+    fn push_attachment_rejection(&mut self, reason_key: &str) {
+        let reason = umadev_i18n::t(self.lang, reason_key);
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(self.lang, "attach.rejected", &[reason]),
+        );
+        self.refresh_status();
+    }
+
+    fn validate_attachment(
+        &self,
+        path: &str,
+        require_image: bool,
+    ) -> Result<std::path::PathBuf, &'static str> {
+        if self.attachments.len() + self.file_attachments.len() >= MAX_TURN_ATTACHMENTS {
+            return Err("attach.reason.count");
         }
-        // Large-paste chips: replace each stashed paste's chip with its full text.
-        // Done sequentially via `find` (first remaining occurrence) so two pastes
-        // that happen to share a line count — and thus an identical chip token —
-        // still map to their OWN stash entry in buffer order, not a collision.
-        for stash in &self.text_stash {
-            let chip = self.text_chip(stash);
-            if let Some(pos) = out.find(&chip) {
-                out.replace_range(pos..pos + chip.len(), stash);
+        let path = std::path::Path::new(path);
+        let before = std::fs::symlink_metadata(path).map_err(|_| "attach.reason.unavailable")?;
+        if before.file_type().is_symlink() {
+            return Err("attach.reason.symlink");
+        }
+        if !before.file_type().is_file() {
+            return Err("attach.reason.regular");
+        }
+        if before.len() > MAX_ATTACHMENT_BYTES {
+            return Err("attach.reason.size");
+        }
+        let prior_total = self
+            .attachments
+            .iter()
+            .chain(self.file_attachments.iter())
+            .filter_map(|item| std::fs::metadata(item).ok().map(|meta| meta.len()))
+            .fold(0_u64, u64::saturating_add);
+        if prior_total.saturating_add(before.len()) > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err("attach.reason.total_size");
+        }
+        let canonical = std::fs::canonicalize(path).map_err(|_| "attach.reason.unavailable")?;
+        if require_image {
+            use std::io::Read as _;
+
+            let mut file =
+                std::fs::File::open(&canonical).map_err(|_| "attach.reason.unavailable")?;
+            let mut header = [0_u8; 16];
+            let read = file
+                .read(&mut header)
+                .map_err(|_| "attach.reason.unavailable")?;
+            let bytes = &header[..read];
+            if !supported_image_magic(bytes) || !image_extension_matches(path, bytes) {
+                return Err("attach.reason.mime");
             }
         }
-        out
+        Ok(canonical)
+    }
+
+    /// Path-free text view of the composed turn. Image/file chips stay visible
+    /// labels; bulky paste chips expand to their original text.
+    fn expand_attachments(&self, raw: &str) -> String {
+        self.compose_submitted_turn(raw).text
+    }
+
+    /// Resolve the editor's visible chip stream into ordered typed blocks. This
+    /// is called before `clear_input`, so every backing path/stash is snapshotted
+    /// while its chip-to-vector index is still valid.
+    fn compose_submitted_turn(&self, raw: &str) -> SubmittedTurn {
+        #[derive(Clone)]
+        enum Marker {
+            Image(usize),
+            File(usize),
+            Paste(String),
+        }
+
+        let mut markers: Vec<(usize, usize, Marker)> = Vec::new();
+        for index in 0..self.attachments.len() {
+            let token = self.image_chip(index + 1);
+            if let Some(start) = raw.find(&token) {
+                markers.push((start, start + token.len(), Marker::Image(index)));
+            }
+        }
+        for index in 0..self.file_attachments.len() {
+            let token = self.file_chip(index + 1);
+            if let Some(start) = raw.find(&token) {
+                markers.push((start, start + token.len(), Marker::File(index)));
+            }
+        }
+        let mut claimed_pastes = Vec::new();
+        for stash in &self.text_stash {
+            let token = self.text_chip(stash);
+            let mut search = 0;
+            while let Some(relative) = raw[search..].find(&token) {
+                let start = search + relative;
+                if claimed_pastes.contains(&start) {
+                    search = start + token.len().max(1);
+                    continue;
+                }
+                claimed_pastes.push(start);
+                markers.push((start, start + token.len(), Marker::Paste(stash.clone())));
+                break;
+            }
+        }
+        markers.sort_by_key(|marker| marker.0);
+
+        let content_end = submitted_content_end(raw, markers.last().map(|(_, end, _)| *end));
+
+        let mut blocks = Vec::new();
+        let mut display = String::with_capacity(content_end);
+        let mut cursor = 0usize;
+        for (start, end, marker) in markers {
+            if start < cursor || end > content_end {
+                continue;
+            }
+            append_text_block(&mut blocks, &raw[cursor..start]);
+            display.push_str(&raw[cursor..start]);
+            match marker {
+                Marker::Image(index) => {
+                    if let Some(path) = self.attachments.get(index) {
+                        blocks.push(TurnInputBlock::Image { path: path.clone() });
+                        display.push_str(&self.image_chip(index + 1));
+                    }
+                }
+                Marker::File(index) => {
+                    if let Some(path) = self.file_attachments.get(index) {
+                        blocks.push(TurnInputBlock::File {
+                            path: path.clone(),
+                            mode: FileInputMode::MaterializeText,
+                        });
+                        display.push_str(&self.file_chip(index + 1));
+                    }
+                }
+                Marker::Paste(text) => {
+                    append_text_block(&mut blocks, &text);
+                    display.push_str(&text);
+                }
+            }
+            cursor = end;
+        }
+        append_text_block(&mut blocks, &raw[cursor..content_end]);
+        display.push_str(&raw[cursor..content_end]);
+        SubmittedTurn {
+            text: display,
+            input: TurnInput::new(blocks),
+        }
     }
 
     /// Locate every composed-turn chip currently intact in `input`, returning each
@@ -5358,6 +6870,12 @@ impl App {
         // Image chips: unique token per attachment number.
         for i in 0..self.attachments.len() {
             let token = self.image_chip(i + 1);
+            if let Some(byte_pos) = self.input.find(&token) {
+                push_token(&self.input, byte_pos, &token);
+            }
+        }
+        for i in 0..self.file_attachments.len() {
+            let token = self.file_chip(i + 1);
             if let Some(byte_pos) = self.input.find(&token) {
                 push_token(&self.input, byte_pos, &token);
             }
@@ -5467,6 +6985,46 @@ impl App {
             }
             self.attachments = new_attachments;
         }
+        // ---- generic-file chips: same contiguous-index invariant ----
+        if !self.file_attachments.is_empty() {
+            let mut hits: Vec<(usize, usize)> = Vec::new();
+            for k in 1..=self.file_attachments.len() {
+                if let Some(position) = self.input.find(&self.file_chip(k)) {
+                    hits.push((position, k));
+                }
+            }
+            hits.sort_by_key(|&(position, _)| position);
+            let new_files: Vec<std::path::PathBuf> = hits
+                .iter()
+                .map(|&(_, k)| self.file_attachments[k - 1].clone())
+                .collect();
+            let needs_rewrite = new_files.len() != self.file_attachments.len()
+                || hits
+                    .iter()
+                    .enumerate()
+                    .any(|(index, &(_, k))| k != index + 1);
+            if needs_rewrite {
+                let mut edits: Vec<(usize, usize, String)> = hits
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &(position, k))| {
+                        let old = self.file_chip(k);
+                        (position, position + old.len(), self.file_chip(index + 1))
+                    })
+                    .collect();
+                edits.sort_by_key(|edit| edit.0);
+                let mut out = String::with_capacity(self.input.len());
+                let mut last = 0;
+                for (start, end, replacement) in edits {
+                    out.push_str(&self.input[last..start]);
+                    out.push_str(&replacement);
+                    last = end;
+                }
+                out.push_str(&self.input[last..]);
+                self.input = out;
+            }
+            self.file_attachments = new_files;
+        }
         // ---- large-paste chips: drop entries whose token vanished ----
         if !self.text_stash.is_empty() {
             let mut claimed: Vec<usize> = Vec::new();
@@ -5501,7 +7059,6 @@ impl App {
     /// double-pollute the ↑↓ recall). Also persists to disk so history
     /// survives across TUI sessions.
     pub fn remember_submission(&mut self, text: &str) {
-        const HISTORY_CAP_PROMPTS: usize = 100;
         if text.trim().is_empty() {
             return;
         }
@@ -5512,7 +7069,7 @@ impl App {
             return;
         }
         self.input_history.push_back(text.to_string());
-        while self.input_history.len() > HISTORY_CAP_PROMPTS {
+        while self.input_history.len() > INPUT_HISTORY_CAP {
             self.input_history.pop_front();
         }
         self.persist_history();
@@ -5594,11 +7151,39 @@ impl App {
         Self::cmd("codex", &[], None, CmdGroup::Worker, "tui.cmd.codex"),
         Self::cmd("opencode", &[], None, CmdGroup::Worker, "tui.cmd.opencode"),
         Self::cmd(
+            "grok",
+            &["grok-build"],
+            None,
+            CmdGroup::Worker,
+            "tui.cmd.grok",
+        ),
+        Self::cmd(
+            "kimi",
+            &["kimi-code"],
+            None,
+            CmdGroup::Worker,
+            "tui.cmd.kimi",
+        ),
+        Self::cmd(
             "offline",
             &[],
             None,
             CmdGroup::Worker,
             "tui.help.worker.offline",
+        ),
+        Self::cmd(
+            "base",
+            &[],
+            Some("</command> [args]"),
+            CmdGroup::Worker,
+            "input.delivery.native",
+        ),
+        Self::cmd(
+            "thinking",
+            &[],
+            Some("[on|off]"),
+            CmdGroup::Worker,
+            "tui.cmd.thinking",
         ),
         Self::cmd(
             "sandbox",
@@ -5685,6 +7270,13 @@ impl App {
             CmdGroup::Pipeline,
             "tui.cmd.tasks",
         ),
+        Self::cmd(
+            "processes",
+            &["ps", "bg"],
+            Some("[stop <id>]"),
+            CmdGroup::Pipeline,
+            "tui.cmd.processes",
+        ),
         Self::cmd("init", &[], None, CmdGroup::Pipeline, "tui.help.pipe.init"),
         Self::cmd("adopt", &[], None, CmdGroup::Pipeline, "tui.cmd.adopt"),
         Self::cmd(
@@ -5763,6 +7355,13 @@ impl App {
             "tui.help.inspect.pitfalls",
         ),
         Self::cmd("lessons", &[], None, CmdGroup::Inspect, "tui.cmd.lessons"),
+        Self::cmd(
+            "memory",
+            &[],
+            Some("[inventory|capture|recall|retention|export|forget|clear-cache]"),
+            CmdGroup::Inspect,
+            "tui.cmd.memory",
+        ),
         Self::cmd("team", &[], None, CmdGroup::Inspect, "tui.cmd.team"),
         Self::cmd(
             "constitution",
@@ -5949,8 +7548,7 @@ impl App {
     }
 
     /// Resolve a typed verb (after `/`, lowercased for ASCII) to its registry
-    /// entry by canonical name OR any alias. `None` for an unknown verb (e.g. a
-    /// dynamic per-backend id like `goose`, handled by the dispatch fallback).
+    /// entry by canonical name OR any alias. `None` for an unknown verb.
     #[must_use]
     pub fn resolve_command(verb: &str) -> Option<&'static SlashCommand> {
         Self::COMMANDS
@@ -5958,16 +7556,27 @@ impl App {
             .find(|c| c.name == verb || c.aliases.contains(&verb))
     }
 
+    fn advertised_command_name(command: &SessionCommandInfo) -> Option<&str> {
+        let name = command.name.trim();
+        let name = name.strip_prefix('/').unwrap_or(name);
+        (!name.is_empty() && !name.contains(char::is_whitespace)).then_some(name)
+    }
+
+    fn advertised_base_command(&self, verb: &str) -> bool {
+        self.base_session_commands.iter().any(|command| {
+            Self::advertised_command_name(command)
+                .is_some_and(|name| name.eq_ignore_ascii_case(verb))
+        })
+    }
+
     /// Match the verbs prefixed by what comes after `/` in the current
     /// input. Empty input or non-slash input → empty list.
     ///
-    /// Combines the registry [`COMMANDS`](Self::COMMANDS) with the dynamic
-    /// per-backend verbs (so typing `/go` suggests `/goose`, typing `/am`
-    /// suggests `/claude`, `/codex`, etc.) — kept in sync with `BACKEND_IDS`.
     /// Descriptions are localized for the active language; hidden commands are
-    /// never suggested.
+    /// never suggested. Backend switching is intentionally registry-only, so a
+    /// transport driver cannot become an undocumented TUI command.
     #[must_use]
-    pub fn palette_matches(&self) -> Vec<PaletteEntry> {
+    pub fn palette_matches(&self) -> Vec<PaletteEntry<'_>> {
         if !self.input.starts_with('/') {
             return Vec::new();
         }
@@ -6000,7 +7609,7 @@ impl App {
             // match); prefix/exact tiers are always a subsequence, so they pass.
             fuzzy_score(&typed, verb).map(|s| (tier, s))
         };
-        let mut out: Vec<(u8, i32, PaletteEntry)> = Self::COMMANDS
+        let mut out: Vec<(u8, i32, PaletteEntry<'_>)> = Self::COMMANDS
             .iter()
             .filter(|c| !c.hidden)
             .filter_map(|c| {
@@ -6017,24 +7626,31 @@ impl App {
                 })
             })
             .collect();
-        // Skip ids already covered by the registry (the three first-class
-        // base CLIs) to avoid duplicate palette rows.
-        let known: std::collections::HashSet<&str> = out.iter().map(|(_, _, p)| p.verb).collect();
-        for (id, hint) in backend_palette_verbs() {
-            if !known.contains(id) {
-                if let Some((t, s)) = rank(id) {
-                    out.push((
-                        t,
-                        s,
-                        PaletteEntry {
-                            verb: id,
-                            desc: hint,
-                            arg_hint: None,
-                        },
-                    ));
-                }
+        out.extend(self.base_session_commands.iter().filter_map(|command| {
+            let name = Self::advertised_command_name(command)?;
+            let normalized = name.to_ascii_lowercase();
+            // A base command that collides with any UmaDev canonical command or
+            // alias remains reachable through `/base /…`, but never shadows the
+            // product command in autocomplete or direct dispatch.
+            if Self::resolve_command(&normalized).is_some() {
+                return None;
             }
-        }
+            rank(&normalized).map(|(tier, score)| {
+                (
+                    tier,
+                    score,
+                    PaletteEntry {
+                        verb: name,
+                        desc: if command.description.trim().is_empty() {
+                            "base command"
+                        } else {
+                            command.description.as_str()
+                        },
+                        arg_hint: command.input_hint.as_deref(),
+                    },
+                )
+            })
+        }));
         // Tier ascending (exact → prefix → fuzzy), then fzf score DESCENDING; a
         // stable sort keeps the canonical verb order within an equal (tier, score).
         out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
@@ -6059,7 +7675,8 @@ impl App {
             return;
         }
         let selected = self.palette_selected.min(matches.len() - 1);
-        let verb = matches[selected].verb;
+        let verb = matches[selected].verb.to_string();
+        drop(matches);
         self.input = format!("/{verb} ");
         self.input_cursor = self.input_len();
         self.palette_selected = 0;
@@ -6249,7 +7866,7 @@ impl App {
 
     /// The ranked `@`-mention candidates for the partial currently under the
     /// cursor: repo-relative paths filtered by prefix / subsequence (basename
-    /// first, then full path), capped at [`MENTION_MATCH_CAP`].
+    /// first, then full path), capped at the internal mention-match limit.
     ///
     /// Empty when no `@`-token is active, the popover was dismissed (Esc), or
     /// nothing matches — so this is the single "is the `@`-popover open?"
@@ -6327,11 +7944,10 @@ impl App {
         }
     }
 
-    /// Insert the highlighted `@`-mention candidate: replace the `@partial`
-    /// token under the cursor with `@<path> ` (trailing space) and place the
-    /// caret after it. Also consumes any mention-char tail to the RIGHT of the
-    /// cursor so editing mid-token replaces the whole reference. No-op when the
-    /// popover is empty. The trailing space ends the token, so the popover closes.
+    /// Select the highlighted `@` candidate as a typed file attachment. The
+    /// editor receives a stable `[File N]` chip rather than an `@path`, so paths
+    /// containing spaces/CJK remain unambiguous and no local path enters model
+    /// text or transcript history.
     pub fn accept_mention(&mut self) {
         let matches = self.mention_matches();
         if matches.is_empty() {
@@ -6341,6 +7957,10 @@ impl App {
             return;
         };
         let sel = self.mention_selected.min(matches.len() - 1);
+        let selected = self.project_root.join(&matches[sel]);
+        let Some(number) = self.attach_file(&selected) else {
+            return;
+        };
         let chars: Vec<char> = self.input.chars().collect();
         let mut end = self.input_cursor.min(chars.len());
         while end < chars.len() && is_mention_char(chars[end]) {
@@ -6348,7 +7968,18 @@ impl App {
         }
         let start_b = self.byte_index(at_char);
         let end_b = self.byte_index(end);
-        let replacement = format!("@{} ", matches[sel]);
+        let replacement = format!("{} ", self.file_chip(number));
+        let removed = end.saturating_sub(at_char);
+        if self
+            .input_len()
+            .saturating_sub(removed)
+            .saturating_add(replacement.chars().count())
+            > INPUT_CAP
+        {
+            self.file_attachments.pop();
+            self.push_attachment_rejection("attach.reason.input_full");
+            return;
+        }
         let added = replacement.chars().count();
         self.input.replace_range(start_b..end_b, &replacement);
         self.input_cursor = at_char + added;
@@ -6676,6 +8307,101 @@ impl App {
 
     // ---- engine events ----------------------------------------------------
 
+    fn configured_base_state(&self) -> (Option<String>, Option<u64>) {
+        let Some(backend) = self
+            .backend
+            .as_deref()
+            .filter(|backend| !backend.is_empty() && *backend != "offline")
+        else {
+            return (None, None);
+        };
+        (
+            crate::detect_base_model(backend, &self.project_root),
+            crate::detect_base_context_window(backend, &self.project_root),
+        )
+    }
+
+    /// Drop state owned by a particular live base session. Static base-config
+    /// observations remain available until the replacement session reports.
+    pub(crate) fn reset_base_session_state(&mut self) {
+        self.base_session_models.clear();
+        self.base_session_model = None;
+        self.base_session_mode = None;
+        self.base_session_thinking = None;
+        self.base_session_thinking_can_enable = false;
+        self.base_session_thinking_can_disable = false;
+        self.base_session_commands.clear();
+        self.base_session_tools.clear();
+        self.base_session_plan.clear();
+        let (model, context_window) = self.configured_base_state();
+        self.base_model = model;
+        self.base_model_live = false;
+        self.base_context_window = context_window;
+    }
+
+    fn set_live_base_session_model(&mut self, model_id: Option<&str>) {
+        let Some(model_id) = model_id.map(str::trim).filter(|id| !id.is_empty()) else {
+            let (model, context_window) = self.configured_base_state();
+            self.base_session_model = None;
+            self.base_model = model;
+            self.base_model_live = false;
+            self.base_context_window = context_window;
+            return;
+        };
+        let catalog_window = self
+            .base_session_models
+            .iter()
+            .find(|model| model.model_id == model_id)
+            .and_then(|model| model.total_context_tokens);
+        let configured_window = self.backend.as_deref().and_then(|backend| {
+            crate::detect_base_context_window_for_model(backend, &self.project_root, model_id)
+        });
+        self.base_session_model = Some(model_id.to_string());
+        self.base_model = Some(model_id.to_string());
+        self.base_model_live = true;
+        self.base_context_window = catalog_window.or(configured_window);
+    }
+
+    fn apply_base_session_state(&mut self, backend_id: &str, update: SessionStateUpdate) {
+        if self.backend.as_deref() != Some(backend_id) {
+            return;
+        }
+        match update {
+            SessionStateUpdate::ModelCatalogReplaced {
+                current_model_id,
+                available_models,
+            } => {
+                self.base_session_models = available_models;
+                self.set_live_base_session_model(Some(&current_model_id));
+            }
+            SessionStateUpdate::ModelChanged { model_id, .. } => {
+                self.set_live_base_session_model(Some(&model_id));
+            }
+            SessionStateUpdate::ModelAutoSwitched { new_model_id, .. } => {
+                self.set_live_base_session_model(Some(&new_model_id));
+            }
+            SessionStateUpdate::ModeChanged { mode } => {
+                self.base_session_mode = Some(mode);
+            }
+            SessionStateUpdate::ThinkingChanged {
+                enabled,
+                can_enable,
+                can_disable,
+            } => {
+                self.base_session_thinking = enabled;
+                self.base_session_thinking_can_enable = can_enable;
+                self.base_session_thinking_can_disable = can_disable;
+            }
+            SessionStateUpdate::CommandCatalogReplaced { commands, tools } => {
+                self.base_session_commands = commands;
+                self.base_session_tools = tools;
+            }
+            SessionStateUpdate::PlanReplaced { entries } => {
+                self.base_session_plan = entries;
+            }
+        }
+    }
+
     /// Fold one engine event into the chat history + status bar.
     ///
     /// # Panics
@@ -6784,6 +8510,16 @@ impl App {
                 );
             }
             EngineEvent::GateOpened { gate, choice } => {
+                // A Director session is still being wound down when its engine
+                // emits GateOpened. Do not expose an actionable gate yet: a typed
+                // `c`, picker approval, or `/continue` would otherwise start a
+                // second resume while the first writer still owns the session.
+                // The terminal RunPausedAtGate decision activates this exact gate
+                // (including its structured choice) after `session.end()` returns.
+                if self.director_run_in_flight || (self.agentic_in_flight && self.thinking) {
+                    self.pending_director_gate = Some((gate, choice));
+                    return;
+                }
                 self.active_gate = Some(gate);
                 // Drop any stale picker up front so the auto-approve / queued-steer
                 // early-return paths can never leave one rendering; the paused path
@@ -6840,7 +8576,10 @@ impl App {
                 // run's step-boundary intake), so the gate PAUSES for the user
                 // and the steer applies on the resumed plan — never a legacy
                 // block re-spawn.
-                if !self.queued_steer.is_empty() && !self.director_run_in_flight {
+                if !self.queued_steer.is_empty()
+                    && !self.director_run_in_flight
+                    && !self.director_gate_paused
+                {
                     // Fold EVERY queued steer (FIFO) into one revision — a single
                     // `Option` used to overwrite all but the last, silently
                     // dropping the earlier turns.
@@ -7137,20 +8876,8 @@ impl App {
                     self.push(ChatRole::Host, trimmed);
                 }
             }
-            EngineEvent::TurnUsage {
-                input_tokens,
-                output_tokens,
-            } => {
-                // Accumulate the base's REAL reported per-turn usage into the live
-                // session total shown on the waiting indicator — true consumption
-                // (the base's own numbers), accruing across this session's turns.
-                self.session_tokens = self
-                    .session_tokens
-                    .saturating_add(u64::from(input_tokens) + u64::from(output_tokens));
-                // The LAST turn's input tokens = the context the base just read ≈
-                // current context occupancy (the numerator of the context gauge). A
-                // fresh real measurement each turn; drives the proactive /compact nudge.
-                self.last_turn_input_tokens = u64::from(input_tokens);
+            EngineEvent::TurnUsage { usage } => {
+                self.session_usage.apply(usage);
                 self.maybe_nudge_compaction();
             }
             EngineEvent::BaseModel { id } => {
@@ -7164,16 +8891,11 @@ impl App {
                 // an empty id is ignored.
                 let id = id.trim();
                 if !id.is_empty() {
-                    self.base_model = Some(id.to_string());
-                    self.base_model_live = true;
-                    self.base_context_window = self
-                        .backend
-                        .as_deref()
-                        .filter(|b| !b.is_empty() && *b != "offline")
-                        .and_then(|b| {
-                            crate::detect_base_context_window_for_model(b, &self.project_root, id)
-                        });
+                    self.set_live_base_session_model(Some(id));
                 }
+            }
+            EngineEvent::BaseSessionState { backend_id, update } => {
+                self.apply_base_session_state(&backend_id, update);
             }
             EngineEvent::Note(note) => {
                 // A TERMINAL-ABORT note (a block that returned `Err` → produced
@@ -7333,6 +9055,59 @@ impl App {
                             _ => self.push_tool_use(&name, &detail),
                         }
                     }
+                    umadev_runtime::StreamEvent::ToolUseCorrelated {
+                        call_id,
+                        name,
+                        detail,
+                        edit,
+                    } => {
+                        self.collapse_thinking_block();
+                        self.stream_text_active = false;
+                        self.tool_in_progress = true;
+                        self.long_op_in_progress =
+                            matches!(name.as_str(), "Bash") && is_long_running_command(&detail);
+                        match edit {
+                            Some(e) if matches!(name.as_str(), "Write" | "Edit" | "MultiEdit") => {
+                                self.push_diff_correlated(&call_id, &e);
+                            }
+                            _ => self.push_tool_use_correlated(&call_id, &name, &detail),
+                        }
+                    }
+                    umadev_runtime::StreamEvent::ToolProgressCorrelated { call_id, title } => {
+                        self.collapse_thinking_block();
+                        self.stream_text_active = false;
+                        self.tool_in_progress = true;
+                        self.attach_tool_progress_correlated(&call_id, &title);
+                    }
+                    umadev_runtime::StreamEvent::ToolOutputDelta { delta } => {
+                        // A process-log delta is progress, never completion: keep
+                        // the running row/spinner alive and append the visible log.
+                        self.collapse_thinking_block();
+                        self.stream_text_active = false;
+                        self.tool_in_progress = true;
+                        self.attach_tool_output_delta(&delta);
+                    }
+                    umadev_runtime::StreamEvent::ToolOutputDeltaCorrelated { call_id, delta } => {
+                        self.collapse_thinking_block();
+                        self.stream_text_active = false;
+                        self.tool_in_progress = true;
+                        self.attach_tool_output_delta_correlated(&call_id, &delta);
+                    }
+                    umadev_runtime::StreamEvent::ToolOutputSnapshot { output } => {
+                        self.collapse_thinking_block();
+                        self.stream_text_active = false;
+                        self.tool_in_progress = true;
+                        self.attach_tool_output_snapshot(&output);
+                    }
+                    umadev_runtime::StreamEvent::ToolOutputSnapshotCorrelated {
+                        call_id,
+                        output,
+                    } => {
+                        self.collapse_thinking_block();
+                        self.stream_text_active = false;
+                        self.tool_in_progress = true;
+                        self.attach_tool_output_snapshot_correlated(&call_id, &output);
+                    }
                     umadev_runtime::StreamEvent::ToolResult { ok, summary } => {
                         // P5c: a result is content → close any open reasoning block.
                         self.collapse_thinking_block();
@@ -7342,6 +9117,19 @@ impl App {
                         self.tool_in_progress = false;
                         self.long_op_in_progress = false;
                         self.attach_tool_result(ok, &summary);
+                        self.refresh_running_tool_flags();
+                    }
+                    umadev_runtime::StreamEvent::ToolResultCorrelated {
+                        call_id,
+                        ok,
+                        summary,
+                    } => {
+                        self.collapse_thinking_block();
+                        self.stream_text_active = false;
+                        self.tool_in_progress = false;
+                        self.long_op_in_progress = false;
+                        self.attach_tool_result_correlated(&call_id, ok, &summary);
+                        self.refresh_running_tool_flags();
                     }
                     umadev_runtime::StreamEvent::Warning { message } => {
                         // P5c: a warning closes any open reasoning block.
@@ -7383,43 +9171,7 @@ impl App {
                         self.stream_text_active = false;
                         self.stream_tool_batch = None;
                         self.open_thinking_block();
-                        if let Some(idx) = self.thinking_block_idx {
-                            // Re-validate the stored index still points at OUR live
-                            // placeholder before appending. `thinking_block_idx` is an
-                            // ABSOLUTE `history` index; while the block stays open, a
-                            // non-collapsing push at `HISTORY_CAP` `pop_front`s the
-                            // front row and shifts every index down by one — the stored
-                            // idx would then point at an UNRELATED row, and appending
-                            // this reasoning delta would corrupt it. Mirror the
-                            // collapse path's guard: only append when the row is still
-                            // the System `[thinking]` placeholder we pushed.
-                            let still_placeholder = matches!(
-                                self.history.get(idx),
-                                Some(m) if m.role == ChatRole::System
-                                    && m.body().trim_start().starts_with(THINKING_PLACEHOLDER_TAG)
-                            );
-                            if still_placeholder {
-                                if let Some(text) =
-                                    self.history.get_mut(idx).and_then(ChatMessage::text_mut)
-                                {
-                                    // The reasoning lives BELOW the `[thinking] …`
-                                    // header line, so the first chunk starts a fresh
-                                    // line. Bound the block so a runaway stream can't
-                                    // grow unbounded.
-                                    if text.len() < THINKING_REASONING_MAX {
-                                        if !text.contains('\n') {
-                                            text.push('\n');
-                                        }
-                                        text.push_str(&delta);
-                                    }
-                                }
-                            } else {
-                                // The row rolled off / shifted under a cap eviction —
-                                // forget the stale index so the NEXT delta re-opens a
-                                // fresh block instead of writing into a moved row.
-                                self.thinking_block_idx = None;
-                            }
-                        }
+                        self.append_thinking_delta(&delta);
                     }
                 }
             }
@@ -7737,6 +9489,54 @@ impl App {
         // CONTROL editing/shell key (Ctrl-U clears the line, Ctrl-D is EOF).
         let ctrl_alt = ctrl && alt && !shift;
 
+        // Grok Build native prompt queue. Both published toggle chords are
+        // accepted because several terminal/IDE combinations drop one of them.
+        if ctrl && !alt && matches!(key, KeyCode::Char(';' | '\'')) {
+            if self.prompt_queue.toggle() {
+                self.request_full_repaint();
+            }
+            return Action::None;
+        }
+
+        // A focused queue pane owns its navigation and mutation keys. Mutations
+        // only mark "awaiting snapshot"; the rows themselves are untouched.
+        if self.prompt_queue.is_open() {
+            let mutation = match key {
+                KeyCode::Esc => {
+                    self.prompt_queue.toggle();
+                    self.request_full_repaint();
+                    return Action::None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.prompt_queue.select_next();
+                    return Action::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.prompt_queue.select_previous();
+                    return Action::None;
+                }
+                KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
+                    self.prompt_queue.remove_selected()
+                }
+                KeyCode::Char('J') => self.prompt_queue.reorder_selected(false),
+                KeyCode::Char('K') => self.prompt_queue.reorder_selected(true),
+                KeyCode::Enter | KeyCode::Char('i') if ctrl => {
+                    self.prompt_queue.interject_selected()
+                }
+                KeyCode::Char('e') | KeyCode::Enter => {
+                    if let Some(text) = self.prompt_queue.begin_edit() {
+                        self.clear_input();
+                        self.input = text;
+                        self.input_cursor = self.input_len();
+                        self.request_full_repaint();
+                    }
+                    return Action::None;
+                }
+                _ => return Action::None,
+            };
+            return mutation.map_or(Action::None, Action::PromptQueueMutate);
+        }
+
         // Kill-ring coalescing + the yank-pop window live only across a run of
         // consecutive same-FAMILY keys. Any key that is neither a kill
         // (Ctrl+U/K/W) nor a yank (Ctrl+Y / Alt+Y) closes both windows, so a
@@ -7799,7 +9599,7 @@ impl App {
                 // build: the first Esc ARMS (the indicator shows "再按 Esc 中断"),
                 // a second Esc within the window actually cancels. It never quits
                 // the app while a run is in flight.
-                if self.is_pipeline_active() || self.agentic_in_flight {
+                if self.has_interruptible_work() {
                     if self.interrupt_armed() {
                         self.interrupt_armed_at = None;
                         return Action::Cancel;
@@ -8056,6 +9856,35 @@ impl App {
             }
 
             // ---- enter: submit, or insert newline with Shift ----
+            KeyCode::Enter | KeyCode::Char('i') if ctrl && self.prompt_queue.ready() => {
+                let raw = self.input.clone();
+                if raw.trim().is_empty() {
+                    return self
+                        .prompt_queue
+                        .interject_top()
+                        .map_or(Action::None, Action::PromptQueueMutate);
+                }
+                let turn = self.compose_submitted_turn(&raw);
+                if self.prompt_queue.is_editing() {
+                    if turn.has_attachments() {
+                        self.push(
+                            ChatRole::System,
+                            umadev_i18n::t(self.lang, "prompt_queue.edit_attachments"),
+                        );
+                        return Action::None;
+                    }
+                    let Some(mutation) = self.prompt_queue.submit_edit(turn.text) else {
+                        return Action::None;
+                    };
+                    self.clear_input();
+                    return Action::PromptQueueMutate(mutation);
+                }
+                self.clear_input();
+                self.transcript_scroll_to_bottom();
+                self.remember_submission(&turn.text);
+                self.submit_turn_with_queue_placement(turn, Some(PromptQueuePlacement::SendNow))
+            }
+
             KeyCode::Enter => {
                 if shift {
                     // Shift+Enter inserts a literal newline so the user
@@ -8083,42 +9912,71 @@ impl App {
                 // an "unknown command". Only when the input is a bare verb (no
                 // args yet) and isn't already an exact command.
                 if self.input.starts_with('/') && !self.input[1..].contains(char::is_whitespace) {
-                    let matches = self.palette_matches();
-                    if !matches.is_empty() {
+                    let completion = {
+                        let matches = self.palette_matches();
                         let typed = self.input[1..].to_ascii_lowercase();
                         let is_exact = matches.iter().any(|p| p.verb == typed)
                             || umadev_host::driver_for(&typed).is_some();
-                        if !is_exact {
+                        if matches.is_empty() || is_exact {
+                            None
+                        } else {
                             let sel = self.palette_selected.min(matches.len() - 1);
-                            self.input = format!("/{}", matches[sel].verb);
-                            self.input_cursor = self.input_len();
+                            Some(matches[sel].verb.to_string())
                         }
+                    };
+                    if let Some(verb) = completion {
+                        self.input = format!("/{verb}");
+                        self.input_cursor = self.input_len();
                     }
                 }
-                // Rewrite any `[图片 N]` chip → `@<abs-path>` BEFORE clearing the
-                // input (clear drops the attachment list), so the base receives a
-                // path it can open as an image.
-                let raw = self.expand_attachments(self.input.trim());
+                // Snapshot typed blocks BEFORE clearing their chip backing stores.
+                // No attachment path is ever rewritten into prompt text.
+                let raw = self.input.clone();
+                let turn = self.compose_submitted_turn(&raw);
+                if turn.has_attachments()
+                    && (turn.text.trim_start().starts_with('/')
+                        || turn.text.trim_start().starts_with('!'))
+                {
+                    self.push_attachment_rejection("attach.reason.command");
+                    return Action::None;
+                }
+                if self.prompt_queue.is_editing() {
+                    if turn.has_attachments() {
+                        self.push(
+                            ChatRole::System,
+                            umadev_i18n::t(self.lang, "prompt_queue.edit_attachments"),
+                        );
+                        return Action::None;
+                    }
+                    let Some(mutation) = self.prompt_queue.submit_edit(turn.text) else {
+                        return Action::None;
+                    };
+                    self.clear_input();
+                    return Action::PromptQueueMutate(mutation);
+                }
                 self.clear_input();
-                if raw.is_empty() {
+                if turn.input.blocks.is_empty() || turn.text.trim().is_empty() {
+                    if let Some(mutation) = self.prompt_queue.interject_top() {
+                        return Action::PromptQueueMutate(mutation);
+                    }
                     return Action::None;
                 }
                 // Submitting re-pins the transcript to the bottom so the user
                 // always sees their own new turn (and the reply) land, even if
                 // they were scrolled up reviewing history.
                 self.transcript_scroll_to_bottom();
-                self.remember_submission(&raw);
-                if let Some(action) = self.try_slash_command(&raw) {
+                self.remember_submission(&turn.text);
+                if let Some(action) = self.try_slash_command(&turn.text) {
                     return action;
                 }
                 // `!cmd` runs a one-off local shell in the project root (Claude
                 // Code's `!` convenience-shell convention) — NOT routed to the
                 // borrowed brain. Checked after the slash dispatch so it can't
                 // shadow a command; a bare `!` is a consumed no-op.
-                if let Some(action) = self.try_bang_command(&raw) {
+                if let Some(action) = self.try_bang_command(&turn.text) {
                     return action;
                 }
-                self.submit_text(raw)
+                self.submit_turn(turn)
             }
 
             // ---- emacs-style line editing (Claude Code parity) ----
@@ -8193,37 +10051,12 @@ impl App {
                 // box has text. The old behaviour (only-interrupt-on-empty)
                 // forced a second keystroke to actually stop a run when the
                 // user had half-typed the next message.
-                if self.is_pipeline_active() {
-                    // Defensive: dropping the input on an interrupt avoids a
-                    // half-typed turn silently submitting later.
+                if self.has_interruptible_work() || self.thinking {
+                    // The canonical path aborts any owned task, seals partial
+                    // output, preserves deferred FIFO turns, and invalidates an
+                    // in-flight gate-query generation.
                     self.clear_input();
                     return Action::Cancel;
-                }
-                if self.agentic_in_flight {
-                    // An agentic execution call is streaming in a real base
-                    // subprocess (parked in the event loop's `run_task`). Unlike
-                    // a fire-and-forget chat route, simply clearing the spinner
-                    // would leave the subprocess running — so route through
-                    // `Action::Cancel`, which aborts the task. `cancel_run`
-                    // clears `thinking` / `agentic_in_flight` and the queue.
-                    self.clear_input();
-                    return Action::Cancel;
-                }
-                if self.thinking {
-                    // A routed chat turn is in flight. Stop the spinner and drop
-                    // any chat turns parked behind it so the interrupt is clean;
-                    // the in-flight route task is fire-and-forget (it only chats,
-                    // no workspace mutation) so its late reply is simply ignored.
-                    // Seal any half-streamed reply first so the partial text is
-                    // marked incomplete, not read as the whole answer.
-                    self.seal_interrupted_stream();
-                    self.thinking = false;
-                    self.thinking_started = None;
-                    self.queued_chat.clear();
-                    self.clear_input();
-                    self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.cancelled"));
-                    self.refresh_status();
-                    return Action::None;
                 }
                 // Idle: Ctrl+C clears a half-typed input but NEVER quits the app —
                 // it's universal muscle-memory for COPY, so an accidental Ctrl+C must
@@ -8358,18 +10191,230 @@ impl App {
         self.transcript_scroll_to_bottom();
     }
 
+    /// Most recent user row that was real work/chat, not a local meta query.
+    fn last_non_meta_user_index(&self) -> Option<usize> {
+        self.history
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, message)| {
+                (message.role == ChatRole::You
+                    && classify_live_meta(message.body().as_ref()).is_none())
+                .then_some(idx)
+            })
+    }
+
+    /// Structured diff paths emitted after the latest real user request.
+    fn latest_turn_diff_paths(&self) -> Vec<String> {
+        let start = self.last_non_meta_user_index().map_or(0, |idx| idx + 1);
+        let mut paths = Vec::new();
+        for message in self.history.iter().skip(start) {
+            if let MessageBody::Diff(diff) = &message.kind {
+                if !paths.contains(&diff.path) {
+                    paths.push(diff.path.clone());
+                }
+            }
+        }
+        paths
+    }
+
+    /// The post-turn fact line, if the latest turn has already settled.
+    fn latest_turn_fact(&self) -> Option<&str> {
+        let start = self.last_non_meta_user_index().map_or(0, |idx| idx + 1);
+        self.history.iter().skip(start).rev().find_map(|message| {
+            let MessageBody::Text(body) = &message.kind else {
+                return None;
+            };
+            (body.contains("[note] 本轮实际文件变更:") || body.contains("[note] 本轮无文件变更"))
+                .then_some(body.as_str())
+        })
+    }
+
+    fn live_progress_reply(&self) -> String {
+        let mut lines = vec![umadev_i18n::t(self.lang, "live_meta.progress.title").to_string()];
+
+        if let Some(task) = self.active_task() {
+            lines.push(umadev_i18n::tf(
+                self.lang,
+                "live_meta.progress.task",
+                &[
+                    &task.id,
+                    &task.requirement,
+                    &task.done.to_string(),
+                    &task.total.to_string(),
+                ],
+            ));
+        } else if self.thinking {
+            let current = self
+                .last_non_meta_user_index()
+                .and_then(|idx| self.history.get(idx))
+                .map_or_else(|| self.requirement.clone(), |m| task_summary(&m.body()));
+            lines.push(umadev_i18n::tf(
+                self.lang,
+                "live_meta.progress.chat",
+                &[&current],
+            ));
+        } else {
+            lines.push(umadev_i18n::t(self.lang, "live_meta.progress.idle").to_string());
+        }
+
+        if !self.plan_steps.is_empty() {
+            let done = self
+                .plan_steps
+                .iter()
+                .filter(|step| step.status == "done")
+                .count();
+            lines.push(umadev_i18n::tf(
+                self.lang,
+                "live_meta.progress.plan",
+                &[&done.to_string(), &self.plan_steps.len().to_string()],
+            ));
+            if let Some(step) = self
+                .plan_steps
+                .iter()
+                .find(|step| step.status == "active")
+                .or_else(|| self.plan_steps.iter().find(|step| step.status == "pending"))
+            {
+                lines.push(umadev_i18n::tf(
+                    self.lang,
+                    "live_meta.progress.step",
+                    &[&step.id, &step.title],
+                ));
+            }
+        }
+
+        if let Some(row) = self
+            .phases
+            .iter()
+            .find(|row| row.status == PhaseStatus::Running)
+        {
+            lines.push(umadev_i18n::tf(
+                self.lang,
+                "live_meta.progress.phase",
+                &[row.phase.id()],
+            ));
+        }
+        if let Some(gate) = self.active_gate {
+            lines.push(umadev_i18n::tf(
+                self.lang,
+                "live_meta.progress.gate",
+                &[gate.id_str()],
+            ));
+        }
+        lines.join("\n")
+    }
+
+    fn live_changes_reply(&self) -> String {
+        const CAP: usize = 12;
+        let paths = self.latest_turn_diff_paths();
+        if !paths.is_empty() {
+            let shown = paths
+                .iter()
+                .take(CAP)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            return umadev_i18n::tf(
+                self.lang,
+                "live_meta.changes.diff",
+                &[&paths.len().to_string(), &shown],
+            );
+        }
+
+        if let Some(fact) = self.latest_turn_fact() {
+            if fact.contains("[note] 本轮无文件变更") {
+                return umadev_i18n::t(self.lang, "live_meta.changes.none").to_string();
+            }
+            if let Some((_, files)) = fact.split_once("[note] 本轮实际文件变更:") {
+                return umadev_i18n::tf(self.lang, "live_meta.changes.fact", &[files.trim()]);
+            }
+        }
+
+        let status_paths = crate::git_status_porcelain(&self.project_root)
+            .map(|snapshot| {
+                snapshot
+                    .lines()
+                    .filter_map(crate::porcelain_path)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if status_paths.is_empty() {
+            return umadev_i18n::t(self.lang, "live_meta.changes.none_yet").to_string();
+        }
+        let shown = status_paths
+            .iter()
+            .take(CAP)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        umadev_i18n::tf(
+            self.lang,
+            "live_meta.changes.git_status",
+            &[&status_paths.len().to_string(), &shown],
+        )
+    }
+
+    fn answer_live_meta(&mut self, intent: LiveMetaIntent, text: String) {
+        let reply = match intent {
+            LiveMetaIntent::Progress => self.live_progress_reply(),
+            LiveMetaIntent::Changes => self.live_changes_reply(),
+        };
+        self.push(ChatRole::You, text.clone());
+        self.push(ChatRole::UmaDev, reply.clone());
+        self.record_turn("user", text);
+        self.record_turn("assistant", reply);
+        self.persist_chat();
+        self.refresh_status();
+    }
+
+    /// Start the sole read-only question attached to an open confirmation gate.
+    /// The writer is already parked; generation tagging prevents late answers
+    /// from crossing a cancel, clear, or later run boundary.
+    fn begin_gate_query(&mut self, text: String) -> Action {
+        self.record_user_turn(&text);
+        self.gate_query_epoch = self.gate_query_epoch.wrapping_add(1);
+        let epoch = self.gate_query_epoch;
+        self.active_gate_query_epoch = Some(epoch);
+        self.gate_query_in_flight = true;
+        self.thinking = true;
+        self.thinking_started = Some(std::time::Instant::now());
+        self.agentic_in_flight = true;
+        self.refresh_status();
+        Action::GateQuery {
+            epoch,
+            question: text,
+        }
+    }
+
     /// Treat non-slash text as either a fresh requirement (if no run is
     /// active) or a revision (if a gate is open). Single-letter `c` at a
     /// gate is the documented shortcut for "approve / continue" — match
     /// the gate card so users don't have to type `/continue` every time.
+    #[cfg(test)]
     fn submit_text(&mut self, text: String) -> Action {
-        // A cancel is DRAINING ("stopping…"): a submit here would push a You bubble + queue
-        // into queued_chat, which cancel_run then CLEARS -> the message shows as sent but is
-        // silently dropped. Refuse during the drain and RESTORE the text to the input box (+
-        // caret at end) so the user resends the instant the stop settles - no lost input.
+        self.submit_turn(SubmittedTurn::text(text))
+    }
+
+    fn submit_turn(&mut self, turn: SubmittedTurn) -> Action {
+        self.submit_turn_with_queue_placement(turn, None)
+    }
+
+    fn submit_turn_with_queue_placement(
+        &mut self,
+        turn: SubmittedTurn,
+        queue_placement: Option<PromptQueuePlacement>,
+    ) -> Action {
+        let text = turn.text.clone();
+        // A cancel is DRAINING ("stopping…"). Restore new text to the input box
+        // instead of racing it into the preserved queue while the old task still
+        // owns its session; the user can submit once cancellation settles.
         if self.cancelling {
-            self.input = text;
-            self.input_cursor = self.input_len();
+            self.restore_submitted_turn(turn);
+            return Action::None;
+        }
+        // These observations never become steering or a base turn.
+        if let Some(intent) = classify_live_meta(&text) {
+            self.answer_live_meta(intent, text);
             return Action::None;
         }
         // A2#5 — a PAUSED consequential-action approval is live: an exact typed
@@ -8387,24 +10432,35 @@ impl App {
                 return Action::ApprovalReply(allow);
             }
         }
-        // Fix (dedup): a failed chat turn armed a ONE-SHOT guard with its exact text.
-        // If the user's very next submit is that same text — a reflexive re-send, or a
-        // double-Enter that outran the failure note — swallow it ONCE so a failed turn
-        // never silently auto-duplicates (the queued-duplicate drop only covers turns
-        // parked WHILE thinking; this covers a re-send AFTER the failure cleared it).
-        // Consumed unconditionally (a different submit clears it), and only when we are
-        // actually on the fresh-chat-route path (not thinking, no gate open) so a gate
-        // answer or a parked turn is never suppressed.
-        if let Some(dup) = self.suppress_route_dup.take() {
-            if !self.thinking && self.active_gate.is_none() && dup == text.trim() {
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::t(self.lang, "chat.queued_duplicate_skipped").to_string(),
-                );
-                self.refresh_status();
-                return Action::None;
-            }
+        // Natural-language cancel is a protocol action only while work is live.
+        // Keep it outside semantic routing so it cannot sit in queued_chat while
+        // the writer the user asked to stop keeps running.
+        if (self.thinking
+            || self.agentic_in_flight
+            || self.is_pipeline_active()
+            || self.active_gate.is_some()
+            || self.director_gate_paused)
+            && umadev_agent::is_running_cancel_intent(&text)
+        {
+            self.active_gate = None;
+            self.gate_choice = None;
+            self.push(ChatRole::You, text);
+            self.refresh_status();
+            return Action::Cancel;
         }
+        // A gate question uses a separate read-only one-shot while the parked
+        // Director plan remains intact. Keep a second submitted line editable
+        // instead of dispatching another base call concurrently; once the answer
+        // lands the user can press Enter to send the preserved text. This check
+        // deliberately follows natural-language cancellation so `stop` / `取消`
+        // can still abort an in-flight gate query immediately.
+        if self.gate_query_in_flight {
+            self.restore_submitted_turn(turn);
+            return Action::None;
+        }
+        // An explicit Enter after a failed turn is an intentional retry. Exact
+        // duplicates already queued before failure are removed by settlement;
+        // a later user action must remain authoritative (notably after a 502).
         self.push(ChatRole::You, text.clone());
         // A brain-driven turn is still in flight (`thinking`). Firing a second one
         // now would drive the SAME base `session_id` in two subprocesses at once →
@@ -8415,31 +10471,79 @@ impl App {
         // (A gate is never open while `thinking`, so this check sits ahead of gate
         // handling.)
         if self.thinking {
-            // A DIRECTOR build in flight (A2#4/#5): text typed now is mid-run
-            // STEERING, not a parked chat turn — queue it on the steering lane so
-            // the event loop hands it to the run's step-boundary intake and it
-            // applies at the NEXT step, instead of sitting until the whole build
-            // settles (the strongest engine had the weakest steering).
+            // A DIRECTOR build has two safe input lanes. Only an explicit change
+            // to the CURRENT task reaches the step-boundary steering intake.
+            // Questions, later tasks, and ambiguous text wait as ordinary chat;
+            // after the run settles they go through the same model-first route as
+            // any fresh turn. This classifier is only a concurrency/safety split,
+            // never a business-topic intent router.
             if self.director_run_in_flight {
-                self.queued_steer.push_back(text);
-                self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.queued"));
+                if turn.has_attachments() {
+                    self.queue_chat_turn(turn);
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::t(self.lang, "input.steer.director_deferred"),
+                    );
+                    self.refresh_status();
+                    return Action::None;
+                }
+                match umadev_agent::classify_running_input(&text) {
+                    umadev_agent::RunningInputDisposition::Steer => {
+                        self.queued_steer.push_back(text);
+                        self.push(
+                            ChatRole::System,
+                            umadev_i18n::t(self.lang, "run.steer_queued"),
+                        );
+                    }
+                    umadev_agent::RunningInputDisposition::Query
+                    | umadev_agent::RunningInputDisposition::Deferred => {
+                        self.queue_chat_turn(turn.clone());
+                        self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.deferred"));
+                    }
+                }
                 self.refresh_status();
                 return Action::None;
             }
             // Park it WITHOUT recording into conversation memory yet. Recording at
-            // submit time left a dangling "user said X" with no assistant reply in
-            // memory whenever the user then interrupted (Ctrl-C clears `queued_chat`
-            // but the premature record stayed) — a scrambled turn order the base
-            // would later see. The turn is recorded only when it actually FIRES
+            // submit time left a dangling "user said X" with no assistant reply
+            // whenever the user interrupted. The turn is recorded only when it fires
             // (see `take_next_queued_chat`), so an interrupted queue leaves memory
             // clean. Tell the user it is queued — NOT the pipeline `run.queued`
             // text (there is no gate here, this is a plain conversational turn).
-            self.queued_chat.push_back(text);
+            if self.prompt_queue.ready() {
+                return Action::PromptQueueEnqueue {
+                    turn,
+                    placement: queue_placement.unwrap_or(PromptQueuePlacement::Tail),
+                };
+            }
+            if self.live_input_ready {
+                return Action::LiveInput(turn);
+            }
+            self.queue_chat_turn(turn);
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "chat.queued"));
             self.refresh_status();
             return Action::None;
         }
         if let Some(gate) = self.active_gate {
+            if turn.has_attachments() {
+                self.queue_chat_turn(turn);
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "input.steer.gate_deferred"),
+                );
+                self.refresh_status();
+                return Action::None;
+            }
+            // A question at a gate asks for a model answer; it is not consent and
+            // must never be reinterpreted as `Action::Revise`. The Director writer
+            // is already parked at this point, so answer on a fresh read-only
+            // surface while keeping the gate open.
+            if matches!(
+                umadev_agent::classify_running_input(&text),
+                umadev_agent::RunningInputDisposition::Query
+            ) {
+                return self.begin_gate_query(text);
+            }
             // ClarifyGate: non-"c" text is an answer (append to
             // answers file); "c" submits all answers + continues.
             if gate == Gate::ClarifyGate {
@@ -8451,6 +10555,12 @@ impl App {
                         umadev_i18n::t(self.lang, "gate.clarify_saved").to_string(),
                     );
                     return Action::Continue(gate);
+                }
+                if !umadev_agent::is_explicit_clarification_answer(&text) {
+                    self.queue_chat_turn(turn.clone());
+                    self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.deferred"));
+                    self.refresh_status();
+                    return Action::None;
                 }
                 match self.append_clarify_answer(&text) {
                     Ok(()) => self.push(
@@ -8500,6 +10610,26 @@ impl App {
                 self.gate_choice = None;
                 return Action::Cancel;
             }
+            // At a docs/preview gate, only a clear correction of the current
+            // artifact is a revision. A later task or ambiguous conversational
+            // turn is deferred for the model instead of accidentally re-running
+            // this producing block.
+            let disposition = umadev_agent::classify_running_input(&text);
+            if matches!(disposition, umadev_agent::RunningInputDisposition::Deferred)
+                && umadev_agent::is_explicit_later_work(&text)
+            {
+                self.queue_chat_turn(turn.clone());
+                self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.deferred"));
+                self.refresh_status();
+                return Action::None;
+            }
+            if !matches!(disposition, umadev_agent::RunningInputDisposition::Steer) {
+                // At docs/preview confirmation, ambiguity is safer as a read-only
+                // question than as an indefinitely parked message. Only an
+                // explicit current correction may revise, and only explicit
+                // later-work wording enters the FIFO queue.
+                return self.begin_gate_query(text);
+            }
             // A revision request resets this gate's trust streak.
             self.record_trust_revision(gate.id_str());
             self.push(
@@ -8532,11 +10662,11 @@ impl App {
             self.tool_in_progress = false;
             // Record the exact dispatched text so a terminal failure can dedup off it.
             self.last_dispatched_chat = Some(text.clone());
+            self.pending_route_input = Some(turn);
             self.refresh_status();
             Action::Route(text)
         } else if !self.run_started {
-            // Natural-language intent belongs to the selected base
-            // (Claude Code / Codex / OpenCode / external model API). UmaDev is
+            // Natural-language intent belongs to the selected supported base. UmaDev is
             // only the shell: it relays the base's decision — a conversational
             // reply, or a 9-phase pipeline run — and never classifies the
             // intent itself. The full conversation is carried along so the base
@@ -8549,14 +10679,28 @@ impl App {
             self.tool_in_progress = false;
             // Record the exact dispatched text so a terminal failure can dedup off it.
             self.last_dispatched_chat = Some(text.clone());
+            self.pending_route_input = Some(turn);
             self.refresh_status();
             Action::Route(text)
         } else {
-            // Pipeline is mid-phase (no gate open). We can't inject into the
-            // running base subprocess, so QUEUE the message and fire it at the
-            // next gap — gate / phase boundary — like Claude Code queuing a turn.
-            self.queued_steer.push_back(text);
-            self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.queued"));
+            // Legacy pipeline mid-phase: use the same safe split as the director
+            // path. Only a clear current-task correction may be injected at the
+            // next gap; everything else becomes a later model-routed chat turn.
+            match umadev_agent::classify_running_input(&text) {
+                umadev_agent::RunningInputDisposition::Steer => {
+                    self.queued_steer.push_back(text);
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::t(self.lang, "run.steer_queued"),
+                    );
+                }
+                umadev_agent::RunningInputDisposition::Query
+                | umadev_agent::RunningInputDisposition::Deferred => {
+                    self.queue_chat_turn(turn.clone());
+                    self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.deferred"));
+                }
+            }
+            self.refresh_status();
             Action::None
         }
     }
@@ -8590,6 +10734,14 @@ impl App {
     /// **Fail-open:** an out-of-range index, no active picker, or no active gate
     /// → [`Action::None`] (the gate is left untouched).
     fn gate_choice_pick(&mut self, idx: usize) -> Action {
+        if self.gate_query_in_flight {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "gate.query.busy"),
+            );
+            self.refresh_status();
+            return Action::None;
+        }
         let Some(option) = self
             .gate_choice
             .as_ref()
@@ -8732,7 +10884,7 @@ impl App {
         MARKERS.iter().any(|m| hay.contains(m))
     }
 
-    pub(crate) fn record_route_failed(&mut self, note: String) {
+    pub(crate) fn record_route_failed(&mut self, note: String, origin: FailedRouteOrigin) {
         // Feature A — a turn that ran a while then errored out is still a terminal
         // outcome worth a beep (gated on elapsed, so a fast base-init failure is
         // silent). Arm before clearing the timer.
@@ -8750,12 +10902,16 @@ impl App {
         // (and any stale gate-pause marker: the failed run resolves its pause).
         self.director_run_in_flight = false;
         self.director_gate_paused = false;
+        self.pending_director_gate = None;
         // Settle the live task as Failed (a no-op for a plain chat-route failure,
         // which never registered a task).
         self.mark_active_task(TaskStatus::Failed);
-        // Arm the one-shot dedup guard with the just-failed turn's text so an immediate
-        // reflexive re-send of the SAME message is swallowed once (see `submit_text`).
-        self.suppress_route_dup = self.last_dispatched_chat.clone();
+        if origin == FailedRouteOrigin::Director {
+            // A Director failure has no safe chat dedup key. Explicit `/run`
+            // never dispatched `last_dispatched_chat`; a model-promoted run
+            // crossed ownership boundaries after setting it.
+            self.last_dispatched_chat = None;
+        }
         // If the failure is the BASE SESSION dying (broken pipe / process exit / a `--resume`
         // that found no conversation), the stored session id is a corpse - re-resuming it on
         // every subsequent turn reproduces the failure forever. Invalidate it so the NEXT turn
@@ -8764,9 +10920,75 @@ impl App {
         // survived the failure).
         if Self::note_indicates_session_lost(&note) {
             self.chat_session_id = None;
+            self.chat_resume_identity = None;
         }
+        // Close the dispatched user turn in durable memory before any queued
+        // follow-up is drained. Without this boundary a fresh/resumed base sees
+        // `user A -> user B` and may retry A's partial side effects as though it
+        // never terminated.
+        self.record_turn(
+            "assistant",
+            format!(
+                "[control: the preceding turn failed and must not be resumed implicitly]\n{note}"
+            ),
+        );
+        self.persist_chat();
         self.refresh_status();
         self.push(ChatRole::System, note);
+        if origin == FailedRouteOrigin::Chat {
+            self.drop_failed_route_duplicate_queued_chat();
+        }
+    }
+
+    /// Settle an explicitly cancelled pre-session authentication flow without
+    /// treating it as a model/base turn failure. The already-rendered user turn
+    /// remains paired with a durable control boundary, while its exact typed
+    /// blocks are restored into the editor and merged with any newer draft.
+    pub(crate) fn record_auth_cancelled(&mut self, turn: SubmittedTurn, note: String) {
+        self.thinking = false;
+        self.thinking_started = None;
+        self.agentic_in_flight = false;
+        self.tool_in_progress = false;
+        self.stream_text_active = false;
+        self.stream_tool_batch = None;
+        self.collapse_thinking_block();
+        self.reset_stream_md_cache();
+        self.director_run_in_flight = false;
+        self.director_gate_paused = false;
+        self.pending_director_gate = None;
+        self.last_dispatched_chat = None;
+        self.mark_active_task(TaskStatus::Stopped);
+        self.record_turn(
+            "assistant",
+            format!("[control: authentication cancelled; no user turn was sent]\n{note}"),
+        );
+        self.push(ChatRole::System, note);
+        self.restore_rejected_turn(turn);
+        self.persist_chat();
+        self.refresh_status();
+    }
+
+    /// Settle a defensive Director entry that hit the Plan/read-only ceiling.
+    /// This is intentionally distinct from both `record_agentic_done` and
+    /// `record_route_failed`: no build completed, no failure occurred, and no
+    /// completion bell/card or resumable build session should be created.
+    pub(crate) fn record_run_not_executed(&mut self) {
+        self.thinking = false;
+        self.thinking_started = None;
+        self.agentic_in_flight = false;
+        self.tool_in_progress = false;
+        self.stream_text_active = false;
+        self.stream_tool_batch = None;
+        self.collapse_thinking_block();
+        self.reset_stream_md_cache();
+        self.director_run_in_flight = false;
+        self.director_gate_paused = false;
+        self.pending_director_gate = None;
+        // If a programmatic caller registered a task before reaching the inner
+        // ceiling, preserve the honest lifecycle: it was stopped before work,
+        // never completed.
+        self.mark_active_task(TaskStatus::Stopped);
+        self.refresh_status();
     }
 
     /// An agentic streaming turn finished cleanly. The body ALREADY streamed live
@@ -8785,6 +11007,7 @@ impl App {
         reply: String,
         director_build: bool,
         base_session_id: Option<String>,
+        base_resume_identity: Option<BaseResumeIdentity>,
     ) {
         // Feature A — a long agentic turn just settled; alert the (possibly away)
         // user. Arm BEFORE clearing `thinking_started`, gated on its elapsed.
@@ -8801,9 +11024,10 @@ impl App {
         // codex's `thread.id` ride back here on the terminal decision; opencode /
         // offline carry `None`. Fail-open: a `None` / empty id leaves the prior value
         // (degrades to today's fresh-session + transcript-replay behavior).
-        if let Some(id) = base_session_id {
+        if let (Some(id), Some(identity)) = (base_session_id, base_resume_identity) {
             if !id.trim().is_empty() {
                 self.chat_session_id = Some(id);
+                self.chat_resume_identity = Some(identity);
                 self.host_chat_session_active = true;
             }
         }
@@ -8813,19 +11037,17 @@ impl App {
         // final, complete body renders through one clean whole-body pass (the
         // guaranteed-consistent path) and the NEXT stream starts fresh.
         self.reset_stream_md_cache();
-        // Wave 5 deliverable 2 — unify chat ↔ /run memory. A finished director
-        // build hands its session back to chat: the NEXT chat turn resumes the
-        // base's most-recent session in this dir (`--continue`) so "why did you
-        // build it that way?" continues the SAME session that did the build, with
-        // full context — instead of a disjoint cold chat session. Only fires after a
-        // real director build (a plain chat / explain / quick-edit turn carries
-        // `director_build = false`). Fail-open: if the base can't resume, it starts
-        // fresh. The in-flight marker is always cleared (it was only ever an
-        // aliveness/UI hint once the class moved into the task).
+        // Wave 5 deliverable 2 — unify chat ↔ director memory. The exact native
+        // session id arrived in `base_session_id` above and is now pinned on App;
+        // this one-shot flag tells the next turn not to mint a competing id. Only a
+        // real director build sets it (plain chat / explain / quick-edit carry
+        // `director_build = false`). Bases without resume support fall back to the
+        // bounded UmaDev transcript. The in-flight marker is always cleared.
         self.director_run_in_flight = false;
         // A settled run is no longer parked at any gate (safety: a stale pause
         // marker must never survive into the next run's routing).
         self.director_gate_paused = false;
+        self.pending_director_gate = None;
         if director_build {
             self.run_session_handed_to_chat = true;
             // The director build settled cleanly → mark its task Done.
@@ -8861,10 +11083,9 @@ impl App {
     /// terminal `RunPausedAtGate` decision's recorder. Clears the in-flight
     /// "thinking…" state (the run task has settled; a fresh session resumes it on
     /// approval) and arms [`Self::director_gate_paused`] so the gate approval /
-    /// revision paths resume the DIRECTOR plan. The `GateOpened` engine event —
-    /// drained before terminal decisions — already set [`Self::active_gate`] and
-    /// rendered the gate card/picker; re-asserting it here is a fail-open backstop
-    /// only (idempotent, never a second card).
+    /// revision paths resume the DIRECTOR plan. A `GateOpened` event arriving
+    /// before this terminal decision is intentionally staged, then activated here
+    /// only after the writer session is known to have ended.
     pub(crate) fn record_run_paused_at_gate(&mut self, gate: Gate) {
         self.thinking = false;
         self.thinking_started = None;
@@ -8878,9 +11099,99 @@ impl App {
         // pause marker (not the in-flight marker) carries the state forward.
         self.director_run_in_flight = false;
         self.director_gate_paused = true;
-        if self.active_gate.is_none() {
-            self.active_gate = Some(gate);
+        // Activate only after the writer session has ended. Replaying the staged
+        // event here preserves the choice/card behaviour without exposing a live
+        // approval surface during session teardown. A missing staged event fails
+        // open to an optionless gate rather than losing the required checkpoint.
+        let choice = self
+            .pending_director_gate
+            .take()
+            .filter(|(staged, _)| *staged == gate)
+            .and_then(|(_, choice)| choice);
+        self.apply_engine(EngineEvent::GateOpened { gate, choice });
+        self.refresh_status();
+    }
+
+    /// Settle a read-only answer asked while a gate remains open. The streamed
+    /// body is already visible; this records it in durable model memory and clears
+    /// only the query spinner — never the gate or its Director pause marker.
+    pub(crate) fn record_gate_query_done(&mut self, epoch: u64, reply: String) -> bool {
+        if self.active_gate_query_epoch != Some(epoch) {
+            return false;
         }
+        self.active_gate_query_epoch = None;
+        self.gate_query_in_flight = false;
+        self.thinking = false;
+        self.thinking_started = None;
+        self.agentic_in_flight = false;
+        self.tool_in_progress = false;
+        self.stream_text_active = false;
+        self.stream_tool_batch = None;
+        self.collapse_thinking_block();
+        self.reset_stream_md_cache();
+        let reply = reply.trim().to_string();
+        if !reply.is_empty() {
+            self.push(ChatRole::UmaDev, reply.clone());
+            self.record_turn("assistant", reply);
+            self.persist_chat();
+        }
+        self.refresh_status();
+        true
+    }
+
+    /// Settle a failed read-only gate question without resolving the gate. The
+    /// user can retry, approve, revise, or cancel immediately.
+    pub(crate) fn record_gate_query_failed(&mut self, epoch: u64, note: String) -> bool {
+        if self.active_gate_query_epoch != Some(epoch) {
+            return false;
+        }
+        self.active_gate_query_epoch = None;
+        self.gate_query_in_flight = false;
+        self.thinking = false;
+        self.thinking_started = None;
+        self.agentic_in_flight = false;
+        self.tool_in_progress = false;
+        self.stream_text_active = false;
+        self.collapse_thinking_block();
+        self.reset_stream_md_cache();
+        self.push(ChatRole::System, note.clone());
+        self.record_turn(
+            "assistant",
+            format!("[gate question failed; gate remains open] {note}"),
+        );
+        self.persist_chat();
+        self.refresh_status();
+        true
+    }
+
+    /// Mark a confirmed `/deploy` as the sole cancellable workspace task.
+    pub(crate) fn begin_deploy(&mut self) {
+        self.thinking = true;
+        self.thinking_started = Some(std::time::Instant::now());
+        self.agentic_in_flight = true;
+        self.tool_in_progress = true;
+        self.refresh_status();
+    }
+
+    /// Settle a tracked deploy and release its single-task guard.
+    pub(crate) fn record_deploy_done(&mut self, succeeded: bool) {
+        self.arm_completion_bell(self.thinking_started);
+        self.thinking = false;
+        self.thinking_started = None;
+        self.agentic_in_flight = false;
+        self.tool_in_progress = false;
+        self.record_turn(
+            "assistant",
+            format!(
+                "[control: deploy task settled — {}]",
+                if succeeded {
+                    "deployed"
+                } else {
+                    "not deployed"
+                }
+            ),
+        );
+        self.persist_chat();
         self.refresh_status();
     }
 
@@ -8900,6 +11211,164 @@ impl App {
             ChatRole::System,
             umadev_i18n::tf(self.lang, "run.queued_unsent", &[&text]),
         );
+        self.record_turn(
+            "assistant",
+            format!("[control: user steering was not applied before settlement]\n{text}"),
+        );
+        self.persist_chat();
+    }
+
+    fn queue_chat_turn(&mut self, turn: SubmittedTurn) {
+        self.align_queued_dispatch_kinds();
+        self.queued_chat.push_back(turn.text.clone());
+        self.queued_turn_inputs.push_back(turn);
+        self.queued_dispatch_kinds
+            .push_back(QueuedResidentKind::RoutedChat);
+    }
+
+    fn queue_native_command(&mut self, payload: String) {
+        self.align_queued_dispatch_kinds();
+        self.queued_chat.push_back(payload.clone());
+        self.queued_turn_inputs
+            .push_back(SubmittedTurn::text(payload));
+        self.queued_dispatch_kinds
+            .push_back(QueuedResidentKind::NativeCommand);
+    }
+
+    fn align_queued_dispatch_kinds(&mut self) {
+        self.queued_dispatch_kinds.truncate(self.queued_chat.len());
+        while self.queued_dispatch_kinds.len() < self.queued_chat.len() {
+            self.queued_dispatch_kinds
+                .push_back(QueuedResidentKind::RoutedChat);
+        }
+    }
+
+    fn take_queued_turn_input_front(&mut self, text: &str) -> Option<SubmittedTurn> {
+        if self
+            .queued_turn_inputs
+            .front()
+            .is_some_and(|turn| turn.text == text)
+        {
+            return self.queued_turn_inputs.pop_front();
+        }
+        // Fail-open compatibility for hand-built test/application state from
+        // before snapshots became positionally complete.
+        let position = self
+            .queued_turn_inputs
+            .iter()
+            .position(|turn| turn.text == text)?;
+        self.queued_turn_inputs.remove(position)
+    }
+
+    fn take_queued_turn_input_back(&mut self, text: &str) -> Option<SubmittedTurn> {
+        if self
+            .queued_turn_inputs
+            .back()
+            .is_some_and(|turn| turn.text == text)
+        {
+            return self.queued_turn_inputs.pop_back();
+        }
+        let position = self
+            .queued_turn_inputs
+            .iter()
+            .rposition(|turn| turn.text == text)?;
+        self.queued_turn_inputs.remove(position)
+    }
+
+    /// Queue a live input that the active vendor session cannot guarantee as a
+    /// same-turn steer. The user bubble already exists; this only preserves the
+    /// typed snapshot and publishes an honest transport-specific status.
+    pub(crate) fn defer_live_input(&mut self, turn: SubmittedTurn, note_key: &str) {
+        self.queue_chat_turn(turn);
+        self.push(ChatRole::System, umadev_i18n::t(self.lang, note_key));
+        self.refresh_status();
+    }
+
+    /// Record a same-turn steer only after its protocol write returned a receipt.
+    pub(crate) fn record_live_input_delivered(&mut self, text: &str) {
+        self.record_user_turn(text);
+        self.refresh_status();
+    }
+
+    pub(crate) fn reject_live_input(&mut self, turn: SubmittedTurn, note: String) {
+        self.push(ChatRole::System, note);
+        self.restore_rejected_turn(turn);
+        self.refresh_status();
+    }
+
+    /// Keep the authoritative queue rows and restore an unsaved edit if its
+    /// protocol mutation failed before a replacement snapshot arrived.
+    pub(crate) fn reject_prompt_queue_mutation(
+        &mut self,
+        mutation: PromptQueueMutation,
+        note: String,
+    ) {
+        self.prompt_queue.reject_pending();
+        self.push(ChatRole::System, note);
+        if let PromptQueueMutation::Edit { new_text, .. } = mutation {
+            self.restore_rejected_turn(SubmittedTurn::text(new_text));
+        }
+        self.refresh_status();
+    }
+
+    /// Put a protocol-rejected structured turn back into the editor without
+    /// losing text the user typed while the rejection was in flight.
+    pub(crate) fn restore_rejected_turn(&mut self, mut turn: SubmittedTurn) {
+        if !self.input.trim().is_empty() {
+            let draft = self.compose_submitted_turn(&self.input);
+            append_text_block(&mut turn.input.blocks, "\n");
+            turn.input.blocks.extend(draft.input.blocks);
+            turn.text.push('\n');
+            turn.text.push_str(&draft.text);
+        }
+        // The corrected turn normally keeps the same path-free chip text. It is
+        // an explicit user retry and must remain in the editor.
+        self.restore_submitted_turn(turn);
+    }
+
+    /// Restore a rejected/not-yet-dispatched structured turn into the editor.
+    /// Paths stay only in backing vectors; the visible input contains chips.
+    pub(crate) fn restore_submitted_turn(&mut self, turn: SubmittedTurn) {
+        self.clear_input();
+        let mut input = String::new();
+        for block in turn.input.blocks {
+            match block {
+                TurnInputBlock::Text { text } => input.push_str(&text),
+                TurnInputBlock::Image { path } => {
+                    self.attachments.push(path);
+                    input.push_str(&self.image_chip(self.attachments.len()));
+                }
+                TurnInputBlock::File { path, .. } => {
+                    self.file_attachments.push(path);
+                    input.push_str(&self.file_chip(self.file_attachments.len()));
+                }
+            }
+        }
+        self.input = input;
+        self.input_cursor = self.input_len();
+        self.request_full_repaint();
+    }
+
+    /// Take the structured snapshot paired with an immediate/queued Route action.
+    /// Text-only programmatic routes retain the conservative one-text-block shape.
+    pub(crate) fn take_route_input(&mut self, text: &str) -> SubmittedTurn {
+        self.pending_route_input
+            .take()
+            .filter(|turn| turn.text == text)
+            .unwrap_or_else(|| SubmittedTurn::text(text.to_string()))
+    }
+
+    /// Drop input/routing state that belongs only to the current conversation.
+    /// Called at every explicit conversation replacement (`/clear`, `/resume`).
+    fn clear_transient_routing_state(&mut self) {
+        self.queued_steer.clear();
+        self.pending_steer = None;
+        self.queued_chat.clear();
+        self.queued_dispatch_kinds.clear();
+        self.queued_turn_inputs.clear();
+        self.pending_route_input = None;
+        self.route_backlog_len = 0;
+        self.last_dispatched_chat = None;
     }
 
     /// Pop the oldest chat turn parked by [`submit_text`] while a route was in
@@ -8909,12 +11378,107 @@ impl App {
     /// event loop fires it as the NEXT route only after the current route result
     /// has landed, keeping same-session routing strictly serial (never two base
     /// subprocesses resuming one `session_id` at once).
-    pub(crate) fn take_next_queued_chat(&mut self) -> Option<String> {
+    pub(crate) fn take_next_queued_dispatch(&mut self) -> Option<ResidentDispatch> {
+        self.align_queued_dispatch_kinds();
         let text = self.queued_chat.pop_front()?;
-        // This drained turn is now the dispatched one → dedup a later failure off it.
-        self.last_dispatched_chat = Some(text.clone());
+        let kind = self
+            .queued_dispatch_kinds
+            .pop_front()
+            .unwrap_or(QueuedResidentKind::RoutedChat);
+        let input = self.take_queued_turn_input_front(&text);
         self.record_user_turn(&text);
-        Some(text)
+        match kind {
+            QueuedResidentKind::RoutedChat => {
+                self.pending_route_input = input;
+                // This drained turn is now the dispatched one → dedup a later
+                // route failure off it.
+                self.last_dispatched_chat = Some(text.clone());
+                Some(ResidentDispatch::RoutedChat(text))
+            }
+            QueuedResidentKind::NativeCommand => {
+                self.pending_route_input = None;
+                self.last_dispatched_chat = None;
+                Some(ResidentDispatch::NativeCommand(text))
+            }
+        }
+    }
+
+    /// Compatibility view used by chat-only tests and older in-crate callers.
+    #[cfg(test)]
+    pub(crate) fn take_next_queued_chat(&mut self) -> Option<String> {
+        match self.take_next_queued_dispatch()? {
+            ResidentDispatch::RoutedChat(text) | ResidentDispatch::NativeCommand(text) => {
+                Some(text)
+            }
+        }
+    }
+
+    /// Snapshot the FIFO backlog that predates a newly dispatched model route.
+    /// Called immediately before its asynchronous classifier is spawned.
+    pub(crate) fn begin_route_dispatch(&mut self) {
+        self.route_backlog_len = self.queued_chat.len();
+    }
+
+    /// Reclassify turns submitted while the model was still deciding whether the
+    /// current request needed Director. That classification interval can last a
+    /// few seconds; an explicit correction typed there belongs to the run once the
+    /// model crosses the Director boundary, while questions/future work must remain
+    /// ordinary deferred chat. Preserves FIFO within both lanes.
+    pub(crate) fn promote_queued_inputs_for_director(&mut self) {
+        self.align_queued_dispatch_kinds();
+        let boundary = self.route_backlog_len.min(self.queued_chat.len());
+        if boundary == self.queued_chat.len() {
+            return;
+        }
+        let snapshots_aligned = self.queued_turn_inputs.len() == self.queued_chat.len()
+            && self
+                .queued_turn_inputs
+                .iter()
+                .zip(self.queued_chat.iter())
+                .all(|(turn, text)| &turn.text == text);
+        // Older queued turns are independent future work. Only messages appended
+        // during this route's classification interval can steer this Director.
+        let mut route_tail = self.queued_chat.split_off(boundary);
+        let mut route_kinds = self.queued_dispatch_kinds.split_off(boundary);
+        let mut route_turns = if snapshots_aligned {
+            self.queued_turn_inputs.split_off(boundary)
+        } else {
+            VecDeque::new()
+        };
+        let mut deferred = VecDeque::with_capacity(route_tail.len());
+        let mut deferred_turns = VecDeque::with_capacity(route_tail.len());
+        let mut deferred_kinds = VecDeque::with_capacity(route_tail.len());
+        while let Some(text) = route_tail.pop_front() {
+            let kind = route_kinds
+                .pop_front()
+                .unwrap_or(QueuedResidentKind::RoutedChat);
+            let turn = if snapshots_aligned {
+                route_turns.pop_front()
+            } else {
+                self.take_queued_turn_input_front(&text)
+            };
+            let has_attachments = turn.as_ref().is_some_and(SubmittedTurn::has_attachments);
+            if kind == QueuedResidentKind::RoutedChat
+                && !has_attachments
+                && matches!(
+                    umadev_agent::classify_running_input(&text),
+                    umadev_agent::RunningInputDisposition::Steer
+                )
+            {
+                self.queued_steer.push_back(text);
+            } else {
+                deferred.push_back(text);
+                deferred_kinds.push_back(kind);
+                if let Some(turn) = turn {
+                    deferred_turns.push_back(turn);
+                }
+            }
+        }
+        self.queued_chat.extend(deferred);
+        self.queued_dispatch_kinds.extend(deferred_kinds);
+        self.queued_turn_inputs.extend(deferred_turns);
+        self.route_backlog_len = self.queued_chat.len();
+        self.refresh_status();
     }
 
     /// After a route failure, drop leading queued chat turns that are exact
@@ -8924,6 +11488,7 @@ impl App {
     /// again as soon as the failure note landed, reading as "it skipped thinking
     /// and dumped old output". Different queued turns still drain normally.
     pub(crate) fn drop_failed_route_duplicate_queued_chat(&mut self) -> usize {
+        self.align_queued_dispatch_kinds();
         // Key off the EXACT text just dispatched to the base (the turn that failed),
         // not the last "user" turn in conversation memory. The conversation heuristic
         // was fragile: a relayed / reframed turn, or an intervening record, could make
@@ -8938,12 +11503,16 @@ impl App {
             return 0;
         };
         let mut dropped = 0usize;
-        while self
-            .queued_chat
-            .front()
-            .is_some_and(|text| text.trim() == failed_turn)
+        while self.queued_dispatch_kinds.front() == Some(&QueuedResidentKind::RoutedChat)
+            && self
+                .queued_chat
+                .front()
+                .is_some_and(|text| text.trim() == failed_turn)
         {
-            self.queued_chat.pop_front();
+            if let Some(text) = self.queued_chat.pop_front() {
+                let _ = self.take_queued_turn_input_front(&text);
+            }
+            let _ = self.queued_dispatch_kinds.pop_front();
             dropped += 1;
         }
         if dropped > 0 {
@@ -8968,9 +11537,16 @@ impl App {
     /// (`take_next_queued_chat`), never at queue time, so this pop leaves no
     /// dangling record.
     fn recall_queued_chat(&mut self) -> bool {
+        self.align_queued_dispatch_kinds();
         let Some(text) = self.queued_chat.pop_back() else {
             return false;
         };
+        let _ = self.queued_dispatch_kinds.pop_back();
+        if let Some(turn) = self.take_queued_turn_input_back(&text) {
+            self.restore_submitted_turn(turn);
+            self.refresh_status();
+            return true;
+        }
         self.input = text;
         self.input_cursor = self.input_len();
         // Land as a clean fresh draft: not mid history-recall, no armed
@@ -8998,17 +11574,6 @@ impl App {
     #[must_use]
     pub(crate) fn conversation_snapshot(&self) -> Vec<umadev_runtime::Message> {
         self.conversation.clone()
-    }
-
-    /// Return the UUID pinning this chat's host-CLI session, minting one on
-    /// first use. Called when routing a turn to a `HostCli` base so `claude`
-    /// can `--session-id` / `--resume` its own conversation deterministically.
-    pub(crate) fn ensure_chat_session_id(&mut self) -> String {
-        if self.chat_session_id.is_none() {
-            self.chat_session_id = Some(new_chat_session_id());
-        }
-        // Safe: just set above when absent.
-        self.chat_session_id.clone().unwrap_or_default()
     }
 
     /// Synchronous anti-unbounded safety net on the working view: drop the oldest
@@ -9040,10 +11605,9 @@ impl App {
     /// lands. Pure read, fail-open.
     #[must_use]
     pub(crate) fn context_used_tokens(&self) -> Option<u64> {
-        if self.last_turn_input_tokens > 0 {
-            return Some(self.last_turn_input_tokens);
-        }
-        None
+        self.session_usage
+            .exact_context_input()
+            .filter(|tokens| *tokens > 0)
     }
 
     /// The context-window DENOMINATOR for the active base/model, or `None` when the
@@ -9166,11 +11730,11 @@ impl App {
     /// Stale-guarded: a job whose generation no longer matches (a `/clear` /
     /// `/resume` happened since it started) is dropped without mutating anything.
     pub(crate) fn apply_compaction(&mut self, summary: &str, fold_count: usize, generation: u64) {
-        self.compaction_in_flight = false;
-        self.compaction_breaker.record_success();
         if generation != self.conversation_generation {
             return; // stale — the conversation was cleared / resumed meanwhile.
         }
+        self.compaction_in_flight = false;
+        self.compaction_breaker.record_success();
         if fold_count < umadev_agent::compaction::MIN_FOLD || fold_count > self.conversation.len() {
             return;
         }
@@ -9205,8 +11769,10 @@ impl App {
         // close/break at worst leaves a stale session one extra turn.
         self.host_chat_session_active = false;
         self.chat_session_id = None;
+        self.chat_resume_identity = None;
         self.run_session_handed_to_chat = false;
         self.chat_session_dirty = true;
+        self.reset_base_session_state();
         self.push(
             ChatRole::System,
             umadev_i18n::tf(
@@ -9222,7 +11788,10 @@ impl App {
     /// behaviour — drop the oldest down to [`CONVERSATION_CAP`] so the working
     /// prompt stays bounded. The full transcript on disk is untouched, so nothing
     /// durable is lost; the conversation is never corrupted.
-    pub(crate) fn fail_compaction(&mut self) {
+    pub(crate) fn fail_compaction(&mut self, generation: u64) {
+        if generation != self.conversation_generation {
+            return; // stale — never trim or mutate the new conversation's breaker.
+        }
         self.compaction_in_flight = false;
         self.compaction_breaker.record_failure();
         let len = self.conversation.len();
@@ -9281,6 +11850,9 @@ impl App {
         // A fresh run supersedes any parked director gate (its plan is being
         // replaced) — the stale pause marker must not hijack the next approval.
         self.director_gate_paused = false;
+        self.pending_director_gate = None;
+        self.gate_query_in_flight = false;
+        self.active_gate_query_epoch = None;
         // A fresh run starts UNARMED: interrupt_armed_at is only cleared by the confirming
         // second Esc, so without this a stale arm from a PREVIOUS run (still inside its 3s
         // window) made a single Esc on the new run cancel it immediately - defeating the
@@ -9408,6 +11980,31 @@ impl App {
         }
     }
 
+    fn append_thinking_delta(&mut self, delta: &str) {
+        let Some(idx) = self.thinking_block_idx else {
+            return;
+        };
+        let still_placeholder = matches!(
+            self.history.get(idx),
+            Some(message) if message.role == ChatRole::System
+                && message.body().trim_start().starts_with(THINKING_PLACEHOLDER_TAG)
+        );
+        if !still_placeholder {
+            self.thinking_block_idx = None;
+            return;
+        }
+        let Some(text) = self.history.get_mut(idx).and_then(ChatMessage::text_mut) else {
+            return;
+        };
+        if text.len() >= THINKING_REASONING_MAX {
+            return;
+        }
+        if !text.contains('\n') {
+            text.push('\n');
+        }
+        text.push_str(delta);
+    }
+
     /// P5c: close an open reasoning block when real content arrives. Rewrites the
     /// live `[thinking]` placeholder's HEADER line to a one-line summary (`正在思考…
     /// · 4.2s`, timed from the block start). When the block accumulated reasoning
@@ -9489,8 +12086,8 @@ impl App {
     }
 
     /// Interrupt the active run / in-flight turn: seal any half-streamed reply,
-    /// stop the spinner, clear the in-flight + queued state, and post a cancelled
-    /// note. The canonical Esc/Ctrl-C handler (see `lib.rs`).
+    /// stop the spinner, clear in-flight steering, preserve deferred chat turns,
+    /// and post a cancelled note. The canonical Esc/Ctrl-C handler (see `lib.rs`).
     pub fn cancel_run(&mut self) {
         // Seal any half-streamed reply BEFORE the reset clears the stream flag, so
         // the user sees the partial answer is incomplete (not the whole reply).
@@ -9512,9 +12109,22 @@ impl App {
         self.director_run_in_flight = false;
         // A cancel resolves any parked director gate — the run is over.
         self.director_gate_paused = false;
-        // Drop chat turns parked behind the in-flight route so they can't fire
-        // into a freshly-reset state.
-        self.queued_chat.clear();
+        self.pending_director_gate = None;
+        self.gate_query_in_flight = false;
+        self.active_gate_query_epoch = None;
+        // The native base session contains an unfinished request but no explicit
+        // cancellation boundary. Never resume that session as if it settled;
+        // UmaDev's own durable transcript carries the honest boundary into the
+        // next fresh session instead.
+        self.chat_session_id = None;
+        self.chat_resume_identity = None;
+        self.host_chat_session_active = false;
+        self.run_session_handed_to_chat = false;
+        // Deferred chat turns are independent future model turns, not revisions
+        // owned by the cancelled writer. Preserve them so cancellation cannot
+        // silently eat input; they remain visible in the queued chip and can be
+        // recalled/edited before they are sent.
+        let deferred_count = self.queued_chat.len();
         // M2 — also drop any pipeline-run steer parked in `queued_steer`. A user
         // cancel ends the run, so a parked steer can never reach a gate; leaving
         // it would keep the "queued N" chip falsely lit after the reset.
@@ -9524,7 +12134,25 @@ impl App {
         self.cancelling = false;
         // A user cancel settles the live task as Stopped (resumable via /tasks).
         self.mark_active_task(TaskStatus::Stopped);
-        self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.cancelled"));
+        let cancelled = umadev_i18n::t(self.lang, "run.cancelled").to_string();
+        self.push(ChatRole::System, cancelled.clone());
+        self.record_turn(
+            "assistant",
+            format!(
+                "{cancelled}\n[control] The preceding in-flight request was cancelled by the user before completion. Do not resume it unless the user explicitly asks."
+            ),
+        );
+        self.persist_chat();
+        if deferred_count > 0 {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(
+                    self.lang,
+                    "chat.queued_preserved",
+                    &[&deferred_count.to_string()],
+                ),
+            );
+        }
     }
 
     /// Enter the **stopping** state the instant Esc/Ctrl-C cancels an in-flight
@@ -9532,8 +12160,14 @@ impl App {
     /// reads as in-progress while the aborted task winds down OFF the render path
     /// (the actual drain + reset happens in the event loop's drain branch, which
     /// calls [`Self::cancel_run`] once the task has released its session). This is
-    /// the public entry the loop calls so [`Self::push`] stays private.
+    /// the public entry the loop calls while the underlying queue insertion stays private.
     pub fn begin_cancelling(&mut self) {
+        // Cancellation acceptance is the linearization point for a gate query.
+        // Invalidate it now — not after the async task's bounded drain — so a
+        // terminal answer already queued on another channel cannot land during
+        // the stopping window.
+        self.active_gate_query_epoch = None;
+        self.gate_query_in_flight = false;
         self.cancelling = true;
         self.thinking = true;
         self.thinking_started = Some(std::time::Instant::now());
@@ -9553,6 +12187,7 @@ impl App {
         // that predates the build.
         self.host_chat_session_active = false;
         self.chat_session_id = None;
+        self.chat_resume_identity = None;
         self.maybe_suggest_design();
         self.push_preflight(requirement);
     }
@@ -9576,6 +12211,16 @@ impl App {
             // is not handed to the base as a chat turn.
             return Some(Action::None);
         }
+        // A bang command can mutate the same workspace as the base. Keep it on
+        // the single-writer boundary instead of running a second shell beside an
+        // active/paused task.
+        if self.has_interruptible_work() || self.thinking || self.cancelling {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
+            );
+            return Some(Action::None);
+        }
         let (ok, output) = run_bang_command(&self.project_root, cmd, self.lang);
         self.push_shell_row(cmd, ok, output);
         Some(Action::None)
@@ -9594,10 +12239,12 @@ impl App {
         self.history.push_back(ChatMessage {
             role: ChatRole::Host,
             kind: MessageBody::Tool(ToolCall {
+                call_id: None,
                 name: "Bash".to_string(),
                 arg,
                 status: if ok { ToolStatus::Ok } else { ToolStatus::Fail },
                 result: (!output.trim().is_empty()).then_some(output),
+                progress: None,
                 merged: false,
                 count: 1,
                 collapsed: ok,
@@ -9607,6 +12254,52 @@ impl App {
         while self.history.len() > HISTORY_CAP {
             self.history.pop_front();
         }
+    }
+
+    fn native_command_action(&mut self, payload: String) -> Action {
+        if self
+            .backend
+            .as_deref()
+            .is_none_or(|backend| !crate::FIRST_CLASS_BACKEND_IDS.contains(&backend))
+        {
+            self.push(
+                ChatRole::System,
+                "[warn] 当前没有可接收原生命令的底座 / no active base can receive a native command",
+            );
+            return Action::None;
+        }
+        if self.cancelling {
+            self.restore_submitted_turn(SubmittedTurn::text(payload));
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "status.stopping"),
+            );
+            return Action::None;
+        }
+        if self.thinking || self.has_interruptible_work() || self.gate_query_in_flight {
+            self.queue_native_command(payload);
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, "chat.queued"));
+            self.refresh_status();
+            return Action::None;
+        }
+        self.record_user_turn(&payload);
+        self.last_dispatched_chat = None;
+        self.thinking = true;
+        self.thinking_started = Some(std::time::Instant::now());
+        self.last_output_at = None;
+        self.tool_in_progress = false;
+        self.refresh_status();
+        Action::NativeCommand(payload)
+    }
+
+    fn slash_base(&mut self, raw: &str) -> Action {
+        let suffix = raw.get("/base".len()..).unwrap_or("");
+        let payload = suffix.trim_start_matches(char::is_whitespace);
+        if !payload.starts_with('/') {
+            self.push(ChatRole::System, "usage: /base /<command> [args]");
+            return Action::None;
+        }
+        self.native_command_action(payload.to_string())
     }
 
     /// `Some(action)` if `raw` was a recognised slash command; `None`
@@ -9621,13 +12314,53 @@ impl App {
         self.push(ChatRole::You, raw.to_string());
         // Resolve aliases CENTRALLY against the registry first, so the dispatch
         // arms below only ever key on canonical names (e.g. `/q`, `/exit` →
-        // `quit`; `/abort` → `cancel`; `/语言` → `lang`). An unknown verb (a
-        // dynamic per-backend id, or a typo) passes through unchanged to the `_`
-        // fallback. The `commands_and_dispatch_are_in_lockstep` test parses the
+        // `quit`; `/abort` → `cancel`; `/语言` → `lang`). An unknown verb passes
+        // through unchanged to the `_` fallback. The
+        // `commands_and_dispatch_are_in_lockstep` test parses the
         // arm literals between the COMMAND-DISPATCH sentinels and locks them
         // against [`COMMANDS`](Self::COMMANDS) so no arm can drift from the
         // registry that the palette + help also read.
-        let canonical = Self::resolve_command(&verb).map_or(verb.as_str(), |c| c.name);
+        let resolved = Self::resolve_command(&verb);
+        let canonical = resolved.map_or(verb.as_str(), |c| c.name);
+        // Product commands always win. Only a verb absent from the static
+        // registry may use the current base's replacement catalog directly.
+        if resolved.is_none() && self.advertised_base_command(&verb) {
+            return Some(self.native_command_action(raw.to_string()));
+        }
+        if self.cancelling && !matches!(canonical, "quit" | "base") {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "status.stopping"),
+            );
+            self.refresh_status();
+            return Some(Action::None);
+        }
+        // A query at a parked Director gate owns the sole async task slot. Do not
+        // let slash commands such as /continue, /revise, /redo, /clear, /run, or
+        // a backend switch detach that task and start a writer underneath it. The
+        // query can settle, or the user can explicitly cancel/quit it; /help is a
+        // harmless local overlay and remains available.
+        if self.gate_query_in_flight && !matches!(canonical, "cancel" | "quit" | "help") {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "gate.query.busy"),
+            );
+            self.refresh_status();
+            return Some(Action::None);
+        }
+        // Commands that write project metadata, snapshot/publish the workspace,
+        // or launch an external mutation share the same single-writer boundary
+        // as the base. Read-only overlays remain available during a run.
+        if (self.has_interruptible_work() || self.thinking)
+            && matches!(canonical, "init" | "adopt" | "deploy" | "pr" | "checkpoint")
+        {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
+            );
+            self.refresh_status();
+            return Some(Action::None);
+        }
         // COMMAND-DISPATCH-START
         let action = match canonical {
             "help" => {
@@ -9640,6 +12373,10 @@ impl App {
                 Action::Quit
             }
             "clear" => {
+                if self.has_interruptible_work() || self.thinking {
+                    self.push(ChatRole::System, umadev_i18n::t(self.lang, "clear.busy"));
+                    return Some(Action::None);
+                }
                 self.history.clear();
                 self.conversation.clear();
                 // Drop the durable transcript too (a cleared chat starts a fresh
@@ -9651,8 +12388,7 @@ impl App {
                 // A cleared session starts metering from zero — the persistent
                 // token/cost gauge resets with the transcript, and the context
                 // gauge + its one-shot nudge re-arm for the fresh conversation.
-                self.session_tokens = 0;
-                self.last_turn_input_tokens = 0;
+                self.session_usage.reset();
                 self.context_nudge_shown = false;
                 self.transcript_scroll.set(0);
                 self.transcript_prev_hidden.set(0);
@@ -9676,15 +12412,22 @@ impl App {
                 self.gate_choice_sel = 0;
                 self.run_started = false;
                 self.run_started_at = None;
+                // This is a conversation boundary, not only a transcript wipe.
+                // Drop every not-yet-dispatched input and the failed-turn dedup
+                // keys so neither steering nor a stale one-shot suppression can
+                // affect the first message in the new chat.
+                self.clear_transient_routing_state();
                 // A cleared transcript means the base should start a fresh
                 // session on the next turn, not resume the old one.
                 self.host_chat_session_active = false;
                 self.chat_session_id = None;
+                self.chat_resume_identity = None;
                 self.run_session_handed_to_chat = false;
                 // The RESIDENT chat session held by the event loop predates the
                 // cleared conversation — flag it for close so the next turn opens a
                 // fresh one instead of carrying the old dialogue's live process.
                 self.chat_session_dirty = true;
+                self.reset_base_session_state();
                 // Wave 5 / G11: `/clear` starts a FRESH persistent chat — mint a new
                 // id so the prior saved chat stays on disk (resumable via /resume)
                 // and the next turn persists under the new id.
@@ -9703,7 +12446,10 @@ impl App {
             "claude" => self.slash_backend(Some("claude-code")),
             "codex" => self.slash_backend(Some("codex")),
             "opencode" => self.slash_backend(Some("opencode")),
+            "grok" => self.slash_backend(Some("grok-build")),
+            "kimi" => self.slash_backend(Some("kimi-code")),
             "offline" => self.slash_backend(None),
+            "base" => self.slash_base(raw),
             "init" => {
                 let slug = if self.slug.is_empty() {
                     self.project_root
@@ -9714,66 +12460,56 @@ impl App {
                 } else {
                     self.slug.clone()
                 };
-                let manifest = umadev_agent::SpecManifest::new(&slug);
-                match manifest.write_to(&self.project_root, false) {
-                    Ok(path) => {
-                        let ds_count = self.scaffold_design_files();
-                        let ds_msg = if ds_count > 0 {
-                            umadev_i18n::tf(
-                                self.lang,
-                                "init.design_files",
-                                &[&ds_count.to_string()],
-                            )
-                        } else {
-                            String::new()
-                        };
-                        self.push(
-                            ChatRole::UmaDev,
-                            umadev_i18n::tf(
-                                self.lang,
-                                "init.manifest_written",
-                                &[
-                                    &path.display().to_string(),
-                                    manifest.level.as_str(),
-                                    manifest.profile.as_str(),
-                                    &slug,
-                                    &ds_msg,
-                                ],
-                            ),
-                        );
+                match umadev_agent::initialize_project(
+                    &self.project_root,
+                    &umadev_agent::ProjectInitOptions::new(slug),
+                ) {
+                    Ok(report) => {
+                        self.slug = report.effective_slug();
+                        self.push(ChatRole::UmaDev, report.render_summary(self.lang));
+                        self.refresh_status();
+                        return Some(Action::WorkspaceInitialized);
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let ds_count = self.scaffold_design_files();
-                        let ds_msg = if ds_count > 0 {
-                            umadev_i18n::tf(
-                                self.lang,
-                                "init.design_files_new",
-                                &[&ds_count.to_string()],
-                            )
-                        } else {
-                            umadev_i18n::t(self.lang, "init.already_exists").to_string()
-                        };
-                        self.push(ChatRole::System, ds_msg);
-                    }
-                    Err(e) => self.push(
+                    Err(error) => self.push(
                         ChatRole::System,
-                        umadev_i18n::tf(self.lang, "init.failed", &[&e.to_string()]),
+                        umadev_i18n::tf(self.lang, "init.failed", &[&error.to_string()]),
                     ),
                 }
                 Action::None
             }
             "continue" => {
-                if let Some(gate) = self.active_gate.take() {
+                // Plan may collect clarification, but it must never approve the
+                // docs/preview execution boundary or resume a mutating Director.
+                // Check before `take()` so the gate remains open and recoverable
+                // after the user switches to guarded/auto.
+                if self.effective_trust_mode() == umadev_agent::TrustMode::Plan
+                    && matches!(
+                        self.active_gate,
+                        Some(Gate::DocsConfirm | Gate::PreviewConfirm)
+                    )
+                {
+                    self.reject_director_execution_in_plan();
+                    Action::None
+                } else if let Some(gate) = self.active_gate.take() {
                     self.push(
                         ChatRole::UmaDev,
                         umadev_i18n::tf(self.lang, "slash.gate_approved", &[gate.id_str()]),
                     );
                     self.record_trust_pass(gate.id_str());
                     Action::Continue(gate)
+                } else if self.has_interruptible_work() || self.thinking {
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::t(self.lang, "continue.running"),
+                    );
+                    Action::None
                 } else if !self.run_started
                     && !self.finished
                     && umadev_agent::has_resumable_run(&self.project_root)
                 {
+                    if self.reject_director_execution_in_plan() {
+                        return Some(Action::None);
+                    }
                     // Fresh session (no in-memory gate, no in-flight run) but the
                     // previous `/run` left a resumable director-loop run on disk —
                     // RE-ATTACH to the saved plan and drive only the remaining steps
@@ -9872,6 +12608,7 @@ impl App {
             "manual" => self.slash_set_review_mode(false),
             "auto" => self.slash_set_review_mode(true),
             "mode" => self.slash_mode(rest),
+            "thinking" => self.slash_thinking(rest),
             "sandbox" => self.slash_sandbox(rest),
             "lang" => self.slash_lang(rest),
             "setup" | "guide" => self.slash_setup(),
@@ -9922,7 +12659,8 @@ impl App {
                 Action::None
             }
             "pitfalls" => {
-                let body = umadev_agent::pitfall_overview(&self.project_root);
+                let report = umadev_agent::lessons_report(&self.project_root);
+                let body = format_pitfalls_report(self.lang, &report);
                 self.overlay = Some(Overlay::from_body(
                     umadev_i18n::t(self.lang, "pitfalls.overlay_title"),
                     &body,
@@ -9930,6 +12668,7 @@ impl App {
                 Action::None
             }
             "lessons" => self.slash_lessons(),
+            "memory" => self.slash_memory(rest),
             "team" => self.slash_team(rest),
             "constitution" => self.slash_constitution(),
             "mcp" => {
@@ -9969,7 +12708,7 @@ impl App {
                 // stop a streaming agentic subprocess — only Ctrl-C could. Mirror the
                 // Ctrl-C path, which already routes both to `Action::Cancel` (the
                 // event loop aborts `run_task`; `cancel_run` clears the flags).
-                if self.is_pipeline_active() || self.agentic_in_flight {
+                if self.has_interruptible_work() || self.thinking {
                     Action::Cancel
                 } else {
                     self.push(
@@ -9981,6 +12720,7 @@ impl App {
             }
             "redo" => self.slash_redo(rest),
             "tasks" => self.slash_tasks(rest),
+            "processes" => self.slash_processes(rest),
             "checkpoint" => self.slash_checkpoint(rest),
             "rewind" => self.slash_rewind(rest),
             "config" => {
@@ -9997,14 +12737,6 @@ impl App {
             }
             // COMMAND-DISPATCH-END
             _ => {
-                // Dynamic backend verbs: only a verb that resolves to a REAL
-                // registered driver switches the worker. (Never special-case a
-                // name that `driver_for` can't build — committing an unbuildable
-                // backend id to config leaves the next run permanently broken.)
-                // Keeps the TUI in lock-step with umadev-host's BACKEND_IDS.
-                if umadev_host::driver_for(&verb).is_some() {
-                    return Some(self.slash_backend(Some(&verb)));
-                }
                 let hint = Self::did_you_mean(&verb)
                     .map(|s| umadev_i18n::tf(self.lang, "slash.did_you_mean", &[s]))
                     .unwrap_or_default();
@@ -10029,20 +12761,10 @@ impl App {
         if let Some(c) = Self::COMMANDS.iter().find(|c| c.name.starts_with(typed)) {
             return Some(c.name);
         }
-        // Also consider the dynamic backend verbs (goose, amp, junie, …).
-        if let Some((verb, _)) = backend_palette_verbs()
-            .iter()
-            .find(|(v, _)| v.starts_with(typed))
-        {
-            return Some(verb);
-        }
-        // Otherwise Levenshtein ≤ 2 against known verbs (registry + dynamic).
+        // Otherwise Levenshtein ≤ 2 against known registry verbs.
         let typed_lower = typed.to_ascii_lowercase();
         let (mut best, mut best_dist) = (None, usize::MAX);
-        let all_verbs = Self::COMMANDS
-            .iter()
-            .map(|c| c.name)
-            .chain(backend_palette_verbs().iter().map(|(v, _)| *v));
+        let all_verbs = Self::COMMANDS.iter().map(|c| c.name);
         for verb in all_verbs {
             let d = lev(&typed_lower, verb);
             if d < best_dist && d <= 2 {
@@ -10086,7 +12808,7 @@ impl App {
         // chat's conversation + session while an in-flight build/turn still streams — the
         // finishing turn then overwrites the resumed session's holder (orphaning a base
         // subprocess with no end()) and appends its reply into the WRONG chat's transcript.
-        if self.is_pipeline_active() || self.agentic_in_flight {
+        if self.has_interruptible_work() || self.thinking {
             self.push(
                 ChatRole::System,
                 umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
@@ -10134,7 +12856,7 @@ impl App {
     fn slash_compact(&mut self) -> Action {
         // Refuse mid-run / mid-turn for consistency with /resume + /backend: a compaction
         // that folds the transcript while a turn is streaming races the generation guard.
-        if self.is_pipeline_active() || self.agentic_in_flight {
+        if self.has_interruptible_work() || self.thinking {
             self.push(
                 ChatRole::System,
                 umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
@@ -10181,7 +12903,7 @@ impl App {
         // OLD-base session — racing the preload into either a leaked/dropped session
         // (never `end()`ed) or a holder pinned to the OLD base while config/UI claim
         // the new one. Guard on both, mirroring the `/cancel` arm.
-        if self.is_pipeline_active() || self.agentic_in_flight {
+        if self.has_interruptible_work() || self.thinking {
             self.push(
                 ChatRole::System,
                 umadev_i18n::t(self.lang, "backend.busy_no_switch"),
@@ -10468,6 +13190,27 @@ impl App {
         }
     }
 
+    /// Refuse an explicit Director execution command while the session is in
+    /// Plan mode. Returns `true` when the command was consumed. This check lives
+    /// on the UI thread so `/run`, `/goal`, and cross-session resume settle before
+    /// task registration, run-lock/branch setup, workflow persistence, or host
+    /// session creation. Ordinary conversation remains available for read-only
+    /// research and planning.
+    fn reject_director_execution_in_plan(&mut self) -> bool {
+        if self.effective_trust_mode() != umadev_agent::TrustMode::Plan {
+            return false;
+        }
+        self.push(
+            ChatRole::UmaDev,
+            umadev_i18n::t(self.lang, "continuous.plan_mode_skip").to_string(),
+        );
+        self.push(
+            ChatRole::UmaDev,
+            umadev_i18n::t(self.lang, "mode.plan.gate").to_string(),
+        );
+        true
+    }
+
     fn slash_run(&mut self, arg: &str) -> Action {
         // Single-writer guard: only ONE workspace-mutating run at a time. A second
         // `/run` while one is live is politely rejected (never silently starts a
@@ -10483,6 +13226,9 @@ impl App {
         }
         if arg.is_empty() {
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.usage"));
+            return Action::None;
+        }
+        if self.reject_director_execution_in_plan() {
             return Action::None;
         }
         // The first token is the optional run SLUG only when it UNAMBIGUOUSLY looks
@@ -10521,79 +13267,6 @@ impl App {
         Action::StartRun(req)
     }
 
-    /// `/tasks [stop|resume]` — the background-run management surface.
-    ///
-    /// - bare `/tasks` lists the live run (if any) plus a short history of recent
-    ///   finished/stopped runs with their status + `X/Y` progress + elapsed.
-    /// - `/tasks stop` cancels the live run (reuses the canonical `/cancel`
-    ///   path → [`Action::Cancel`], so the single-writer drain/cleanup is
-    ///   identical; the task settles to `Stopped`).
-    /// - `/tasks resume` re-attaches to a persisted, resumable run (reuses the
-    ///   `/continue` resume path → [`Action::ResumeRun`]).
-    ///
-    /// Fail-open: an unknown subcommand shows usage; stop/resume with nothing to
-    /// act on report it instead of erroring.
-    fn slash_tasks(&mut self, arg: &str) -> Action {
-        let sub = arg
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        match sub.as_str() {
-            "" => {
-                let body = self.render_tasks();
-                self.push(ChatRole::System, body);
-                Action::None
-            }
-            "stop" | "cancel" => {
-                // Reuse the canonical interrupt path so the run-lock drain +
-                // cleanup are byte-for-byte the cancel behaviour (the event loop
-                // aborts the run task; `cancel_run` settles the task to Stopped).
-                if self.has_active_run() {
-                    Action::Cancel
-                } else {
-                    self.push(
-                        ChatRole::System,
-                        umadev_i18n::t(self.lang, "tasks.none_active"),
-                    );
-                    Action::None
-                }
-            }
-            "resume" | "continue" => {
-                if self.has_active_run() {
-                    // A run is already live — resuming would be a second writer.
-                    self.push(
-                        ChatRole::System,
-                        umadev_i18n::t(self.lang, "tasks.already_running"),
-                    );
-                    Action::None
-                } else if !self.finished && umadev_agent::has_resumable_run(&self.project_root) {
-                    // Re-attach to the persisted plan + drive the remaining steps
-                    // (the same RESUME the `/continue` cross-session path uses).
-                    let req = self.resume_run_requirement();
-                    // Same continuity affordance as `/continue`: the earlier steps
-                    // stay in scrollback, this divider marks where the run resumes.
-                    self.push_resume_separator();
-                    self.push(
-                        ChatRole::UmaDev,
-                        umadev_i18n::t(self.lang, "continue.resuming"),
-                    );
-                    Action::ResumeRun(req)
-                } else {
-                    self.push(
-                        ChatRole::System,
-                        umadev_i18n::t(self.lang, "tasks.nothing_to_resume"),
-                    );
-                    Action::None
-                }
-            }
-            _ => {
-                self.push(ChatRole::System, umadev_i18n::t(self.lang, "tasks.usage"));
-                Action::None
-            }
-        }
-    }
-
     /// `/goal <objective>` — start a GOAL-DRIVEN director build: drive the borrowed
     /// brain toward `<objective>` until it's met (Claude Code's native persistent
     /// `/goal` mode on a capable base; a "don't stop early" prompt fallback on the
@@ -10616,6 +13289,9 @@ impl App {
         let objective = arg.trim();
         if objective.is_empty() {
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "goal.usage"));
+            return Action::None;
+        }
+        if self.reject_director_execution_in_plan() {
             return Action::None;
         }
         let objective = objective.to_string();
@@ -10858,6 +13534,340 @@ impl App {
                 ],
             ),
         );
+    }
+
+    fn open_memory_overlay(&mut self, title_key: &str, body: &str) {
+        self.overlay = Some(Overlay::from_body(
+            umadev_i18n::t(self.lang, title_key),
+            body,
+        ));
+    }
+
+    fn push_memory_failure(&mut self, error: &dyn std::fmt::Display) {
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(self.lang, "memory.operation_failed", &[&error.to_string()]),
+        );
+    }
+
+    fn slash_memory(&mut self, rest: &str) -> Action {
+        let command = match parse_memory_command(rest) {
+            Ok(command) => command,
+            Err(error) => {
+                let body = format!(
+                    "{}\n\n{}",
+                    format_memory_parse_error(self.lang, &error),
+                    umadev_i18n::t(self.lang, "memory.usage")
+                );
+                self.open_memory_overlay("memory.usage_title", &body);
+                return Action::None;
+            }
+        };
+        if command.mutates() && (self.has_interruptible_work() || self.thinking) {
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, "memory.busy"));
+            return Action::None;
+        }
+        self.execute_memory_command(command);
+        Action::None
+    }
+
+    fn execute_memory_command(&mut self, command: MemoryTuiCommand) {
+        use umadev_agent::memory_control::{self, MemoryScope, MemoryStore};
+
+        match command {
+            MemoryTuiCommand::Inventory { scope } => {
+                let mut sections = Vec::new();
+                for selected in scope.scopes() {
+                    sections.push(format_memory_inventory(
+                        self.lang,
+                        &memory_control::inventory(&self.project_root, *selected),
+                        *selected,
+                        false,
+                        None,
+                    ));
+                }
+                self.open_memory_overlay("memory.overlay_title", &sections.join("\n\n"));
+            }
+            MemoryTuiCommand::RetentionView { scope, store } => {
+                let mut sections = Vec::new();
+                for selected in scope.scopes() {
+                    sections.push(format_memory_inventory(
+                        self.lang,
+                        &memory_control::inventory(&self.project_root, *selected),
+                        *selected,
+                        true,
+                        store,
+                    ));
+                }
+                self.open_memory_overlay("memory.overlay_title", &sections.join("\n\n"));
+            }
+            MemoryTuiCommand::Capture {
+                scope,
+                selector,
+                enabled,
+            } => {
+                let selected = selector.map(|selector| selector.capture_stores(scope));
+                let result = selected.as_ref().map_or_else(
+                    || memory_control::update_capture(&self.project_root, scope, None, enabled),
+                    |stores| {
+                        memory_control::update_capture_stores(
+                            &self.project_root,
+                            scope,
+                            stores,
+                            enabled,
+                        )
+                    },
+                );
+                match result {
+                    Ok(()) => {
+                        let stores = selected.as_ref().map_or_else(
+                            || {
+                                umadev_i18n::t(self.lang, "memory.stores.all_configurable")
+                                    .to_string()
+                            },
+                            |stores| memory_store_summary(self.lang, stores),
+                        );
+                        self.push(
+                            ChatRole::System,
+                            umadev_i18n::tf(
+                                self.lang,
+                                "memory.capture_ok",
+                                &[
+                                    memory_state_label(self.lang, Some(enabled)),
+                                    scope.id(),
+                                    &stores,
+                                ],
+                            ),
+                        );
+                    }
+                    Err(error) => self.push_memory_failure(&error),
+                }
+            }
+            MemoryTuiCommand::Recall {
+                scope,
+                selector,
+                enabled,
+            } => {
+                let selected = selector.map(|selector| selector.recall_stores(scope));
+                let affects_input_history = scope == MemoryScope::Project
+                    && selected
+                        .as_ref()
+                        .is_none_or(|stores| stores.contains(&MemoryStore::InputHistory));
+                let result = selected.as_ref().map_or_else(
+                    || memory_control::update_recall(&self.project_root, scope, None, enabled),
+                    |stores| {
+                        memory_control::update_recall_stores(
+                            &self.project_root,
+                            scope,
+                            stores,
+                            enabled,
+                        )
+                    },
+                );
+                match result {
+                    Ok(()) => {
+                        if affects_input_history {
+                            self.input_history.clear();
+                            self.input_history_idx = None;
+                            self.input_history_draft = None;
+                            self.load_history();
+                        }
+                        let stores = selected.as_ref().map_or_else(
+                            || {
+                                umadev_i18n::t(self.lang, "memory.stores.all_configurable")
+                                    .to_string()
+                            },
+                            |stores| memory_store_summary(self.lang, stores),
+                        );
+                        self.push(
+                            ChatRole::System,
+                            umadev_i18n::tf(
+                                self.lang,
+                                "memory.recall_ok",
+                                &[
+                                    memory_state_label(self.lang, Some(enabled)),
+                                    scope.id(),
+                                    &stores,
+                                ],
+                            ),
+                        );
+                    }
+                    Err(error) => self.push_memory_failure(&error),
+                }
+            }
+            MemoryTuiCommand::RetentionSet { scope, store, days } => {
+                match memory_control::update_retention(&self.project_root, scope, store, Some(days))
+                {
+                    Ok(()) => self.push(
+                        ChatRole::System,
+                        umadev_i18n::tf(
+                            self.lang,
+                            "memory.retention_set_ok",
+                            &[scope.id(), store.id(), &days.to_string()],
+                        ),
+                    ),
+                    Err(error) => self.push_memory_failure(&error),
+                }
+            }
+            MemoryTuiCommand::RetentionClear { scope, store } => {
+                match memory_control::update_retention(&self.project_root, scope, store, None) {
+                    Ok(()) => self.push(
+                        ChatRole::System,
+                        umadev_i18n::tf(
+                            self.lang,
+                            "memory.retention_clear_ok",
+                            &[scope.id(), store.id()],
+                        ),
+                    ),
+                    Err(error) => self.push_memory_failure(&error),
+                }
+            }
+            MemoryTuiCommand::RetentionRun {
+                scope,
+                store,
+                confirmed,
+            } => {
+                if !confirmed {
+                    let body = umadev_i18n::tf(
+                        self.lang,
+                        "memory.retention_preview",
+                        &[scope.id(), store.id()],
+                    );
+                    self.open_memory_overlay("memory.confirm_title", &body);
+                    return;
+                }
+                match memory_control::enforce_retention(&self.project_root, scope, store) {
+                    Ok(report) => {
+                        let days = report.retention_days.map_or_else(
+                            || umadev_i18n::t(self.lang, "common.none").to_string(),
+                            |days| days.to_string(),
+                        );
+                        self.push(
+                            ChatRole::System,
+                            umadev_i18n::tf(
+                                self.lang,
+                                "memory.retention_run_ok",
+                                &[
+                                    scope.id(),
+                                    report.store.id(),
+                                    &days,
+                                    &report.scanned_files.to_string(),
+                                    &report.forgotten_files.to_string(),
+                                    &report.bytes.to_string(),
+                                    report.tombstone_id.as_deref().unwrap_or("none"),
+                                ],
+                            ),
+                        );
+                    }
+                    Err(error) => self.push_memory_failure(&error),
+                }
+            }
+            MemoryTuiCommand::Export {
+                scope,
+                selector,
+                destination,
+                confirmed,
+            } => {
+                let stores = selector.stores(scope);
+                if stores.is_empty() {
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::t(self.lang, "memory.no_stores"),
+                    );
+                    return;
+                }
+                let store_summary = memory_store_summary(self.lang, &stores);
+                if !confirmed {
+                    let body = umadev_i18n::tf(
+                        self.lang,
+                        "memory.export_preview",
+                        &[
+                            scope.id(),
+                            &store_summary,
+                            &destination.display().to_string(),
+                        ],
+                    );
+                    self.open_memory_overlay("memory.confirm_title", &body);
+                    return;
+                }
+                match memory_control::export(&self.project_root, scope, &stores, &destination, true)
+                {
+                    Ok(report) => self.push(
+                        ChatRole::System,
+                        umadev_i18n::tf(
+                            self.lang,
+                            "memory.export_ok",
+                            &[
+                                scope.id(),
+                                &report.files.to_string(),
+                                &report.bytes.to_string(),
+                                &report.destination.display().to_string(),
+                            ],
+                        ),
+                    ),
+                    Err(error) => self.push_memory_failure(&error),
+                }
+            }
+            MemoryTuiCommand::Forget {
+                scope,
+                selector,
+                confirmed,
+            } => {
+                let stores = selector.forget_stores(scope);
+                if stores.is_empty() {
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::t(self.lang, "memory.no_stores"),
+                    );
+                    return;
+                }
+                let store_summary = memory_store_summary(self.lang, &stores);
+                if !confirmed {
+                    let body = umadev_i18n::tf(
+                        self.lang,
+                        "memory.forget_preview",
+                        &[scope.id(), &store_summary],
+                    );
+                    self.open_memory_overlay("memory.confirm_title", &body);
+                    return;
+                }
+                match memory_control::forget(&self.project_root, scope, &stores, true) {
+                    Ok(report) => self.push(
+                        ChatRole::System,
+                        umadev_i18n::tf(
+                            self.lang,
+                            "memory.forget_ok",
+                            &[
+                                scope.id(),
+                                &report.files.to_string(),
+                                &report.bytes.to_string(),
+                                report.tombstone_id.as_deref().unwrap_or("none"),
+                            ],
+                        ),
+                    ),
+                    Err(error) => self.push_memory_failure(&error),
+                }
+            }
+            MemoryTuiCommand::ClearCache { store, confirmed } => {
+                if !confirmed {
+                    let body =
+                        umadev_i18n::tf(self.lang, "memory.clear_cache_preview", &[store.id()]);
+                    self.open_memory_overlay("memory.confirm_title", &body);
+                    return;
+                }
+                match memory_control::clear_derived_cache(&self.project_root, store) {
+                    Ok((files, bytes)) => self.push(
+                        ChatRole::System,
+                        umadev_i18n::tf(
+                            self.lang,
+                            "memory.clear_cache_ok",
+                            &[store.id(), &files.to_string(), &bytes.to_string()],
+                        ),
+                    ),
+                    Err(error) => self.push_memory_failure(&error),
+                }
+            }
+        }
     }
 
     /// Run a `umadev` CLI subcommand and return its stdout output.
@@ -11406,7 +14416,7 @@ impl App {
     /// scratch (the original behaviour). With a phase name, re-run just that ONE
     /// phase using the prior run's context (e.g. recover a base-offline degrade).
     fn slash_redo(&mut self, arg: &str) -> Action {
-        if self.is_pipeline_active() {
+        if self.has_interruptible_work() || self.thinking {
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "redo.busy"));
             return Action::None;
         }
@@ -11529,7 +14539,8 @@ impl App {
         }
 
         body.push_str("\n## How to change\n\n");
-        body.push_str("  /claude /codex /opencode      switch base CLI (or /offline)\n");
+        body.push_str("  /claude /codex /opencode /grok /kimi\n");
+        body.push_str("                                  switch base CLI (or /offline)\n");
         body.push_str(
             "  (model)                       set it in the base — UmaDev never overrides it\n",
         );
@@ -11539,109 +14550,6 @@ impl App {
         body.push_str("  /run <slug> <req>             set slug + requirement\n");
         body.push_str("  edit .umadevrc               project-level overrides\n");
         self.overlay = Some(Overlay::from_body(" config — Esc close ", &body));
-    }
-
-    fn scaffold_design_files(&self) -> usize {
-        let files: &[(&str, &str)] = &[
-            (
-                "knowledge/design-systems/modern-minimal.md",
-                include_str!("../../../knowledge/design-systems/modern-minimal.md"),
-            ),
-            (
-                "knowledge/design-systems/editorial-clean.md",
-                include_str!("../../../knowledge/design-systems/editorial-clean.md"),
-            ),
-            (
-                "knowledge/design-systems/tech-utility.md",
-                include_str!("../../../knowledge/design-systems/tech-utility.md"),
-            ),
-            (
-                "knowledge/design-systems/soft-warm.md",
-                include_str!("../../../knowledge/design-systems/soft-warm.md"),
-            ),
-            (
-                "knowledge/design-systems/bold-geometric.md",
-                include_str!("../../../knowledge/design-systems/bold-geometric.md"),
-            ),
-            (
-                "knowledge/design-systems/00-craft-rules.md",
-                include_str!("../../../knowledge/design-systems/00-craft-rules.md"),
-            ),
-            (
-                "knowledge/seed-templates/saas-landing.md",
-                include_str!("../../../knowledge/seed-templates/saas-landing.md"),
-            ),
-            (
-                "knowledge/seed-templates/dashboard.md",
-                include_str!("../../../knowledge/seed-templates/dashboard.md"),
-            ),
-            (
-                "knowledge/seed-templates/blog-content.md",
-                include_str!("../../../knowledge/seed-templates/blog-content.md"),
-            ),
-            (
-                "knowledge/seed-templates/e-commerce.md",
-                include_str!("../../../knowledge/seed-templates/e-commerce.md"),
-            ),
-            (
-                "knowledge/seed-templates/auth-system.md",
-                include_str!("../../../knowledge/seed-templates/auth-system.md"),
-            ),
-            (
-                "knowledge/seed-templates/settings-page.md",
-                include_str!("../../../knowledge/seed-templates/settings-page.md"),
-            ),
-            (
-                "knowledge/seed-templates/docs-site.md",
-                include_str!("../../../knowledge/seed-templates/docs-site.md"),
-            ),
-            (
-                "knowledge/experts/product-manager/methodology.md",
-                include_str!("../../../knowledge/experts/product-manager/methodology.md"),
-            ),
-            (
-                "knowledge/experts/architect/api-design.md",
-                include_str!("../../../knowledge/experts/architect/api-design.md"),
-            ),
-            (
-                "knowledge/experts/architect/security.md",
-                include_str!("../../../knowledge/experts/architect/security.md"),
-            ),
-            (
-                "knowledge/experts/frontend-lead/methodology.md",
-                include_str!("../../../knowledge/experts/frontend-lead/methodology.md"),
-            ),
-            (
-                "knowledge/experts/backend-lead/methodology.md",
-                include_str!("../../../knowledge/experts/backend-lead/methodology.md"),
-            ),
-            (
-                "knowledge/experts/qa-lead/test-strategy.md",
-                include_str!("../../../knowledge/experts/qa-lead/test-strategy.md"),
-            ),
-            (
-                "knowledge/experts/uiux-designer/methodology.md",
-                include_str!("../../../knowledge/experts/uiux-designer/methodology.md"),
-            ),
-            (
-                "knowledge/experts/devops/methodology.md",
-                include_str!("../../../knowledge/experts/devops/methodology.md"),
-            ),
-        ];
-        let mut count = 0;
-        for (rel, content) in files {
-            let target = self.project_root.join(rel);
-            if target.exists() {
-                continue;
-            }
-            if let Some(parent) = target.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if std::fs::write(&target, content).is_ok() {
-                count += 1;
-            }
-        }
-        count
     }
 
     fn open_runs_overlay(&mut self) {
@@ -11740,7 +14648,18 @@ impl App {
                 self.backend_label
             )),
         }
-        if let Some(b) = self.backend.as_deref() {
+        if let Some(enabled) = self.base_session_thinking {
+            let locked = if enabled {
+                !self.base_session_thinking_can_disable
+            } else {
+                !self.base_session_thinking_can_enable
+            };
+            body.push_str(&format!(
+                "thinking     {}{} (reported by the base)\n",
+                if enabled { "on" } else { "off" },
+                if locked { " · model-locked" } else { "" }
+            ));
+        } else if let Some(b) = self.backend.as_deref() {
             if !b.is_empty() && b != "offline" {
                 if let Some(r) = crate::detect_base_reasoning(b, &self.project_root) {
                     body.push_str(&format!("reasoning    {r} (from {b}, not overridden)\n"));
@@ -12182,20 +15101,13 @@ impl App {
     fn commit_backend(&mut self, backend: Option<String>) {
         self.backend.clone_from(&backend);
         self.backend_label = backend.clone().unwrap_or_else(|| "offline".to_string());
-        self.base_model = backend
-            .as_deref()
-            .filter(|b| !b.is_empty() && *b != "offline")
-            .and_then(|b| crate::detect_base_model(b, &self.project_root));
-        self.base_model_live = false;
-        self.base_context_window = backend
-            .as_deref()
-            .filter(|b| !b.is_empty() && *b != "offline")
-            .and_then(|b| crate::detect_base_context_window(b, &self.project_root));
+        self.reset_base_session_state();
         self.config.backend = Some(self.backend_label.clone());
         // A different base means a different session — don't resume the old
         // base's conversation into the new one.
         self.host_chat_session_active = false;
         self.chat_session_id = None;
+        self.chat_resume_identity = None;
         // Persist; failures only surface as a system message so the TUI
         // never panics on config save errors.
         if let Err(e) = crate::config::save_to(&self.config, &self.config_path) {
@@ -12716,18 +15628,9 @@ impl App {
         Action::RunDeploy { command: cmd }
     }
 
-    /// `/animations` — toggle spinner animation on/off (accessibility).
-    /// When off, the spinner shows a static `…` instead of braille dots.
-    /// `/manual` (review = on) / `/auto` (autonomous) — flip whether the
-    /// docs/preview gates pause for review this session. The Clarify gate
-    /// always pauses regardless. Session-level override; for a permanent
-    /// default set `auto_approve_gates` in `.umadevrc`.
-    /// Shift+Tab cycles the full trust/autonomy tier Plan → Guarded → Auto →
-    /// Plan (Claude-Code style), so the Plan tier is reachable from the keyboard
-    /// — it used to flip only Auto <-> Guarded, leaving Plan reachable only via
-    /// `/mode plan`. Plan = read-only research + plan; Guarded (default) = pause
-    /// at every gate; Auto = run end-to-end. The current tier shows in the prompt
-    /// meta row; a brief confirmation line names the new tier.
+    /// Toggle animations, or cycle the trust tier with Shift+Tab:
+    /// Plan (read-only) → Guarded (approval-gated) → Auto → Plan.
+    /// `/manual` and `/auto` select the corresponding execution tier directly.
     pub fn cycle_approval_mode(&mut self) {
         use umadev_agent::TrustMode;
         let next = match self.effective_trust_mode() {
@@ -12735,6 +15638,14 @@ impl App {
             TrustMode::Guarded => TrustMode::Auto,
             TrustMode::Auto => TrustMode::Plan,
         };
+        // A live writer can lose authority only at a cancel/rebuild boundary.
+        if next == TrustMode::Plan && (self.has_interruptible_work() || self.thinking) {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
+            );
+            return;
+        }
         self.set_trust_mode(next);
         self.push(
             ChatRole::UmaDev,
@@ -12802,6 +15713,15 @@ impl App {
         } else {
             umadev_agent::TrustMode::Guarded
         };
+        if self.effective_trust_mode().is_downgrade_to(mode)
+            && (self.has_interruptible_work() || self.thinking)
+        {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
+            );
+            return Action::None;
+        }
         self.set_trust_mode(mode);
         let msg = if auto {
             umadev_i18n::t(self.lang, "review.auto_on")
@@ -12832,6 +15752,15 @@ impl App {
         }
         match umadev_agent::TrustMode::parse(arg) {
             Some(mode) => {
+                if self.effective_trust_mode().is_downgrade_to(mode)
+                    && (self.has_interruptible_work() || self.thinking)
+                {
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
+                    );
+                    return Action::None;
+                }
                 self.set_trust_mode(mode);
                 self.push(
                     ChatRole::UmaDev,
@@ -12848,13 +15777,99 @@ impl App {
         Action::None
     }
 
+    /// `/thinking [on|off]` — inspect or change Kimi Code's native,
+    /// model-owned thinking toggle. The change is sent as typed ACP session
+    /// configuration; it is never forwarded as chat text.
+    fn slash_thinking(&mut self, rest: &str) -> Action {
+        if self.backend.as_deref() != Some("kimi-code") {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "thinking.kimi_only"),
+            );
+            return Action::None;
+        }
+        let arg = rest.trim().to_ascii_lowercase();
+        if arg.is_empty() {
+            let state = self.base_session_thinking.map_or_else(
+                || umadev_i18n::t(self.lang, "thinking.unavailable").to_string(),
+                |enabled| {
+                    let locked = if enabled {
+                        !self.base_session_thinking_can_disable
+                    } else {
+                        !self.base_session_thinking_can_enable
+                    };
+                    umadev_i18n::tf(
+                        self.lang,
+                        if locked {
+                            "thinking.current_locked"
+                        } else {
+                            "thinking.current"
+                        },
+                        &[if enabled { "on" } else { "off" }],
+                    )
+                },
+            );
+            self.push(
+                ChatRole::System,
+                format!("{state}\n{}", umadev_i18n::t(self.lang, "thinking.usage")),
+            );
+            return Action::None;
+        }
+        let enabled = match arg.as_str() {
+            "on" | "enable" | "enabled" | "开" | "開" => true,
+            "off" | "disable" | "disabled" | "关" | "關" => false,
+            _ => {
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "thinking.usage"),
+                );
+                return Action::None;
+            }
+        };
+        if self.has_interruptible_work() || self.thinking {
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, "thinking.busy"));
+            return Action::None;
+        }
+        if let Some(current) = self.base_session_thinking {
+            if current == enabled {
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::tf(
+                        self.lang,
+                        "thinking.already",
+                        &[if enabled { "on" } else { "off" }],
+                    ),
+                );
+                return Action::None;
+            }
+            let selectable = if enabled {
+                self.base_session_thinking_can_enable
+            } else {
+                self.base_session_thinking_can_disable
+            };
+            if !selectable {
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "thinking.locked"),
+                );
+                return Action::None;
+            }
+        }
+        self.transient_status = Some(umadev_i18n::tf(
+            self.lang,
+            "thinking.changing",
+            &[if enabled { "on" } else { "off" }],
+        ));
+        Action::SetThinking(enabled)
+    }
+
     /// `/sandbox [read-only|workspace-write|danger-full-access]` — view or change
     /// the **Codex base** launch sandbox without hand-editing `.umadevrc` (or
     /// hacking `UMADEV_CODEX_SANDBOX` into a shell rc).
     ///
     /// No arg → show the CURRENT tier + the three options with a one-line WHY for
     /// each. In particular it answers the "why does network need it?" question:
-    /// `workspace-write` (the default) sandboxes the base so the NETWORK and local
+    /// `workspace-write` sandboxes the base so the NETWORK and local
     /// dev ports are blocked and `git` won't run — which is why `npm start`, a dev
     /// server, package installs and `git commit` all FAIL under it;
     /// `danger-full-access` removes the sandbox so full-stack work runs. If the
@@ -12911,6 +15926,17 @@ impl App {
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "sandbox.usage"));
             return Action::None;
         }
+        // A live turn owns the resident session. Replacing its sandbox in the
+        // middle of a tool call would race the old process and make the visible
+        // setting disagree with the work still running. Ask for an explicit
+        // cancel first; an idle/parked session is rebuilt below.
+        if is_codex && (self.has_interruptible_work() || self.thinking) {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "sandbox.busy_no_change").to_string(),
+            );
+            return Action::None;
+        }
         let mode = CodexSandbox::parse_fail_open(arg);
 
         // Apply for THIS session: publish to the codex driver's thread-safe shared
@@ -12952,19 +15978,35 @@ impl App {
                 umadev_i18n::tf(self.lang, "sandbox.persist_failed", &[&e.to_string()]),
             );
         }
-        Action::None
+        if is_codex {
+            Action::SandboxChanged
+        } else {
+            Action::None
+        }
     }
 
     /// Apply a trust tier as the session override, keeping the legacy binary
     /// `auto_approve_override` consistent so the prompt chip + any old code path
     /// reads the same state.
     fn set_trust_mode(&mut self, mode: umadev_agent::TrustMode) {
+        let changed = self.effective_trust_mode() != mode;
         self.trust_mode_override = Some(mode);
         self.auto_approve_override = Some(mode.gates_auto_approve());
-        // A `/mode` switch may also have rewritten `.umadevrc`'s
-        // `auto_approve_gates` elsewhere; drop the cache so the fallback path
-        // re-reads fresh if the session override is ever cleared.
+        // Keep a future config-derived fallback honest if this override is cleared.
         self.invalidate_trust_cache();
+        if changed {
+            // Native sessions retain launch permissions and a persisted vendor id
+            // is authority-bound to that exact profile. Rebuild at the boundary
+            // and deliberately hand the conversation over through UmaDev's durable
+            // transcript; never load the old id under the new trust tier.
+            self.chat_session_dirty = true;
+            self.chat_session_id = None;
+            self.chat_resume_identity = None;
+            self.host_chat_session_active = false;
+            self.run_session_handed_to_chat = false;
+            self.reset_base_session_state();
+            self.persist_chat();
+        }
     }
 
     /// Record that a gate passed (auto or manual) into the per-project trust
@@ -13156,15 +16198,18 @@ impl App {
     /// totals, a grand total, and a rough advisory cost estimate. Pure read of
     /// the usage log (mirrors the `umadev usage` CLI verb).
     fn slash_usage(&mut self) -> Action {
-        let body = format_usage_report(self.lang, &umadev_agent::runner::usage_report());
+        let body = crate::usage_view::format_usage_report(
+            self.lang,
+            &umadev_agent::runner::usage_report(),
+        );
         self.push(ChatRole::System, body);
         Action::None
     }
 
-    /// `/lessons` — make UmaDev's self-evolution visible: high-frequency
-    /// pitfalls, the failed fixes it now steers away from, and validated
-    /// success patterns. Pure read of `.umadev/learned/` (mirrors the
-    /// `umadev lessons` CLI verb). Shown in a scrollable overlay.
+    /// `/lessons` — show reusable rules distilled from concrete incidents and
+    /// mechanically verified outcomes. The incident ledger itself remains in
+    /// `/pitfalls`; this view never duplicates it. Pure read of
+    /// `.umadev/learned/` (mirrors the `umadev lessons` CLI verb).
     fn slash_lessons(&mut self) -> Action {
         let report = umadev_agent::lessons_report(&self.project_root);
         let body = format_lessons_report(self.lang, &report);
@@ -13466,7 +16511,7 @@ impl App {
 
     /// Arm the completion bell if it's enabled and `since` (the turn/run's start
     /// instant, captured BEFORE the settle clears it) is at least
-    /// [`BELL_MIN_ELAPSED`] in the past. A `None` start or a too-short turn arms
+    /// the internal minimum elapsed interval in the past. A `None` start or a too-short turn arms
     /// nothing — no beep on a quick turn.
     /// Mirror the shared in-flight approval pause into the app model (called by
     /// the event loop each iteration with the holder's current `(action, target)`
@@ -13909,11 +16954,11 @@ fn chars_ci_eq(a: char, b: char) -> bool {
 /// non-empty, non-italic-placeholder line under it. Returns `None` when the
 /// section is absent or only contains placeholder text (`_(…)_`).
 /// Minimal `which`: true when `program` is on PATH.
-/// Mint a fresh RFC-4122 version-4-*formatted* UUID for a chat session id.
+/// Mint a fresh RFC-4122 version-4-*formatted* logical chat-file id.
 ///
 /// Not cryptographically random — it only needs to be unique per chat session
-/// on one machine and a syntactically valid UUID (claude's `--session-id`
-/// validates the format). Entropy mixes wall-clock nanoseconds, a per-process
+/// on one machine. It is never handed to a base as native resume authority.
+/// Entropy mixes wall-clock nanoseconds, a per-process
 /// atomic counter, and the pid, so two ids minted back-to-back in the same
 /// process still differ. No external crate (UmaDev stays dependency-light).
 /// A persisted chat session (Wave 5 / G11) — the on-disk mirror of
@@ -13925,7 +16970,7 @@ pub(crate) struct ChatSession {
     /// Stable chat id (the file stem). Pairs with [`App::chat_id`].
     pub id: String,
     /// ISO-8601 UTC timestamp of the last persist — drives most-recent ordering
-    /// in `/sessions` and the launch-time "reopen most recent" pick.
+    /// in `/sessions`; launch remains fresh until the user explicitly resumes.
     #[serde(default)]
     pub updated_at: String,
     /// Backend id that produced this chat (advisory; for the listing).
@@ -13943,13 +16988,18 @@ pub(crate) struct ChatSession {
     /// id targets a base session that was never created.
     #[serde(default)]
     pub base_session_id: Option<String>,
+    /// Immutable launch/sandbox identity attached to `base_session_id`.
+    /// Missing on legacy chat files. Grok legacy or unverified identities are
+    /// deliberately not resumed; the durable transcript still restores normally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_resume_identity: Option<BaseResumeIdentity>,
     /// The conversation transcript, oldest → newest.
     pub messages: Vec<umadev_runtime::Message>,
     /// Wave 3 — the **visible display transcript**: the rendered rows the user
     /// actually saw (prose, structured tool rows, diff cards, system notes),
     /// bounded by [`HISTORY_CAP`]. Persisted alongside the base-facing
-    /// [`Self::messages`] so a relaunch REBUILDS the same screen instead of an
-    /// empty conversation (the Claude Code / opencode reopen model).
+    /// [`Self::messages`] so an explicit `/resume` rebuilds the same screen
+    /// instead of an empty conversation.
     /// `#[serde(default)]` for back-compat: an old file without the field loads
     /// as `None` and `load_chat` seeds prose rows from `messages` instead.
     /// Deserialized LENIENTLY, element-wise ([`lenient_display_rows`]): a
@@ -14031,7 +17081,8 @@ fn settle_restored_row(mut row: ChatMessage) -> ChatMessage {
 /// Precedence: an override already in effect (an external `UMADEV_CODEX_SANDBOX`
 /// launch env is seeded into that shared state on first read — advanced / CI) wins;
 /// otherwise the project's `.umadevrc` `[codex] sandbox_mode` is resolved
-/// (fail-open → `workspace-write`) and published. Returns the effective mode so
+/// (missing section → `danger-full-access`; an explicitly invalid value restricts
+/// to `workspace-write`) and published. Returns the effective mode so
 /// the caller can decide whether to warn.
 ///
 /// Uses shared state, NOT a process-env `set_var`: the driver reads it from a
@@ -14048,6 +17099,7 @@ fn resolve_and_publish_codex_sandbox(
             return CodexSandbox::parse_fail_open(&v);
         }
     }
+    let _ = umadev_agent::config::migrate_legacy_generated_codex_sandbox(project_root);
     // Otherwise publish the `.umadevrc` choice so the codex driver honors it.
     let mode = umadev_agent::config::load_project_config(project_root)
         .codex
@@ -14116,29 +17168,32 @@ pub(crate) fn message_is_collapsible(m: &ChatMessage) -> bool {
     }
 }
 
+fn claude_subagent_row(name: &str) -> Option<(&str, bool)> {
+    let tail = name.strip_prefix(CLAUDE_SUBAGENT_STEM)?;
+    if tail.is_empty() {
+        return Some(("", false));
+    }
+    let tail = tail.strip_prefix(" · ")?;
+    if tail == CLAUDE_SUBAGENT_WORKING {
+        return Some(("", true));
+    }
+    if let Some(label) = tail.strip_suffix(" · 工作中…") {
+        return Some((label, true));
+    }
+    Some((tail, false))
+}
+
+fn is_claude_subagent_result(summary: &str) -> bool {
+    summary
+        .strip_prefix(CLAUDE_SUBAGENT_STEM)
+        .is_some_and(|tail| tail.starts_with(" · "))
+}
+
 /// The headline for a merged low-signal batch row, e.g. `读取 3 个文件,搜索` /
 /// `inspected 3 items`. One localized phrase carries the live count; the count
 /// is greatest-seen so a streamed value never visibly jumps backwards.
 fn merged_batch_summary(lang: umadev_i18n::Lang, count: u32) -> String {
     umadev_i18n::tf(lang, "tui.tool.batch", &[&count.to_string()])
-}
-
-/// Fold a read-only tool's raw result into a single metric instead of dumping
-/// it: a `Grep`/`Glob` summary that mentions a count keeps `(N matches)`,
-/// otherwise the result is suppressed entirely (the merged headline already
-/// says what happened). Returns `None` when there is nothing worth a gutter
-/// line. Fail-open: any parse miss → `None`.
-fn read_only_metric(lang: umadev_i18n::Lang, name: &str, preview: &str) -> Option<String> {
-    // Pull the first integer out of the summary, if any (`3 matches`, `Found 5`).
-    let n: Option<usize> = preview
-        .split(|c: char| !c.is_ascii_digit())
-        .find_map(|s| s.parse::<usize>().ok());
-    match (name, n) {
-        ("Grep" | "Glob", Some(n)) => {
-            Some(umadev_i18n::tf(lang, "tui.tool.matches", &[&n.to_string()]))
-        }
-        _ => None,
-    }
 }
 
 /// A low-signal read-only tool whose calls may be *merged* into one transcript
@@ -14304,6 +17359,31 @@ fn now_iso8601() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Decide whether an on-disk vendor pointer may be handed to a new base process.
+///
+/// Grok's ACP `session/load` occurs after process sandbox startup, so it cannot
+/// perform the native saved-profile conflict check. Until the launch adapter
+/// reports that native preflight as satisfied, even a syntactically complete
+/// identity fails closed on every base: old chat files did not persist their
+/// launch permission profile, so an Auto-created id cannot safely be loaded in
+/// Plan/Guarded. The durable transcript remains the compatibility handoff. A
+/// present typed identity must match every immutable field; Grok additionally
+/// needs its native preflight and effective-state proof.
+fn chat_resume_identity_allows_load(
+    saved_backend: &str,
+    current_backend: &str,
+    saved: Option<&BaseResumeIdentity>,
+    requested: Option<&BaseResumeIdentity>,
+) -> bool {
+    if saved_backend != current_backend {
+        return false;
+    }
+    match (saved, requested) {
+        (Some(saved), Some(requested)) => saved.permits_resume_as(requested, false),
+        _ => false,
+    }
 }
 
 fn new_chat_session_id() -> String {
@@ -14590,79 +17670,6 @@ fn open_browser(url: &str) -> std::io::Result<()> {
     }
 }
 
-/// Slash-verb entries for every registered host backend, derived from
-/// `umadev_host::BACKEND_IDS` so the palette + did-you-mean can never
-/// drift from the driver registry. Each entry is `(id, "switch worker to <display>")`.
-///
-/// Computed once and cached in a [`OnceLock`] (the backend registry is
-/// immutable for the process lifetime), so callers get `&'static` refs
-/// without per-keystroke allocation or leaks.
-fn backend_palette_verbs() -> &'static [(&'static str, &'static str)] {
-    static CACHE: std::sync::OnceLock<Vec<(&'static str, &'static str)>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| {
-        umadev_host::BACKEND_IDS
-            .iter()
-            .map(|id| {
-                let display = umadev_host::driver_for(id)
-                    .map_or_else(|| (*id).to_string(), |d| d.display_name().to_string());
-                // Leak once at first use: the registry never changes, so the
-                // table is process-lived. This is the standard pattern for
-                // turning runtime-built data into &'static for const-shaped APIs.
-                let hint: &'static str =
-                    Box::leak(format!("switch worker to {display}").into_boxed_str());
-                (*id, hint)
-            })
-            .collect()
-    })
-}
-
-/// The fixed set of options the picker shows. Probe results refine the
-/// labels at runtime.
-fn step_items(
-    step: PickerStep,
-    _lang: umadev_i18n::Lang,
-    backends: &[BackendInfo],
-) -> Vec<PickerItem> {
-    match step {
-        // Step 1 - UI language.
-        PickerStep::Language => umadev_i18n::Lang::ALL
-            .iter()
-            .map(|&l| PickerItem {
-                backend_id: None,
-                label: l.label().to_string(),
-                ready: true,
-                detail: l.code().to_string(),
-                group: PickerGroup::Language,
-                lang: Some(l),
-                auth: AuthMark::LoggedIn,
-                login_cmd: String::new(),
-                install_cmd: String::new(),
-            })
-            .collect(),
-        // Step 2 - which logged-in base CLI (ready-state from the live probe).
-        PickerStep::BaseCli => umadev_host::BACKEND_IDS
-            .iter()
-            .map(|id| {
-                let display = umadev_host::driver_for(id)
-                    .map_or_else(|| (*id).to_string(), |d| d.display_name().to_string());
-                let probe = backends.iter().find(|b| b.id == *id);
-                PickerItem {
-                    backend_id: Some((*id).to_string()),
-                    label: display,
-                    ready: probe.is_some_and(|p| p.ready),
-                    detail: probe.map_or_else(|| "detecting...".to_string(), |p| p.detail.clone()),
-                    group: PickerGroup::HostCli,
-                    lang: None,
-                    auth: probe.map_or(AuthMark::Unknown, |p| p.auth),
-                    login_cmd: probe.map(|p| p.login_cmd.clone()).unwrap_or_default(),
-                    install_cmd: probe.map(|p| p.install_cmd.clone()).unwrap_or_default(),
-                }
-            })
-            .collect(),
-    }
-}
-
 /// Tiny scalar extractors used by the `/verify` overlay so we don't need
 /// a JSON dependency just to surface "score: 95 / passed: true" from the
 /// quality-gate file. Returns `None` if the key isn't present or the
@@ -14883,64 +17890,6 @@ pub(crate) fn parse_seat(summary: &str) -> String {
     String::new()
 }
 
-/// Sentinel that prefixes the structured auth metadata `spawn_probe` packs onto
-/// the [`EngineEvent::BackendProbed`] `detail` (since that event can't grow new
-/// fields — it lives in umadev-agent, outside this crate). Shape:
-/// `\u{1}auth=<state>|login=<cmd>|install=<cmd>\u{1}<human detail>`.
-pub(crate) const PROBE_AUTH_SENTINEL: char = '\u{1}';
-
-/// Unpack the auth tag `spawn_probe` packed onto a probe `detail`. Returns
-/// `(auth_mark, login_cmd, install_cmd, human_detail)`. **Fail-open**: a `detail`
-/// with no sentinel (an external emitter, an older build) yields
-/// `(Unknown, "", "", detail)` — the human string is preserved verbatim and the
-/// picker simply shows the conservative "unknown" mark.
-pub(crate) fn parse_probe_detail(detail: &str) -> (AuthMark, String, String, String) {
-    let Some(rest) = detail.strip_prefix(PROBE_AUTH_SENTINEL) else {
-        return (
-            AuthMark::Unknown,
-            String::new(),
-            String::new(),
-            detail.to_string(),
-        );
-    };
-    let Some((meta, human)) = rest.split_once(PROBE_AUTH_SENTINEL) else {
-        // Malformed (no closing sentinel) — treat the whole thing as human text.
-        return (
-            AuthMark::Unknown,
-            String::new(),
-            String::new(),
-            rest.to_string(),
-        );
-    };
-    let mut auth = AuthMark::Unknown;
-    let mut login = String::new();
-    let mut install = String::new();
-    for field in meta.split('|') {
-        if let Some(v) = field.strip_prefix("auth=") {
-            auth = AuthMark::from_tag(v);
-        } else if let Some(v) = field.strip_prefix("login=") {
-            login = v.to_string();
-        } else if let Some(v) = field.strip_prefix("install=") {
-            install = v.to_string();
-        }
-    }
-    (auth, login, install, human.to_string())
-}
-
-fn refresh_picker_with_probes(items: &mut [PickerItem], probes: &[BackendInfo]) {
-    for item in items.iter_mut() {
-        if let Some(id) = item.backend_id.as_deref() {
-            if let Some(p) = probes.iter().find(|p| p.id == id) {
-                item.ready = p.ready;
-                item.detail = p.detail.clone();
-                item.auth = p.auth;
-                item.login_cmd.clone_from(&p.login_cmd);
-                item.install_cmd.clone_from(&p.install_cmd);
-            }
-        }
-    }
-}
-
 /// Format a duration in seconds as a compact `m:ss` (or `s` when under a
 /// minute) human counter for the status bar.
 fn fmt_elapsed(secs: u64) -> String {
@@ -14956,7 +17905,8 @@ fn fmt_elapsed(secs: u64) -> String {
 /// readable length on a char boundary (CJK-safe) with an ellipsis when cut.
 fn task_summary(requirement: &str) -> String {
     const MAX_CHARS: usize = 60;
-    let first = requirement
+    let redacted = umadev_agent::task_lifecycle::redact_task_text(requirement);
+    let first = redacted
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
@@ -14991,11188 +17941,161 @@ fn walkdir_count_md(dir: &std::path::Path) -> usize {
     count
 }
 
-/// Truncate a string to `max` chars with an ellipsis (char-safe).
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
-    t.push('…');
-    t
+const LESSONS_LINE_WIDTH: usize = 80;
+
+fn lesson_display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
 }
 
-/// Render a [`umadev_agent::runner::UsageReport`] as an i18n plain-text block
-/// for the `/usage` chat reply. Mirrors the `umadev usage` CLI layout so both
-/// surfaces read identically. Empty report → the friendly empty state.
-fn format_usage_report(
-    lang: umadev_i18n::Lang,
-    report: &umadev_agent::runner::UsageReport,
-) -> String {
-    if report.is_empty() {
-        return umadev_i18n::t(lang, "usage.empty").to_string();
+fn split_lesson_token(token: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(1);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for ch in token.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if !current.is_empty() && current_width + char_width > max_width {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += char_width;
     }
-    let mut out = umadev_i18n::tf(
-        lang,
-        "usage.title",
-        &[
-            &report.total_calls.to_string(),
-            &report.runs.len().to_string(),
-        ],
-    );
-    out.push('\n');
-    for run in &report.runs {
-        let backends = if run.backends.is_empty() {
-            "offline".to_string()
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn wrap_lesson_text(text: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for token in text.split_whitespace() {
+        let token_width = lesson_display_width(token);
+        let separator = usize::from(!current.is_empty());
+        if token_width <= max_width
+            && lesson_display_width(&current) + separator + token_width <= max_width
+        {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(token);
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        if token_width <= max_width {
+            current.push_str(token);
+            continue;
+        }
+        let chunks = split_lesson_token(token, max_width);
+        let chunk_count = chunks.len();
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            if index + 1 == chunk_count {
+                current = chunk;
+            } else {
+                lines.push(chunk);
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn wrap_lesson_message(message: &str) -> String {
+    message
+        .lines()
+        .flat_map(|line| wrap_lesson_text(line, LESSONS_LINE_WIDTH))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn push_lesson_field(out: &mut String, prefix: &str, value: &str) {
+    let prefix = format!("{prefix} ");
+    let prefix_width = lesson_display_width(&prefix);
+    let available = LESSONS_LINE_WIDTH.saturating_sub(prefix_width).max(16);
+    let lines = wrap_lesson_text(value, available);
+    if lines.is_empty() {
+        return;
+    }
+    let continuation = " ".repeat(prefix_width);
+    for (index, line) in lines.iter().enumerate() {
+        if index == 0 {
+            out.push_str(&prefix);
         } else {
-            run.backends.join(", ")
+            out.push_str(&continuation);
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
+fn push_pitfall_observations(
+    out: &mut String,
+    lang: umadev_i18n::Lang,
+    observations: &[umadev_agent::PitfallObservation],
+) {
+    if observations.is_empty() {
+        return;
+    }
+    out.push_str(umadev_i18n::t(lang, "pitfalls.observations_header"));
+    out.push('\n');
+    let unknown = umadev_i18n::t(lang, "pitfalls.time.unknown");
+    for observation in observations {
+        let observed_at = if observation.observed_at.trim().is_empty() {
+            unknown
+        } else {
+            observation.observed_at.trim()
         };
-        out.push('\n');
-        out.push_str(&umadev_i18n::tf(
+        let episode = compact_audit_id(&observation.episode_id, 8, 6);
+        let evidence = compact_audit_id(&observation.evidence_hash, 12, 0);
+        let value = umadev_i18n::tf(
             lang,
-            "usage.run_header",
-            &[&run.index.to_string(), &backends],
-        ));
-        out.push('\n');
-        for p in &run.phases {
-            out.push_str(&umadev_i18n::tf(
-                lang,
-                "usage.phase_line",
-                &[&p.phase, &p.calls.to_string(), &p.tokens.to_string()],
-            ));
-            out.push('\n');
-        }
-        out.push_str(&umadev_i18n::tf(
-            lang,
-            "usage.run_total",
-            &[&run.calls.to_string(), &run.tokens.to_string()],
-        ));
-        out.push('\n');
-    }
-    out.push('\n');
-    out.push_str(&umadev_i18n::tf(
-        lang,
-        "usage.grand_total",
-        &[&report.total_tokens.to_string()],
-    ));
-    out.push('\n');
-    let cost = format!(
-        "{:.2}",
-        umadev_agent::runner::rough_cost_usd(report.total_tokens)
-    );
-    out.push_str(&umadev_i18n::tf(lang, "usage.cost_estimate", &[&cost]));
-    out.push('\n');
-    out.push_str(umadev_i18n::t(lang, "usage.note_combined"));
-    out
-}
-
-/// Map a pitfall status to its (icon, i18n status-label key) for the lessons view.
-fn lesson_status_chrome(status: umadev_agent::PitfallStatus) -> (&'static str, &'static str) {
-    use umadev_agent::PitfallStatus;
-    match status {
-        PitfallStatus::Validated => ("[ok]", "lessons.status.validated"),
-        PitfallStatus::Recurring => ("[warn]", "lessons.status.recurring"),
-        PitfallStatus::Active => ("[pitfall]", "lessons.status.active"),
+            "pitfalls.observation_value",
+            &[
+                observed_at,
+                if episode.is_empty() {
+                    unknown
+                } else {
+                    &episode
+                },
+                if evidence.is_empty() {
+                    unknown
+                } else {
+                    &evidence
+                },
+            ],
+        );
+        push_lesson_field(out, "    -", &value);
     }
 }
 
-/// Render a [`umadev_agent::LessonsReport`] as an i18n plain-text block for the
-/// `/lessons` overlay. Mirrors the `umadev lessons` CLI layout. Empty report →
-/// the friendly empty state.
-fn format_lessons_report(lang: umadev_i18n::Lang, report: &umadev_agent::LessonsReport) -> String {
-    if report.is_empty() {
-        return umadev_i18n::t(lang, "lessons.empty").to_string();
+fn pitfall_first_observed(
+    lang: umadev_i18n::Lang,
+    value: &str,
+    timeline_complete: bool,
+    has_observations: bool,
+) -> String {
+    if value.trim().is_empty() {
+        return umadev_i18n::t(lang, "pitfalls.time.unknown").to_string();
     }
-    let e = report.efficacy;
-    let mut out = umadev_i18n::tf(
-        lang,
-        "lessons.efficacy",
-        &[
-            &e.total.to_string(),
-            &e.validated.to_string(),
-            &e.recurring.to_string(),
-            &e.active.to_string(),
-        ],
-    );
-    out.push_str("\n\n");
+    if !timeline_complete && !has_observations {
+        return umadev_i18n::tf(lang, "pitfalls.time.legacy_value", &[value.trim()]);
+    }
+    value.trim().to_string()
+}
 
-    if !report.top_pitfalls.is_empty() {
-        out.push_str(umadev_i18n::t(lang, "lessons.top_header"));
-        out.push('\n');
-        for p in &report.top_pitfalls {
-            let (icon, status_key) = lesson_status_chrome(p.status);
-            let status = umadev_i18n::t(lang, status_key);
-            out.push_str(&umadev_i18n::tf(
-                lang,
-                "lessons.pitfall_line",
-                &[icon, &p.title, &p.hits.to_string(), status],
-            ));
-            out.push('\n');
-            if !p.fix.is_empty() {
-                out.push_str(&umadev_i18n::tf(
-                    lang,
-                    "lessons.pitfall_fix",
-                    &[&truncate_chars(&p.fix, 200)],
-                ));
-                out.push('\n');
-            }
-            if !p.context.is_empty() {
-                out.push_str(&umadev_i18n::tf(
-                    lang,
-                    "lessons.pitfall_ctx",
-                    &[&p.context.join(", ")],
-                ));
-                out.push('\n');
-            }
-        }
-        out.push('\n');
-    }
-
-    // Failed fixes UmaDev is now steering away from (deduped across pitfalls).
-    let mut avoid: Vec<String> = Vec::new();
-    for p in &report.recurring {
-        for f in &p.failed_fixes {
-            let f = truncate_chars(f, 160);
-            if !avoid.contains(&f) {
-                avoid.push(f);
-            }
-        }
-    }
-    if !avoid.is_empty() {
-        out.push_str(umadev_i18n::t(lang, "lessons.recurring_header"));
-        out.push('\n');
-        for f in &avoid {
-            out.push_str(&umadev_i18n::tf(lang, "lessons.avoid_line", &[f]));
-            out.push('\n');
-        }
-        out.push('\n');
-    }
-
-    if !report.validated_patterns.is_empty() {
-        out.push_str(umadev_i18n::t(lang, "lessons.validated_header"));
-        out.push('\n');
-        for v in &report.validated_patterns {
-            out.push_str(&umadev_i18n::tf(
-                lang,
-                "lessons.validated_line",
-                &[&v.title, &v.summary],
-            ));
-            out.push('\n');
-        }
-    }
-    out
+fn push_wrapped_pitfall_line(out: &mut String, value: &str) {
+    out.push_str(&wrap_lesson_message(value));
+    out.push('\n');
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::UserConfig;
-    use umadev_agent::config::CodexSandbox;
-
-    #[test]
-    fn session_lost_note_detected_across_locales_and_forms() {
-        // The Windows broken pipe (os error 232, either locale), a `--resume` that found no
-        // conversation, and a base-exited note are all SESSION LOST: the stored session id is a
-        // corpse, so record_route_failed invalidates it (next turn opens fresh + replays the
-        // transcript) instead of re-resuming the corpse forever.
-        for note in [
-            "session send: 管道正在被关闭 (os error 232)",
-            "session send: The pipe is being closed. (os error 232)",
-            "base session ended mid-turn - base stderr: No conversation found with session ID x",
-            "base session ended before send (base exited: exit status: 1)",
-            "session send: Broken pipe (os error 32)",
-        ] {
-            assert!(
-                App::note_indicates_session_lost(note),
-                "should be session-lost: {note}"
-            );
-        }
-        // A content/tool failure on a still-LIVE session must NOT drop the session.
-        for note in [
-            "本轮底座执行出错:模型返回了空回复",
-            "the build step failed: cargo test exited non-zero",
-        ] {
-            assert!(
-                !App::note_indicates_session_lost(note),
-                "should NOT be session-lost: {note}"
-            );
-        }
-    }
-
-    #[test]
-    fn codex_sandbox_warning_only_for_danger_full_access_on_codex() {
-        // Fires ONLY for the high-risk tier on the codex base.
-        assert!(should_warn_codex_sandbox(
-            Some("codex"),
-            CodexSandbox::DangerFullAccess
-        ));
-        // Safe tiers stay silent, even on codex.
-        assert!(!should_warn_codex_sandbox(
-            Some("codex"),
-            CodexSandbox::WorkspaceWrite
-        ));
-        assert!(!should_warn_codex_sandbox(
-            Some("codex"),
-            CodexSandbox::ReadOnly
-        ));
-        // Other bases never warn, even at the high-risk tier (the knob is codex's).
-        assert!(!should_warn_codex_sandbox(
-            Some("claude-code"),
-            CodexSandbox::DangerFullAccess
-        ));
-        assert!(!should_warn_codex_sandbox(
-            None,
-            CodexSandbox::DangerFullAccess
-        ));
-    }
-
-    fn fresh_app(backend: Option<&str>) -> App {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let cfg = UserConfig {
-            backend: backend.map(str::to_string),
-            // Pin zh-CN so language-sensitive UI assertions (gate cards etc.)
-            // are deterministic regardless of the test host's locale.
-            lang: Some("zh-CN".to_string()),
-            ..Default::default()
-        };
-        // Each test gets a unique workspace dir to avoid file races between
-        // parallel tests. The .umadevrc disables auto_approve_gates so
-        // gate-card tests see the manual-approval path. Remove any leftover dir
-        // from a PRIOR run first so a persisted `.umadev/chat/` (Wave 5) can't
-        // bleed into a test that expects a clean conversation buffer.
-        let workspace = std::env::temp_dir().join(format!("sd-test-ws-{id}"));
-        let _ = std::fs::remove_dir_all(&workspace);
-        let _ = std::fs::create_dir_all(&workspace);
-        let _ = std::fs::write(
-            workspace.join(".umadevrc"),
-            "[pipeline]\nauto_approve_gates = false\n",
-        );
-        let mut app = App::new(
-            "demo",
-            cfg,
-            std::env::temp_dir().join(format!("sd-test-cfg-{id}.toml")),
-            workspace,
-        );
-        // P5d: force animations ON in tests so spinner-cadence assertions are
-        // deterministic regardless of whether the test host's stdout is a TTY
-        // (where `animations_enabled_default` would otherwise pick `false`).
-        app.animations = true;
-        app
-    }
-
-    // ---- A2#5: typed approval replies + sticky pending-approval state --------
-
-    #[test]
-    fn classify_approval_reply_exact_tokens_only() {
-        for t in [
-            "y", "Y", "yes", "批准", " 同意 ", "允许", "允許", "approve", "APPROVE", "ok", "通过",
-            "确认", "可以",
-        ] {
-            assert_eq!(classify_approval_reply(t), Some(true), "{t}");
-        }
-        for t in [
-            "n",
-            "no",
-            "拒绝",
-            "拒絕",
-            "不批准",
-            "不同意",
-            "deny",
-            "Reject",
-            "取消",
-            "cancel",
-            "skip",
-        ] {
-            assert_eq!(classify_approval_reply(t), Some(false), "{t}");
-        }
-        // NOT decisions: empty, decision words inside longer messages, plain
-        // steering text — these fall through to the normal queued lanes.
-        for t in [
-            "",
-            "批准这个改动吧",
-            "please approve the plan",
-            "先跑一下测试",
-            "not ok",
-        ] {
-            assert_eq!(classify_approval_reply(t), None, "{t}");
-        }
-    }
-
-    #[test]
-    fn typed_approval_reply_resolves_pause_instead_of_queueing() {
-        let mut app = fresh_app(Some("claude-code"));
-        // A chat turn is in flight and the drain paused on an approval.
-        app.thinking = true;
-        assert!(app.set_pending_approval(Some(("Bash".into(), "npm install".into()))));
-        // Same snapshot again → unchanged (no redraw churn).
-        assert!(!app.set_pending_approval(Some(("Bash".into(), "npm install".into()))));
-        // The reported trap: 「批准」 used to queue as a normal message with no
-        // effect (every key silently consumed, no approval entry point). Now it
-        // resolves the pause as ALLOW — and must NOT also park on a queue.
-        assert_eq!(
-            app.submit_text("批准".to_string()),
-            Action::ApprovalReply(true)
-        );
-        assert!(app.pending_approval.is_none());
-        assert!(
-            app.queued_chat.is_empty(),
-            "the decision must not ALSO queue as a chat turn"
-        );
-        // A deny word denies.
-        let _ = app.set_pending_approval(Some(("Write".into(), ".claude/skills/x.md".into())));
-        assert_eq!(
-            app.submit_text("拒绝".to_string()),
-            Action::ApprovalReply(false)
-        );
-        // A NON-decision message mid-pause keeps the pause and parks on the
-        // normal queued-chat lane, exactly as before.
-        let _ = app.set_pending_approval(Some(("Bash".into(), "npm install".into())));
-        assert_eq!(
-            app.submit_text("先解释一下为什么要装这个依赖".to_string()),
-            Action::None
-        );
-        assert_eq!(app.queued_chat.len(), 1);
-        assert!(
-            app.pending_approval.is_some(),
-            "a steering message must keep the pause registered"
-        );
-        // The pause resolving (holder emptied) clears the mirrored state.
-        assert!(app.set_pending_approval(None));
-        assert!(app.pending_approval.is_none());
-    }
-
-    // ---- Context-usage gauge + proactive compaction nudge --------------------
-
-    #[test]
-    fn base_model_engine_event_updates_display_not_context_window() {
-        // The base reports its resolved model via `EngineEvent::BaseModel`, so
-        // the UI records the real model for DISPLAY only (see `model_meta_text`).
-        // It must NOT infer a context window from that id: a hardcoded model
-        // table drifts and a base may route to a third-party/local model, so
-        // only an EXACT base-config window is ever a denominator.
-        let mut app = fresh_app(Some("claude-code"));
-        app.last_turn_input_tokens = 100_000;
-        // Pin "user pinned nothing" deterministically — `fresh_app` would otherwise
-        // inherit the dev host's ambient `~/.claude/settings.json` model.
-        app.base_model = None;
-        assert_eq!(app.context_window_tokens(), None);
-        // A dashed real Sonnet id updates the display model but proves no window.
-        app.apply_engine(EngineEvent::BaseModel {
-            id: "claude-sonnet-4-5-20250929[1m]".to_string(),
-        });
-        assert_eq!(
-            app.base_model.as_deref(),
-            Some("claude-sonnet-4-5-20250929[1m]")
-        );
-        assert_eq!(app.context_window_tokens(), None);
-        // Fail-open: an empty id is ignored, keeping the last good display model.
-        app.apply_engine(EngineEvent::BaseModel { id: String::new() });
-        assert_eq!(
-            app.base_model.as_deref(),
-            Some("claude-sonnet-4-5-20250929[1m]")
-        );
-        // ONLY an exact base-config window unlocks the denominator.
-        app.base_context_window = Some(200_000);
-        assert_eq!(app.context_window_tokens(), Some(200_000));
-    }
-
-    #[test]
-    fn context_usage_pct_is_bounded_and_saturating() {
-        assert_eq!(context_usage_pct(0, 200_000), 0);
-        assert_eq!(context_usage_pct(100_000, 200_000), 50);
-        assert_eq!(context_usage_pct(160_000, 200_000), 80);
-        // A conservative denominator can under-count → clamp at 100, never >100.
-        assert_eq!(context_usage_pct(500_000, 200_000), 100);
-        // total == 0 → 0, never a divide-by-zero.
-        assert_eq!(context_usage_pct(1234, 0), 0);
-    }
-
-    #[test]
-    fn context_gauge_computes_pct_from_last_turn_input_tokens() {
-        let mut app = fresh_app(Some("claude-code"));
-        // Pin "no detected model/window" deterministically — `fresh_app` would
-        // otherwise inherit the dev host's ambient `~/.claude/settings.json` model
-        // (test isolation).
-        app.base_model = None;
-        // No usage and an empty transcript → nothing to show (fail-open).
-        assert!(app.context_used_tokens().is_none());
-        assert!(app.context_usage_pct().is_none());
-        // A known last-turn input count alone is not enough: without an exact
-        // configured context window, the UI must hide the context gauge.
-        app.last_turn_input_tokens = 50_000;
-        assert_eq!(app.context_used_tokens(), Some(50_000));
-        assert_eq!(app.context_window_tokens(), None);
-        assert_eq!(app.context_usage_pct(), None);
-        // Exact provider/config metadata unlocks the denominator.
-        app.base_context_window = Some(200_000);
-        assert_eq!(app.context_window_tokens(), Some(200_000));
-        assert_eq!(app.context_usage_pct(), Some(25));
-    }
-
-    #[test]
-    fn context_gauge_does_not_infer_window_from_a_config_pinned_model() {
-        // A codex config pinning a gpt-5 model sets the DISPLAY model, but the gauge
-        // must NOT fabricate a window from it — only an exact base-config window is a
-        // denominator, so codex (which exposes none) shows the model name and no bar.
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
-        std::fs::write(
-            tmp.path().join(".codex/config.toml"),
-            "model = \"gpt-5.5\"\n",
-        )
-        .unwrap();
-        let mut app = App::new(
-            "demo".to_string(),
-            UserConfig {
-                backend: Some("codex".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        app.last_turn_input_tokens = 100_000;
-        assert_eq!(app.base_model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(app.context_window_tokens(), None);
-        assert_eq!(app.context_usage_pct(), None);
-    }
-
-    #[test]
-    fn context_gauge_prefers_exact_opencode_provider_window() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join("opencode.json"),
-            r#"{
-              "model": "provider-auth-big/glm-5",
-              "provider": {
-                "provider-auth-big": {
-                  "models": {
-                    "glm-5": { "limit": { "context": 200000 } }
-                  }
-                }
-              }
-            }"#,
-        )
-        .unwrap();
-        let mut app = App::new(
-            "demo".to_string(),
-            UserConfig {
-                backend: Some("opencode".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        app.last_turn_input_tokens = 100_000;
-        assert_eq!(app.base_model.as_deref(), Some("provider-auth-big/glm-5"));
-        assert_eq!(app.base_context_window, Some(200_000));
-        assert_eq!(app.context_window_tokens(), Some(200_000));
-        assert_eq!(app.context_usage_pct(), Some(50));
-    }
-
-    #[test]
-    fn live_base_model_recomputes_exact_opencode_context_or_clears_stale_window() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join("opencode.json"),
-            r#"{
-              "model": "provider-auth-big/glm-5",
-              "provider": {
-                "provider-auth-big": {
-                  "models": {
-                    "glm-5": { "limit": { "context": 200000 } },
-                    "glm-5-next": {
-                      "limit": { "context": 300000 },
-                      "variants": { "high": {} }
-                    }
-                  }
-                }
-              }
-            }"#,
-        )
-        .unwrap();
-        let mut app = App::new(
-            "demo".to_string(),
-            UserConfig {
-                backend: Some("opencode".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        assert_eq!(app.base_context_window, Some(200_000));
-
-        app.apply_engine(EngineEvent::BaseModel {
-            id: "provider-auth-big/glm-5-next/high".to_string(),
-        });
-        assert_eq!(
-            app.base_context_window,
-            Some(300_000),
-            "live model can keep the gauge only when provider metadata proves it"
-        );
-
-        app.apply_engine(EngineEvent::BaseModel {
-            id: "provider-auth-big/unknown".to_string(),
-        });
-        assert_eq!(
-            app.base_context_window, None,
-            "a live model mismatch must clear the stale static denominator"
-        );
-    }
-
-    #[test]
-    fn context_gauge_falls_open_when_model_unknown() {
-        let mut app = fresh_app(None); // offline / no backend
-        app.last_turn_input_tokens = 50_000;
-        // Numerator exists but there's no denominator → gauge shows nothing.
-        assert_eq!(app.context_used_tokens(), Some(50_000));
-        assert!(app.context_window_tokens().is_none());
-        assert!(app.context_usage_pct().is_none());
-    }
-
-    #[test]
-    fn compaction_nudge_fires_once_on_crossing_and_not_below() {
-        let mut app = fresh_app(Some("claude-code"));
-        // Pin an exact configured 200K window — the nudge must not use backend/model
-        // defaults, but it should still work when the base exposes a real limit.
-        app.base_model = None;
-        app.base_context_window = Some(200_000);
-        let before = app.history.len();
-        // Below the 80% threshold (100k/200k = 50%) → no nudge.
-        app.last_turn_input_tokens = 100_000;
-        app.maybe_nudge_compaction();
-        assert_eq!(app.history.len(), before);
-        assert!(!app.context_nudge_shown);
-        // Cross the threshold (170k/200k = 85%) → nudge exactly once.
-        app.last_turn_input_tokens = 170_000;
-        app.maybe_nudge_compaction();
-        assert_eq!(app.history.len(), before + 1);
-        assert!(app.context_nudge_shown);
-        // Still above threshold next turn → no second nudge (no spam).
-        app.last_turn_input_tokens = 180_000;
-        app.maybe_nudge_compaction();
-        assert_eq!(app.history.len(), before + 1);
-        // Drop back below (e.g. after a /compact) → re-arm; a later crossing nudges again.
-        app.last_turn_input_tokens = 90_000;
-        app.maybe_nudge_compaction();
-        assert!(!app.context_nudge_shown);
-        app.last_turn_input_tokens = 175_000;
-        app.maybe_nudge_compaction();
-        assert_eq!(app.history.len(), before + 2);
-    }
-
-    // ---- I1: kill-ring + yank / yank-pop -------------------------------------
-
-    use crossterm::event::KeyModifiers;
-
-    /// Build the modifier set for a Ctrl-key.
-    fn ctrl() -> KeyModifiers {
-        KeyModifiers::CONTROL
-    }
-    /// Build the modifier set for an Alt-key.
-    fn alt() -> KeyModifiers {
-        KeyModifiers::ALT
-    }
-
-    #[test]
-    fn ctrl_u_pushes_to_kill_ring_and_ctrl_y_yanks_it_back() {
-        let mut app = fresh_app(Some("offline"));
-        app.input = "hello world".to_string();
-        app.input_cursor = app.input_len();
-        // Ctrl+U kills the line back to the start — but PUSHES it, not destroys.
-        let _ = app.apply_key_with_mods(KeyCode::Char('u'), ctrl());
-        assert_eq!(app.input, "", "Ctrl+U cleared the line");
-        assert_eq!(
-            app.kill_ring.front().map(String::as_str),
-            Some("hello world"),
-            "the killed text is on the ring, not lost"
-        );
-        // Ctrl+Y yanks the front entry back in.
-        let _ = app.apply_key_with_mods(KeyCode::Char('y'), ctrl());
-        assert_eq!(app.input, "hello world", "Ctrl+Y restored the killed text");
-        assert_eq!(app.input_cursor, app.input_len());
-    }
-
-    #[test]
-    fn ctrl_k_and_ctrl_w_both_feed_the_ring() {
-        // Ctrl+K (kill to end).
-        let mut app = fresh_app(Some("offline"));
-        app.input = "abcdef".to_string();
-        app.input_cursor = 0;
-        let _ = app.apply_key_with_mods(KeyCode::Char('k'), ctrl());
-        assert_eq!(app.kill_ring.front().map(String::as_str), Some("abcdef"));
-        // Ctrl+W (delete word back).
-        let mut app = fresh_app(Some("offline"));
-        app.input = "one two".to_string();
-        app.input_cursor = app.input_len();
-        let _ = app.apply_key_with_mods(KeyCode::Char('w'), ctrl());
-        assert_eq!(app.kill_ring.front().map(String::as_str), Some("two"));
-    }
-
-    #[test]
-    fn consecutive_same_direction_kills_coalesce_into_one_entry() {
-        // Two consecutive Ctrl+W (both BACKWARD) build ONE ring entry, the
-        // newer-killed text PREPENDED so the chunk reads in document order.
-        let mut app = fresh_app(Some("offline"));
-        app.input = "one two three".to_string();
-        app.input_cursor = app.input_len();
-        let _ = app.apply_key_with_mods(KeyCode::Char('w'), ctrl());
-        let _ = app.apply_key_with_mods(KeyCode::Char('w'), ctrl());
-        assert_eq!(
-            app.kill_ring.len(),
-            1,
-            "two same-direction kills are one ring entry"
-        );
-        assert_eq!(
-            app.kill_ring.front().map(String::as_str),
-            Some("two three"),
-            "backward kills prepend so the chunk reads in order"
-        );
-    }
-
-    #[test]
-    fn push_kill_coalesces_per_direction_and_forks_on_change() {
-        let mut app = fresh_app(Some("offline"));
-        // Forward kills APPEND into the front entry.
-        app.push_kill("aa", KillDir::Forward);
-        app.push_kill("bb", KillDir::Forward);
-        assert_eq!(app.kill_ring.len(), 1);
-        assert_eq!(app.kill_ring.front().map(String::as_str), Some("aabb"));
-        // A direction change FORKS a new entry; backward kills PREPEND.
-        app.push_kill("cc", KillDir::Backward);
-        app.push_kill("dd", KillDir::Backward);
-        assert_eq!(app.kill_ring.len(), 2);
-        assert_eq!(app.kill_ring[0], "ddcc");
-        assert_eq!(app.kill_ring[1], "aabb");
-        // A non-kill key resets coalescing, so the next kill never folds in.
-        app.reset_kill_yank();
-        app.push_kill("ee", KillDir::Backward);
-        assert_eq!(app.kill_ring.len(), 3);
-        assert_eq!(app.kill_ring[0], "ee");
-    }
-
-    #[test]
-    fn alt_y_yank_pops_to_cycle_the_ring_after_a_yank() {
-        let mut app = fresh_app(Some("offline"));
-        app.input = String::new();
-        app.input_cursor = 0;
-        // Seed two distinct ring entries (front = most recent).
-        app.kill_ring = VecDeque::from(["AAA".to_string(), "BBB".to_string()]);
-        // Ctrl+Y yanks the front entry.
-        let _ = app.apply_key_with_mods(KeyCode::Char('y'), ctrl());
-        assert_eq!(app.input, "AAA");
-        // Alt+Y replaces the just-yanked span with the next ring entry.
-        let _ = app.apply_key_with_mods(KeyCode::Char('y'), alt());
-        assert_eq!(app.input, "BBB", "Alt+Y cycled to the next ring entry");
-        // Alt+Y wraps back around the 2-entry ring.
-        let _ = app.apply_key_with_mods(KeyCode::Char('y'), alt());
-        assert_eq!(app.input, "AAA");
-    }
-
-    #[test]
-    fn alt_y_is_inert_without_a_preceding_yank() {
-        let mut app = fresh_app(Some("offline"));
-        app.input = "draft".to_string();
-        app.input_cursor = app.input_len();
-        app.kill_ring = VecDeque::from(["AAA".to_string(), "BBB".to_string()]);
-        // No yank happened first → yank-pop must be a no-op (no span recorded).
-        let _ = app.apply_key_with_mods(KeyCode::Char('y'), alt());
-        assert_eq!(app.input, "draft");
-    }
-
-    // ---- I2: undo / redo ------------------------------------------------------
-
-    #[test]
-    fn edit_then_undo_restores_text_and_cursor() {
-        let mut app = fresh_app(Some("offline"));
-        // A pre-existing draft (set directly → not itself a snapshot).
-        app.input = "hello".to_string();
-        app.input_cursor = app.input_len();
-        // Type a char — the FIRST edit always opens a fresh undo step.
-        let _ = app.apply_key(KeyCode::Char('!'));
-        assert_eq!(app.input, "hello!");
-        assert_eq!(app.input_cursor, 6);
-        // Ctrl+Z restores both the text AND the caret.
-        let _ = app.apply_key_with_mods(KeyCode::Char('z'), ctrl());
-        assert_eq!(app.input, "hello");
-        assert_eq!(app.input_cursor, 5);
-    }
-
-    #[test]
-    fn rapid_edits_coalesce_into_one_undo_step() {
-        let mut app = fresh_app(Some("offline"));
-        // Three keystrokes with no pause between them (the test runs in
-        // microseconds, well inside the coalesce window).
-        for c in ['a', 'b', 'c'] {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        assert_eq!(app.input, "abc");
-        assert_eq!(
-            app.undo_stack.len(),
-            1,
-            "a rapid burst collapses to one undo step"
-        );
-        // One Ctrl+Z reverts the entire burst.
-        let _ = app.apply_key_with_mods(KeyCode::Char('z'), ctrl());
-        assert_eq!(app.input, "");
-    }
-
-    #[test]
-    fn redo_reapplies_after_undo() {
-        let mut app = fresh_app(Some("offline"));
-        let _ = app.apply_key(KeyCode::Char('a'));
-        assert_eq!(app.input, "a");
-        let _ = app.apply_key_with_mods(KeyCode::Char('z'), ctrl());
-        assert_eq!(app.input, "");
-        // Alt+Z replays the undone edit.
-        let _ = app.apply_key_with_mods(KeyCode::Char('z'), alt());
-        assert_eq!(app.input, "a");
-    }
-
-    #[test]
-    fn a_fresh_edit_truncates_the_redo_branch() {
-        let mut app = fresh_app(Some("offline"));
-        let _ = app.apply_key(KeyCode::Char('a'));
-        let _ = app.apply_key_with_mods(KeyCode::Char('z'), ctrl());
-        assert_eq!(app.input, "");
-        // A new edit forks a clean future — the redo branch is gone.
-        let _ = app.apply_key(KeyCode::Char('b'));
-        assert_eq!(app.input, "b");
-        assert!(app.redo_stack.is_empty(), "the redo branch was truncated");
-        // Alt+Z now has nothing to replay.
-        let _ = app.apply_key_with_mods(KeyCode::Char('z'), alt());
-        assert_eq!(app.input, "b");
-    }
-
-    #[test]
-    fn ring_and_undo_do_not_fire_while_search_owns_the_keys() {
-        let mut app = fresh_app(Some("offline"));
-        app.input = "hello world".to_string();
-        app.input_cursor = app.input_len();
-        // Search mode owns EVERY keystroke.
-        app.open_search();
-        let _ = app.apply_key_with_mods(KeyCode::Char('u'), ctrl());
-        let _ = app.apply_key_with_mods(KeyCode::Char('y'), ctrl());
-        let _ = app.apply_key_with_mods(KeyCode::Char('z'), ctrl());
-        assert_eq!(app.input, "hello world", "the input buffer is untouched");
-        assert!(app.kill_ring.is_empty(), "no kill fired");
-        assert!(app.undo_stack.is_empty(), "no undo snapshot fired");
-    }
-
-    #[test]
-    fn bang_prefix_runs_a_local_shell_and_shows_output() {
-        let mut app = fresh_app(Some("offline"));
-        let before = app.history.len();
-        // `!echo <marker>` runs once in the project root and renders as a
-        // finished Bash tool row whose result holds the command's output — it is
-        // NOT routed to the base, so this works with no live session.
-        let action = app.try_bang_command("!echo umadev_bang_marker").unwrap();
-        assert!(matches!(action, Action::None));
-        assert_eq!(
-            app.history.len(),
-            before + 1,
-            "exactly one tool row is appended"
-        );
-        let last = app.history.back().unwrap();
-        assert_eq!(last.role, ChatRole::Host);
-        let MessageBody::Tool(t) = &last.kind else {
-            panic!(
-                "a bang command must render as a tool row, got {:?}",
-                last.kind
-            );
-        };
-        assert_eq!(t.name, "Bash");
-        assert_eq!(t.status, ToolStatus::Ok);
-        assert!(
-            t.result
-                .as_deref()
-                .unwrap_or_default()
-                .contains("umadev_bang_marker"),
-            "the shell output must be shown in the row: {:?}",
-            t.result
-        );
-    }
-
-    #[test]
-    fn bare_bang_is_a_consumed_no_op() {
-        let mut app = fresh_app(Some("offline"));
-        let before = app.history.len();
-        // A bare `!` (and `!` followed by only whitespace) CONSUMES the input so
-        // the literal `!` never reaches the base, but runs nothing + appends no row.
-        assert!(matches!(app.try_bang_command("!"), Some(Action::None)));
-        assert!(matches!(app.try_bang_command("!   "), Some(Action::None)));
-        assert_eq!(
-            app.history.len(),
-            before,
-            "an empty bang must not append any row"
-        );
-        // Non-`!` input is not a bang command at all (falls through to routing).
-        assert!(app.try_bang_command("echo hi").is_none());
-        assert!(app.try_bang_command("/help").is_none());
-    }
-
-    #[test]
-    fn bang_nonzero_exit_surfaces_the_code_and_stays_expanded() {
-        let mut app = fresh_app(Some("offline"));
-        // A failing command marks the row Fail (kept expanded so the error is
-        // never hidden) and surfaces its nonzero exit code in the result.
-        let _ = app.try_bang_command("!exit 3").unwrap();
-        let MessageBody::Tool(t) = &app.history.back().unwrap().kind else {
-            panic!("expected a tool row");
-        };
-        assert_eq!(t.status, ToolStatus::Fail);
-        assert!(!t.collapsed, "a failed shell row stays expanded");
-        assert!(
-            t.result.as_deref().unwrap_or_default().contains('3'),
-            "the nonzero exit code must be shown: {:?}",
-            t.result
-        );
-    }
-
-    /// M3 regression — a runaway-output command (`yes` emits "y\n" forever) must
-    /// NOT buffer unbounded into memory the way `Command::output()` did (read to
-    /// EOF) and must NOT run on / hang. The per-stream reader caps in-memory bytes
-    /// and drops the pipe at the cap; `yes` then dies on SIGPIPE — so the call
-    /// returns PROMPTLY with BOUNDED output, with the kill-on-deadline path as the
-    /// backstop. Unix-only (`yes` / SIGPIPE semantics).
-    #[cfg(unix)]
-    #[test]
-    fn bang_runaway_output_is_bounded_and_does_not_hang() {
-        let root = std::env::temp_dir();
-        let start = std::time::Instant::now();
-        let (ok, out) = run_bang_command(&root, "yes", umadev_i18n::Lang::En);
-        let elapsed = start.elapsed();
-        // Killed by SIGPIPE (or the deadline) → not a clean success.
-        assert!(!ok, "a killed runaway command is not a success");
-        // Output is bounded (`bound_shell_output` caps at 300 lines / 16k chars),
-        // proving we never buffered the infinite stream into memory; add headroom
-        // for the appended failure note.
-        assert!(
-            out.chars().count() < 17_000,
-            "runaway output must be bounded, got {} chars",
-            out.chars().count()
-        );
-        // And it returned well under the 10s kill budget (SIGPIPE death, not a
-        // hang) — the old code would never even return from this for `yes`.
-        assert!(
-            elapsed < std::time::Duration::from_secs(9),
-            "runaway command must not hang: {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn transient_status_updates_field_without_growing_transcript() {
-        // The long-phase heartbeat's periodic beats arrive as TransientStatus
-        // and must update the in-place status field WITHOUT pushing a transcript
-        // row — this is the flood-bug fix. A repeated beat overwrites, never
-        // appends; a `None` clears the line.
-        let mut app = fresh_app(Some("offline"));
-        let before = app.history.len();
-
-        app.apply_engine(EngineEvent::TransientStatus(Some(
-            "做事 仍在进行(已 0:03)".to_string(),
-        )));
-        assert_eq!(
-            app.history.len(),
-            before,
-            "a transient beat must NOT add a transcript row"
-        );
-        assert_eq!(
-            app.transient_status.as_deref(),
-            Some("做事 仍在进行(已 0:03)"),
-            "the in-place status field must be set"
-        );
-
-        // A second beat OVERWRITES the field (still no new row).
-        app.apply_engine(EngineEvent::TransientStatus(Some(
-            "做事 仍在进行(已 0:10)".to_string(),
-        )));
-        assert_eq!(app.history.len(), before, "second beat must not add a row");
-        assert_eq!(
-            app.transient_status.as_deref(),
-            Some("做事 仍在进行(已 0:10)"),
-            "the field must be overwritten by the newer beat"
-        );
-
-        // Completion clears the line.
-        app.apply_engine(EngineEvent::TransientStatus(None));
-        assert_eq!(app.history.len(), before, "clearing must not add a row");
-        assert!(
-            app.transient_status.is_none(),
-            "TransientStatus(None) must clear the in-place line"
-        );
-    }
-
-    #[test]
-    fn real_output_and_phase_boundary_clear_a_stale_heartbeat_line() {
-        // A real sign of life (host output) or a new phase supersedes the
-        // heartbeat reassurance — the in-place line must not linger next to
-        // fresh content.
-        let mut app = fresh_app(Some("offline"));
-        app.transient_status = Some("阶段 仍在进行(已 1:51)".to_string());
-        app.apply_engine(EngineEvent::HostOutput {
-            phase: Phase::Frontend,
-            line: "real worker output".to_string(),
-        });
-        assert!(
-            app.transient_status.is_none(),
-            "real host output must clear a stale heartbeat line"
-        );
-
-        app.transient_status = Some("阶段 仍在进行(已 2:30)".to_string());
-        app.apply_engine(EngineEvent::PhaseStarted {
-            phase: Phase::Backend,
-        });
-        assert!(
-            app.transient_status.is_none(),
-            "a fresh phase must clear the prior phase's heartbeat line"
-        );
-    }
-
-    #[test]
-    fn shift_up_scrolls_transcript_and_stops_auto_stick() {
-        let mut app = fresh_app(Some("offline"));
-        // Simulate a render having published a scroll bound + viewport.
-        app.transcript_max_scroll.set(20);
-        app.transcript_viewport_rows.set(10);
-        // Shift+↑ nudges the transcript up one row (un-pins from the bottom).
-        let _ = app.apply_key_with_mods(
-            crossterm::event::KeyCode::Up,
-            crossterm::event::KeyModifiers::SHIFT,
-        );
-        assert_eq!(app.transcript_scroll(), 1);
-        // Shift+↓ brings it back.
-        let _ = app.apply_key_with_mods(
-            crossterm::event::KeyCode::Down,
-            crossterm::event::KeyModifiers::SHIFT,
-        );
-        assert_eq!(app.transcript_scroll(), 0);
-    }
-
-    #[test]
-    fn page_and_home_end_scroll_against_published_viewport() {
-        let mut app = fresh_app(Some("offline"));
-        app.transcript_max_scroll.set(100);
-        app.transcript_viewport_rows.set(20);
-        // PageUp = viewport - 1 rows.
-        let _ = app.apply_key(crossterm::event::KeyCode::PageUp);
-        assert_eq!(app.transcript_scroll(), 19);
-        // Home jumps to the very top (= max scroll).
-        let _ = app.apply_key(crossterm::event::KeyCode::Home);
-        assert_eq!(app.transcript_scroll(), 100);
-        // End re-pins to the bottom.
-        let _ = app.apply_key(crossterm::event::KeyCode::End);
-        assert_eq!(app.transcript_scroll(), 0);
-        // Ctrl+Alt+U = half a page up (the half-page scroll moved off bare
-        // Ctrl-U so the shell "clear line" key keeps its job).
-        let _ = app.apply_key_with_mods(
-            crossterm::event::KeyCode::Char('u'),
-            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
-        );
-        assert_eq!(app.transcript_scroll(), 10);
-    }
-
-    #[test]
-    fn ctrl_alt_u_and_d_half_page_scroll_transcript() {
-        let mut app = fresh_app(Some("offline"));
-        app.transcript_max_scroll.set(100);
-        app.transcript_viewport_rows.set(20);
-        let cmd_alt = crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT;
-        // Ctrl+Alt+U → half a viewport up (20 / 2 = 10).
-        let _ = app.apply_key_with_mods(crossterm::event::KeyCode::Char('u'), cmd_alt);
-        assert_eq!(
-            app.transcript_scroll(),
-            10,
-            "Ctrl+Alt+U scrolls half a page up"
-        );
-        // Ctrl+Alt+D → half a viewport back down.
-        let _ = app.apply_key_with_mods(crossterm::event::KeyCode::Char('d'), cmd_alt);
-        assert_eq!(
-            app.transcript_scroll(),
-            0,
-            "Ctrl+Alt+D scrolls half a page down"
-        );
-        // Ctrl+Alt+B / Ctrl+Alt+F are paging aliases.
-        let _ = app.apply_key_with_mods(crossterm::event::KeyCode::Char('b'), cmd_alt);
-        assert_eq!(app.transcript_scroll(), 10, "Ctrl+Alt+B aliases scroll-up");
-        let _ = app.apply_key_with_mods(crossterm::event::KeyCode::Char('f'), cmd_alt);
-        assert_eq!(app.transcript_scroll(), 0, "Ctrl+Alt+F aliases scroll-down");
-    }
-
-    #[test]
-    fn bare_ctrl_u_and_ctrl_d_no_longer_scroll_transcript() {
-        let mut app = fresh_app(Some("offline"));
-        app.transcript_max_scroll.set(100);
-        app.transcript_viewport_rows.set(20);
-        // Empty input + bare Ctrl-U: must NOT scroll (it's the line-clear key,
-        // and the input is empty so there is nothing to delete either).
-        let _ = app.apply_key_with_mods(
-            crossterm::event::KeyCode::Char('u'),
-            crossterm::event::KeyModifiers::CONTROL,
-        );
-        assert_eq!(
-            app.transcript_scroll(),
-            0,
-            "bare Ctrl-U must not move the transcript"
-        );
-        // Scroll up first, then bare Ctrl-D: it must NOT scroll back (Ctrl-D is
-        // the terminal EOF/quit convention, not a scroll key). On empty input
-        // it routes to quit, so assert via should_quit and a still-scrolled view.
-        app.transcript_scroll.set(30);
-        let _ = app.apply_key_with_mods(
-            crossterm::event::KeyCode::Char('d'),
-            crossterm::event::KeyModifiers::CONTROL,
-        );
-        assert_eq!(
-            app.transcript_scroll(),
-            30,
-            "bare Ctrl-D must not move the transcript"
-        );
-        assert!(app.should_quit, "bare Ctrl-D on empty input quits (EOF)");
-    }
-
-    #[test]
-    fn slash_mouse_emits_set_capture_action_and_uses_i18n() {
-        let mut app = fresh_app(Some("offline"));
-        assert!(
-            app.mouse_scroll,
-            "mouse capture defaults ON (wheel-scroll + in-app drag-to-copy both work)"
-        );
-        // Toggling OFF must emit SetMouseCapture(false) so the event loop issues the
-        // real DisableMouseCapture (handing selection back to the terminal), not just
-        // flip a bool.
-        let action = app.slash_toggle_mouse();
-        assert_eq!(action, Action::SetMouseCapture(false));
-        assert!(!app.mouse_scroll);
-        // The pushed status line must be the i18n string, not a raw literal.
-        let last = app.history.back().expect("a status line was pushed");
-        assert_eq!(
-            last.body(),
-            umadev_i18n::t(app.lang, "slash.mouse_off"),
-            "/mouse status text must come from the i18n catalog"
-        );
-        // Toggling back ON emits SetMouseCapture(true).
-        let action = app.slash_toggle_mouse();
-        assert_eq!(action, Action::SetMouseCapture(true));
-        assert!(app.mouse_scroll);
-    }
-
-    #[test]
-    fn submitting_a_turn_repins_transcript_to_bottom() {
-        let mut app = fresh_app(Some("offline"));
-        app.transcript_max_scroll.set(50);
-        app.transcript_scroll.set(30); // user is reviewing history
-        for c in "hello".chars() {
-            let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
-        }
-        let _ = app.apply_key(crossterm::event::KeyCode::Enter);
-        assert_eq!(
-            app.transcript_scroll(),
-            0,
-            "submitting must snap back to the newest content"
-        );
-    }
-
-    #[test]
-    fn slash_mouse_toggles_wheel_scroll_flag() {
-        let mut app = fresh_app(Some("offline"));
-        assert!(app.mouse_scroll, "mouse capture defaults on");
-        for c in "/mouse".chars() {
-            let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
-        }
-        let _ = app.apply_key(crossterm::event::KeyCode::Enter);
-        assert!(!app.mouse_scroll, "/mouse turns the capture binding off");
-    }
-
-    #[test]
-    fn conversation_memory_threads_turns_and_bounds_length() {
-        let mut app = fresh_app(Some("claude-code"));
-
-        app.record_user_turn("你好");
-        app.record_chat_reply("你好,我是底座".to_string());
-        app.record_user_turn("我刚才说了什么?");
-
-        // The snapshot handed to the base is the running dialogue, in order,
-        // with correct roles — this is what makes chat a real conversation.
-        let snap = app.conversation_snapshot();
-        assert_eq!(snap.len(), 3);
-        assert_eq!(snap[0].role, "user");
-        assert_eq!(snap[0].content, "你好");
-        assert_eq!(snap[1].role, "assistant");
-        assert_eq!(snap[2].content, "我刚才说了什么?");
-
-        // The base's reply is also rendered in the visible chat as a Host line.
-        assert!(app
-            .history
-            .iter()
-            .any(|m| m.role == ChatRole::Host && m.body() == "你好,我是底座"));
-
-        // The in-memory working view stays bounded by the safety net, while the
-        // durable full transcript keeps EVERY recorded turn (compaction / the FIFO
-        // fallback only ever touch the working view, never the on-disk history).
-        let full_before = app.full_transcript.len();
-        for i in 0..CONVERSATION_CAP * 2 {
-            app.record_user_turn(&format!("msg {i}"));
-        }
-        assert!(app.conversation.len() <= CONVERSATION_HARD_CAP);
-        assert_eq!(
-            app.full_transcript.len(),
-            full_before + CONVERSATION_CAP * 2,
-            "the full transcript keeps every recorded turn"
-        );
-        assert_eq!(
-            app.conversation.last().unwrap().content,
-            format!("msg {}", CONVERSATION_CAP * 2 - 1)
-        );
-        assert_eq!(
-            app.full_transcript.last().unwrap().content,
-            format!("msg {}", CONVERSATION_CAP * 2 - 1)
-        );
-    }
-
-    /// Build an app rooted at a UNIQUE temp dir so the `.umadev/chat/` persistence
-    /// tests don't collide with each other or the shared `fresh_app` temp dirs.
-    fn temp_app() -> (App, tempfile::TempDir) {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = UserConfig {
-            backend: Some("claude-code".to_string()),
-            lang: Some("zh-CN".to_string()),
-            ..Default::default()
-        };
-        let app = App::new(
-            "demo",
-            cfg,
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        (app, tmp)
-    }
-
-    #[test]
-    fn pasted_image_path_becomes_a_chip_and_expands_to_an_at_mention() {
-        let mut app = fresh_app(Some("offline"));
-        let dir = tempfile::TempDir::new().unwrap();
-        let img = dir.path().join("shot.png");
-        std::fs::write(&img, b"\x89PNG\r\n\x1a\n").unwrap();
-        app.handle_paste(img.to_str().unwrap());
-        // A chip is shown in the input (not the raw path); one attachment tracked.
-        assert!(
-            app.input.contains("图片") || app.input.contains("Image"),
-            "chip inserted, got: {}",
-            app.input
-        );
-        assert_eq!(app.attachments.len(), 1);
-        // On submit the chip rewrites to an @<abs-path> mention the base can open.
-        let abs = std::fs::canonicalize(&img).unwrap();
-        let expanded = app.expand_attachments(app.input.trim());
-        assert!(
-            expanded.contains(&format!("@{}", abs.display())),
-            "expanded to @path, got: {expanded}"
-        );
-    }
-
-    #[test]
-    fn pasted_plain_text_with_a_png_word_is_verbatim_not_attached() {
-        let mut app = fresh_app(Some("offline"));
-        app.handle_paste("see the png export in the docs");
-        assert_eq!(app.input, "see the png export in the docs");
-        assert!(app.attachments.is_empty());
-    }
-
-    #[test]
-    fn a_nonexistent_image_path_is_left_as_plain_text() {
-        let mut app = fresh_app(Some("offline"));
-        app.handle_paste("/no/such/dir/ghost.png");
-        // Can't canonicalise → not attached → inserted verbatim, no chip.
-        assert!(app.attachments.is_empty());
-        assert!(app.input.contains("ghost.png"));
-    }
-
-    // ---- I4: large-paste collapse to a chip ----
-
-    /// Build `n` distinct `"<prefix> <i>\n"` lines — test fixtures for the
-    /// large-paste chip (distinct markers let the assertions confirm the FULL
-    /// text round-trips through stash→expand).
-    fn numbered_lines(prefix: &str, n: usize) -> String {
-        use std::fmt::Write as _;
-        let mut s = String::new();
-        for i in 0..n {
-            let _ = writeln!(s, "{prefix} {i}");
-        }
-        s
-    }
-
-    #[test]
-    fn large_paste_collapses_to_a_chip_and_expands_on_submit() {
-        let mut a = fresh_app(Some("offline"));
-        // 20 lines → over the line threshold → one chip, not a 20-line flood.
-        let big = numbered_lines("line", 20);
-        a.handle_paste(&big);
-        assert!(
-            a.input.contains("粘贴") || a.input.contains("pasted") || a.input.contains("貼上"),
-            "a chip is shown, got: {}",
-            a.input
-        );
-        assert!(
-            !a.input.contains("line 15"),
-            "the bulk text is stashed, NOT flooding the box: {}",
-            a.input
-        );
-        assert_eq!(a.text_stash.len(), 1, "one paste stashed");
-        // On submit the chip expands back to the full text inline.
-        let expanded = a.expand_attachments(a.input.trim());
-        assert!(
-            expanded.contains("line 0") && expanded.contains("line 19"),
-            "chip expands to the full pasted text, got: {expanded}"
-        );
-    }
-
-    #[test]
-    fn huge_single_line_paste_also_collapses_to_a_chip() {
-        let mut a = fresh_app(Some("offline"));
-        // One line, but past the CHAR threshold → still chipped (1 line of noise
-        // is as unscrollable as 40 short ones).
-        let big = "x".repeat(PASTE_CHIP_MIN_CHARS + 50);
-        a.handle_paste(&big);
-        assert_eq!(a.text_stash.len(), 1, "one-line but huge → chipped");
-        assert!(
-            a.input.chars().count() < 30,
-            "box holds a compact chip, not the full {} chars",
-            big.len()
-        );
-        let expanded = a.expand_attachments(a.input.trim());
-        assert_eq!(expanded, big, "expands back to the exact pasted text");
-    }
-
-    #[test]
-    fn small_paste_inserts_inline_without_a_chip() {
-        let mut a = fresh_app(Some("offline"));
-        a.handle_paste("just a short note\nwith two lines");
-        assert_eq!(a.input, "just a short note\nwith two lines");
-        assert!(a.text_stash.is_empty(), "a small paste is never stashed");
-    }
-
-    #[test]
-    fn small_paste_normalizes_windows_cr_newlines() {
-        let mut a = fresh_app(Some("offline"));
-        a.handle_paste("first\rsecond\r\nthird");
-        assert_eq!(a.input, "first\nsecond\nthird");
-        assert!(a.text_stash.is_empty(), "a small paste stays inline");
-    }
-
-    #[test]
-    fn small_paste_strips_ansi_sequences() {
-        let mut a = fresh_app(Some("offline"));
-        a.handle_paste("\x1b[31mred\x1b[0m \x1b]0;title\x07plain \x1bPignored\x1b\\done");
-        assert_eq!(a.input, "red plain done");
-    }
-
-    #[test]
-    fn large_paste_stashes_normalized_windows_newlines() {
-        let mut a = fresh_app(Some("offline"));
-        let big = (0..20)
-            .map(|i| format!("row {i}"))
-            .collect::<Vec<_>>()
-            .join("\r");
-        a.handle_paste(&big);
-        assert_eq!(a.text_stash.len(), 1, "CR-separated paste is still bulky");
-        assert!(a.input.contains("粘贴") || a.input.contains("pasted"));
-        assert_eq!(a.text_stash[0], big.replace('\r', "\n"));
-    }
-
-    #[test]
-    fn dragging_a_file_into_the_input_pastes_its_path_verbatim() {
-        // Dropping a file onto the terminal is a PASTE of its path — and on Windows
-        // that path is backslashed, quoted when it contains spaces, and very often
-        // full of CJK. Every one of those is a way to mangle it: a backslash read as
-        // an escape, the quotes eaten, or a byte-sliced CJK segment. It arrives as one
-        // bracketed-paste burst (see EnableBracketedPaste), so it lands here whole.
-        let mut a = fresh_app(Some("offline"));
-        let dropped = "\"D:\\我的 项目\\需求文档\\说明.md\"";
-        a.handle_paste(dropped);
-        assert_eq!(
-            a.input, dropped,
-            "a dropped path must reach the input exactly as the terminal sent it"
-        );
-        // And it is ONE line, so it must stay in the input box rather than being
-        // stashed away behind a [pasted N lines] chip the user then cannot edit.
-        assert!(
-            a.text_stash.is_empty(),
-            "a single dropped path is not a bulk paste"
-        );
-
-        // The same path unquoted (no spaces to quote), dropped at the cursor inside
-        // text the user had already typed — the splice must stay on char boundaries.
-        let mut b = fresh_app(Some("offline"));
-        for c in "看看 ".chars() {
-            let _ = b.apply_key(KeyCode::Char(c));
-        }
-        b.handle_paste("D:\\项目\\readme.md");
-        assert_eq!(b.input, "看看 D:\\项目\\readme.md");
-    }
-
-    #[test]
-    fn paste_preserves_tab_indentation() {
-        // Low finding — the insert filter keeps `\n` but used to drop ALL other
-        // control chars, silently stripping every `\t` out of pasted tab-indented
-        // code. Tabs must survive (other control chars still dropped).
-        let mut a = fresh_app(Some("offline"));
-        a.insert_str_at_cursor("\tfn main() {\n\t\tprintln!();\n\t}");
-        assert_eq!(
-            a.input, "\tfn main() {\n\t\tprintln!();\n\t}",
-            "pasted tab indentation must be preserved verbatim"
-        );
-        // A stray control char (e.g. a bell) is still filtered out.
-        let mut b = fresh_app(Some("offline"));
-        b.insert_str_at_cursor("a\u{7}b");
-        assert_eq!(
-            b.input, "ab",
-            "non-tab/newline control chars are still dropped"
-        );
-    }
-
-    #[test]
-    fn two_large_pastes_each_stash_and_expand_independently() {
-        let mut a = fresh_app(Some("offline"));
-        let a_text = numbered_lines("alpha", 15);
-        let b_text = numbered_lines("beta", 18);
-        a.handle_paste(&a_text);
-        a.handle_paste(&b_text);
-        assert_eq!(a.text_stash.len(), 2, "two pastes → two stash entries");
-        let expanded = a.expand_attachments(a.input.trim());
-        assert!(
-            expanded.contains("alpha 14") && expanded.contains("beta 17"),
-            "each chip expands to its OWN stashed text, got: {expanded}"
-        );
-    }
-
-    #[test]
-    fn paste_chip_is_fail_open_clear_resets_stash_and_expand_noops() {
-        let mut a = fresh_app(Some("offline"));
-        // expand with nothing stashed/attached returns the text unchanged.
-        assert_eq!(a.expand_attachments("hello"), "hello");
-        let big = numbered_lines("row", 30);
-        a.handle_paste(&big);
-        assert_eq!(a.text_stash.len(), 1);
-        a.clear_input();
-        assert!(a.text_stash.is_empty(), "clear_input drops the stash");
-        assert!(a.input.is_empty());
-    }
-
-    #[test]
-    fn large_paste_near_input_cap_never_orphans_the_stash() {
-        // Mirrors the image-chip cap guard: if the visible `[pasted N lines]`
-        // token cannot fit WHOLE, do not stash the backing text. A partial chip
-        // would not expand on submit, silently dropping the pasted content.
-        let big = numbered_lines("row", 30);
-
-        let mut a = fresh_app(Some("offline"));
-        let chip = a.text_chip(&big);
-        let room = chip.chars().count().saturating_sub(1);
-        a.input = "x".repeat(INPUT_CAP - room);
-        a.input_cursor = a.input_len();
-        let before = a.input.clone();
-        a.handle_paste(&big);
-        assert_eq!(a.input, before, "no partial paste chip should be inserted");
-        assert!(
-            a.text_stash.is_empty(),
-            "no backing stash should exist without a complete chip"
-        );
-
-        let mut b = fresh_app(Some("offline"));
-        let chip = b.text_chip(&big);
-        b.input = "y".repeat(INPUT_CAP - chip.chars().count());
-        b.input_cursor = b.input_len();
-        b.handle_paste(&big);
-        assert_eq!(b.text_stash.len(), 1, "the complete chip fits");
-        assert!(b.input.ends_with(&chip), "chip landed whole: {}", b.input);
-        assert_eq!(
-            b.expand_attachments(&b.input),
-            format!("{}{}", "y".repeat(INPUT_CAP - chip.chars().count()), big),
-            "the fitted chip expands to the exact pasted text"
-        );
-    }
-
-    // ---- chip-aware deletion (user-reported: backspace "does nothing" on a chip) -
-
-    /// Attach a throwaway PNG so `handle_paste(path)` produces an `[图片 N]` chip
-    /// backed by a real `attachments` entry. Returns the temp dir (keep it alive).
-    fn attach_one_image(app: &mut App) -> tempfile::TempDir {
-        let dir = tempfile::TempDir::new().unwrap();
-        let img = dir.path().join("shot.png");
-        std::fs::write(&img, b"\x89PNG\r\n\x1a\n").unwrap();
-        app.handle_paste(img.to_str().unwrap());
-        dir
-    }
-
-    #[test]
-    fn image_paste_near_input_cap_never_orphans_the_attachment() {
-        // Fix 5 — dragging an image when the input box is within a chip-width of
-        // INPUT_CAP must not push an attachment whose `[图片 N]` chip can't fit
-        // whole: that orphaned ref is silently dropped by `expand_attachments` on
-        // submit. Either the chip lands whole (attached) or the image is skipped
-        // (not attached) — never a pushed attachment with no chip in the buffer.
-        let dir = tempfile::TempDir::new().unwrap();
-        let img = dir.path().join("shot.png");
-        std::fs::write(&img, b"\x89PNG\r\n\x1a\n").unwrap();
-        let path = img.to_str().unwrap().to_string();
-
-        // Invariant: every backing image attachment has an intact chip in `input`.
-        let no_orphan =
-            |a: &App| (0..a.attachments.len()).all(|i| a.input.contains(&a.image_chip(i + 1)));
-
-        // Case 1: NO room for the whole chip → the image is skipped, not orphaned.
-        let mut a = fresh_app(Some("offline"));
-        a.input = "x".repeat(INPUT_CAP - 2); // room = 2 < chip width
-        a.input_cursor = a.input_len();
-        a.handle_paste(&path);
-        assert!(
-            a.attachments.is_empty(),
-            "no room for the chip → the image is skipped, not orphaned"
-        );
-        assert!(no_orphan(&a), "no attachment left without its chip");
-
-        // Case 2: room for the chip (+ its space) → the image attaches with a real
-        // chip and expands to its `@path` mention on submit.
-        let mut b = fresh_app(Some("offline"));
-        let chip_width = b.image_chip(1).chars().count();
-        b.input = "y".repeat(INPUT_CAP - chip_width - 1); // room = chip + space
-        b.input_cursor = b.input_len();
-        b.handle_paste(&path);
-        assert_eq!(b.attachments.len(), 1, "the chip fits → the image attaches");
-        assert!(
-            no_orphan(&b),
-            "the attached image has its chip in the buffer"
-        );
-        assert!(
-            b.expand_attachments(&b.input)
-                .contains(&format!("@{}", b.attachments[0].display())),
-            "the attached image expands to its @path on submit (not dropped)"
-        );
-    }
-
-    #[test]
-    fn backspace_after_a_chip_removes_the_whole_chip_and_drops_its_ref() {
-        let mut app = fresh_app(Some("offline"));
-        let _dir = attach_one_image(&mut app);
-        // Buffer is now "[图片 1] " — caret right after the trailing space.
-        let chip = app.image_chip(1);
-        assert!(app.input.contains(&chip));
-        assert_eq!(app.attachments.len(), 1);
-        // First Backspace eats the space the paste appended (normal char delete).
-        app.backspace();
-        assert!(
-            app.input.ends_with(']'),
-            "space gone, chip intact: {:?}",
-            app.input
-        );
-        assert_eq!(app.attachments.len(), 1, "the space is not a chip");
-        // Caret is now flush against `]` → ONE Backspace removes the entire chip
-        // (not just the bracket) and drops the backing attachment.
-        app.backspace();
-        assert!(
-            !app.input.contains('图') && !app.input.contains('['),
-            "the whole chip is gone in one stroke, got: {:?}",
-            app.input
-        );
-        assert!(app.attachments.is_empty(), "backing image ref dropped");
-        assert_eq!(app.input_cursor, app.input_len());
-    }
-
-    #[test]
-    fn chip_delete_works_with_cjk_around_it_screenshot_shape() {
-        // The exact reported buffer: "shiyong的[图片 1] 出".
-        let mut app = fresh_app(Some("offline"));
-        app.insert_str_at_cursor("shiyong的");
-        let _dir = attach_one_image(&mut app); // appends "[图片 1] "
-        app.insert_str_at_cursor("出");
-        assert_eq!(app.input, format!("shiyong的{} 出", app.image_chip(1)));
-        // Peel the trailing CJK + the space (plain deletes, no panic).
-        app.backspace(); // 出
-        app.backspace(); // space
-        assert_eq!(app.input, format!("shiyong的{}", app.image_chip(1)));
-        assert_eq!(app.attachments.len(), 1, "chip still present, ref kept");
-        // Caret flush against the chip → one stroke clears it as a unit.
-        app.backspace();
-        assert_eq!(app.input, "shiyong的", "chip removed atomically");
-        assert!(app.attachments.is_empty(), "ref dropped");
-        // The CJK before the chip still deletes normally afterward.
-        app.backspace();
-        assert_eq!(app.input, "shiyong");
-    }
-
-    #[test]
-    fn char_immediately_before_a_chip_deletes_normally() {
-        let mut app = fresh_app(Some("offline"));
-        app.insert_str_at_cursor("ab");
-        let _dir = attach_one_image(&mut app); // "ab[图片 1] "
-                                               // Move the caret to just before the `[` of the chip (after "ab").
-        app.input_cursor = 2;
-        app.backspace(); // deletes 'b', NOT the chip
-        assert_eq!(app.input, format!("a{} ", app.image_chip(1)));
-        assert_eq!(app.attachments.len(), 1, "chip untouched, ref kept");
-    }
-
-    #[test]
-    fn forward_delete_on_a_chip_removes_it_as_a_unit() {
-        let mut app = fresh_app(Some("offline"));
-        let _dir = attach_one_image(&mut app); // "[图片 1] "
-        app.input_cursor = 0; // caret at the chip's left edge
-        app.forward_delete();
-        assert_eq!(app.input, " ", "chip gone, trailing space remains");
-        assert!(app.attachments.is_empty(), "backing ref dropped");
-    }
-
-    #[test]
-    fn typing_inside_a_chip_drops_the_broken_attachment_instead_of_mis_submitting() {
-        // Low/Med: overtyping INTERIOR to a `[图片 1]` chip splits its token so
-        // `expand_attachments` can no longer match it. Before the fix the corrupted
-        // literal was submitted verbatim and the image silently dropped. The insert
-        // paths are now chip-aware: an interior insert reconciles, dropping the
-        // now-broken chip's backing ref so submit can't mis-send a corrupted token.
-        let mut app = fresh_app(Some("offline"));
-        let _dir = attach_one_image(&mut app); // "[图片 1] "
-        assert_eq!(app.attachments.len(), 1);
-        // Caret between `图` (1) and `片` (2) — strictly interior to span (0,6).
-        app.input_cursor = 2;
-        app.insert_at_cursor('X');
-        // The backing image ref is dropped (no orphaned attachment left behind).
-        assert!(
-            app.attachments.is_empty(),
-            "interior insert into a chip must drop its broken ref, got: {:?}",
-            app.attachments
-        );
-        // Submit no longer mis-expands a corrupted token to a real `@path`.
-        let expanded = app.expand_attachments(app.input.trim());
-        assert!(
-            !expanded.contains('@'),
-            "the corrupted chip must not mis-submit a path, got: {expanded}"
-        );
-    }
-
-    #[test]
-    fn pasting_inside_a_chip_drops_the_broken_attachment() {
-        // Same hazard via the bulk `insert_str_at_cursor` (bracketed paste / IME).
-        let mut app = fresh_app(Some("offline"));
-        let _dir = attach_one_image(&mut app); // "[图片 1] "
-        app.input_cursor = 3; // interior (between `片` and the space inside the token)
-        app.insert_str_at_cursor("zzz");
-        assert!(
-            app.attachments.is_empty(),
-            "interior paste into a chip must drop its broken ref"
-        );
-        assert!(!app.expand_attachments(app.input.trim()).contains('@'));
-    }
-
-    #[test]
-    fn typing_at_a_chip_edge_keeps_the_attachment_intact() {
-        // Guard the boundary: inserting AT an edge (cursor == start or == end) is
-        // adjacent, not interior — the `[图片 N]` token stays whole and the image
-        // must survive (the fix must not over-reconcile a still-valid chip).
-        let mut app = fresh_app(Some("offline"));
-        let _dir = attach_one_image(&mut app); // "[图片 1] "
-        let chip_end = app.image_chip(1).chars().count(); // == 6, the `]` boundary
-        app.input_cursor = chip_end; // flush against the right edge, not interior
-        app.insert_at_cursor('Z');
-        assert_eq!(app.attachments.len(), 1, "an edge insert keeps the chip");
-        let expanded = app.expand_attachments(app.input.trim());
-        assert!(
-            expanded.contains('@'),
-            "the intact chip still expands to its path, got: {expanded}"
-        );
-    }
-
-    #[test]
-    fn middle_chip_delete_renumbers_remaining_chips_in_lockstep() {
-        // Two images: deleting the FIRST must renumber the second to `[图片 1]`
-        // and keep it bound to its OWN path (a naive Vec::remove would submit the
-        // wrong file or drop one).
-        let mut app = fresh_app(Some("offline"));
-        let dir = tempfile::TempDir::new().unwrap();
-        let img1 = dir.path().join("one.png");
-        let img2 = dir.path().join("two.png");
-        std::fs::write(&img1, b"\x89PNG\r\n\x1a\n1").unwrap();
-        std::fs::write(&img2, b"\x89PNG\r\n\x1a\n2").unwrap();
-        app.handle_paste(img1.to_str().unwrap()); // "[图片 1] "
-        app.handle_paste(img2.to_str().unwrap()); // "[图片 1] [图片 2] "
-        assert_eq!(app.attachments.len(), 2);
-        let abs2 = std::fs::canonicalize(&img2).unwrap();
-        // Delete the FIRST chip: caret right after its `]` (char index = chip len).
-        let first_end = app.image_chip(1).chars().count();
-        app.input_cursor = first_end;
-        app.backspace();
-        assert_eq!(app.attachments.len(), 1, "one image left");
-        // The survivor renumbered to `[图片 1]` and still expands to img2's path.
-        assert!(
-            app.input.contains(&app.image_chip(1)) && !app.input.contains(&app.image_chip(2)),
-            "survivor renumbered to chip 1, got: {:?}",
-            app.input
-        );
-        let expanded = app.expand_attachments(app.input.trim());
-        assert!(
-            expanded.contains(&format!("@{}", abs2.display())),
-            "survivor still bound to its OWN path, got: {expanded}"
-        );
-    }
-
-    #[test]
-    fn ctrl_w_swallows_a_chip_flush_against_the_caret() {
-        let mut app = fresh_app(Some("offline"));
-        app.insert_str_at_cursor("hi ");
-        let _dir = attach_one_image(&mut app); // "hi [图片 1] "
-                                               // Trim the trailing space so the caret is flush against `]`.
-        app.backspace();
-        assert!(app.input.ends_with(']'));
-        app.delete_word_back(); // Ctrl+W
-        assert_eq!(app.input, "hi ", "the whole chip is one word-kill unit");
-        assert!(app.attachments.is_empty(), "ref dropped by Ctrl+W");
-    }
-
-    #[test]
-    fn ctrl_u_clears_chips_and_drops_all_refs_no_orphan() {
-        let mut app = fresh_app(Some("offline"));
-        let _dir = attach_one_image(&mut app); // "[图片 1] "
-        app.insert_str_at_cursor("tail");
-        app.delete_to_line_start(); // Ctrl+U from end → wipes the line
-        assert!(app.input.is_empty(), "line cleared");
-        assert!(
-            app.attachments.is_empty(),
-            "no orphaned image ref after Ctrl+U"
-        );
-    }
-
-    #[test]
-    fn chip_delete_is_fail_open_on_a_cursor_past_the_buffer() {
-        // A desynced caret must never panic the editing helpers.
-        let mut app = fresh_app(Some("offline"));
-        let _dir = attach_one_image(&mut app);
-        app.input_cursor = app.input_len() + 5; // bogus, out of range
-        app.backspace(); // must not panic
-        app.forward_delete(); // must not panic
-        assert!(app.input_cursor <= app.input_len());
-    }
-
-    #[test]
-    fn chat_persists_and_a_restart_reopens_the_conversation() {
-        // Wave 5 / G11: a restart must reopen the SAME dialogue (no goldfish).
-        let (mut app, tmp) = temp_app();
-        app.record_user_turn("我在做一个看板应用");
-        // A host chat turn captured the base's OWN resumable session id (claude's
-        // pinned `--session-id`) — it must survive the restart so the base resumes its
-        // DEEP context, not just the replayed transcript.
-        app.record_agentic_done(
-            "好的,已经开始搭建。".to_string(),
-            false,
-            Some("base-sess-kanban".to_string()),
-        );
-        let saved_id = app.chat_id.clone();
-        assert_eq!(app.conversation.len(), 2);
-
-        // Simulate a restart: a brand-new App over the SAME project root.
-        let cfg = UserConfig {
-            backend: Some("claude-code".to_string()),
-            lang: Some("zh-CN".to_string()),
-            ..Default::default()
-        };
-        let app2 = App::new(
-            "demo",
-            cfg,
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        // The most-recent saved chat is reopened: same id, same transcript.
-        assert_eq!(app2.chat_id, saved_id, "restart reopens the saved chat id");
-        assert_eq!(app2.conversation.len(), 2);
-        assert_eq!(app2.conversation[0].content, "我在做一个看板应用");
-        assert_eq!(app2.conversation[1].role, "assistant");
-        // The base session id is restored so the NEXT host chat turn RESUMES the base's
-        // deep context (the resident pre-load opens it via `--resume <id>`), and the
-        // session is flagged active. This is the cross-session base-memory fix.
-        assert_eq!(
-            app2.chat_session_id.as_deref(),
-            Some("base-sess-kanban"),
-            "restart restores the base's resumable session id, not the chat file id"
-        );
-        assert!(
-            app2.host_chat_session_active,
-            "a restored base session id flags the chat session active"
-        );
-        // The restore note is surfaced so the user knows context was kept.
-        assert!(app2
-            .history
-            .iter()
-            .any(|m| m.role == ChatRole::System && m.body().contains("恢复")));
-    }
-
-    #[test]
-    fn slash_sessions_lists_saved_chats_and_resume_reopens_one() {
-        let (mut app, _tmp) = temp_app();
-        // Chat A — capture its OWN base session id (claude's pinned `--session-id`).
-        app.record_user_turn("第一个对话");
-        app.record_agentic_done("reply A".to_string(), false, Some("base-A".to_string()));
-        let id_a = app.chat_id.clone();
-        // `/clear` starts a FRESH persistent chat (A stays on disk).
-        let _ = app.try_slash_command("/clear");
-        assert_ne!(app.chat_id, id_a, "/clear mints a new chat id");
-        app.record_user_turn("第二个对话");
-        app.record_agentic_done("reply B".to_string(), false, Some("base-B".to_string()));
-
-        // `/sessions` lists BOTH saved chats.
-        let _ = app.try_slash_command("/sessions");
-        assert!(app
-            .history
-            .iter()
-            .any(|m| m.body().contains(&id_a) && m.body().contains("已保存")));
-
-        // `/resume <id_a>` reopens chat A's transcript. Clear the dirty flag first so
-        // the assertion below proves `/resume` (not the earlier `/clear`) set it.
-        app.chat_session_dirty = false;
-        let _ = app.try_slash_command(&format!("/resume {id_a}"));
-        assert_eq!(app.chat_id, id_a);
-        assert_eq!(app.conversation[0].content, "第一个对话");
-        // The base session is pinned to chat A's OWN persisted base session id
-        // (`base-A`), NOT the chat FILE id (`id_a`) — the bug fix: a host CLI resumes
-        // the conversation IT created, not an id it never saw. The resident session
-        // is flagged dirty so the loop re-opens against the resumed base id.
-        assert_eq!(app.chat_session_id.as_deref(), Some("base-A"));
-        assert!(app.host_chat_session_active);
-        assert!(
-            app.chat_session_dirty,
-            "/resume flags the resident session for re-open against the resumed base id"
-        );
-    }
-
-    #[test]
-    fn backend_switch_keeps_conversation_clears_resume_id_and_records_one_handoff() {
-        // The reported context-loss chain, link by link: a `/backend` switch must
-        // (a) KEEP `conversation` (the bounded transcript the new base's first
-        // directive front-loads), (b) CLEAR the old base's resumable session id (a
-        // claude id means nothing to codex — the post-switch pre-load must open
-        // FRESH, `resume_session_id = None`), and (c) record exactly ONE context
-        // handoff block into the conversation so the new base + the user both see
-        // what carried over.
-        let (mut app, _tmp) = temp_app();
-        app.record_user_turn("MARKER-EARLIER-TURN 我要一个登录页");
-        app.record_agentic_done(
-            "已完成登录页初版".to_string(),
-            false,
-            Some("claude-sess-1".to_string()),
-        );
-        assert_eq!(app.chat_session_id.as_deref(), Some("claude-sess-1"));
-        let chat_id_before = app.chat_id.clone();
-
-        let action = app.slash_backend(Some("codex"));
-        assert_eq!(action, Action::BackendChanged);
-        // (a) the conversation SURVIVES the switch.
-        assert!(
-            app.conversation
-                .iter()
-                .any(|m| m.content.contains("MARKER-EARLIER-TURN")),
-            "the bounded transcript must survive a backend switch"
-        );
-        assert_eq!(
-            app.chat_id, chat_id_before,
-            "a backend switch never re-mints the chat id"
-        );
-        // (b) the old base's resume pointer is invalidated → the `BackendChanged`
-        // pre-load passes `None` (`app.chat_session_id.clone()`), a fresh open.
-        assert!(
-            app.chat_session_id.is_none(),
-            "a claude session id must not be resumed on codex"
-        );
-        assert!(!app.host_chat_session_active);
-        assert!(
-            app.chat_session_dirty,
-            "the old base's resident session is flagged for close"
-        );
-        // (c) exactly ONE handoff block, in the conversation (the new base sees it)
-        // AND on screen (the user sees it).
-        let handoff = umadev_i18n::tf(app.lang, "backend.handoff", &["claude-code", "codex"]);
-        assert_eq!(
-            app.conversation
-                .iter()
-                .filter(|m| m.role == "system" && m.content == handoff)
-                .count(),
-            1,
-            "exactly one context-handoff block is recorded"
-        );
-        assert!(
-            app.history
-                .iter()
-                .any(|m| m.role == ChatRole::System && m.body() == handoff),
-            "the handoff note is also shown to the user"
-        );
-        // Switching back records a SECOND, direction-reversed handoff (once per switch).
-        let _ = app.slash_backend(Some("claude-code"));
-        let back = umadev_i18n::tf(app.lang, "backend.handoff", &["codex", "claude-code"]);
-        assert_eq!(
-            app.conversation
-                .iter()
-                .filter(|m| m.content == back)
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn backend_switch_records_no_handoff_for_same_base_or_empty_chat() {
-        // Same target → not a real switch → no handoff block.
-        let (mut app, _tmp) = temp_app();
-        app.record_user_turn("你好");
-        let _ = app.slash_backend(Some("claude-code"));
-        assert!(
-            !app.conversation.iter().any(|m| m.role == "system"),
-            "re-selecting the current base records no handoff"
-        );
-        // Empty conversation → nothing to hand over → no block (fail-open).
-        let (mut app, _tmp) = temp_app();
-        let _ = app.slash_backend(Some("codex"));
-        assert!(
-            app.conversation.is_empty(),
-            "an empty chat records no handoff block"
-        );
-    }
-
-    #[test]
-    fn resumed_chat_survives_a_backend_switch_into_the_new_base_first_directive() {
-        // The exact reported repro, end to end: work on claude in one process →
-        // relaunch in ANOTHER process → resume the saved chat by id → switch to
-        // codex → the NEXT turn's first directive (what codex actually receives)
-        // must carry the pre-resume dialogue AND the handoff marker. This is the
-        // full chain: persist → load_chat → slash_backend → conversation_snapshot →
-        // first_chat_directive.
-        let (mut app, tmp) = temp_app();
-        app.record_user_turn("MARKER-RESUME-A17 我们决定数据层用 SQLite");
-        app.record_agentic_done(
-            "好的,就用 SQLite,表结构已经定了".to_string(),
-            false,
-            Some("claude-deep-sess-9".to_string()),
-        );
-        let saved_chat_id = app.chat_id.clone();
-        drop(app);
-
-        // A brand-new process over the SAME project root (the native-terminal case).
-        let cfg = UserConfig {
-            backend: Some("claude-code".to_string()),
-            lang: Some("zh-CN".to_string()),
-            ..Default::default()
-        };
-        let mut app2 = App::new(
-            "demo",
-            cfg,
-            tmp.path().join("config2.toml"),
-            tmp.path().to_path_buf(),
-        );
-        // Resume the saved chat explicitly (the `/resume <id>` path).
-        let _ = app2.try_slash_command(&format!("/resume {saved_chat_id}"));
-        assert_eq!(app2.chat_id, saved_chat_id);
-        assert_eq!(
-            app2.chat_session_id.as_deref(),
-            Some("claude-deep-sess-9"),
-            "the resumed chat restores the OLD base's resumable id"
-        );
-
-        // Switch to codex mid-conversation.
-        let action = app2.slash_backend(Some("codex"));
-        assert_eq!(action, Action::BackendChanged);
-        assert!(
-            app2.chat_session_id.is_none(),
-            "the claude session id is dropped — the codex pre-load opens fresh"
-        );
-
-        // The NEXT turn's first directive on the new base: front-load the snapshot
-        // exactly as `drive_chat_session_turn` does for a Warm codex session.
-        let convo = app2.conversation_snapshot();
-        let directive =
-            crate::first_chat_directive(Some("FW-CODEX"), "codex", &convo, "接着把接口做完");
-        assert!(
-            directive.contains("MARKER-RESUME-A17"),
-            "the first directive on the new base must carry the resumed dialogue: {directive:?}"
-        );
-        assert!(
-            directive.contains("SQLite"),
-            "prior decisions ride the front-load: {directive:?}"
-        );
-        let handoff = umadev_i18n::tf(app2.lang, "backend.handoff", &["claude-code", "codex"]);
-        assert!(
-            directive.contains(&handoff),
-            "the handoff block reaches the new base inside the front-load: {directive:?}"
-        );
-        assert!(
-            directive.starts_with("FW-CODEX"),
-            "codex has no native system slot — firmware is front-loaded too"
-        );
-        assert!(
-            directive.contains("接着把接口做完"),
-            "the current ask closes the directive"
-        );
-    }
-
-    #[test]
-    fn resume_unknown_id_is_fail_open() {
-        let (mut app, _tmp) = temp_app();
-        app.record_user_turn("hi");
-        let before = app.conversation.clone();
-        let _ = app.try_slash_command("/resume does-not-exist");
-        // The live conversation is untouched; a clear note explains why.
-        assert_eq!(app.conversation, before);
-        assert!(app
-            .history
-            .iter()
-            .any(|m| m.role == ChatRole::System && m.body().contains("没找到")));
-    }
-
-    /// (a) `ChatSession` round-trips `base_session_id`, and an OLD chat file written
-    /// before the field existed deserializes to `None` (back-compat / fail-open).
-    #[test]
-    fn chat_session_round_trips_base_session_id_and_is_back_compat() {
-        // New schema → the base session id survives a serialize/deserialize cycle.
-        let s = ChatSession {
-            id: "chat-1".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-            backend: "claude-code".to_string(),
-            base_session_id: Some("base-xyz".to_string()),
-            messages: vec![umadev_runtime::Message {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }],
-            display: Some(vec![ChatMessage {
-                role: ChatRole::You,
-                kind: MessageBody::Text("hi".to_string()),
-                collapsed: false,
-            }]),
-        };
-        let json = serde_json::to_string(&s).unwrap();
-        let back: ChatSession = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.base_session_id.as_deref(), Some("base-xyz"));
-        // Wave 3 — the display transcript round-trips through the same file.
-        let display = back.display.expect("the display rows round-trip");
-        assert_eq!(display.len(), 1);
-        assert_eq!(display[0].role, ChatRole::You);
-        assert_eq!(display[0].body(), "hi");
-
-        // OLD file (no `base_session_id` / `display` key) → `#[serde(default)]`
-        // yields `None` for both (back-compat / fail-open).
-        let legacy = r#"{"id":"old","updated_at":"x","backend":"codex",
-            "messages":[{"role":"user","content":"hi"}]}"#;
-        let parsed: ChatSession = serde_json::from_str(legacy).unwrap();
-        assert_eq!(
-            parsed.base_session_id, None,
-            "an old chat file without the field loads as None (back-compat)"
-        );
-        assert_eq!(
-            parsed.display, None,
-            "an old chat file without display rows loads as None (Wave 3 back-compat)"
-        );
-        assert_eq!(parsed.messages.len(), 1, "the transcript still loads");
-    }
-
-    /// (c) `persist_chat` writes the LIVE `chat_session_id` into the saved
-    /// `base_session_id`; (b) `load_chat` restores it into `chat_session_id` and flags
-    /// the host chat session active.
-    #[test]
-    fn persist_writes_and_load_restores_the_base_session_id() {
-        let (mut app, _tmp) = temp_app();
-        app.record_user_turn("第一句");
-        // The live base session id (captured off a host turn) is persisted.
-        app.chat_session_id = Some("base-live".to_string());
-        app.persist_chat();
-        let saved_id = app.chat_id.clone();
-
-        // (c) The on-disk record carries the base session id.
-        let path = app.chat_path(&saved_id);
-        let text = std::fs::read_to_string(&path).unwrap();
-        let on_disk: ChatSession = serde_json::from_str(&text).unwrap();
-        assert_eq!(on_disk.base_session_id.as_deref(), Some("base-live"));
-
-        // (b) A fresh App with the id cleared, then `load_chat`, restores it + flags.
-        app.chat_session_id = None;
-        app.host_chat_session_active = false;
-        assert!(app.load_chat(&saved_id), "the saved chat loads");
-        assert_eq!(
-            app.chat_session_id.as_deref(),
-            Some("base-live"),
-            "load_chat restores the base session id"
-        );
-        assert!(
-            app.host_chat_session_active,
-            "a restored base session id flags the host chat session active"
-        );
-    }
-
-    /// (b, fail-open) Loading a chat whose `base_session_id` is `None` (an old file /
-    /// opencode / offline) leaves `chat_session_id` `None` and does NOT force the
-    /// session active — degrading cleanly to today's fresh-session behavior.
-    #[test]
-    fn load_chat_with_no_base_session_id_is_fail_open() {
-        let (mut app, _tmp) = temp_app();
-        app.record_user_turn("仅文本");
-        app.chat_session_id = None; // no base id captured (e.g. opencode)
-        app.persist_chat();
-        let saved_id = app.chat_id.clone();
-
-        app.host_chat_session_active = false;
-        assert!(app.load_chat(&saved_id));
-        assert_eq!(
-            app.chat_session_id, None,
-            "no base session id → stays None (fresh session next turn)"
-        );
-        assert!(
-            !app.host_chat_session_active,
-            "a None base session id never force-flags the session active"
-        );
-    }
-
-    /// Wave 3 P0 — the VISIBLE display transcript round-trips: rich rows (a
-    /// structured tool row with its result, a system note) survive persist →
-    /// relaunch verbatim, a tool row saved mid-flight settles to Aborted, the
-    /// restored transcript ends with the divider, and the view re-pins to the
-    /// bottom.
-    #[test]
-    fn display_transcript_round_trips_rich_rows_and_ends_with_divider() {
-        let (mut app, tmp) = temp_app();
-        app.push(ChatRole::You, "做一个看板");
-        app.push(ChatRole::Host, "好的，开始搭建。");
-        // A finished tool row (result attached) + one still in flight.
-        app.history.push_back(ChatMessage {
-            role: ChatRole::Host,
-            kind: MessageBody::Tool(ToolCall {
-                name: "Bash".to_string(),
-                arg: "npm test".to_string(),
-                status: ToolStatus::Ok,
-                result: Some("42 tests passed".to_string()),
-                merged: false,
-                count: 1,
-                collapsed: true,
-            }),
-            collapsed: false,
-        });
-        app.history.push_back(ChatMessage {
-            role: ChatRole::Host,
-            kind: MessageBody::Tool(ToolCall {
-                name: "Write".to_string(),
-                arg: "src/app.tsx".to_string(),
-                status: ToolStatus::Running,
-                result: None,
-                merged: false,
-                count: 1,
-                collapsed: false,
-            }),
-            collapsed: false,
-        });
-        app.push(ChatRole::System, "note: checkpoint saved");
-        // A recorded exchange makes the chat persistable; `record_agentic_done`
-        // persists (transcript + the display snapshot above).
-        app.record_user_turn("做一个看板");
-        app.record_agentic_done("好的，开始搭建。".to_string(), false, None);
-
-        // Simulate a restart: a brand-new App over the SAME project root.
-        let cfg = UserConfig {
-            backend: Some("claude-code".to_string()),
-            lang: Some("zh-CN".to_string()),
-            ..Default::default()
-        };
-        let app2 = App::new(
-            "demo",
-            cfg,
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        // The rich rows were REBUILT, not flattened: the finished tool row keeps
-        // its structure, result, and fold state...
-        let ok_tool = app2
-            .history
-            .iter()
-            .find_map(|m| match &m.kind {
-                MessageBody::Tool(t) if t.name == "Bash" => Some(t.clone()),
-                _ => None,
-            })
-            .expect("the finished tool row survives the relaunch");
-        assert_eq!(ok_tool.status, ToolStatus::Ok);
-        assert_eq!(ok_tool.result.as_deref(), Some("42 tests passed"));
-        assert!(ok_tool.collapsed, "the fold state survives");
-        // ...the mid-flight tool row settled to Aborted (nothing spins forever)...
-        let write_tool = app2
-            .history
-            .iter()
-            .find_map(|m| match &m.kind {
-                MessageBody::Tool(t) if t.name == "Write" => Some(t.clone()),
-                _ => None,
-            })
-            .expect("the in-flight tool row survives the relaunch");
-        assert_eq!(
-            write_tool.status,
-            ToolStatus::Aborted,
-            "a restored mid-flight tool row settles to Aborted"
-        );
-        // ...and the prose + note rows are back too.
-        assert!(app2
-            .history
-            .iter()
-            .any(|m| m.role == ChatRole::You && m.body() == "做一个看板"));
-        assert!(app2
-            .history
-            .iter()
-            .any(|m| m.role == ChatRole::System && m.body() == "note: checkpoint saved"));
-        // The restored transcript ends with the divider, then the launch-time
-        // "restored N turns" note — and the view is pinned to the bottom.
-        let divider = umadev_i18n::t(app2.lang, "chat.restored_divider");
-        let rows: Vec<String> = app2.history.iter().map(|m| m.body().to_string()).collect();
-        let divider_idx = rows
-            .iter()
-            .position(|b| b == divider)
-            .expect("the restore divider is present");
-        assert_eq!(
-            divider_idx,
-            rows.len() - 2,
-            "the restored rows end with the divider (only the restore note follows)"
-        );
-        assert!(
-            rows.last().unwrap().contains("恢复"),
-            "the chat.restored note follows the divider"
-        );
-        assert_eq!(
-            app2.transcript_scroll.get(),
-            0,
-            "the restored transcript lands pinned to the bottom"
-        );
-    }
-
-    /// Wave 3 P0 back-compat — an OLD session file (persisted before the
-    /// `display` field existed) still reopens VISIBLE: the prose conversation is
-    /// seeded from the durable transcript (user → You, assistant → Host), ends
-    /// with the divider, and never crashes.
-    #[test]
-    fn old_session_file_without_display_seeds_prose_history() {
-        let (mut app, _tmp) = temp_app();
-        let dir = app.project_root.join(".umadev").join("chat");
-        std::fs::create_dir_all(&dir).unwrap();
-        let legacy = r#"{"id":"legacy-1","updated_at":"2026-01-01T00:00:00Z","backend":"claude-code",
-            "messages":[{"role":"user","content":"老问题"},{"role":"assistant","content":"老回答"}]}"#;
-        std::fs::write(dir.join("legacy-1.json"), legacy).unwrap();
-
-        assert!(
-            app.load_chat("legacy-1"),
-            "an old file without display rows still loads"
-        );
-        assert!(
-            app.history
-                .iter()
-                .any(|m| m.role == ChatRole::You && m.body() == "老问题"),
-            "the user turn is seeded as a visible You row"
-        );
-        assert!(
-            app.history
-                .iter()
-                .any(|m| m.role == ChatRole::Host && m.body() == "老回答"),
-            "the assistant turn is seeded as a visible Host row"
-        );
-        assert_eq!(
-            app.history.back().unwrap().body(),
-            umadev_i18n::t(app.lang, "chat.restored_divider"),
-            "the seeded transcript ends with the restore divider"
-        );
-        assert_eq!(app.transcript_scroll.get(), 0);
-    }
-
-    /// Wave 3 P0 fail-open — a corrupt `display` field can never take the chat
-    /// down: a wrong-typed field falls back to prose seeding, and a corrupt ROW
-    /// inside an otherwise-good array is skipped element-wise while the valid
-    /// rows survive.
-    #[test]
-    fn corrupt_display_field_falls_back_cleanly() {
-        let (mut app, _tmp) = temp_app();
-        let dir = app.project_root.join(".umadev").join("chat");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // (a) `display` is the wrong TYPE entirely → lenient parse yields None →
-        // the prose conversation is seeded from the durable transcript.
-        let wrong_type = r#"{"id":"corrupt-a","updated_at":"x","backend":"codex",
-            "messages":[{"role":"user","content":"你好"}],"display":"not-an-array"}"#;
-        std::fs::write(dir.join("corrupt-a.json"), wrong_type).unwrap();
-        assert!(
-            app.load_chat("corrupt-a"),
-            "a corrupt display field never fails the load"
-        );
-        assert!(
-            app.history
-                .iter()
-                .any(|m| m.role == ChatRole::You && m.body() == "你好"),
-            "fell back to prose seeding from the durable transcript"
-        );
-
-        // (b) ONE corrupt row inside the array is skipped; the valid row survives
-        // (element-wise leniency — never all-or-nothing).
-        let mixed = r#"{"id":"corrupt-b","updated_at":"x","backend":"codex",
-            "messages":[{"role":"user","content":"第二"}],
-            "display":[{"bogus":true},{"role":"System","kind":{"Text":"手写行"},"collapsed":false}]}"#;
-        std::fs::write(dir.join("corrupt-b.json"), mixed).unwrap();
-        assert!(app.load_chat("corrupt-b"));
-        assert!(
-            app.history
-                .iter()
-                .any(|m| m.role == ChatRole::System && m.body() == "手写行"),
-            "the valid display row survives element-wise parsing"
-        );
-        assert!(
-            !app.history.iter().any(|m| m.body() == "第二"),
-            "the display path was used — no prose-seeding duplicate"
-        );
-    }
-
-    #[test]
-    fn slash_compact_runs_the_structured_summary_path() {
-        // `/compact` now folds via the SAME structured-summary path as
-        // auto-compaction (a forked base `complete()`), NOT the old lossy 160-char
-        // digest. The slash handler validates + signals `Action::Compact`; the
-        // event loop drives the fork; `apply_compaction` splices the result.
-        let (mut app, _tmp) = temp_app();
-        for i in 0..12 {
-            app.record_user_turn(&format!("user message {i}"));
-            app.record_agentic_done(format!("assistant reply {i}"), false, None);
-        }
-        // The slash handler signals intent (and pushes the "compacting…" note).
-        let action = app.try_slash_command("/compact").expect("a slash command");
-        assert!(matches!(action, Action::Compact));
-        // A manual job folds everything except the recent verbatim tail.
-        let job = app.begin_manual_compaction().expect("enough to fold");
-        assert!(job.fold_count >= umadev_agent::compaction::MIN_FOLD);
-        let before = app.conversation.len();
-        // Apply a stand-in structured summary — the same call the event loop makes
-        // when the fork returns its summary.
-        app.apply_compaction(
-            "## Intent / Goal\nBuild a kanban board.",
-            job.fold_count,
-            job.generation,
-        );
-        let after = app.conversation.len();
-        assert!(
-            after < before,
-            "compact must shrink the working view: {before}->{after}"
-        );
-        // The leading block is the structured summary (a user-role grounding note)
-        // and carries both the localized header and the model's section text.
-        assert_eq!(app.conversation[0].role, "user");
-        assert!(
-            app.conversation[0].content.contains("摘要"),
-            "the summary block carries the localized header"
-        );
-        assert!(
-            app.conversation[0].content.contains("Intent / Goal"),
-            "the structured summary body is preserved"
-        );
-        // The most-recent turn is preserved verbatim.
-        assert_eq!(
-            app.conversation.last().unwrap().content,
-            "assistant reply 11"
-        );
-        // The on-disk FULL transcript is untouched — every turn still present.
-        assert_eq!(app.full_transcript.len(), 24);
-        assert_eq!(
-            app.full_transcript.last().unwrap().content,
-            "assistant reply 11"
-        );
-    }
-
-    /// Build a conversation whose estimated token cost is comfortably over
-    /// [`COMPACTION_TOKEN_BUDGET`], so the auto-compaction trigger fires.
-    fn fill_over_budget(app: &mut App, exchanges: usize) {
-        for i in 0..exchanges {
-            app.record_user_turn(&format!("u{i} {}", "alpha ".repeat(80)));
-            app.record_agentic_done(format!("a{i} {}", "beta ".repeat(80)), false, None);
-        }
-    }
-
-    #[test]
-    fn auto_compaction_triggers_near_budget_and_keeps_tail_verbatim() {
-        // The token-budgeted trigger fires once the working transcript crosses the
-        // budget; applying the summary replaces the older prefix with ONE block and
-        // keeps the recent tail word-for-word.
-        let (mut app, _tmp) = temp_app();
-        fill_over_budget(&mut app, 16); // 32 messages of long content
-        assert!(
-            app.should_auto_compact(),
-            "a transcript over the token budget triggers compaction"
-        );
-        let total = app.conversation.len();
-        let last_user = app.conversation[total - 2].content.clone();
-        let last_asst = app.conversation[total - 1].content.clone();
-        let full_before = app.full_transcript.len();
-
-        let job = app.begin_auto_compaction().expect("a job near budget");
-        assert!(app.compaction_in_flight, "a job is now in flight");
-        assert!(job.fold_count >= umadev_agent::compaction::MIN_FOLD);
-        assert!(
-            job.fold_count < total,
-            "the recent tail must survive the fold"
-        );
-
-        app.apply_compaction(
-            "## Current work\nWiring the API.",
-            job.fold_count,
-            job.generation,
-        );
-        assert!(!app.compaction_in_flight, "the job settled");
-        // [structured summary] + [recent verbatim tail].
-        assert_eq!(app.conversation[0].role, "user");
-        assert!(app.conversation[0].content.contains("Current work"));
-        assert!(app.conversation[0].content.contains("摘要"));
-        assert_eq!(
-            app.conversation.last().unwrap().content,
-            last_asst,
-            "the most-recent reply is kept verbatim"
-        );
-        assert_eq!(
-            app.conversation[app.conversation.len() - 2].content,
-            last_user,
-            "the most-recent user turn is kept verbatim"
-        );
-        // The compacted working view is strictly smaller than the full history.
-        assert!(app.conversation.len() < full_before);
-        // The on-disk FULL transcript is untouched by compaction.
-        assert_eq!(app.full_transcript.len(), full_before);
-        assert_eq!(app.full_transcript.last().unwrap().content, last_asst);
-    }
-
-    #[test]
-    fn apply_compaction_marks_resident_session_dirty() {
-        // After a SUCCESSFUL fold the resident base session still holds the FULL
-        // pre-compaction history in its own process memory, and that is what drives
-        // each turn — so `apply_compaction` must flag it for close. The event loop
-        // then reopens a FRESH session that front-loads the COMPACTED transcript,
-        // which is what stops the base re-emitting folded turns (history bleed) and
-        // driving in stale build context (a plain question misrouted as a build).
-        let (mut app, _tmp) = temp_app();
-        fill_over_budget(&mut app, 16);
-        let job = app.begin_auto_compaction().expect("a job near budget");
-        // Seed an ACTIVE base-session pin so we can prove the fold breaks it: a fresh
-        // open that RESUMED this id would reload the base's full uncompacted native
-        // history and defeat the fold.
-        app.chat_session_id = Some("sid".into());
-        app.host_chat_session_active = true;
-        assert!(
-            !app.chat_session_dirty,
-            "no pending resident-close before the fold settles"
-        );
-        app.apply_compaction(
-            "## Current work\nWiring the API.",
-            job.fold_count,
-            job.generation,
-        );
-        assert!(
-            app.chat_session_dirty,
-            "a successful fold flags the resident base session for close so the next \
-             turn reopens fresh against the compacted transcript"
-        );
-        assert!(
-            app.chat_session_id.is_none(),
-            "the fold clears the base-session pin so the next open is truly fresh, not \
-             a resume of the full uncompacted native history"
-        );
-        assert!(
-            !app.host_chat_session_active,
-            "the fold breaks the active base session so the next turn does not continue \
-             the pre-compaction session"
-        );
-    }
-
-    #[test]
-    fn failed_summary_falls_back_to_fifo_without_losing_history() {
-        // Fail-open: a failed / empty / offline summary must NOT lose or corrupt the
-        // conversation — it falls back to the original FIFO drop on the working view,
-        // and the full transcript on disk is untouched.
-        let (mut app, _tmp) = temp_app();
-        for i in 0..40 {
-            app.record_user_turn(&format!("m{i}"));
-        }
-        let full_before = app.full_transcript.len();
-        // Pretend a summary was in flight and then failed.
-        app.compaction_in_flight = true;
-        app.fail_compaction();
-        assert!(!app.compaction_in_flight, "the failed job is cleared");
-        // Working view FIFO-bounded; the most-recent turn is still there (no corruption).
-        assert!(app.conversation.len() <= CONVERSATION_CAP);
-        assert_eq!(app.conversation.last().unwrap().content, "m39");
-        // The full transcript on disk kept EVERY message — nothing lost.
-        assert_eq!(app.full_transcript.len(), full_before);
-        assert_eq!(app.full_transcript.last().unwrap().content, "m39");
-    }
-
-    #[test]
-    fn circuit_breaker_suppresses_auto_compaction_while_tripped() {
-        // The breaker bounds retries: after N consecutive summary failures the
-        // trigger is suppressed (no more wasted base calls) until a success resets it.
-        let (mut app, _tmp) = temp_app();
-        fill_over_budget(&mut app, 16);
-        assert!(app.should_auto_compact(), "over budget → would compact");
-        for _ in 0..umadev_agent::compaction::Breaker::LIMIT {
-            app.compaction_breaker.record_failure();
-        }
-        assert!(
-            !app.should_auto_compact(),
-            "a tripped breaker suppresses the trigger even while over budget"
-        );
-        assert!(app.begin_auto_compaction().is_none());
-        // A later success un-trips it → compaction resumes.
-        app.compaction_breaker.record_success();
-        assert!(app.should_auto_compact());
-    }
-
-    #[test]
-    fn stale_compaction_result_is_dropped_after_clear() {
-        // A summary that returns AFTER a `/clear` carries a stale generation and must
-        // be dropped — it can never splice into the fresh conversation.
-        let (mut app, _tmp) = temp_app();
-        fill_over_budget(&mut app, 16);
-        let job = app.begin_auto_compaction().expect("a job");
-        // `/clear` happens while the summary is in flight → generation bumps.
-        let _ = app.try_slash_command("/clear");
-        let convo_after_clear = app.conversation.clone();
-        app.apply_compaction("late summary", job.fold_count, job.generation);
-        assert_eq!(
-            app.conversation, convo_after_clear,
-            "a stale summary is dropped, not spliced into the cleared conversation"
-        );
-    }
-
-    #[test]
-    fn director_run_finish_hands_session_back_to_chat() {
-        // Wave 5 deliverable 2: a finished director build hands its session to chat
-        // so the next chat turn continues the SAME build session. The build-ness now
-        // rides the terminal decision (`director_build: true`), NOT the pre-spawn
-        // `director_run_in_flight` flag — the chat surface classifies in the task.
-        let (mut app, _tmp) = temp_app();
-        app.director_run_in_flight = true;
-        app.record_agentic_done("built the app".to_string(), true, None);
-        assert!(
-            app.run_session_handed_to_chat,
-            "a finished director build hands its session back to chat"
-        );
-        assert!(
-            !app.director_run_in_flight,
-            "the in-flight marker is cleared"
-        );
-
-        // A PLAIN chat turn (`director_build: false`) does NOT trigger the handoff,
-        // even if the in-flight marker was left set.
-        app.run_session_handed_to_chat = false;
-        app.director_run_in_flight = true;
-        app.record_agentic_done("just chatting".to_string(), false, None);
-        assert!(
-            !app.run_session_handed_to_chat,
-            "a non-build turn never hands a session back"
-        );
-        assert!(
-            !app.director_run_in_flight,
-            "the in-flight marker is always cleared on a terminal turn"
-        );
-    }
-
-    #[test]
-    fn chat_session_id_is_stable_then_resets() {
-        let mut app = fresh_app(Some("claude-code"));
-        assert!(app.chat_session_id.is_none(), "no id until first host turn");
-
-        let id1 = app.ensure_chat_session_id();
-        let id2 = app.ensure_chat_session_id();
-        assert_eq!(id1, id2, "the id is minted once and stays stable");
-
-        // Looks like a v4 UUID: 8-4-4-4-12 hex, version nibble = 4.
-        let groups: Vec<&str> = id1.split('-').collect();
-        assert_eq!(
-            groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
-            vec![8, 4, 4, 4, 12]
-        );
-        assert!(id1.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
-        assert!(groups[2].starts_with('4'), "version nibble must be 4");
-
-        // /clear drops the id so the next turn starts a brand-new session.
-        let _ = app.try_slash_command("/clear");
-        assert!(app.chat_session_id.is_none());
-        assert_ne!(
-            app.ensure_chat_session_id(),
-            id1,
-            "a fresh session gets a fresh id"
-        );
-    }
-
-    #[test]
-    fn new_chat_session_ids_are_unique() {
-        let a = new_chat_session_id();
-        let b = new_chat_session_id();
-        assert_ne!(a, b, "back-to-back ids must differ");
-    }
-
-    #[test]
-    fn parse_notes_section_extracts_url() {
-        let body = "# Frontend notes\n\n## Preview URL\n\nhttp://localhost:5173\n\n## Run command\n\ncd web && npm run dev\n";
-        assert_eq!(
-            parse_notes_section(body, "Preview URL"),
-            Some("http://localhost:5173")
-        );
-        assert_eq!(
-            parse_notes_section(body, "Run command"),
-            Some("cd web && npm run dev")
-        );
-    }
-
-    #[test]
-    fn parse_notes_section_skips_placeholder() {
-        let body = "## Preview URL\n\n_(worker fills this)_\n\nhttp://localhost:3000\n";
-        // Skips the italic placeholder, returns the real URL.
-        assert_eq!(
-            parse_notes_section(body, "Preview URL"),
-            Some("http://localhost:3000")
-        );
-    }
-
-    #[test]
-    fn parse_notes_section_missing_returns_none() {
-        assert_eq!(parse_notes_section("no headings here", "Preview URL"), None);
-    }
-
-    #[test]
-    fn parse_notes_section_stops_at_next_heading() {
-        let body = "## Preview URL\n\nhttp://localhost:5173\n\n## Other\n\nhttp://wrong\n";
-        assert_eq!(
-            parse_notes_section(body, "Preview URL"),
-            Some("http://localhost:5173")
-        );
-    }
-
-    #[test]
-    fn preview_url_from_notes_reads_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let slug = "demo";
-        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
-        std::fs::write(
-            tmp.path()
-                .join("output")
-                .join(format!("{slug}-frontend-notes.md")),
-            "# Notes\n\n## Preview URL\n\nhttp://localhost:4321\n\n## Run command\n\nnpm run dev\n",
-        )
-        .unwrap();
-        let app = App::new(
-            slug.to_string(),
-            UserConfig {
-                backend: Some("offline".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        assert_eq!(
-            app.preview_url_from_notes().as_deref(),
-            Some("http://localhost:4321")
-        );
-        assert_eq!(app.run_command_from_notes().as_deref(), Some("npm run dev"));
-    }
-
-    #[test]
-    fn slash_preview_with_no_notes_gives_hint() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut app = App::new(
-            "demo".to_string(),
-            UserConfig {
-                backend: Some("offline".into()),
-                lang: Some("zh-CN".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        // No output dir / notes file → guidance message, no StartPreview.
-        let action = app.slash_preview();
-        assert!(matches!(action, Action::None));
-        assert!(app
-            .history
-            .iter()
-            .any(|m| m.body().contains("还没有可预览")));
-    }
-
-    #[test]
-    fn slash_preview_with_url_and_command_emits_start() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let slug = "demo";
-        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
-        std::fs::write(
-            tmp.path()
-                .join("output")
-                .join(format!("{slug}-frontend-notes.md")),
-            "## Preview URL\n\nhttp://localhost:5173\n\n## Run command\n\ncd web && npm run dev\n",
-        )
-        .unwrap();
-        let mut app = App::new(
-            slug.to_string(),
-            UserConfig {
-                backend: Some("offline".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        let action = app.slash_preview();
-        match action {
-            Action::StartPreview { url, command } => {
-                assert_eq!(url, "http://localhost:5173");
-                assert_eq!(command, "cd web && npm run dev");
-            }
-            other => panic!("expected StartPreview, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn slash_preview_ignores_harness_notes_when_real_frontend_exists() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let slug = "demo";
-        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
-        std::fs::create_dir_all(tmp.path().join("src/backend")).unwrap();
-        std::fs::create_dir_all(tmp.path().join("src/frontend")).unwrap();
-        std::fs::write(tmp.path().join("src/backend/server.mjs"), "listen()").unwrap();
-        std::fs::write(
-            tmp.path()
-                .join("output")
-                .join(format!("{slug}-frontend-notes.md")),
-            "## Preview URL\n\nhttp://127.0.0.1:4173\n\n## Run command\n\nnode src/backend/server.mjs\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(tmp.path().join("jeecgboot-vue3")).unwrap();
-        std::fs::write(
-            tmp.path().join("jeecgboot-vue3/package.json"),
-            r#"{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^5.0.0"}}"#,
-        )
-        .unwrap();
-
-        let mut app = App::new(
-            slug.to_string(),
-            UserConfig {
-                backend: Some("offline".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        let action = app.slash_preview();
-        match action {
-            Action::StartPreview { url, command } => {
-                assert_eq!(url, "http://localhost:5173");
-                assert_eq!(command, "cd jeecgboot-vue3 && npm run dev");
-            }
-            other => panic!("expected real frontend StartPreview, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn web_build_completion_card_has_files_entry_run_and_pending_preview() {
-        // A finished web build's card shows what changed + the key entry + the
-        // run command, and (when a dev server is detected) a "starting preview"
-        // line — the "✅ done + here's the demo" finish.
-        let (app, _tmp) = temp_app();
-        let root = app.project_root.clone();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("package.json"),
-            r#"{"dependencies":{"vite":"^5"},"scripts":{"dev":"vite"}}"#,
-        )
-        .unwrap();
-        std::fs::write(root.join("src").join("App.tsx"), "export default 1;").unwrap();
-
-        // A web project resolves a dev-server target (Vite) → preview is pending.
-        let target = app.auto_preview_target();
-        assert!(
-            target.is_some(),
-            "vite project must resolve a preview target"
-        );
-        let card = app.build_completion_card(target.is_some());
-        // Headline + the three substantive sections.
-        assert!(card.contains("构建完成"), "card carries the done headline");
-        assert!(
-            card.contains("App.tsx"),
-            "card names the key entry / a changed file"
-        );
-        assert!(
-            card.contains("vite") || card.contains("npm run dev"),
-            "card carries the run command: {card}"
-        );
-        // The "starting dev server…" placeholder shows because a server was found.
-        assert!(
-            card.contains(umadev_i18n::t(app.lang, "build.complete.preview_starting")),
-            "web card flags the pending preview"
-        );
-    }
-
-    #[test]
-    fn non_web_build_completion_card_has_no_preview_line_fail_open() {
-        // Fail-open: a non-web project detects no dev server → the card is still
-        // produced (✅ done + what changed) but carries NO preview line and the
-        // auto-preview target is None (so the event loop starts no server).
-        let (app, _tmp) = temp_app();
-        let root = app.project_root.clone();
-        // A pure-Rust project: a main.rs but no package.json / index.html.
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
-
-        assert!(
-            app.auto_preview_target().is_none(),
-            "a non-web project resolves no preview target"
-        );
-        let card = app.build_completion_card(false);
-        assert!(
-            card.contains("构建完成"),
-            "card still shows the done headline"
-        );
-        assert!(card.contains("main.rs"), "card names the rust entry");
-        assert!(
-            !card.contains(umadev_i18n::t(app.lang, "build.complete.preview_starting")),
-            "non-web card must NOT show a preview-starting line"
-        );
-    }
-
-    #[test]
-    fn build_completion_card_falls_back_to_dirs_without_git_delta() {
-        // No git repo (no porcelain delta) → the card still names a concrete
-        // product directory instead of an empty "files changed" section.
-        let (app, _tmp) = temp_app();
-        std::fs::create_dir_all(app.project_root.join("src")).unwrap();
-        let card = app.build_completion_card(false);
-        assert!(card.contains("构建完成"));
-        assert!(
-            card.contains("src"),
-            "falls back to naming an output dir: {card}"
-        );
-    }
-
-    #[test]
-    fn build_completion_card_persists_task_statuses_before_panel_clears() {
-        // The user's core ask: when a build finishes — worst when it ends
-        // INCOMPLETE — the completion card must carry the per-step task
-        // breakdown (which are DONE, BLOCKED, INCOMPLETE), because the live
-        // `/plan` panel is cleared right after. This proves the ordering holds:
-        // `post_build_completion_card` reads the rows for the card BEFORE
-        // `finalize_live_panels` clears them, so the statuses survive in the
-        // transcript even though the panel goes away.
-        let (mut app, _tmp) = temp_app();
-        // Real source so a completion card is legitimate; a non-web project so
-        // no dev server is started under the unit test.
-        std::fs::create_dir_all(app.project_root.join("src")).unwrap();
-        std::fs::write(app.project_root.join("src").join("main.rs"), "fn main(){}").unwrap();
-        // A plan that ended INCOMPLETE: 2 done, 1 blocked, 1 pending.
-        app.apply_engine(EngineEvent::PlanPosted {
-            steps: vec![
-                "s1 · scaffold (frontend)".into(),
-                "s2 · login route (backend)".into(),
-                "s3 · login form (frontend)".into(),
-                "s4 · e2e review (qa)".into(),
-            ],
-            statuses: vec![
-                "done".into(),
-                "done".into(),
-                "blocked".into(),
-                "pending".into(),
-            ],
-            done: 2,
-            total: 4,
-        });
-        // Build + push the card through the REAL finalize path (the one that
-        // also clears the live panel afterwards).
-        let target = app.post_build_completion_card();
-        assert!(target.is_none(), "non-web build resolves no preview target");
-        let card = app
-            .history
-            .iter()
-            .rev()
-            .find(|m| m.role == ChatRole::UmaDev)
-            .expect("a completion card was pushed")
-            .body()
-            .clone();
-        // Same `done/total` convention as the live `/plan` panel.
-        assert!(card.contains("2/4"), "card carries the done count: {card}");
-        // Every step with its final glyph — DONE / BLOCKED / INCOMPLETE visible.
-        assert!(card.contains("[x] s1"), "done step checked: {card}");
-        assert!(card.contains("[!] s3"), "blocked step flagged: {card}");
-        assert!(card.contains("[ ] s4"), "pending step blank: {card}");
-        // The incomplete lead names 1 blocked + 1 unfinished (pending).
-        assert!(
-            card.contains(&umadev_i18n::tf(
-                app.lang,
-                "build.complete.tasks_incomplete",
-                &["1", "1"],
-            )),
-            "incomplete build leads with blocked/unfinished counts: {card}"
-        );
-        // The live panel is cleared AFTER the card captured the statuses.
-        assert!(
-            app.plan_steps.is_empty(),
-            "the live plan panel clears after the card is built"
-        );
-    }
-
-    #[test]
-    fn build_completion_card_omits_task_section_without_a_plan() {
-        // A plan-less chat/Fast build (no live plan) → NO empty "tasks" block:
-        // the section renders only when there are steps to report.
-        let (app, _tmp) = temp_app();
-        std::fs::create_dir_all(app.project_root.join("src")).unwrap();
-        assert!(app.plan_steps.is_empty());
-        let card = app.build_completion_card(false);
-        assert!(
-            !card.contains(&umadev_i18n::tf(app.lang, "build.complete.tasks", &["0/0"])),
-            "no task-status header when there is no plan: {card}"
-        );
-        // And no orphan glyph lines leak in.
-        assert!(
-            !card.contains("[x]") && !card.contains("[ ]"),
-            "no step glyphs: {card}"
-        );
-    }
-
-    #[test]
-    fn no_backend_opens_picker() {
-        let app = fresh_app(None);
-        assert_eq!(app.mode, AppMode::Picker);
-    }
-
-    #[test]
-    fn configured_backend_opens_chat_with_greeting() {
-        let app = fresh_app(Some("claude-code"));
-        assert_eq!(app.mode, AppMode::Chat);
-        assert_eq!(app.backend_label, "claude-code");
-        // Greeting is the very first message.
-        let first = app.history.front().unwrap();
-        assert_eq!(first.role, ChatRole::UmaDev);
-        assert!(first.body().contains("claude-code"));
-    }
-
-    #[test]
-    fn picker_arrow_keys_navigate() {
-        let mut app = fresh_app(None);
-        let last = app.picker_items.len() - 1;
-        assert_eq!(app.picker_selected, 0);
-        // Walk all the way down — should clamp at `last`.
-        for _ in 0..(app.picker_items.len() + 2) {
-            let _ = app.apply_key(KeyCode::Down);
-        }
-        assert_eq!(app.picker_selected, last);
-        let _ = app.apply_key(KeyCode::Up);
-        assert_eq!(app.picker_selected, last - 1);
-    }
-
-    #[test]
-    fn picker_enter_on_unavailable_host_stays() {
-        let mut app = fresh_app(None);
-        // Base CLIs live in step 3; with no probes yet they're all unready.
-        app.goto_picker_step(PickerStep::BaseCli);
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::None);
-        assert_eq!(app.mode, AppMode::Picker);
-        // The refusal is surfaced INLINE on the picker (visible to the user),
-        // not pushed to the not-yet-visible chat screen.
-        assert!(app.picker_notice.is_some());
-        // …and navigating away clears it.
-        let _ = app.apply_key(KeyCode::Down);
-        assert!(app.picker_notice.is_none());
-    }
-
-    #[test]
-    fn picker_refreshes_on_backend_probed() {
-        let mut app = fresh_app(None);
-        app.apply_engine(EngineEvent::BackendProbed {
-            backend_id: "claude-code".into(),
-            ready: true,
-            detail: "claude 1.6.0".into(),
-        });
-        // Walk to the base-CLI step (language -> mode -> base) where the host
-        // rows live; the probe just cached marks claude-code ready.
-        app.goto_picker_step(PickerStep::BaseCli);
-        let idx = app
-            .picker_items
-            .iter()
-            .position(|i| i.backend_id.as_deref() == Some("claude-code"))
-            .unwrap();
-        app.picker_selected = idx;
-        assert!(app.picker_items[idx].ready);
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::BackendChanged);
-        assert_eq!(app.mode, AppMode::Chat);
-        assert_eq!(app.backend_label, "claude-code");
-    }
-
-    // --- Wave 1: intent card / live plan / team review event rendering ---
-
-    #[test]
-    fn intent_decided_pushes_intent_card_and_records_class() {
-        let mut app = fresh_app(Some("offline"));
-        let before = app.history.len();
-        app.apply_engine(EngineEvent::IntentDecided {
-            class: "build".into(),
-            depth: "deep".into(),
-            team: vec!["architect".into(), "qa".into()],
-            est_tool_calls: 160,
-            rationale: "完整构建,进研发流程".into(),
-        });
-        // A prominent UmaDev card landed in the transcript…
-        assert!(app.history.len() > before);
-        let card = app
-            .history
-            .iter()
-            .rev()
-            .find(|m| m.role == ChatRole::UmaDev)
-            .unwrap();
-        // …carrying the BUILD headline, the rough budget, the team, and the reason.
-        assert!(card.body().contains("160"), "shows the budget");
-        assert!(card.body().contains("architect"), "shows the team");
-        assert!(card.body().contains("研发流程"), "carries the rationale");
-        // …and the class is recorded so the status chip can show it.
-        assert_eq!(app.last_intent_class.as_deref(), Some("build"));
-    }
-
-    #[test]
-    fn intent_decided_unknown_class_falls_open_to_chat_headline() {
-        let mut app = fresh_app(Some("offline"));
-        // A bogus class id must not panic and must not show a budget/team line.
-        app.apply_engine(EngineEvent::IntentDecided {
-            class: "totally-unknown".into(),
-            depth: "weird".into(),
-            team: vec![],
-            est_tool_calls: 0,
-            rationale: String::new(),
-        });
-        assert_eq!(app.last_intent_class.as_deref(), Some("totally-unknown"));
-        // Still produced a card (the neutral chat headline), no crash.
-        assert!(app.history.iter().any(|m| m.role == ChatRole::UmaDev));
-    }
-
-    #[test]
-    fn plan_posted_then_step_status_drives_the_checklist() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec![
-                "s1 · scaffold the app (frontend)".into(),
-                "s2 · login route (backend)".into(),
-                "s3 · login form (frontend)".into(),
-            ],
-            done: 0,
-            total: 3,
-        });
-        assert_eq!(app.plan_steps.len(), 3);
-        assert_eq!(app.plan_steps[0].id, "s1");
-        assert!(app.plan_steps[0].title.contains("scaffold"));
-        assert!(app.plan_steps.iter().all(|s| s.status == "pending"));
-        // A status transition ticks the matching step in place (not a new row).
-        app.apply_engine(EngineEvent::PlanStepStatus {
-            id: "s1".into(),
-            title: "scaffold the app".into(),
-            status: "done".into(),
-        });
-        assert_eq!(app.plan_steps.len(), 3, "no new row appended");
-        assert_eq!(app.plan_steps[0].status, "done");
-        // A status for an UNKNOWN id is appended, never dropped (fail-open).
-        app.apply_engine(EngineEvent::PlanStepStatus {
-            id: "s9".into(),
-            title: "extra".into(),
-            status: "active".into(),
-        });
-        assert_eq!(app.plan_steps.len(), 4);
-        assert_eq!(app.plan_steps[3].id, "s9");
-    }
-
-    #[test]
-    fn resumed_plan_post_restores_persisted_step_statuses() {
-        // Cross-session resume (user-reported): after /continue the re-posted
-        // plan must render the persisted truth — earlier done steps stay
-        // checked, the blocked one stays flagged — instead of resetting the
-        // checklist to all-pending with a 0/N done count.
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::PlanPosted {
-            steps: vec![
-                "s1 · scaffold (frontend)".into(),
-                "s2 · login route (backend)".into(),
-                "s3 · login form (frontend)".into(),
-                "s4 · e2e review (qa)".into(),
-            ],
-            statuses: vec![
-                "done".into(),
-                "done".into(),
-                "blocked".into(),
-                "pending".into(),
-            ],
-            done: 2,
-            total: 4,
-        });
-        let statuses: Vec<&str> = app.plan_steps.iter().map(|s| s.status.as_str()).collect();
-        assert_eq!(statuses, vec!["done", "done", "blocked", "pending"]);
-        // The panel header + `/plan` derive the done-count from the rows: 2/4.
-        assert_eq!(
-            app.plan_steps.iter().filter(|s| s.status == "done").count(),
-            2
-        );
-        // Pre-resume completions are NOT replayed as fresh handoffs.
-        assert!(app.handoffs.is_empty(), "no handoff invented on a resume");
-        // The transcript `/plan` card matches the restored panel.
-        let _ = app.try_slash_command("/plan").unwrap();
-        let card = app.history.back().unwrap().body().clone();
-        assert!(card.contains("2/4"), "card counts restored steps: {card}");
-        assert!(card.contains("[x] s1"), "done step checked: {card}");
-        assert!(card.contains("[!] s3"), "blocked step flagged: {card}");
-        assert!(card.contains("[ ] s4"), "pending step blank: {card}");
-    }
-
-    #[test]
-    fn plan_post_with_short_statuses_falls_open_to_pending() {
-        // Fail-open: a statuses list shorter than the steps (or absent, as on a
-        // fresh post) leaves the uncovered steps `pending` — never a panic or a
-        // dropped row.
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::PlanPosted {
-            steps: vec![
-                "s1 · scaffold (frontend)".into(),
-                "s2 · login route (backend)".into(),
-            ],
-            statuses: vec!["done".into()],
-            done: 1,
-            total: 2,
-        });
-        assert_eq!(app.plan_steps[0].status, "done");
-        assert_eq!(app.plan_steps[1].status, "pending");
-    }
-
-    // ---- Wave C: live team roster + handoff timeline ----------------------
-
-    #[test]
-    fn convened_roster_shows_only_seated_steps_with_live_status() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec![
-                "s1 · API contract (architect)".into(),
-                "s2 · login form (frontend)".into(),
-                // No `(seat)` → unattributed; anti-theater drops it from the roster.
-                "s3 · housekeeping step".into(),
-            ],
-            done: 0,
-            total: 3,
-        });
-        // The step seat was captured from the `(seat)` token.
-        assert_eq!(app.plan_steps[0].seat, "architect");
-        assert_eq!(app.plan_steps[1].seat, "frontend-engineer");
-        assert_eq!(
-            app.plan_steps[2].seat, "",
-            "no seat parsed for the bare step"
-        );
-        // Only the two seat-attributed steps convene a seat; all pending → idle.
-        let roster = app.convened_roster();
-        assert_eq!(roster.len(), 2, "only seated steps convene a teammate");
-        assert!(roster.iter().all(|r| r.status == SeatStatus::Idle));
-        // A reviewing seat (architect) active reads `Reviewing`; a doing seat
-        // (frontend) active reads `Working`.
-        app.apply_engine(EngineEvent::PlanStepStatus {
-            id: "s1".into(),
-            title: "API contract".into(),
-            status: "active".into(),
-        });
-        app.apply_engine(EngineEvent::PlanStepStatus {
-            id: "s2".into(),
-            title: "login form".into(),
-            status: "active".into(),
-        });
-        let roster = app.convened_roster();
-        let arch = roster.iter().find(|r| r.role == "architect").unwrap();
-        let fe = roster
-            .iter()
-            .find(|r| r.role == "frontend-engineer")
-            .unwrap();
-        assert_eq!(arch.status, SeatStatus::Reviewing);
-        assert_eq!(fe.status, SeatStatus::Working);
-    }
-
-    #[test]
-    fn step_done_marks_seat_done_and_records_a_handoff() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec!["s1 · API contract (architect)".into()],
-            done: 0,
-            total: 1,
-        });
-        assert!(
-            app.handoffs.is_empty(),
-            "no handoff before a step completes"
-        );
-        app.apply_engine(EngineEvent::PlanStepStatus {
-            id: "s1".into(),
-            title: "API contract".into(),
-            status: "done".into(),
-        });
-        // The (only) step done → the seat reads Done…
-        assert_eq!(app.convened_roster()[0].status, SeatStatus::Done);
-        // …and a handoff entry was recorded for the architect.
-        assert_eq!(app.handoffs.len(), 1);
-        assert_eq!(app.handoffs[0].seat, "architect");
-        assert!(app.handoffs[0].title.contains("API contract"));
-        // A repeated `done` event does NOT double-record the handoff (idempotent).
-        app.apply_engine(EngineEvent::PlanStepStatus {
-            id: "s1".into(),
-            title: "API contract".into(),
-            status: "done".into(),
-        });
-        assert_eq!(
-            app.handoffs.len(),
-            1,
-            "no duplicate handoff on a repeat done"
-        );
-    }
-
-    #[test]
-    fn roster_verdict_chip_reflects_critic_verdict_only_for_convened_seats() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec![
-                "s1 · API contract (architect)".into(),
-                "s2 · login form (frontend)".into(),
-            ],
-            done: 0,
-            total: 2,
-        });
-        // Architect (convened) accepts; QA (NO plan step) blocks.
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "architect".into(),
-            accepts: true,
-            blocking: vec![],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "qa".into(),
-            accepts: false,
-            blocking: vec!["missing tests".into()],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        let roster = app.convened_roster();
-        // Anti-theater: QA reviewed but has no step → it never joins the roster.
-        assert!(
-            roster.iter().all(|r| r.role != "qa-engineer"),
-            "an unconvened reviewer is not shown in the roster"
-        );
-        // The architect's chip carries its accept verdict; frontend has no verdict.
-        let arch = roster.iter().find(|r| r.role == "architect").unwrap();
-        assert_eq!(arch.verdict, Some((true, 0)));
-        let fe = roster
-            .iter()
-            .find(|r| r.role == "frontend-engineer")
-            .unwrap();
-        assert_eq!(fe.verdict, None);
-    }
-
-    #[test]
-    fn roster_and_handoffs_are_empty_with_no_active_build() {
-        // Fail-open: a fresh app with no plan shows nothing extra and never panics.
-        let app = fresh_app(Some("offline"));
-        assert!(app.convened_roster().is_empty());
-        assert!(app.handoffs.is_empty());
-    }
-
-    #[test]
-    fn critic_transcript_note_carries_per_blocker_resolution() {
-        // The never-lost transcript note lists each must-fix problem AND, right
-        // under it, the seat's suggested fix (the per-blocker remediation) so the
-        // full resolution is always in the scrollable history.
-        let mut app = fresh_app(Some("offline"));
-        app.lang = umadev_i18n::Lang::En;
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "security-engineer".into(),
-            accepts: false,
-            blocking: vec![
-                "Authentication is effectively bypassed".into(),
-                "Hardcoded, guessable session identifiers".into(),
-            ],
-            remediation: vec![
-                "add a signed session token + a real identity provider".into(),
-                "generate a random per-session id server-side".into(),
-            ],
-            advisory: vec![],
-        });
-        let note = app
-            .history
-            .iter()
-            .find(|m| m.role == ChatRole::System && m.body().contains("must-fix"))
-            .expect("a blocking critic pushes a transcript note");
-        let body = note.body();
-        // Each problem is present…
-        assert!(
-            body.contains("Authentication is effectively bypassed"),
-            "{body}"
-        );
-        assert!(
-            body.contains("Hardcoded, guessable session identifiers"),
-            "{body}"
-        );
-        // …with its concrete fix surfaced right under it.
-        assert!(
-            body.contains("signed session token"),
-            "fix 1 surfaced: {body}"
-        );
-        assert!(
-            body.contains("random per-session id"),
-            "fix 2 surfaced: {body}"
-        );
-    }
-
-    #[test]
-    fn team_command_surfaces_convened_roster_and_handoff_timeline() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec![
-                "s1 · API contract (architect)".into(),
-                "s2 · login form (frontend)".into(),
-            ],
-            done: 0,
-            total: 2,
-        });
-        app.apply_engine(EngineEvent::PlanStepStatus {
-            id: "s1".into(),
-            title: "API contract".into(),
-            status: "done".into(),
-        });
-        let before = app.history.len();
-        app.slash_team("");
-        let note = app
-            .history
-            .iter()
-            .skip(before)
-            .find(|m| m.role == ChatRole::UmaDev)
-            .expect("a team note was pushed");
-        let body = note.body();
-        // The convened architect appears with its done status word, and the handoff
-        // timeline names the architect's completed deliverable.
-        let arch_name = seat_display_name(app.lang, "architect");
-        assert!(body.contains(&arch_name), "names the convened architect");
-        assert!(
-            body.contains(umadev_i18n::t(app.lang, "team.handoff.header")),
-            "shows the handoff timeline header once a step is done"
-        );
-        assert!(
-            body.contains("API contract"),
-            "names the handed-off deliverable"
-        );
-    }
-
-    #[test]
-    fn a_blocked_step_makes_its_seat_read_blocked() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec!["s1 · login form (frontend)".into()],
-            done: 0,
-            total: 1,
-        });
-        app.apply_engine(EngineEvent::PlanStepStatus {
-            id: "s1".into(),
-            title: "login form".into(),
-            status: "blocked".into(),
-        });
-        assert_eq!(app.convened_roster()[0].status, SeatStatus::Blocked);
-        // A blocked step is not a completion → no handoff entry.
-        assert!(app.handoffs.is_empty());
-    }
-
-    // ---- background-run task registry + /tasks ----------------------------
-
-    #[test]
-    fn run_registers_a_running_task_and_tracks_step_progress() {
-        let mut app = fresh_app(Some("offline"));
-        // A started run (legacy path emits PipelineStarted) registers a live task.
-        app.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "build a todo app with login".into(),
-        });
-        let t = app.active_task().expect("a Running task is registered");
-        assert_eq!(t.status, TaskStatus::Running);
-        assert!(t.requirement.contains("todo app"));
-        assert_eq!((t.done, t.total), (0, 0));
-        // A posted plan + a step tick drive the X/Y progress.
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec![
-                "s1 · scaffold (frontend)".into(),
-                "s2 · login route (backend)".into(),
-                "s3 · login form (frontend)".into(),
-            ],
-            done: 0,
-            total: 3,
-        });
-        let t = app.active_task().unwrap();
-        assert_eq!((t.done, t.total), (0, 3), "total seeded from the plan");
-        app.apply_engine(EngineEvent::PlanStepStatus {
-            id: "s1".into(),
-            title: "scaffold".into(),
-            status: "done".into(),
-        });
-        let t = app.active_task().unwrap();
-        assert_eq!((t.done, t.total), (1, 3), "a done step advances progress");
-        // Still exactly ONE task (idempotent: PipelineStarted + PlanPosted reuse it).
-        assert_eq!(app.tasks.len(), 1);
-    }
-
-    #[test]
-    fn director_path_registers_a_task_from_a_posted_plan() {
-        // The director build emits NO PipelineStarted — a posted plan is the
-        // "a build is live" signal that must still register the task.
-        let mut app = fresh_app(Some("offline"));
-        app.requirement = "做一个登录页".into();
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec!["s1 · 登录页 (frontend)".into()],
-            done: 0,
-            total: 1,
-        });
-        let t = app.active_task().expect("plan post registers a task");
-        assert_eq!(t.status, TaskStatus::Running);
-        assert!(t.requirement.contains("登录页"));
-    }
-
-    #[test]
-    fn tasks_command_lists_the_active_run() {
-        let mut app = fresh_app(Some("offline"));
-        app.register_run_task("build a blog engine");
-        let before = app.history.len();
-        let action = app.slash_tasks("");
-        assert!(matches!(action, Action::None));
-        assert!(
-            app.history
-                .iter()
-                .skip(before)
-                .any(|m| m.body().contains("build a blog engine")),
-            "the list names the active run"
-        );
-    }
-
-    #[test]
-    fn tasks_stop_cancels_the_active_run_then_marks_it_stopped() {
-        let mut app = fresh_app(Some("offline"));
-        app.register_run_task("build a wiki");
-        // The director run set this; has_active_run sees it.
-        app.agentic_in_flight = true;
-        let action = app.slash_tasks("stop");
-        assert_eq!(action, Action::Cancel, "/tasks stop reuses the cancel path");
-        // The event loop's cancel completes via cancel_run, settling the task.
-        app.cancel_run();
-        let t = app.tasks.last().unwrap();
-        assert_eq!(t.status, TaskStatus::Stopped);
-        assert!(app.active_task().is_none(), "no live task after a stop");
-    }
-
-    #[test]
-    fn tasks_resume_with_a_resumable_run_triggers_resume_run() {
-        let mut app = fresh_app(Some("claude-code"));
-        // Persist a plan + workflow-state exactly as an interrupted /run leaves.
-        let plan = umadev_agent::Plan {
-            steps: vec![umadev_agent::PlanStep {
-                files: umadev_agent::StepFiles::default(),
-                id: "a".into(),
-                title: "build the login page".into(),
-                seat: umadev_agent::Seat::FrontendEngineer,
-                kind: umadev_agent::StepKind::Build,
-                depends_on: vec![],
-                acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
-                evidence: Vec::new(),
-                status: umadev_agent::StepStatus::Pending,
-            }],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        umadev_agent::save_plan(&plan, &app.project_root).unwrap();
-        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
-        state.slug = "demo".into();
-        state.requirement = "做一个登录页".into();
-        state.backend = "claude-code".into();
-        umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
-
-        let action = app.slash_tasks("resume");
-        assert_eq!(
-            action,
-            Action::ResumeRun("做一个登录页".to_string()),
-            "/tasks resume re-attaches to the persisted run"
-        );
-    }
-
-    #[test]
-    fn second_run_while_one_is_active_is_guarded() {
-        let mut app = fresh_app(Some("offline"));
-        // A first run is live (registered + agentic in flight).
-        app.register_run_task("build app one");
-        app.agentic_in_flight = true;
-        assert!(app.has_active_run());
-        let before_tasks = app.tasks.len();
-        let action = app
-            .try_slash_command("/run build app two")
-            .expect("/run is a slash command");
-        assert!(
-            matches!(action, Action::None),
-            "a second /run is rejected, not started"
-        );
-        assert_eq!(app.tasks.len(), before_tasks, "no second task registered");
-        // The guard names the /tasks surface.
-        assert!(app.history.iter().any(|m| m.body().contains("/tasks")));
-        // The original task is untouched (still Running).
-        assert_eq!(app.active_task().unwrap().requirement, "build app one");
-    }
-
-    #[test]
-    fn tasks_is_fail_open_with_no_active_task() {
-        let mut app = fresh_app(Some("offline"));
-        // Empty registry: list shows the empty hint, no panic.
-        let action = app.slash_tasks("");
-        assert!(matches!(action, Action::None));
-        // stop / resume with nothing to act on are polite no-ops, never a panic.
-        assert!(matches!(app.slash_tasks("stop"), Action::None));
-        assert!(matches!(app.slash_tasks("resume"), Action::None));
-        // Progress + terminal hooks with no task are pure no-ops.
-        app.sync_active_task_progress();
-        app.mark_active_task(TaskStatus::Done);
-        assert!(app.tasks.is_empty());
-        assert!(!app.has_active_run());
-    }
-
-    #[test]
-    fn terminal_transitions_settle_the_task_status() {
-        // Done on a delivered build.
-        let mut app = fresh_app(Some("offline"));
-        app.register_run_task("ship it");
-        app.apply_engine(EngineEvent::BlockCompleted {
-            final_phase: Phase::Delivery,
-            paused_at: None,
-        });
-        assert_eq!(app.tasks.last().unwrap().status, TaskStatus::Done);
-
-        // Failed on an aborted run.
-        let mut app = fresh_app(Some("offline"));
-        app.register_run_task("build x");
-        app.mark_block_aborted("boom".into());
-        assert_eq!(app.tasks.last().unwrap().status, TaskStatus::Failed);
-
-        // Done on a clean director build hand-back.
-        let mut app = fresh_app(Some("offline"));
-        app.register_run_task("build y");
-        app.record_agentic_done("done".into(), true, None);
-        assert_eq!(app.tasks.last().unwrap().status, TaskStatus::Done);
-    }
-
-    #[test]
-    fn task_registry_caps_history_without_evicting_the_live_run() {
-        let mut app = fresh_app(Some("offline"));
-        // Fill past the cap with settled tasks.
-        for i in 0..(TASKS_CAP + 4) {
-            app.register_run_task(&format!("run {i}"));
-            app.mark_active_task(TaskStatus::Done);
-        }
-        // Now a live one.
-        app.register_run_task("the live run");
-        assert!(app.tasks.len() <= TASKS_CAP);
-        assert_eq!(
-            app.active_task().unwrap().requirement,
-            "the live run",
-            "the live run is never evicted"
-        );
-    }
-
-    // ---- Task-registry persistence (relaunch survival) -----------------------
-
-    fn cfg_offline() -> UserConfig {
-        UserConfig {
-            backend: Some("offline".to_string()),
-            lang: Some("zh-CN".to_string()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn task_registry_persists_and_reloads_across_a_relaunch() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        // First session: one settled run + one still-running run.
-        {
-            let mut app = App::new(
-                "demo",
-                cfg_offline(),
-                root.join("config.toml"),
-                root.clone(),
-            );
-            app.register_run_task("first run");
-            app.mark_active_task(TaskStatus::Done);
-            app.register_run_task("second run"); // stays Running at exit
-            assert_eq!(app.tasks.len(), 2);
-        }
-        // Relaunch: a fresh App on the SAME root reloads the registry from disk.
-        let app2 = App::new(
-            "demo",
-            cfg_offline(),
-            root.join("config.toml"),
-            root.clone(),
-        );
-        assert_eq!(app2.tasks.len(), 2, "recent tasks survive a relaunch");
-        // Order preserved (newest last); the settled one kept its outcome.
-        assert_eq!(app2.tasks[0].requirement, "first run");
-        assert_eq!(app2.tasks[0].status, TaskStatus::Done);
-        // The interrupted run is surfaced as Stopped (no live writer after relaunch)
-        // — resumable, but not counted as an active run.
-        assert_eq!(app2.tasks[1].requirement, "second run");
-        assert_eq!(app2.tasks[1].status, TaskStatus::Stopped);
-        assert!(!app2.has_active_run());
-        // The id sequence advanced past the reloaded ids (no id reuse).
-        assert!(
-            app2.task_seq >= 2,
-            "task_seq carried forward across relaunch"
-        );
-    }
-
-    #[test]
-    fn task_registry_load_is_fail_open_with_no_file() {
-        // temp_app builds on a fresh tempdir with no tasks.json → empty, no panic.
-        let (app, _tmp) = temp_app();
-        assert!(app.tasks.is_empty());
-        assert_eq!(app.task_seq, 0);
-    }
-
-    #[test]
-    fn task_registry_load_is_fail_open_on_a_corrupt_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".umadev")).unwrap();
-        std::fs::write(root.join(".umadev").join("tasks.json"), "not json {{{").unwrap();
-        // A corrupt registry is ignored (fail-open), never a crash.
-        let app = App::new(
-            "demo",
-            cfg_offline(),
-            root.join("config.toml"),
-            root.clone(),
-        );
-        assert!(app.tasks.is_empty());
-    }
-
-    // ---- Trust record-on-approval --------------------------------------------
-
-    #[test]
-    fn approving_a_reversible_action_records_to_the_trust_ledger() {
-        let (mut app, _tmp) = temp_app();
-        // A plain shell command is a reversible class → remembered.
-        let recorded = app.record_action_approval("npm run build", "");
-        assert!(recorded, "a reversible action class is remembered");
-        // Consultable in-memory for the rest of this session…
-        assert!(app.trust_ledger.remembers("npm run build", ""));
-        // …and persisted to disk so a later session / consult sees it too.
-        let on_disk = umadev_agent::TrustLedger::load(&app.project_root);
-        assert!(on_disk.remembers("npm run build", ""));
-    }
-
-    #[test]
-    fn approving_an_irreversible_action_is_floor_safe_and_records_nothing() {
-        let (mut app, _tmp) = temp_app();
-        // A network push is the irreversible floor — never remembered (always re-asked).
-        let recorded = app.record_action_approval("git push origin main", "");
-        assert!(!recorded);
-        assert!(!app.trust_ledger.remembers("git push origin main", ""));
-        assert!(!umadev_agent::TrustLedger::load(&app.project_root)
-            .remembers("git push origin main", ""));
-    }
-
-    #[test]
-    fn critic_verdict_records_and_replaces_per_seat() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "architect".into(),
-            accepts: true,
-            blocking: vec![],
-            remediation: vec![],
-            advisory: vec!["consider a cache".into()],
-        });
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "qa".into(),
-            accepts: false,
-            blocking: vec!["no tests".into(), "no error handling".into()],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        assert_eq!(app.critic_verdicts.len(), 2);
-        // A re-review of the SAME seat replaces its row (does not stack).
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "qa".into(),
-            accepts: true,
-            blocking: vec![],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        assert_eq!(app.critic_verdicts.len(), 2, "seat replaced, not stacked");
-        let qa = app.critic_verdicts.iter().find(|c| c.seat == "qa").unwrap();
-        assert!(qa.accepts);
-    }
-
-    #[test]
-    fn split_plan_summary_fails_open_on_odd_shape() {
-        // Normal shape: `id · title (seat)`.
-        let (id, title) = split_plan_summary("s2 · build the API (backend)", 1);
-        assert_eq!(id, "s2");
-        assert_eq!(title, "build the API (backend)");
-        // No separator → positional id, whole string as title (never drops it).
-        let (id, title) = split_plan_summary("just a bare title", 4);
-        assert_eq!(id, "s4");
-        assert_eq!(title, "just a bare title");
-    }
-
-    #[test]
-    fn slash_plan_shows_usage_when_no_plan() {
-        let mut app = fresh_app(Some("offline"));
-        let action = app.try_slash_command("/plan").unwrap();
-        assert_eq!(action, Action::None);
-        // A "no active plan" hint + the usage line land (not silent).
-        let joined: String = app.history.iter().map(|m| m.body().clone()).collect();
-        assert!(joined.contains("/plan skip"), "usage shown: {joined}");
-    }
-
-    #[test]
-    fn slash_plan_skip_folds_into_queued_steer() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec![
-                "s1 · scaffold (frontend)".into(),
-                "s2 · login route (backend)".into(),
-            ],
-            done: 0,
-            total: 2,
-        });
-        let action = app.try_slash_command("/plan skip s2").unwrap();
-        assert_eq!(action, Action::None);
-        // The skip directive is folded into the queued-steer queue (same-session
-        // delivery), and it references the skipped step id.
-        assert_eq!(app.queued_steer.len(), 1);
-        assert!(app.queued_steer[0].contains("s2"));
-        assert!(app.queued_steer[0].to_ascii_uppercase().contains("SKIP"));
-    }
-
-    #[test]
-    fn slash_plan_unknown_step_does_not_queue() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec!["s1 · only step (frontend)".into()],
-            done: 0,
-            total: 1,
-        });
-        let _ = app.try_slash_command("/plan veto s9").unwrap();
-        // No such step → nothing queued, an honest "no step" note instead.
-        assert!(app.queued_steer.is_empty());
-        let joined: String = app.history.iter().map(|m| m.body().clone()).collect();
-        assert!(joined.contains("s9"));
-    }
-
-    #[test]
-    fn slash_plan_add_takes_free_text() {
-        let mut app = fresh_app(Some("offline"));
-        let _ = app
-            .try_slash_command("/plan add write integration tests")
-            .unwrap();
-        assert_eq!(app.queued_steer.len(), 1);
-        assert!(app.queued_steer[0].contains("write integration tests"));
-        assert!(app.queued_steer[0].to_ascii_uppercase().contains("ADD"));
-    }
-
-    #[test]
-    fn slash_plan_collapse_toggles_panel() {
-        let mut app = fresh_app(Some("offline"));
-        assert!(!app.plan_collapsed);
-        let _ = app.try_slash_command("/plan collapse").unwrap();
-        assert!(app.plan_collapsed);
-        let _ = app.try_slash_command("/plan collapse").unwrap();
-        assert!(!app.plan_collapsed);
-    }
-
-    #[test]
-    fn new_run_clears_the_plan_and_review_panels() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec!["s1 · do a thing (frontend)".into()],
-            done: 0,
-            total: 1,
-        });
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "qa".into(),
-            accepts: false,
-            blocking: vec!["x".into()],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        assert!(!app.plan_steps.is_empty() && !app.critic_verdicts.is_empty());
-        app.reset_for_new_run();
-        assert!(app.plan_steps.is_empty(), "plan cleared for a fresh run");
-        assert!(app.critic_verdicts.is_empty(), "review cleared too");
-    }
-
-    #[test]
-    fn critic_verdict_is_mirrored_into_the_transcript_with_full_findings() {
-        // Defect 1: the panel collapses extra verdicts to "… +N"; the FULL set
-        // (seat + every blocking finding) must always reach the scrollable
-        // transcript so nothing is lost behind the clip.
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "frontend-engineer".into(),
-            accepts: false,
-            blocking: vec![
-                "API contract drift: /login missing".into(),
-                "no error states on the form".into(),
-            ],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        let joined: String = app.history.iter().map(|m| m.body().clone()).collect();
-        assert!(joined.contains("[frontend-engineer]"), "seat in transcript");
-        assert!(
-            joined.contains("API contract drift: /login missing"),
-            "first must-fix in transcript: {joined}"
-        );
-        assert!(
-            joined.contains("no error states on the form"),
-            "second must-fix (beyond the panel's first-line inline) in transcript"
-        );
-    }
-
-    #[test]
-    fn a_new_review_round_replaces_the_previous_rounds_seats() {
-        // Defect 2a: round 1 blocks with three seats; a plan-step transition seals
-        // the round; round 2 has a single passing seat. The panel must show ONLY
-        // round 2's seat, not a stale mix of both rounds.
-        let mut app = fresh_app(Some("offline"));
-        for seat in ["frontend-engineer", "backend-engineer", "qa"] {
-            app.apply_engine(EngineEvent::CriticVerdict {
-                seat: seat.into(),
-                accepts: false,
-                blocking: vec!["fix it".into()],
-                remediation: vec![],
-                advisory: vec![],
-            });
-        }
-        assert_eq!(app.critic_verdicts.len(), 3, "round 1 has three seats");
-        // Work resumes (the director drives the next step) → the round is sealed.
-        app.apply_engine(EngineEvent::PlanStepStatus {
-            id: "s1".into(),
-            title: "rework".into(),
-            status: "active".into(),
-        });
-        // Round 2: a single seat now passes.
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "qa".into(),
-            accepts: true,
-            blocking: vec![],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        assert_eq!(
-            app.critic_verdicts.len(),
-            1,
-            "the new round replaced the old one, not a stale mix"
-        );
-        assert_eq!(app.critic_verdicts[0].seat, "qa");
-        assert!(app.critic_verdicts[0].accepts, "shows the CURRENT round");
-    }
-
-    #[test]
-    fn contiguous_verdicts_in_one_round_do_not_clear_each_other() {
-        // The seal must NOT fire between two seats of the SAME round (no work
-        // event interleaves a review burst), so both seats accumulate.
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "architect".into(),
-            accepts: true,
-            blocking: vec![],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "qa".into(),
-            accepts: false,
-            blocking: vec!["no tests".into()],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        assert_eq!(app.critic_verdicts.len(), 2, "one round keeps both seats");
-    }
-
-    #[test]
-    fn delivery_finish_clears_the_live_plan_and_review_panels() {
-        // Defect 2b: a finished run must not leave a stale live plan / verdict
-        // list hanging below the transcript — the terminal transition clears them
-        // and folds the round into a one-line summary in the transcript.
-        let mut app = fresh_app(Some("offline"));
-        app.run_started = true;
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec!["s1 · ship it (frontend)".into()],
-            done: 0,
-            total: 1,
-        });
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "qa".into(),
-            accepts: true,
-            blocking: vec![],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        assert!(!app.plan_steps.is_empty() && !app.critic_verdicts.is_empty());
-        app.apply_engine(EngineEvent::BlockCompleted {
-            final_phase: Phase::Delivery,
-            paused_at: None,
-        });
-        assert!(app.finished, "the run reached its terminal delivery state");
-        assert!(
-            app.plan_steps.is_empty(),
-            "the live plan panel is cleared on finish"
-        );
-        assert!(
-            app.critic_verdicts.is_empty(),
-            "the live team-review panel is cleared on finish"
-        );
-        // The verdict content isn't silently dropped — a settle summary lands.
-        let joined: String = app.history.iter().map(|m| m.body().clone()).collect();
-        assert!(
-            joined.contains(umadev_i18n::t(app.lang, "plan.review.title")),
-            "a team-review settle summary is folded into the transcript: {joined}"
-        );
-    }
-
-    #[test]
-    fn an_aborted_block_clears_the_live_plan_and_review_panels() {
-        // Defect 2b (abort branch): a bailed round is terminal too — its panels
-        // must not linger as stale state.
-        let mut app = fresh_app(Some("offline"));
-        app.run_started = true;
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec!["s1 · do a thing (frontend)".into()],
-            done: 0,
-            total: 1,
-        });
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "qa".into(),
-            accepts: false,
-            blocking: vec!["broken".into()],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        assert!(!app.plan_steps.is_empty() && !app.critic_verdicts.is_empty());
-        app.apply_engine(EngineEvent::Note(format!(
-            "{}本轮已中止:磁盘写入失败",
-            crate::ABORT_SENTINEL
-        )));
-        assert!(app.aborted, "the sentinel flips the run into aborted");
-        assert!(app.plan_steps.is_empty(), "plan panel cleared on abort");
-        assert!(
-            app.critic_verdicts.is_empty(),
-            "team-review panel cleared on abort"
-        );
-    }
-
-    // --- Wave 1: honest picker auth state (gap G10) ---
-
-    #[test]
-    fn parse_probe_detail_unpacks_packed_auth_metadata() {
-        // The packed shape spawn_probe emits.
-        let s = PROBE_AUTH_SENTINEL;
-        let packed = format!(
-            "{s}auth=not_logged_in|login=claude auth login|install=npm i -g x{s}claude 1.6.0",
-        );
-        let (auth, login, install, human) = parse_probe_detail(&packed);
-        assert_eq!(auth, AuthMark::NotLoggedIn);
-        assert_eq!(login, "claude auth login");
-        assert_eq!(install, "npm i -g x");
-        assert_eq!(human, "claude 1.6.0");
-        // Fail-open: a plain (untagged) detail keeps the human text, Unknown auth.
-        let (auth, login, _i, human) = parse_probe_detail("claude 1.6.0");
-        assert_eq!(auth, AuthMark::Unknown);
-        assert!(login.is_empty());
-        assert_eq!(human, "claude 1.6.0");
-    }
-
-    // Drive a probe through the engine, then select that base in the picker.
-    fn probe_and_select(app: &mut App, id: &str, auth: &str, login: &str, install: &str) {
-        let s = PROBE_AUTH_SENTINEL;
-        let detail = format!("{s}auth={auth}|login={login}|install={install}{s}{id} 1.0.0");
-        // `ready` mirrors spawn_probe: true only when logged in.
-        app.apply_engine(EngineEvent::BackendProbed {
-            backend_id: id.into(),
-            ready: auth == "logged_in",
-            detail,
-        });
-        app.goto_picker_step(PickerStep::BaseCli);
-        let idx = app
-            .picker_items
-            .iter()
-            .position(|i| i.backend_id.as_deref() == Some(id))
-            .unwrap();
-        app.picker_selected = idx;
-    }
-
-    #[test]
-    fn picker_blocks_commit_on_not_logged_in_with_login_cmd() {
-        let mut app = fresh_app(None);
-        probe_and_select(
-            &mut app,
-            "claude-code",
-            "not_logged_in",
-            "claude auth login",
-            "npm i -g claude",
-        );
-        let action = app.apply_key(KeyCode::Enter);
-        // FIRST Enter: soft-warned, NOT committed — stays on the picker with the login command
-        // surfaced (the probe may be a false negative for a local/third-party-configured base).
-        assert_eq!(action, Action::None);
-        assert_eq!(app.mode, AppMode::Picker);
-        let notice = app.picker_notice.as_deref().unwrap_or("");
-        assert!(
-            notice.contains("claude auth login"),
-            "login cmd shown: {notice}"
-        );
-        // SECOND Enter on the SAME base: proceeds anyway (drive-whatever-is-configured), so a
-        // local/third-party model that needs no login is never permanently blocked.
-        let action2 = app.apply_key(KeyCode::Enter);
-        assert_ne!(action2, Action::None, "second select commits, not blocked");
-        assert_eq!(app.mode, AppMode::Chat, "second select enters chat");
-    }
-
-    #[test]
-    fn picker_blocks_commit_on_not_installed_with_install_cmd() {
-        let mut app = fresh_app(None);
-        probe_and_select(
-            &mut app,
-            "codex",
-            "not_installed",
-            "codex login",
-            "npm install -g @openai/codex",
-        );
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::None);
-        assert_eq!(app.mode, AppMode::Picker);
-        let notice = app.picker_notice.as_deref().unwrap_or("");
-        assert!(
-            notice.contains("npm install -g @openai/codex"),
-            "install cmd shown: {notice}"
-        );
-    }
-
-    #[test]
-    fn picker_commits_when_logged_in() {
-        let mut app = fresh_app(None);
-        probe_and_select(
-            &mut app,
-            "claude-code",
-            "logged_in",
-            "claude auth login",
-            "",
-        );
-        let action = app.apply_key(KeyCode::Enter);
-        // A logged-in base commits straight into chat.
-        assert_eq!(action, Action::BackendChanged);
-        assert_eq!(app.mode, AppMode::Chat);
-        assert_eq!(app.backend_label, "claude-code");
-    }
-
-    #[test]
-    fn chat_plain_text_routes_to_worker() {
-        let mut app = fresh_app(Some("offline"));
-        for c in "build a login".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Route("build a login".to_string()));
-        // Input is cleared after submit.
-        assert!(app.input.is_empty());
-    }
-
-    #[test]
-    fn chat_empty_enter_is_noop() {
-        let mut app = fresh_app(Some("offline"));
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::None);
-    }
-
-    #[test]
-    fn slash_help_toggles_help_overlay() {
-        let mut app = fresh_app(Some("offline"));
-        for c in "/help".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::None);
-        assert!(app.show_help);
-    }
-
-    #[test]
-    fn slash_quit_returns_quit() {
-        let mut app = fresh_app(Some("offline"));
-        for c in "/quit".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Quit);
-        assert!(app.should_quit);
-    }
-
-    #[test]
-    fn slash_clear_clears_history() {
-        let mut app = fresh_app(Some("offline"));
-        assert!(!app.history.is_empty()); // greeting present
-        for c in "/clear".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let _ = app.apply_key(KeyCode::Enter);
-        // After /clear: only the localized "history cleared" system note remains.
-        assert_eq!(app.history.len(), 1);
-        assert_eq!(
-            app.history.front().unwrap().body(),
-            umadev_i18n::t(app.lang, "slash.history_cleared")
-        );
-    }
-
-    #[test]
-    fn session_tokens_accumulate_across_turns_and_reset_on_clear() {
-        let mut a = fresh_app(Some("offline"));
-        assert_eq!(a.session_tokens, 0, "a fresh session meters from zero");
-        // The base reports per-turn usage; the gauge total sums input+output.
-        a.apply_engine(EngineEvent::TurnUsage {
-            input_tokens: 1_200,
-            output_tokens: 800,
-        });
-        assert_eq!(a.session_tokens, 2_000, "the first turn's usage accrues");
-        a.apply_engine(EngineEvent::TurnUsage {
-            input_tokens: 500,
-            output_tokens: 500,
-        });
-        assert_eq!(a.session_tokens, 3_000, "usage accumulates across turns");
-        // `/clear` starts a fresh session — the meter resets with the transcript.
-        let _ = a.try_slash_command("/clear");
-        assert_eq!(a.session_tokens, 0, "/clear resets the token meter");
-    }
-
-    #[test]
-    fn slash_claude_switches_backend_and_saves() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cfg_path = tmp.path().join("config.toml");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        let cfg = UserConfig {
-            backend: Some("offline".to_string()),
-            ..Default::default()
-        };
-        let mut app = App::new("demo", cfg, cfg_path.clone(), workspace);
-        for c in "/claude".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::BackendChanged);
-        assert_eq!(app.backend_label, "claude-code");
-        // Config is persisted.
-        let loaded = crate::config::load_from(&cfg_path);
-        assert_eq!(loaded.backend.as_deref(), Some("claude-code"));
-    }
-
-    #[test]
-    fn slash_continue_with_open_gate_returns_continue() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        for c in "/continue".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Continue(Gate::DocsConfirm));
-    }
-
-    #[test]
-    fn slash_continue_without_gate_is_noop_with_hint() {
-        let mut app = fresh_app(Some("offline"));
-        for c in "/continue".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::None);
-        assert!(app
-            .history
-            .iter()
-            .any(|m| m.body().contains("还没启动流水线") || m.body().contains("没有打开的 gate")));
-    }
-
-    #[test]
-    fn slash_continue_with_a_resumable_plan_resumes_instead_of_hinting() {
-        // /continue on a FRESH session (no in-memory gate) with a persisted, resumable
-        // director-loop run on disk must RE-ATTACH (Action::ResumeRun + a resuming
-        // note), not show the "no pipeline started" restart hint.
-        let mut app = fresh_app(Some("claude-code"));
-        // Persist a plan with one Pending step + a workflow-state carrying the
-        // requirement — exactly what an interrupted /run leaves behind.
-        let plan = umadev_agent::Plan {
-            steps: vec![umadev_agent::PlanStep {
-                files: umadev_agent::StepFiles::default(),
-                id: "a".into(),
-                title: "build the login page".into(),
-                seat: umadev_agent::Seat::FrontendEngineer,
-                kind: umadev_agent::StepKind::Build,
-                depends_on: vec![],
-                acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
-                evidence: Vec::new(),
-                status: umadev_agent::StepStatus::Pending,
-            }],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        umadev_agent::save_plan(&plan, &app.project_root).unwrap();
-        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
-        state.slug = "demo".into();
-        state.requirement = "做一个登录页".into();
-        state.backend = "claude-code".into();
-        umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
-
-        let before = app.history.len();
-        let action = app
-            .try_slash_command("/continue")
-            .expect("/continue is a slash command");
-        assert_eq!(
-            action,
-            Action::ResumeRun("做一个登录页".to_string()),
-            "a resumable run resumes with the persisted requirement"
-        );
-        // The trilingual resuming note was surfaced (not the restart hint).
-        assert!(
-            app.history
-                .iter()
-                .skip(before)
-                .any(|m| m.body().contains("续跑")),
-            "the resuming note is shown"
-        );
-        assert!(
-            !app.history
-                .iter()
-                .skip(before)
-                .any(|m| m.body().contains("还没启动流水线")),
-            "the restart hint is NOT shown"
-        );
-    }
-
-    #[test]
-    fn resuming_a_blocked_run_keeps_earlier_transcript_and_marks_a_continued_divider() {
-        // User-reported: after a run BLOCKS and the user `/continue`s, the earlier
-        // steps must NOT disappear from the transcript. The block only clears the
-        // LIVE PANEL (plan / verdict) state; the durable `history` (plan-posted
-        // memo + per-seat critic notes + the block message) is preserved, and the
-        // resume APPENDS a "— continued —" divider so the run reads as one
-        // continuous history the user can scroll back through.
-        let mut app = fresh_app(Some("claude-code"));
-
-        // ---- Earlier steps: a posted plan + two seat verdicts (one a BLOCK). ----
-        app.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec![
-                "s1 · scaffold app (frontend-engineer)".into(),
-                "s2 · wire auth API (backend-engineer)".into(),
-            ],
-            done: 0,
-            total: 2,
-        });
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "architect".into(),
-            accepts: true,
-            blocking: vec![],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        app.apply_engine(EngineEvent::CriticVerdict {
-            seat: "security".into(),
-            accepts: false,
-            blocking: vec!["step-2-auth-token-leak".into()],
-            remediation: vec!["scope the token to the session".into()],
-            advisory: vec![],
-        });
-        // The run hits a hard block and stops (clears the live panels, keeps the
-        // transcript).
-        app.mark_block_aborted("step-2-blocked-marker".into());
-
-        // The panels are gone, but the earlier per-step content is still in the
-        // scrollable transcript.
-        assert!(
-            app.plan_steps.is_empty(),
-            "block clears the live plan panel"
-        );
-        assert!(
-            app.critic_verdicts.is_empty(),
-            "block clears the live review panel"
-        );
-        // The per-step team-review notes (seat + blocking finding) and the block
-        // message are the durable transcript record that must survive the block.
-        // (Plan step TITLES live only in the panel, so they are re-posted on
-        // resume, not asserted here.)
-        let earlier_markers = [
-            "security",
-            "step-2-auth-token-leak",
-            "step-2-blocked-marker",
-        ];
-        for m in earlier_markers {
-            assert!(
-                app.history.iter().any(|row| row.body().contains(m)),
-                "earlier transcript content `{m}` is present after the block"
-            );
-        }
-
-        // A resumable run exists on disk (what an interrupted /run leaves behind).
-        let plan = umadev_agent::Plan {
-            steps: vec![umadev_agent::PlanStep {
-                files: umadev_agent::StepFiles::default(),
-                id: "s2".into(),
-                title: "wire auth API".into(),
-                seat: umadev_agent::Seat::BackendEngineer,
-                kind: umadev_agent::StepKind::Build,
-                depends_on: vec![],
-                acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
-                evidence: Vec::new(),
-                status: umadev_agent::StepStatus::Pending,
-            }],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        umadev_agent::save_plan(&plan, &app.project_root).unwrap();
-        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Backend);
-        state.slug = "demo".into();
-        state.requirement = "做一个登录页".into();
-        state.backend = "claude-code".into();
-        umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
-
-        // Snapshot the earlier transcript row bodies, then resume.
-        let earlier_bodies: Vec<String> =
-            app.history.iter().map(|m| m.body().to_string()).collect();
-        let len_before = app.history.len();
-        let action = app
-            .try_slash_command("/continue")
-            .expect("/continue is a slash command");
-        assert_eq!(action, Action::ResumeRun("做一个登录页".to_string()));
-
-        // Every earlier row is STILL present, in order (nothing was dropped).
-        let after_bodies: Vec<String> = app.history.iter().map(|m| m.body().to_string()).collect();
-        assert_eq!(
-            &after_bodies[..len_before],
-            &earlier_bodies[..],
-            "the earlier transcript is preserved, unmodified, as a prefix"
-        );
-
-        // The resume APPENDED a "— continued —" divider (the localized separator).
-        let separator = umadev_i18n::t(app.lang, "continue.separator");
-        let sep_idx = app
-            .history
-            .iter()
-            .position(|m| m.body() == separator)
-            .expect("a continued divider was appended on resume");
-        assert!(
-            sep_idx >= len_before,
-            "the divider is appended AFTER the preserved earlier transcript"
-        );
-        // The resuming note follows the divider (earlier steps · divider · resume).
-        let resume_idx = app
-            .history
-            .iter()
-            .rposition(|m| m.body().contains("续跑"))
-            .expect("the resuming note is shown");
-        assert!(
-            sep_idx < resume_idx,
-            "the divider precedes the resuming note"
-        );
-    }
-
-    #[test]
-    fn slash_revise_at_gate_returns_revise_with_text() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        for c in "/revise 把 OAuth 删掉".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Revise("把 OAuth 删掉".to_string()));
-    }
-
-    #[test]
-    fn slash_revise_without_args_is_noop_with_usage_hint() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        for c in "/revise".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::None);
-        assert!(app.history.iter().any(|m| m.body().contains("/revise")));
-    }
-
-    #[test]
-    fn slash_goal_with_objective_starts_a_goal_driven_build() {
-        // `/goal <objective>` → a goal-driven director build (StartGoal), carrying
-        // the whole arg as the objective (no slug parsing — a goal is a sentence).
-        let mut app = fresh_app(Some("offline"));
-        for c in "/goal build a shippable todo app".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(
-            action,
-            Action::StartGoal("build a shippable todo app".to_string())
-        );
-        // A goal acknowledgement was surfaced to the user (the `goal.starting` line).
-        assert!(app
-            .history
-            .iter()
-            .any(|m| m.body().contains("build a shippable todo app")));
-    }
-
-    #[test]
-    fn slash_goal_without_objective_is_noop_with_usage_hint() {
-        // Empty `/goal` → a usage hint, no build kicked off.
-        let mut app = fresh_app(Some("offline"));
-        for c in "/goal".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::None);
-        assert!(app.history.iter().any(|m| m.body().contains("/goal")));
-    }
-
-    #[test]
-    fn goal_is_a_registered_slash_verb() {
-        // The `/goal` verb is in the palette so completion + help surface it.
-        assert!(App::COMMANDS.iter().any(|c| c.name == "goal"));
-    }
-
-    /// Parse the canonical verbs from the dispatch `match` arms by reading THIS
-    /// source between the `COMMAND-DISPATCH-START/END` sentinels. An arm head is
-    /// a line that (after trimming) starts with a string literal and contains
-    /// `=>`; its `|`-separated quoted literals are the verbs it handles. The `_`
-    /// fallback sits past the END sentinel, so dynamic per-backend ids are
-    /// excluded. This reads the REAL dispatcher, so it can't drift from it.
-    fn dispatch_arm_verbs() -> Vec<String> {
-        let src = include_str!("app.rs");
-        let start = src
-            .find("// COMMAND-DISPATCH-START")
-            .expect("dispatch start sentinel present");
-        let end = src
-            .find("// COMMAND-DISPATCH-END")
-            .expect("dispatch end sentinel present");
-        assert!(end > start, "END sentinel follows START");
-        let mut verbs = Vec::new();
-        for line in src[start..end].lines() {
-            let trimmed = line.trim_start();
-            if !trimmed.starts_with('"') {
-                continue;
-            }
-            let Some(arrow) = trimmed.find("=>") else {
-                continue;
-            };
-            for part in trimmed[..arrow].split('|') {
-                let part = part.trim();
-                if let Some(inner) = part.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                    verbs.push(inner.to_string());
-                }
-            }
-        }
-        verbs
-    }
-
-    #[test]
-    fn commands_and_dispatch_are_in_lockstep() {
-        // The ONE-registry invariant (UX maturity Fix A): the palette, the help
-        // overlay, and the dispatcher all read `App::COMMANDS`. This test locks
-        // the registry against the actual dispatch arms so the three surfaces can
-        // never drift again (the historical bugs: `/model` dispatchable yet not
-        // in the palette; a dozen verbs missing from help; aliases only in
-        // dispatch). Mirrors how a mature TUI locks its built-in command names.
-        let dispatch = dispatch_arm_verbs();
-        assert!(
-            dispatch.len() >= 40,
-            "parsed the dispatch arms (got {}): {dispatch:?}",
-            dispatch.len()
-        );
-
-        // (1) Every non-hidden registry command has a dispatch arm on its
-        //     canonical name — the palette/help can't advertise an unwired verb.
-        for c in App::COMMANDS {
-            if c.hidden {
-                continue;
-            }
-            assert!(
-                dispatch.iter().any(|v| v == c.name),
-                "/{} is in COMMANDS but has no dispatch arm",
-                c.name
-            );
-            // Each alias resolves CENTRALLY back to its command (aliases live only
-            // in the registry now), so a typed alias always reaches the handler.
-            for alias in c.aliases {
-                let resolved = App::resolve_command(alias);
-                assert!(
-                    resolved.is_some_and(|r| r.name == c.name),
-                    "alias /{alias} of /{} does not resolve to it",
-                    c.name
-                );
-            }
-        }
-
-        // (2) Every dispatch arm is a registered command name — a hand-added
-        //     `match` arm that forgot the registry fails right here.
-        for verb in &dispatch {
-            assert!(
-                App::COMMANDS.iter().any(|c| c.name == verb),
-                "dispatch arm \"{verb}\" is not a registered COMMANDS name"
-            );
-        }
-
-        // (3) Names + aliases are globally unique, so resolution is unambiguous.
-        let mut seen = std::collections::HashSet::new();
-        for c in App::COMMANDS {
-            assert!(seen.insert(c.name), "duplicate command name /{}", c.name);
-            for alias in c.aliases {
-                assert!(
-                    seen.insert(*alias),
-                    "alias /{alias} collides with another verb"
-                );
-            }
-            // Every description key must be present in the catalog (resolves to a
-            // real string, not the key echoed back) so no palette/help row is blank.
-            assert_ne!(
-                umadev_i18n::t(umadev_i18n::Lang::En, c.desc_key),
-                c.desc_key,
-                "/{} desc_key {} is missing from the i18n catalog",
-                c.name,
-                c.desc_key
-            );
-        }
-    }
-
-    #[test]
-    fn slash_unknown_command_hints() {
-        let mut app = fresh_app(Some("offline"));
-        for c in "/foo".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let _ = app.apply_key(KeyCode::Enter);
-        assert!(app
-            .history
-            .iter()
-            .any(|m| m.body().contains("未知命令") && m.body().contains("/foo")));
-    }
-
-    #[test]
-    fn plain_text_at_open_gate_routes_to_revise() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        for c in "去掉 OAuth".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Revise("去掉 OAuth".to_string()));
-    }
-
-    #[test]
-    fn approval_words_at_open_gate_approve_instead_of_revising() {
-        // A2#2: "确认" / "通过" / "approve" / "ok" / "lgtm" at a gate run through
-        // `classify_reply` and APPROVE — the reported trap was typing 确认 and
-        // watching the whole producing block re-run as a "revision". The literal
-        // `c` shortcut keeps working (covered elsewhere).
-        for word in ["确认", "通过", "approve", "ok", "LGTM"] {
-            let mut app = fresh_app(Some("offline"));
-            app.apply_engine(EngineEvent::GateOpened {
-                gate: Gate::DocsConfirm,
-                choice: None,
-            });
-            let action = app.submit_text(word.to_string());
-            assert_eq!(
-                action,
-                Action::Continue(Gate::DocsConfirm),
-                "`{word}` approves the gate"
-            );
-            assert!(app.active_gate.is_none(), "`{word}` cleared the gate");
-        }
-    }
-
-    #[test]
-    fn cancel_words_at_open_gate_cancel_the_run() {
-        // A2#2: "取消" / "cancel" at a gate cancels (the picker's Cancel path) —
-        // never a revision that re-runs the block with "取消" as feedback.
-        for word in ["取消", "cancel"] {
-            let mut app = fresh_app(Some("offline"));
-            app.apply_engine(EngineEvent::GateOpened {
-                gate: Gate::DocsConfirm,
-                choice: None,
-            });
-            let action = app.submit_text(word.to_string());
-            assert_eq!(action, Action::Cancel, "`{word}` cancels at the gate");
-            assert!(app.active_gate.is_none(), "`{word}` cleared the gate");
-        }
-    }
-
-    #[test]
-    fn text_during_director_run_queues_as_steering_not_chat() {
-        // A2#4/#5: while a DIRECTOR build is in flight, typed text is mid-run
-        // STEERING (queued_steer → the step-boundary intake), not a chat turn
-        // parked until the whole build settles. A plain chat turn keeps the old
-        // queued_chat lane.
-        let mut app = fresh_app(Some("offline"));
-        app.thinking = true;
-        app.director_run_in_flight = true;
-        let action = app.submit_text("把配色换成暗色".into());
-        assert_eq!(action, Action::None);
-        assert_eq!(app.queued_steer.len(), 1, "steer lane took the message");
-        assert!(app.queued_chat.is_empty(), "chat lane untouched");
-
-        // A non-director thinking turn still parks on the chat lane.
-        let mut chat = fresh_app(Some("offline"));
-        chat.thinking = true;
-        let action = chat.submit_text("另一个问题".into());
-        assert_eq!(action, Action::None);
-        assert!(chat.queued_steer.is_empty());
-        assert_eq!(chat.queued_chat.len(), 1);
-    }
-
-    #[test]
-    fn record_run_paused_at_gate_clears_thinking_and_arms_the_pause() {
-        // The RunPausedAtGate terminal decision: the in-flight state clears, the
-        // director-pause marker arms, and the gate is asserted fail-open even if
-        // the GateOpened event raced (idempotent backstop).
-        let mut app = fresh_app(Some("offline"));
-        app.thinking = true;
-        app.agentic_in_flight = true;
-        app.director_run_in_flight = true;
-        app.record_run_paused_at_gate(Gate::DocsConfirm);
-        assert!(!app.thinking && !app.agentic_in_flight && !app.director_run_in_flight);
-        assert!(app.director_gate_paused, "the pause marker is armed");
-        assert_eq!(app.active_gate, Some(Gate::DocsConfirm));
-        // A cancel resolves the pause (no stale marker into the next run).
-        app.cancel_run();
-        assert!(!app.director_gate_paused);
-    }
-
-    #[test]
-    fn surface_unsent_steer_reports_leftovers_once_and_clears_the_chip() {
-        // A2#4: steering that never reached a step boundary is surfaced honestly
-        // (run.queued_unsent) and the queued chip clears; nothing queued → no note.
-        let mut app = fresh_app(Some("offline"));
-        app.queued_steer.push_back("skip step 2".into());
-        let before = app.history.len();
-        app.surface_unsent_steer(vec!["make it dark".into()]);
-        assert!(app.queued_steer.is_empty(), "the queued chip cleared");
-        assert_eq!(app.history.len(), before + 1, "ONE surfacing note");
-        let body = app.history.back().unwrap().body().to_string();
-        assert!(body.contains("skip step 2") && body.contains("make it dark"));
-        // Empty → silent no-op.
-        let before = app.history.len();
-        app.surface_unsent_steer(Vec::new());
-        assert_eq!(app.history.len(), before);
-    }
-
-    #[test]
-    fn rewind_is_refused_while_a_run_is_writing_the_workspace() {
-        // A2#11: `/rewind <id>` during an active run would be a second writer
-        // racing the build — refused with the busy note (same guard as /redo).
-        // The read-only list form stays allowed.
-        let mut app = fresh_app(Some("offline"));
-        app.agentic_in_flight = true; // a director/agentic build is live
-        for c in "/rewind c1".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::None);
-        assert!(
-            app.history
-                .iter()
-                .any(|m| m.body() == umadev_i18n::t(app.lang, "rewind.busy")),
-            "the busy note was surfaced"
-        );
-        // Listing (no id) is read-only and never refused.
-        for c in "/rewind".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::None);
-        let busy_notes = app
-            .history
-            .iter()
-            .filter(|m| m.body() == umadev_i18n::t(app.lang, "rewind.busy"))
-            .count();
-        assert_eq!(busy_notes, 1, "the list form is not refused");
-    }
-
-    #[test]
-    fn plain_text_after_delivery_routes_to_worker() {
-        let mut app = fresh_app(Some("offline"));
-        app.run_started = true;
-        app.apply_engine(EngineEvent::BlockCompleted {
-            final_phase: Phase::Delivery,
-            paused_at: None,
-        });
-        assert!(app.finished);
-        for c in "make another tool".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Route("make another tool".to_string()));
-        // Routing alone does not reset the delivered run; reset happens after
-        // the worker returns a `run` decision.
-        assert!(app.finished);
-    }
-
-    #[test]
-    fn worker_routed_run_after_delivery_resets_phases() {
-        let mut app = fresh_app(Some("offline"));
-        app.run_started = true;
-        app.apply_engine(EngineEvent::BlockCompleted {
-            final_phase: Phase::Delivery,
-            paused_at: None,
-        });
-        assert!(app.finished);
-        app.prepare_worker_routed_run("make another tool");
-
-        assert!(app.phases.iter().all(|r| r.status == PhaseStatus::Pending));
-        assert!(!app.finished);
-    }
-
-    #[test]
-    fn abort_sentinel_note_surfaces_explicit_terminal_state_not_idle() {
-        // THE VISIBILITY BUG: a block that ended with an error used to emit a
-        // bare, easily-missed note and leave the bar reading "ready / 0/9". A
-        // terminal-abort note (carrying `ABORT_SENTINEL`) must instead flip the
-        // run into an explicit aborted state and stop the live counters.
-        let mut app = fresh_app(Some("offline"));
-        app.run_started = true;
-        app.run_started_at = Some(std::time::Instant::now());
-        assert!(app.is_pipeline_active(), "run is active before the abort");
-
-        app.apply_engine(EngineEvent::Note(format!(
-            "{}本轮已中止:磁盘写入失败 — 释放空间后重试",
-            crate::ABORT_SENTINEL
-        )));
-
-        assert!(app.aborted, "the sentinel note flips the run into aborted");
-        assert!(
-            !app.is_pipeline_active(),
-            "an aborted run is NOT active — a retry must not be refused as busy"
-        );
-        assert!(
-            app.run_started_at.is_none() && app.phase_started_at.is_none(),
-            "live elapsed counters stop on abort so the bar isn't a fake idle"
-        );
-        // The user sees the cause, and the sentinel marker is stripped.
-        let last = app.history.back().unwrap();
-        assert!(last.body().contains("本轮已中止"));
-        assert!(
-            !last.body().contains(crate::ABORT_SENTINEL),
-            "the internal sentinel marker must never be shown to the user"
-        );
-        // The status bar carries the explicit aborted label, not an idle look.
-        app.refresh_status();
-        assert!(app.status.contains("aborted"));
-    }
-
-    #[test]
-    fn a_new_pipeline_start_clears_a_prior_aborted_state() {
-        // Retrying after an abort: `PipelineStarted` must clear `aborted` so the
-        // fresh run reads as live, not stuck in the previous terminal state.
-        let mut app = fresh_app(Some("offline"));
-        app.aborted = true;
-        app.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "retry it".into(),
-        });
-        assert!(!app.aborted, "a fresh block clears the prior aborted state");
-        assert!(app.is_pipeline_active(), "the retried run is active again");
-    }
-
-    #[test]
-    fn ordinary_progress_note_does_not_abort() {
-        // A normal progress note (no sentinel) must keep the run active — only
-        // the explicit terminal-abort marker flips it.
-        let mut app = fresh_app(Some("offline"));
-        app.run_started = true;
-        app.apply_engine(EngineEvent::Note("[plan] 动态规划:greenfield".into()));
-        assert!(!app.aborted, "a plain progress note never aborts");
-        assert!(app.is_pipeline_active());
-    }
-
-    #[test]
-    fn host_output_lands_in_history_as_host_role() {
-        let mut app = fresh_app(Some("offline"));
-        app.apply_engine(EngineEvent::HostOutput {
-            phase: Phase::Research,
-            line: "## Similar products".into(),
-        });
-        let last = app.history.back().unwrap();
-        assert_eq!(last.role, ChatRole::Host);
-        assert!(last.body().contains("Similar products"));
-    }
-
-    #[test]
-    fn history_is_bounded() {
-        let mut app = fresh_app(Some("offline"));
-        for i in 0..(HISTORY_CAP + 50) {
-            app.apply_engine(EngineEvent::Note(format!("line {i}")));
-        }
-        assert!(app.history.len() <= HISTORY_CAP);
-    }
-
-    #[test]
-    fn f1_toggles_help_in_both_modes() {
-        let mut a = fresh_app(None);
-        assert!(!a.show_help);
-        let _ = a.apply_key(KeyCode::F(1));
-        assert!(a.show_help);
-        let mut b = fresh_app(Some("offline"));
-        let _ = b.apply_key(KeyCode::F(1));
-        assert!(b.show_help);
-    }
-
-    #[test]
-    fn help_scroll_clamps_and_accepts_arrow_vim_keys() {
-        let mut a = fresh_app(Some("offline"));
-        let _ = a.apply_key(KeyCode::F(1));
-        a.help_max_scroll.set(3);
-
-        for _ in 0..10 {
-            let _ = a.apply_key(KeyCode::Down);
-        }
-        assert_eq!(a.help_scroll, 3, "Down must clamp at the rendered bottom");
-
-        let _ = a.apply_key(KeyCode::Up);
-        assert_eq!(
-            a.help_scroll, 2,
-            "Up must move immediately after bottom clamp"
-        );
-
-        let _ = a.apply_key(KeyCode::Char('J'));
-        assert_eq!(a.help_scroll, 3, "uppercase J mirrors j/Down");
-
-        let _ = a.apply_key(KeyCode::Char('K'));
-        assert_eq!(a.help_scroll, 2, "uppercase K mirrors k/Up");
-
-        let _ = a.apply_key(KeyCode::Char('G'));
-        assert_eq!(a.help_scroll, 3, "G jumps to the bottom");
-
-        let _ = a.apply_key(KeyCode::Home);
-        assert_eq!(a.help_scroll, 0, "Home jumps to the top");
-    }
-
-    #[test]
-    fn slash_spec_opens_overlay() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/spec".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        let ov = a.overlay.as_ref().expect("overlay should open");
-        assert!(ov.title.contains("UMADEV_HOST_SPEC_V1"));
-        assert!(ov.lines.iter().any(|l| l.contains("UMADEV_HOST_SPEC_V1")));
-    }
-
-    #[test]
-    fn slash_doctor_opens_overlay_with_binary_line() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/doctor".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        let ov = a.overlay.as_ref().expect("doctor overlay");
-        // Locale-independent: the binary line carries the crate version, and the
-        // worker-availability section header is always present. (The labels
-        // themselves are localized, so we assert on the language-neutral parts.)
-        assert!(
-            ov.lines
-                .iter()
-                .any(|l| l.contains(env!("CARGO_PKG_VERSION"))),
-            "doctor overlay should show the binary version line"
-        );
-        let avail = umadev_i18n::t(a.lang, "doctor.worker_availability");
-        assert!(
-            ov.lines.iter().any(|l| l.contains(avail.trim())),
-            "doctor overlay should show the worker-availability section"
-        );
-    }
-
-    #[test]
-    fn slash_verify_opens_overlay_with_sections() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/verify".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        let ov = a.overlay.as_ref().unwrap();
-        let joined = ov.lines.join("\n");
-        assert!(joined.contains("## Spec manifest"));
-        assert!(joined.contains("## Workflow state"));
-        assert!(joined.contains("## Artifacts"));
-    }
-
-    #[test]
-    fn slash_diff_missing_artifact_shows_available_list() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/diff".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        let ov = a.overlay.as_ref().unwrap();
-        // Empty workspace → fallback message kicks in.
-        assert!(ov
-            .lines
-            .iter()
-            .any(|l| l.contains("找不到") || l.contains("还不存在")));
-    }
-
-    #[test]
-    fn slash_init_writes_umadev_yaml() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = UserConfig {
-            backend: Some("offline".into()),
-            ..Default::default()
-        };
-        let mut app = App::new(
-            "demo",
-            cfg,
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        for c in "/init".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let action = app.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::None);
-        // Manifest must exist on disk after the slash command.
-        assert!(tmp.path().join("umadev.yaml").is_file());
-        // Confirmation message landed in the chat.
-        assert!(app
-            .history
-            .iter()
-            .any(|m| m.role == ChatRole::UmaDev && m.body().contains("umadev.yaml")));
-    }
-
-    #[test]
-    fn esc_during_active_pipeline_interrupts_the_run() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "build".into(),
-        });
-        assert!(a.is_pipeline_active());
-        // Esc INTERRUPTS the running pipeline (like Claude Code), but a DELIBERATE
-        // double-press — the first arms, the second cancels — so a stray keypress
-        // can't nuke a long build. Neither press quits the app.
-        assert_eq!(a.apply_key(KeyCode::Esc), Action::None);
-        assert!(a.interrupt_armed(), "first Esc arms the interrupt");
-        assert!(!a.should_quit);
-        assert_eq!(a.apply_key(KeyCode::Esc), Action::Cancel);
-        assert!(!a.should_quit);
-    }
-
-    // ---- Windows-console render garble: force a full repaint when an operation
-    // shifts the layout, so ratatui's incremental diff can't leave stale
-    // overlapping rows on conhost / PowerShell. ------------------------------
-
-    #[test]
-    fn multiline_history_recall_forces_full_repaint() {
-        let mut a = fresh_app(Some("offline"));
-        // The renderer publishes the available input text width; pin it so the
-        // height comparison is deterministic.
-        a.input_text_cols.set(40);
-        // A multi-line prior submission. Recalling it into the empty one-row box
-        // GROWS the prompt, shifting the transcript above it — exactly the case
-        // that leaves overlapping garble on the Windows console.
-        a.remember_submission("line one\nline two\nline three");
-        assert!(
-            !a.terminal_contaminated.get(),
-            "no repaint pending before the recall"
-        );
-        a.input_history_back();
-        assert_eq!(a.input, "line one\nline two\nline three");
-        assert!(
-            a.take_terminal_contaminated(),
-            "a multi-line recall that grows the input box must force a full repaint"
-        );
-        // The request drains in ONE shot — exactly one full repaint, then the
-        // cheap incremental diff resumes.
-        assert!(
-            !a.take_terminal_contaminated(),
-            "the repaint request drains once"
-        );
-    }
-
-    #[test]
-    fn same_height_history_recall_does_not_force_repaint() {
-        let mut a = fresh_app(Some("offline"));
-        a.input_text_cols.set(40);
-        // A short single-line entry: recalling it into the empty box keeps the
-        // box one row tall (nothing above shifts), so no full repaint is needed.
-        a.remember_submission("hi");
-        a.input_history_back();
-        assert_eq!(a.input, "hi");
-        assert!(
-            !a.take_terminal_contaminated(),
-            "a same-height recall must NOT force a needless full repaint"
-        );
-    }
-
-    #[test]
-    fn history_forward_shrink_forces_full_repaint() {
-        let mut a = fresh_app(Some("offline"));
-        a.input_text_cols.set(40);
-        a.remember_submission("a\nb\nc\nd"); // four rows tall
-        a.remember_submission("short"); // one row
-        a.input_history_back(); // -> "short" (same height as empty draft)
-        let _ = a.take_terminal_contaminated(); // clear whatever that step set
-        a.input_history_back(); // -> the tall entry (grows)
-        assert!(
-            a.take_terminal_contaminated(),
-            "growing the box on the way back forces a repaint"
-        );
-        // Stepping FORWARD shrinks the tall entry back to "short": the box loses
-        // rows, which must also force a full repaint (the shrink-leaves-stale-rows
-        // case — the back-buffer reset is what wipes them).
-        a.input_history_forward();
-        assert_eq!(a.input, "short");
-        assert!(
-            a.take_terminal_contaminated(),
-            "shrinking the input box on forward-recall must force a full repaint"
-        );
-    }
-
-    // ---- long-run transcript garble: a transcript reflow / scroll must force a
-    // full repaint too (not just the input box), so a diff-only console can't
-    // leave stale/overlapping rows over a long streaming run. ----------------
-
-    #[test]
-    fn scroll_jump_does_not_force_full_repaint() {
-        let mut a = fresh_app(Some("offline"));
-        // The renderer publishes the scroll bound; pin one so a scroll actually
-        // moves the offset.
-        a.transcript_max_scroll.set(100);
-        assert!(
-            !a.take_transcript_repaint(),
-            "no transcript repaint pending before any scroll"
-        );
-        // A real scroll UP (0 → 10) replaces the visible window, but it must not
-        // clear the whole terminal on every wheel/PageUp step; that visibly
-        // flickers on Windows. Structural reflow still repaints via the renderer.
-        a.transcript_scroll_up(10);
-        assert_eq!(a.transcript_scroll(), 10);
-        assert!(
-            !a.take_transcript_repaint(),
-            "scrolling history must not force a full clear/repaint"
-        );
-        // Scrolling back to the bottom also moves the window, but stays
-        // incremental for the same reason.
-        a.transcript_scroll_to_bottom();
-        assert_eq!(a.transcript_scroll(), 0);
-        assert!(
-            !a.take_transcript_repaint(),
-            "jumping back to bottom must not force a full clear/repaint"
-        );
-    }
-
-    #[test]
-    fn boundary_scroll_that_moves_nothing_does_not_repaint() {
-        let mut a = fresh_app(Some("offline"));
-        a.transcript_max_scroll.set(0); // everything fits: nothing to scroll
-                                        // Already pinned to the bottom (offset 0): a scroll-down / to-bottom is a
-                                        // no-op and must NOT force a needless repaint (no thrash on a static view).
-        a.transcript_scroll_down(5);
-        a.transcript_scroll_to_bottom();
-        assert!(
-            !a.take_transcript_repaint(),
-            "a scroll that changed nothing must not force a repaint"
-        );
-        // A scroll UP clamped to a zero bound also moves nothing → no repaint.
-        a.transcript_scroll_up(5);
-        assert_eq!(a.transcript_scroll(), 0);
-        assert!(
-            !a.take_transcript_repaint(),
-            "a scroll clamped to a zero bound moves nothing → no repaint"
-        );
-    }
-
-    #[test]
-    fn slash_clear_forces_full_repaint() {
-        let mut a = fresh_app(Some("offline"));
-        // Put content in the transcript so `/clear` actually drops rows.
-        a.push(ChatRole::You, "hello");
-        a.push(ChatRole::UmaDev, "hi there");
-        // Dispatch `/clear` exactly as the user types it.
-        for c in "/clear".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::None);
-        // The prior conversation is dropped (only the "history cleared" system
-        // confirmation remains).
-        assert!(
-            !a.history.iter().any(|m| m.body().contains("hi there")),
-            "/clear drops the prior transcript"
-        );
-        assert!(
-            a.take_terminal_contaminated(),
-            "/clear drops transcript rows without changing the input height, so it \
-             must force a full repaint itself (the generic height guard can't catch it)"
-        );
-    }
-
-    // ---- P3: out-of-band terminal writes contaminate the render, forcing one
-    // healing clear+repaint on the next frame (the primary heal on terminals
-    // without confirmed synchronized output). --------------------------------
-
-    #[test]
-    fn taking_an_armed_bell_contaminates_the_terminal() {
-        let mut a = fresh_app(Some("offline"));
-        a.bell_pending = true;
-        assert!(a.take_bell(), "the armed bell drains");
-        assert!(
-            a.take_terminal_contaminated(),
-            "the out-of-band BEL write must contaminate the terminal (one heal frame)"
-        );
-        // Both flags are one-shot: no bell, no second heal.
-        assert!(!a.take_bell(), "the bell drains once");
-        assert!(
-            !a.take_terminal_contaminated(),
-            "the contamination flag drains once — exactly one healing repaint"
-        );
-    }
-
-    #[test]
-    fn an_unarmed_bell_does_not_contaminate() {
-        let mut a = fresh_app(Some("offline"));
-        assert!(!a.take_bell(), "nothing armed → no bell");
-        assert!(
-            !a.take_terminal_contaminated(),
-            "no out-of-band write happened → the steady state stays clean"
-        );
-    }
-
-    #[test]
-    fn input_block_rows_clamps_so_oversized_inputs_report_equal_height() {
-        // Two inputs that both exceed the visible cap report the SAME box height,
-        // so swapping one for the other never forces a needless repaint.
-        let tall = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj";
-        let taller = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm";
-        assert_eq!(
-            crate::ui::input_block_rows(tall, 40),
-            crate::ui::input_block_rows(taller, 40),
-            "the visible-row clamp makes both oversized inputs report one height"
-        );
-        // A one-line vs a three-line input DO differ in height.
-        assert_ne!(
-            crate::ui::input_block_rows("one", 40),
-            crate::ui::input_block_rows("one\ntwo\nthree", 40),
-        );
-    }
-
-    #[test]
-    fn interrupt_seals_a_half_streamed_reply_as_incomplete() {
-        let mut a = fresh_app(Some("offline"));
-        // Simulate a Host reply mid-stream.
-        a.push(ChatRole::Host, "the answer so far".to_string());
-        a.stream_text_active = true;
-        a.cancel_run();
-        let marker = umadev_i18n::t(a.lang, "chat.interrupted");
-        let last = a
-            .history
-            .iter()
-            .rev()
-            .find(|m| m.role == ChatRole::Host)
-            .unwrap();
-        assert!(
-            last.body().contains(marker.trim()),
-            "an interrupted reply must be marked incomplete: {:?}",
-            last.body()
-        );
-        assert!(!a.stream_text_active, "the stream flag is cleared on seal");
-    }
-
-    #[test]
-    fn seal_is_a_noop_when_nothing_was_streaming() {
-        let mut a = fresh_app(Some("offline"));
-        a.push(ChatRole::Host, "a finished reply".to_string());
-        a.stream_text_active = false;
-        a.seal_interrupted_stream();
-        let last = a
-            .history
-            .iter()
-            .rev()
-            .find(|m| m.role == ChatRole::Host)
-            .unwrap();
-        assert_eq!(
-            last.body(),
-            "a finished reply",
-            "no marker when nothing streamed"
-        );
-    }
-
-    #[test]
-    fn typing_clears_pending_quit_confirm() {
-        let mut a = fresh_app(Some("offline"));
-        // Idle Esc arms the quit confirmation (no pipeline running).
-        let _ = a.apply_key(KeyCode::Esc);
-        assert!(a.pending_quit_confirm);
-        // Any typing — even one char — clears the pending confirmation.
-        let _ = a.apply_key(KeyCode::Char('x'));
-        assert!(!a.pending_quit_confirm);
-    }
-
-    #[test]
-    fn typing_mid_phase_queues_and_fires_at_the_next_gate() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "build".into(),
-        });
-        assert!(a.is_pipeline_active() && a.active_gate.is_none());
-        // Typing while a phase runs (no gate open) QUEUES the message instead of
-        // dropping it.
-        for c in "make it dark mode".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::None);
-        assert_eq!(
-            a.queued_steer
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            vec!["make it dark mode"]
-        );
-        // At the next gate (the gap), the queued message is promoted to a
-        // pending steer — fired as a revision — instead of auto-approving.
-        a.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        assert!(a.queued_steer.is_empty());
-        assert_eq!(a.pending_steer.as_deref(), Some("make it dark mode"));
-        assert!(a.pending_auto_continue.is_none());
-    }
-
-    #[test]
-    fn aborted_block_drains_and_surfaces_a_parked_queued_steer() {
-        // M2 — a steer parked mid-phase that then hits an ABORT (the run errored,
-        // so no further gate/completion fires) must NOT stay stuck forever: the
-        // queue drains (the "queued N" chip clears) and the dropped text is
-        // surfaced so the user knows to resend.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "build".into(),
-        });
-        for c in "make it dark mode".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        assert_eq!(
-            a.queued_steer.len(),
-            1,
-            "the steer parked while the phase ran"
-        );
-        let before = a.history.len();
-        // The producing block errors out (the ABORT_SENTINEL path).
-        a.mark_block_aborted("the base errored".into());
-        assert!(
-            a.queued_steer.is_empty(),
-            "an abort must drain the parked steer so the chip clears"
-        );
-        let surfaced = a
-            .history
-            .iter()
-            .skip(before)
-            .any(|m| m.body().contains("make it dark mode"));
-        assert!(
-            surfaced,
-            "the dropped steer must be surfaced for the user to resend"
-        );
-    }
-
-    #[test]
-    fn cancel_run_clears_a_parked_queued_steer() {
-        // M2 — a user cancel ends the run, so a parked steer can never reach a
-        // gate; it must be cleared so the "queued N" chip doesn't stay falsely lit.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "build".into(),
-        });
-        a.queued_steer.push_back("steer me".into());
-        a.cancel_run();
-        assert!(
-            a.queued_steer.is_empty(),
-            "a user cancel must drop the parked steer"
-        );
-    }
-
-    // ── Structured-choice gate picker ──────────────────────────────────────
-
-    #[test]
-    fn structured_choice_gate_arms_picker_and_approve_drives_continue() {
-        let mut a = fresh_app(Some("offline"));
-        // A confirm gate opened via the standard constructor carries the picker.
-        a.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
-        assert_eq!(a.active_gate, Some(Gate::DocsConfirm));
-        let choice = a.gate_choice.as_ref().expect("picker armed");
-        assert_eq!(choice.options.len(), 3, "approve / revise / add-more");
-        assert_eq!(a.gate_choice_sel, 0);
-        // Arrow keys move the highlight (wrapping both ways).
-        let _ = a.apply_key(KeyCode::Down);
-        let _ = a.apply_key(KeyCode::Down);
-        assert_eq!(a.gate_choice_sel, 2);
-        let _ = a.apply_key(KeyCode::Down); // wraps to 0
-        assert_eq!(a.gate_choice_sel, 0);
-        let _ = a.apply_key(KeyCode::Up); // wraps to 2
-        assert_eq!(a.gate_choice_sel, 2);
-        let _ = a.apply_key(KeyCode::Down); // back to the Approve row
-        assert_eq!(a.gate_choice_sel, 0);
-        // Enter on the highlighted Approve option drives the EXISTING confirm path.
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Continue(Gate::DocsConfirm));
-        assert!(a.gate_choice.is_none() && a.active_gate.is_none());
-    }
-
-    #[test]
-    fn text_question_mode_suppresses_gate_picker_default_still_shows_it() {
-        // Default (picker) mode: the numbered picker is armed (existing behavior,
-        // so users who never opt in are unaffected).
-        let mut picker = fresh_app(Some("offline"));
-        picker.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
-        assert!(
-            picker.gate_choice.is_some(),
-            "picker mode (the default) still arms the numbered picker"
-        );
-
-        // Text-question mode: the picker is SUPPRESSED and the gate is framed as
-        // prose the user answers in natural language (the free-text reply path is
-        // unchanged — only the presentation differs).
-        let mut text = fresh_app(Some("offline"));
-        text.config.question_form = Some("text".into());
-        let lang = text.lang;
-        let before = text.history.len();
-        text.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
-        assert_eq!(text.active_gate, Some(Gate::DocsConfirm));
-        assert!(
-            text.gate_choice.is_none(),
-            "text mode suppresses the numbered picker"
-        );
-        let hint = umadev_i18n::t(lang, "question.text_hint");
-        let framed = text
-            .history
-            .iter()
-            .skip(before)
-            .any(|m| m.body().contains(hint));
-        assert!(
-            framed,
-            "text mode frames the gate as prose with the answer-in-words hint"
-        );
-    }
-
-    #[test]
-    fn gate_picker_number_key_selects_and_drives_decision() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
-        // `1` picks the first option (Approve) directly → Continue.
-        let action = a.apply_key(KeyCode::Char('1'));
-        assert_eq!(action, Action::Continue(Gate::DocsConfirm));
-        assert!(a.gate_choice.is_none());
-    }
-
-    #[test]
-    fn gate_picker_revise_option_hands_off_to_free_text_then_revises() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
-        // `2` picks "Revise": no immediate Action, the picker is consumed, and the
-        // gate STAYS open awaiting the free-text revision (reuses the revise path).
-        let action = a.apply_key(KeyCode::Char('2'));
-        assert_eq!(action, Action::None);
-        assert!(a.gate_choice.is_none(), "picker consumed");
-        assert_eq!(
-            a.active_gate,
-            Some(Gate::DocsConfirm),
-            "gate open for the revision"
-        );
-        // The next typed line drives the existing Action::Revise.
-        for c in "make the header sticky".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Revise("make the header sticky".to_string()));
-    }
-
-    #[test]
-    fn gate_without_options_falls_back_to_free_form() {
-        let mut a = fresh_app(Some("offline"));
-        // No structured choice on the event → no picker (fail-open).
-        a.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        assert!(a.gate_choice.is_none(), "no picker → free-form");
-        assert_eq!(a.active_gate, Some(Gate::DocsConfirm));
-        // The free-text approval (`c`) still works exactly as before.
-        let _ = a.apply_key(KeyCode::Char('c'));
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Continue(Gate::DocsConfirm));
-    }
-
-    #[test]
-    fn gate_picker_coexists_with_free_text_fallback() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::gate_opened(Gate::PreviewConfirm));
-        assert!(a.gate_choice.is_some(), "picker present");
-        // Typing letters is NOT swallowed by the picker — the box only yields its
-        // keys to the picker while empty, so a custom response still types in.
-        for c in "use lucide".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert_eq!(a.input, "use lucide");
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Revise("use lucide".to_string()));
-    }
-
-    #[test]
-    fn gate_picker_out_of_range_digit_is_fail_open() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
-        // `9` is past the 3 options → not a selection; it falls through to normal
-        // insertion (fail-open: never panics, never picks a phantom option).
-        let action = a.apply_key(KeyCode::Char('9'));
-        assert_eq!(action, Action::None);
-        assert_eq!(a.input, "9");
-        assert!(a.gate_choice.is_some(), "picker untouched");
-    }
-
-    #[test]
-    fn gate_picker_pick_is_noop_without_active_gate() {
-        // Direct fail-open guard: picking with no active picker/gate is a no-op.
-        let mut a = fresh_app(Some("offline"));
-        assert_eq!(a.gate_choice_pick(0), Action::None);
-    }
-
-    #[test]
-    fn multiple_mid_phase_steers_queue_without_loss_and_count_correctly() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "build".into(),
-        });
-        assert!(a.is_pipeline_active() && a.active_gate.is_none());
-        // Three separate mid-phase turns. The old `Option<String>` overwrote all
-        // but the last; a `VecDeque` keeps every one, in order.
-        for turn in ["first steer", "second steer", "third steer"] {
-            for c in turn.chars() {
-                let _ = a.apply_key(KeyCode::Char(c));
-            }
-            let action = a.apply_key(KeyCode::Enter);
-            assert_eq!(action, Action::None);
-        }
-        assert_eq!(
-            a.queued_steer
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            vec!["first steer", "second steer", "third steer"],
-            "every steer is retained in FIFO order — none overwritten"
-        );
-        // The `queued N` chip reflects all three, not a stuck 1.
-        assert_eq!(a.queued_count(), 3, "count is the real queue depth");
-        // At the next gate, ALL of them fold into one pending revision (in order).
-        a.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        assert!(a.queued_steer.is_empty(), "queue drained at the gate");
-        assert_eq!(
-            a.pending_steer.as_deref(),
-            Some("first steer\nsecond steer\nthird steer")
-        );
-        assert_eq!(a.queued_count(), 0);
-    }
-
-    #[test]
-    fn esc_during_agentic_turn_interrupts_not_quits() {
-        let mut a = fresh_app(Some("offline"));
-        // An agentic chat turn is streaming in a base subprocess — note this is
-        // NOT a pipeline run (`run_started` stays false), so the only thing that
-        // can interrupt it is the `agentic_in_flight` branch.
-        a.agentic_in_flight = true;
-        assert!(!a.is_pipeline_active());
-        // Esc INTERRUPTS the agentic subprocess (parity with Ctrl-C) via a
-        // deliberate double-press, and does NOT arm quit-confirm or drop the app.
-        assert_eq!(a.apply_key(KeyCode::Esc), Action::None);
-        assert!(a.interrupt_armed(), "first Esc arms the interrupt");
-        assert_eq!(a.apply_key(KeyCode::Esc), Action::Cancel);
-        assert!(!a.should_quit);
-        assert!(
-            !a.pending_quit_confirm,
-            "Esc on an agentic turn interrupts, it does not arm quit-confirm"
-        );
-    }
-
-    // ---- resume hint on chat init ----
-
-    #[test]
-    fn resume_hint_appears_when_workflow_state_paused_at_gate() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        // Seed a workflow-state.json that looks like "paused at docs_confirm".
-        let state_dir = tmp.path().join(".umadev");
-        std::fs::create_dir_all(&state_dir).unwrap();
-        let state_json = r#"{
-            "phase": "docs_confirm",
-            "active_gate": "docs_confirm",
-            "slug": "demo",
-            "requirement": "做一个登录系统",
-            "last_transition_at": "2026-05-23T10:00:00Z",
-            "note": "",
-            "spec_version": "UMADEV_HOST_SPEC_V1"
-        }"#;
-        std::fs::write(state_dir.join("workflow-state.json"), state_json).unwrap();
-
-        let cfg = UserConfig {
-            backend: Some("offline".into()),
-            ..Default::default()
-        };
-        let app = App::new(
-            "demo",
-            cfg,
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-
-        // Greeting + resume hint both land in history.
-        let resume_msg = app
-            .history
-            .iter()
-            .find(|m| m.body().contains("docs_confirm"))
-            .expect("resume hint should mention the paused gate");
-        assert_eq!(resume_msg.role, ChatRole::System);
-        assert!(resume_msg.body().contains("做一个登录系统"));
-        assert!(resume_msg.body().contains("/continue"));
-    }
-
-    #[test]
-    fn resume_hint_marks_completed_runs() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let state_dir = tmp.path().join(".umadev");
-        std::fs::create_dir_all(&state_dir).unwrap();
-        let state_json = r#"{
-            "phase": "delivery",
-            "active_gate": "",
-            "slug": "demo",
-            "requirement": "做个 todo",
-            "last_transition_at": "2026-05-23T10:00:00Z",
-            "note": "Pipeline complete.",
-            "spec_version": "UMADEV_HOST_SPEC_V1"
-        }"#;
-        std::fs::write(state_dir.join("workflow-state.json"), state_json).unwrap();
-
-        let cfg = UserConfig {
-            backend: Some("offline".into()),
-            lang: Some("zh-CN".into()),
-            ..Default::default()
-        };
-        let app = App::new(
-            "demo",
-            cfg,
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        let msg = app
-            .history
-            .iter()
-            .find(|m| m.body().contains("上次跑完了") || m.body().contains("上次会话"))
-            .expect("delivery-state should produce a chat hint");
-        assert!(msg.body().contains("做个 todo"));
-    }
-
-    #[test]
-    fn no_resume_hint_for_clean_workspace() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = UserConfig {
-            backend: Some("offline".into()),
-            ..Default::default()
-        };
-        let app = App::new(
-            "demo",
-            cfg,
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        // Greeting still present (always), but no resume hint.
-        assert!(!app
-            .history
-            .iter()
-            .any(|m| m.body().contains("docs_confirm") || m.body().contains("上次")));
-    }
-
-    // ---- /model + /version + /changelog + typo did-you-mean ----
-
-    #[test]
-    fn slash_cancel_returns_cancel_action_only_while_running() {
-        let mut a = fresh_app(Some("offline"));
-        // Not running → /cancel is a no-op with a hint.
-        for c in "/cancel".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert!(matches!(a.apply_key(KeyCode::Enter), Action::None));
-        assert!(a.history.iter().any(|m| m.body().contains("没有正在运行")));
-        // Running → /cancel returns Action::Cancel (event loop aborts the task).
-        a.run_started = true;
-        a.finished = false;
-        for c in "/cancel".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert!(matches!(a.apply_key(KeyCode::Enter), Action::Cancel));
-        // cancel_run resets state back to a clean prompt.
-        a.cancel_run();
-        assert!(!a.is_pipeline_active());
-        assert!(a.history.iter().any(|m| m.body().contains("已取消")));
-    }
-
-    #[test]
-    fn slash_cancel_aborts_an_in_flight_agentic_round() {
-        // P1-H: an agentic round (`agentic_in_flight`, but NOT a full pipeline) must
-        // be cancellable via `/cancel`. The old pipeline-only check left it
-        // un-cancellable from the prompt (only Ctrl-C worked).
-        let mut a = fresh_app(Some("offline"));
-        a.agentic_in_flight = true;
-        assert!(
-            !a.is_pipeline_active(),
-            "an agentic round is not a pipeline"
-        );
-        for c in "/cancel".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert!(
-            matches!(a.apply_key(KeyCode::Enter), Action::Cancel),
-            "/cancel must abort an in-flight agentic round"
-        );
-    }
-
-    #[test]
-    fn aborted_run_free_text_routes_to_chat_not_a_dead_queue() {
-        // P1-G: after an abort the run keeps `run_started = true`, `finished =
-        // false`, `aborted = true`. Free text in that state must route to the base
-        // as a fresh chat turn (Action::Route) — NOT get queued into `queued_steer`,
-        // which never drains after an abort (no further phase/gate gaps), silently
-        // swallowing the input.
-        let mut a = fresh_app(Some("offline"));
-        a.run_started = true;
-        a.finished = false;
-        a.aborted = true;
-        assert!(!a.is_pipeline_active(), "an aborted run is not active");
-        for c in "hello again".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(
-            action,
-            Action::Route("hello again".to_string()),
-            "aborted-state free text must route to chat"
-        );
-        assert!(
-            a.queued_steer.is_empty(),
-            "aborted-state input must NOT land in the never-draining steer queue"
-        );
-    }
-
-    #[test]
-    fn slash_backend_is_rejected_during_an_active_run() {
-        // P1-I: switching the base mid-run would leave the in-flight run on the old
-        // base while config/UI claim the new one (a silent backend mismatch on the
-        // next resume). `/backend` must refuse while a run is active and leave the
-        // backend unchanged.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "build a dashboard".into(),
-        });
-        assert!(a.is_pipeline_active());
-        let before = a.backend.clone();
-        // `/codex` is the backend-switch verb (TUI uses per-base verbs, not
-        // `/backend <id>`); it routes through `slash_backend`.
-        for c in "/codex".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(
-            action,
-            Action::None,
-            "mid-run base switch is a rejected no-op"
-        );
-        assert_eq!(a.backend, before, "the backend must be unchanged mid-run");
-        assert!(
-            a.history.iter().any(|m| m.body().contains("/cancel")),
-            "the rejection tells the user to /cancel first"
-        );
-    }
-
-    #[test]
-    fn slash_backend_is_rejected_during_an_agentic_chat_turn() {
-        // A streaming chat turn is `agentic_in_flight` but NOT `is_pipeline_active()`.
-        // A `/codex` here must be refused the same as during a pipeline — otherwise it
-        // would commit the new backend + preload a new session while the old turn parks
-        // its old-base session, racing into a leaked session or a silent base mismatch.
-        let mut a = fresh_app(Some("offline"));
-        a.agentic_in_flight = true;
-        assert!(!a.is_pipeline_active());
-        let before = a.backend.clone();
-        for c in "/codex".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(
-            action,
-            Action::None,
-            "a mid-agentic-turn base switch is a rejected no-op"
-        );
-        assert_eq!(
-            a.backend, before,
-            "the backend must be unchanged during an agentic chat turn"
-        );
-        assert!(
-            a.history.iter().any(|m| m.body().contains("/cancel")),
-            "the rejection tells the user to /cancel first"
-        );
-    }
-
-    #[test]
-    fn slash_backend_switches_when_no_run_is_active() {
-        // The guard is scoped to an ACTIVE run only — switching at the idle prompt
-        // still works exactly as before.
-        let mut a = fresh_app(Some("offline"));
-        assert!(!a.is_pipeline_active());
-        for c in "/codex".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::BackendChanged);
-        assert_eq!(a.backend.as_deref(), Some("codex"));
-    }
-
-    #[test]
-    fn enter_on_partial_slash_runs_highlighted_palette_command() {
-        let mut a = fresh_app(Some("offline"));
-        // "/usag" is a partial that uniquely prefixes "usage".
-        for c in "/usag".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        // It RAN /usage (usage summary), not "未知命令 /usag".
-        assert!(
-            a.history
-                .iter()
-                .any(|m| m.body().contains("使用统计") || m.body().contains("还没有使用记录")),
-            "partial /usag + Enter should run /usage"
-        );
-        assert!(
-            !a.history.iter().any(|m| m.body().contains("未知命令")),
-            "should not report unknown command for a resolvable partial"
-        );
-    }
-
-    #[test]
-    fn model_is_not_a_registered_command() {
-        // The `/model` selection feature was removed ENTIRELY: UmaDev owns no model
-        // endpoint, so it neither picks nor overrides one — the base runs its own.
-        // The command must be gone from the registry AND the dispatcher, so the
-        // unknown-command did-you-mean can never suggest it again.
-        assert!(
-            !App::COMMANDS.iter().any(|c| c.name == "model"),
-            "/model must not be a registered command"
-        );
-        assert!(
-            !dispatch_arm_verbs().iter().any(|v| v == "model"),
-            "/model must not have a dispatch arm"
-        );
-    }
-    // ---- backend / brain-spec selection ----
-
-    #[test]
-    fn brain_spec_host_cli_when_no_provider() {
-        let app = fresh_app(Some("codex"));
-        assert!(matches!(app.brain_spec(), crate::BrainSpec::HostCli(_)));
-    }
-
-    #[test]
-    fn clarify_answer_appended_to_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut app = App::new(
-            "demo".to_string(),
-            UserConfig {
-                backend: Some("offline".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        // Simulate ClarifyGate open.
-        app.active_gate = Some(Gate::ClarifyGate);
-        // User types an answer.
-        let action = app.submit_text("面向个人开发者".into());
-        assert!(matches!(action, Action::None), "answer should not continue");
-        // File must exist with the answer.
-        let answers =
-            std::fs::read_to_string(tmp.path().join("output").join("demo-clarify-answers.md"))
-                .unwrap();
-        assert!(answers.contains("面向个人开发者"));
-    }
-
-    #[test]
-    fn clarify_answer_multiple_appends() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut app = App::new(
-            "demo".to_string(),
-            UserConfig {
-                backend: Some("offline".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        app.active_gate = Some(Gate::ClarifyGate);
-        app.submit_text("answer 1".into());
-        app.submit_text("answer 2".into());
-        let answers =
-            std::fs::read_to_string(tmp.path().join("output").join("demo-clarify-answers.md"))
-                .unwrap();
-        assert!(answers.contains("answer 1"));
-        assert!(answers.contains("answer 2"));
-    }
-
-    #[test]
-    fn clarify_c_submits_and_continues() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut app = App::new(
-            "demo".to_string(),
-            UserConfig {
-                backend: Some("offline".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        app.active_gate = Some(Gate::ClarifyGate);
-        app.submit_text("my answer".into());
-        let action = app.submit_text("c".into());
-        assert!(matches!(action, Action::Continue(Gate::ClarifyGate)));
-        assert!(app.active_gate.is_none(), "gate must clear on continue");
-    }
-
-    #[test]
-    fn brain_spec_offline_when_backend_offline() {
-        let app = fresh_app(Some("offline"));
-        assert!(matches!(app.brain_spec(), crate::BrainSpec::Offline));
-    }
-
-    #[test]
-    fn deploy_command_reads_delivery_notes() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let slug = "demo";
-        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
-        std::fs::write(
-            tmp.path().join("output").join(format!("{slug}-delivery-notes.md")),
-            "# Delivery\n\n## Deploy command\n\nnpx vercel --prod\n\n## Frontend URL\n\n(not yet deployed)\n",
-        ).unwrap();
-        let app = App::new(
-            slug.to_string(),
-            UserConfig {
-                backend: Some("offline".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        assert_eq!(
-            app.deploy_command_from_notes().as_deref(),
-            Some("npx vercel --prod")
-        );
-        // "(not yet deployed)" is filtered out (not http).
-        assert!(app.deploy_url_from_notes().is_none());
-    }
-
-    #[test]
-    fn deploy_url_reads_live_url() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let slug = "demo";
-        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
-        std::fs::write(
-            tmp.path()
-                .join("output")
-                .join(format!("{slug}-delivery-notes.md")),
-            "## Frontend URL\n\nhttps://my-app.vercel.app\n",
-        )
-        .unwrap();
-        let app = App::new(
-            slug.to_string(),
-            UserConfig {
-                backend: Some("offline".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        assert_eq!(
-            app.deploy_url_from_notes().as_deref(),
-            Some("https://my-app.vercel.app")
-        );
-    }
-
-    #[test]
-    fn slash_deploy_without_notes_gives_hint() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut app = App::new(
-            "demo".to_string(),
-            UserConfig {
-                backend: Some("offline".into()),
-                lang: Some("zh-CN".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        let action = app.slash_deploy("");
-        assert!(matches!(action, Action::None));
-        assert!(app
-            .history
-            .iter()
-            .any(|m| m.body().contains("还没有部署指令")));
-    }
-
-    #[test]
-    fn slash_deploy_with_command_emits_run_deploy() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let slug = "demo";
-        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
-        std::fs::write(
-            tmp.path()
-                .join("output")
-                .join(format!("{slug}-delivery-notes.md")),
-            "## Deploy command\n\nnpx vercel --prod\n",
-        )
-        .unwrap();
-        let mut app = App::new(
-            slug.to_string(),
-            UserConfig {
-                backend: Some("offline".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        // Bare /deploy only PREVIEWS — it must not deploy without confirmation.
-        let preview = app.slash_deploy("");
-        assert!(
-            matches!(preview, Action::None),
-            "bare /deploy is preview-only"
-        );
-        // Assert on the locale-independent command — the "not yet run" note is
-        // i18n'd, so it differs by resolved locale (zh-CN on dev, English on CI).
-        assert!(app
-            .history
-            .iter()
-            .any(|m| m.body().contains("npx vercel --prod")));
-        // /deploy confirm actually runs it.
-        let action = app.slash_deploy("confirm");
-        match action {
-            Action::RunDeploy { command } => assert_eq!(command, "npx vercel --prod"),
-            other => panic!("expected RunDeploy, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn slash_deploy_floor_requires_confirm_even_in_auto_mode() {
-        // Gap 3 reversibility floor: a deploy is an irreversible network action,
-        // so even in the AUTO trust tier bare /deploy must NOT fire — it
-        // previews and waits for an explicit confirm. `auto` does not get to
-        // skip the floor.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let slug = "demo";
-        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
-        std::fs::write(
-            tmp.path()
-                .join("output")
-                .join(format!("{slug}-delivery-notes.md")),
-            "## Deploy command\n\nnpx vercel --prod\n",
-        )
-        .unwrap();
-        let mut app = App::new(
-            slug.to_string(),
-            UserConfig {
-                backend: Some("offline".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        // Force the strictest-skipping tier; the floor must still gate.
-        app.trust_mode_override = Some(umadev_agent::TrustMode::Auto);
-        assert_eq!(app.effective_trust_mode(), umadev_agent::TrustMode::Auto);
-        let preview = app.slash_deploy("");
-        assert!(
-            matches!(preview, Action::None),
-            "auto mode must NOT skip the deploy confirmation floor"
-        );
-        // Explicit confirm still works.
-        match app.slash_deploy("confirm") {
-            Action::RunDeploy { command } => assert_eq!(command, "npx vercel --prod"),
-            other => panic!("expected RunDeploy after confirm, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn slash_version_opens_overlay_with_binary_info() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/version".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        let ov = a.overlay.as_ref().expect("version overlay");
-        let joined = ov.lines.join("\n");
-        assert!(joined.contains("umadev"));
-        assert!(joined.contains(env!("CARGO_PKG_VERSION")));
-        assert!(joined.contains("UMADEV_HOST_SPEC_V1"));
-    }
-
-    #[test]
-    fn slash_version_prefers_live_base_model_over_static_config() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
-        std::fs::write(
-            tmp.path().join(".codex/config.toml"),
-            "model = \"gpt-static-config\"\n",
-        )
-        .unwrap();
-        let mut app = App::new(
-            "demo".to_string(),
-            UserConfig {
-                backend: Some("codex".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-
-        app.apply_engine(EngineEvent::BaseModel {
-            id: "  gpt-live-session  ".to_string(),
-        });
-        app.open_version_overlay();
-
-        let joined = app.overlay.as_ref().unwrap().lines.join("\n");
-        assert!(joined.contains("model        gpt-live-session (reported by the base)"));
-        assert!(!joined.contains("gpt-static-config"));
-    }
-
-    #[test]
-    fn a_workspace_recovery_note_lands_in_the_transcript() {
-        // The heal that puts a user's source tree back (after a run was killed inside a
-        // temporary evidence rewind) runs before any UI exists — under the TUI its
-        // `tracing::warn!` goes to a log FILE and its startup `eprintln!` is wiped by the
-        // alternate screen. So it spoke to nobody. The note now travels through the
-        // workspace-notice queue onto the transcript, which is the surface the user reads.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut app = App::new(
-            "demo".to_string(),
-            UserConfig::default(),
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        let before = app.history.len();
-
-        umadev_agent::checkpoint::record_workspace_notice("workspace restored: …".to_string());
-        let notices = umadev_agent::checkpoint::take_workspace_notices();
-        assert!(
-            notices.iter().any(|n| n.contains("workspace restored")),
-            "the queue carries the note across the surface boundary"
-        );
-        for note in notices {
-            app.push_workspace_notice(note);
-        }
-
-        assert_eq!(
-            app.history.len(),
-            before + 1,
-            "the note is IN the transcript"
-        );
-        let row = app.history.back().expect("row");
-        assert!(matches!(row.role, ChatRole::System));
-        assert!(row.kind.as_text().contains("workspace restored"));
-    }
-
-    #[test]
-    fn slash_version_labels_static_model_as_configured() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
-        std::fs::write(
-            tmp.path().join(".codex/config.toml"),
-            "model = \"gpt-static-config\"\n",
-        )
-        .unwrap();
-        let mut app = App::new(
-            "demo".to_string(),
-            UserConfig {
-                backend: Some("codex".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-
-        app.open_version_overlay();
-
-        let joined = app.overlay.as_ref().unwrap().lines.join("\n");
-        assert!(joined.contains("model        gpt-static-config (configured by the base)"));
-        assert!(!joined.contains("reported by the base"));
-    }
-
-    #[test]
-    fn slash_changelog_opens_overlay_with_header() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/changelog".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        let ov = a.overlay.as_ref().expect("changelog overlay");
-        assert!(ov.lines.iter().any(|l| l.contains("Changelog")));
-    }
-
-    #[test]
-    fn did_you_mean_suggests_for_typo() {
-        // "/quitz" → suggest /quit
-        let suggestion = App::did_you_mean("quitz");
-        assert_eq!(suggestion, Some("quit"));
-    }
-
-    #[test]
-    fn did_you_mean_suggests_via_prefix() {
-        // "/rev" → /revise (prefix wins)
-        let suggestion = App::did_you_mean("rev");
-        assert_eq!(suggestion, Some("revise"));
-    }
-
-    #[test]
-    fn did_you_mean_returns_none_for_garbage() {
-        assert_eq!(App::did_you_mean("xxxxxxxxxx"), None);
-    }
-
-    #[test]
-    fn unknown_slash_command_includes_did_you_mean_hint() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/quitz".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        let last = a.history.back().unwrap();
-        assert!(last.body().contains("/quitz"));
-        assert!(last.body().contains("/quit"));
-        assert!(last.body().contains("是想用"));
-    }
-
-    #[test]
-    fn extract_json_number_pulls_score() {
-        let json = r#"{"score": 95, "passed": true, "notes": "ok"}"#;
-        assert_eq!(extract_json_number(json, "score"), Some(95));
-        assert_eq!(extract_json_number(json, "missing"), None);
-    }
-
-    #[test]
-    fn extract_json_bool_pulls_passed() {
-        let json = r#"{"score": 70, "passed": false}"#;
-        assert_eq!(extract_json_bool(json, "passed"), Some(false));
-        assert_eq!(extract_json_bool(json, "score"), None);
-    }
-
-    #[test]
-    fn verify_overlay_surfaces_quality_gate_when_present() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        let out_dir = root.join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
-        std::fs::write(
-            out_dir.join("demo-quality-gate.json"),
-            r#"{"score": 88, "passed": true}"#,
-        )
-        .unwrap();
-
-        let mut app = App::new(
-            "demo",
-            UserConfig {
-                backend: Some("offline".into()),
-                ..Default::default()
-            },
-            tmp.path().join("config.toml"),
-            root.to_path_buf(),
-        );
-        for c in "/verify".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let _ = app.apply_key(KeyCode::Enter);
-        let ov = app.overlay.as_ref().expect("verify overlay");
-        let joined = ov.lines.join("\n");
-        assert!(joined.contains("Quality gate"));
-        assert!(joined.contains("88/100"));
-        assert!(joined.contains("PASSED"));
-    }
-
-    #[test]
-    fn gate_card_lists_artifacts_and_next_steps() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "x".into(),
-        });
-        a.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        let card = a
-            .history
-            .iter()
-            .find(|m| m.role == ChatRole::Gate)
-            .expect("gate card must land in chat");
-        // Lists the three core docs by slug.
-        assert!(card.body().contains("output/demo-prd.md"));
-        assert!(card.body().contains("output/demo-architecture.md"));
-        assert!(card.body().contains("output/demo-uiux.md"));
-        // Lists next-step verbs.
-        assert!(card.body().contains("/continue"));
-        assert!(card.body().contains("/revise"));
-        assert!(card.body().contains("/diff"));
-    }
-
-    #[test]
-    fn gate_card_for_preview_confirm_lists_frontend_artifacts() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "shop".into(),
-            requirement: "x".into(),
-        });
-        a.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::PreviewConfirm,
-            choice: None,
-        });
-        let card = a
-            .history
-            .iter()
-            .find(|m| m.role == ChatRole::Gate)
-            .expect("gate card must land in chat");
-        assert!(card.body().contains("output/shop-frontend-notes.md"));
-        assert!(card.body().contains("output/shop-execution-plan.md"));
-    }
-
-    #[test]
-    fn gate_card_includes_approval_checklist() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "x".into(),
-        });
-        a.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        let card = a
-            .history
-            .iter()
-            .find(|m| m.role == ChatRole::Gate)
-            .expect("gate card must land in chat");
-        // The checklist tells the user WHAT to verify before approving.
-        assert!(card.body().contains("审批清单"));
-        assert!(card.body().contains("验收标准") || card.body().contains("验收"));
-    }
-
-    #[test]
-    fn fmt_elapsed_formats_seconds_and_minutes() {
-        assert_eq!(fmt_elapsed(5), "5s");
-        assert_eq!(fmt_elapsed(59), "59s");
-        assert_eq!(fmt_elapsed(60), "1:00");
-        assert_eq!(fmt_elapsed(125), "2:05");
-        assert_eq!(fmt_elapsed(3661), "61:01");
-    }
-
-    #[test]
-    fn pipeline_started_sets_run_timer() {
-        let mut a = fresh_app(Some("offline"));
-        assert!(a.run_started_at.is_none());
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "x".into(),
-        });
-        assert!(a.run_started_at.is_some(), "run timer must start");
-    }
-
-    #[test]
-    fn gate_open_stops_run_timer() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "x".into(),
-        });
-        a.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        // Timer stops while waiting on the user — status bar shouldn't keep
-        // ticking during an approval pause.
-        assert!(a.run_started_at.is_none());
-        assert!(a.phase_started_at.is_none());
-    }
-
-    #[test]
-    fn verify_failed_appends_actionable_hint() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::VerifyFailed {
-            phase: Phase::Frontend,
-            exit_code: 1,
-            stderr: "error: cannot find module 'react'".into(),
-        });
-        // The verify-failed line is now localized (the word "verify" itself is
-        // translated), so find it by its language-neutral [fail] tag instead.
-        let msg = a
-            .history
-            .iter()
-            .find(|m| m.body().contains("[fail]"))
-            .expect("verify failure message");
-        assert!(msg.body().contains("依赖未安装"), "got: {}", msg.body());
-    }
-
-    #[test]
-    fn bare_c_at_gate_is_treated_as_continue_shortcut() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        let _ = a.apply_key(KeyCode::Char('c'));
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Continue(Gate::DocsConfirm));
-        assert!(a.active_gate.is_none());
-    }
-
-    #[test]
-    fn bare_c_without_gate_is_plain_chat() {
-        let mut a = fresh_app(Some("offline"));
-        let _ = a.apply_key(KeyCode::Char('c'));
-        let action = a.apply_key(KeyCode::Enter);
-        // Outside a gate, "c" is neither approval nor a real requirement.
-        assert_eq!(action, Action::Route("c".to_string()));
-        assert!(!a.history.iter().any(|m| m.body().contains("直接描述需求")));
-    }
-
-    #[test]
-    fn chinese_greeting_is_plain_chat_not_pipeline() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "你好".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Route("你好".to_string()));
-        assert!(!a.history.iter().any(|m| m.body().contains("收到需求")));
-    }
-
-    #[test]
-    fn how_are_you_is_plain_chat_not_pipeline() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "你好吗？我很好啊".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Route("你好吗？我很好啊".to_string()));
-        assert!(!a.history.iter().any(|m| m.body().contains("流水线启动")));
-    }
-
-    #[test]
-    fn slash_continue_no_run_hint_redirects_to_typing_a_requirement() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/continue".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        let last = a.history.back().unwrap();
-        assert!(
-            last.body().contains("还没启动流水线"),
-            "expected redirect hint, got: {}",
-            last.body()
-        );
-    }
-
-    #[test]
-    fn preflight_message_lands_when_starting_run() {
-        let mut a = fresh_app(Some("offline"));
-        a.prepare_worker_routed_run("build me a thing");
-        // The UmaDev preflight message includes the 9-phase plan.
-        assert!(a.history.iter().any(|m| m.role == ChatRole::UmaDev
-            && m.body().contains("9 阶段")
-            && m.body().contains("docs_confirm")
-            && m.body().contains("preview_confirm")));
-    }
-
-    // ---- cursor + editing ----
-
-    #[test]
-    fn left_arrow_moves_cursor_back_one_char() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "abc".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert_eq!(a.input_cursor, 3);
-        let _ = a.apply_key(KeyCode::Left);
-        assert_eq!(a.input_cursor, 2);
-    }
-
-    #[test]
-    fn home_and_end_jump_cursor() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "abc".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Home);
-        assert_eq!(a.input_cursor, 0);
-        let _ = a.apply_key(KeyCode::End);
-        assert_eq!(a.input_cursor, 3);
-    }
-
-    #[test]
-    fn forward_delete_removes_char_at_cursor() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "abc".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Home);
-        let _ = a.apply_key(KeyCode::Delete);
-        assert_eq!(a.input, "bc");
-        assert_eq!(a.input_cursor, 0);
-    }
-
-    #[test]
-    fn insertion_in_middle_preserves_surrounding_chars() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "ac".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Left);
-        let _ = a.apply_key(KeyCode::Char('b'));
-        assert_eq!(a.input, "abc");
-        assert_eq!(a.input_cursor, 2);
-    }
-
-    #[test]
-    fn backspace_respects_cjk_boundary() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "做个".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert_eq!(a.input, "做个");
-        // Backspace once → just one CJK char gone, no panic.
-        let _ = a.apply_key(KeyCode::Backspace);
-        assert_eq!(a.input, "做");
-    }
-
-    #[test]
-    fn windows_bs_control_char_backspaces() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "abc".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Char('\u{8}'));
-        assert_eq!(a.input, "ab");
-        assert_eq!(a.input_cursor, 2);
-    }
-
-    #[test]
-    fn alt_backspace_deletes_word_not_one_char() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "hello world".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-
-        let _ = a.apply_key_with_mods(KeyCode::Backspace, crossterm::event::KeyModifiers::ALT);
-
-        assert_eq!(a.input, "hello ");
-        assert_eq!(a.input_cursor, 6);
-    }
-
-    // ---- I5: grapheme-cluster-aware cursor ----
-
-    #[test]
-    fn cursor_steps_over_zwj_emoji_as_one_grapheme() {
-        let mut a = fresh_app(Some("offline"));
-        // A ZWJ family emoji is several codepoints but ONE user-perceived glyph.
-        let family = "👨‍👩‍👧";
-        assert!(
-            family.chars().count() > 1,
-            "precondition: multi-codepoint cluster"
-        );
-        let n = family.chars().count();
-        a.insert_str_at_cursor(family);
-        assert_eq!(a.input_cursor, n, "cursor at the end after insert");
-        // One ← steps over the WHOLE cluster, not one codepoint.
-        a.move_cursor(-1);
-        assert_eq!(a.input_cursor, 0, "one ← jumps the whole ZWJ cluster");
-        // One → steps forward over the whole cluster.
-        a.move_cursor(1);
-        assert_eq!(a.input_cursor, n, "one → crosses the whole cluster");
-        // Backspace removes the whole glyph — no half-mojibake left behind.
-        a.backspace();
-        assert_eq!(a.input, "", "backspace deletes the whole cluster");
-    }
-
-    #[test]
-    fn cursor_steps_over_combining_mark_as_one_grapheme() {
-        let mut a = fresh_app(Some("offline"));
-        // 'e' + U+0301 COMBINING ACUTE = 2 codepoints, one grapheme "é".
-        let e_acute = "e\u{301}";
-        a.insert_str_at_cursor(e_acute);
-        assert_eq!(a.input.chars().count(), 2, "precondition: base + combining");
-        a.move_cursor(-1);
-        assert_eq!(a.input_cursor, 0, "← steps over base+combining as one unit");
-        // Forward-delete from the start removes the whole cluster, not just 'e'.
-        a.forward_delete();
-        assert_eq!(a.input, "", "forward-delete removes the whole cluster");
-    }
-
-    #[test]
-    fn cursor_still_steps_single_ascii_and_cjk_chars() {
-        let mut a = fresh_app(Some("offline"));
-        a.insert_str_at_cursor("ab做");
-        assert_eq!(a.input_cursor, 3);
-        a.move_cursor(-1);
-        assert_eq!(a.input_cursor, 2, "one ← over the CJK char");
-        a.move_cursor(-1);
-        assert_eq!(a.input_cursor, 1, "one ← over 'b'");
-        a.move_cursor(-1);
-        assert_eq!(a.input_cursor, 0, "one ← over 'a'");
-        // Forward-delete removes exactly one char (no over-eager cluster merge).
-        a.forward_delete();
-        assert_eq!(a.input, "b做", "forward-delete removed only 'a'");
-    }
-
-    // ---- Shift+Enter multi-line ----
-
-    #[test]
-    fn shift_enter_inserts_newline_and_does_not_submit() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "line1".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key_with_mods(KeyCode::Enter, crossterm::event::KeyModifiers::SHIFT);
-        assert_eq!(action, Action::None);
-        assert!(a.input.contains("line1\n"));
-        // Cursor advances past the newline.
-        assert!(a.input_cursor >= 6);
-    }
-
-    #[test]
-    fn plain_enter_after_shift_enter_keeps_short_multiline_as_chat() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "line1".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key_with_mods(KeyCode::Enter, crossterm::event::KeyModifiers::SHIFT);
-        for c in "line2".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Route("line1\nline2".to_string()));
-    }
-
-    #[test]
-    fn plain_enter_after_shift_enter_submits_multiline_requirement() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "build a login app".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key_with_mods(KeyCode::Enter, crossterm::event::KeyModifiers::SHIFT);
-        for c in "with email authentication".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(
-            action,
-            Action::Route("build a login app\nwith email authentication".to_string())
-        );
-    }
-
-    // ---- Ctrl+J universal newline (works on EVERY terminal) ----
-
-    #[test]
-    fn ctrl_j_inserts_newline_and_does_not_submit_on_the_owned_path() {
-        // The owned byte tokenizer surfaces a Ctrl+J press as the raw LF byte
-        // 0x0A; `keymap::normalize_key` (applied by `apply_key_with_mods`) folds
-        // that to `Char('j')` + CONTROL, exactly like the decoder. Feeding the
-        // raw form exercises the whole owned path end-to-end.
-        let mut a = fresh_app(Some("offline"));
-        for c in "line1".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key_with_mods(
-            KeyCode::Char('\u{0a}'),
-            crossterm::event::KeyModifiers::NONE,
-        );
-        assert_eq!(action, Action::None, "Ctrl+J must NOT submit");
-        assert!(
-            a.input.contains("line1\n"),
-            "Ctrl+J inserts a literal newline"
-        );
-        assert!(a.input_cursor >= 6, "cursor advances past the newline");
-    }
-
-    #[test]
-    fn ctrl_v_requests_image_capture_without_touching_the_text_paste_path() {
-        let mut app = fresh_app(Some("claude-code"));
-        app.input = "draft ".into();
-        app.input_cursor = app.input_len();
-        let before = app.input.clone();
-
-        let action =
-            app.apply_key_with_mods(KeyCode::Char('v'), crossterm::event::KeyModifiers::CONTROL);
-
-        assert_eq!(action, Action::PasteImage);
-        assert_eq!(app.input, before, "the blocking worker owns image capture");
-        assert!(app.attachments.is_empty());
-
-        // Ordinary terminal text paste remains the direct, synchronous old path:
-        // no image Action and no platform probe is involved.
-        app.handle_paste("plain clipboard text");
-        assert_eq!(app.input, "draft plain clipboard text");
-        assert!(app.attachments.is_empty());
-    }
-
-    #[test]
-    fn ctrl_j_post_decode_form_also_inserts_a_newline() {
-        // The already-decoded form (`Char('j')` + CONTROL) — what the dispatch
-        // actually matches — must reach the same newline-insert arm.
-        let mut a = fresh_app(Some("offline"));
-        for c in "abc".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action =
-            a.apply_key_with_mods(KeyCode::Char('j'), crossterm::event::KeyModifiers::CONTROL);
-        assert_eq!(action, Action::None);
-        assert_eq!(a.input, "abc\n");
-    }
-
-    #[test]
-    fn plain_enter_still_submits_the_common_case() {
-        // The daily-common path: a bare Enter (a plain CR on every terminal) must
-        // keep SUBMITTING, never regress to a newline.
-        let mut a = fresh_app(Some("offline"));
-        for c in "just ship it".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Route("just ship it".to_string()));
-    }
-
-    #[test]
-    fn shift_enter_via_kitty_csi_u_inserts_a_newline() {
-        // On a kitty-capable terminal (protocol enabled in `setup_terminal`),
-        // Shift+Enter arrives as the CSI-u sequence `\x1b[13;2u`. Drive the FULL
-        // owned pipeline (tokenizer → decoder) over those bytes and feed the
-        // resulting key to the app — it must insert a newline, not submit.
-        let mut tk = crate::input::tokenize::Tokenizer::for_stdin();
-        let mut dec = crate::input::decode::Decoder::new();
-        let mut keyed: Option<(KeyCode, crossterm::event::KeyModifiers)> = None;
-        for token in tk.feed(b"\x1b[13;2u") {
-            for ev in dec.feed_token(token) {
-                if let crate::input::decode::InputEvent::Key(k) = ev {
-                    keyed = Some((k.code, k.modifiers));
-                }
-            }
-        }
-        let (code, mods) = keyed.expect("CSI-u Shift+Enter must decode to one key");
-        assert_eq!(code, KeyCode::Enter);
-        assert!(mods.contains(crossterm::event::KeyModifiers::SHIFT));
-
-        let mut a = fresh_app(Some("offline"));
-        for c in "line1".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action = a.apply_key_with_mods(code, mods);
-        assert_eq!(action, Action::None, "Shift+Enter (CSI-u) must NOT submit");
-        assert!(a.input.contains("line1\n"));
-    }
-
-    #[test]
-    fn no_kitty_terminal_still_submits_enter_and_newlines_on_ctrl_j() {
-        // A terminal that does NOT report kitty support gets no protocol push, so
-        // Shift+Enter can't be distinguished — but the daily pain is still fixed:
-        // plain Enter submits (a bare CR), and Ctrl+J (a literal LF) newlines.
-        let mut a = fresh_app(Some("offline"));
-        for c in "draft".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        // Ctrl+J newlines mid-draft.
-        let nl = a.apply_key_with_mods(KeyCode::Char('j'), crossterm::event::KeyModifiers::CONTROL);
-        assert_eq!(nl, Action::None);
-        for c in "more".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        // Plain Enter submits the whole multi-line draft.
-        let action = a.apply_key(KeyCode::Enter);
-        assert_eq!(action, Action::Route("draft\nmore".to_string()));
-    }
-
-    // ---- palette ----
-
-    #[test]
-    fn slash_run_only_treats_a_separatored_ascii_first_word_as_a_slug() {
-        // `todo-app` (ASCII + a `-` separator) IS the optional run slug.
-        let mut a = fresh_app(Some("offline"));
-        let _ = a.slash_run("todo-app 做一个待办应用");
-        assert_eq!(a.slug, "todo-app");
-        // A multi-word / Chinese requirement's first word is NOT mistaken for a
-        // slug (no separator / not ASCII), so the whole thing stays the requirement
-        // and no slug-invalid error fires (was: '/run with spaces' wrongly rejected).
-        let mut b = fresh_app(Some("offline"));
-        let _ = b.slash_run("做一个 带空格 的登录页");
-        assert_ne!(
-            b.slug, "做一个",
-            "the first word must not become a phantom slug"
-        );
-    }
-
-    #[test]
-    fn palette_fuzzy_finds_deploy_from_dpl() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/dpl".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let verbs: Vec<&str> = a.palette_matches().iter().map(|p| p.verb).collect();
-        assert!(
-            verbs.contains(&"deploy"),
-            "fuzzy /dpl → deploy, got: {verbs:?}"
-        );
-    }
-
-    #[test]
-    fn word_motion_jumps_across_words() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "hello world foo".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        a.move_word_left();
-        assert_eq!(a.input_cursor, 12, "→ start of last word 'foo'");
-        a.move_word_left();
-        assert_eq!(a.input_cursor, 6, "→ start of 'world'");
-        a.move_word_right();
-        assert_eq!(a.input_cursor, 12, "→ back to start of 'foo'");
-    }
-
-    #[test]
-    fn palette_matches_filter_by_prefix() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/cl".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let matches = a.palette_matches();
-        // /claude /clear → 2 matches.
-        let verbs: Vec<&str> = matches.iter().map(|p| p.verb).collect();
-        assert!(verbs.contains(&"claude"));
-        assert!(verbs.contains(&"clear"));
-    }
-
-    #[test]
-    fn arrow_down_navigates_palette_when_active() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/c".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let before = a.palette_selected;
-        let _ = a.apply_key(KeyCode::Down);
-        assert_ne!(a.palette_selected, before);
-    }
-
-    #[test]
-    fn tab_autocompletes_selected_palette_match() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/cla".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Tab);
-        assert_eq!(a.input, "/claude ");
-    }
-
-    // ---- @-file-mention typeahead ----
-
-    /// Seed a few files into the test workspace so the `@`-typeahead has real
-    /// candidates to rank: `src/main.rs`, `src/lib.rs`, `README.md`.
-    fn seed_mention_files(a: &App) {
-        let root = &a.project_root;
-        let _ = std::fs::create_dir_all(root.join("src"));
-        let _ = std::fs::write(root.join("src/main.rs"), "fn main() {}\n");
-        let _ = std::fs::write(root.join("src/lib.rs"), "// lib\n");
-        let _ = std::fs::write(root.join("README.md"), "# readme\n");
-    }
-
-    #[test]
-    fn mention_detects_partial_under_cursor() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "look at @sr".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert_eq!(
-            a.mention_token(),
-            Some((8, "sr".to_string())),
-            "the `@sr` token under the cursor is detected with its partial"
-        );
-    }
-
-    #[test]
-    fn mention_inactive_without_at_token() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "hello world".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert_eq!(a.mention_token(), None, "no `@` → no mention context");
-        assert!(a.mention_matches().is_empty(), "no `@` → no candidates");
-        // An `@` glued to a preceding non-space (an email) must NOT open it.
-        let mut b = fresh_app(Some("offline"));
-        for c in "ping a@host".chars() {
-            let _ = b.apply_key(KeyCode::Char(c));
-        }
-        assert_eq!(b.mention_token(), None, "`a@host` is not a file mention");
-    }
-
-    #[test]
-    fn mention_candidates_filter_by_partial() {
-        let mut a = fresh_app(Some("offline"));
-        seed_mention_files(&a);
-        for c in "@main".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let m = a.mention_matches();
-        assert!(
-            m.iter().any(|p| p == "src/main.rs"),
-            "`@main` ranks src/main.rs, got {m:?}"
-        );
-        assert!(
-            !m.iter().any(|p| p == "README.md"),
-            "`README.md` is filtered out by the `main` partial, got {m:?}"
-        );
-    }
-
-    #[test]
-    fn mention_accept_inserts_path_and_replaces_partial() {
-        let mut a = fresh_app(Some("offline"));
-        seed_mention_files(&a);
-        for c in "@main".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Tab);
-        assert_eq!(
-            a.input, "@src/main.rs ",
-            "Tab replaced `@main` with the path"
-        );
-        assert_eq!(
-            a.input_cursor,
-            a.input_len(),
-            "caret lands after the insert"
-        );
-        assert!(
-            a.mention_matches().is_empty(),
-            "the trailing space closes the popover"
-        );
-    }
-
-    #[test]
-    fn mention_enter_inserts_selected_path() {
-        let mut a = fresh_app(Some("offline"));
-        seed_mention_files(&a);
-        for c in "@README".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        assert_eq!(a.input, "@README.md ", "Enter accepted the mention");
-    }
-
-    #[test]
-    fn mention_popover_suppresses_slash_palette() {
-        // A line that is BOTH a slash command and carries an `@`-token: the
-        // mention popover wins, so Tab inserts the file path — not the slash
-        // completion. Proves the two popovers are mutually exclusive.
-        let mut a = fresh_app(Some("offline"));
-        seed_mention_files(&a);
-        for c in "/run @main".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert!(
-            !a.mention_matches().is_empty(),
-            "the `@main` token is active"
-        );
-        assert!(
-            !a.palette_matches().is_empty(),
-            "`/run` still matches the palette registry"
-        );
-        let _ = a.apply_key(KeyCode::Tab);
-        assert_eq!(
-            a.input, "/run @src/main.rs ",
-            "Tab accepted the mention, not the slash autocomplete"
-        );
-    }
-
-    #[test]
-    fn mention_esc_closes_without_inserting() {
-        let mut a = fresh_app(Some("offline"));
-        seed_mention_files(&a);
-        for c in "@main".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert!(!a.mention_matches().is_empty(), "popover open before Esc");
-        let _ = a.apply_key(KeyCode::Esc);
-        assert!(a.mention_dismissed, "Esc dismissed the popover");
-        assert!(a.mention_matches().is_empty(), "popover closed after Esc");
-        assert_eq!(a.input, "@main", "Esc left the prompt text untouched");
-        // A further edit re-opens the popover (dismissal is not sticky).
-        let _ = a.apply_key(KeyCode::Char('.'));
-        assert!(
-            !a.mention_matches().is_empty(),
-            "editing re-opened the popover"
-        );
-    }
-
-    #[test]
-    fn delete_reopens_dismissed_mention_after_query_changes() {
-        let mut a = fresh_app(Some("offline"));
-        seed_mention_files(&a);
-        for c in "@mainx".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        a.dismiss_mention();
-        assert!(
-            a.mention_matches().is_empty(),
-            "dismissed mention starts closed"
-        );
-
-        let _ = a.apply_key(KeyCode::Left);
-        assert!(
-            a.mention_matches().is_empty(),
-            "pure cursor movement must not re-open a dismissed mention"
-        );
-        let _ = a.apply_key(KeyCode::Delete);
-
-        assert_eq!(a.input, "@main");
-        assert!(
-            !a.mention_matches().is_empty(),
-            "forward delete changed the query and must re-open matches"
-        );
-    }
-
-    #[test]
-    fn kill_edit_keys_reset_dismissed_mention_state() {
-        let mut a = fresh_app(Some("offline"));
-        seed_mention_files(&a);
-        a.input = "@mainx".to_string();
-        a.input_cursor = a.input_len() - 1;
-        a.dismiss_mention();
-
-        let _ = a.apply_key_with_mods(KeyCode::Char('k'), crossterm::event::KeyModifiers::CONTROL);
-        assert_eq!(a.input, "@main");
-        assert!(
-            !a.mention_matches().is_empty(),
-            "Ctrl+K changed the active mention token and must re-open it"
-        );
-
-        a.dismiss_mention();
-        let _ = a.apply_key_with_mods(KeyCode::Char('w'), crossterm::event::KeyModifiers::CONTROL);
-        assert!(
-            !a.mention_dismissed,
-            "Ctrl+W is an edit and must not leave a stale dismissed flag"
-        );
-    }
-
-    #[test]
-    fn mention_arrow_down_cycles_selection() {
-        let mut a = fresh_app(Some("offline"));
-        seed_mention_files(&a);
-        // A bare `@` lists every file (≥2), so ↓ can move the highlight.
-        let _ = a.apply_key(KeyCode::Char('@'));
-        let count = a.mention_matches().len();
-        assert!(count >= 2, "expected ≥2 candidates, got {count}");
-        assert_eq!(a.mention_selected, 0, "starts on the first candidate");
-        let _ = a.apply_key(KeyCode::Down);
-        assert_eq!(a.mention_selected, 1, "↓ moved the mention highlight");
-    }
-
-    // ---- I8 — fzf-style positional fuzzy scorer ----
-
-    #[test]
-    fn fuzzy_score_ranks_boundary_path_above_incidental_subsequence() {
-        // `main` matched contiguously at a path boundary (`src/main.rs`) must
-        // outscore the same chars buried mid-word (`domain_libs.rs` — d-o-MAIN).
-        let boundary = fuzzy_score("main", "src/main.rs").expect("boundary match");
-        let incidental = fuzzy_score("main", "domain_libs.rs").expect("incidental match");
-        assert!(
-            boundary > incidental,
-            "boundary/path match ({boundary}) should beat incidental subsequence ({incidental})"
-        );
-    }
-
-    #[test]
-    fn fuzzy_score_rejects_non_subsequence_and_no_ops_empty_query() {
-        // Not a subsequence → None (the scan is also the existence test).
-        assert!(fuzzy_score("xyz", "src/main.rs").is_none());
-        assert!(fuzzy_score("nima", "src/main.rs").is_none()); // out of order
-                                                               // Empty query is a ranking no-op (callers short-circuit it).
-        assert_eq!(fuzzy_score("", "anything"), Some(0));
-        // Case-insensitive (ASCII fold).
-        assert!(fuzzy_score("MAIN", "src/main.rs").is_some());
-    }
-
-    #[test]
-    fn palette_ranks_exact_command_first() {
-        // An exact verb sorts ahead of looser fuzzy hits (tier wins over score).
-        let mut a = fresh_app(Some("offline"));
-        for c in "/clear".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let m = a.palette_matches();
-        assert_eq!(
-            m.first().map(|p| p.verb),
-            Some("clear"),
-            "exact `/clear` ranks first, got {:?}",
-            m.iter().map(|p| p.verb).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn palette_prefix_outranks_fuzzy() {
-        // `/cla` → `claude` is a prefix (tier 1); `clear` is only a fuzzy hit
-        // (c-l-e-A-r, tier 2). The prefix must rank first regardless of score.
-        let mut a = fresh_app(Some("offline"));
-        for c in "/cla".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let verbs: Vec<&str> = a.palette_matches().iter().map(|p| p.verb).collect();
-        let pc = verbs.iter().position(|v| *v == "claude");
-        let pl = verbs.iter().position(|v| *v == "clear");
-        assert_eq!(pc, Some(0), "prefix `claude` is first, got {verbs:?}");
-        if let (Some(pc), Some(pl)) = (pc, pl) {
-            assert!(pc < pl, "prefix outranks fuzzy: {verbs:?}");
-        }
-    }
-
-    #[test]
-    fn mention_fuzzy_ranks_path_match_above_incidental_hit() {
-        let mut a = fresh_app(Some("offline"));
-        let root = a.project_root.clone();
-        let _ = std::fs::create_dir_all(root.join("src"));
-        let _ = std::fs::write(root.join("src/main.rs"), "");
-        let _ = std::fs::write(root.join("domain_libs.rs"), "");
-        for c in "@main".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let m = a.mention_matches();
-        let pos_main = m.iter().position(|p| p == "src/main.rs");
-        let pos_dom = m.iter().position(|p| p == "domain_libs.rs");
-        assert!(pos_main.is_some(), "src/main.rs is a candidate: {m:?}");
-        if let (Some(pm), Some(pd)) = (pos_main, pos_dom) {
-            assert!(
-                pm < pd,
-                "the path/boundary match ranks above the incidental hit: {m:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn arrow_up_with_input_not_in_palette_recalls_history() {
-        let mut a = fresh_app(Some("offline"));
-        // Submit a prompt to populate history.
-        for c in "first request".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        // After submit, input is empty. ↑ should recall it.
-        assert!(a.input.is_empty());
-        let _ = a.apply_key(KeyCode::Up);
-        assert_eq!(a.input, "first request");
-    }
-
-    #[test]
-    fn arrow_down_at_newest_history_returns_to_fresh_draft() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "request".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        let _ = a.apply_key(KeyCode::Up);
-        assert_eq!(a.input, "request");
-        let _ = a.apply_key(KeyCode::Down);
-        assert!(a.input.is_empty());
-        assert!(a.input_history_idx.is_none());
-    }
-
-    #[test]
-    fn submit_dedups_consecutive_identical_recalls() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = UserConfig {
-            backend: Some("offline".to_string()),
-            ..Default::default()
-        };
-        let mut a = App::new(
-            "demo",
-            cfg,
-            tmp.path().join("config.toml"),
-            tmp.path().join("workspace"),
-        );
-        for c in "same".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        a.finished = true;
-        a.run_started = false;
-        for c in "same".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        assert_eq!(
-            a.input_history
-                .iter()
-                .filter(|s| s.as_str() == "same")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn esc_when_idle_needs_a_second_press_to_quit() {
-        let mut a = fresh_app(Some("offline"));
-        // First idle Esc arms the confirmation (guards against an accidental
-        // quit — including the Esc that just interrupted a run).
-        let action = a.apply_key(KeyCode::Esc);
-        assert_eq!(action, Action::None);
-        assert!(a.pending_quit_confirm);
-        // Second Esc actually quits.
-        let action = a.apply_key(KeyCode::Esc);
-        assert_eq!(action, Action::Quit);
-    }
-
-    // ── Feature B: idle double-Esc rewinds (edit + resend the last message) ──
-
-    #[test]
-    fn double_esc_on_empty_idle_rewinds_last_user_message() {
-        let mut a = fresh_app(Some("offline"));
-        // `fresh_app` seeds a greeting; measure from there so the test is robust
-        // to the welcome prefix.
-        let base = a.history.len();
-        // A short conversation: two user turns, each with a reply.
-        a.push(ChatRole::You, "first");
-        a.push(ChatRole::Host, "reply one");
-        a.push(ChatRole::You, "second");
-        a.push(ChatRole::Host, "reply two");
-        assert!(a.input.is_empty(), "starts on an empty idle input");
-
-        // First Esc ARMS the rewind (a stray single Esc can't rewind) — input
-        // and transcript are untouched, and it never quits.
-        let r1 = a.apply_key(KeyCode::Esc);
-        assert_eq!(r1, Action::None);
-        assert!(a.pending_rewind, "first Esc arms the rewind");
-        assert!(a.input.is_empty(), "first Esc does not yet reload");
-        assert!(!a.should_quit);
-
-        // Second Esc FIRES: the last user message is re-loaded into the box, and
-        // the transcript is truncated to everything BEFORE that turn.
-        let r2 = a.apply_key(KeyCode::Esc);
-        assert_eq!(r2, Action::None);
-        assert_eq!(a.input, "second", "last user message reloaded for editing");
-        assert_eq!(a.input_cursor, a.input_len(), "cursor parked at the end");
-        assert!(!a.pending_rewind, "rewind disarmed after firing");
-        assert!(!a.should_quit, "rewind never quits");
-        // The last user turn + everything after it is gone; the earlier turn
-        // (`first` + its reply) survives.
-        assert_eq!(
-            a.history.len(),
-            base + 2,
-            "the last user turn + everything after dropped"
-        );
-        let users: Vec<_> = a
-            .history
-            .iter()
-            .filter(|m| m.role == ChatRole::You)
-            .collect();
-        assert_eq!(users.len(), 1, "exactly the earlier user turn remains");
-        assert_eq!(users[0].body().as_ref(), "first");
-    }
-
-    #[test]
-    fn rewind_truncates_conversation_and_transcript_to_match_history() {
-        // Low finding — double-Esc rewind dropped the last user turn from the
-        // VISIBLE history but not from `conversation` (the base-facing memory) or
-        // `full_transcript` (the on-disk record), so a resend re-asked WITH the
-        // dropped turn and a relaunch `/resume` restored it. All three must stay
-        // in lockstep.
-        let mut a = fresh_app(Some("offline"));
-        // Two complete turns recorded into BOTH the visible history and the
-        // base-facing memory, mirroring a real chat session.
-        a.push(ChatRole::You, "first");
-        a.record_user_turn("first");
-        a.record_chat_reply("reply one".to_string());
-        a.push(ChatRole::You, "second");
-        a.record_user_turn("second");
-        a.record_chat_reply("reply two".to_string());
-        assert_eq!(a.conversation.len(), 4, "two user + two assistant turns");
-        assert_eq!(a.full_transcript.len(), 4);
-
-        // Double-Esc rewind (idle, empty box): arm, then fire.
-        let _ = a.apply_key(KeyCode::Esc);
-        let _ = a.apply_key(KeyCode::Esc);
-        assert_eq!(a.input, "second", "last user turn reloaded for editing");
-
-        // The dropped turn is gone from the memory + durable transcript too — the
-        // base won't see it on resend and a relaunch won't restore it.
-        assert_eq!(
-            a.conversation
-                .iter()
-                .map(|m| m.content.as_str())
-                .collect::<Vec<_>>(),
-            vec!["first", "reply one"],
-            "conversation truncated to before the rewound user turn"
-        );
-        assert_eq!(
-            a.full_transcript
-                .iter()
-                .map(|m| m.content.as_str())
-                .collect::<Vec<_>>(),
-            vec!["first", "reply one"],
-            "durable transcript truncated to match"
-        );
-    }
-
-    #[test]
-    fn rewinding_the_first_user_turn_clears_the_on_disk_chat() {
-        // Fix 8 — rewinding the FIRST user turn empties `full_transcript`, and
-        // `persist_chat` early-returns on an empty transcript, so without an
-        // explicit delete the OLD, un-rewound chat survives on disk and a relaunch
-        // `/resume` would restore the conversation the rewind dropped. The rewind
-        // must clear the persisted chat instead.
-        let mut a = fresh_app(Some("offline"));
-        // One complete first turn; `record_user_turn` persists it to disk.
-        a.push(ChatRole::You, "only turn");
-        a.record_user_turn("only turn");
-        a.record_chat_reply("a reply".to_string());
-        let path = a.chat_path(&a.chat_id);
-        assert!(path.exists(), "the first turn was persisted to disk");
-
-        // Double-Esc rewind of the (only) user turn (idle, empty box).
-        let _ = a.apply_key(KeyCode::Esc);
-        let _ = a.apply_key(KeyCode::Esc);
-        assert_eq!(
-            a.input, "only turn",
-            "the first user turn reloaded for editing"
-        );
-        assert!(a.full_transcript.is_empty(), "the transcript is now empty");
-
-        // The on-disk chat is gone → a relaunch cannot restore the un-rewound convo.
-        assert!(
-            !path.exists(),
-            "a first-turn rewind that empties the transcript must delete the stale on-disk chat"
-        );
-    }
-
-    #[test]
-    fn double_esc_rewind_is_a_noop_without_a_prior_user_message() {
-        let mut a = fresh_app(Some("offline"));
-        // No user turn has been spoken yet → there is nothing to rewind, so the
-        // idle double-Esc falls through to the existing quit-confirm path.
-        assert!(a.last_user_msg_index().is_none());
-        let r1 = a.apply_key(KeyCode::Esc);
-        assert_eq!(r1, Action::None);
-        assert!(!a.pending_rewind, "no user turn → the rewind never arms");
-        assert!(
-            a.pending_quit_confirm,
-            "falls through to quit-confirm instead"
-        );
-        assert!(a.input.is_empty(), "input stays empty — nothing reloaded");
-    }
-
-    #[test]
-    fn esc_rewind_never_fires_mid_run() {
-        let mut a = fresh_app(Some("offline"));
-        a.push(ChatRole::You, "build me an app");
-        let len_before = a.history.len();
-        // A brain-driven turn is streaming — Esc must INTERRUPT it (double-press),
-        // never rewind the transcript out from under a live run.
-        a.agentic_in_flight = true;
-        let r1 = a.apply_key(KeyCode::Esc);
-        assert_eq!(r1, Action::None);
-        assert!(a.interrupt_armed(), "first Esc arms the interrupt mid-run");
-        assert!(!a.pending_rewind, "mid-run Esc never arms the rewind");
-        let r2 = a.apply_key(KeyCode::Esc);
-        assert_eq!(r2, Action::Cancel, "second Esc interrupts the run");
-        assert!(a.input.is_empty(), "rewind did not fire — input untouched");
-        assert_eq!(a.history.len(), len_before, "transcript untouched mid-run");
-        assert!(!a.should_quit);
-    }
-
-    #[test]
-    fn transcript_plaintext_handoff_renders_history_and_skips_empties() {
-        // The scrollback handoff: a clean-exit dump of the conversation. Each turn
-        // is its speaker tag + body; whitespace-only turns are dropped.
-        let mut a = fresh_app(Some("offline"));
-        a.history.clear();
-        a.push(ChatRole::You, "build me an app");
-        a.push(ChatRole::Host, "sure, here is the plan");
-        a.push(ChatRole::System, "   "); // whitespace-only → skipped
-        a.push(ChatRole::UmaDev, "done");
-        let dump = a.transcript_plaintext();
-        assert!(
-            dump.contains("build me an app"),
-            "user turn present: {dump}"
-        );
-        assert!(
-            dump.contains("sure, here is the plan"),
-            "host turn present (untagged): {dump}"
-        );
-        assert!(
-            dump.contains("UmaDev: done"),
-            "umadev turn is tagged: {dump}"
-        );
-        assert!(
-            !dump.lines().any(|l| l.trim() == "·"),
-            "the whitespace-only system turn is skipped: {dump}"
-        );
-        // An empty history hands off nothing (the caller prints nothing).
-        a.history.clear();
-        assert!(a.transcript_plaintext().is_empty());
-    }
-
-    #[test]
-    fn transcript_plaintext_keeps_multiline_bodies_intact() {
-        // A multi-line body keeps its own line breaks; only the first line is
-        // tagged so the block reads cleanly in scrollback.
-        let mut a = fresh_app(Some("offline"));
-        a.history.clear();
-        a.push(ChatRole::You, "line one\nline two\nline three");
-        let dump = a.transcript_plaintext();
-        assert!(dump.contains("line one"));
-        assert!(dump.contains("line two"));
-        assert!(dump.contains("line three"));
-        assert!(dump.ends_with('\n'), "the dump ends on a fresh line");
-    }
-
-    // ── wheel / edge extends a drag-selection past the viewport ───────────
-    //
-    // Shared geometry: 10 content rows "row0".."row9", a 4-row viewport at the
-    // top-left, `hidden_above` (max_scroll) = 6. Pinned to the bottom
-    // (`transcript_scroll` = 0) the renderer would publish `first_visible` = 6,
-    // so rows 6,7,8,9 are on screen and rows 0..5 are hidden ABOVE.
-    fn seed_transcript_geometry(a: &App) {
-        *a.transcript_rows.borrow_mut() = (0..10).map(|i| format!("row{i}")).collect();
-        a.transcript_gutters.borrow_mut().clear();
-        a.transcript_area.set((0, 0, 10, 4));
-        a.transcript_max_scroll.set(6);
-        a.set_transcript_scroll(0);
-        a.transcript_first_visible.set(6);
-    }
-
-    #[test]
-    fn wheel_during_drag_extends_selection_past_viewport() {
-        let mut a = fresh_app(Some("offline"));
-        seed_transcript_geometry(&a);
-        // Press at the end of the bottom-most visible row (screen row 3 → content
-        // row 9): the anchor that the wheel must keep fixed.
-        a.selection_begin(9, 3);
-        assert!(
-            a.selection_dragging,
-            "a down inside the transcript opens a drag"
-        );
-        assert_eq!(a.selection.unwrap().anchor, (9, 4));
-        // Drag up to the TOP visible row (screen row 0 → content row 6). The
-        // selection now spans only what is on screen: rows 6..9.
-        a.selection_extend(0, 0);
-        assert_eq!(a.selection.unwrap().cursor, (6, 0));
-        assert_eq!(
-            crate::selection::extract(&a.transcript_rows.borrow(), &a.selection.unwrap()),
-            "row6\nrow7\nrow8\nrow9",
-            "before the wheel the span is just the visible viewport",
-        );
-        // Wheel UP three rows WHILE the drag is live: the transcript scrolls AND
-        // the selection end re-resolves at the last drag position (screen row 0),
-        // which now sits over content row 3 — so the span GROWS to rows 3..9,
-        // reaching content that was hidden above the old viewport.
-        assert!(a.mouse_wheel_select(true, 3));
-        assert_eq!(
-            a.transcript_scroll(),
-            3,
-            "the wheel still scrolls the transcript"
-        );
-        assert_eq!(
-            a.selection.unwrap().cursor,
-            (3, 0),
-            "end grew to the revealed row"
-        );
-        assert_eq!(
-            a.selection.unwrap().anchor,
-            (9, 4),
-            "the anchor stays pinned"
-        );
-        assert_eq!(
-            crate::selection::extract(&a.transcript_rows.borrow(), &a.selection.unwrap()),
-            "row3\nrow4\nrow5\nrow6\nrow7\nrow8\nrow9",
-            "extract returns the now-larger, beyond-the-viewport span",
-        );
-    }
-
-    #[test]
-    fn wheel_without_active_drag_only_scrolls() {
-        let mut a = fresh_app(Some("offline"));
-        seed_transcript_geometry(&a);
-        // Make a real selection then release the button (mouse-up): the span
-        // stays highlighted but the drag is over.
-        a.selection_begin(9, 3); // anchor (9,4)
-        a.selection_extend(0, 0); // cursor (6,0)
-        let copied = a.selection_finish_copy();
-        assert_eq!(copied.as_deref(), Some("row6\nrow7\nrow8\nrow9"));
-        assert!(!a.selection_dragging, "mouse-up ends the drag");
-        let before = a.selection.unwrap();
-        // A wheel notch now must ONLY scroll — the highlighted span is frozen.
-        assert!(a.mouse_wheel_select(true, 3));
-        assert_eq!(a.transcript_scroll(), 3, "the wheel scrolls as usual");
-        assert_eq!(
-            a.selection.unwrap(),
-            before,
-            "no active drag → the selection is left untouched",
-        );
-    }
-
-    #[test]
-    fn drag_outside_transcript_surfaces_copy_hint_once() {
-        let mut a = fresh_app(Some("offline"));
-        seed_transcript_geometry(&a);
-        let before = a.history.len();
-        // A drag whose mouse-down landed OUTSIDE the transcript (the input box)
-        // never opened an in-app selection.
-        assert!(a.selection.is_none());
-        a.hint_native_copy_once();
-        assert!(
-            a.native_copy_hint_shown,
-            "the first outside-drag latches the hint"
-        );
-        assert_eq!(a.history.len(), before + 1, "the copy hint is posted once");
-        // A SECOND outside-drag must NOT nag again.
-        a.hint_native_copy_once();
-        assert_eq!(a.history.len(), before + 1, "the hint never repeats");
-    }
-
-    #[test]
-    fn copy_hint_suppressed_during_a_real_transcript_selection() {
-        let mut a = fresh_app(Some("offline"));
-        seed_transcript_geometry(&a);
-        // A drag that began INSIDE the transcript opened a selection — that path
-        // copies via the in-app layer, so the native-selection hint stays silent.
-        a.selection_begin(9, 3);
-        assert!(a.selection.is_some());
-        let before = a.history.len();
-        a.hint_native_copy_once();
-        assert_eq!(
-            a.history.len(),
-            before,
-            "no hint while a real selection is live"
-        );
-        assert!(!a.native_copy_hint_shown, "and it does not latch");
-    }
-
-    // ── in-app drag-select+copy INSIDE the input composer box ─────────────
-    //
-    // The renderer publishes the input geometry every frame; a test seeds it
-    // directly (the same seam `ui::render_prompt` writes) then drives the same
-    // begin/extend/finish methods the event loop calls. A uniform 3-cell mode
-    // prefix (`>_ `) is the gutter, so screen col N maps to logical col N-3.
-
-    /// Seed the published input-box geometry for `input` at `text_cols` text
-    /// columns, wrapped exactly as the renderer would. Prefix gutter = 3, pinned
-    /// to the top (no scroll).
-    fn seed_input_geometry(a: &App, input: &str, text_cols: u16) {
-        a.input_text_cols.set(text_cols);
-        let rows = crate::ui::wrap_input_rows(input, text_cols);
-        let visible = u16::try_from(rows.len().min(6)).unwrap_or(1);
-        *a.input_rows.borrow_mut() = rows;
-        a.input_gutter.set(3);
-        a.input_scroll.set(0);
-        // width = gutter + text columns; height = the visible (capped) row count.
-        a.input_area.set((0, 0, 3 + text_cols, visible));
-    }
-
-    #[test]
-    fn dragging_over_input_box_selects_and_copies_the_substring() {
-        let mut a = fresh_app(Some("offline"));
-        a.input = "hello world".to_string();
-        seed_input_geometry(&a, "hello world", 40);
-        // Down on the first content cell (screen col 3 = gutter) → logical col 0.
-        assert!(
-            a.input_selection_begin(3, 0),
-            "a down inside the input box begins an input selection"
-        );
-        assert!(a.input_selection_dragging);
-        assert_eq!(a.input_selection.unwrap().anchor, (0, 0));
-        // Drag to screen col 8 (gutter 3 + 5) → logical col 5, the end of "hello".
-        a.input_selection_extend(8, 0);
-        assert_eq!(a.input_selection.unwrap().cursor, (0, 5));
-        // Mouse-up copies the dragged substring.
-        let copied = a.input_selection_finish_copy();
-        assert_eq!(copied.as_deref(), Some("hello"));
-        assert!(!a.input_selection_dragging, "mouse-up ends the input drag");
-    }
-
-    #[test]
-    fn input_drag_preserves_a_hard_newline_but_not_a_soft_wrap() {
-        // A hard `Ctrl+J` newline is a real char in the buffer → copied. A
-        // soft-wrap boundary is NOT a char → the wrapped line copies unbroken.
-        let mut a = fresh_app(Some("offline"));
-        // Hard newline: "abc\ndef" wraps into two rows at a wide width.
-        a.input = "abc\ndef".to_string();
-        seed_input_geometry(&a, "abc\ndef", 40);
-        a.input_selection_begin(3, 0); // logical (0,0)
-        a.input_selection_extend(6, 1); // row 1, logical col 3 (end of "def")
-        assert_eq!(
-            a.input_selection_finish_copy().as_deref(),
-            Some("abc\ndef"),
-            "the hard newline survives the copy"
-        );
-        // Soft wrap: "abcdefgh" folded at 4 columns → ["abcd","efgh"], no newline.
-        let mut b = fresh_app(Some("offline"));
-        b.input = "abcdefgh".to_string();
-        seed_input_geometry(&b, "abcdefgh", 4);
-        b.input_selection_begin(3, 0); // logical (0,0)
-        b.input_selection_extend(6, 1); // row 1, logical col 3 → char index 7
-        assert_eq!(
-            b.input_selection_finish_copy().as_deref(),
-            Some("abcdefg"),
-            "a soft-wrapped span copies as one line — no spurious newline"
-        );
-    }
-
-    #[test]
-    fn input_selection_and_transcript_selection_do_not_coexist() {
-        let mut a = fresh_app(Some("offline"));
-        seed_transcript_geometry(&a);
-        a.input = "typed text".to_string();
-        seed_input_geometry(&a, "typed text", 40);
-        // Begin a transcript selection, then a down inside the input box: the
-        // transcript highlight is retired so the two layers never collide.
-        a.selection_begin(9, 3);
-        assert!(a.selection.is_some());
-        assert!(a.input_selection_begin(3, 0));
-        assert!(
-            a.selection.is_none(),
-            "the input down cleared the transcript span"
-        );
-        assert!(a.input_selection.is_some());
-        // And the reverse: a transcript down clears the input selection.
-        a.selection_begin(0, 0);
-        assert!(
-            a.input_selection.is_none(),
-            "the transcript down cleared the input span"
-        );
-    }
-
-    #[test]
-    fn a_down_outside_the_input_box_falls_through_to_the_transcript() {
-        let mut a = fresh_app(Some("offline"));
-        // Input box occupies rows 10..=10; the transcript occupies rows 0..4.
-        seed_transcript_geometry(&a); // area (0,0,10,4)
-        a.input = "x".to_string();
-        a.input_text_cols.set(40);
-        *a.input_rows.borrow_mut() = vec!["x".to_string()];
-        a.input_gutter.set(3);
-        a.input_scroll.set(0);
-        a.input_area.set((0, 10, 43, 1)); // far below the transcript
-                                          // A down at a transcript cell is NOT inside the input box.
-        assert!(
-            !a.input_selection_begin(2, 1),
-            "point is outside the input box"
-        );
-    }
-
-    #[test]
-    fn typing_after_an_input_selection_clears_the_stale_highlight() {
-        let mut a = fresh_app(Some("offline"));
-        a.input = "hello world".to_string();
-        a.input_cursor = a.input_len();
-        seed_input_geometry(&a, "hello world", 40);
-        a.input_selection_begin(3, 0);
-        a.input_selection_extend(8, 0);
-        let _ = a.input_selection_finish_copy();
-        assert!(
-            a.input_selection.is_some(),
-            "the copied span stays highlighted"
-        );
-        // A keystroke that EDITS the buffer retires the now-stale highlight…
-        let _ = a.apply_key(KeyCode::Char('!'));
-        assert!(
-            a.input_selection.is_none(),
-            "an edit invalidates the cached selection coords"
-        );
-    }
-
-    // ── Ctrl+click → open URL / file under the cursor ─────────────────────
-
-    /// Seed a wide viewport whose row 0 holds a URL mid-sentence, pinned to
-    /// the top (no scroll), no gutters — so screen col == char index.
-    fn seed_link_geometry(a: &App, rows: &[&str]) {
-        *a.transcript_rows.borrow_mut() = rows.iter().map(|s| (*s).to_string()).collect();
-        a.transcript_gutters.borrow_mut().clear();
-        a.transcript_row_wraps.borrow_mut().clear();
-        a.transcript_area.set((0, 0, 60, 4));
-        a.transcript_max_scroll.set(0);
-        a.set_transcript_scroll(0);
-        a.transcript_first_visible.set(0);
-    }
-
-    #[test]
-    fn ctrl_click_resolves_the_url_under_the_cursor() {
-        let a = fresh_app(Some("offline"));
-        seed_link_geometry(&a, &["preview at http://127.0.0.1:4173/ now"]);
-        // Click on the '1' of `127` (screen col 18, row 0).
-        assert_eq!(
-            a.link_target_at(18, 0).as_deref(),
-            Some("http://127.0.0.1:4173/"),
-            "the URL under the cursor is recovered, boundary-trimmed"
-        );
-        // A click on plain prose hits nothing (silent no-op upstream).
-        assert_eq!(a.link_target_at(2, 0), None, "plain words are not links");
-        // A click past the end of the text hits nothing either.
-        assert_eq!(
-            a.link_target_at(55, 0),
-            None,
-            "blank right margin is a miss"
-        );
-    }
-
-    #[test]
-    fn ctrl_click_resolves_only_existing_paths() {
-        let a = fresh_app(Some("offline"));
-        // A real file in the workspace + a non-existent sibling on row 1.
-        std::fs::write(a.project_root.join("proof.png"), b"x").unwrap();
-        seed_link_geometry(&a, &["shot: proof.png done", "shot: missing.png done"]);
-        let hit = a
-            .link_target_at(8, 0)
-            .expect("existing workspace file resolves");
-        assert!(
-            hit.ends_with("proof.png"),
-            "resolved to the canonicalized real file: {hit}"
-        );
-        assert_eq!(
-            a.link_target_at(8, 1),
-            None,
-            "a path token that does not exist is a miss, not an open"
-        );
-    }
-
-    #[test]
-    fn link_click_miss_is_silent_and_suppresses_the_gesture() {
-        let mut a = fresh_app(Some("offline"));
-        seed_link_geometry(&a, &["no links in this row at all"]);
-        let before = a.history.len();
-        a.link_click_open(3, 0);
-        assert!(
-            a.link_click_pending,
-            "the gesture is armed even on a miss (drag/up stay suppressed)"
-        );
-        assert_eq!(a.history.len(), before, "a miss posts no status note");
-        assert!(
-            a.selection.is_none(),
-            "no selection is opened by ctrl+click"
-        );
-        // The event loop clears the flag on mouse-up; a PLAIN click afterwards
-        // must start a selection exactly as before (behavior unchanged).
-        a.link_click_pending = false;
-        a.selection_begin(3, 0);
-        assert!(
-            a.selection.is_some(),
-            "plain click still begins a selection"
-        );
-        assert!(a.selection_dragging, "and still opens a drag");
-        assert!(
-            !a.link_click_pending,
-            "a plain click never arms the link gesture"
-        );
-    }
-
-    #[test]
-    fn ctrl_click_reads_a_url_across_soft_wrapped_rows() {
-        let a = fresh_app(Some("offline"));
-        // One logical line folded over two visual rows mid-URL.
-        seed_link_geometry(&a, &["see http://127.0.0.1:41", "73/ done"]);
-        *a.transcript_row_wraps.borrow_mut() = vec![false, true];
-        // Click on the second visual row's `7` (screen col 0, row 1): the
-        // rejoined logical line yields the WHOLE url.
-        assert_eq!(
-            a.link_target_at(0, 1).as_deref(),
-            Some("http://127.0.0.1:4173/"),
-            "soft-wrapped URL rejoins before extraction"
-        );
-    }
-
-    #[test]
-    fn handle_paste_inserts_a_multiline_block_verbatim() {
-        // The legacy + owned paths both end at `handle_paste` with the full text
-        // (crossterm `Event::Paste` / a decoded bracketed paste). A small
-        // multi-line paste must land in the input box as ONE block — embedded
-        // newlines kept, nothing dropped — not fragmented into submitted lines.
-        let mut a = fresh_app(Some("offline"));
-        a.handle_paste("first line\nsecond line");
-        assert_eq!(a.input, "first line\nsecond line");
-        assert_eq!(a.input_cursor, a.input_len());
-    }
-
-    #[test]
-    fn drag_past_bottom_edge_auto_scrolls_and_extends() {
-        let mut a = fresh_app(Some("offline"));
-        seed_transcript_geometry(&a);
-        // Scroll all the way UP first so rows 0..3 are visible and there is room
-        // to auto-scroll DOWN toward the newer rows.
-        a.set_transcript_scroll(6);
-        a.transcript_first_visible.set(0);
-        a.selection_begin(0, 0); // anchor at content row 0
-        assert_eq!(a.selection.unwrap().anchor, (0, 0));
-        // Drag STRICTLY below the bottom edge (screen row 4 == top+height): one
-        // auto-scroll step downward + the end pins to the freshly revealed row.
-        a.selection_extend(0, 4);
-        assert_eq!(
-            a.transcript_scroll(),
-            5,
-            "dragging past the bottom auto-scrolls one step"
-        );
-        assert_eq!(
-            a.selection.unwrap().cursor.0,
-            4,
-            "the end extends to the row pulled into view below the old viewport",
-        );
-    }
-
-    #[test]
-    fn slash_history_opens_overlay_with_messages() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/history".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        let ov = a.overlay.as_ref().unwrap();
-        assert!(ov
-            .lines
-            .iter()
-            .any(|l| l.contains("[umadev]") || l.contains("[system]")));
-    }
-
-    #[test]
-    fn overlay_esc_closes() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/spec".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        assert!(a.overlay.is_some());
-        // Esc should close, NOT quit, when an overlay is open.
-        let action = a.apply_key(KeyCode::Esc);
-        assert_eq!(action, Action::None);
-        assert!(a.overlay.is_none());
-        assert!(!a.should_quit);
-    }
-
-    #[test]
-    fn overlay_scroll_keys() {
-        let mut a = fresh_app(Some("offline"));
-        for c in "/spec".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        // A real frame publishes `max_scroll` (the top-most reachable VISUAL row)
-        // before any key is handled; simulate that so scroll_down has room to move.
-        a.overlay.as_ref().unwrap().max_scroll.set(100);
-        let initial = a.overlay.as_ref().unwrap().scroll;
-        // Down + PageDown advance.
-        let _ = a.apply_key(KeyCode::Down);
-        assert!(a.overlay.as_ref().unwrap().scroll > initial);
-        let after_j = a.overlay.as_ref().unwrap().scroll;
-        let _ = a.apply_key(KeyCode::PageDown);
-        assert!(a.overlay.as_ref().unwrap().scroll > after_j);
-        // Up rewinds.
-        let _ = a.apply_key(KeyCode::Up);
-        // Home resets to 0.
-        let _ = a.apply_key(KeyCode::Home);
-        assert_eq!(a.overlay.as_ref().unwrap().scroll, 0);
-        // End jumps to the published last reachable row (not a logical-line guess).
-        let _ = a.apply_key(KeyCode::End);
-        assert_eq!(a.overlay.as_ref().unwrap().scroll, 100);
-    }
-
-    #[test]
-    fn overlay_wheel_scrolls_overlay_not_transcript() {
-        let mut a = fresh_app(Some("offline"));
-        // A tall transcript so a mis-routed wheel WOULD visibly move it.
-        a.transcript_max_scroll.set(100);
-        a.set_transcript_scroll(0);
-        // Open an overlay (taller than the viewport — publish a non-zero max).
-        for c in "/spec".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Enter);
-        assert!(a.overlay.is_some());
-        a.overlay.as_ref().unwrap().max_scroll.set(100);
-        // Wheel DOWN with the overlay open scrolls the OVERLAY, not the transcript.
-        assert!(a.mouse_wheel(false, 3));
-        assert_eq!(a.overlay.as_ref().unwrap().scroll, 3);
-        assert_eq!(
-            a.transcript_scroll(),
-            0,
-            "transcript stays pinned while an overlay is open"
-        );
-        // PageDown (key path) advances further; End clamps to the published last row.
-        let _ = a.apply_key(KeyCode::PageDown);
-        assert!(a.overlay.as_ref().unwrap().scroll > 3);
-        let _ = a.apply_key(KeyCode::End);
-        assert_eq!(a.overlay.as_ref().unwrap().scroll, 100, "End clamps to max");
-        // Wheeling past the end stays clamped — never overruns the last visual row.
-        assert!(a.mouse_wheel(false, 50));
-        assert_eq!(a.overlay.as_ref().unwrap().scroll, 100);
-        // The modal owns the wheel even when the `/mouse` toggle is OFF.
-        a.mouse_scroll = false;
-        let _ = a.apply_key(KeyCode::Home);
-        assert_eq!(a.overlay.as_ref().unwrap().scroll, 0);
-        a.overlay.as_ref().unwrap().max_scroll.set(100);
-        assert!(a.mouse_wheel(false, 5));
-        assert_eq!(
-            a.overlay.as_ref().unwrap().scroll,
-            5,
-            "overlay scrolls regardless of the /mouse wheel-capture toggle"
-        );
-        // With the overlay CLOSED, the wheel falls back to the transcript.
-        a.overlay = None;
-        a.mouse_scroll = true;
-        a.transcript_max_scroll.set(100);
-        a.set_transcript_scroll(0);
-        assert!(a.mouse_wheel(true, 4));
-        assert_eq!(
-            a.transcript_scroll(),
-            4,
-            "no overlay → the wheel scrolls the transcript"
-        );
-    }
-
-    #[test]
-    fn slash_plan_includes_full_team_review_section() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PlanPosted {
-            statuses: vec![],
-            steps: vec![
-                "s1 · scaffold (frontend)".into(),
-                "s2 · login route (backend)".into(),
-            ],
-            done: 1,
-            total: 2,
-        });
-        a.apply_engine(EngineEvent::CriticVerdict {
-            seat: "architect".into(),
-            accepts: true,
-            blocking: vec![],
-            remediation: vec![],
-            advisory: vec!["consider a cache".into()],
-        });
-        a.apply_engine(EngineEvent::CriticVerdict {
-            seat: "qa".into(),
-            accepts: false,
-            blocking: vec!["no tests for login".into(), "no error handling".into()],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        assert_eq!(a.critic_verdicts.len(), 2);
-        let before = a.history.len();
-        let action = a.try_slash_command("/plan").unwrap();
-        assert_eq!(action, Action::None);
-        let out: String = a
-            .history
-            .iter()
-            .skip(before)
-            .map(|m| m.body().clone())
-            .collect();
-        // Plan steps still render.
-        assert!(out.contains("s1") && out.contains("s2"), "plan steps shown");
-        // EVERY seat's verdict is listed (truthful "/plan for all").
-        assert!(out.contains("[architect]"), "accepting seat shown: {out}");
-        assert!(out.contains("[qa]"), "blocking seat shown: {out}");
-        // A blocking seat's FULL findings are listed, not just the first.
-        assert!(out.contains("no tests for login"), "first finding: {out}");
-        assert!(out.contains("no error handling"), "second finding: {out}");
-    }
-
-    #[test]
-    fn team_command_registered_and_dispatchable() {
-        // Wave C: `/team` is one registry row (so the palette + help advertise it)
-        // AND has a dispatch arm — the lockstep parity test relies on both.
-        assert!(
-            App::COMMANDS.iter().any(|c| c.name == "team"),
-            "/team is in COMMANDS"
-        );
-        assert!(
-            dispatch_arm_verbs().iter().any(|v| v == "team"),
-            "/team has a dispatch arm"
-        );
-    }
-
-    #[test]
-    fn slash_team_no_run_shows_roster_and_convene_hint() {
-        // No plan, no verdicts, no output dir → roster + the "convenes on a build"
-        // hint, never the run section.
-        let mut a = fresh_app(Some("offline"));
-        let before = a.history.len();
-        let action = a.try_slash_command("/team").unwrap();
-        assert_eq!(action, Action::None);
-        let out: String = a
-            .history
-            .iter()
-            .skip(before)
-            .map(|m| m.body().clone())
-            .collect();
-        // Roster: the title + every seat's role→deliverable line is present.
-        assert!(
-            out.contains(umadev_i18n::t(a.lang, "team.title")),
-            "title: {out}"
-        );
-        for key in TEAM_ROSTER {
-            assert!(
-                out.contains(umadev_i18n::t(a.lang, key)),
-                "roster row {key} present: {out}"
-            );
-        }
-        // No run context → the convene hint, NOT the run header.
-        assert!(
-            out.contains(umadev_i18n::t(a.lang, "team.no_run")),
-            "hint: {out}"
-        );
-        assert!(
-            !out.contains(umadev_i18n::t(a.lang, "team.run.header")),
-            "no run section without context: {out}"
-        );
-    }
-
-    #[test]
-    fn slash_team_with_verdicts_shows_per_seat_verdicts() {
-        // Recorded critic verdicts are run context. With NO plan steps the
-        // convened roster is empty, so the run section falls back to naming each
-        // reviewing seat (by its short display name) with its verdict.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::CriticVerdict {
-            seat: "architect".into(),
-            accepts: true,
-            blocking: vec![],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        a.apply_engine(EngineEvent::CriticVerdict {
-            seat: "qa".into(),
-            accepts: false,
-            blocking: vec!["no tests for login".into()],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        let before = a.history.len();
-        let _ = a.try_slash_command("/team").unwrap();
-        let out: String = a
-            .history
-            .iter()
-            .skip(before)
-            .map(|m| m.body().clone())
-            .collect();
-        assert!(
-            out.contains(umadev_i18n::t(a.lang, "team.run.header")),
-            "run header: {out}"
-        );
-        assert!(
-            out.contains(&seat_display_name(a.lang, "architect")),
-            "accepting seat: {out}"
-        );
-        assert!(
-            out.contains(&seat_display_name(a.lang, "qa")),
-            "blocking seat: {out}"
-        );
-        // The verdict wording rides along (accept + must-fix).
-        assert!(out.contains(umadev_i18n::t(a.lang, "plan.review.accept")));
-    }
-
-    #[test]
-    fn slash_team_reports_produced_vs_pending_deliverables() {
-        // A deliverable that exists on disk renders `produced`; one that does not
-        // renders `pending`. Need run context for the deliverables block to show.
-        let mut a = fresh_app(Some("offline"));
-        let out_dir = a.project_root.join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
-        std::fs::write(out_dir.join("demo-prd.md"), "# PRD").unwrap();
-        a.apply_engine(EngineEvent::CriticVerdict {
-            seat: "pm".into(),
-            accepts: true,
-            blocking: vec![],
-            remediation: vec![],
-            advisory: vec![],
-        });
-        let before = a.history.len();
-        let _ = a.try_slash_command("/team").unwrap();
-        let out: String = a
-            .history
-            .iter()
-            .skip(before)
-            .map(|m| m.body().clone())
-            .collect();
-        let produced = umadev_i18n::t(a.lang, "team.run.produced");
-        let pending = umadev_i18n::t(a.lang, "team.run.pending");
-        let prd = umadev_i18n::t(a.lang, "team.deliverable.prd");
-        let deploy = umadev_i18n::t(a.lang, "team.deliverable.deploy");
-        // The written PRD shows produced; the absent deploy proof shows pending.
-        assert!(
-            out.contains(&format!("{produced} {prd}")),
-            "PRD produced: {out}"
-        );
-        assert!(
-            out.contains(&format!("{pending} {deploy}")),
-            "deploy proof pending: {out}"
-        );
-    }
-
-    #[test]
-    fn constitution_command_registered_and_dispatchable() {
-        // Wave C: `/constitution` is one registry row (palette + help advertise it)
-        // AND has a dispatch arm — the lockstep parity test relies on both.
-        assert!(
-            App::COMMANDS.iter().any(|c| c.name == "constitution"),
-            "/constitution is in COMMANDS"
-        );
-        assert!(
-            dispatch_arm_verbs().iter().any(|v| v == "constitution"),
-            "/constitution has a dispatch arm"
-        );
-        // The `/charter` alias resolves back to it.
-        assert_eq!(
-            App::resolve_command("charter").map(|c| c.name),
-            Some("constitution")
-        );
-    }
-
-    #[test]
-    fn slash_constitution_generates_and_shows_the_charter() {
-        // First use with no file → generate the charter, open it in the overlay
-        // with the real non-negotiables, and note where the user can edit it.
-        let mut a = fresh_app(Some("offline"));
-        let before = a.history.len();
-        let action = a.try_slash_command("/constitution").unwrap();
-        assert_eq!(action, Action::None);
-        // The charter is shown in the overlay and names the enforced rules.
-        let body = a
-            .overlay
-            .as_ref()
-            .expect("charter overlay opened")
-            .lines
-            .join("\n");
-        assert!(body.contains("UD-CODE-001"), "charter shown: {body}");
-        // The file was actually generated on disk and not clobbered on a re-open.
-        let path = a.project_root.join(umadev_agent::constitution_rel_path());
-        assert!(path.exists(), "charter file generated");
-        // A System note tells the user where to edit it (path surfaced).
-        let notes: String = a
-            .history
-            .iter()
-            .skip(before)
-            .map(|m| m.body().clone())
-            .collect();
-        assert!(
-            notes.contains(&path.display().to_string()),
-            "edit hint names the path: {notes}"
-        );
-    }
-
-    #[test]
-    fn slash_constitution_shows_a_user_edited_file_without_clobbering() {
-        // An existing (user-edited) charter is shown verbatim and never rewritten.
-        let mut a = fresh_app(Some("offline"));
-        let path = a.project_root.join(umadev_agent::constitution_rel_path());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let edited = "# Our rules\n\n- We pair on every PR.\n";
-        std::fs::write(&path, edited).unwrap();
-        let _ = a.try_slash_command("/constitution").unwrap();
-        let body = a
-            .overlay
-            .as_ref()
-            .expect("charter overlay opened")
-            .lines
-            .join("\n");
-        assert!(body.contains("pair on every PR"), "user file shown: {body}");
-        // On disk it is untouched.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
-    }
-
-    #[test]
-    fn host_output_groups_into_single_bubble() {
-        let mut a = fresh_app(Some("offline"));
-        let before = a.history.len();
-        a.apply_engine(EngineEvent::HostOutput {
-            phase: Phase::Research,
-            line: "# header".into(),
-        });
-        a.apply_engine(EngineEvent::HostOutput {
-            phase: Phase::Research,
-            line: "## section".into(),
-        });
-        a.apply_engine(EngineEvent::HostOutput {
-            phase: Phase::Research,
-            line: "body line".into(),
-        });
-        // All three lines collapse into one Host message.
-        let host_msgs: Vec<_> = a
-            .history
-            .iter()
-            .skip(before)
-            .filter(|m| m.role == ChatRole::Host)
-            .collect();
-        assert_eq!(host_msgs.len(), 1);
-        let body = &host_msgs[0].body();
-        assert!(body.contains("# header"));
-        assert!(body.contains("## section"));
-        assert!(body.contains("body line"));
-    }
-
-    #[test]
-    fn host_output_starts_new_bubble_after_umadev_break() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::HostOutput {
-            phase: Phase::Research,
-            line: "research line".into(),
-        });
-        // A UmaDev message between the two streams must break the group.
-        a.apply_engine(EngineEvent::PhaseCompleted {
-            phase: Phase::Research,
-        });
-        a.apply_engine(EngineEvent::HostOutput {
-            phase: Phase::Docs,
-            line: "docs line".into(),
-        });
-        let host_msgs: Vec<_> = a
-            .history
-            .iter()
-            .filter(|m| m.role == ChatRole::Host)
-            .collect();
-        assert_eq!(host_msgs.len(), 2);
-    }
-
-    #[test]
-    fn status_bar_contains_phase_dots() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PhaseStarted {
-            phase: Phase::Research,
-        });
-        // Phase progress is a compact geometric bar after the backend label.
-        // With research running (first of 9): ◐○○○○○○○○ 0/9.
-        assert!(a.status.contains("◐○○○○○○○○"));
-        assert!(a.status.contains("0/9"));
-    }
-
-    #[test]
-    fn status_bar_dots_advance_as_phases_complete() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PhaseStarted {
-            phase: Phase::Research,
-        });
-        a.apply_engine(EngineEvent::PhaseCompleted {
-            phase: Phase::Research,
-        });
-        a.apply_engine(EngineEvent::PhaseStarted { phase: Phase::Docs });
-        // After research done + docs running: ●◐○○○○○○○ 1/9.
-        assert!(a.status.contains("●◐○○○○○○○"));
-        assert!(a.status.contains("1/9"));
-    }
-
-    #[test]
-    fn spinner_cycles() {
-        let mut a = fresh_app(Some("offline"));
-        let first = a.spinner();
-        // 10 braille frames × 2 ticks each = 20 ticks per cycle.
-        for _ in 0..20 {
-            a.tick();
-        }
-        assert_eq!(a.spinner(), first);
-    }
-
-    #[test]
-    fn p5c_thinking_collapses_to_one_summary_row() {
-        // P5c: a burst of Thinking events opens exactly ONE placeholder row; the
-        // next real content collapses it to a single `正在思考… · N.Ns` summary
-        // instead of leaving a stack of orphan `[thinking]` rows.
-        let mut a = fresh_app(Some("offline"));
-        let before = a.history.len();
-        for _ in 0..5 {
-            a.apply_engine(EngineEvent::WorkerStream {
-                event: umadev_runtime::StreamEvent::Thinking,
-            });
-        }
-        // Only ONE placeholder row was pushed despite five Thinking events.
-        assert_eq!(
-            a.history.len(),
-            before + 1,
-            "a thinking burst must not stack rows"
-        );
-        let placeholder_idx = a.history.len() - 1;
-        assert!(a
-            .history
-            .back()
-            .unwrap()
-            .body()
-            .contains(THINKING_PLACEHOLDER_TAG));
-        assert!(a.thinking_block_idx.is_some(), "a reasoning block is open");
-        // Real content arrives → the placeholder collapses to a summary in place
-        // (no new row added for the collapse itself).
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Text {
-                delta: "here is the answer".into(),
-            },
-        });
-        assert!(a.thinking_block_idx.is_none(), "block closed after content");
-        let collapsed = a.history.get(placeholder_idx).unwrap().body().into_owned();
-        assert!(
-            !collapsed.contains(THINKING_PLACEHOLDER_TAG),
-            "placeholder tag is gone after collapse: {collapsed:?}"
-        );
-        // The summary carries the thinking label + a seconds figure (`· N.Ns`).
-        assert!(
-            collapsed.contains('·') && collapsed.contains('s'),
-            "summary shows elapsed seconds: {collapsed:?}"
-        );
-    }
-
-    #[test]
-    fn p5c_collapse_failopen_without_timing() {
-        // Fail-open: if the block-start timestamp is missing, the collapse still
-        // rewrites the placeholder (to a no-seconds completion marker), never
-        // leaving an orphan `[thinking]` row.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Thinking,
-        });
-        let idx = a.thinking_block_idx.unwrap();
-        a.thinking_block_start = None; // simulate lost timing
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolResult {
-                ok: true,
-                summary: "done".into(),
-            },
-        });
-        let row = a.history.get(idx).unwrap().body().into_owned();
-        assert!(
-            !row.contains(THINKING_PLACEHOLDER_TAG),
-            "placeholder still collapsed without timing: {row:?}"
-        );
-    }
-
-    #[test]
-    fn thinking_deltas_accumulate_into_one_collapsed_block() {
-        // Phase-2-C-P0: a stream of reasoning deltas must build ONE foldable
-        // `[thinking]` block (not a row per delta), default collapsed, and the
-        // reasoning text must be preserved in that single row.
-        let mut a = fresh_app(Some("offline"));
-        let before = a.history.len();
-        for chunk in ["Let me ", "think about ", "the architecture."] {
-            a.apply_engine(EngineEvent::WorkerStream {
-                event: umadev_runtime::StreamEvent::ThinkingDelta(chunk.into()),
-            });
-        }
-        // Exactly ONE new row despite three deltas.
-        assert_eq!(
-            a.history.len(),
-            before + 1,
-            "reasoning deltas must fold into one block, not a row per delta"
-        );
-        let idx = a.thinking_block_idx.expect("a reasoning block is open");
-        let body = a.history.get(idx).unwrap().body().into_owned();
-        assert!(
-            body.starts_with(THINKING_PLACEHOLDER_TAG),
-            "header tag: {body:?}"
-        );
-        assert!(
-            body.contains("Let me think about the architecture."),
-            "the full reasoning text is accumulated: {body:?}"
-        );
-        // Default collapsed, and recognized as a foldable reasoning block.
-        let msg = a.history.get(idx).unwrap();
-        assert!(msg.collapsed, "the reasoning block defaults to collapsed");
-        assert!(
-            crate::app::is_thinking_reasoning_block(msg.role, body.as_str()),
-            "row is a foldable [thinking] reasoning block"
-        );
-        // Real content closes the block but KEEPS the reasoning + the expandable tag.
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Text {
-                delta: "Here is the plan.".into(),
-            },
-        });
-        assert!(a.thinking_block_idx.is_none(), "block closed after content");
-        let after = a.history.get(idx).unwrap();
-        let after_body = after.body().into_owned();
-        assert!(
-            after_body.starts_with(THINKING_PLACEHOLDER_TAG),
-            "a reasoning block keeps its expandable tag after collapse: {after_body:?}"
-        );
-        assert!(
-            after_body.contains("Let me think about the architecture."),
-            "the reasoning survives collapse so it can be expanded: {after_body:?}"
-        );
-        assert!(after.collapsed, "still collapsed (expand with Ctrl+O)");
-    }
-
-    #[test]
-    fn thinking_delta_at_history_cap_never_corrupts_a_shifted_row() {
-        // Fix 3 — `thinking_block_idx` is an ABSOLUTE `history` index. While a
-        // reasoning block is open, a non-collapsing push at `HISTORY_CAP`
-        // `pop_front`s the front row and shifts every index down by one, so the
-        // stored idx lands on an UNRELATED row. The delta-append must re-validate
-        // the placeholder tag (like the collapse path) and never write reasoning
-        // into that shifted-onto row.
-        let mut a = fresh_app(Some("offline"));
-        // Fill history to exactly the cap so the NEXT push evicts a front row.
-        for i in 0..HISTORY_CAP {
-            a.push(ChatRole::System, format!("filler {i}"));
-        }
-        assert_eq!(a.history.len(), HISTORY_CAP);
-        // Open a reasoning block + accumulate one delta (opening pushes the
-        // placeholder at the back, evicting one filler).
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ThinkingDelta("first reasoning".into()),
-        });
-        let stale_idx = a.thinking_block_idx.expect("a reasoning block is open");
-        // A non-collapsing push AT cap shifts every index down by one, so
-        // `stale_idx` now points at THIS new (unrelated) row.
-        a.push(ChatRole::You, "a new user line");
-        let shifted = a.history.get(stale_idx).unwrap();
-        assert_eq!(
-            shifted.role,
-            ChatRole::You,
-            "the stored index was shifted onto an unrelated row"
-        );
-        let before = shifted.body().into_owned();
-        // A further reasoning delta must NOT be appended into that unrelated row.
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ThinkingDelta("STRAY".into()),
-        });
-        let after = a.history.get(stale_idx).unwrap().body().into_owned();
-        assert_eq!(
-            before, after,
-            "a reasoning delta must not corrupt the shifted-onto row"
-        );
-        assert!(
-            !after.contains("STRAY"),
-            "no reasoning leaked into the user row"
-        );
-        // Self-heal: the stale index was dropped, and the NEXT delta re-opens a
-        // fresh reasoning block rather than chasing the moved row.
-        assert!(a.thinking_block_idx.is_none(), "the stale index is dropped");
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ThinkingDelta("fresh".into()),
-        });
-        let new_idx = a
-            .thinking_block_idx
-            .expect("a fresh reasoning block re-opened");
-        let new_body = a.history.get(new_idx).unwrap().body().into_owned();
-        assert!(
-            new_body.starts_with(THINKING_PLACEHOLDER_TAG) && new_body.contains("fresh"),
-            "the next delta re-opens a fresh reasoning block: {new_body:?}"
-        );
-    }
-
-    #[test]
-    fn a_turn_with_no_thinking_shows_no_reasoning_block() {
-        // A plain answer with no reasoning deltas must add NO `[thinking]` block.
-        let mut a = fresh_app(Some("offline"));
-        let before = a.history.len();
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Text {
-                delta: "just an answer".into(),
-            },
-        });
-        assert!(a.thinking_block_idx.is_none(), "no block opened");
-        assert!(
-            a.history
-                .iter()
-                .skip(before)
-                .all(|m| !m.body().contains(THINKING_PLACEHOLDER_TAG)),
-            "no [thinking] row when the turn never reasoned"
-        );
-    }
-
-    #[test]
-    fn p5d_spinner_frame_static_when_animations_off() {
-        // P5d: animations off → a single static glyph, never a strobing frame.
-        for tick in 0..30u8 {
-            assert_eq!(
-                spinner_frame(tick, false, false),
-                SPINNER_STATIC,
-                "animations off must be static at tick {tick}"
-            );
-        }
-    }
-
-    #[test]
-    fn p5d_spinner_frame_freezes_on_stall() {
-        // P5d: a stall FREEZES the spinner on one frame (the status surface paints
-        // it the warning color) — it must not keep fake-spinning.
-        let frozen = spinner_frame(0, true, true);
-        for tick in 0..30u8 {
-            assert_eq!(
-                spinner_frame(tick, true, true),
-                frozen,
-                "stalled spinner must not advance (tick {tick})"
-            );
-        }
-        // And while NOT stalled it does advance through the braille frames.
-        let mut seen = std::collections::HashSet::new();
-        for tick in 0..10u8 {
-            seen.insert(spinner_frame(tick, true, false));
-        }
-        assert_eq!(seen.len(), SPINNER_FRAMES.len(), "all frames appear");
-    }
-
-    #[test]
-    fn p5d_app_spinner_uses_shared_frames() {
-        // The App-level spinner funnels through the shared frame source, so a
-        // non-animated app shows the static glyph and an animated one rotates.
-        let mut a = fresh_app(Some("offline"));
-        a.animations = false;
-        assert_eq!(a.spinner(), SPINNER_STATIC);
-        a.animations = true;
-        assert_eq!(
-            a.spinner(),
-            SPINNER_FRAMES[a.tick as usize % SPINNER_FRAMES.len()]
-        );
-    }
-
-    #[test]
-    fn running_circle_animates_through_its_frames() {
-        // The in-progress phase circle must ROTATE (◐◓◑◒) as the tick advances,
-        // not sit static — that rotation is what proves the bar is alive even
-        // when the bottom-bar spinner is off-attention. One frame per 2 ticks.
-        let mut a = fresh_app(Some("offline"));
-        assert_eq!(a.running_circle(), '◐', "frame 0 at tick 0");
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..8 {
-            seen.insert(a.running_circle());
-            a.tick();
-            a.tick(); // advance one full circle frame (~160ms)
-        }
-        // All four quarter-circle glyphs must appear as it rotates.
-        for g in ['◐', '◓', '◑', '◒'] {
-            assert!(seen.contains(&g), "running circle must show {g}: {seen:?}");
-        }
-    }
-
-    #[test]
-    fn running_phase_circle_in_status_bar_rotates() {
-        // The progress bar (in app.status) shows the rotating circle for the
-        // running phase, not a frozen ◐.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PhaseStarted {
-            phase: Phase::Research,
-        });
-        // tick=0 → ◐ (frame 0).
-        assert!(a.status.contains('◐'), "tick 0 shows ◐: {}", a.status);
-        // Advance two ticks (one circle frame) → the running glyph becomes ◓.
-        a.tick();
-        a.tick();
-        assert!(
-            a.status.contains('◓'),
-            "after 2 ticks the running circle rotates to ◓: {}",
-            a.status
-        );
-    }
-
-    #[test]
-    fn stall_after_threshold_then_clears_on_output() {
-        // Honest stall signal: a running phase with no output past the 60s
-        // threshold reads as stalled (status painted red by the UI); any fresh
-        // output clears it. A short quiet spell (the base thinking) is NOT a stall.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PhaseStarted {
-            phase: Phase::Research,
-        });
-        // Just started → not stalled (spin-up grace).
-        assert!(!a.is_stalled(), "a just-started phase is not stalled");
-        // A 30s quiet spell is normal base thinking, NOT a stall.
-        a.last_output_at =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(30));
-        assert!(!a.is_stalled(), "a sub-60s quiet spell is not a stall");
-        // Backdate the last-output clock past the 60s threshold.
-        a.last_output_at =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(90));
-        assert!(a.is_stalled(), "no output for >60s must read as stalled");
-        // A worker stream event is a sign of life → stall clears immediately.
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Text {
-                delta: "back to work".into(),
-            },
-        });
-        assert!(!a.is_stalled(), "fresh output must clear the stall signal");
-    }
-
-    #[test]
-    fn tool_call_in_flight_is_not_a_stall() {
-        // A long tool call (e.g. a multi-minute npm install) is WORK, not a stall
-        // — the red signal must stay suppressed while a ToolUse has no ToolResult
-        // yet, even past the 60s threshold; the ToolResult re-arms the stall clock.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PhaseStarted {
-            phase: Phase::Backend,
-        });
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Bash".into(),
-                detail: "npm install".into(),
-                edit: None,
-            },
-        });
-        assert!(a.tool_in_progress, "ToolUse marks a tool in flight");
-        // Even with a clock well past the 60s threshold, an in-flight tool is not
-        // a stall (otherwise a long `npm install` would falsely flash red).
-        a.last_output_at =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(120));
-        assert!(
-            !a.is_stalled(),
-            "an in-flight tool call must NOT read as stalled"
-        );
-        // The result returns → tool no longer in flight; the stall clock applies.
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolResult {
-                ok: true,
-                summary: "added 200 packages".into(),
-            },
-        });
-        assert!(!a.tool_in_progress, "ToolResult clears the in-flight flag");
-        // (The result itself just marked output, so still not stalled now.)
-        assert!(!a.is_stalled());
-    }
-
-    #[test]
-    fn not_stalled_at_a_gate_or_when_idle() {
-        // At a gate (paused for the user) phase_started_at is cleared, so the
-        // status must never falsely flash red while waiting on a human.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PhaseStarted { phase: Phase::Docs });
-        a.last_output_at =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(90));
-        a.apply_engine(EngineEvent::GateOpened {
-            gate: umadev_agent::gates::Gate::DocsConfirm,
-            choice: None,
-        });
-        assert!(
-            !a.is_stalled(),
-            "a gate pause (no running phase) is not a stall"
-        );
-        // A brand-new app with nothing running is never stalled either.
-        let idle = fresh_app(Some("offline"));
-        assert!(!idle.is_stalled());
-    }
-
-    #[test]
-    fn pre_phase_window_stalls_after_three_seconds() {
-        // THE 0/9 WINDOW: a run has STARTED (PipelineStarted) but no `Running`
-        // phase has begun yet (cold index build / intake / vector build). Here
-        // `phase_started_at` is None and `thinking` is false — the old judge
-        // would NEVER go red, so a silent freeze in this window read as smooth.
-        // The structural backstop must paint it red past 60s.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "build it".into(),
-        });
-        assert!(a.phase_started_at.is_none(), "no Running phase yet (0/9)");
-        assert!(!a.thinking, "not a chat-thinking turn");
-        // Just launched → not stalled (spin-up grace).
-        assert!(!a.is_stalled(), "a just-launched run is not stalled");
-        // Backdate the run start past the 60s threshold (no output has arrived).
-        a.run_started_at =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(90));
-        assert!(
-            a.is_stalled(),
-            "a silent pre-phase 0/9 window past 60s MUST read as stalled"
-        );
-    }
-
-    #[test]
-    fn pre_phase_gate_pause_is_not_stalled() {
-        // The pre-phase backstop must NOT misfire at a gate: GateOpened clears
-        // run_started_at and sets active_gate, so a human pause never flashes red.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "build it".into(),
-        });
-        a.apply_engine(EngineEvent::GateOpened {
-            gate: umadev_agent::gates::Gate::DocsConfirm,
-            choice: None,
-        });
-        // Even with a very stale clock, a gate pause is not a stall.
-        a.run_started_at =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(90));
-        assert!(
-            !a.is_stalled(),
-            "a gate pause in the pre-phase window must not read as stalled"
-        );
-        // A finished/aborted run is likewise never stalled.
-        let mut done = fresh_app(Some("offline"));
-        done.run_started = true;
-        done.aborted = true;
-        done.run_started_at =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(90));
-        assert!(!done.is_stalled(), "an aborted run is not stalled");
-    }
-
-    #[test]
-    fn build_brain_failure_drives_aborted_terminal_state() {
-        // Fix 3: a `build_brain` init failure (unknown backend / driver build
-        // error) carries the ABORT_SENTINEL like the other terminal paths, so the
-        // bar flips to `[aborted]` instead of sitting at a fake idle "0/9".
-        let mut app = fresh_app(Some("offline"));
-        app.run_started = true;
-        app.run_started_at = Some(std::time::Instant::now());
-        // Emulate the wrapped terminal note spawn_block now emits on init failure.
-        app.apply_engine(EngineEvent::Note(format!(
-            "{}{}",
-            crate::ABORT_SENTINEL,
-            umadev_i18n::tlf("worker.init_failed", &["claude", "not on PATH"])
-        )));
-        assert!(
-            app.aborted,
-            "an init-failure sentinel note flips to aborted"
-        );
-        assert!(
-            !app.is_pipeline_active(),
-            "the failed run is no longer active"
-        );
-        app.refresh_status();
-        assert!(
-            app.status.contains("aborted"),
-            "the bar shows [aborted], not a fake idle 0/9"
-        );
-    }
-
-    #[test]
-    fn config_save_failure_pushes_a_note_on_lang_change() {
-        // Fix 4: a persist failure on `/lang` must surface a note, not silently
-        // claim success and revert on next launch. Point config_path under a
-        // regular FILE so `create_dir_all(parent)` inside save_to fails.
-        let mut app = fresh_app(Some("offline"));
-        let tmp = tempfile::TempDir::new().unwrap();
-        let blocker = tmp.path().join("cfg-blocker");
-        std::fs::write(&blocker, b"x").unwrap();
-        app.config_path = blocker.join("nested").join("config.toml");
-        let before = app.history.len();
-        let _ = app.slash_lang("en");
-        let pushed: Vec<String> = app
-            .history
-            .iter()
-            .skip(before)
-            .map(|m| m.body().into_owned())
-            .collect();
-        assert!(
-            pushed.iter().any(|b| b.contains("[warn]")),
-            "a config persist failure must push a warning note: {pushed:?}"
-        );
-        // The language still changed for this session (fail-open).
-        assert_eq!(app.lang, umadev_i18n::Lang::En);
-    }
-
-    #[test]
-    fn chat_reply_claiming_edits_gets_an_unverified_warning() {
-        // Fix 5: a pure-chat reply that recites an edit ("已修改…/新增了…") —
-        // with no run and no agentic tool calls — gets a reality-anchor note.
-        let mut app = fresh_app(Some("offline"));
-        app.record_chat_reply("我已修改了 app.rs 并新增了一个函数".to_string());
-        assert!(
-            app.history.iter().any(|m| m.body().contains("[warn]")),
-            "a chat reply claiming code changes must get a verify warning"
-        );
-        // A benign chat reply (no change claim) must NOT be warned.
-        let mut benign = fresh_app(Some("offline"));
-        benign.record_chat_reply("你好,有什么可以帮你的?".to_string());
-        assert!(
-            !benign.history.iter().any(|m| m.body().contains("[warn]")),
-            "a plain chat reply must not trigger the warning"
-        );
-    }
-
-    #[test]
-    fn clarify_answer_write_failure_does_not_claim_recorded() {
-        // Fix 6: when the clarify answer can't be persisted, the user must be
-        // told it was NOT recorded — never the false "已记录" line.
-        let mut app = fresh_app(Some("offline"));
-        // Point the project root at a regular FILE so the output/ dir can't be
-        // created and the answer write fails.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let blocker = tmp.path().join("clarify-blocker");
-        std::fs::write(&blocker, b"x").unwrap();
-        app.project_root = blocker.clone();
-        app.active_gate = Some(Gate::ClarifyGate);
-        for c in "use postgres".chars() {
-            let _ = app.apply_key(KeyCode::Char(c));
-        }
-        let _ = app.apply_key(KeyCode::Enter);
-        let last = app.history.back().unwrap();
-        assert!(
-            !last.body().contains("已记录"),
-            "a failed write must NOT claim the answer was recorded: {}",
-            last.body()
-        );
-        assert!(
-            last.body().contains("[warn]"),
-            "a failed clarify write must surface a warning: {}",
-            last.body()
-        );
-    }
-
-    // ---- WorkerStream rendering tests ----
-
-    #[test]
-    fn text_delta_creates_host_message() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Text {
-                delta: "Hello world".into(),
-            },
-        });
-        let last = a.history.back().unwrap();
-        assert_eq!(last.role, ChatRole::Host);
-        assert!(last.body().contains("Hello world"));
-        assert!(
-            a.stream_text_active,
-            "stream_text_active should be true after first text"
-        );
-    }
-
-    #[test]
-    fn consecutive_text_deltas_append_not_push() {
-        let mut a = fresh_app(Some("offline"));
-        // First delta → new message
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Text {
-                delta: "Part 1".into(),
-            },
-        });
-        // Second delta → append to same message (typewriter)
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Text {
-                delta: " Part 2".into(),
-            },
-        });
-        let host_msgs: Vec<_> = a
-            .history
-            .iter()
-            .filter(|m| m.role == ChatRole::Host)
-            .collect();
-        assert_eq!(
-            host_msgs.len(),
-            1,
-            "two consecutive text deltas should be one message"
-        );
-        assert_eq!(host_msgs[0].body(), "Part 1 Part 2");
-    }
-
-    #[test]
-    fn long_stream_is_never_truncated_only_segmented() {
-        // The bug: a long streamed reply was hard-capped at 2000 bytes and the
-        // rest silenced with `…` (CJK hit that in a few sentences). The fix keeps
-        // EVERY byte — once a segment fills, the reply rolls into a fresh Host
-        // bubble. Stream ~20 KB of CJK in many deltas and assert nothing is lost
-        // and no `…` truncation marker is appended.
-        let mut a = fresh_app(Some("offline"));
-        let chunk = "这是一段很长的中文回复内容用来测试不被截断"; // 21 chars
-        let n = 500;
-        for _ in 0..n {
-            a.apply_engine(EngineEvent::WorkerStream {
-                event: umadev_runtime::StreamEvent::Text {
-                    delta: chunk.into(),
-                },
-            });
-        }
-        let host_total: usize = a
-            .history
-            .iter()
-            .filter(|m| m.role == ChatRole::Host)
-            .map(|m| m.body().chars().count())
-            .sum();
-        let expected = chunk.chars().count() * n;
-        assert_eq!(
-            host_total, expected,
-            "every streamed char must survive — no truncation"
-        );
-        // It segmented into more than one bubble (proof the rollover ran), and no
-        // segment carries the old truncation ellipsis.
-        let host_msgs: Vec<_> = a
-            .history
-            .iter()
-            .filter(|m| m.role == ChatRole::Host)
-            .collect();
-        assert!(
-            host_msgs.len() > 1,
-            "a 20 KB reply must roll over into multiple segments"
-        );
-        for m in &host_msgs {
-            assert!(
-                !m.body().contains('…'),
-                "no segment should be truncated with an ellipsis: {}",
-                m.body()
-            );
-        }
-    }
-
-    #[test]
-    fn tool_use_resets_text_append() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Text {
-                delta: "Some text".into(),
-            },
-        });
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Read".into(),
-                detail: "Cargo.toml".into(),
-                edit: None,
-            },
-        });
-        // Text after tool should be a NEW message, not appended to tool line
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Text {
-                delta: "New text".into(),
-            },
-        });
-        assert!(!a.stream_text_active || a.history.back().unwrap().body() == "New text");
-    }
-
-    #[test]
-    fn same_tool_type_batches() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Read".into(),
-                detail: "file1".into(),
-                edit: None,
-            },
-        });
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Read".into(),
-                detail: "file2".into(),
-                edit: None,
-            },
-        });
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Read".into(),
-                detail: "file3".into(),
-                edit: None,
-            },
-        });
-        let host_msgs: Vec<_> = a
-            .history
-            .iter()
-            .filter(|m| m.role == ChatRole::Host)
-            .collect();
-        assert_eq!(
-            host_msgs.len(),
-            1,
-            "3 same-type read calls should merge into 1 structured tool row"
-        );
-        // The merged row is a STRUCTURED tool call, not a flattened sentence.
-        let MessageBody::Tool(t) = &host_msgs[0].kind else {
-            panic!("merged read batch must be a Tool body, got Text");
-        };
-        assert!(t.merged, "low-signal reads merge into one batch row");
-        assert_eq!(t.count, 3, "the count tracks all three reads");
-        assert_eq!(t.status, ToolStatus::Running, "still in flight");
-        // The flat text still surfaces the count for export / history.
-        assert!(
-            host_msgs[0].body().contains('3'),
-            "flat text carries the count: {}",
-            host_msgs[0].body()
-        );
-    }
-
-    #[test]
-    fn different_tool_type_resets_batch() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Read".into(),
-                detail: "file1".into(),
-                edit: None,
-            },
-        });
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Bash".into(),
-                detail: "npm test".into(),
-                edit: None,
-            },
-        });
-        let host_msgs: Vec<_> = a
-            .history
-            .iter()
-            .filter(|m| m.role == ChatRole::Host)
-            .collect();
-        assert_eq!(
-            host_msgs.len(),
-            2,
-            "different tool types should be separate messages"
-        );
-        // The Bash row is a single, un-merged tool row (its result IS signal).
-        let MessageBody::Tool(bash) = &host_msgs[1].kind else {
-            panic!("Bash must render as a structured tool row");
-        };
-        assert!(!bash.merged, "Bash is a single-row tool, never merged");
-        assert_eq!(bash.name, "Bash");
-    }
-
-    // ---- P4: structured tool rows ----------------------------------------
-
-    #[test]
-    fn tool_use_pushes_structured_tool_row_not_a_sentence() {
-        // A ToolUse no longer flattens into a `[write] Edit `path`` string — it
-        // becomes a typed `MessageBody::Tool` the renderer draws as one status
-        // line. Guards against regressing to the "tool call reads like prose" bug.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Edit".into(),
-                detail: "src/main.rs".into(),
-                edit: None,
-            },
-        });
-        let last = a.history.back().unwrap();
-        let MessageBody::Tool(t) = &last.kind else {
-            panic!("a tool use must produce a Tool body, not Text");
-        };
-        assert_eq!(t.name, "Edit");
-        assert_eq!(t.arg, "src/main.rs");
-        assert_eq!(t.status, ToolStatus::Running);
-        assert!(t.result.is_none(), "no result yet while in flight");
-    }
-
-    #[test]
-    fn edit_with_content_pushes_a_diff_card_in_real_time() {
-        // P1: a Write/Edit carrying structured content renders a diff card the
-        // moment the tool_use arrives — we don't wait for the result.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Edit".into(),
-                detail: "src/lib.rs".into(),
-                edit: Some(umadev_runtime::ToolEdit {
-                    path: "src/lib.rs".into(),
-                    before: "let x = 1;\nlet y = 2;\n".into(),
-                    after: "let x = 1;\nlet y = 3;\n".into(),
-                }),
-            },
-        });
-        let MessageBody::Diff(d) = &a.history.back().unwrap().kind else {
-            panic!("an edit with content must produce a Diff card, not a Tool row");
-        };
-        assert_eq!(d.path, "src/lib.rs");
-        assert_eq!(d.added, 1, "one line changed → one added");
-        assert_eq!(d.removed, 1, "…and one removed");
-        // The unchanged `let x = 1;` is kept as ±context around the change.
-        let all: Vec<(char, &str)> = d
-            .hunks
-            .iter()
-            .flat_map(|h| h.lines.iter())
-            .map(|l| (l.tag, l.text.as_str()))
-            .collect();
-        assert!(
-            all.contains(&(' ', "let x = 1;")),
-            "context line kept: {all:?}"
-        );
-        assert!(all.contains(&('-', "let y = 2;")), "deletion kept: {all:?}");
-        assert!(all.contains(&('+', "let y = 3;")), "addition kept: {all:?}");
-    }
-
-    #[test]
-    fn identical_diff_card_is_not_rendered_twice_in_a_row() {
-        // A base can surface the same edit both in its narration AND as the structured
-        // tool call (or an opencode tool part can arrive under two ids), landing a
-        // byte-identical diff card right after the last - the reported duplicate. The
-        // guard collapses it, while a different follow-up edit still renders its card.
-        let mut a = fresh_app(Some("offline"));
-        for _ in 0..2 {
-            a.apply_engine(EngineEvent::WorkerStream {
-                event: umadev_runtime::StreamEvent::ToolUse {
-                    name: "Edit".into(),
-                    detail: "src/lib.rs".into(),
-                    edit: Some(umadev_runtime::ToolEdit {
-                        path: "src/lib.rs".into(),
-                        before: "let x = 1;\nlet y = 2;\n".into(),
-                        after: "let x = 1;\nlet y = 3;\n".into(),
-                    }),
-                },
-            });
-        }
-        let one = a
-            .history
-            .iter()
-            .filter(|m| matches!(m.kind, MessageBody::Diff(_)))
-            .count();
-        assert_eq!(one, 1, "an identical consecutive diff must render once");
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Edit".into(),
-                detail: "src/lib.rs".into(),
-                edit: Some(umadev_runtime::ToolEdit {
-                    path: "src/lib.rs".into(),
-                    before: "let y = 3;\n".into(),
-                    after: "let y = 4;\n".into(),
-                }),
-            },
-        });
-        let two = a
-            .history
-            .iter()
-            .filter(|m| matches!(m.kind, MessageBody::Diff(_)))
-            .count();
-        assert_eq!(
-            two, 2,
-            "a distinct follow-up edit still renders its own card"
-        );
-    }
-
-    #[test]
-    fn write_renders_as_all_additions_diff() {
-        // A Write is a fresh file: every line is an addition, none removed.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Write".into(),
-                detail: "src/new.rs".into(),
-                edit: Some(umadev_runtime::ToolEdit {
-                    path: "src/new.rs".into(),
-                    before: String::new(),
-                    after: "fn a() {}\nfn b() {}\n".into(),
-                }),
-            },
-        });
-        let MessageBody::Diff(d) = &a.history.back().unwrap().kind else {
-            panic!("a Write with content must produce a Diff card");
-        };
-        assert_eq!(d.added, 2);
-        assert_eq!(d.removed, 0);
-        assert!(
-            d.hunks
-                .iter()
-                .flat_map(|h| h.lines.iter())
-                .all(|l| l.tag == '+'),
-            "every line of a fresh Write is an addition"
-        );
-    }
-
-    #[test]
-    fn diff_card_keeps_only_three_context_lines() {
-        // ±DIFF_CONTEXT: a far-away unchanged line is NOT kept in the hunk.
-        use std::fmt::Write as _;
-        let mut before = String::new();
-        let mut after = String::new();
-        for i in 0..20 {
-            let _ = writeln!(before, "line{i}");
-            if i == 10 {
-                after.push_str("line10-CHANGED\n");
-            } else {
-                let _ = writeln!(after, "line{i}");
-            }
-        }
-        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
-            path: "x.txt".into(),
-            before,
-            after,
-        });
-        let texts: Vec<&str> = d
-            .hunks
-            .iter()
-            .flat_map(|h| h.lines.iter())
-            .map(|l| l.text.as_str())
-            .collect();
-        // line7 is within 3 of the change (line10) → kept; line0 is far → dropped.
-        assert!(texts.contains(&"line7"), "±3 context kept: {texts:?}");
-        assert!(!texts.contains(&"line0"), "far line dropped");
-        assert_eq!(DIFF_CONTEXT, 3);
-    }
-
-    #[test]
-    fn noop_edit_falls_open_to_a_plain_tool_row() {
-        // Fail-open: an edit whose before==after (no real change → zero hunks)
-        // degrades to a plain tool row, never an empty diff card.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Edit".into(),
-                detail: "same.rs".into(),
-                edit: Some(umadev_runtime::ToolEdit {
-                    path: "same.rs".into(),
-                    before: "unchanged\n".into(),
-                    after: "unchanged\n".into(),
-                }),
-            },
-        });
-        assert!(
-            matches!(a.history.back().unwrap().kind, MessageBody::Tool(_)),
-            "a no-op edit degrades to a plain tool row"
-        );
-    }
-
-    #[test]
-    fn diff_card_handles_cjk_content_without_panic() {
-        // CJK lines must not panic the diff builder (char-boundary safe) and must
-        // round-trip their content.
-        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
-            path: "说明.md".into(),
-            before: "第一行\n第二行\n".into(),
-            after: "第一行\n第二行改\n".into(),
-        });
-        assert_eq!(d.added, 1);
-        assert_eq!(d.removed, 1);
-        assert!(d
-            .hunks
-            .iter()
-            .flat_map(|h| h.lines.iter())
-            .any(|l| l.text == "第二行改"));
-    }
-
-    #[test]
-    fn diff_card_absorbs_a_success_result_silently() {
-        // After a diff card, a SUCCESS ToolResult is implied by the card itself —
-        // no redundant `[ok]` line is appended.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Write".into(),
-                detail: "f.rs".into(),
-                edit: Some(umadev_runtime::ToolEdit {
-                    path: "f.rs".into(),
-                    before: String::new(),
-                    after: "fn x() {}\n".into(),
-                }),
-            },
-        });
-        let before = a.history.len();
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolResult {
-                ok: true,
-                summary: "File created successfully".into(),
-            },
-        });
-        assert_eq!(
-            a.history.len(),
-            before,
-            "a success after a diff card adds no extra line"
-        );
-        assert!(matches!(
-            a.history.back().unwrap().kind,
-            MessageBody::Diff(_)
-        ));
-    }
-
-    #[test]
-    fn big_diff_defaults_collapsed_and_ctrl_r_toggles() {
-        // A diff over the fold threshold defaults collapsed; Ctrl+R expands it
-        // (reusing the P6 fold lever).
-        use std::fmt::Write as _;
-        let before = String::new();
-        let mut after = String::new();
-        for i in 0..40 {
-            let _ = writeln!(after, "row{i}");
-        }
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Write".into(),
-                detail: "big.rs".into(),
-                edit: Some(umadev_runtime::ToolEdit {
-                    path: "big.rs".into(),
-                    before,
-                    after,
-                }),
-            },
-        });
-        {
-            let MessageBody::Diff(d) = &a.history.back().unwrap().kind else {
-                panic!("Diff card");
-            };
-            assert!(d.collapsed, "a big diff defaults collapsed");
-            assert!(d.total_rows() > DIFF_FOLD_THRESHOLD);
-        }
-        // Ctrl+R toggles the most-recent collapsible row → expanded.
-        let _ = a.apply_key_with_mods(
-            crossterm::event::KeyCode::Char('r'),
-            crossterm::event::KeyModifiers::CONTROL,
-        );
-        let MessageBody::Diff(d) = &a.history.back().unwrap().kind else {
-            panic!("Diff card");
-        };
-        assert!(!d.collapsed, "Ctrl+R expands the folded diff");
-    }
-
-    #[test]
-    fn word_diff_marks_only_the_changed_token_on_each_side() {
-        // `const oldName = compute(input);` → `const newName = compute(input);`
-        // — only `oldName`/`newName` should carry a `changed` byte range; the
-        // surrounding tokens stay unchanged (empty around them). The rename is a
-        // small fraction of the line, well under the 0.4 rewrite threshold.
-        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
-            path: "x.ts".into(),
-            before: "const oldName = compute(input);\n".into(),
-            after: "const newName = compute(input);\n".into(),
-        });
-        let lines: Vec<&DiffLine> = d.hunks.iter().flat_map(|h| h.lines.iter()).collect();
-        let del = lines.iter().find(|l| l.tag == '-').expect("a - line");
-        let ins = lines.iter().find(|l| l.tag == '+').expect("a + line");
-        // Each side has exactly one changed region, and it covers the renamed
-        // identifier — not the whole line.
-        assert_eq!(del.changed.len(), 1, "one changed region on the - line");
-        assert_eq!(ins.changed.len(), 1, "one changed region on the + line");
-        let (ds, de) = del.changed[0];
-        let (is, ie) = ins.changed[0];
-        assert_eq!(&del.text[ds..de], "oldName", "the deleted word is marked");
-        assert_eq!(&ins.text[is..ie], "newName", "the inserted word is marked");
-        // The unchanged prefix `let ` and suffix ` = 1;` are NOT inside a range.
-        assert!(ds >= "let ".len(), "the leading `let ` stays unchanged");
-    }
-
-    #[test]
-    fn word_diff_falls_back_to_whole_line_on_a_near_total_rewrite() {
-        // A line replaced wholesale (almost no shared tokens) trips the 0.4
-        // rewrite ratio → both `changed` vecs come back empty so the renderer
-        // whole-line-highlights instead of confetti.
-        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
-            path: "x.rs".into(),
-            before: "alpha beta gamma delta\n".into(),
-            after: "one two three four five\n".into(),
-        });
-        let lines: Vec<&DiffLine> = d.hunks.iter().flat_map(|h| h.lines.iter()).collect();
-        for l in lines.iter().filter(|l| l.tag != ' ') {
-            assert!(
-                l.changed.is_empty(),
-                "a near-total rewrite drops the word signal: {:?}",
-                l.changed
-            );
-        }
-    }
-
-    #[test]
-    fn word_diff_is_cjk_byte_safe() {
-        // A single CJK token changed inside an otherwise-equal line: the byte
-        // ranges must land on char boundaries (slicing must not panic) and cover
-        // exactly the changed CJK run.
-        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
-            path: "x.md".into(),
-            before: "前缀 旧值 后缀\n".into(),
-            after: "前缀 新值 后缀\n".into(),
-        });
-        let lines: Vec<&DiffLine> = d.hunks.iter().flat_map(|h| h.lines.iter()).collect();
-        let del = lines.iter().find(|l| l.tag == '-').expect("a - line");
-        let ins = lines.iter().find(|l| l.tag == '+').expect("a + line");
-        // Every range must be on a char boundary (no panic when sliced).
-        for l in [del, ins] {
-            for &(s, e) in &l.changed {
-                assert!(l.text.is_char_boundary(s) && l.text.is_char_boundary(e));
-                let _ = &l.text[s..e]; // would panic if mis-aligned
-            }
-        }
-        assert!(
-            del.changed
-                .iter()
-                .any(|&(s, e)| del.text[s..e].contains('旧')),
-            "the changed CJK token is marked on the - side"
-        );
-        assert!(
-            ins.changed
-                .iter()
-                .any(|&(s, e)| ins.text[s..e].contains('新')),
-            "the changed CJK token is marked on the + side"
-        );
-    }
-
-    #[test]
-    fn tool_result_attaches_to_the_running_row_and_auto_collapses_on_ok() {
-        // A successful result flips the SAME row to Ok (not a new line) and
-        // auto-collapses it; a row height stays stable pending→done.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Write".into(),
-                detail: "README.md".into(),
-                edit: None,
-            },
-        });
-        let before = a.history.len();
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolResult {
-                ok: true,
-                summary: "wrote 12 lines".into(),
-            },
-        });
-        assert_eq!(
-            a.history.len(),
-            before,
-            "result updates in place, no new row"
-        );
-        let MessageBody::Tool(t) = &a.history.back().unwrap().kind else {
-            panic!("still a Tool row");
-        };
-        assert_eq!(t.status, ToolStatus::Ok);
-        assert_eq!(t.result.as_deref(), Some("wrote 12 lines"));
-        assert!(t.collapsed, "a finished OK call auto-collapses");
-    }
-
-    #[test]
-    fn failed_tool_result_stays_expanded() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Bash".into(),
-                detail: "cargo build".into(),
-                edit: None,
-            },
-        });
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolResult {
-                ok: false,
-                summary: "error[E0308]".into(),
-            },
-        });
-        let MessageBody::Tool(t) = &a.history.back().unwrap().kind else {
-            panic!("Tool row");
-        };
-        assert_eq!(t.status, ToolStatus::Fail);
-        assert!(!t.collapsed, "a failed call must never hide its error");
-    }
-
-    #[test]
-    fn logs_toggle_keeps_command_output_visible_and_off_clips_it() {
-        // `/logs` ON: a long-running command's full output stays in the row AND the
-        // row stays expanded, so the build log is visible as it streams. OFF (the
-        // default): the tight 200-char clip + auto-collapse, exactly as before.
-        // The renderer reads `self.show_process_logs` (a field, not the env), so this
-        // is deterministic and never races a parallel test on the process env.
-        let long_log: String = (0..60)
-            .map(|_| "[INFO] compiling module")
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // ── OFF (default) ──
-        let mut off = fresh_app(Some("offline"));
-        assert!(!off.show_process_logs, "off by default");
-        off.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::tool_use("Bash", "mvn -q install"),
-        });
-        off.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolResult {
-                ok: true,
-                summary: long_log.clone(),
-            },
-        });
-        let MessageBody::Tool(t) = &off.history.back().unwrap().kind else {
-            panic!("Tool row");
-        };
-        assert!(t.collapsed, "OFF: a finished OK command auto-collapses");
-        assert!(
-            t.result.as_deref().unwrap_or("").chars().count() <= 200,
-            "OFF: output is clipped to the tight preview"
-        );
-
-        // ── ON (via /logs) ──
-        let mut on = fresh_app(Some("offline"));
-        let _ = on.slash_logs();
-        assert!(on.show_process_logs, "/logs turned it on");
-        on.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::tool_use("Bash", "mvn -q install"),
-        });
-        on.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolResult {
-                ok: true,
-                summary: long_log.clone(),
-            },
-        });
-        let MessageBody::Tool(t) = &on.history.back().unwrap().kind else {
-            panic!("Tool row");
-        };
-        assert!(
-            !t.collapsed,
-            "ON: the command row stays expanded so the build log is visible"
-        );
-        let shown = t.result.as_deref().unwrap_or("");
-        assert!(
-            shown.contains("[INFO] compiling module"),
-            "ON: the full build log reaches the transcript: {shown:?}"
-        );
-        assert!(
-            shown.chars().count() > 200,
-            "ON: the output is NOT clipped to 200 chars"
-        );
-
-        // Toggling /logs again turns it back off (and clears the shared flag — the
-        // toggle drives thread-safe state now, never the process env).
-        let _ = on.slash_logs();
-        assert!(!on.show_process_logs, "/logs toggles back off");
-    }
-
-    /// Helper: a tool row whose `status` is whatever the caller passes, so the
-    /// settle tests can stand up a mix of in-flight + already-finished rows.
-    fn push_tool_row(a: &mut App, name: &str, status: ToolStatus) {
-        a.history.push_back(ChatMessage {
-            role: ChatRole::Host,
-            kind: MessageBody::Tool(ToolCall {
-                name: name.to_string(),
-                arg: String::new(),
-                status,
-                result: None,
-                merged: false,
-                count: 1,
-                collapsed: false,
-            }),
-            collapsed: false,
-        });
-    }
-
-    fn tool_statuses(a: &App) -> Vec<ToolStatus> {
-        a.history
-            .iter()
-            .filter_map(|m| match &m.kind {
-                MessageBody::Tool(t) => Some(t.status),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn abort_settles_in_flight_tool_rows_but_keeps_finished_ones() {
-        // The user-reported bug: after the run aborts (idle settle / base error,
-        // both arrive as an ABORT_SENTINEL note), a stack of base tool rows
-        // (TaskCreate / Agent / Bash / Read / TaskUpdate) kept spinning forever
-        // because the matching ToolResult never landed. They must now settle.
-        let mut a = fresh_app(Some("offline"));
-        a.run_started = true;
-        push_tool_row(&mut a, "TaskCreate", ToolStatus::Running);
-        push_tool_row(&mut a, "Read", ToolStatus::Ok); // already finished — keep it
-        push_tool_row(&mut a, "Agent", ToolStatus::Running);
-        push_tool_row(&mut a, "TaskUpdate", ToolStatus::Queued);
-
-        a.apply_engine(EngineEvent::Note(format!(
-            "{}本轮已中止:磁盘写入失败",
-            crate::ABORT_SENTINEL
-        )));
-
-        assert!(a.aborted, "the sentinel flips the run into aborted");
-        let statuses = tool_statuses(&a);
-        // Every in-flight row is settled; NONE is left in-progress.
-        assert!(
-            statuses.iter().all(|s| s.is_terminal()),
-            "no tool row may stay in-progress after an abort: {statuses:?}"
-        );
-        // The genuinely-finished Ok row is NOT downgraded to a fake abort.
-        assert_eq!(
-            statuses,
-            vec![
-                ToolStatus::Aborted,
-                ToolStatus::Ok,
-                ToolStatus::Aborted,
-                ToolStatus::Aborted,
-            ],
-            "in-flight rows -> Aborted, the Ok row keeps its real success: {statuses:?}"
-        );
-    }
-
-    #[test]
-    fn cancel_settles_in_flight_tool_rows() {
-        // The user Cancel path (Esc/Ctrl-C -> cancel_run -> reset_for_new_run ->
-        // clear_live_panels) must also stop any spinning tool row.
-        let mut a = fresh_app(Some("offline"));
-        a.run_started = true;
-        push_tool_row(&mut a, "Bash", ToolStatus::Running);
-        push_tool_row(&mut a, "Edit", ToolStatus::Fail); // finished — keep it
-
-        a.cancel_run();
-
-        let statuses = tool_statuses(&a);
-        assert!(
-            statuses.iter().all(|s| s.is_terminal()),
-            "cancel must settle every in-flight tool row: {statuses:?}"
-        );
-        assert_eq!(
-            statuses,
-            vec![ToolStatus::Aborted, ToolStatus::Fail],
-            "the Running row -> Aborted, the Fail row keeps its failure: {statuses:?}"
-        );
-    }
-
-    #[test]
-    fn clean_finish_closes_dangling_in_flight_tool_row() {
-        // Defensive: even a CLEAN delivery finish (finalize_live_panels, reached
-        // here via the chat/Fast build completion card) must close any tool row
-        // left dangling in-progress, so a settled run never keeps a spinner.
-        let mut a = fresh_app(Some("offline"));
-        push_tool_row(&mut a, "Write", ToolStatus::Running);
-        push_tool_row(&mut a, "Read", ToolStatus::Ok);
-
-        a.finalize_live_panels();
-
-        let statuses = tool_statuses(&a);
-        assert_eq!(
-            statuses,
-            vec![ToolStatus::Aborted, ToolStatus::Ok],
-            "a clean finish closes the dangling Running row, keeps the Ok row: {statuses:?}"
-        );
-    }
-
-    #[test]
-    fn read_only_grep_folds_a_metric_not_the_raw_dump() {
-        // A merged read/grep batch keeps its `inspected N` headline and folds
-        // the grep result into a `(N matches)` metric — never the raw output.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolUse {
-                name: "Grep".into(),
-                detail: "TODO".into(),
-                edit: None,
-            },
-        });
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolResult {
-                ok: true,
-                summary: "3 files\nsrc/a.rs\nsrc/b.rs\nsrc/c.rs".into(),
-            },
-        });
-        let MessageBody::Tool(t) = &a.history.back().unwrap().kind else {
-            panic!("Tool row");
-        };
-        assert!(t.merged, "a grep is a low-signal mergeable tool");
-        // The metric folds in; the raw file list is NOT dumped into the result.
-        let result = t.result.as_deref().unwrap_or("");
-        assert!(result.contains('3'), "folds the count metric: {result}");
-        assert!(
-            !result.contains("src/a.rs"),
-            "must not dump the raw output: {result}"
-        );
-    }
-
-    #[test]
-    fn contiguous_low_signal_reads_merge_with_increasing_count() {
-        // Five reads in a row collapse to one row with count 5 — and the count
-        // is greatest-seen, so it can never visibly jump backwards.
-        let mut a = fresh_app(Some("offline"));
-        for i in 0..5 {
-            a.apply_engine(EngineEvent::WorkerStream {
-                event: umadev_runtime::StreamEvent::ToolUse {
-                    name: "Read".into(),
-                    detail: format!("file{i}"),
-                    edit: None,
-                },
-            });
-        }
-        let host_rows: Vec<_> = a
-            .history
-            .iter()
-            .filter(|m| m.role == ChatRole::Host)
-            .collect();
-        assert_eq!(host_rows.len(), 1, "five reads merge into one row");
-        let MessageBody::Tool(t) = &host_rows[0].kind else {
-            panic!("Tool row");
-        };
-        assert_eq!(t.count, 5);
-        assert!(t.merged);
-    }
-
-    #[test]
-    fn a_write_breaks_the_read_batch_so_the_next_read_starts_fresh() {
-        let mut a = fresh_app(Some("offline"));
-        for ev in [
-            ("Read", "a"),
-            ("Read", "b"),
-            ("Write", "out.txt"),
-            ("Read", "c"),
-        ] {
-            a.apply_engine(EngineEvent::WorkerStream {
-                event: umadev_runtime::StreamEvent::ToolUse {
-                    name: ev.0.into(),
-                    detail: ev.1.into(),
-                    edit: None,
-                },
-            });
-        }
-        let host_rows: Vec<_> = a
-            .history
-            .iter()
-            .filter(|m| m.role == ChatRole::Host)
-            .collect();
-        // batch(a,b) · write · batch(c) → 3 rows.
-        assert_eq!(host_rows.len(), 3, "a write splits the read batch");
-    }
-
-    // ---- P6: long-output folding -----------------------------------------
-
-    #[test]
-    fn a_long_host_reply_is_collapsible_and_ctrl_r_toggles_it() {
-        let mut a = fresh_app(Some("offline"));
-        // A 50-line Host reply — well past the fold threshold.
-        let wall: String = (0..50)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        a.push(ChatRole::Host, wall);
-        let idx = a.history.len() - 1;
-        assert!(
-            message_is_collapsible(&a.history[idx]),
-            "a 50-line wall is foldable"
-        );
-        assert!(!a.history[idx].collapsed, "starts expanded");
-        // Ctrl+R folds the most recent collapsible row.
-        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
-        assert!(a.history[idx].collapsed, "Ctrl+R collapsed the wall");
-        // Ctrl+R again expands it.
-        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
-        assert!(!a.history[idx].collapsed, "Ctrl+R re-expanded the wall");
-    }
-
-    #[test]
-    fn a_short_reply_is_not_collapsible() {
-        let mut a = fresh_app(Some("offline"));
-        a.push(ChatRole::Host, "just one short line");
-        let last = a.history.back().unwrap();
-        assert!(
-            !message_is_collapsible(last),
-            "a short reply is never folded"
-        );
-    }
-
-    #[test]
-    fn ctrl_r_is_a_noop_when_nothing_is_foldable() {
-        let mut a = fresh_app(Some("offline"));
-        a.push(ChatRole::Host, "short");
-        a.input_history.clear(); // no prompt history to search either
-        let before = a.clone();
-        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
-        // Nothing foldable AND no prompt history → Ctrl+R stays a no-op
-        // (fail-open): no fold, and no history-search mode opens.
-        assert_eq!(a.history.len(), before.history.len());
-        assert!(!a.history.back().unwrap().collapsed);
-        assert!(
-            a.history_search.is_none(),
-            "no history → no reverse-search mode"
-        );
-    }
-
-    // ---- I3 — reverse prompt-history search (Ctrl+R) ----
-
-    /// Seed the prompt-history ring directly (front→back == oldest→newest) and
-    /// drop any transcript rows so nothing is foldable — the state in which
-    /// Ctrl+R opens the reverse history search.
-    fn seed_history(a: &mut App, prompts: &[&str]) {
-        a.history.clear();
-        a.input_history.clear();
-        for p in prompts {
-            a.input_history.push_back((*p).to_string());
-        }
-    }
-
-    #[test]
-    fn ctrl_r_opens_history_search_finds_and_cycles() {
-        let mut a = fresh_app(Some("offline"));
-        seed_history(&mut a, &["alpha one", "beta two", "alpha three"]);
-        // Ctrl+R opens the reverse history search (nothing foldable in view).
-        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
-        assert!(
-            a.history_search.is_some(),
-            "Ctrl+R opened reverse history search"
-        );
-        // Empty query previews the NEWEST entry.
-        assert_eq!(a.history_search_preview(), Some("alpha three"));
-        // Typing narrows to the matching entries, newest-first.
-        for c in "alpha".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert_eq!(
-            a.history_search_preview(),
-            Some("alpha three"),
-            "newest 'alpha' match is previewed"
-        );
-        // ↓ steps to the OLDER match; wraps back to the newest.
-        let _ = a.apply_key(KeyCode::Down);
-        assert_eq!(
-            a.history_search_preview(),
-            Some("alpha one"),
-            "cycled older"
-        );
-        let _ = a.apply_key(KeyCode::Down);
-        assert_eq!(
-            a.history_search_preview(),
-            Some("alpha three"),
-            "wrapped to newest"
-        );
-        // Ctrl+R inside the mode also cycles older (readline convention).
-        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
-        assert_eq!(
-            a.history_search_preview(),
-            Some("alpha one"),
-            "Ctrl+R cycled older"
-        );
-    }
-
-    #[test]
-    fn history_search_enter_loads_match_into_input() {
-        let mut a = fresh_app(Some("offline"));
-        seed_history(&mut a, &["fix the bug", "add a feature"]);
-        a.open_history_search();
-        for c in "bug".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert_eq!(a.history_search_preview(), Some("fix the bug"));
-        let _ = a.apply_key(KeyCode::Enter);
-        assert!(a.history_search.is_none(), "Enter closed the mode");
-        assert_eq!(
-            a.input, "fix the bug",
-            "Enter loaded the match into the input box"
-        );
-        assert_eq!(a.input_cursor, a.input_len(), "caret lands at the end");
-    }
-
-    #[test]
-    fn history_search_windows_bs_deletes_query_char() {
-        let mut a = fresh_app(Some("offline"));
-        seed_history(&mut a, &["fix the bug", "add a feature"]);
-        a.open_history_search();
-        for c in "bug".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let _ = a.apply_key(KeyCode::Char('\u{8}'));
-        assert_eq!(a.history_search.as_ref().unwrap().query, "bu");
-    }
-
-    #[test]
-    fn history_search_esc_cancels_without_touching_input() {
-        let mut a = fresh_app(Some("offline"));
-        seed_history(&mut a, &["an old prompt"]);
-        a.input = "draft".to_string();
-        a.input_cursor = a.input_len();
-        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
-        assert!(a.history_search.is_some(), "opened over a non-empty draft");
-        let _ = a.apply_key(KeyCode::Esc);
-        assert!(a.history_search.is_none(), "Esc closed the mode");
-        assert_eq!(a.input, "draft", "Esc left the prompt untouched");
-    }
-
-    #[test]
-    fn history_search_dedups_repeated_entries() {
-        let mut a = fresh_app(Some("offline"));
-        seed_history(&mut a, &["run tests", "run tests", "deploy", "run tests"]);
-        a.open_history_search();
-        let entries = &a.history_search.as_ref().unwrap().entries;
-        // Deduped + newest-first: one "run tests" (its most-recent position), then
-        // "deploy".
-        assert_eq!(
-            entries,
-            &vec!["run tests".to_string(), "deploy".to_string()],
-            "repeated entries collapse to one, newest-first: {entries:?}"
-        );
-    }
-
-    #[test]
-    fn history_search_does_not_open_while_palette_owns_keys() {
-        let mut a = fresh_app(Some("offline"));
-        seed_history(&mut a, &["past prompt"]);
-        // Type a slash command so the palette owns the keyboard.
-        for c in "/cl".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert!(!a.palette_matches().is_empty(), "palette is active");
-        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
-        assert!(
-            a.history_search.is_none(),
-            "Ctrl+R suppressed while the palette owns keys"
-        );
-    }
-
-    #[test]
-    fn history_search_owns_keys_so_other_modes_cannot_open() {
-        // Once open, the mode is mutually exclusive: a Ctrl+F that would normally
-        // open the transcript search is swallowed (typing/nav only).
-        let mut a = fresh_app(Some("offline"));
-        seed_history(&mut a, &["something"]);
-        a.open_history_search();
-        let _ = a.apply_key_with_mods(KeyCode::Char('f'), crossterm::event::KeyModifiers::CONTROL);
-        assert!(
-            a.search.is_none(),
-            "transcript search did not open under history search"
-        );
-        assert!(
-            a.history_search.is_some(),
-            "history search still owns the keyboard"
-        );
-    }
-
-    #[test]
-    fn ctrl_o_toggles_the_global_verbose_flag() {
-        // UX maturity Fix B: a single global key flips `verbose`, which every
-        // collapsible renderer reads so ALL collapsed output reveals/hides at
-        // once — not just the most-recent row that Ctrl+R reaches.
-        let mut a = fresh_app(Some("offline"));
-        assert!(
-            !a.verbose,
-            "verbose defaults off (everything at its per-row state)"
-        );
-        let _ = a.apply_key_with_mods(KeyCode::Char('o'), crossterm::event::KeyModifiers::CONTROL);
-        assert!(a.verbose, "Ctrl+O turns the global expand-all on");
-        let _ = a.apply_key_with_mods(KeyCode::Char('o'), crossterm::event::KeyModifiers::CONTROL);
-        assert!(!a.verbose, "Ctrl+O toggles it back off");
-    }
-
-    // ---- backward-compat: plain Text rows ---------------------------------
-
-    #[test]
-    fn plain_push_stays_a_text_body_and_body_reads_through() {
-        // Every existing `push(role, String)` call still produces a Text body
-        // and `body()` reads it back verbatim — the upgrade is invisible to the
-        // dozens of plain-message call sites.
-        let mut a = fresh_app(Some("offline"));
-        a.push(ChatRole::System, "hello world");
-        let last = a.history.back().unwrap();
-        assert!(matches!(last.kind, MessageBody::Text(_)));
-        assert_eq!(last.body(), "hello world");
-        assert!(!last.collapsed);
-    }
-
-    #[test]
-    fn thinking_indicator_shows() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Thinking,
-        });
-        let last = a.history.back().unwrap();
-        assert_eq!(last.role, ChatRole::System);
-        assert!(
-            last.body().contains("thinking"),
-            "should show thinking indicator: {}",
-            last.body()
-        );
-    }
-
-    #[test]
-    fn tool_result_shows_checkmark() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolResult {
-                ok: true,
-                summary: "version = 4.6.0".into(),
-            },
-        });
-        let last = a.history.back().unwrap();
-        assert!(
-            last.body().contains("[ok]"),
-            "success should show checkmark"
-        );
-        assert!(last.body().contains("4.6.0"));
-    }
-
-    #[test]
-    fn tool_result_error_shows_cross() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::ToolResult {
-                ok: false,
-                summary: "file not found".into(),
-            },
-        });
-        let last = a.history.back().unwrap();
-        assert!(last.body().contains("[fail]"), "error should show cross");
-    }
-
-    #[test]
-    fn empty_text_delta_ignored() {
-        let mut a = fresh_app(Some("offline"));
-        let before = a.history.len();
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Text {
-                delta: "   ".into(),
-            },
-        });
-        assert_eq!(
-            a.history.len(),
-            before,
-            "empty/whitespace text delta should not push"
-        );
-    }
-
-    #[test]
-    fn transient_warning_goes_to_status_not_transcript() {
-        // A RECOVERABLE hiccup (rate-limit / retry / overloaded) surfaces as ONE
-        // muted live status line, NOT a permanent transcript row — so a flurry of
-        // retries doesn't read like the turn is erroring next to the thinking timer
-        // ("时间会乱弹错误"). The turn keeps running; only a terminal ABORT settles it.
-        let mut a = fresh_app(Some("offline"));
-        let before = a.history.len();
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Warning {
-                message: "rate limited".into(),
-            },
-        });
-        assert_eq!(
-            a.history.len(),
-            before,
-            "a transient warning must not be pushed to the transcript"
-        );
-        assert!(
-            a.transient_status
-                .as_deref()
-                .unwrap_or("")
-                .contains("rate limited"),
-            "it surfaces as a transient live status line instead"
-        );
-    }
-
-    #[test]
-    fn notable_warning_still_shows_in_transcript() {
-        // A non-transient warning stays a transcript row as before.
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::WorkerStream {
-            event: umadev_runtime::StreamEvent::Warning {
-                message: "disk almost full".into(),
-            },
-        });
-        let last = a.history.back().unwrap();
-        assert!(last.body().contains("disk almost full"));
-    }
-
-    #[test]
-    fn default_trust_mode_is_guarded() {
-        // fresh_app writes `.umadevrc` with auto_approve_gates = false, so the
-        // default tier is the existing human-in-the-loop behaviour.
-        let a = fresh_app(Some("offline"));
-        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
-        assert!(!a.auto_approve_on());
-    }
-
-    #[test]
-    fn shift_tab_cycles_plan_guarded_auto() {
-        // BackTab/Shift+Tab now cycles the FULL tier Plan → Guarded → Auto → Plan
-        // (was a 2-state Auto<->Guarded flip that could never reach Plan).
-        let mut a = fresh_app(Some("offline"));
-        a.set_trust_mode(umadev_agent::TrustMode::Plan);
-        a.cycle_approval_mode();
-        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
-        a.cycle_approval_mode();
-        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Auto);
-        a.cycle_approval_mode();
-        assert_eq!(
-            a.effective_trust_mode(),
-            umadev_agent::TrustMode::Plan,
-            "cycle must wrap Auto → Plan so Plan is keyboard-reachable"
-        );
-    }
-
-    #[test]
-    fn config_trust_mode_is_cached_not_re_read_per_call() {
-        // P2-B: `effective_trust_mode` runs in the render hot path (~12/s). It
-        // must NOT `load_project_config` (a disk read) on every call. Proof: the
-        // first call memoises `Guarded`; rewriting `.umadevrc` to auto ON DISK is
-        // then IGNORED (cache still serves `Guarded`) — i.e. no per-call read.
-        // Only after an explicit invalidation does it pick up the new value.
-        let a = fresh_app(Some("offline"));
-        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
-
-        // Flip the on-disk config behind the running app's back.
-        std::fs::write(
-            a.project_root.join(".umadevrc"),
-            "[pipeline]\nauto_approve_gates = true\n",
-        )
-        .unwrap();
-
-        // No session override is set, so without a cache this would re-read disk
-        // and flip to Auto. The cache means it stays Guarded — that is the proof
-        // the hot path no longer touches the filesystem.
-        assert_eq!(
-            a.effective_trust_mode(),
-            umadev_agent::TrustMode::Guarded,
-            "config-derived tier must come from the process cache, not a fresh disk read"
-        );
-
-        // After an explicit invalidation, the next call re-reads and sees Auto.
-        a.invalidate_trust_cache();
-        assert_eq!(
-            a.effective_trust_mode(),
-            umadev_agent::TrustMode::Auto,
-            "invalidation must let the next call pick up the new on-disk config"
-        );
-    }
-
-    #[test]
-    fn gate_card_health_labels_are_localized() {
-        // P2-D: the artifact health labels ([warn] MISSING / SCAFFOLD / SHORT /
-        // [ok], and the dark-mode marker) were hard-coded English, so a zh-CN
-        // user saw English jammed into an otherwise localized card. They now come
-        // from the catalog.
-        let app = fresh_app(Some("offline"));
-        // No output/ artifacts exist for this fresh workspace → every doc is
-        // MISSING, exercising the `lines == 0` label.
-        let card = gate_card(
-            Gate::DocsConfirm,
-            &app.slug,
-            &app.project_root,
-            umadev_i18n::Lang::ZhCn,
-        );
-        // Localized "missing" label is present; the old raw English is gone.
-        assert!(
-            card.contains("缺失"),
-            "zh-CN gate card should use the localized MISSING label: {card}"
-        );
-        assert!(
-            !card.contains("MISSING") && !card.contains("SCAFFOLD") && !card.contains("SHORT"),
-            "no hard-coded English health labels should leak into a zh-CN card: {card}"
-        );
-
-        // English locale still shows the English labels (round-trips the key).
-        let card_en = gate_card(
-            Gate::DocsConfirm,
-            &app.slug,
-            &app.project_root,
-            umadev_i18n::Lang::En,
-        );
-        assert!(
-            card_en.contains("MISSING"),
-            "en gate card should render the English MISSING label: {card_en}"
-        );
-    }
-
-    #[test]
-    fn session_override_wins_over_cache() {
-        // A `/mode` override always beats the cached config tier and the override
-        // path never consults the cache at all (it returns before the disk path).
-        let mut a = fresh_app(Some("offline"));
-        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded); // primes cache
-        a.set_trust_mode(umadev_agent::TrustMode::Plan);
-        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Plan);
-    }
-
-    #[test]
-    fn slash_mode_switches_tier_and_keeps_legacy_toggle_consistent() {
-        let mut a = fresh_app(Some("offline"));
-        a.slash_mode("auto");
-        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Auto);
-        assert!(a.auto_approve_on(), "legacy toggle tracks the tier");
-
-        a.slash_mode("plan");
-        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Plan);
-        // plan is read-only → gates do NOT auto-approve.
-        assert!(!a.auto_approve_on());
-
-        a.slash_mode("guarded");
-        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
-
-        // Unknown arg is rejected without changing the tier.
-        a.slash_mode("nonsense");
-        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
-        assert!(a
-            .history
-            .iter()
-            .any(|m| m.body().contains("nonsense") || m.body().contains("未知")));
-    }
-
-    /// Serialize the `/sandbox` tests that mutate the process-wide thread-safe
-    /// codex sandbox override so they can't observe each other's writes when the
-    /// suite runs multi-threaded. Each test restores the override on exit. (The
-    /// override is shared state, NOT the process env: a runtime setenv racing the
-    /// codex driver's getenv would be UB.)
-    static SANDBOX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn sandbox_env_restore(prev: Option<String>) {
-        umadev_host::codex_session::set_codex_sandbox(prev.as_deref());
-    }
-
-    #[test]
-    fn sandbox_verb_is_registered_and_dispatchable() {
-        // The unified-registry contract (mirrors the /model lockstep guard): the
-        // palette, help overlay, and dispatcher all read App::COMMANDS, so
-        // `/sandbox` must be a registry row AND have a real dispatch arm.
-        assert!(
-            App::COMMANDS.iter().any(|c| c.name == "sandbox"),
-            "/sandbox is registered"
-        );
-        assert!(
-            dispatch_arm_verbs().iter().any(|v| v == "sandbox"),
-            "/sandbox has a dispatch arm"
-        );
-    }
-
-    #[test]
-    fn slash_sandbox_no_arg_shows_current_mode_and_all_options() {
-        let _guard = SANDBOX_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = umadev_host::codex_session::codex_sandbox_override();
-        // Pin a known tier so App::new can't emit a startup danger warning.
-        umadev_host::codex_session::set_codex_sandbox(Some("workspace-write"));
-        let mut a = fresh_app(Some("codex"));
-        let before = a.history.len();
-        a.slash_sandbox("");
-        let body = a
-            .history
-            .iter()
-            .skip(before)
-            .map(|m| m.body().into_owned())
-            .collect::<Vec<_>>()
-            .join("\n");
-        // Current tier + all three options + a usage line are shown.
-        assert!(
-            body.contains("workspace-write"),
-            "shows current tier: {body}"
-        );
-        assert!(body.contains("read-only"), "lists read-only: {body}");
-        assert!(
-            body.contains("danger-full-access"),
-            "lists danger-full-access: {body}"
-        );
-        assert!(body.contains("/sandbox"), "shows usage: {body}");
-        sandbox_env_restore(prev);
-    }
-
-    #[test]
-    fn slash_sandbox_danger_sets_env_persists_rc_and_warns() {
-        let _guard = SANDBOX_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = umadev_host::codex_session::codex_sandbox_override();
-        umadev_host::codex_session::set_codex_sandbox(Some("workspace-write"));
-        let mut a = fresh_app(Some("codex"));
-        a.slash_sandbox("danger-full-access");
-        // (1) the shared override is published for the next codex turn (same
-        // mechanism as startup) — thread-safe state, not the process env.
-        assert_eq!(
-            umadev_host::codex_session::codex_sandbox_override().as_deref(),
-            Some("danger-full-access"),
-            "publishes the new tier to the shared override"
-        );
-        // (2) persisted to .umadevrc so it survives a restart.
-        let cfg = umadev_agent::config::load_project_config(&a.project_root);
-        assert_eq!(
-            cfg.codex.resolved_sandbox(),
-            umadev_agent::config::CodexSandbox::DangerFullAccess,
-            "persists to .umadevrc [codex] sandbox_mode"
-        );
-        // (3) the SAME loud red startup liability warning was reused (an Error row).
-        assert!(
-            a.history.iter().any(|m| matches!(m.role, ChatRole::Error)),
-            "danger reuses the red liability warning"
-        );
-        sandbox_env_restore(prev);
-    }
-
-    #[test]
-    fn slash_sandbox_garbage_shows_usage_and_leaves_env_untouched() {
-        let _guard = SANDBOX_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = umadev_host::codex_session::codex_sandbox_override();
-        umadev_host::codex_session::set_codex_sandbox(Some("workspace-write"));
-        let mut a = fresh_app(Some("codex"));
-        let before = a.history.len();
-        a.slash_sandbox("yolo-root");
-        // Garbage never silently widens/narrows the sandbox.
-        assert_eq!(
-            umadev_host::codex_session::codex_sandbox_override().as_deref(),
-            Some("workspace-write"),
-            "garbage leaves the shared override unchanged"
-        );
-        let body = a
-            .history
-            .iter()
-            .skip(before)
-            .map(|m| m.body().into_owned())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(body.contains("/sandbox"), "garbage shows usage: {body}");
-        sandbox_env_restore(prev);
-    }
-
-    #[test]
-    fn slash_sandbox_persist_failure_is_fail_open_env_still_set() {
-        let _guard = SANDBOX_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = umadev_host::codex_session::codex_sandbox_override();
-        umadev_host::codex_session::set_codex_sandbox(Some("workspace-write"));
-        let mut a = fresh_app(Some("codex"));
-        // Corrupt .umadevrc so the persist is REFUSED (returns Err) — the shared
-        // override must STILL be set (fail-open) and the user warned it didn't save.
-        std::fs::write(a.project_root.join(".umadevrc"), "= = not valid toml").unwrap();
-        a.slash_sandbox("read-only");
-        assert_eq!(
-            umadev_host::codex_session::codex_sandbox_override().as_deref(),
-            Some("read-only"),
-            "fail-open: shared override set even though the persist failed"
-        );
-        let body = a
-            .history
-            .iter()
-            .map(|m| m.body().into_owned())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            body.contains(".umadevrc"),
-            "warns the persist failed: {body}"
-        );
-        sandbox_env_restore(prev);
-    }
-
-    #[test]
-    fn plan_mode_does_not_auto_continue_at_gate() {
-        let mut a = fresh_app(Some("offline"));
-        a.run_started = true;
-        a.slash_mode("plan");
-        a.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        // Plan is read-only: the gate pauses, never auto-continues.
-        assert!(
-            a.pending_auto_continue.is_none(),
-            "plan mode must not auto-advance the gate"
-        );
-        assert_eq!(a.active_gate, Some(Gate::DocsConfirm));
-    }
-
-    /// Reset any persisted trust state so a leftover `.umadev/trust.json` from a
-    /// previous run of the (reused) test workspace can't skew the counters.
-    fn reset_trust(a: &mut App) {
-        let _ = std::fs::remove_file(a.project_root.join(".umadev").join("trust.json"));
-        a.trust_ledger = umadev_agent::TrustLedger::default();
-    }
-
-    #[test]
-    fn auto_mode_auto_continues_and_records_trust() {
-        let mut a = fresh_app(Some("offline"));
-        reset_trust(&mut a);
-        a.run_started = true;
-        a.slash_mode("auto");
-        a.apply_engine(EngineEvent::GateOpened {
-            gate: Gate::DocsConfirm,
-            choice: None,
-        });
-        // Auto tier auto-advances AND books a trust pass for the gate.
-        assert_eq!(a.pending_auto_continue, Some(Gate::DocsConfirm));
-        assert_eq!(a.trust_ledger.consecutive("docs_confirm"), 1);
-    }
-
-    #[test]
-    fn manual_approval_builds_trust_and_suggests_at_threshold() {
-        let mut a = fresh_app(Some("offline"));
-        reset_trust(&mut a);
-        // Guarded default: manually approve the docs gate enough times in a row
-        // that the ledger surfaces a one-time auto-advance suggestion.
-        for _ in 0..umadev_agent::trust::SUGGEST_THRESHOLD {
-            a.active_gate = Some(Gate::DocsConfirm);
-            let action = a.submit_text("c".to_string());
-            assert_eq!(action, Action::Continue(Gate::DocsConfirm));
-        }
-        assert_eq!(
-            a.trust_ledger.consecutive("docs_confirm"),
-            umadev_agent::trust::SUGGEST_THRESHOLD
-        );
-        assert!(
-            a.history.iter().any(|m| m.body().contains("[trust]")),
-            "a trust suggestion should have fired once at the threshold"
-        );
-    }
-
-    #[test]
-    fn revision_resets_trust_streak() {
-        let mut a = fresh_app(Some("offline"));
-        reset_trust(&mut a);
-        a.active_gate = Some(Gate::PreviewConfirm);
-        let _ = a.submit_text("c".to_string());
-        assert_eq!(a.trust_ledger.consecutive("preview_confirm"), 1);
-        // A revision at the gate walks back the accumulated trust.
-        a.active_gate = Some(Gate::PreviewConfirm);
-        let _ = a.submit_text("把图标换成 lucide".to_string());
-        assert_eq!(a.trust_ledger.consecutive("preview_confirm"), 0);
-    }
-
-    // ---- input-correctness hardening (wave 3) ----------------------------
-
-    #[test]
-    fn unrelated_note_does_not_clear_thinking_but_route_result_does() {
-        let mut a = fresh_app(Some("offline"));
-        // A routed chat turn is in flight.
-        a.thinking = true;
-        a.thinking_started = Some(std::time::Instant::now());
-        // An UNRELATED progress note (heartbeat / resume-retry / governance)
-        // must NOT extinguish the animation — the route is still running.
-        a.apply_engine(EngineEvent::Note("route.resume_retry: retrying".into()));
-        assert!(
-            a.thinking,
-            "a bare progress Note must not clear thinking while a route is in flight"
-        );
-        // A TERMINAL route outcome DOES clear it: first the failure path…
-        a.record_route_failed("route failed: boom".into());
-        assert!(!a.thinking, "a failed route result clears thinking");
-        assert!(a.thinking_started.is_none());
-        // …and the normal reply path too.
-        a.thinking = true;
-        a.thinking_started = Some(std::time::Instant::now());
-        a.record_chat_reply("hello back".into());
-        assert!(!a.thinking, "a chat reply clears thinking");
-        assert!(a.thinking_started.is_none());
-    }
-
-    #[test]
-    fn submitting_while_thinking_queues_instead_of_routing_concurrently() {
-        let mut a = fresh_app(Some("offline"));
-        // First turn: nothing running → routes, and marks thinking.
-        let first = a.submit_text("first message".to_string());
-        assert!(matches!(first, Action::Route(_)), "first turn routes");
-        assert!(a.thinking, "first routed turn marks thinking");
-        assert!(a.queued_chat.is_empty());
-        // Second turn WHILE thinking: must NOT spawn a second route — it parks.
-        let second = a.submit_text("second message".to_string());
-        assert_eq!(
-            second,
-            Action::None,
-            "a turn submitted while thinking must not route concurrently"
-        );
-        assert_eq!(a.queued_chat.len(), 1, "the extra turn is queued");
-        assert_eq!(
-            a.queued_chat.front().map(String::as_str),
-            Some("second message")
-        );
-        // A third also queues (FIFO order preserved).
-        let _ = a.submit_text("third message".to_string());
-        assert_eq!(a.queued_chat.len(), 2);
-        assert_eq!(a.take_next_queued_chat().as_deref(), Some("second message"));
-        assert_eq!(a.take_next_queued_chat().as_deref(), Some("third message"));
-    }
-
-    #[test]
-    fn failed_route_skips_identical_queued_retry_but_keeps_distinct_followup() {
-        let mut a = fresh_app(Some("offline"));
-        // First turn routes and records the user turn in base-facing memory.
-        let first = a.submit_text("same question".to_string());
-        assert!(matches!(first, Action::Route(_)));
-        assert!(a.thinking);
-        // A duplicate Enter/re-send while thinking is parked, plus a real follow-up.
-        let _ = a.submit_text("same question".to_string());
-        let _ = a.submit_text("different follow-up".to_string());
-        assert_eq!(a.queued_chat.len(), 2);
-
-        a.record_route_failed("route failed".into());
-        let dropped = a.drop_failed_route_duplicate_queued_chat();
-
-        assert_eq!(dropped, 1, "only the exact duplicate retry is skipped");
-        assert_eq!(
-            a.queued_chat.front().map(String::as_str),
-            Some("different follow-up"),
-            "a distinct queued turn remains ready to drain"
-        );
-        assert!(
-            a.history
-                .iter()
-                .any(|m| m.body().contains("完全相同") || m.body().contains("identical")),
-            "the transcript explains why the duplicate was skipped"
-        );
-        assert_eq!(
-            a.conversation
-                .iter()
-                .filter(|m| m.role == "user" && m.content == "same question")
-                .count(),
-            1,
-            "the skipped duplicate was never recorded into base memory"
-        );
-        assert_eq!(
-            a.take_next_queued_chat().as_deref(),
-            Some("different follow-up")
-        );
-    }
-
-    // ---- post-failure reflexive-resend dedup guard + post-run refresh trigger -----
-
-    #[test]
-    fn a_failed_turn_swallows_one_immediate_reflexive_resend() {
-        let mut a = fresh_app(Some("offline"));
-        // Dispatch a turn → it records the EXACT dispatched text.
-        let first = a.submit_text("retry me".to_string());
-        assert!(matches!(first, Action::Route(_)));
-        assert_eq!(a.last_dispatched_chat.as_deref(), Some("retry me"));
-        // The route fails → arms the one-shot dedup guard with that exact text, and
-        // clears `thinking` so a fresh submit is accepted.
-        a.record_route_failed("boom".into());
-        assert_eq!(a.suppress_route_dup.as_deref(), Some("retry me"));
-        assert!(!a.thinking);
-        // A reflexive re-send of the SAME text right after the failure is swallowed ONCE
-        // (no route), with the skipped-duplicate note.
-        let resend = a.submit_text("retry me".to_string());
-        assert_eq!(
-            resend,
-            Action::None,
-            "an identical re-send just after a failure is swallowed"
-        );
-        assert!(
-            a.suppress_route_dup.is_none(),
-            "the one-shot guard is consumed"
-        );
-        assert!(
-            a.history
-                .iter()
-                .any(|m| m.body().contains("完全相同") || m.body().contains("identical")),
-            "the transcript explains the skipped duplicate"
-        );
-        // One-shot: a LATER deliberate re-send of the same text now routes normally.
-        let deliberate = a.submit_text("retry me".to_string());
-        assert!(
-            matches!(deliberate, Action::Route(_)),
-            "a later deliberate re-send is untouched"
-        );
-    }
-
-    #[test]
-    fn the_resend_guard_only_swallows_the_exact_failed_text_and_is_consumed_either_way() {
-        let mut a = fresh_app(Some("offline"));
-        let _ = a.submit_text("first thing".to_string());
-        a.record_route_failed("boom".into());
-        assert_eq!(a.suppress_route_dup.as_deref(), Some("first thing"));
-        // A DIFFERENT next submit is NOT swallowed — it routes — and the guard is
-        // consumed regardless (a distinct follow-up is never mistaken for the duplicate).
-        let other = a.submit_text("a different message".to_string());
-        assert!(
-            matches!(other, Action::Route(_)),
-            "a distinct follow-up routes normally"
-        );
-        assert!(
-            a.suppress_route_dup.is_none(),
-            "the guard is consumed on the next submit either way"
-        );
-    }
-
-    #[test]
-    fn a_gate_answer_is_never_swallowed_by_the_resend_guard() {
-        let mut a = fresh_app(Some("offline"));
-        // Arm the guard with "c" via a failed dispatch of that text.
-        let _ = a.submit_text("c".to_string());
-        a.record_route_failed("boom".into());
-        assert_eq!(a.suppress_route_dup.as_deref(), Some("c"));
-        // "c" now arrives WHILE a gate is open → it is the gate approval, not a reflexive
-        // re-send, so the guard must NOT swallow it.
-        a.active_gate = Some(Gate::DocsConfirm);
-        let action = a.submit_text("c".to_string());
-        assert_eq!(
-            action,
-            Action::Continue(Gate::DocsConfirm),
-            "a gate answer is honored, never suppressed by the dedup guard"
-        );
-    }
-
-    #[test]
-    fn terminal_recorders_clear_the_run_marker_so_the_post_run_refresh_must_snapshot_it_first() {
-        // The post-run resident-chat refresh (a `/run` leaves the idle chat session
-        // stale) keys off `director_run_in_flight` — but BOTH terminal recorders CLEAR
-        // it. So the event loop MUST snapshot `was_run` BEFORE recording; this locks the
-        // invariant that makes the capture-before-record ordering load-bearing.
-        let mut failed = fresh_app(Some("offline"));
-        failed.director_run_in_flight = true;
-        failed.record_route_failed("run failed".into());
-        assert!(
-            !failed.director_run_in_flight,
-            "a failed run clears the in-flight marker"
-        );
-
-        let mut done = fresh_app(Some("offline"));
-        done.director_run_in_flight = true;
-        done.record_agentic_done("built it".into(), true, None);
-        assert!(
-            !done.director_run_in_flight,
-            "a completed run clears the in-flight marker"
-        );
-    }
-
-    // ---- I6: editable queued-input recall ------------------------------------
-
-    #[test]
-    fn i6_up_on_empty_box_recalls_most_recent_queued_message_for_editing() {
-        let mut a = fresh_app(Some("offline"));
-        // A routed turn is in flight, with two more parked behind it (FIFO).
-        let _ = a.submit_text("first message".to_string()); // routes, marks thinking
-        assert!(a.thinking);
-        let _ = a.submit_text("second message".to_string()); // queued
-        let _ = a.submit_text("third message".to_string()); // queued
-        assert_eq!(a.queued_chat.len(), 2);
-        // Empty box → Up pulls the MOST RECENT queued message back for editing,
-        // popping it (recall the queue BEFORE shell history).
-        a.input.clear();
-        a.input_cursor = 0;
-        let act = a.apply_key(KeyCode::Up);
-        assert_eq!(act, Action::None);
-        assert_eq!(
-            a.input, "third message",
-            "the newest queued turn is recalled"
-        );
-        assert_eq!(a.queued_chat.len(), 1, "the recalled turn was popped");
-        assert_eq!(
-            a.queued_chat.front().map(String::as_str),
-            Some("second message"),
-            "the earlier queued turn stays parked"
-        );
-    }
-
-    #[test]
-    fn i6_esc_on_empty_box_recalls_queued_message_before_rewind() {
-        let mut a = fresh_app(Some("offline"));
-        let _ = a.submit_text("first".to_string());
-        let _ = a.submit_text("queued edit".to_string());
-        assert_eq!(a.queued_chat.len(), 1);
-        a.input.clear();
-        a.input_cursor = 0;
-        // Esc with a parked queued turn recalls it (popping) instead of arming the
-        // idle rewind gesture — the box was empty, so the queue wins.
-        let act = a.apply_key(KeyCode::Esc);
-        assert_eq!(act, Action::None);
-        assert_eq!(a.input, "queued edit");
-        assert!(
-            a.queued_chat.is_empty(),
-            "the queued turn was popped for editing"
-        );
-        assert!(
-            !a.pending_rewind,
-            "queue recall takes precedence over the rewind arm"
-        );
-    }
-
-    #[test]
-    fn i6_up_with_no_queue_still_does_history_recall() {
-        let mut a = fresh_app(Some("offline"));
-        a.remember_submission("an earlier prompt");
-        assert!(a.queued_chat.is_empty());
-        a.input.clear();
-        a.input_cursor = 0;
-        // Empty box + NO queue → Up recalls shell history exactly as before.
-        let act = a.apply_key(KeyCode::Up);
-        assert_eq!(act, Action::None);
-        assert_eq!(
-            a.input, "an earlier prompt",
-            "with no queue, history recall is unchanged"
-        );
-    }
-
-    // ---- I9: first-run rotating example placeholder --------------------------
-
-    #[test]
-    fn i9_first_run_example_tip_shows_when_idle_empty_early() {
-        let a = fresh_app(Some("offline"));
-        // Fresh session: idle, empty box, nothing sent yet → a rotating example.
-        let tip = a
-            .first_run_example_tip()
-            .expect("a first-run example shows");
-        assert!(!tip.is_empty());
-        assert_ne!(
-            tip,
-            umadev_i18n::t(a.lang, "input.idle"),
-            "the tip is the example, layered above the plain idle hint"
-        );
-        // The empty test workspace has no source file → the generic token is used.
-        let generic = umadev_i18n::t(a.lang, "input.example.file_generic");
-        assert!(
-            tip.contains(generic),
-            "names a generic file when none is found: {tip}"
-        );
-    }
-
-    #[test]
-    fn i9_example_tip_vanishes_on_typing_and_after_first_turn() {
-        let mut a = fresh_app(Some("offline"));
-        assert!(a.first_run_example_tip().is_some(), "shown at first-run");
-        // The instant the user types, the box is non-empty → the tip is gone.
-        let _ = a.apply_key(KeyCode::Char('h'));
-        assert!(!a.input.is_empty());
-        assert!(
-            a.first_run_example_tip().is_none(),
-            "vanishes the moment the user types"
-        );
-        // Cleared again, but still no submit this session → the tip returns.
-        a.input.clear();
-        a.input_cursor = 0;
-        assert!(
-            a.first_run_example_tip().is_some(),
-            "empty again, no submit yet → still first-run"
-        );
-        // After an ACTUAL submit, the first-run window closes for the session.
-        a.remember_submission("do a thing");
-        a.input.clear();
-        a.input_cursor = 0;
-        assert!(
-            a.first_run_example_tip().is_none(),
-            "the first-run window closes after a submit"
-        );
-    }
-
-    #[test]
-    fn i9_example_tip_rotates_by_session_stable_index() {
-        let mut a = fresh_app(Some("offline"));
-        let templates = [
-            "input.example.refactor",
-            "input.example.tests",
-            "input.example.explain",
-        ];
-        let generic = umadev_i18n::t(a.lang, "input.example.file_generic").to_string();
-        // Rotation index = the persisted prompt-history depth (stable across the
-        // first-run window; `session_turns` stays 0 since we don't submit). No RNG.
-        for depth in 0..6usize {
-            a.input_history.clear();
-            for i in 0..depth {
-                a.input_history.push_back(format!("p{i}"));
-            }
-            let tip = a.first_run_example_tip().expect("idle+empty+early");
-            let expected = umadev_i18n::tf(a.lang, templates[depth % 3], &[&generic]);
-            assert_eq!(tip, expected, "depth {depth} picks template {}", depth % 3);
-        }
-    }
-
-    #[test]
-    fn ctrl_c_interrupts_a_running_pipeline_even_with_nonempty_input() {
-        let mut a = fresh_app(Some("offline"));
-        a.apply_engine(EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "build".into(),
-        });
-        assert!(a.is_pipeline_active());
-        // Half-typed next message in the box.
-        for c in "half typed".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        assert!(!a.input.is_empty());
-        // Ctrl-C while running → INTERRUPT immediately (Claude Code parity),
-        // not just clear the input.
-        let action =
-            a.apply_key_with_mods(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL);
-        assert_eq!(
-            action,
-            Action::Cancel,
-            "Ctrl-C interrupts a running pipeline"
-        );
-        assert!(
-            a.input.is_empty(),
-            "the half-typed input is dropped on interrupt"
-        );
-    }
-
-    #[test]
-    fn queued_turn_is_echoed_recorded_and_uses_chat_text() {
-        let mut a = fresh_app(Some("offline"));
-        // First turn starts a brain-driven turn (thinking).
-        let _ = a.submit_text("first".to_string());
-        assert!(a.thinking);
-        let convo_before = a.conversation.len();
-        let hist_before = a.history.len();
-        // Second turn WHILE thinking: queued — but it must STILL be echoed to the
-        // transcript (the user sees their message), recorded in conversation
-        // memory (so the parked turn isn't lost from the base's context), and the
-        // queue note must be the chat text, NOT the pipeline `run.queued` (no gate
-        // exists here). This is the "second message looks like it did nothing" fix.
-        let _ = a.submit_text("second".to_string());
-        // Echoed: the user's "second" message is in the transcript.
-        assert!(
-            a.history.iter().any(|m| m.body() == "second"),
-            "the queued user message is still echoed to the transcript"
-        );
-        // NOT YET recorded in conversation memory: a queued turn is recorded only
-        // when it actually FIRES (in `take_next_queued_chat`), not when parked — so
-        // an interrupt that clears the queue can't leave a dangling "user said X"
-        // with no assistant reply in the base's context.
-        assert_eq!(
-            a.conversation.len(),
-            convo_before,
-            "a parked turn is recorded at drain time, not when queued"
-        );
-        // A chat.queued note was pushed (history grew by the You echo + the note).
-        assert!(a.history.len() >= hist_before + 2);
-        let note = umadev_i18n::t(a.lang, "chat.queued");
-        assert!(
-            a.history.iter().any(|m| m.body() == note),
-            "the queue note uses chat.queued, not the gate-flavoured run.queued"
-        );
-        assert_eq!(a.queued_chat.len(), 1);
-    }
-
-    #[test]
-    fn ctrl_c_while_thinking_stops_the_spinner_and_drops_the_queue() {
-        let mut a = fresh_app(Some("offline"));
-        // A route in flight, with extra turns parked behind it.
-        a.thinking = true;
-        a.thinking_started = Some(std::time::Instant::now());
-        a.queued_chat.push_back("parked".into());
-        for c in "typing".chars() {
-            let _ = a.apply_key(KeyCode::Char(c));
-        }
-        let action =
-            a.apply_key_with_mods(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL);
-        assert_eq!(action, Action::None);
-        assert!(!a.thinking, "Ctrl-C while thinking stops the animation");
-        assert!(a.thinking_started.is_none());
-        assert!(
-            a.queued_chat.is_empty(),
-            "parked turns are cleared on interrupt"
-        );
-        assert!(a.input.is_empty());
-    }
-
-    #[test]
-    fn ctrl_c_on_empty_idle_input_never_quits() {
-        // Ctrl+C is universal muscle-memory for COPY, so on an idle EMPTY box it must
-        // NOT quit and must NOT even arm a quit-confirm — it only hints to use /quit.
-        // (Quitting stays deliberate: /quit, /q, /exit, Ctrl+D, or a double-Esc.)
-        let mut a = fresh_app(Some("offline"));
-        let action =
-            a.apply_key_with_mods(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL);
-        assert_eq!(action, Action::None);
-        assert!(
-            !a.pending_quit_confirm,
-            "idle empty Ctrl-C does NOT arm a quit confirm"
-        );
-        assert!(!a.should_quit, "idle empty Ctrl-C does NOT quit the app");
-        assert_eq!(
-            a.history.back().expect("a hint was pushed").body(),
-            umadev_i18n::t(a.lang, "quit.use_command"),
-            "idle empty Ctrl-C hints to use /quit"
-        );
-    }
-
-    #[test]
-    fn queued_count_reflects_chat_queue_and_steer() {
-        let mut a = fresh_app(Some("offline"));
-        assert_eq!(a.queued_count(), 0, "nothing queued initially");
-        a.queued_chat.push_back("a".into());
-        a.queued_chat.push_back("b".into());
-        assert_eq!(a.queued_count(), 2, "chat queue counts");
-        a.queued_steer.push_back("steer".into());
-        assert_eq!(a.queued_count(), 3, "a pending steer adds to the count");
-        a.queued_chat.clear();
-        a.queued_steer.clear();
-        assert_eq!(a.queued_count(), 0, "clears back to zero");
-    }
-
-    #[test]
-    fn history_recall_preserves_the_in_progress_draft() {
-        let mut a = fresh_app(Some("offline"));
-        a.remember_submission("first prompt");
-        a.remember_submission("second prompt");
-        // The user is mid-way through typing a fresh line.
-        a.input = "draft I was typing".to_string();
-        a.input_cursor = a.input_len();
-        // Recall back through history…
-        a.input_history_back();
-        assert_eq!(a.input, "second prompt");
-        a.input_history_back();
-        assert_eq!(a.input, "first prompt");
-        // …then step forward past the newest entry → the DRAFT is restored, not
-        // cleared.
-        a.input_history_forward();
-        assert_eq!(a.input, "second prompt");
-        a.input_history_forward();
-        assert_eq!(
-            a.input, "draft I was typing",
-            "stepping forward past the newest entry restores the stashed draft"
-        );
-        assert_eq!(
-            a.input_cursor,
-            a.input_len(),
-            "cursor lands at the draft end"
-        );
-        assert!(a.input_history_idx.is_none(), "recall is over");
-    }
-
-    #[test]
-    fn up_on_first_row_with_a_nonempty_draft_recalls_and_down_restores_it() {
-        // Claude Code parity: ↑ on a first-visual-row caret recalls history EVEN
-        // when the box holds a non-empty partial draft (the old gate required an
-        // empty box, so ↑ did nothing). The draft is stashed and ↓ restores it.
-        let mut a = fresh_app(Some("offline"));
-        a.remember_submission("earlier prompt");
-        // A non-empty, un-recalled single-line draft; the caret is on the first
-        // (only) visual row, so `caret_move_up_wrapped` returns false and the key
-        // handler falls through to history recall.
-        a.input = "partial draft".to_string();
-        a.input_cursor = a.input_len();
-        a.input_text_cols.set(40);
-        let act = a.apply_key(KeyCode::Up);
-        assert_eq!(act, Action::None);
-        assert_eq!(
-            a.input, "earlier prompt",
-            "↑ recalls history even over a non-empty draft"
-        );
-        assert!(a.input_history_idx.is_some(), "now paging history");
-        // ↓ steps forward past the newest entry → the stashed partial returns.
-        let _ = a.apply_key(KeyCode::Down);
-        assert_eq!(
-            a.input, "partial draft",
-            "↓ restores the stashed partial draft"
-        );
-        assert!(a.input_history_idx.is_none(), "recall is over");
-    }
-
-    #[test]
-    fn multiline_submitted_entry_round_trips_through_persist_load_as_one_entry() {
-        // A multi-line requirement (built with Ctrl+J) must survive a restart as a
-        // SINGLE history entry. The old newline-joined format re-split it into one
-        // entry per physical line; the JSON format keeps it whole.
-        let mut a = fresh_app(Some("offline"));
-        let entry = "build a login page\n- email + password\n- remember me";
-        a.remember_submission(entry); // writes the ring to disk (JSON)
-                                      // Simulate a fresh launch: drop the in-memory ring and reload from disk.
-        a.input_history.clear();
-        a.load_history();
-        assert_eq!(
-            a.input_history.len(),
-            1,
-            "the multi-line entry loads as ONE entry, not three lines"
-        );
-        assert_eq!(
-            a.input_history.back().map(String::as_str),
-            Some(entry),
-            "the multi-line body round-trips verbatim"
-        );
-    }
-
-    #[test]
-    fn legacy_newline_history_file_still_loads_fail_open() {
-        // An existing pre-JSON history file (newline-delimited) must still load —
-        // each physical line an entry — rather than being dropped.
-        let mut a = fresh_app(Some("offline"));
-        let path = a.history_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::write(&path, "alpha\nbeta\ngamma").unwrap();
-        a.load_history();
-        assert_eq!(
-            a.input_history.len(),
-            3,
-            "three legacy lines → three entries"
-        );
-        assert_eq!(a.input_history.back().map(String::as_str), Some("gamma"));
-        assert_eq!(a.input_history.front().map(String::as_str), Some("alpha"));
-    }
-
-    #[test]
-    fn picker_enter_with_stale_index_does_not_panic() {
-        let mut a = fresh_app(Some("offline"));
-        a.mode = AppMode::Picker;
-        // Force a selection index past the end of whatever the picker holds.
-        a.picker_selected = a.picker_items.len() + 5;
-        // Must fail-open to a no-op Action, never index-panic.
-        let act = a.apply_key_with_mods(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
-        assert!(matches!(act, Action::None));
-    }
-
-    #[test]
-    fn forward_delete_and_kill_to_eol_reset_palette_selected() {
-        let mut a = fresh_app(Some("offline"));
-        a.input = "abcdef".to_string();
-        a.input_cursor = 2;
-        a.palette_selected = 3;
-        a.forward_delete();
-        assert_eq!(a.palette_selected, 0, "forward_delete resets the palette");
-
-        a.palette_selected = 4;
-        a.delete_to_line_end();
-        assert_eq!(
-            a.palette_selected, 0,
-            "delete_to_line_end resets the palette"
-        );
-    }
-
-    // ---- /status reconciles with the persisted workflow state ----
-
-    #[test]
-    fn reconcile_phase_statuses_advances_to_persisted_phase() {
-        // The plan / director-loop build emits no PhaseStarted/PhaseCompleted,
-        // so the in-memory vector is all-Pending. Reconciled against a
-        // workflow-state that reached `backend`, every phase up to and including
-        // backend must read Done and quality/delivery must stay Pending.
-        let rows: Vec<PhaseRow> = PHASE_CHAIN
-            .iter()
-            .map(|&phase| PhaseRow {
-                phase,
-                status: PhaseStatus::Pending,
-            })
-            .collect();
-        let statuses = App::reconcile_phase_statuses(&rows, Some(Phase::Backend));
-        let backend_i = PHASE_CHAIN
-            .iter()
-            .position(|&p| p == Phase::Backend)
-            .unwrap();
-        for (i, (row, status)) in rows.iter().zip(&statuses).enumerate() {
-            if i <= backend_i {
-                assert_eq!(
-                    *status,
-                    PhaseStatus::Done,
-                    "{} should be done",
-                    row.phase.id()
-                );
-            } else {
-                assert_eq!(
-                    *status,
-                    PhaseStatus::Pending,
-                    "{} should be pending",
-                    row.phase.id()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn reconcile_phase_statuses_fail_open_and_never_regresses() {
-        // Legacy walk: research/docs/docs_confirm done, spec actively Running.
-        let rows: Vec<PhaseRow> = PHASE_CHAIN
-            .iter()
-            .map(|&phase| {
-                let status = match phase {
-                    Phase::Research | Phase::Docs | Phase::DocsConfirm => PhaseStatus::Done,
-                    Phase::Spec => PhaseStatus::Running,
-                    _ => PhaseStatus::Pending,
-                };
-                PhaseRow { phase, status }
-            })
-            .collect();
-        let spec_i = PHASE_CHAIN.iter().position(|&p| p == Phase::Spec).unwrap();
-        let backend_i = PHASE_CHAIN
-            .iter()
-            .position(|&p| p == Phase::Backend)
-            .unwrap();
-        let quality_i = PHASE_CHAIN
-            .iter()
-            .position(|&p| p == Phase::Quality)
-            .unwrap();
-
-        // No persisted phase → in-memory statuses returned verbatim (fail-open).
-        let verbatim = App::reconcile_phase_statuses(&rows, None);
-        assert_eq!(
-            verbatim,
-            rows.iter().map(|r| r.status).collect::<Vec<_>>(),
-            "missing/unparseable state must fall back to in-memory only"
-        );
-
-        // File at the SAME furthest phase → keep spec's Running (active) marker.
-        let same = App::reconcile_phase_statuses(&rows, Some(Phase::Spec));
-        assert_eq!(same[spec_i], PhaseStatus::Running);
-
-        // File AHEAD (backend) → spec subsumed into Done, backend Done, quality
-        // still Pending.
-        let ahead = App::reconcile_phase_statuses(&rows, Some(Phase::Backend));
-        assert_eq!(ahead[spec_i], PhaseStatus::Done);
-        assert_eq!(ahead[backend_i], PhaseStatus::Done);
-        assert_eq!(ahead[quality_i], PhaseStatus::Pending);
-
-        // File BEHIND (docs) → never regress; spec stays Running.
-        let behind = App::reconcile_phase_statuses(&rows, Some(Phase::Docs));
-        assert_eq!(behind[spec_i], PhaseStatus::Running, "never goes backward");
-    }
-
-    #[test]
-    fn status_overlay_reflects_persisted_phase_after_plan_run() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let state_dir = tmp.path().join(".umadev");
-        std::fs::create_dir_all(&state_dir).unwrap();
-        // A director-loop / plan build reached `backend` (phase persisted by the
-        // run) but emitted no PhaseStarted/PhaseCompleted, so self.phases is
-        // all-Pending and the raw table would lie.
-        let state_json = r#"{
-            "phase": "backend",
-            "active_gate": "",
-            "slug": "shop",
-            "requirement": "做个电商后台",
-            "last_transition_at": "2026-06-27T10:00:00Z",
-            "note": "",
-            "spec_version": "UMADEV_HOST_SPEC_V1"
-        }"#;
-        std::fs::write(state_dir.join("workflow-state.json"), state_json).unwrap();
-
-        let cfg = UserConfig {
-            backend: Some("offline".into()),
-            lang: Some("zh-CN".into()),
-            ..Default::default()
-        };
-        let mut app = App::new(
-            "shop",
-            cfg,
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
-        // Precondition: the in-memory phase vector is frozen all-Pending.
-        assert!(
-            app.phases.iter().all(|r| r.status == PhaseStatus::Pending),
-            "the plan path leaves self.phases all-Pending"
-        );
-
-        app.open_status_overlay();
-        let lines = app.overlay.as_ref().expect("overlay opened").lines.clone();
-        // The pipeline-phases table precedes the knowledge table, so `find`
-        // returns the pipeline row (the only one carrying a status icon).
-        let row = |phase: &str| {
-            lines
-                .iter()
-                .find(|l| l.contains(&format!("| {phase} |")))
-                .cloned()
-                .unwrap_or_default()
-        };
-        for done in [
-            "research",
-            "docs",
-            "docs_confirm",
-            "spec",
-            "frontend",
-            "preview_confirm",
-            "backend",
-        ] {
-            assert!(
-                row(done).contains("[ok]"),
-                "{done} row should be done, got: {:?}",
-                row(done)
-            );
-        }
-        for pending in ["quality", "delivery"] {
-            assert!(
-                row(pending).contains("[pending]"),
-                "{pending} row should be pending, got: {:?}",
-                row(pending)
-            );
-        }
-    }
-
-    // ===== Feature A — completion notification (terminal bell) =====
-
-    #[test]
-    fn bell_env_parsing_default_on_and_falsy_off() {
-        // Unset → default ON.
-        assert!(bell_enabled_from_env(None));
-        // Truthy / unrecognized → ON.
-        assert!(bell_enabled_from_env(Some("1")));
-        assert!(bell_enabled_from_env(Some("on")));
-        assert!(bell_enabled_from_env(Some("")));
-        // The documented OFF values (case-insensitive, trimmed).
-        assert!(!bell_enabled_from_env(Some("0")));
-        assert!(!bell_enabled_from_env(Some("false")));
-        assert!(!bell_enabled_from_env(Some(" OFF ")));
-        assert!(!bell_enabled_from_env(Some("No")));
-    }
-
-    /// Build an `Instant` `secs` in the past (saturating at "now" on the rare
-    /// host where the monotonic clock is younger than `secs`).
-    fn secs_ago(secs: u64) -> Option<std::time::Instant> {
-        std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(secs))
-            .or_else(|| Some(std::time::Instant::now()))
-    }
-
-    #[test]
-    fn a_long_finished_run_rings_the_bell_a_quick_one_does_not() {
-        // A run that's been going well past the threshold reaching delivery rings.
-        let mut app = fresh_app(Some("offline"));
-        app.bell_enabled = true;
-        app.run_started = true;
-        app.run_started_at = secs_ago(6);
-        app.apply_engine(EngineEvent::BlockCompleted {
-            final_phase: Phase::Delivery,
-            paused_at: None,
-        });
-        assert!(app.finished);
-        assert!(app.bell_pending, "a long finished run arms the bell");
-        assert_eq!(app.bell_count, 1);
-        // `take_bell` drains it (the event loop emits the BEL once).
-        assert!(app.take_bell());
-        assert!(!app.bell_pending);
-        assert!(!app.take_bell(), "drained — no second beep");
-
-        // A run that JUST started reaching delivery must not beep (quick turn).
-        let mut quick = fresh_app(Some("offline"));
-        quick.bell_enabled = true;
-        quick.run_started = true;
-        quick.run_started_at = Some(std::time::Instant::now());
-        quick.apply_engine(EngineEvent::BlockCompleted {
-            final_phase: Phase::Delivery,
-            paused_at: None,
-        });
-        assert!(quick.finished);
-        assert!(!quick.bell_pending, "a quick run does not beep");
-        assert_eq!(quick.bell_count, 0);
-    }
-
-    #[test]
-    fn an_aborted_long_run_rings_and_umadev_bell_zero_silences() {
-        // A long run that aborts (the ABORT_SENTINEL note) rings the away user.
-        let mut app = fresh_app(Some("offline"));
-        app.bell_enabled = true;
-        app.run_started = true;
-        app.run_started_at = secs_ago(7);
-        app.apply_engine(EngineEvent::Note(format!("{}boom", crate::ABORT_SENTINEL)));
-        assert!(app.aborted, "the sentinel note flips the run into aborted");
-        assert!(app.bell_pending, "an aborted long run arms the bell");
-
-        // bell_enabled = false (UMADEV_BELL=0) silences even a long abort.
-        let mut silent = fresh_app(Some("offline"));
-        silent.bell_enabled = false;
-        silent.run_started = true;
-        silent.run_started_at = secs_ago(7);
-        silent.apply_engine(EngineEvent::Note(format!("{}boom", crate::ABORT_SENTINEL)));
-        assert!(silent.aborted);
-        assert!(!silent.bell_pending, "UMADEV_BELL=0 silences the bell");
-        assert_eq!(silent.bell_count, 0);
-    }
-
-    #[test]
-    fn a_long_agentic_turn_rings_a_short_chat_reply_does_not() {
-        // A long agentic turn settling (the common chat path) rings.
-        let mut app = fresh_app(Some("offline"));
-        app.bell_enabled = true;
-        app.thinking = true;
-        app.thinking_started = secs_ago(6);
-        app.record_agentic_done("done".into(), false, None);
-        assert!(app.bell_pending, "a long agentic turn arms the bell");
-        assert_eq!(app.bell_count, 1);
-
-        // A snappy chat reply (a second or two) does NOT beep.
-        let mut quick = fresh_app(Some("offline"));
-        quick.bell_enabled = true;
-        quick.thinking = true;
-        quick.thinking_started = Some(std::time::Instant::now());
-        quick.record_agentic_done("hi".into(), false, None);
-        assert!(!quick.bell_pending, "a quick reply does not beep");
-        assert_eq!(quick.bell_count, 0);
-    }
-
-    // ===== Feature B — search-in-transcript =====
-
-    /// Seed the folded-row cache + scroll bounds the search normally reads off a
-    /// render, so search logic is testable without a terminal frame.
-    fn seed_transcript(app: &App, rows: &[&str]) {
-        *app.transcript_rows.borrow_mut() = rows.iter().map(|s| (*s).to_string()).collect();
-        *app.transcript_gutters.borrow_mut() = vec![0; rows.len()];
-    }
-
-    #[test]
-    fn search_finds_case_insensitive_matches_and_nav_wraps() {
-        let mut app = fresh_app(Some("offline"));
-        seed_transcript(
-            &app,
-            &["the quick brown fox", "jumps over the lazy dog", "THE END"],
-        );
-        // Renderer-published scroll bounds, so focus-into-view has math to do.
-        app.transcript_max_scroll.set(10);
-        app.transcript_viewport_rows.set(4);
-
-        app.open_search();
-        assert!(app.search.is_some());
-        // Type "the" through the key path (routed to the modal search handler).
-        for c in "the".chars() {
-            let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
-        }
-        {
-            let s = app.search.as_ref().unwrap();
-            assert_eq!(s.matches.len(), 3, "three case-insensitive matches");
-            assert_eq!(s.current, 0);
-            // Each match carries its (visual-row, char-span) coordinate.
-            assert_eq!(
-                (s.matches[0].row, s.matches[0].start, s.matches[0].end),
-                (0, 0, 3)
-            );
-            assert_eq!(s.matches[1].row, 1);
-            assert_eq!(s.matches[2].row, 2, "uppercase THE matched too");
-        }
-
-        // n/N (next/prev) cycle the current index and WRAP.
-        app.search_next();
-        assert_eq!(app.search.as_ref().unwrap().current, 1);
-        app.search_next();
-        assert_eq!(app.search.as_ref().unwrap().current, 2);
-        app.search_next();
-        assert_eq!(
-            app.search.as_ref().unwrap().current,
-            0,
-            "next wraps past the end"
-        );
-        app.search_prev();
-        assert_eq!(
-            app.search.as_ref().unwrap().current,
-            2,
-            "prev wraps past the start"
-        );
-
-        // The current match's position is turned into a scroll offset that brings
-        // its row into view, and navigating actually applied it.
-        let row = app.search.as_ref().unwrap().matches[2].row;
-        let off = app.search_scroll_offset_for(row);
-        assert_eq!(
-            off,
-            app.transcript_scroll(),
-            "focus set the transcript scroll"
-        );
-        // max(10) - (row 2 - viewport/2 (=2) → 0) = 10.
-        assert_eq!(off, 10);
-
-        // Esc clears search entirely.
-        let _ = app.apply_key(crossterm::event::KeyCode::Esc);
-        assert!(app.search.is_none(), "Esc closes + clears search");
-    }
-
-    #[test]
-    fn ctrl_f_opens_search_modally_and_swallows_typing() {
-        let mut app = fresh_app(Some("offline"));
-        seed_transcript(&app, &["alpha beta gamma"]);
-        // Ctrl+F opens the bar.
-        let _ = app.apply_key_with_mods(
-            crossterm::event::KeyCode::Char('f'),
-            crossterm::event::KeyModifiers::CONTROL,
-        );
-        assert!(app.search.is_some(), "Ctrl+F opens search");
-        // While open, typing filters the query and never reaches the input box
-        // (so it can't collide with the slash palette / @-mention popover).
-        let before = app.input.clone();
-        for c in "beta".chars() {
-            let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
-        }
-        assert_eq!(
-            app.input, before,
-            "typing goes to search, not the input box"
-        );
-        let s = app.search.as_ref().unwrap();
-        assert_eq!(s.query, "beta");
-        assert_eq!(s.matches.len(), 1);
-        assert_eq!(s.matches[0].row, 0);
-
-        let _ = app.apply_key(crossterm::event::KeyCode::Char('\u{8}'));
-        assert_eq!(
-            app.search.as_ref().unwrap().query,
-            "bet",
-            "Windows BS deletes from the search query"
-        );
-        let _ = app.apply_key(crossterm::event::KeyCode::Char('a'));
-
-        // Enter advances to the next match (single match → stays put, no panic).
-        let _ = app.apply_key(crossterm::event::KeyCode::Enter);
-        assert_eq!(app.search.as_ref().unwrap().current, 0);
-
-        // A query with no hits clears matches but keeps search open.
-        for c in "ZZZ".chars() {
-            let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
-        }
-        assert!(app.search.as_ref().unwrap().matches.is_empty());
-        assert!(app.search.is_some());
-    }
-}
+#[path = "app/tests.rs"]
+mod tests;

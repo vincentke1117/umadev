@@ -6,11 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "UmaDev host drivers — drive already-logged-in Claude Code / Codex / OpenCode CLIs as subprocesses."
+description = "UmaDev subprocess drivers for five first-class bases: three vendor-specific transports plus isolated Grok Build and Kimi Code ACP v1 profiles."
 
 [dependencies]
 umadev-runtime = { workspace = true }
 umadev-spec = { workspace = true }
+umadev-governance = { workspace = true }
+umadev-process = { workspace = true }
 
 async-trait = { workspace = true }
 futures = "0.3"
@@ -18,6 +20,8 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+semver = { workspace = true }
+agent-client-protocol-schema = { workspace = true }
 # HTTP + SSE transport for the continuous-session opencode driver
 # (`opencode serve` is an HTTP/SSE server — see `opencode_session.rs`). The host
 # crate is on the BINARY's dependency chain, which already links reqwest via the
@@ -25,6 +29,11 @@ serde_json = { workspace = true }
 # binary. The CLAUDE.md "lib-light deps" guidance is about the dependency-light
 # governance libs (spec/governance/contract), not this host driver layer.
 reqwest = { workspace = true }
+base64 = "0.22"
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["process", "signal"] }
 
 [dev-dependencies]
 tempfile = "3"

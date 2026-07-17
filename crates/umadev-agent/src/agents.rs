@@ -569,23 +569,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_critic_fail_open_accepts() {
-        // A custom seat handed a fail-open (empty/accepting) consult ACCEPTS — an
-        // absent / broken custom seat can never block the base (invariant 1).
+    async fn custom_critic_missing_verdict_is_unavailable() {
+        // A custom seat handed an empty consult has no trustworthy judgement. It
+        // carries no semantic blocker, but it must not be collapsed into a pass.
         let role = parse_role(
             "perf",
             "---\nname: Performance Reviewer\n---\nCheck for N+1 and unbounded queries.\n",
         )
         .unwrap();
-        // empty("") -> accepts with an unset role; normalize tags it with the seat,
-        // mirroring how ForkConsult fail-opens to RoleVerdict::empty(role).
+        // empty("") -> unavailable with an unset role; normalize tags it with the seat.
         let stub = StubConsult(RoleVerdict::empty(""));
         let arts = CriticArtifacts {
             requirement: "an app",
             ..Default::default()
         };
         let v = role.review(&stub, arts).await;
-        assert!(v.accepts, "fail-open consult -> accepting verdict");
+        assert_eq!(v.status(), crate::critics::ReviewStatus::Unavailable);
+        assert!(!v.accepts, "absence is not a trustworthy acceptance");
         assert!(v.blocking.is_empty());
         assert_eq!(v.role, "performance-reviewer");
     }

@@ -18,28 +18,24 @@
 //! custom_knowledge = "team-standards/" # extra knowledge directory
 //!
 //! [knowledge]
-//! enabled = true                       # use structured BM25 retrieval (default)
-//! engine = "bm25"                      # "bm25" (offline) or "hybrid" (+ OpenAI embeddings)
+//! enabled = true                       # use structured retrieval (default)
+//! engine = "hybrid"                    # request BM25+vector; degrades to BM25
 //! top_k = 6                            # chunks injected per phase
 //!
 //! [model]
 //! # DEPRECATED / UNUSED — UmaDev does NOT route models. UmaDev owns no model
-//! # endpoint; the base CLI's OWN login/config (claude-code / codex / opencode)
-//! # is the sole authority for which model runs. A non-empty `provider` here is
+//! # endpoint; the selected one of five base CLIs (3 native + 2 vendor-isolated ACP) owns the
+//! # login/config and decides which model runs. A non-empty `provider` here is
 //! # IGNORED, and the run prints a one-time "ignored" warning so it fails loud
 //! # rather than silently doing nothing. To use a different model, configure it
 //! # in your base CLI, not here. Kept only so an older `.umadevrc` still parses.
 //! provider = ""                        # ignored — configure the model in the base CLI
 //!
 //! [codex]
-//! sandbox_mode = "workspace-write"     # codex launch sandbox: read-only |
-//!                                       # workspace-write (default, safe) |
-//!                                       # danger-full-access. The default
-//!                                       # blocks local dev servers (npm start
-//!                                       # for React / Electron) and git
-//!                                       # commits; set danger-full-access to
-//!                                       # allow them (high-risk — you accept
-//!                                       # the risk to your system environment).
+//! sandbox_mode = "danger-full-access"  # main coding session default: full
+//!                                       # filesystem / process / network /
+//!                                       # local-port access. Set read-only or
+//!                                       # workspace-write to restrict Codex.
 //! ```
 
 use std::path::Path;
@@ -61,7 +57,8 @@ pub struct ProjectConfig {
     /// Knowledge-base / RAG retrieval overrides.
     #[serde(default)]
     pub knowledge: KnowledgeConfig,
-    /// Custom-model (API provider) overrides.
+    /// Deprecated model-provider field retained only for backward-compatible
+    /// parsing; the run path ignores it (see [`ModelConfig`]).
     #[serde(default)]
     pub model: ModelConfig,
     /// Codex base launch-sandbox overrides.
@@ -110,12 +107,12 @@ pub struct PipelineConfig {
     /// Overridable per run by the `UMADEV_STRICT_COVERAGE=1` environment flag.
     #[serde(default)]
     pub strict_coverage: bool,
-    /// Auto-approve all pipeline gates without waiting for user input
-    /// (default `true`). UmaDev's pipeline is designed to run fully
-    /// autonomously — like Claude Code's `/goal` mode. The gates
-    /// (`docs_confirm`, `preview_confirm`) still fire as checkpoints
-    /// in the event stream and status bar, but they don't block
-    /// execution. Set to `false` to restore manual gate approval.
+    /// Auto-approve the pipeline's ordinary document/preview gates without
+    /// waiting for input (default `true`). The gates (`docs_confirm`,
+    /// `preview_confirm`) still appear as checkpoints in the event stream and
+    /// status bar. This setting does not bypass irreversible-action
+    /// confirmations, deterministic acceptance, or the trust-mode safety
+    /// floor. Set it to `false` to require manual gate approval.
     #[serde(default = "default_auto_approve")]
     pub auto_approve_gates: bool,
 }
@@ -151,9 +148,10 @@ pub struct ExpertsConfig {
 /// **DEPRECATED / UNUSED** custom-model (API provider) override.
 ///
 /// UmaDev deliberately owns NO model endpoint and does NOT route models: the
-/// base CLI's own login/config (claude-code / codex / opencode) is the sole
-/// authority for which model runs. This section is therefore **not consumed by
-/// the run path** — the run always drives the base on the base's own model. It
+/// selected one of five base CLIs (three native plus Grok Build/Kimi Code ACP) owns the
+/// login/config and decides which model runs. This section is therefore **not
+/// consumed by the run path** — the run always drives the base on the base's own
+/// model. It
 /// is retained ONLY so an older `.umadevrc` that sets `[model] provider` still
 /// parses; a non-empty value is IGNORED, and the run surfaces a one-time
 /// "ignored" warning (see [`ModelConfig::ignored_provider`]) so a mis-set
@@ -188,18 +186,17 @@ impl ModelConfig {
 
 /// Codex base launch-sandbox customization (`.umadevrc` `[codex]` section).
 ///
-/// Codex launches its workspace in one of three sandbox tiers. UmaDev keeps the
-/// safe `workspace-write` baseline by default (write the project dir, but no
-/// network and no arbitrary system access) — behaviour is UNCHANGED when this
-/// section is absent. A full-stack project that must boot a local dev server
-/// (`npm start` for React / Electron) or run `git commit` needs the relaxed
-/// `danger-full-access` tier; advanced users opt in explicitly and accept the
-/// risk to their system environment.
+/// Codex launches its workspace in one of three sandbox tiers. UmaDev is a
+/// development-team host, so its main execution session defaults to
+/// `danger-full-access`: package managers, local dev servers, git, subprocesses,
+/// and network calls must reach the real development environment. Users can
+/// explicitly downgrade a project to `workspace-write` or `read-only`; the
+/// independent critic session is always read-only regardless of this setting.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CodexConfig {
-    /// One of `read-only` / `workspace-write` (default) / `danger-full-access`.
-    /// An unknown / garbage value fails open to `workspace-write` (never an
-    /// error), so a typo can never silently widen the sandbox.
+    /// One of `read-only` / `workspace-write` / `danger-full-access` (default).
+    /// An explicitly invalid value resolves conservatively to `workspace-write`,
+    /// so a typo in a restriction never silently widens access.
     #[serde(default = "default_codex_sandbox")]
     pub sandbox_mode: String,
 }
@@ -213,8 +210,9 @@ impl Default for CodexConfig {
 }
 
 impl CodexConfig {
-    /// Resolve the configured string to the typed [`CodexSandbox`], failing open
-    /// to [`CodexSandbox::WorkspaceWrite`] on any unrecognised value.
+    /// Resolve the configured string to the typed [`CodexSandbox`]. Missing
+    /// config is already populated with [`CodexSandbox::DangerFullAccess`]; an
+    /// explicitly unrecognised value restricts to [`CodexSandbox::WorkspaceWrite`].
     #[must_use]
     pub fn resolved_sandbox(&self) -> CodexSandbox {
         CodexSandbox::parse_fail_open(&self.sandbox_mode)
@@ -222,7 +220,7 @@ impl CodexConfig {
 }
 
 fn default_codex_sandbox() -> String {
-    CodexSandbox::WorkspaceWrite.as_codex_arg().to_string()
+    CodexSandbox::DangerFullAccess.as_codex_arg().to_string()
 }
 
 /// The three Codex launch sandbox tiers, matching codex's own `--sandbox` enum
@@ -231,25 +229,28 @@ fn default_codex_sandbox() -> String {
 pub enum CodexSandbox {
     /// Read-only: the base can read the workspace but write nothing.
     ReadOnly,
-    /// Write the workspace only — codex's default and UmaDev's safe baseline.
-    #[default]
+    /// Write the workspace only, without general host/network access.
     WorkspaceWrite,
-    /// No sandbox: full filesystem + network + process access. Required to boot
-    /// local dev servers / run `git`; high-risk, opt-in only.
+    /// No sandbox: full filesystem + network + process access. UmaDev's main
+    /// execution default; required for normal full-stack development work.
+    #[default]
     DangerFullAccess,
 }
 
 impl CodexSandbox {
     /// Parse a config / env string fail-open. Recognises codex's canonical
     /// kebab-case ids (and is lenient about case / `_`↔`-`); anything else —
-    /// including an empty or garbage value — resolves to [`Self::WorkspaceWrite`]
-    /// so a typo can never silently widen the sandbox.
+    /// including an empty or garbage explicit value — resolves to
+    /// [`Self::WorkspaceWrite`] so a typo in a restriction never silently widens
+    /// access. The absent-value default is supplied separately by
+    /// the default sandbox resolver as [`Self::DangerFullAccess`].
     #[must_use]
     pub fn parse_fail_open(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
             "read-only" | "readonly" => Self::ReadOnly,
             "danger-full-access" | "danger-full" | "full-access" => Self::DangerFullAccess,
-            // "workspace-write" + every unrecognised value → the safe default.
+            // "workspace-write" + every unrecognised explicit value → the
+            // conservative restricted tier.
             _ => Self::WorkspaceWrite,
         }
     }
@@ -275,16 +276,21 @@ impl CodexSandbox {
 /// Knowledge-base (RAG) retrieval customization.
 ///
 /// Controls the [`umadev_knowledge`] retrieval engine that replaces the
-/// legacy "keyword-sort the folder" approach. Default uses BM25 (offline,
-/// zero-dependency); setting `engine = "hybrid"` additionally enables the
-/// optional OpenAI embeddings layer when `OPENAI_EMBED_KEY` is present.
+/// legacy "keyword-sort the folder" approach. `hybrid` is the configured
+/// default, but it is a request rather than proof that a vector channel ran.
+/// Local vectors require a binary built with `vector-local` plus a compatible,
+/// verified model on disk (official release launchers provision that model;
+/// plain source builds do not). Remote vectors require both the dedicated key
+/// and the explicit upload opt-in documented by `umadev-knowledge`. If neither
+/// vector backend is usable, retrieval degrades to BM25.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KnowledgeConfig {
-    /// Whether structured retrieval is enabled (default `true`). Set
-    /// `false` to fall back to the legacy keyword-scoring path.
+    /// Whether all knowledge consumption is enabled (default `true`). `false`
+    /// short-circuits lexical retrieval, vectors, agentic/phase digests,
+    /// previews, and expert knowledge; no legacy fallback may recall content.
     #[serde(default = "default_knowledge_enabled")]
     pub enabled: bool,
-    /// Retrieval engine: `"bm25"` (default) or `"hybrid"`.
+    /// Retrieval engine: `"hybrid"` (default) or lexical-only `"bm25"`.
     #[serde(default = "default_knowledge_engine")]
     pub engine: String,
     /// How many knowledge chunks to inject per phase (default 6).
@@ -307,9 +313,9 @@ fn default_knowledge_enabled() -> bool {
 }
 
 fn default_knowledge_engine() -> String {
-    // Hybrid (BM25 + vector RRF fusion) is the commercial default; it degrades
-    // to pure BM25 automatically when no embedding backend is reachable, so it
-    // is always safe. Set `engine = "bm25"` to force offline lexical-only.
+    // `hybrid` requests BM25 + vector RRF fusion. It degrades to pure BM25 when
+    // no enabled embedding backend can produce a usable vector. Set
+    // `engine = "bm25"` to force lexical-only retrieval.
     "hybrid".to_string()
 }
 
@@ -342,8 +348,9 @@ pub fn load_project_config(project_root: &Path) -> ProjectConfig {
     cfg.quality.threshold = cfg.quality.threshold.min(100);
     cfg.knowledge.top_k = cfg.knowledge.top_k.clamp(1, 50);
     // Normalise the codex sandbox to a canonical kebab id; an unrecognised
-    // value fails open to the safe `workspace-write` baseline (never widens the
-    // sandbox). Mirrors the knowledge.engine fail-open above.
+    // explicitly invalid value falls back to the restricted `workspace-write`
+    // tier (never widens access). Missing config already carries the full-access
+    // product default from `CodexConfig::default`.
     let raw_sandbox = cfg.codex.sandbox_mode.clone();
     let resolved_sandbox = CodexSandbox::parse_fail_open(&raw_sandbox);
     let normalized_sandbox = raw_sandbox.trim().to_ascii_lowercase().replace('_', "-");
@@ -353,12 +360,33 @@ pub fn load_project_config(project_root: &Path) -> ProjectConfig {
     {
         tracing::warn!(
             "codex.sandbox_mode = {:?} is not read-only/workspace-write/danger-full-access \
-             — falling back to workspace-write",
+             — restricting to workspace-write",
             raw_sandbox
         );
     }
     cfg.codex.sandbox_mode = resolved_sandbox.as_codex_arg().to_string();
     cfg
+}
+
+const LEGACY_GENERATED_CODEX_BLOCK: &str = "# Codex launch sandbox: read-only | workspace-write (default, safe) | danger-full-access.\n# The default blocks local dev servers (npm start for React/Electron) and git commits;\n# set danger-full-access to allow them (high-risk -- you accept the system-environment risk).\nsandbox_mode = \"workspace-write\"";
+
+/// Upgrade the exact `[codex]` block generated by UmaDev 1.0.52–1.0.55.
+/// Hand-written `workspace-write` settings are left untouched.
+pub fn migrate_legacy_generated_codex_sandbox(project_root: &Path) -> std::io::Result<bool> {
+    let path = project_root.join(".umadevrc");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !body.contains(LEGACY_GENERATED_CODEX_BLOCK) || body.contains("sandbox_explicit = true") {
+        return Ok(false);
+    }
+    persist_codex_sandbox_inner(project_root, CodexSandbox::DangerFullAccess, false)?;
+    tracing::warn!(
+        "migrated UmaDev's legacy generated Codex sandbox default to danger-full-access"
+    );
+    Ok(true)
 }
 
 /// Persist the chosen Codex launch sandbox tier into the project's `.umadevrc`
@@ -382,6 +410,14 @@ pub fn load_project_config(project_root: &Path) -> ProjectConfig {
 /// Propagates a filesystem write error, or an `InvalidData` error if an existing
 /// `.umadevrc` cannot be parsed as TOML (refusing to overwrite it).
 pub fn persist_codex_sandbox(project_root: &Path, mode: CodexSandbox) -> std::io::Result<()> {
+    persist_codex_sandbox_inner(project_root, mode, true)
+}
+
+fn persist_codex_sandbox_inner(
+    project_root: &Path,
+    mode: CodexSandbox,
+    explicit: bool,
+) -> std::io::Result<()> {
     use toml_edit::{value, DocumentMut, Item, Table};
 
     let path = project_root.join(".umadevrc");
@@ -405,6 +441,7 @@ pub fn persist_codex_sandbox(project_root: &Path, mode: CodexSandbox) -> std::io
         doc["codex"] = Item::Table(Table::new());
     }
     doc["codex"]["sandbox_mode"] = value(mode.as_codex_arg());
+    doc["codex"]["sandbox_explicit"] = value(explicit);
 
     let body = doc.to_string();
     // Atomic write: temp file in the SAME dir (so the rename is same-filesystem
@@ -463,20 +500,21 @@ mod tests {
     }
 
     #[test]
-    fn codex_sandbox_unset_defaults_to_workspace_write() {
+    fn codex_sandbox_unset_defaults_to_full_access() {
         let tmp = TempDir::new().unwrap();
-        // No `.umadevrc` at all → default, behaviour UNCHANGED.
+        // No `.umadevrc` at all → a main coding session can use the complete
+        // development environment.
         let cfg = load_project_config(tmp.path());
         assert_eq!(
             cfg.codex.resolved_sandbox(),
-            CodexSandbox::WorkspaceWrite,
-            "missing config must keep the safe baseline"
+            CodexSandbox::DangerFullAccess,
+            "missing config must use the full-access execution default"
         );
         // A `.umadevrc` that omits the [codex] section → still the default.
         std::fs::write(tmp.path().join(".umadevrc"), "[quality]\nthreshold = 80\n").unwrap();
         let cfg = load_project_config(tmp.path());
-        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::WorkspaceWrite);
-        assert_eq!(cfg.codex.sandbox_mode, "workspace-write");
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::DangerFullAccess);
+        assert_eq!(cfg.codex.sandbox_mode, "danger-full-access");
     }
 
     #[test]
@@ -518,7 +556,7 @@ mod tests {
         assert_eq!(
             cfg.codex.resolved_sandbox(),
             CodexSandbox::WorkspaceWrite,
-            "a garbage value must fail open to the safe baseline, never error"
+            "a garbage explicit value must restrict access, never error"
         );
         // The stored string is normalised so downstream consumers see the canonical id.
         assert_eq!(cfg.codex.sandbox_mode, "workspace-write");
@@ -561,6 +599,7 @@ mod tests {
         assert!(cfg.knowledge.enabled);
         assert_eq!(cfg.knowledge.engine, "hybrid");
         assert_eq!(cfg.knowledge.top_k, 6);
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::DangerFullAccess);
     }
 
     #[test]
@@ -714,7 +753,7 @@ mod tests {
             "[codex]\nsandbox_mode = \"danger-full-access\"\n",
         )
         .unwrap();
-        // Walk it back to the safe baseline.
+        // Explicitly restrict it to the workspace.
         persist_codex_sandbox(tmp.path(), CodexSandbox::WorkspaceWrite).unwrap();
         let cfg = load_project_config(tmp.path());
         assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::WorkspaceWrite);
@@ -735,5 +774,43 @@ mod tests {
         // The original file is untouched.
         let body = std::fs::read_to_string(tmp.path().join(".umadevrc")).unwrap();
         assert_eq!(body, garbage);
+    }
+
+    #[test]
+    fn migrates_only_the_legacy_generated_workspace_write_default() {
+        let generated = TempDir::new().unwrap();
+        std::fs::write(
+            generated.path().join(".umadevrc"),
+            format!("[codex]\n{LEGACY_GENERATED_CODEX_BLOCK}\n"),
+        )
+        .unwrap();
+        assert!(migrate_legacy_generated_codex_sandbox(generated.path()).unwrap());
+        assert_eq!(
+            load_project_config(generated.path())
+                .codex
+                .resolved_sandbox(),
+            CodexSandbox::DangerFullAccess
+        );
+
+        let custom = TempDir::new().unwrap();
+        std::fs::write(
+            custom.path().join(".umadevrc"),
+            "[codex]\nsandbox_mode = \"workspace-write\"\n",
+        )
+        .unwrap();
+        assert!(!migrate_legacy_generated_codex_sandbox(custom.path()).unwrap());
+        assert_eq!(
+            load_project_config(custom.path()).codex.resolved_sandbox(),
+            CodexSandbox::WorkspaceWrite
+        );
+
+        let explicitly_saved = TempDir::new().unwrap();
+        std::fs::write(
+            explicitly_saved.path().join(".umadevrc"),
+            format!("[codex]\n{LEGACY_GENERATED_CODEX_BLOCK}\n"),
+        )
+        .unwrap();
+        persist_codex_sandbox(explicitly_saved.path(), CodexSandbox::WorkspaceWrite).unwrap();
+        assert!(!migrate_legacy_generated_codex_sandbox(explicitly_saved.path()).unwrap());
     }
 }

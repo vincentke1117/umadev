@@ -169,7 +169,7 @@ pub fn assess_readiness(project_root: &Path) -> PrReadiness {
     } else {
         String::new()
     };
-    let has_changes = is_repo && git_has_changes(project_root);
+    let has_changes = is_repo && git_has_pr_changes(project_root);
     let has_remote = is_repo && git_has_github_remote(project_root);
     let gh_present = gh_on_path();
     let gh_authed = gh_present && gh_logged_in();
@@ -643,6 +643,26 @@ fn git_has_changes(project_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// PR-specific change probe. Unlike run-isolation's [`git_has_changes`], this
+/// counts `output/` and `release/`: those are review evidence and can be the
+/// entire deliverable for a documentation-only run. UmaDev's transient state
+/// and installed Claude hook remain excluded. The caller assesses readiness
+/// before writing the new PR body, so that body cannot manufacture readiness.
+fn git_has_pr_changes(project_root: &Path) -> bool {
+    run_git(project_root, &["status", "--porcelain"])
+        .map(|status| {
+            status.lines().any(|line| {
+                let path = line.get(3..).unwrap_or("").trim().trim_matches('"');
+                let path = path.rsplit(" -> ").next().unwrap_or(path);
+                let our_transient_dir = |dir: &str| {
+                    path.starts_with(&format!("{dir}/")) || path.starts_with(&format!("{dir}\\"))
+                };
+                !path.is_empty() && !our_transient_dir(".umadev") && !our_transient_dir(".claude")
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// `true` iff any configured remote URL points at github.com.
 fn git_has_github_remote(project_root: &Path) -> bool {
     run_git(project_root, &["remote", "-v"])
@@ -906,6 +926,28 @@ mod tests {
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "seed"]);
         tmp
+    }
+
+    #[test]
+    fn pr_readiness_counts_output_only_deliverables_but_not_transient_state() {
+        if !git_available() {
+            return;
+        }
+        let tmp = init_repo("main");
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".umadev")).unwrap();
+        fs::write(root.join(".umadev/plan.json"), "{}\n").unwrap();
+        assert!(
+            !assess_readiness(root).has_changes,
+            "transient state alone is not a PR deliverable"
+        );
+
+        fs::create_dir_all(root.join("output")).unwrap();
+        fs::write(root.join("output/demo-prd.md"), "# PRD\n").unwrap();
+        assert!(
+            assess_readiness(root).has_changes,
+            "a docs-only run must be eligible for a PR"
+        );
     }
 
     #[test]

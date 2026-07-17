@@ -1,13 +1,10 @@
 //! `umadev-agent` — the spec-aware orchestrator.
 //!
-//! Drives the `UMADEV_HOST_SPEC_V1` 9-phase pipeline (research → docs
-//! → `docs_confirm` → spec → frontend → `preview_confirm` → backend →
-//! quality → delivery), honours both confirmation gates, and emits the
-//! Layer-4 evidence chain along the way.
-//!
-//! V1 skeleton — `runner.rs` will be fleshed out as the runtime
-//! integration lands. The shape stabilises now so downstream crates
-//! (CLI, CI plugins) can already import it.
+//! Routes a request, owns a dependency plan, schedules single-writer work and
+//! isolated reviews, verifies deterministic acceptance, and records only
+//! evidence-backed learning. Deep builds may still use the specification's
+//! research-to-delivery phase vocabulary, but ordinary chat and narrow edits
+//! stay on proportional paths rather than inheriting a fixed nine-phase chain.
 
 // `deny`, not `forbid`: the crate is unsafe-free EXCEPT the single audited
 // `pre_exec` seam in `spawn_util` (a `#[allow(unsafe_code)]` island), which
@@ -47,6 +44,7 @@ pub mod ask_question;
 pub mod base_error;
 pub mod base_gate;
 pub mod bg_agents;
+pub mod blocker;
 pub mod checkpoint;
 pub mod coach;
 pub mod color_permission;
@@ -63,23 +61,29 @@ pub mod director;
 pub mod director_loop;
 pub mod error_kb;
 pub mod events;
+pub mod execution_contract;
 pub mod experts;
 pub mod fact_extract;
 pub mod first_pass;
 pub mod freshness;
 pub(crate) mod fswalk;
 pub mod gates;
+pub mod init_assets;
 pub mod interaction;
 pub mod knowledge_feedback;
 pub mod lessons;
 pub mod manifest;
 pub mod materialize;
+/// User-visible inventory and policy controls for persisted agent memory.
+pub mod memory_control;
 pub mod open_decisions;
 pub mod phases;
 pub mod plan_state;
+pub mod plan_tasks;
 pub mod planner;
 pub mod pr;
 pub mod project_facts;
+pub mod project_init;
 pub mod recipes;
 pub mod review;
 pub mod router;
@@ -94,10 +98,13 @@ pub mod sizing_calibration;
 pub mod skills;
 pub mod spawn_util;
 pub mod state;
+pub mod task_lifecycle;
 pub mod tech_debt;
 pub mod test_integrity;
 pub mod trust;
+pub mod usage_ledger;
 pub mod verify;
+pub mod workspace_diff;
 
 #[cfg(test)]
 mod test_support;
@@ -146,6 +153,7 @@ pub use director_loop::{
     has_resumable_director_plan, has_resumable_run, run_post_build_qc, DirectorLoopOutcome,
 };
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
+pub use execution_contract::{ContractViolation, ExecutionContract};
 pub use first_pass::{
     autonomy_default as first_pass_autonomy_default, class_kind as first_pass_class_kind,
     first_pass_rate, low_confidence_nudge as first_pass_low_confidence_nudge,
@@ -155,17 +163,24 @@ pub use gates::{
     claims_code_changes, classify_reply, Gate, GateChoice, GateChoiceOption, GateDecision,
     GateOutcome,
 };
+pub use init_assets::{scaffold_init_knowledge, KnowledgeScaffoldReport};
 pub use interaction::{
-    hosted as hosted_interaction, ApprovalFn, ApprovalFuture, RunInteraction, SteerIntake,
+    classify_running_input, hosted as hosted_interaction, is_explicit_clarification_answer,
+    is_explicit_later_work, is_running_cancel_intent, ApprovalFn, ApprovalFuture, HostRequestFn,
+    HostRequestFuture, RunInteraction, RunningInputDisposition, SteerIntake,
 };
 pub use lessons::{
     apply_dev_error_trust, apply_trust_for_identities, apply_trust_for_signatures,
-    capture_dev_errors, capture_gate_revision, capture_quality_failures,
-    capture_validated_patterns, fold_beliefs, lessons_report, list_sedimented_lessons,
+    capture_dev_errors, capture_dev_errors_detailed, capture_dev_errors_detailed_with_evidence_id,
+    capture_gate_revision, capture_quality_failures, capture_validated_patterns,
+    commit_pitfall_fix_attempt, fold_beliefs, lessons_report, list_sedimented_lessons,
     parse_reconcile_decision, pitfall_efficacy_summary, pitfall_overview, reconcile_candidates,
     reconcile_prompt, resolve_new_lesson_conflicts, scan_contradictions, sediment_lessons,
-    sediment_lessons_with_judge, Lesson, LessonsReport, PitfallEfficacySummary, PitfallEntry,
-    PitfallStatus, ReconcileDecision, ValidatedEntry,
+    sediment_lessons_with_judge, settle_pitfall_fix_attempt, CuratedLessonEntry,
+    CuratedLessonStatus, KnowledgeEvidenceOutcome, Lesson, LessonsReport, PitfallCaptureOutcome,
+    PitfallEfficacySummary, PitfallEntry, PitfallFixAttemptResult, PitfallFixSettlement,
+    PitfallObservation, PitfallStatus, ReconcileDecision, UnclassifiedCandidateEntry,
+    ValidatedEntry,
 };
 pub use manifest::{ConformanceLevel, Profile, SpecManifest};
 pub use open_decisions::{
@@ -189,16 +204,24 @@ pub use pr::{
     latest_proof_pack, manual_steps, plan_branches, pr_body_rel_path, proof_pack_summary,
     render_pr_body, BranchIsolation, PrPlan, PrReadiness, ReadinessCheck,
 };
+pub use project_init::{
+    analyze_project, initialize_project, ProjectAnalysis, ProjectInitOptions, ProjectInitReport,
+    ProjectShape,
+};
 pub use recipes::{
-    capture_recipe, fingerprint_for, load_recipes, recall_best, recall_prior_block,
-    recipe_prior_block, recipes_dir, Fingerprint, OutcomeStats, Recipe, RECIPE_PRIOR_BUDGET,
+    capture_recipe, commit_recipe_prior_sent, fingerprint_for, load_recipes, prepare_recipe_prior,
+    project_recipes_dir, recall_best, recall_prior_block, recipe_prior_block, recipes_dir,
+    settle_recipe_receipt, Fingerprint, OutcomeStats, PreparedRecipePrior, Recipe, RecipeOutcome,
+    RecipeReceipt, RECIPE_PRIOR_BUDGET,
 };
 pub use review::{
     build_review_report, render_review_md, review_report_rel_path, scan_ci_weakening,
     write_review_report, ReviewClaim, ReviewReport, Verdict,
 };
 pub use router::{
-    looks_like_work_request, route, Budget, ClarifyQuestion, Depth, RouteClass, RoutePlan,
+    deterministic_route, looks_like_work_request, route, route_with_context_and_readonly_session,
+    route_with_context_and_source, route_with_source, Budget, ClarifyQuestion, Depth, RouteClass,
+    RoutePlan, RouteSource, RoutedIntent,
 };
 pub use runner::{
     setup_run_isolation, strict_coverage_from_env, AgentRunner, RunOptions, RunReport,
@@ -217,8 +240,10 @@ pub use sizing_calibration::{
     SizingAdjustment, SizingStats,
 };
 pub use skills::{
-    graduate_skill, graduate_validated_patterns, read_skills, retrieve_skills,
-    skill_description_prompt, skills_for_prompt, skills_report, Skill,
+    commit_skill_prompt_receipt, graduate_skill, graduate_validated_patterns,
+    prepare_skills_for_prompt, read_skills, retrieve_skills, settle_skill_prompt_receipt,
+    skill_description_prompt, skills_for_prompt, skills_report, Skill, SkillPromptCandidate,
+    SkillReceiptGuard, SkillReceiptSettlement, SkillUseOutcome,
 };
 pub use spawn_util::{
     detach_from_controlling_terminal, detach_kind, kill_process_group, DetachKind,
@@ -238,3 +263,4 @@ pub use trust::{
     TrustSuggestion, CIRCUIT_THRESHOLD, CIRCUIT_WINDOW_SECS, CONSECUTIVE_FAILURE_THRESHOLD,
 };
 pub use verify::{detect_project, record_verify_outcome, run_verify, ProjectKind, VerifyOutcome};
+pub use workspace_diff::{WorkspaceBaseline, WorkspaceSnapshotError};

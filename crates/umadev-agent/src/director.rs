@@ -9,7 +9,7 @@
 //! depth signal (Wave A):
 //!
 //! - **Deliberate build** → UmaDev's own loop drives the plan SEAT-BY-SEAT
-//!   ([`crate::director_loop::drive_plan_steps`]): it [`summon`]s each step's seat
+//!   (the director loop's internal plan-step driver): it [`summon`]s each step's seat
 //!   serially on the main session (single-writer) so the team visibly BUILDS its own
 //!   deliverables, then [`review`]s / [`verify`]s to judge reality.
 //! - **Lean / single-turn build** → the base is already a complete Agent: its body
@@ -18,7 +18,7 @@
 //!   are called AFTER it builds to read reality and judge it.
 //!
 //! - [`summon`] — drive/fork ONE seat. On a DELIBERATE build the director's build loop
-//!   ([`crate::director_loop::drive_plan_steps`]) drives EACH plan step by `summon`ing
+//!   (the director loop's internal plan-step driver) drives EACH plan step by `summon`ing
 //!   its seat in [`SummonMode::Serial`] on the main session (single-writer) — the
 //!   seat-by-seat "team builds" path (Wave A). On a lean / single-turn build the base
 //!   builds end to end in one turn and the lever is used only for QC composition + any
@@ -39,15 +39,15 @@
 //!
 //! - [`summon`] in [`SummonMode::Serial`] drives the MAIN session through the same
 //!   governed, single-writer turn pump the rework loop uses
-//!   ([`continuous::drive_rework_turn`]); in [`SummonMode::Parallel`] it forks a
-//!   read-only session ([`continuous::fork_with_timeout`]) and reviews/works on it
-//!   ([`continuous::ForkConsult`]) — exactly `critics.rs`'s mechanism, generalised
+//!   (through the continuous runner's internal rework-turn pump); in
+//!   [`SummonMode::Parallel`] it forks a read-only session through the continuous
+//!   runner's internal fork-consult mechanism — exactly `critics.rs`'s mechanism, generalised
 //!   so the director can invoke it whenever it judges useful.
-//! - [`review`] reuses [`continuous::run_review_team`] + [`continuous::team_for`]
+//! - [`review`] reuses the continuous runner's internal review-team and team-selection machinery
 //!   (the 8-seat critic roster, scaled to the task) to fork parallel reviewers and
 //!   collect their [`RoleVerdict`]s.
 //! - [`verify`] reuses the objective checkers — [`crate::verify::run_verify`] (real
-//!   build/test/lint), [`continuous::quality_floor`] (contract + coverage drift),
+//!   build/test/lint), the continuous runner's quality floor (contract + coverage drift),
 //!   and [`crate::acceptance::source_files`] (real code present) — and returns a FACTUAL
 //!   result, never an opinion.
 //! - [`checkpoint`] reuses the trust ladder ([`crate::trust::TrustMode`]): in `auto` it
@@ -55,19 +55,18 @@
 //!
 //! HARD INVARIANTS (mirrors `critics.rs`; never break — these keep the team SAFE):
 //!
-//! 1. **Fail-open.** Every tool degrades to a safe no-op on any error: a summon
-//!    that can't drive returns "not done" (the director proceeds), a review that
-//!    can't fork returns no blocking (accept), a verify that can't run returns
+//! 1. **Failure stays typed.** Every tool returns a bounded, explicit result on
+//!    error: a summon that can't drive returns "not done", a review that can't
+//!    produce a verdict returns "unavailable", a verify that can't run returns
 //!    "unavailable / skipped" (not a false failure), a checkpoint that can't reach
 //!    the user auto-proceeds. A tool can NEVER block the director on a bug.
 //! 2. **Single-writer preserved.** Only [`SummonMode::Serial`] mutates the
 //!    workspace, and it does so on the MAIN session under the run-lock the caller
 //!    already holds — exactly one doer writes at a time. Parallel summons + every
 //!    review run on ISOLATED read-only forks that never touch the main writer.
-//! 3. **Objective floor untouched.** [`verify`] is a deterministic reality check
-//!    (it RUNS the build / greps the real source); critic verdicts from [`review`]
-//!    stay advisory — they fold into a rework directive but never drive loop
-//!    termination, which the deterministic floor + the user gate own.
+//! 3. **Objective floor untouched.** [`verify`] remains a deterministic reality
+//!    check. Review findings may trigger bounded rework or prevent a false clean
+//!    claim, while Rust-side budgets and the objective floor own termination.
 //! 4. **No new endpoint.** Every tool runs over the SAME borrowed brain (the live
 //!    [`BaseSession`] + its `fork()`); no extra model endpoint, no extra API key.
 //!
@@ -86,7 +85,7 @@ use std::sync::Arc;
 use umadev_runtime::BaseSession;
 
 use crate::continuous::{self, ReviewKind};
-use crate::critics::RoleVerdict;
+use crate::critics::{ReviewStatus, RoleVerdict};
 use crate::events::{EngineEvent, EventSink};
 use crate::router::{RouteClass, RoutePlan};
 use crate::runner::RunOptions;
@@ -100,8 +99,7 @@ pub enum SummonMode {
     Serial,
     /// The seat works on an ISOLATED read-only `fork()` — never touches the main
     /// writer. Use for a parallel reviewer / analyst whose output is an OPINION,
-    /// not a file write. Falls back to no-op (a fail-open empty result) if the
-    /// base can't fork.
+    /// not a file write. Returns an unavailable verdict if the base can't fork.
     Parallel,
 }
 
@@ -119,7 +117,7 @@ impl SummonMode {
 /// What a [`summon`] produced. Fail-open by construction: a degraded summon still
 /// returns a well-formed result (`done == false`, an explanatory note), never an
 /// error — so the director can read it and decide, never get blocked.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct SummonResult {
     /// The seat that was summoned (e.g. `frontend-engineer`).
     pub role: String,
@@ -145,13 +143,20 @@ pub struct SummonResult {
     /// the pitfall feed the director distils into the lessons KB on the default
     /// loop (Wave 2). Empty for a Parallel reviewer (it writes nothing).
     pub pitfalls: Vec<String>,
+    /// Base-native children observed during a serial doer turn. Vendor ids are
+    /// ephemeral and are hashed before the durable plan ledger sees them.
+    pub base_agents: crate::bg_agents::BaseAgentObservation,
+    /// Serial only: receipt armed after the exact doer directive (including its
+    /// stable knowledge markers) was accepted by the host. The scheduler keeps
+    /// it alive until this round's deterministic verification settles.
+    pub memory_receipt: Option<crate::knowledge_feedback::SentReceiptGuard>,
+    /// Serial only: exact sent-skill receipt, settled from the same objective
+    /// verifier as the knowledge receipt. Abandoned turns settle Unknown.
+    pub skill_receipt: Option<crate::skills::SkillReceiptGuard>,
 }
 
-/// What a [`review`] produced — the deduped, seat-tagged union of every reviewing
-/// seat's `blocking` findings, plus whether the team was convened at all. Empty
-/// `blocking` = all seats accept (or fail-open) → the director proceeds. The
-/// findings are ADVISORY: the director MAY fold them into a rework summon, but
-/// they never force loop termination (invariant 3).
+/// What a [`review`] produced. Semantic blockers and operationally unavailable
+/// seats stay separate so a failed fork or malformed reply cannot look like pass.
 #[derive(Debug, Clone, Default)]
 pub struct ReviewResult {
     /// How many seats reviewed (0 = lean / no-UI / docs-only path got no team).
@@ -159,9 +164,23 @@ pub struct ReviewResult {
     /// The union of must-fix findings, each tagged `[seat] finding`. Empty =
     /// nothing blocking.
     pub blocking: Vec<String>,
+    /// Required seats that could not produce a trustworthy verdict.
+    pub unavailable: Vec<String>,
 }
 
 impl ReviewResult {
+    /// Aggregate state for the convened team. No team is a deliberate neutral skip.
+    #[must_use]
+    pub fn status(&self) -> ReviewStatus {
+        if !self.unavailable.is_empty() {
+            ReviewStatus::Unavailable
+        } else if !self.blocking.is_empty() {
+            ReviewStatus::Fail
+        } else {
+            ReviewStatus::Pass
+        }
+    }
+
     /// Whether any seat raised a blocking finding.
     #[must_use]
     pub fn has_blocking(&self) -> bool {
@@ -176,7 +195,7 @@ pub enum VerifyKind {
     /// [`crate::verify::run_verify`]) and report pass/fail per step.
     BuildTest,
     /// Cross-check the frontend↔backend API contract + requirement coverage
-    /// (via [`continuous::quality_floor`]) — drift = a factual gap.
+    /// (via the continuous runner's quality floor) — drift = a factual gap.
     Contract,
     /// Confirm real source files actually exist on disk (via
     /// [`crate::acceptance::source_files`]) — the "did anything get built" floor.
@@ -260,18 +279,18 @@ pub enum CheckpointDecision {
 /// drive it on the MAIN session (`Serial` doer, single-writer) or on a read-only
 /// `fork()` (`Parallel` reviewer).
 ///
-/// - `Serial`: reuses [`continuous::drive_rework_turn`] — the SAME governed,
+/// - `Serial`: reuses the continuous runner's internal rework-turn pump — the SAME governed,
 ///   audited, approval-mediated turn pump the rework loop uses, so a summoned
 ///   doer is governed exactly like any phase turn and writes under the run-lock
 ///   the caller holds (single-writer invariant 2). Returns `done = true` when the
 ///   turn completed.
-/// - `Parallel`: forks a read-only session ([`continuous::fork_with_timeout`]) and
-///   runs the seat's review over it ([`continuous::ForkConsult`]) — never touches
+/// - `Parallel`: forks a read-only session through the continuous runner's
+///   internal fork-consult mechanism — never touches
 ///   the main writer. Returns the seat's [`RoleVerdict`]. A base that can't fork
-///   fails open to an accepting empty verdict.
+///   returns an unavailable verdict.
 ///
-/// Fail-open: any error (send failure, dead session, no fork) yields a degraded
-/// [`SummonResult`] (`done = false` / an empty accepting verdict) — never blocks.
+/// Any error (send failure, dead session, no fork) yields a degraded
+/// [`SummonResult`] (`done = false` / an unavailable verdict) without hanging.
 pub async fn summon(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -299,9 +318,29 @@ pub async fn summon(
             // so the director can run the "claimed a build" gate and feed the
             // lessons KB on the default loop — every tool call is still governed +
             // audited inside the pump (UD-EVID-002), exactly as a phase turn.
-            let directive = summon_directive(options, role, instruction);
-            let turn = continuous::drive_rework_turn_capturing(
-                session, options, events, directive, deadline,
+            let mut directive = summon_directive_with_memories(options, role, instruction);
+            let skill_query = format!("{role} {instruction}");
+            let skill_candidate = crate::skills::prepare_skills_for_prompt(
+                &options.project_root,
+                &crate::phases::knowledge_root(&options.project_root),
+                &skill_query,
+                3,
+            );
+            if !skill_candidate.is_empty() {
+                directive
+                    .text
+                    .push_str(&crate::skills::render_skill_prompt_reference(
+                        &skill_candidate,
+                    ));
+            }
+            let turn = continuous::drive_rework_turn_capturing_with_memories_and_skills(
+                session,
+                options,
+                events,
+                directive.text,
+                directive.memories,
+                (!skill_candidate.is_empty()).then_some(skill_candidate),
+                deadline,
             )
             .await;
             SummonResult {
@@ -311,6 +350,9 @@ pub async fn summon(
                 verdict: None,
                 text: turn.text,
                 pitfalls: turn.pitfalls,
+                base_agents: turn.base_agents,
+                memory_receipt: turn.memory_receipt,
+                skill_receipt: turn.skill_receipt,
             }
         }
         SummonMode::Parallel => {
@@ -318,11 +360,11 @@ pub async fn summon(
             // a read-only fork so it can never collide with the main writer. We
             // reuse the critic roster's seat for `role` when one exists (so the
             // parallel seat carries the same craft as the review team); if `role`
-            // isn't a known critic seat, the seat falls back to a fail-open accept
-            // (an unknown parallel seat never blocks).
-            let verdict = summon_parallel_seat(session, options, role, instruction).await;
-            let done = verdict.is_some();
-            let verdict = verdict.unwrap_or_else(|| RoleVerdict::empty(role));
+            // isn't a known critic seat, the result is explicitly unavailable.
+            let verdict = summon_parallel_seat(session, options, role, instruction)
+                .await
+                .unwrap_or_else(|| RoleVerdict::unavailable(role, "unknown reviewer seat"));
+            let done = verdict.status() != ReviewStatus::Unavailable;
             SummonResult {
                 role: role.to_string(),
                 done,
@@ -330,6 +372,9 @@ pub async fn summon(
                 verdict: Some(verdict),
                 text: String::new(),
                 pitfalls: Vec::new(),
+                base_agents: crate::bg_agents::BaseAgentObservation::default(),
+                memory_receipt: None,
+                skill_receipt: None,
             }
         }
     }
@@ -340,21 +385,25 @@ pub async fn summon(
 /// knowledge digest, then a clear ROLE line and the concrete instruction. Reuses
 /// the existing prompt policy in `experts` / the knowledge digest in `phases` —
 /// the wording lives in one place.
-fn summon_directive(options: &RunOptions, role: &str, instruction: &str) -> String {
+fn summon_directive_with_memories(
+    options: &RunOptions,
+    role: &str,
+    instruction: &str,
+) -> crate::phases::KnowledgeDigest {
     // Relevant accumulated experience for this slice, SCOPED TO THE SEAT (not just
     // the step-instruction text): the seat blends its own domain vocabulary into
     // the query and filters the corpus to its discipline's subdirs, so a frontend
     // step draws frontend/design knowledge and a security step draws security KB.
     // Fail-open empty (or the plain instruction-keyed digest for an unknown seat).
-    // `record_feedback = true`: this seat step's directive precedes a real doer
-    // whose PASS/FAIL is consumed by `self_evolve::{reward_on_pass,penalise_on_fail}`
-    // — so the surfaced chunks are snapshotted here for that outcome to attribute.
-    let knowledge = crate::phases::seat_scoped_knowledge_digest(
+    // Retrieval is pure here. The structured digest carries exact content IDs
+    // and stable marker lines through final assembly; the turn pump commits them
+    // only after this exact directive is accepted by the host.
+    let knowledge = crate::phases::seat_scoped_knowledge_digest_with_memories(
         &options.project_root,
         role,
         instruction,
         4,
-        true,
+        false,
     );
     let mut directive = String::new();
     directive.push_str(crate::experts::agentic_engineering_rules());
@@ -387,7 +436,7 @@ fn summon_directive(options: &RunOptions, role: &str, instruction: &str) -> Stri
          not just narrate; apply ONLY this step's work and STOP — end your turn as \
          soon as this step is done.\n\n## Your task\n{instruction}\n"
     ));
-    let kd = knowledge.trim();
+    let kd = knowledge.text.trim();
     if !kd.is_empty() {
         directive.push_str("\n## Relevant team experience\n");
         directive.push_str(kd);
@@ -398,14 +447,17 @@ fn summon_directive(options: &RunOptions, role: &str, instruction: &str) -> Stri
     // before review + rework). The base still narrates its actions; the integrated final
     // report comes only after the whole build converges. See `wrapup_suppression_note`.
     directive.push_str(crate::director_loop::wrapup_suppression_note());
-    directive
+    crate::phases::KnowledgeDigest {
+        text: directive,
+        memories: knowledge.memories,
+    }
 }
 
 /// Run a single parallel seat over a read-only fork and return its verdict.
 /// Reuses the exact fork → [`ForkConsult`] → critic mechanism `run_review_team`
 /// uses, but for ONE director-chosen seat. The seat reviews the current on-disk
 /// blackboard (quality surface) with `instruction` appended as the focus. A base
-/// that can't fork / an unknown role → `None` (the caller fail-opens to accept).
+/// that can't fork / an unknown role → `None` (the caller reports unavailable).
 /// An ADVERSARIAL seat (QA / security) under a host-scoped cold surface reviews
 /// on a FRESH stateless one-shot instead — no doer transcript — with the fork as
 /// its fail-open backup (see [`crate::critics::RoleCritic::cold`]).
@@ -451,7 +503,7 @@ async fn summon_parallel_seat(
 
 /// Resolve a critic seat for a role id from the full roster (the union of the
 /// docs / preview / quality teams). Returns `None` for an unknown role so a
-/// parallel summon of an unrecognised seat fail-opens to accept.
+/// parallel summon of an unrecognised seat can report unavailability.
 fn critic_for_role(role: &str) -> Option<Box<dyn crate::critics::RoleCritic>> {
     use crate::critics::{
         ArchitectureCritic, BackendCritic, DevOpsCritic, FrontendCritic, PmCritic, QaCritic,
@@ -478,18 +530,19 @@ fn critic_for_role(role: &str) -> Option<Box<dyn crate::critics::RoleCritic>> {
 
 /// **Convene a cross-review team** — fork parallel reviewers and collect their
 /// verdicts. The director calls this when it judges a slice warrants a second
-/// pair of eyes; the team is scaled to the task ([`continuous::team_for`] →
+/// pair of eyes; the team is scaled by the continuous runner's internal selector →
 /// the planner's complexity tiering), so a lean goal convenes no team and this
 /// returns immediately (seats = 0, no blocking).
 ///
-/// Reuses [`continuous::run_review_team`] verbatim: one read-only `fork()` per
+/// Reuses the continuous runner's internal review-team implementation verbatim:
+/// one read-only `fork()` per
 /// seat, reviews run concurrently, verdicts recorded to the team ledger, the
 /// deduped seat-tagged union of blocking findings returned. The findings are
 /// ADVISORY — the director MAY fold them into a rework summon, but they never
 /// drive loop termination (invariant 3).
 ///
-/// Fail-open: a base that can't fork / an offline brain / a parse failure yields
-/// accepting empty verdicts → no blocking → the director proceeds.
+/// A base that can't fork, an offline brain, or a parse failure is returned as
+/// review unavailability rather than an empty pass.
 pub async fn review(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -506,8 +559,8 @@ pub async fn review(
 /// (`RoutePlan.team`), so team sizing is uniform on EVERY path, not just `/run`. An
 /// empty route team (a lean/fast route) → no cross-review here (the floor stands).
 ///
-/// Fail-open identically to [`review`]: a base that can't fork / an offline brain /
-/// a parse failure yields accepting empty verdicts → no blocking → proceed.
+/// Identically to [`review`], transport and parse failures stay explicitly
+/// unavailable rather than being collapsed into no-blocker acceptance.
 ///
 /// User-defined seats (`.umadev/agents/*.md`) that apply to the QUALITY node join
 /// here too, so a custom reviewer rides the route-sized path uniformly — appended
@@ -544,14 +597,19 @@ async fn review_with_team(
         return ReviewResult {
             seats: 0,
             blocking: Vec::new(),
+            unavailable: Vec::new(),
         };
     }
     // Round 0 — a single review pass. The director decides whether to act on the
     // findings (e.g. summon a rework); this tool returns the facts, it does not
     // itself loop. (The bounded auto-rework loop stays in the pipeline's
     // `review_and_rework`; the director composes summon + review itself.)
-    let blocking = continuous::run_review_team(session, options, events, kind, &team, 0).await;
-    ReviewResult { seats, blocking }
+    let review = continuous::run_review_team(session, options, events, kind, &team, 0).await;
+    ReviewResult {
+        seats,
+        blocking: review.blocking,
+        unavailable: review.unavailable,
+    }
 }
 
 // ===================================================================
@@ -564,7 +622,7 @@ async fn review_with_team(
 ///
 /// - [`VerifyKind::BuildTest`] runs the project's real build/test/lint via
 ///   [`crate::verify::run_verify`] and reports pass/fail per step.
-/// - [`VerifyKind::Contract`] runs [`continuous::quality_floor`] — frontend↔
+/// - [`VerifyKind::Contract`] runs the continuous runner's quality floor — frontend↔
 ///   backend contract drift + requirement coverage gaps.
 /// - [`VerifyKind::SourcePresent`] greps the workspace for real source files via
 ///   [`crate::acceptance::source_files`] — the "did anything get built" floor.
@@ -1147,8 +1205,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let o = opts(tmp.path());
         let instr = "build the account settings screen";
-        let fe = summon_directive(&o, "frontend-engineer", instr);
-        let sec = summon_directive(&o, "security-engineer", instr);
+        let fe = summon_directive_with_memories(&o, "frontend-engineer", instr).text;
+        let sec = summon_directive_with_memories(&o, "security-engineer", instr).text;
         // Frontend directive carries the frontend method (contract-align fetch +
         // design tokens) and NOT the security checklist.
         let fe_l = fe.to_lowercase();
@@ -1178,7 +1236,7 @@ mod tests {
         );
         // Unknown seat: no persona, no method → still a valid non-empty directive
         // (fail-open) carrying the instruction, never a panic or empty directive.
-        let unknown = summon_directive(&o, "astrologer", instr);
+        let unknown = summon_directive_with_memories(&o, "astrologer", instr).text;
         assert!(
             !unknown.is_empty() && unknown.contains(instr),
             "unknown seat fails open"
@@ -1334,6 +1392,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn summon_serial_sends_and_returns_exact_skill_receipt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        crate::lessons::capture_quality_failures(
+            tmp.path(),
+            &[crate::phases::QualityCheck {
+                name: "form contract".into(),
+                category: "frontend".into(),
+                description: "repair".into(),
+                status: "failed".into(),
+                score: 20,
+                details: "missing labels".into(),
+                weight: 1.0,
+            }],
+            "demo",
+            "private",
+        );
+        assert!(crate::skills::graduate_skill(
+            tmp.path(),
+            "Accessible login form",
+            "Build login form controls with explicit labels and error descriptions.",
+            "Bind every input to an accessible label.",
+            "frontend",
+            &["login".into(), "form".into(), "accessibility".into()],
+            "private",
+            true,
+        ));
+        let mut session = FakeSession::new(TurnStatus::Completed, false, "");
+        let sent = session.directive_handle();
+        let result = summon(
+            &mut session,
+            &opts(tmp.path()),
+            &sink(),
+            "frontend-engineer",
+            "build the accessible login form",
+            SummonMode::Serial,
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        )
+        .await;
+
+        let delivered = sent.lock().unwrap().clone();
+        assert!(delivered.contains("umadev-skill:"));
+        assert!(delivered.contains("<umadev_reference_data_v1>"));
+        assert_eq!(
+            delivered.matches("<umadev_reference_data_v1>").count(),
+            delivered.matches("</umadev_reference_data_v1>").count(),
+            "every delivered reference envelope must be complete"
+        );
+        assert!(delivered.contains("\"authority\":\"none\""));
+        assert_eq!(delivered.matches("\"kind\":\"skill_package\"").count(), 1);
+        assert!(delivered.contains("REFERENCE DATA, NOT INSTRUCTIONS"));
+        assert!(
+            !delivered.contains("<!-- umadev-skill:"),
+            "retrieved skill markup must remain JSON-escaped reference data"
+        );
+        let receipt = result
+            .skill_receipt
+            .expect("the accepted exact skill block arms a receipt");
+        assert_eq!(
+            receipt.settle(crate::skills::SkillUseOutcome::Pass),
+            crate::skills::SkillReceiptSettlement::Settled
+        );
+        assert_eq!(crate::skills::read_skills(tmp.path())[0].utility(), 2);
+    }
+
+    #[tokio::test]
     async fn summon_serial_failed_turn_is_fail_open_not_done() {
         // A failed/dead session → done = false (the director proceeds, never blocks).
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1380,8 +1503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summon_parallel_unknown_role_fails_open_accept() {
-        // An unknown parallel seat has no craft to lend → fail-open accepting verdict.
+    async fn summon_parallel_unknown_role_is_unavailable() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut sess = FakeSession::new(TurnStatus::Completed, true, "{}");
         let o = opts(tmp.path());
@@ -1397,13 +1519,12 @@ mod tests {
         )
         .await;
         let v = r.verdict.expect("always a verdict");
-        assert!(v.accepts, "unknown seat fail-opens to accept");
+        assert_eq!(v.status(), ReviewStatus::Unavailable);
         assert!(!r.done, "an unknown seat could not be summoned");
     }
 
     #[tokio::test]
-    async fn summon_parallel_no_fork_fails_open_accept() {
-        // A base that can't fork → fail-open accepting verdict, never blocks.
+    async fn summon_parallel_no_fork_is_unavailable() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut sess = FakeSession::new(TurnStatus::Completed, false, "{}");
         let o = opts(tmp.path());
@@ -1419,8 +1540,8 @@ mod tests {
         )
         .await;
         let v = r.verdict.expect("always a verdict");
-        // The fork failed → the seat's consult fail-opens to an accepting verdict.
-        assert!(v.accepts, "a seat with no fork fail-opens to accept");
+        assert_eq!(v.status(), ReviewStatus::Unavailable);
+        assert!(!r.done, "unavailable is not a completed review");
     }
 
     #[tokio::test]
@@ -1489,8 +1610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_no_fork_is_fail_open_no_blocking() {
-        // A base that can't fork → every seat fail-opens to accept → no blocking.
+    async fn review_no_fork_is_unavailable_not_pass() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut sess = FakeSession::new(TurnStatus::Completed, false, "{}");
         let o = opts(tmp.path());
@@ -1498,8 +1618,10 @@ mod tests {
         let r = review(&mut sess, &o, &ev, ReviewKind::Quality).await;
         assert!(
             !r.has_blocking(),
-            "no fork → fail-open accept → no blocking"
+            "transport failure is not a semantic blocker"
         );
+        assert_eq!(r.status(), crate::critics::ReviewStatus::Unavailable);
+        assert!(!r.unavailable.is_empty(), "the missing seats stay visible");
     }
 
     #[tokio::test]

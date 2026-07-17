@@ -18,13 +18,20 @@
 //! session in this directory; and `-s/--session <id>` resumes a *specific*
 //! session id deterministically. When UmaDev has pinned a session id it uses
 //! `-s <id>` (never colliding with the user's other `opencode` conversations in
-//! the same dir); with no pinned id it falls back to `--continue`.
+//! the same dir). Fresh calls use `--format json`; the authoritative `sessionID`
+//! repeated on each raw event is captured for the next turn. `--continue` is
+//! used only when an older caller requested continuation before an id was known.
 
+use std::path::Path;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use semver::Version;
+use tokio::sync::OnceCell;
 use umadev_runtime::{
-    CompletionRequest, CompletionResponse, Runtime, RuntimeError, RuntimeKind, Usage,
+    BasePermissionProfile, CompletionRequest, CompletionResponse, Runtime, RuntimeError,
+    RuntimeKind, Usage,
 };
 
 use crate::{
@@ -32,11 +39,93 @@ use crate::{
     AuthState, HostDriver, ProbeResult, PromptChannel, SubprocessCall,
 };
 
+/// First OpenCode release containing the upstream fix that prevents a `Task`
+/// subagent from escaping a read-only Plan agent's permission rules.
+///
+/// Evidence: <https://github.com/anomalyco/opencode/issues/20549> was fixed by
+/// <https://github.com/anomalyco/opencode/pull/23290>; `v1.14.31` is the first
+/// release whose commit ancestry contains that merge. This is an execution
+/// safety boundary, not a content-governance rule: an unknown version must not
+/// be silently treated as read-only-safe.
+pub const MIN_SAFE_OPENCODE_VERSION: &str = "1.14.31";
+
+const OPENCODE_UPGRADE_COMMAND: &str = "npm install -g opencode-ai@latest";
+
+/// Parse one exact semver token from OpenCode's `--version` output. Labels such
+/// as `OpenCode CLI` and a leading `v` are accepted, as are semver prerelease and
+/// build suffixes. We deliberately do not scrape an arbitrary digit substring:
+/// an unrecognised format is unsafe to classify and must remain unknown.
+fn parse_reported_opencode_version(raw: &str) -> Option<Version> {
+    raw.lines()
+        .flat_map(str::split_whitespace)
+        .find_map(|token| {
+            let token = token
+                .trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'));
+            let token = token
+                .strip_prefix('v')
+                .or_else(|| token.strip_prefix('V'))
+                .unwrap_or(token);
+            Version::parse(token).ok()
+        })
+}
+
+fn version_output_excerpt(raw: &str) -> String {
+    let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        "<empty>".to_string()
+    } else {
+        one_line.chars().take(160).collect()
+    }
+}
+
+/// Validate the permission semantics supplied by the installed OpenCode CLI.
+/// Low and unparseable versions both fail closed with an actionable diagnostic.
+fn validate_opencode_version(raw: &str) -> Result<Version, String> {
+    let Some(version) = parse_reported_opencode_version(raw) else {
+        return Err(format!(
+            "OpenCode CLI returned an unrecognized `--version` value (`{}`). UmaDev cannot prove that the Plan read-only subagent fix from {MIN_SAFE_OPENCODE_VERSION} is present, so it refused to run this base instead of assuming it is safe. Upgrade or reinstall with `{OPENCODE_UPGRADE_COMMAND}`, verify `opencode --version`, and retry.",
+            version_output_excerpt(raw)
+        ));
+    };
+    let minimum = Version::new(1, 14, 31);
+    if version < minimum {
+        return Err(format!(
+            "OpenCode CLI {version} is below UmaDev's minimum safe version {MIN_SAFE_OPENCODE_VERSION}. Older versions can let Task subagents bypass Plan's read-only permissions (upstream fix: https://github.com/anomalyco/opencode/pull/23290). UmaDev refused to run this base. Upgrade with `{OPENCODE_UPGRADE_COMMAND}`, verify `opencode --version`, and retry."
+        ));
+    }
+    Ok(version)
+}
+
+/// Run the real version probe used by discovery and every OpenCode execution
+/// surface. Returning the normalized version keeps picker/doctor output stable.
+pub(crate) async fn probe_safe_opencode_version(
+    program: &str,
+    workspace: &Path,
+) -> Result<String, String> {
+    let out = run_subprocess(SubprocessCall {
+        program,
+        args: &["--version".to_string()],
+        prompt: "",
+        channel: PromptChannel::Stdin,
+        workspace,
+        timeout: Duration::from_secs(10),
+        env: &[],
+    })
+    .await?;
+    validate_opencode_version(&out.stdout).map(|version| version.to_string())
+}
+
 /// Drives the `opencode` CLI as a subprocess.
 #[derive(Debug, Clone)]
 pub struct OpenCodeDriver {
     program: String,
     timeout: Duration,
+    /// One security-version probe per driver (shared by its concurrent forks).
+    /// The actual execution paths consult it too, so a configured backend cannot
+    /// bypass the startup picker and silently run an unsafe Plan session.
+    safe_version: Arc<OnceCell<Result<String, String>>>,
+    /// Permission posture for this legacy one-shot driver. Defaults to Plan.
+    permissions: BasePermissionProfile,
     /// When `true`, the next `complete` resumes a prior `opencode` session so
     /// the base keeps its own memory — deterministically via `-s <id>` when a
     /// [`Self::session_id`] is pinned, otherwise `--continue` (most recent).
@@ -46,7 +135,7 @@ pub struct OpenCodeDriver {
     /// resumes *its own* session deterministically instead of grabbing
     /// "the most recent in this dir" (which could be the user's other
     /// conversation). When `None`, falls back to `--continue`.
-    session_id: Option<String>,
+    session_id: Arc<RwLock<Option<String>>>,
     /// The cwd the `opencode` subprocess runs in (the pipeline project root).
     workspace: Option<std::path::PathBuf>,
 }
@@ -57,8 +146,10 @@ impl Default for OpenCodeDriver {
             program: std::env::var("UMADEV_OPENCODE_BIN")
                 .unwrap_or_else(|_| "opencode".to_string()),
             timeout: crate::worker_timeout_from_env(),
+            safe_version: Arc::new(OnceCell::new()),
+            permissions: BasePermissionProfile::Plan,
             continue_session: false,
-            session_id: None,
+            session_id: Arc::new(RwLock::new(None)),
             workspace: None,
         }
     }
@@ -81,6 +172,31 @@ impl OpenCodeDriver {
         self
     }
 
+    async fn require_safe_version(&self, workspace: &Path) -> Result<String, String> {
+        let program = self.program.clone();
+        let workspace = workspace.to_path_buf();
+        self.safe_version
+            .get_or_init(|| async move { probe_safe_opencode_version(&program, &workspace).await })
+            .await
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn with_version_output_for_test(mut self, raw: &str) -> Self {
+        let value = validate_opencode_version(raw).map(|version| version.to_string());
+        let cell = OnceCell::new();
+        assert!(cell.set(value).is_ok(), "fresh version cell must be empty");
+        self.safe_version = Arc::new(cell);
+        self
+    }
+
+    /// Select the access/approval posture for this one-shot driver.
+    #[must_use]
+    pub fn with_permissions(mut self, permissions: BasePermissionProfile) -> Self {
+        self.permissions = permissions;
+        self
+    }
+
     /// Builder form of [`HostDriver::set_continue_session`] (mainly for tests).
     #[must_use]
     pub fn with_continue_session(mut self, continue_session: bool) -> Self {
@@ -91,14 +207,49 @@ impl OpenCodeDriver {
     /// Builder form of [`HostDriver::set_session_id`] (mainly for tests).
     #[must_use]
     pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
-        self.session_id = session_id;
+        // Replace the cell instead of mutating a shared clone. In particular,
+        // `fork()` must reset only the child and never erase its parent's live
+        // session id.
+        self.session_id = Arc::new(RwLock::new(session_id));
         self
+    }
+
+    fn pinned_session_id(&self) -> Option<String> {
+        self.session_id
+            .read()
+            .ok()
+            .and_then(|session_id| session_id.clone())
+    }
+
+    fn remember_session_id(&self, session_id: &str) {
+        if !valid_opencode_session_id(session_id) {
+            return;
+        }
+        if let Ok(mut slot) = self.session_id.write() {
+            *slot = Some(session_id.to_string());
+        }
     }
 
     /// The argument vector preceding the prompt. Exposed for tests.
     #[must_use]
     pub fn base_args(&self, model: &str) -> Vec<String> {
+        self.base_args_for(
+            model,
+            std::env::var("UMADEV_NO_SKIP_PERMS").as_deref() == Ok("1"),
+        )
+    }
+
+    fn base_args_for(&self, model: &str, no_skip: bool) -> Vec<String> {
         let mut args = vec!["run".to_string()];
+        args.push("--agent".to_string());
+        args.push(
+            if matches!(self.permissions, BasePermissionProfile::Plan) {
+                "plan"
+            } else {
+                "build"
+            }
+            .to_string(),
+        );
         // OpenCode model ids are provider/model. UmaDev's default launch
         // model (`claude-sonnet-4-6`) is not in that shape, so only pass a
         // model when the user explicitly selected an OpenCode-compatible id.
@@ -106,12 +257,10 @@ impl OpenCodeDriver {
             args.push("--model".to_string());
             args.push(model.to_string());
         }
-        // Auto-approve tool permissions so the headless `run` never blocks on
-        // an interactive y/n that can't be answered in subprocess mode (the
-        // claude/codex drivers have their equivalent). UmaDev's governance
-        // layer is the safety net. Opt out with UMADEV_NO_SKIP_PERMS=1.
-        if std::env::var("UMADEV_NO_SKIP_PERMS").as_deref() != Ok("1") {
-            args.push("--dangerously-skip-permissions".to_string());
+        // `--auto` is OpenCode's documented non-interactive auto-approval flag.
+        // The environment latch only tightens Auto; Plan and Guarded never add it.
+        if self.permissions.auto_approve() && !no_skip {
+            args.push("--auto".to_string());
         }
         args
     }
@@ -125,28 +274,21 @@ impl OpenCodeDriver {
     /// - fresh              → (nothing)     (brand-new session)
     ///
     /// Both `-s/--session <id>` and `-c/--continue` are confirmed against the
-    /// live `opencode run --help`. A pinned id is preferred because `--continue`
-    /// could otherwise grab the user's other conversation in the same directory.
-    ///
-    // TODO(opencode): we cannot yet *capture* the session id opencode assigns on
-    // a fresh turn (opencode has no "create with this id" flag like claude's
-    // `--session-id`; the id only appears in `--format json` output, whose exact
-    // event schema is not yet confirmed on this machine). Until that schema is
-    // verified, turn 1 stays a fresh `run` and only an externally-pinned id
-    // drives deterministic `-s <id>` resume. Do NOT add `--format json` to the
-    // run path before the usage/session-id event shape is confirmed — it would
-    // turn the plain-text stdout this driver parses into raw JSON and break
-    // `complete`'s answer extraction.
+    /// live `opencode run --help`. Every call also uses the documented
+    /// `--format json` raw-event stream. Each event repeats the authoritative
+    /// `sessionID`; a fresh call captures it into this driver so its next turn
+    /// can resume with `--session <id>` rather than accidentally selecting the
+    /// user's most recent unrelated OpenCode conversation.
     #[must_use]
     pub fn call_args(&self, model: &str) -> Vec<String> {
         let mut args = self.base_args(model);
         if self.continue_session {
-            match &self.session_id {
+            match self.pinned_session_id() {
                 Some(id) => {
                     // Resume OUR specific session — never "the most recent in
                     // this dir", so we can't continue the user's other chat.
                     args.push("--session".to_string());
-                    args.push(id.clone());
+                    args.push(id);
                 }
                 None => {
                     // `--continue` resumes the last session so `opencode` answers
@@ -155,6 +297,8 @@ impl OpenCodeDriver {
                 }
             }
         }
+        args.push("--format".to_string());
+        args.push("json".to_string());
         args
     }
 }
@@ -190,8 +334,11 @@ impl Runtime for OpenCodeDriver {
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, RuntimeError> {
-        let prompt = merge_prompt(&req);
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
+        self.require_safe_version(&ws)
+            .await
+            .map_err(crate::map_subprocess_error)?;
+        let prompt = merge_prompt(&req);
         let args = self.call_args(&req.model);
         let out = run_subprocess(SubprocessCall {
             program: &self.program,
@@ -205,38 +352,38 @@ impl Runtime for OpenCodeDriver {
         .await
         .map_err(crate::map_subprocess_error)?;
 
-        Ok(CompletionResponse {
-            text: out.stdout,
-            id: "opencode-cli".to_string(),
-            model: req.model,
-            usage: Usage::default(),
-        })
+        if let Some(session_id) = extract_opencode_session_id(&out.stdout) {
+            self.remember_session_id(&session_id);
+        }
+        let extraction = extract_opencode_output(&out.stdout);
+        let text = if extraction.saw_structured_event {
+            extraction.text
+        } else {
+            // Fail open for an older/custom binary that ignores `--format` and
+            // still prints plain text. A valid structured stream with no final
+            // text stays empty instead of leaking raw event JSON to the user.
+            out.stdout
+        };
+
+        Ok(crate::redaction::sanitize_completion_response(
+            &CompletionResponse {
+                text,
+                id: "opencode-cli".to_string(),
+                model: req.model,
+                usage: Usage::default(),
+            },
+        ))
     }
 
     /// Streaming completion via `opencode run`, forwarding stdout **line by
     /// line** so the TUI shows live progress instead of a frozen spinner.
     ///
-    /// `opencode run` writes a plain-text answer (NOT structured JSONL like
-    /// `claude --output-format stream-json` / `codex exec --json`), so there is
-    /// no machine-readable tool-call schema to parse — and `--format json` is
-    /// deliberately NOT used here (it would turn the plain-text stdout this
-    /// driver parses into raw JSON and break answer extraction; see the
-    /// `call_args` TODO). What this DOES win is the thing that mattered most:
-    /// before this override, `OpenCodeDriver` fell back to the trait-default
-    /// `complete_streaming` — a blocking `complete` that emits **nothing** until
-    /// the whole phase ends, leaving the entire research phase with zero
-    /// intermediate events and a 25s+ blank screen. Forwarding each line as a
-    /// [`StreamEvent::Text`] delta as it arrives — even without a structured
-    /// stream — is strictly better than buffer-then-dump: the user sees the
-    /// answer materialize in real time and the runner's stream-activity tracker
-    /// stops heartbeating "still working" over a base that IS producing output.
-    ///
-    /// A line that looks like a tool-call marker (`opencode` prints lines such
-    /// as `|  Read  path` for tool steps in some configurations) is forwarded as
-    /// a [`StreamEvent::ToolUse`] so the activity reads richer when present;
-    /// everything else is plain text. Fail-open: on ANY streaming error we fall
-    /// back to the non-streaming [`complete`](Self::complete) so a format change
-    /// or an environment without line-buffered stdout never breaks the phase.
+    /// `opencode run --format json` emits newline-delimited raw events with an
+    /// authoritative `sessionID`, completed text parts, tool parts, and step
+    /// lifecycle records. UmaDev parses those records into the same typed live
+    /// events used by the other native bases and captures the assigned session
+    /// id for deterministic resume. A custom/older binary that prints plain text
+    /// still degrades to the conservative line forwarder.
     /// Timeout / empty-reply / error semantics are inherited unchanged from the
     /// shared subprocess layer and the `complete` fallback.
     async fn complete_streaming(
@@ -246,6 +393,9 @@ impl Runtime for OpenCodeDriver {
     ) -> Result<CompletionResponse, RuntimeError> {
         let prompt = merge_prompt(&req);
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
+        self.require_safe_version(&ws)
+            .await
+            .map_err(crate::map_subprocess_error)?;
         let args = self.call_args(&req.model);
         let model = req.model.clone();
         let program = self.program.clone();
@@ -273,17 +423,33 @@ impl Runtime for OpenCodeDriver {
                 if let Some(ev) = parse_opencode_stream_line(line) {
                     on_event(ev);
                 }
+                if let Some(session_id) = opencode_session_id_from_line(line) {
+                    self.remember_session_id(&session_id);
+                }
             },
         )
         .await;
 
         match result {
-            Ok(out) => Ok(CompletionResponse {
-                text: out.stdout,
-                id: "opencode-cli".to_string(),
-                model,
-                usage: Usage::default(),
-            }),
+            Ok(out) => {
+                if let Some(session_id) = extract_opencode_session_id(&out.stdout) {
+                    self.remember_session_id(&session_id);
+                }
+                let extraction = extract_opencode_output(&out.stdout);
+                let text = if extraction.saw_structured_event {
+                    extraction.text
+                } else {
+                    out.stdout
+                };
+                Ok(crate::redaction::sanitize_completion_response(
+                    &CompletionResponse {
+                        text,
+                        id: "opencode-cli".to_string(),
+                        model,
+                        usage: Usage::default(),
+                    },
+                ))
+            }
             Err(e) => {
                 // Fail-open: drop to the non-streaming path so a streaming-only
                 // failure (no line-buffered stdout, format drift, or the base
@@ -293,13 +459,21 @@ impl Runtime for OpenCodeDriver {
                 // before paying for a full `complete` re-run.
                 tracing::debug!(error = %e, "opencode streaming failed, falling back to non-streaming");
                 let partial = stream_buf.into_inner().unwrap_or_default();
-                if !partial.trim().is_empty() {
-                    return Ok(CompletionResponse {
-                        text: partial,
-                        id: "opencode-cli".to_string(),
-                        model,
-                        usage: Usage::default(),
-                    });
+                let extraction = extract_opencode_output(&partial);
+                let salvaged = if extraction.saw_structured_event {
+                    extraction.text
+                } else {
+                    partial
+                };
+                if !salvaged.trim().is_empty() {
+                    return Ok(crate::redaction::sanitize_completion_response(
+                        &CompletionResponse {
+                            text: salvaged,
+                            id: "opencode-cli".to_string(),
+                            model,
+                            usage: Usage::default(),
+                        },
+                    ));
                 }
                 drop(args);
                 drop(prompt);
@@ -309,20 +483,169 @@ impl Runtime for OpenCodeDriver {
     }
 }
 
-/// Turn one line of plain-text `opencode run` stdout into a [`StreamEvent`].
-///
-/// `opencode run` is NOT structured JSONL, so this is a best-effort plain-text
-/// forwarder, not a parser: every non-blank line becomes a [`StreamEvent::Text`]
-/// delta (with its newline restored so the typewriter view reads naturally),
-/// EXCEPT lines that match a recognisable tool-step marker, which become a
-/// [`StreamEvent::ToolUse`] so the activity reads richer when opencode prints
-/// them. A blank line yields `None` (no empty events). This is deliberately
-/// conservative — anything not confidently a tool step is treated as text, so a
-/// format change degrades to "plain text streaming", never to a wrong tag.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OpenCodeExtraction {
+    text: String,
+    saw_structured_event: bool,
+}
+
+fn valid_opencode_session_id(session_id: &str) -> bool {
+    (4..=160).contains(&session_id.len())
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn opencode_event(line: &str) -> Option<serde_json::Value> {
+    let value = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
+    let kind = value.get("type").and_then(serde_json::Value::as_str)?;
+    if !matches!(
+        kind,
+        "tool_use" | "step_start" | "step_finish" | "text" | "reasoning" | "error"
+    ) {
+        return None;
+    }
+    let session_id = value.get("sessionID").and_then(serde_json::Value::as_str)?;
+    if !valid_opencode_session_id(session_id)
+        || !value
+            .get("timestamp")
+            .is_some_and(serde_json::Value::is_number)
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn opencode_session_id_from_line(line: &str) -> Option<String> {
+    opencode_event(line)?
+        .get("sessionID")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn extract_opencode_session_id(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(opencode_session_id_from_line)
+}
+
+fn extract_opencode_output(stdout: &str) -> OpenCodeExtraction {
+    let mut output = OpenCodeExtraction::default();
+    for line in stdout.lines() {
+        let Some(event) = opencode_event(line) else {
+            continue;
+        };
+        output.saw_structured_event = true;
+        if event.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(text) = event
+            .get("part")
+            .filter(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+            .and_then(|part| part.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        if !output.text.is_empty() && !output.text.ends_with('\n') {
+            output.text.push('\n');
+        }
+        output.text.push_str(text);
+    }
+    output
+}
+
+fn opencode_tool_detail(part: &serde_json::Value) -> String {
+    let state = part.get("state").unwrap_or(&serde_json::Value::Null);
+    if let Some(title) = state
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+    {
+        return title.chars().take(160).collect();
+    }
+    let input = state.get("input").unwrap_or(&serde_json::Value::Null);
+    for key in [
+        "filePath",
+        "file_path",
+        "path",
+        "command",
+        "pattern",
+        "query",
+        "url",
+    ] {
+        if let Some(value) = input
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            return value.chars().take(160).collect();
+        }
+    }
+    String::new()
+}
+
+/// Turn one line of `opencode run --format json` stdout into a typed live
+/// event. The current official schema is parsed strictly enough that arbitrary
+/// JSON in an assistant answer cannot impersonate a host event: an allow-listed
+/// type, numeric timestamp, valid session id, and event-specific part shape are
+/// all required. Plain text remains a compatibility fallback for custom builds.
 fn parse_opencode_stream_line(line: &str) -> Option<umadev_runtime::StreamEvent> {
+    parse_opencode_stream_line_raw(line).map(crate::redaction::sanitize_stream_event)
+}
+
+fn parse_opencode_stream_line_raw(line: &str) -> Option<umadev_runtime::StreamEvent> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
+    }
+    if let Some(event) = opencode_event(trimmed) {
+        let kind = event.get("type").and_then(serde_json::Value::as_str)?;
+        let part = event.get("part").unwrap_or(&serde_json::Value::Null);
+        return match kind {
+            "text" if part.get("type").and_then(serde_json::Value::as_str) == Some("text") => part
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| umadev_runtime::StreamEvent::Text {
+                    delta: text.to_string(),
+                }),
+            "tool_use" if part.get("type").and_then(serde_json::Value::as_str) == Some("tool") => {
+                let name = part
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|name| !name.trim().is_empty())?;
+                Some(umadev_runtime::StreamEvent::tool_use(
+                    name,
+                    opencode_tool_detail(part),
+                ))
+            }
+            "reasoning"
+                if part.get("type").and_then(serde_json::Value::as_str) == Some("reasoning") =>
+            {
+                part.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| umadev_runtime::StreamEvent::ThinkingDelta(text.to_string()))
+            }
+            "error" => {
+                let error = event.get("error").unwrap_or(&serde_json::Value::Null);
+                let message = error
+                    .get("data")
+                    .and_then(|data| data.get("message"))
+                    .or_else(|| error.get("message"))
+                    .or_else(|| error.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("OpenCode reported an error")
+                    .chars()
+                    .take(240)
+                    .collect();
+                Some(umadev_runtime::StreamEvent::Warning { message })
+            }
+            // Step lifecycle is useful for completion accounting but carries no
+            // user-facing delta on its own; unknown future records are likewise
+            // ignored rather than guessed.
+            _ => None,
+        };
     }
     // Best-effort tool-step recognition. `opencode` decorates tool steps with a
     // leading box-drawing/pipe gutter in some terminals (e.g. "|  Read  src/x"
@@ -339,7 +662,7 @@ fn parse_opencode_stream_line(line: &str) -> Option<umadev_runtime::StreamEvent>
 }
 
 /// Recognise a known tool name in a gutter-decorated `opencode` step line,
-/// returning a [`StreamEvent::ToolUse`] or `None`. Conservative: only fires when
+/// returning a [`umadev_runtime::StreamEvent::ToolUse`] or `None`. Conservative: only fires when
 /// the line starts with a box-drawing/pipe gutter AND the first token after it
 /// is a known tool id — so ordinary prose that merely contains the word "Read"
 /// is never mis-tagged.
@@ -380,12 +703,16 @@ impl HostDriver for OpenCodeDriver {
         "OpenCode CLI"
     }
 
+    fn permission_profile(&self) -> BasePermissionProfile {
+        self.permissions
+    }
+
     fn set_continue_session(&mut self, continue_session: bool) {
         self.continue_session = continue_session;
     }
 
     fn set_session_id(&mut self, session_id: Option<String>) {
-        self.session_id = session_id;
+        self.session_id = Arc::new(RwLock::new(session_id));
     }
 
     fn set_workspace(&mut self, workspace: std::path::PathBuf) {
@@ -402,20 +729,10 @@ impl HostDriver for OpenCodeDriver {
 
     async fn probe(&self) -> ProbeResult {
         let tmp = default_workspace();
-        match run_subprocess(SubprocessCall {
-            program: &self.program,
-            args: &["--version".to_string()],
-            prompt: "",
-            channel: PromptChannel::Stdin,
-            workspace: &tmp,
-            timeout: Duration::from_secs(10),
-            env: &[],
-        })
-        .await
-        {
+        match self.require_safe_version(&tmp).await {
             // Installed — resolve the honest auth state too (gap G10).
-            Ok(out) => ProbeResult::Ready {
-                version: out.stdout.lines().next().unwrap_or("unknown").to_string(),
+            Ok(version) => ProbeResult::Ready {
+                version,
                 auth_state: self.probe_auth().await,
             },
             Err(e) if e.contains("not found on PATH") => ProbeResult::NotInstalled {
@@ -525,30 +842,100 @@ mod tests {
         assert_eq!(d.backend_id(), "opencode");
         assert_eq!(d.display_name(), "OpenCode CLI");
         assert_eq!(d.kind(), RuntimeKind::Openai);
-        // A bare (non provider/model) id is NOT passed; the headless
-        // skip-permissions flag is added by default.
+        assert_eq!(d.permission_profile(), BasePermissionProfile::Plan);
+    }
+
+    #[test]
+    fn version_floor_rejects_lower_and_accepts_equal_or_higher() {
+        let lower = validate_opencode_version("1.14.30").unwrap_err();
+        assert!(lower.contains("minimum safe version 1.14.31"));
+        assert!(lower.contains(OPENCODE_UPGRADE_COMMAND));
+
         assert_eq!(
-            d.base_args("claude-sonnet-4-6"),
-            vec![
-                "run".to_string(),
-                "--dangerously-skip-permissions".to_string()
-            ]
+            validate_opencode_version("1.14.31").unwrap(),
+            Version::new(1, 14, 31)
         );
         assert_eq!(
-            d.base_args("anthropic/claude-sonnet-4-5"),
-            vec![
-                "run".to_string(),
-                "--model".to_string(),
-                "anthropic/claude-sonnet-4-5".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-            ]
+            validate_opencode_version("1.17.16").unwrap(),
+            Version::new(1, 17, 16)
         );
+    }
+
+    #[test]
+    fn version_parser_handles_labels_prefixes_and_semver_suffixes() {
+        let parsed = validate_opencode_version("OpenCode CLI v1.15.0+linux.x64 (stable)")
+            .expect("a labelled version with build metadata is still exact semver");
+        assert_eq!(parsed.to_string(), "1.15.0+linux.x64");
+
+        let prerelease = validate_opencode_version("opencode V1.14.31-beta.1").unwrap_err();
+        assert!(
+            prerelease.contains("below UmaDev's minimum safe version"),
+            "a prerelease of the fixed version is not the fixed release: {prerelease}"
+        );
+    }
+
+    #[test]
+    fn unparseable_version_is_not_misreported_as_safe() {
+        for raw in ["", "OpenCode version unknown", "build 2026-07-15"] {
+            let err = validate_opencode_version(raw).unwrap_err();
+            assert!(err.contains("unrecognized `--version` value"), "{err}");
+            assert!(err.contains("refused to run"), "{err}");
+            assert!(err.contains(OPENCODE_UPGRADE_COMMAND), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_refuses_an_unsafe_cached_version_before_running_the_base() {
+        let d = OpenCodeDriver::with_program("echo").with_version_output_for_test("1.14.30");
+        let req = CompletionRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![umadev_runtime::Message {
+                role: "user".into(),
+                content: "must not reach echo".into(),
+            }],
+            max_tokens: None,
+            temperature: None,
+        };
+        let err = d.complete(req).await.unwrap_err().to_string();
+        assert!(err.contains("minimum safe version 1.14.31"), "{err}");
+    }
+
+    #[test]
+    fn permission_profiles_shape_legacy_args_and_no_skip_only_tightens() {
+        let cases = [
+            (BasePermissionProfile::Plan, "plan", false),
+            (BasePermissionProfile::Guarded, "build", false),
+            (BasePermissionProfile::Auto, "build", true),
+        ];
+        for (profile, agent, auto) in cases {
+            let args = OpenCodeDriver::default()
+                .with_permissions(profile)
+                .base_args_for("anthropic/claude-sonnet", false);
+            assert!(args.windows(2).any(|w| w[0] == "--agent" && w[1] == agent));
+            assert_eq!(args.iter().any(|a| a == "--auto"), auto);
+            assert!(args
+                .windows(2)
+                .any(|w| { w[0] == "--model" && w[1] == "anthropic/claude-sonnet" }));
+        }
+
+        let tightened = OpenCodeDriver::default()
+            .with_permissions(BasePermissionProfile::Auto)
+            .base_args_for("m", true);
+        assert!(tightened
+            .windows(2)
+            .any(|w| w[0] == "--agent" && w[1] == "build"));
+        assert!(!tightened.iter().any(|a| a == "--auto"));
     }
 
     #[test]
     fn continue_session_appends_resume_flag() {
         let fresh = OpenCodeDriver::default();
-        assert!(!fresh.call_args("m").contains(&"--continue".to_string()));
+        let fresh_args = fresh.call_args("m");
+        assert!(!fresh_args.contains(&"--continue".to_string()));
+        assert!(fresh_args
+            .windows(2)
+            .any(|args| args == ["--format", "json"]));
 
         let mut resumed = OpenCodeDriver::default();
         resumed.set_continue_session(true);
@@ -590,6 +977,14 @@ mod tests {
         let args = fresh_pinned.call_args("m");
         assert!(!args.contains(&"--session".to_string()));
         assert!(!args.contains(&"--continue".to_string()));
+    }
+
+    #[test]
+    fn a_fork_reset_does_not_erase_the_parent_session() {
+        let parent = OpenCodeDriver::default().with_session_id(Some("ses_parent".to_string()));
+        let child = parent.clone().with_session_id(None);
+        assert_eq!(parent.pinned_session_id().as_deref(), Some("ses_parent"));
+        assert!(child.pinned_session_id().is_none());
     }
 
     #[tokio::test]
@@ -700,6 +1095,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn structured_json_extracts_text_tool_and_authoritative_session() {
+        let tool = r#"{"type":"tool_use","timestamp":123,"sessionID":"ses_abc","part":{"type":"tool","tool":"read","state":{"status":"completed","title":"Read src/lib.rs","input":{"filePath":"src/lib.rs"}}}}"#;
+        let text = r#"{"type":"text","timestamp":124,"sessionID":"ses_abc","part":{"type":"text","text":"done","time":{"start":1,"end":2}}}"#;
+        assert_eq!(
+            opencode_session_id_from_line(tool).as_deref(),
+            Some("ses_abc")
+        );
+        match parse_opencode_stream_line(tool).unwrap() {
+            umadev_runtime::StreamEvent::ToolUse { name, detail, edit } => {
+                assert_eq!(name, "read");
+                assert_eq!(detail, "Read src/lib.rs");
+                assert!(edit.is_none());
+            }
+            other => panic!("expected structured tool event, got {other:?}"),
+        }
+        assert_eq!(
+            parse_opencode_stream_line(text),
+            Some(umadev_runtime::StreamEvent::Text {
+                delta: "done".to_string()
+            })
+        );
+        let output = extract_opencode_output(&format!("{tool}\n{text}\n"));
+        assert!(output.saw_structured_event);
+        assert_eq!(output.text, "done");
+        assert_eq!(
+            extract_opencode_session_id(&format!("{tool}\n{text}\n")).as_deref(),
+            Some("ses_abc")
+        );
+    }
+
+    #[test]
+    fn structured_parser_rejects_spoofed_or_malformed_json() {
+        for line in [
+            r#"{"type":"text","sessionID":"ses_abc","part":{"type":"text","text":"no timestamp"}}"#,
+            r#"{"type":"text","timestamp":1,"sessionID":"../../escape","part":{"type":"text","text":"bad id"}}"#,
+            r#"{"type":"unknown","timestamp":1,"sessionID":"ses_abc"}"#,
+        ] {
+            assert!(opencode_event(line).is_none(), "must reject: {line}");
+            // Compatibility fallback treats an untrusted JSON-looking line as
+            // plain text, never as a privileged tool/session event.
+            assert!(matches!(
+                parse_opencode_stream_line(line),
+                Some(umadev_runtime::StreamEvent::Text { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn captured_fresh_session_becomes_a_pinned_resume() {
+        let mut driver = OpenCodeDriver::default();
+        driver.remember_session_id("ses_fresh");
+        driver.set_continue_session(true);
+        let args = driver.call_args("m");
+        assert!(args
+            .windows(2)
+            .any(|args| args == ["--session", "ses_fresh"]));
+        assert!(!args.contains(&"--continue".to_string()));
+    }
+
     // The fake is a `#!/bin/sh` script Windows cannot exec; the per-line
     // forwarding logic is also covered by the `parse_opencode_stream_line` unit
     // tests above, which are platform-independent.
@@ -724,7 +1179,8 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let d = OpenCodeDriver::with_program(script.to_str().unwrap());
+        let d = OpenCodeDriver::with_program(script.to_str().unwrap())
+            .with_version_output_for_test("1.17.16");
         let req = CompletionRequest {
             model: "m".into(),
             system: None,
@@ -758,7 +1214,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_drives_a_fake_opencode_binary() {
-        let d = OpenCodeDriver::with_program("echo");
+        let d = OpenCodeDriver::with_program("echo").with_version_output_for_test("1.17.16");
         let req = CompletionRequest {
             model: "anthropic/claude-sonnet-4-5".into(),
             system: Some("be concise".into()),
@@ -776,5 +1232,19 @@ mod tests {
         assert!(resp.text.contains("--model"));
         assert!(resp.text.contains("be concise"));
         assert!(resp.text.contains("explain the repo"));
+    }
+
+    #[test]
+    fn stream_events_redact_synthetic_secrets() {
+        const SECRET: &str = "SYNTH_OPENCODE_SECRET_DO_NOT_LEAK_73";
+        let text = parse_opencode_stream_line(&format!("password={SECRET}"));
+        let tool = parse_opencode_stream_line(&format!(
+            "│ Bash curl -H 'Authorization: Bearer {SECRET}' example.test"
+        ));
+        let rendered = format!("{text:?}{tool:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "stream event leaked: {rendered}"
+        );
     }
 }

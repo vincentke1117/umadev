@@ -36,7 +36,8 @@
 //! 4. **Comment hygiene** (`UD-CODE-006d`, ADVISORY) — a touched source file
 //!    that newly gains an 8-line ordinary-comment run, or at least 12 ordinary
 //!    comment-only lines exceeding its code lines, gets a concise advisory.
-//!    Documentation, licenses, generated files, and tests are exempt.
+//!    Language-specific documentation, licenses, generated/vendored files,
+//!    directives, and tests are exempt.
 //!
 //! # The architecture-doc layering convention
 //!
@@ -88,7 +89,7 @@
 //! Every path that cannot be determined yields NO findings: an unreadable /
 //! absent architecture doc, a doc with no layering declaration, an empty or
 //! unresolvable import-edge set, an unreadable tree, and a huge repo (more
-//! than [`MAX_SCAN_FILES`] source files, or a blown read budget) all degrade
+//! than the bounded source-file limit, or a blown read budget) all degrade
 //! to a silent skip. The gate can never fabricate a block, never error, and
 //! its rework is bounded by the caller's existing fix-round counters.
 
@@ -178,7 +179,7 @@ const SKIP_DIRS: &[&str] = &[
 const SRC_EXT: &[&str] = &[
     "ts", "tsx", "js", "jsx", "mjs", "cjs", "vue", "svelte", "astro", "py", "rs", "go", "java",
     "kt", "kts", "rb", "php", "cs", "ex", "exs", "dart", "swift", "scala", "c", "cc", "cpp", "h",
-    "hpp",
+    "hpp", "m", "mm", "lua",
 ];
 
 /// The god-file line ceilings, honoring `UMADEV_ARCH_MAX_FILE_LINES` for the
@@ -213,7 +214,7 @@ pub struct Finding {
     /// importer, for a layer violation).
     pub file: String,
     /// The violated rule's clause id ([`RULE_GOD_FILE`] / [`RULE_LAYER`] /
-    /// [`RULE_CLONE`]).
+    /// [`RULE_CLONE`] / [`RULE_COMMENT_HYGIENE`]).
     pub rule_id: &'static str,
 }
 
@@ -236,7 +237,13 @@ struct CommentStats {
     code: usize,
     max_run: usize,
     max_run_start: u32,
-    long_runs: HashMap<u64, (u32, usize)>,
+    runs: Vec<CommentRun>,
+}
+
+#[derive(Debug, Clone)]
+struct CommentRun {
+    start: u32,
+    lines: Vec<u64>,
 }
 
 /// A point-in-time snapshot of the project's fitness-relevant source surface,
@@ -260,7 +267,7 @@ struct ArchScan {
 }
 
 /// Capture the pre-step architecture baseline. Bounded and fail-open: a repo
-/// over [`MAX_SCAN_FILES`] source files (or a blown read budget) yields a
+/// over the bounded source-file limit (or a blown read budget) yields a
 /// `disabled` baseline against which [`arch_fitness_findings_since`] reports
 /// nothing.
 #[must_use]
@@ -345,13 +352,21 @@ fn scan(root: &Path) -> Option<ArchScan> {
         } else {
             HashMap::new()
         };
+        let comments = if bytes.len() > MAX_FILE_BYTES {
+            CommentStats::default()
+        } else {
+            std::str::from_utf8(&bytes)
+                .ok()
+                .map(|text| comment_stats(text, &rel))
+                .unwrap_or_default()
+        };
         files.insert(
             rel,
             FileScan {
                 lines: content.lines().count(),
                 hash: fnv(content.as_bytes()),
                 windows,
-                comments: comment_stats(&content),
+                comments,
             },
         );
     }
@@ -377,7 +392,8 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, depth: usi
         match classify_no_follow(&p) {
             EntryKind::Dir => {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+                let lower_name = name.to_ascii_lowercase();
+                if name.starts_with('.') || SKIP_DIRS.contains(&lower_name.as_str()) {
                     continue;
                 }
                 collect(root, &p, out, depth + 1);
@@ -433,12 +449,12 @@ fn is_exempt(rel: &str) -> bool {
     let test_by_name = name.contains(".test.")
         || name.contains(".spec.")
         || name.starts_with("test_")
-        || name.ends_with("_test.py")
-        || name.ends_with("_test.go")
-        || name.ends_with("_test.rs")
-        || name.ends_with("_test.ts")
-        || name.ends_with("_test.js")
-        || name.ends_with("_spec.rb")
+        || name.rsplit_once('.').is_some_and(|(stem, _)| {
+            stem.ends_with("_test")
+                || stem.ends_with("_tests")
+                || stem.ends_with("_spec")
+                || stem.ends_with("_specs")
+        })
         || name.ends_with("test.java")
         || name.ends_with("tests.java")
         || name.ends_with("test.kt");
@@ -497,16 +513,20 @@ pub fn arch_fitness_findings(root: &Path, slug: &str, touched: &[PathBuf]) -> Ve
         }
     }
     out.extend(clone_findings(&now, &rels, None));
-    out.extend(comment_hygiene_findings(&now, &rels, None));
+    // Comment hygiene is intentionally baseline-only. A touched path says the
+    // file changed, but without its previous comment shape we cannot prove the
+    // narration was added by this change; surfacing legacy debt would violate
+    // the rule's "newly gains" boundary.
     out
 }
 
 /// The step-level architecture-fitness check: compare the current tree to the
-/// pre-step [`baseline`], derive the touched set, and run all three rules
+/// pre-step [`baseline`], derive the touched set, and run all four rules
 /// with full semantics — a NEW file over the new-file ceiling or a file that
 /// GREW PAST the grown ceiling blocks; a duplicated block of ADDED code is
-/// advisory. Empty when the baseline is disabled or the tree cannot be
-/// scanned (fail-open, `UD-CODE-006`).
+/// advisory; newly added comment narration is advisory. Empty when the
+/// baseline is disabled or the tree cannot be scanned (fail-open,
+/// `UD-CODE-006`).
 #[must_use]
 pub fn arch_fitness_findings_since(root: &Path, slug: &str, before: &ArchBaseline) -> Vec<Finding> {
     if before.disabled {
@@ -955,89 +975,505 @@ fn windows_of(content: &str) -> HashMap<u64, u32> {
 // Rule 4 — comment hygiene (advisory)
 // ---------------------------------------------------------------------------
 
-/// Count ordinary explanatory comments without treating API docs, licenses, or
-/// block documentation as implementation narration. The classifier is
-/// intentionally conservative: a miss costs one advisory, never a block.
-fn comment_stats(content: &str) -> CommentStats {
-    let mut stats = CommentStats::default();
-    let mut run = 0usize;
-    let mut run_start = 0u32;
-    let mut run_text = String::new();
-    let mut block_end: Option<&'static str> = None;
-    let mut block_is_ordinary = false;
-    let finish_run = |stats: &mut CommentStats, run: usize, start: u32, text: &mut String| {
-        if run >= LONG_COMMENT_RUN {
-            stats.long_runs.insert(fnv(text.as_bytes()), (start, run));
-        }
-        text.clear();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentStyle {
+    Slash,
+    Hash,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+enum ClassifiedLine {
+    Ordinary { hash: u64, style: CommentStyle },
+    Exempt,
+    Blank,
+    Code,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LineCommentSyntax {
+    Slash,
+    Hash,
+    SlashAndHash,
+    Dash,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BlockCommentSyntax {
+    None,
+    C,
+    CAndHtml,
+    Ruby,
+    Lua,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CommentSyntax {
+    line: LineCommentSyntax,
+    block: BlockCommentSyntax,
+}
+
+impl CommentSyntax {
+    fn slash(self) -> bool {
+        matches!(
+            self.line,
+            LineCommentSyntax::Slash | LineCommentSyntax::SlashAndHash
+        )
+    }
+
+    fn hash(self) -> bool {
+        matches!(
+            self.line,
+            LineCommentSyntax::Hash | LineCommentSyntax::SlashAndHash
+        )
+    }
+
+    fn dash(self) -> bool {
+        matches!(self.line, LineCommentSyntax::Dash)
+    }
+
+    fn c_block(self) -> bool {
+        matches!(
+            self.block,
+            BlockCommentSyntax::C | BlockCommentSyntax::CAndHtml
+        )
+    }
+
+    fn html_block(self) -> bool {
+        matches!(self.block, BlockCommentSyntax::CAndHtml)
+    }
+
+    fn ruby_block(self) -> bool {
+        matches!(self.block, BlockCommentSyntax::Ruby)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockState {
+    end: &'static str,
+    ordinary: bool,
+}
+
+fn comment_syntax(rel: &str) -> Option<CommentSyntax> {
+    let ext = rel.rsplit_once('.')?.1.to_ascii_lowercase();
+    let syntax = match ext.as_str() {
+        "py" | "ex" | "exs" => CommentSyntax {
+            line: LineCommentSyntax::Hash,
+            block: BlockCommentSyntax::None,
+        },
+        "rb" => CommentSyntax {
+            line: LineCommentSyntax::Hash,
+            block: BlockCommentSyntax::Ruby,
+        },
+        "lua" => CommentSyntax {
+            line: LineCommentSyntax::Dash,
+            block: BlockCommentSyntax::Lua,
+        },
+        "php" => CommentSyntax {
+            line: LineCommentSyntax::SlashAndHash,
+            block: BlockCommentSyntax::C,
+        },
+        "vue" | "svelte" | "astro" => CommentSyntax {
+            line: LineCommentSyntax::Slash,
+            block: BlockCommentSyntax::CAndHtml,
+        },
+        ext if SRC_EXT.contains(&ext) => CommentSyntax {
+            line: LineCommentSyntax::Slash,
+            block: BlockCommentSyntax::C,
+        },
+        _ => return None,
     };
-    for (index, raw) in content.lines().enumerate() {
-        let line_no = u32::try_from(index + 1).unwrap_or(u32::MAX);
-        let trimmed = raw.trim();
-        let license = index < 10
-            && (trimmed.contains("SPDX-License-Identifier")
-                || trimmed.to_ascii_lowercase().contains("copyright"));
-        let ordinary;
-        if let Some(end) = block_end {
-            ordinary = block_is_ordinary;
-            if trimmed.contains(end) {
-                block_end = None;
+    Some(syntax)
+}
+
+fn generated_header(content: &str) -> bool {
+    content.lines().take(20).any(|raw| {
+        let line = raw.trim().to_ascii_lowercase();
+        let comment_header = line.starts_with("//")
+            || line.starts_with('#')
+            || line.starts_with("/*")
+            || line.starts_with('*')
+            || line.starts_with("<!--")
+            || line.starts_with("--");
+        comment_header
+            && (line.contains("@generated")
+                || line.contains("<auto-generated")
+                || (line.contains("code generated") && line.contains("do not edit"))
+                || (line.contains("generated by") && line.contains("do not edit"))
+                || (line.contains("auto-generated") && line.contains("do not edit")))
+    })
+}
+
+fn license_header(content: &str) -> bool {
+    content.lines().take(128).any(|raw| {
+        let line = raw.trim().to_ascii_lowercase();
+        let comment_header = line.starts_with("//")
+            || line.starts_with('#')
+            || line.starts_with("/*")
+            || line.starts_with('*')
+            || line.starts_with("<!--")
+            || line.starts_with("--");
+        comment_header
+            && (line.contains("spdx-license-identifier")
+                || line.contains("copyright")
+                || line.contains("licensed under")
+                || line.contains("permission is hereby granted")
+                || line.contains("apache license")
+                || line.contains("gnu general public license")
+                || line.contains("mozilla public license"))
+    })
+}
+
+fn comment_directive(trimmed: &str) -> bool {
+    let body = trimmed
+        .trim_start_matches(['/', '#', '-', '*', '!', ':'])
+        .trim()
+        .to_ascii_lowercase();
+    [
+        "@ts-",
+        "+build",
+        "biome-ignore",
+        "clang-format",
+        "eslint-",
+        "fmt:",
+        "go:",
+        "ktlint-",
+        "mypy:",
+        "noqa",
+        "nolint",
+        "nosec",
+        "noinspection",
+        "pylint:",
+        "pyright:",
+        "region",
+        "endregion",
+        "ruff:",
+        "swiftlint:",
+        "type:",
+    ]
+    .iter()
+    .any(|prefix| body.starts_with(prefix))
+}
+
+fn comment_hash(trimmed: &str) -> u64 {
+    let mut normalized = String::with_capacity(trimmed.len());
+    let mut whitespace = false;
+    for ch in trimmed.chars() {
+        if ch.is_whitespace() {
+            whitespace = true;
+        } else {
+            if whitespace && !normalized.is_empty() {
+                normalized.push(' ');
             }
-        } else if let Some((end, is_doc)) = if trimmed.starts_with("/*") {
-            Some((
-                "*/",
-                trimmed.starts_with("/**") || trimmed.starts_with("/*!"),
-            ))
-        } else if trimmed.starts_with("<!--") {
-            Some(("-->", false))
-        } else if trimmed.starts_with("--[[") {
-            Some(("]]", false))
+            whitespace = false;
+            normalized.extend(ch.to_lowercase());
+        }
+    }
+    fnv(normalized.as_bytes())
+}
+
+fn block_opener(
+    trimmed: &str,
+    syntax: CommentSyntax,
+    header_exempt: bool,
+) -> Option<(&'static str, &'static str, bool)> {
+    if syntax.c_block() && trimmed.starts_with("/*") {
+        let doc = trimmed.starts_with("/**") || trimmed.starts_with("/*!");
+        return Some((
+            "/*",
+            "*/",
+            !doc && !header_exempt && !comment_directive(trimmed),
+        ));
+    }
+    if syntax.html_block() && trimmed.starts_with("<!--") {
+        return Some(("<!--", "-->", !header_exempt));
+    }
+    if matches!(syntax.block, BlockCommentSyntax::Lua) && trimmed.starts_with("--[[") {
+        return Some(("--[[", "]]", !header_exempt));
+    }
+    None
+}
+
+fn api_declaration(rel: &str, trimmed: &str) -> bool {
+    let ext = rel
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "go" => ["package ", "func ", "type ", "var ", "const "]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix)),
+        "rb" => ["class ", "module ", "def ", "attr_"]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix)),
+        _ => false,
+    }
+}
+
+fn exclude_implicit_api_docs(rel: &str, raw: &[&str], lines: &mut [ClassifiedLine]) {
+    let mut index = 0usize;
+    while index < lines.len() {
+        let style = if let Some(ClassifiedLine::Ordinary { style, .. }) = lines.get(index) {
+            *style
+        } else {
+            index += 1;
+            continue;
+        };
+        let start = index;
+        while matches!(
+            lines.get(index),
+            Some(ClassifiedLine::Ordinary { style: current, .. }) if *current == style
+        ) {
+            index += 1;
+        }
+        let mut next = index;
+        while matches!(lines.get(next), Some(ClassifiedLine::Exempt)) {
+            next += 1;
+        }
+        let eligible_style = match rel
+            .rsplit_once('.')
+            .map(|(_, ext)| ext.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("go") => style == CommentStyle::Slash,
+            Some("rb") => style == CommentStyle::Hash,
+            _ => false,
+        };
+        if eligible_style
+            && raw
+                .get(next)
+                .is_some_and(|line| api_declaration(rel, line.trim()))
+        {
+            lines[start..index].fill(ClassifiedLine::Exempt);
+        }
+    }
+}
+
+fn finish_comment_run(stats: &mut CommentStats, start: u32, run: &mut Vec<u64>) {
+    if run.is_empty() {
+        return;
+    }
+    if run.len() > stats.max_run {
+        stats.max_run = run.len();
+        stats.max_run_start = start;
+    }
+    stats.runs.push(CommentRun {
+        start,
+        lines: std::mem::take(run),
+    });
+}
+
+/// Language-aware, comment-only-line classifier. Unknown, generated, oversized,
+/// and non-UTF-8 inputs produce the default record and therefore no advisory.
+fn comment_stats(content: &str, rel: &str) -> CommentStats {
+    let Some(syntax) = comment_syntax(rel) else {
+        return CommentStats::default();
+    };
+    if generated_header(content) {
+        return CommentStats::default();
+    }
+    let raw: Vec<&str> = content.lines().collect();
+    let has_license = license_header(content);
+    let mut block: Option<BlockState> = None;
+    let mut code_seen = false;
+    let mut classified = Vec::with_capacity(raw.len());
+
+    for (index, line) in raw.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            classified.push(ClassifiedLine::Blank);
+            continue;
+        }
+        if index == 0 && trimmed.starts_with("#!") {
+            classified.push(ClassifiedLine::Exempt);
+            continue;
+        }
+        let header_exempt = has_license && !code_seen;
+        if let Some(state) = block {
+            if let Some(end) = trimmed.find(state.end) {
+                block = None;
+                if trimmed[end + state.end.len()..].trim().is_empty() {
+                    if state.ordinary {
+                        classified.push(ClassifiedLine::Ordinary {
+                            hash: comment_hash(trimmed),
+                            style: CommentStyle::Other,
+                        });
+                    } else {
+                        classified.push(ClassifiedLine::Exempt);
+                    }
+                } else {
+                    code_seen = true;
+                    classified.push(ClassifiedLine::Code);
+                }
+            } else if state.ordinary {
+                classified.push(ClassifiedLine::Ordinary {
+                    hash: comment_hash(trimmed),
+                    style: CommentStyle::Other,
+                });
+            } else {
+                classified.push(ClassifiedLine::Exempt);
+            }
+            continue;
+        }
+
+        if syntax.ruby_block() && line.starts_with("=begin") {
+            block = Some(BlockState {
+                end: "=end",
+                ordinary: !header_exempt,
+            });
+            classified.push(if header_exempt {
+                ClassifiedLine::Exempt
+            } else {
+                ClassifiedLine::Ordinary {
+                    hash: comment_hash(trimmed),
+                    style: CommentStyle::Other,
+                }
+            });
+            continue;
+        }
+
+        if let Some((open, end, ordinary)) = block_opener(trimmed, syntax, header_exempt) {
+            let tail = &trimmed[open.len()..];
+            if let Some(end_at) = tail.find(end) {
+                let suffix = tail[end_at + end.len()..].trim();
+                if !suffix.is_empty() {
+                    code_seen = true;
+                    classified.push(ClassifiedLine::Code);
+                } else if ordinary {
+                    classified.push(ClassifiedLine::Ordinary {
+                        hash: comment_hash(trimmed),
+                        style: CommentStyle::Other,
+                    });
+                } else {
+                    classified.push(ClassifiedLine::Exempt);
+                }
+            } else {
+                block = Some(BlockState { end, ordinary });
+                classified.push(if ordinary {
+                    ClassifiedLine::Ordinary {
+                        hash: comment_hash(trimmed),
+                        style: CommentStyle::Other,
+                    }
+                } else {
+                    ClassifiedLine::Exempt
+                });
+            }
+            continue;
+        }
+
+        let line_comment = if syntax.slash() && trimmed.starts_with("//") {
+            let exempt = header_exempt
+                || trimmed.starts_with("///")
+                || trimmed.starts_with("//!")
+                || comment_directive(trimmed);
+            Some((CommentStyle::Slash, exempt))
+        } else if syntax.hash() && trimmed.starts_with('#') {
+            let exempt = header_exempt
+                || trimmed.starts_with("#!")
+                || trimmed.starts_with("#[")
+                || trimmed.starts_with("#:")
+                || (index < 2 && (trimmed.contains("coding:") || trimmed.contains("coding=")))
+                || comment_directive(trimmed);
+            Some((CommentStyle::Hash, exempt))
+        } else if syntax.dash() && trimmed.starts_with("--") {
+            let exempt = header_exempt || trimmed.starts_with("---") || comment_directive(trimmed);
+            Some((CommentStyle::Other, exempt))
         } else {
             None
-        } {
-            ordinary = !license && !is_doc;
-            if !trimmed[2..].contains(end) {
-                block_end = Some(end);
-                block_is_ordinary = ordinary;
+        };
+        match line_comment {
+            Some((_, true)) => classified.push(ClassifiedLine::Exempt),
+            Some((style, false)) => classified.push(ClassifiedLine::Ordinary {
+                hash: comment_hash(trimmed),
+                style,
+            }),
+            None => {
+                code_seen = true;
+                classified.push(ClassifiedLine::Code);
             }
-        } else {
-            ordinary = !license
-                && ((trimmed.starts_with("//")
-                    && !trimmed.starts_with("///")
-                    && !trimmed.starts_with("//!"))
-                    || (trimmed.starts_with('#')
-                        && !trimmed.starts_with("#!")
-                        && !trimmed.starts_with("#["))
-                    || trimmed.starts_with("-- "));
         }
-        if ordinary {
-            stats.ordinary += 1;
-            if run == 0 {
-                run_start = line_no;
-            }
-            run += 1;
-            run_text.push_str(trimmed);
-            run_text.push('\n');
-            if run > stats.max_run {
-                stats.max_run = run;
-                stats.max_run_start = run_start;
-            }
-            continue;
-        }
-        finish_run(&mut stats, run, run_start, &mut run_text);
-        run = 0;
-        if trimmed.is_empty()
-            || license
-            || trimmed.starts_with("/*")
-            || trimmed.starts_with('*')
-            || trimmed.starts_with("*/")
-        {
-            continue;
-        }
-        stats.code += 1;
     }
-    finish_run(&mut stats, run, run_start, &mut run_text);
+
+    if matches!(
+        rel.rsplit_once('.')
+            .map(|(_, ext)| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("go" | "rb")
+    ) {
+        exclude_implicit_api_docs(rel, &raw, &mut classified);
+    }
+    let mut stats = CommentStats::default();
+    let mut run = Vec::new();
+    let mut run_start = 0u32;
+    for (index, line) in classified.into_iter().enumerate() {
+        match line {
+            ClassifiedLine::Ordinary { hash, .. } => {
+                if run.is_empty() {
+                    run_start = u32::try_from(index + 1).unwrap_or(u32::MAX);
+                }
+                stats.ordinary += 1;
+                run.push(hash);
+            }
+            ClassifiedLine::Code => {
+                finish_comment_run(&mut stats, run_start, &mut run);
+                stats.code += 1;
+            }
+            ClassifiedLine::Exempt | ClassifiedLine::Blank => {
+                finish_comment_run(&mut stats, run_start, &mut run);
+            }
+        }
+    }
+    finish_comment_run(&mut stats, run_start, &mut run);
     stats
+}
+
+fn added_comment_evidence(
+    after: &CommentStats,
+    prior: Option<&CommentStats>,
+) -> (usize, Option<(u32, usize)>) {
+    let Some(prior) = prior else {
+        let run = after
+            .runs
+            .iter()
+            .find(|run| run.lines.len() >= LONG_COMMENT_RUN)
+            .map(|run| (run.start, run.lines.len()));
+        return (after.ordinary, run);
+    };
+    let mut remaining = HashMap::new();
+    for hash in prior.runs.iter().flat_map(|run| &run.lines) {
+        *remaining.entry(*hash).or_insert(0usize) += 1;
+    }
+    let mut added = 0usize;
+    let mut first_long_added = None;
+    for run in &after.runs {
+        let mut consecutive = 0usize;
+        let mut consecutive_start = run.start;
+        for (offset, hash) in run.lines.iter().enumerate() {
+            let reused = remaining.get_mut(hash).is_some_and(|count| {
+                if *count == 0 {
+                    false
+                } else {
+                    *count -= 1;
+                    true
+                }
+            });
+            if reused {
+                consecutive = 0;
+            } else {
+                added += 1;
+                if consecutive == 0 {
+                    consecutive_start = run
+                        .start
+                        .saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
+                }
+                consecutive += 1;
+                if consecutive >= LONG_COMMENT_RUN && first_long_added.is_none() {
+                    first_long_added = Some((consecutive_start, consecutive));
+                }
+            }
+        }
+    }
+    (added, first_long_added)
 }
 
 fn comment_hygiene_findings(
@@ -1054,18 +1490,26 @@ fn comment_hygiene_findings(
             continue;
         };
         let prior = before.and_then(|b| b.files.get(rel)).map(|f| &f.comments);
-        let new_long_run = after
-            .long_runs
-            .iter()
-            .filter(|(hash, _)| prior.is_none_or(|p| !p.long_runs.contains_key(hash)))
-            .min_by_key(|(_, (line, _))| *line)
-            .map(|(_, &(line, len))| (line, len));
+        let (added, added_long_run) = added_comment_evidence(after, prior);
+        let grew = prior.is_none_or(|p| after.ordinary > p.ordinary);
+        let crossed_long_run =
+            after.max_run >= LONG_COMMENT_RUN && prior.is_none_or(|p| p.max_run < LONG_COMMENT_RUN);
+        let new_long_run = if grew && added_long_run.is_some() {
+            added_long_run
+        } else if crossed_long_run {
+            after
+                .runs
+                .iter()
+                .find(|run| run.lines.len() >= LONG_COMMENT_RUN)
+                .map(|run| (run.start, run.lines.len()))
+        } else {
+            None
+        };
         let ratio = after.ordinary >= COMMENT_RATIO_MIN && after.ordinary > after.code;
         let prior_ratio =
             prior.is_some_and(|p| p.ordinary >= COMMENT_RATIO_MIN && p.ordinary > p.code);
-        let newly_worse_ratio = ratio
-            && (!prior_ratio
-                || prior.is_some_and(|p| after.ordinary >= p.ordinary.saturating_add(4)));
+        let newly_worse_ratio =
+            ratio && grew && added > 0 && (!prior_ratio || added >= COMMENT_RATIO_MIN);
         if new_long_run.is_none() && !newly_worse_ratio {
             continue;
         }
@@ -1075,9 +1519,9 @@ fn comment_hygiene_findings(
             blocking: false,
             message: format!(
                 "arch-fitness: {rel}:{line} has comment narration heavier than the code \
-                 ({} ordinary comment lines, {} code lines, longest run {}) — keep comments \
+                 ({} ordinary comment lines, {} newly added, {} code lines, longest run {}) — keep comments \
                  for why/invariants and move history or repair narration to the change report",
-                after.ordinary, after.code, reported_run
+                after.ordinary, added, after.code, reported_run
             ),
             file: rel.clone(),
             rule_id: RULE_COMMENT_HYGIENE,
@@ -1586,6 +2030,319 @@ mod tests {
         );
     }
 
+    #[test]
+    fn supported_languages_use_their_own_comment_syntax() {
+        for ext in SRC_EXT {
+            let rel = format!("src/sample.{ext}");
+            let syntax = comment_syntax(&rel).unwrap_or_else(|| panic!("missing syntax for {ext}"));
+            let prefix = if syntax.hash() {
+                "#"
+            } else if syntax.dash() {
+                "--"
+            } else {
+                assert!(syntax.slash(), "{ext} needs a reliable line-comment form");
+                "//"
+            };
+            let body = (0..LONG_COMMENT_RUN)
+                .map(|n| format!("{prefix} repair narration {n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let stats = comment_stats(&body, &rel);
+            assert_eq!(stats.max_run, LONG_COMMENT_RUN, "wrong syntax for {ext}");
+        }
+
+        let preprocessor = (0..14)
+            .map(|n| format!("#include <header_{n}.h>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let stats = comment_stats(&preprocessor, "src/native.cpp");
+        assert_eq!(stats.ordinary, 0, "C/C++ preprocessor lines are code");
+        assert_eq!(stats.code, 14);
+    }
+
+    #[test]
+    fn generated_license_and_api_documentation_are_exempt() {
+        for (rel, body) in [
+            (
+                "src/schema_runtime.go",
+                format!(
+                    "// Code generated by schema-tool. DO NOT EDIT.\n{}\npackage generated\n",
+                    (0..12)
+                        .map(|n| format!("// generated explanation {n}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            ),
+            (
+                "src/licensed.ts",
+                format!(
+                    "/*\n * Copyright 2026 Example\n * Licensed under the Apache License, Version 2.0\n{}\n */\nexport const value = 1;\n",
+                    (0..12)
+                        .map(|n| format!(" * license term {n}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            ),
+            (
+                "src/cli.js",
+                format!(
+                    "#!/usr/bin/env node\n// Copyright 2026 Example\n{}\nexport const value = 1;\n",
+                    (0..12)
+                        .map(|n| format!("// license term {n}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            ),
+            (
+                "src/widget.go",
+                format!(
+                    "{}\ntype Widget struct {{}}\n",
+                    (0..10)
+                        .map(|n| format!("// Widget public contract detail {n}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            ),
+            (
+                "src/widget.rb",
+                format!(
+                    "{}\nclass Widget\nend\n",
+                    (0..10)
+                        .map(|n| format!("# Widget public contract detail {n}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let before = baseline(tmp.path());
+            write(tmp.path(), rel, &body);
+            let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+            assert!(
+                !findings.iter().any(|f| f.rule_id == RULE_COMMENT_HYGIENE),
+                "{rel} is exempt: {findings:?}"
+            );
+        }
+
+        let detached = TempDir::new().unwrap();
+        let detached_before = baseline(detached.path());
+        let narration = (0..10)
+            .map(|n| format!("// repair history {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write(
+            detached.path(),
+            "src/widget.go",
+            &format!("{narration}\n\ntype Widget struct {{}}\n"),
+        );
+        let findings = arch_fitness_findings_since(detached.path(), "demo", &detached_before);
+        assert!(
+            findings.iter().any(|f| f.rule_id == RULE_COMMENT_HYGIENE),
+            "a detached Go comment block is not API documentation: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn only_comment_only_lines_count() {
+        let tmp = TempDir::new().unwrap();
+        let before = baseline(tmp.path());
+        let body = (0..12)
+            .map(|n| format!("/* invariant {n} */ const value_{n} = {n};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write(tmp.path(), "src/inline.ts", &body);
+        let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+        assert!(
+            !findings.iter().any(|f| f.rule_id == RULE_COMMENT_HYGIENE),
+            "inline comments are code lines, not comment-only narration: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn editing_an_existing_long_block_without_growth_is_not_new_debt() {
+        let tmp = TempDir::new().unwrap();
+        let before_text = (0..10)
+            .map(|n| format!("// legacy explanation {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write(
+            tmp.path(),
+            "src/legacy.ts",
+            &format!("{before_text}\nexport const value = 1;\n"),
+        );
+        let before = baseline(tmp.path());
+        let after_text = before_text.replace("explanation 4", "clarification four");
+        write(
+            tmp.path(),
+            "src/legacy.ts",
+            &format!("{after_text}\nexport const value = 2;\n"),
+        );
+        let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+        assert!(
+            !findings.iter().any(|f| f.rule_id == RULE_COMMENT_HYGIENE),
+            "a wording edit with no comment growth is not newly gained debt: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn crossing_the_long_run_threshold_is_advisory() {
+        let tmp = TempDir::new().unwrap();
+        let seven = (0..7)
+            .map(|n| format!("// repair narration {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write(
+            tmp.path(),
+            "src/crossing.ts",
+            &format!("{seven}\nexport const value = 1;\n"),
+        );
+        let before = baseline(tmp.path());
+        write(
+            tmp.path(),
+            "src/crossing.ts",
+            &format!("{seven}\n// repair narration 7\nexport const value = 1;\n"),
+        );
+        let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+        assert!(findings
+            .iter()
+            .any(|f| f.rule_id == RULE_COMMENT_HYGIENE && !f.blocking));
+    }
+
+    #[test]
+    fn dispersed_comment_ratio_is_governed_without_a_comment_quota() {
+        let tmp = TempDir::new().unwrap();
+        let comments = (0..COMMENT_RATIO_MIN)
+            .map(|n| format!("// repair note {n}\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let before = baseline(tmp.path());
+        write(
+            tmp.path(),
+            "src/ratio.ts",
+            &format!("{comments}\nexport const value = 1;\n"),
+        );
+        let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+        assert!(findings.iter().any(|f| {
+            f.rule_id == RULE_COMMENT_HYGIENE && f.message.contains("12 newly added")
+        }));
+
+        let clean = TempDir::new().unwrap();
+        let clean_before = baseline(clean.path());
+        write(
+            clean.path(),
+            "src/no-comments.ts",
+            "export const value = 1;\n",
+        );
+        assert!(
+            !arch_fitness_findings_since(clean.path(), "demo", &clean_before)
+                .iter()
+                .any(|f| f.rule_id == RULE_COMMENT_HYGIENE)
+        );
+    }
+
+    #[test]
+    fn a_small_addition_to_pre_existing_ratio_debt_is_not_reflagged() {
+        let tmp = TempDir::new().unwrap();
+        let comments = (0..COMMENT_RATIO_MIN)
+            .map(|n| format!("// legacy note {n}\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write(
+            tmp.path(),
+            "src/ratio.ts",
+            &format!("{comments}\nexport const value = 1;\n"),
+        );
+        let before = baseline(tmp.path());
+        write(
+            tmp.path(),
+            "src/ratio.ts",
+            &format!("{comments}\n// one new invariant\n\nexport const value = 1;\n"),
+        );
+        let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+        assert!(
+            !findings.iter().any(|f| f.rule_id == RULE_COMMENT_HYGIENE),
+            "legacy ratio debt needs a material new regression: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn baseline_less_calls_never_assign_legacy_comment_debt() {
+        let tmp = TempDir::new().unwrap();
+        let narration = (0..10)
+            .map(|n| format!("// legacy narration {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write(
+            tmp.path(),
+            "src/legacy.ts",
+            &format!("{narration}\nexport const value = 1;\n"),
+        );
+        let findings =
+            arch_fitness_findings(tmp.path(), "demo", &[tmp.path().join("src/legacy.ts")]);
+        assert!(!findings.iter().any(|f| f.rule_id == RULE_COMMENT_HYGIENE));
+    }
+
+    #[test]
+    fn vendored_directories_are_exempt_case_insensitively() {
+        let tmp = TempDir::new().unwrap();
+        let before = baseline(tmp.path());
+        let narration = (0..12)
+            .map(|n| format!("// third-party narration {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write(
+            tmp.path(),
+            "Vendor/dependency.ts",
+            &format!("{narration}\nexport const dependency = 1;\n"),
+        );
+        let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+        assert!(
+            findings.is_empty(),
+            "vendored files are not governed: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn uncertain_text_is_fail_open_and_results_are_deterministic() {
+        let tmp = TempDir::new().unwrap();
+        let before = baseline(tmp.path());
+        let mut invalid = b"// narration one\n// narration two\n".to_vec();
+        invalid.push(0xff);
+        invalid.extend_from_slice(b"\n// narration three\n// narration four\n// narration five\n// narration six\n// narration seven\n// narration eight\n");
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/invalid.ts"), invalid).unwrap();
+        let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+        assert!(!findings.iter().any(|f| f.rule_id == RULE_COMMENT_HYGIENE));
+
+        let oversized = TempDir::new().unwrap();
+        let oversized_before = baseline(oversized.path());
+        write(
+            oversized.path(),
+            "src/oversized.ts",
+            &"// uncertain oversized narration\n".repeat(MAX_FILE_BYTES / 16),
+        );
+        let oversized_findings =
+            arch_fitness_findings_since(oversized.path(), "demo", &oversized_before);
+        assert!(!oversized_findings
+            .iter()
+            .any(|f| f.rule_id == RULE_COMMENT_HYGIENE));
+
+        let stable = TempDir::new().unwrap();
+        let stable_before = baseline(stable.path());
+        let narration = (0..10)
+            .map(|n| format!("// new narration {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write(
+            stable.path(),
+            "src/stable.ts",
+            &format!("{narration}\nexport const value = 1;\n"),
+        );
+        let first = arch_fitness_findings_since(stable.path(), "demo", &stable_before);
+        let second = arch_fitness_findings_since(stable.path(), "demo", &stable_before);
+        assert_eq!(first, second);
+    }
+
     // ---------------- fail-open ----------------
 
     #[test]
@@ -1644,6 +2401,9 @@ mod tests {
             "src/app.test.ts",
             "src/app.spec.js",
             "src/__tests__/x.ts",
+            "src/widget_test.dart",
+            "src/widget_spec.exs",
+            "src/widget_tests.cs",
             "bundle.min.js",
             "proto/api_pb2.py",
             "src/schema.generated.ts",

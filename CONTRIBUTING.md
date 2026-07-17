@@ -2,10 +2,13 @@
 
 Thank you for contributing to UmaDev! 感谢贡献。
 
-UmaDev 3.x is a **Rust workspace** that ships a single static binary
-plus per-host plugin bundles. Contributions can target any layer:
-governance kernel, agent runner, runtime adapters, CLI, plugin
-manifests, or the UMADEV_HOST_SPEC_V1 spec itself.
+UmaDev is a **Rust workspace** that ships one native `umadev` binary for
+each supported target. npm is a distribution surface: its small JavaScript
+launcher selects the matching prebuilt Rust binary. There are no per-host SDK
+or provider integrations. Exactly four base CLIs are driven as subprocesses:
+Claude Code, Codex, and OpenCode keep vendor-specific transports; Grok Build
+uses a dedicated profile over the hardened ACP v1 core. Contributions can target the specification, governance kernel,
+team runner, host drivers, knowledge layer, CLI, or TUI.
 
 ## How to contribute | 如何贡献
 
@@ -18,9 +21,16 @@ manifests, or the UMADEV_HOST_SPEC_V1 spec itself.
 
 Required:
 
-- Rust **1.75+** (stable channel; check with `rustc --version`).
+- Rust **1.88+** (the workspace MSRV; check with `rustc --version`).
 - A working `cargo` (`rustup` is the easiest installer).
-- No Python, no Node, no Docker — UmaDev 3.x is pure Rust.
+
+The product runtime is Rust and does not vendor a host SDK. The following are
+needed only when changing their corresponding delivery surface:
+
+- Node.js **20+** for the npm launcher, npm package smoke tests, or website.
+- Python 3 for the release-only embedding-model quantisation script.
+- Docker (through `cross`) for reproducing the Linux release builds and their
+  glibc 2.31 compatibility floor.
 
 ```bash
 git clone https://github.com/umacloud/umadev.git
@@ -36,8 +46,13 @@ crates/
 ├── umadev-spec/        # UMADEV_HOST_SPEC_V1 as Rust data
 ├── umadev-governance/  # rules / audit / context / compliance kernel
 ├── umadev-agent/       # 9-phase runner + gates + state + experts + coach
-├── umadev-host/        # subprocess drivers for the three first-class bases (claude-code/codex/opencode)
-└── umadev-runtime/     # Runtime trait + OfflineRuntime (deterministic fallback)
+├── umadev-host/        # 3 vendor-specific drivers + 1 Grok Build ACP v1 profile
+├── umadev-runtime/     # Runtime trait + OfflineRuntime (deterministic fallback)
+├── umadev-contract/    # typed OpenAPI 3.1 contract layer
+├── umadev-knowledge/   # BM25 + optional vector/hybrid retrieval
+├── umadev-tui/         # ratatui terminal UI
+├── umadev-i18n/        # zh-CN / zh-TW / en UI catalog
+└── umadev-state/       # safe persistence + leaf-store memory policy
 
 spec/
 └── UMADEV_HOST_SPEC_V1.md   # normative specification
@@ -45,12 +60,19 @@ spec/
 
 ## Local checks | 本地校验
 
-Every PR must pass these three commands clean:
+Every PR must pass these commands clean:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-features --all-targets -- -D warnings
+cargo test --workspace --all-features --all-targets --no-fail-fast
+cargo test --workspace --all-features --doc --no-fail-fast
+```
+
+If npm packaging, self-update, or platform-package resolution changed, also run:
+
+```bash
+./npm/scripts/smoke.sh
 ```
 
 Convenient aliases (no installation required):
@@ -60,6 +82,28 @@ cargo fmt --all                       # apply formatting
 cargo clippy --workspace --fix        # auto-apply safe lint fixes
 cargo test --workspace --all-targets  # unit + integration + doc tests
 ```
+
+The authenticated base acceptance suite is intentionally ignored in ordinary
+CI because it makes real model calls. Before a release, run its three generic
+checks against each installed and logged-in base:
+
+```bash
+for base in claude-code codex opencode grok-build; do
+  UMADEV_LIVE_BASE="$base" cargo test -p umadev-host --test live_base_contract installed_base -- --ignored --nocapture --test-threads=1
+done
+```
+
+Grok's private queue, owned background-process control, and release-stamped
+Folder Trust path have a separate official-binary gate:
+
+```bash
+GROK_TEST_VERSION=0.2.101 GROK_FOLDER_TRUST=1 UMADEV_LIVE_BASE=grok-build \
+  cargo test -p umadev-host --test live_base_contract installed_grok_ -- --ignored --nocapture --test-threads=1
+```
+
+These probes use isolated temporary workspaces, but they exercise the real
+authenticated CLIs. Do not put credentials in the repository or enable them on
+untrusted pull-request runners.
 
 ## Adding a new spec clause | 新增规范条款
 
@@ -79,38 +123,51 @@ Tests in `crates/umadev-spec/src/lib.rs` pin the clause-table
 structure; they will fail if you add a malformed ID. Add a unit test
 for the new rule alongside the implementation.
 
-## Adding a new base | 新增底座
+## Base-driver scope | 底座驱动范围
 
-> First-class support is deliberately limited to **exactly three** bases —
-> `claude-code` / `codex` / `opencode`. `umadev_host::BACKEND_IDS` is the
-> authoritative list and a test pins its length at 3; the steps below
-> document the mechanics, not an invitation to grow the list. Wider model
-> coverage belongs in the base's own config (route it to a third-party /
-> local model), not in a new driver. Before proposing a fourth base, open
-> an issue first.
+> First-class support is deliberately fixed at **exactly five** bases:
+> `claude-code`, `codex`, `opencode`, `grok-build`, and `kimi-code`.
+> `umadev_host::BACKEND_IDS` is authoritative
+> and tests pin both the contents and length. Wider model coverage belongs in
+> the selected base's own provider configuration, not in another UmaDev driver.
 
-A "base" is a non-interactive AI coding CLI driven as a subprocess —
-**no plugin bundles, no install.rs, no Agent SDK required**. The driver
-lives entirely in `crates/umadev-host/`.
+A base is an already-installed and already-configured AI coding CLI driven as a
+subprocess. UmaDev vendors no Agent SDK and owns no model credential.
+`umadev install --base ...` installs a UmaDev governance hook or pre-commit
+integration; it is **not** a base installer, updater, login flow, or licence
+manager.
 
-1. Add a factory to `crates/umadev-host/src/simple.rs`
-   (`SimpleHostDriver::<name>()`) with the program name, base args, the
-   non-interactive prompt channel, and a `version_args` for probing.
-   Honour the `UMADEV_<NAME>_BIN` env override like the other factories.
-2. Register the id in **two places** (a test keeps them in sync):
-   - `driver_for()` and `BACKEND_IDS` in
-     `crates/umadev-host/src/lib.rs`, and
-   - a new `BackendArg` variant + `id()`/`from_id()`/`BACKEND_ARG_IDS`
-     entry in `crates/umadev/src/main.rs`.
-3. Add the executable name to the doctor probe table in
-   `crates/umadev/src/doctor.rs#check_ai_backends`.
-4. The TUI needs **no change** — slash verbs, palette, and did-you-mean
-   are derived dynamically from `BACKEND_IDS`.
+The current adapter families have different maintenance rules:
 
-Only hosts with a documented **non-interactive CLI** form are in scope
-(`binary [flags] "<prompt>"` → stdout). The `backend_arg_ids_match_host`
-and `every_backend_arg_has_a_driver` tests in `main.rs` will fail if the
-selector and driver registry drift apart.
+1. **Native transports:** changes to Claude Code (`stream-json`), Codex
+   (`app-server`), or OpenCode (HTTP/SSE) stay in their dedicated modules.
+   Preserve vendor request ids, permission semantics, session ids, cancellation,
+   bounded shutdown, and exact cross-process resume.
+2. **Grok Build ACP v1 profile:** changes to Grok Build reuse
+   `crates/umadev-host/src/acp.rs`. Keep executable names,
+   launch flags, identity/version checks, permission-mode mapping, and verified
+   extensions in the vendor profile; do not fork the transport core.
+3. **Capability negotiation:** authentication, `session/load`, modes, questions,
+   plans, MCP elicitation, and vendor extensions are accepted only when the
+   installed agent advertises or sends the corresponding protocol surface.
+   Unknown requests never receive automatic authority.
+4. **Read-only proof:** Plan must be enforced by a documented process flag or a
+   successfully negotiated read-only mode. Grok Build adds its documented
+   read-only sandbox, tool allowlist, and subagent fence.
+5. **Platform claims:** test native and `.cmd`/`.bat`/PowerShell resolution on
+   the platforms the vendor actually supports. UmaDev's own platform support
+   never broadens the selected vendor CLI's platform boundary.
+6. **No provenance guessing:** protocol and flag compatibility are not evidence
+   that one vendor copied another.
+
+Any proposal to replace or expand this fixed list is a product/spec change, not
+a routine driver patch. Open an issue first with official non-interactive
+protocol documentation, permission and resume evidence, authentication flow,
+minimum-version strategy, macOS/Linux/Windows support boundaries, and a test
+plan. If accepted, the host registry, CLI enum, TUI command aliases, doctor,
+MCP manager, spec, website, and user docs must change atomically. The
+`backend_arg_ids_match_host` and `every_backend_arg_has_a_driver` tests catch
+only part of that contract.
 
 ## Commit conventions | 提交规范
 
@@ -135,7 +192,8 @@ Before requesting review:
 
 - [ ] `cargo fmt --check` clean
 - [ ] `cargo clippy -D warnings` clean
-- [ ] `cargo test --workspace` green
+- [ ] workspace target tests and doctests are green
+- [ ] `./npm/scripts/smoke.sh` is green when npm/update packaging changed
 - [ ] New code has unit tests in the same file (`mod tests { ... }`)
 - [ ] If you changed `spec/UMADEV_HOST_SPEC_V1.md`, you also
       changed `crates/umadev-spec/src/lib.rs#CLAUSES` (or vice versa)

@@ -1,9 +1,9 @@
-//! `umadev ci` — run governance on every source file in the workspace.
+//! `umadev ci` — run governance on eligible project files in the workspace.
 //!
-//! This is the CI/CD entry point: scan all source files under the project root,
-//! run the full governance rule set on each, and exit non-zero if any file
-//! violates a rule. Designed to run in a GitHub Action / pre-commit hook so
-//! governance violations are caught BEFORE code is pushed.
+//! This is the CI/CD entry point: scan governance-eligible files under the
+//! project root and exit non-zero if any file's blocking rule fires.
+//! In a Git worktree the full scan includes tracked and untracked non-ignored
+//! files; untracked ignored files and generated/vendor paths are excluded.
 //!
 //! ## Usage
 //! ```bash
@@ -13,19 +13,20 @@
 //! ```
 //!
 //! ## Output
-//! One line per violation: `BLOCK  <clause>  <file>:<line>  <reason>`.
-//! Summary at the end: `UmaDev: 3 files blocked, 5 violations (exit 1)`.
+//! Enforcing mode emits the first hit per file. Report-only mode emits every
+//! enabled content-rule hit so its aggregate is suitable for governance audits.
 
 use std::path::{Path, PathBuf};
 use umadev_governance::{
-    check_sensitive_path, pre_write_floor_decision, scan_content_with_context, Policy,
-    ProjectContext,
+    check_sensitive_path, pre_write_floor_decision, scan_content_findings_with_context,
+    scan_content_with_context, Decision, Policy, ProjectContext,
 };
 
 /// File extensions the CI scan considers "source" (governance-eligible).
 const SCAN_EXTENSIONS: &[&str] = &[
-    "js", "jsx", "ts", "tsx", "py", "rb", "go", "rs", "java", "kt", "swift", "php", "vue",
-    "svelte", "astro",
+    "js", "jsx", "mjs", "cjs", "ts", "tsx", "py", "rb", "go", "rs", "java", "kt", "swift", "php",
+    "vue", "svelte", "astro", "html", "htm", "css", "scss", "sass", "yml", "yaml", "sh", "bash",
+    "zsh",
 ];
 
 /// Is `rel` a security-sensitive path that MUST be scanned by the bypass-immune
@@ -83,6 +84,7 @@ const SKIP_DIRS: &[&str] = &[
     "target",
     "dist",
     "build",
+    "out",
     ".next",
     ".nuxt",
     ".output",
@@ -99,9 +101,9 @@ const SKIP_DIRS: &[&str] = &[
 /// CI scan options.
 #[derive(Debug, Clone)]
 pub struct CiOptions {
-    /// Only report violations without failing (exit 0).
+    /// Report first hits without failing (exit 0).
     pub report_only: bool,
-    /// Only scan git-tracked changed files (vs all files).
+    /// Only scan governance-eligible staged Git blobs (vs the full worktree scope).
     pub changed_only: bool,
     /// Project root to scan.
     pub project_root: PathBuf,
@@ -110,17 +112,166 @@ pub struct CiOptions {
 /// Result of a CI scan.
 #[derive(Debug, Default)]
 pub struct CiResult {
-    /// Total source files scanned.
+    /// Files selected after scope, extension, ignore, and directory filters.
+    pub files_selected: usize,
+    /// Selected files whose UTF-8 content was actually scanned.
     pub files_scanned: usize,
-    /// Number of files with at least one violation.
+    /// Number of scanned files with at least one blocking governance decision.
     pub files_blocked: usize,
-    /// Total violations found.
-    pub violations: usize,
-    /// Whether the scan should fail CI (files_blocked > 0 && !report_only).
+    /// Governance findings emitted. Complete in report-only mode; first-hit per
+    /// file in enforcing mode.
+    pub governance_findings: usize,
+    /// High/critical dependency findings returned by `npm audit`.
+    pub npm_audit_findings: usize,
+    /// How the candidate file set was obtained.
+    pub scan_scope: CiScanScope,
+    /// Whether enforcing mode should fail CI.
     pub failed: bool,
 }
 
-/// Run the CI governance scan. Prints violations to stdout, returns the
+/// Reproducible source used to select files for a CI scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CiScanScope {
+    /// Git's staged index (`--changed-only`).
+    StagedIndex,
+    /// Git tracked plus untracked non-ignored files.
+    GitWorktree,
+    /// Filesystem walk used when Git metadata is unavailable.
+    #[default]
+    FilesystemFallback,
+}
+
+impl CiScanScope {
+    fn description(self) -> &'static str {
+        match self {
+            Self::StagedIndex => "staged Git blobs only",
+            Self::GitWorktree => "Git tracked + untracked non-ignored files",
+            Self::FilesystemFallback => {
+                "filesystem fallback (Git metadata and ignore rules unavailable)"
+            }
+        }
+    }
+}
+
+struct FileSelection {
+    files: Vec<PathBuf>,
+    scope: CiScanScope,
+}
+
+struct ScanTask {
+    path: PathBuf,
+    rel: String,
+    ctx: ProjectContext,
+}
+
+struct FileScan {
+    rel: String,
+    scanned: bool,
+    findings: Vec<Decision>,
+}
+
+fn scan_task(
+    task: &ScanTask,
+    root: &Path,
+    changed_only: bool,
+    report_only: bool,
+    policy: &Policy,
+) -> FileScan {
+    let content = if changed_only {
+        read_staged_blob(root, &task.rel)
+    } else {
+        std::fs::read_to_string(&task.path).ok()
+    };
+    let Some(content) = content else {
+        return FileScan {
+            rel: task.rel.clone(),
+            scanned: false,
+            findings: Vec::new(),
+        };
+    };
+
+    let floor = pre_write_floor_decision(&task.rel, &content);
+    let findings = if report_only {
+        let mut findings = Vec::new();
+        if floor.block {
+            findings.push(floor);
+        }
+        for decision in scan_content_findings_with_context(&task.rel, &content, policy, task.ctx) {
+            if !findings
+                .iter()
+                .any(|existing: &Decision| existing.clause == decision.clause)
+            {
+                findings.push(decision);
+            }
+        }
+        findings
+    } else {
+        let decision = if floor.block {
+            floor
+        } else {
+            scan_content_with_context(&task.rel, &content, policy, task.ctx)
+        };
+        if decision.block {
+            vec![decision]
+        } else {
+            Vec::new()
+        }
+    };
+    FileScan {
+        rel: task.rel.clone(),
+        scanned: true,
+        findings,
+    }
+}
+
+fn scan_tasks(
+    tasks: &[ScanTask],
+    root: &Path,
+    changed_only: bool,
+    report_only: bool,
+    policy: &Policy,
+) -> Vec<FileScan> {
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(8)
+        .min(tasks.len());
+    let chunk_size = tasks.len().div_ceil(workers);
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = tasks
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|task| {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                scan_task(task, root, changed_only, report_only, policy)
+                            }))
+                            .unwrap_or_else(|_| FileScan {
+                                rel: task.rel.clone(),
+                                scanned: false,
+                                findings: Vec::new(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut scans = Vec::with_capacity(tasks.len());
+        for handle in handles {
+            if let Ok(mut chunk) = handle.join() {
+                scans.append(&mut chunk);
+            }
+        }
+        scans
+    })
+}
+
+/// Run the CI governance scan. Prints findings to stdout and returns the
 /// summary. Exit code is 1 when `failed` is true (the caller maps this).
 ///
 /// # Errors
@@ -144,57 +295,45 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
     // prevent. So each file is judged by the context of the nearest workspace that CONTAINS
     // it (memoized per directory; the single-workspace case resolves once and costs nothing).
     let mut contexts = ContextCache::new(&opts.project_root);
-    let files = collect_source_files(&opts.project_root, opts.changed_only)?;
+    let selection = collect_source_files(&opts.project_root, opts.changed_only)?;
     let mut result = CiResult {
-        files_scanned: files.len(),
+        files_selected: selection.files.len(),
+        scan_scope: selection.scope,
         ..Default::default()
     };
 
-    for file in &files {
-        let ctx = contexts.for_file(file);
-        let rel = file
-            .strip_prefix(&opts.project_root)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
-        // Read the content to scan. In `--changed-only` mode (the pre-commit
-        // hook) we read the STAGED blob (`git show :<file>`), NOT the on-disk
-        // file: the commit captures the index, so judging the dirty working copy
-        // would block a commit on an unstaged hunk and pass a clean staged
-        // version by its dirty working state. Otherwise read on disk. Best-effort:
-        // skip an unreadable file (a binary blob, a path removed from the index).
-        let content = if opts.changed_only {
-            let Some(staged) = read_staged_blob(&opts.project_root, &rel) else {
-                continue;
-            };
-            staged
-        } else {
-            let Ok(disk) = std::fs::read_to_string(file) else {
-                continue;
-            };
-            disk
-        };
-        // Bypass-immune irreversible floor FIRST (path-type + content
-        // secret/password): a `.umadev/rules.toml` that disabled UD-SEC-001/003/018/026
-        // must NOT let a leaked secret or a sensitive-path write (e.g. a staged
-        // `.env`) pass CI. Only when the floor is clean do we fall through to the
-        // policy-aware content scan (which honours disabled clauses for everything
-        // else).
-        let floor = pre_write_floor_decision(&rel, &content);
-        let decision = if floor.block {
-            floor
-        } else {
-            scan_content_with_context(&rel, &content, &policy, ctx)
-        };
-        if decision.block {
+    let tasks: Vec<_> = selection
+        .files
+        .iter()
+        .map(|file| ScanTask {
+            path: file.clone(),
+            rel: normalized_relative_path(&opts.project_root, file),
+            ctx: contexts.for_file(file),
+        })
+        .collect();
+    for scan in scan_tasks(
+        &tasks,
+        &opts.project_root,
+        opts.changed_only,
+        opts.report_only,
+        &policy,
+    ) {
+        if !scan.scanned {
+            continue;
+        }
+        result.files_scanned += 1;
+        if !scan.findings.is_empty() {
             result.files_blocked += 1;
-            result.violations += 1;
-            println!(
-                "BLOCK  {}  {}  {}",
-                decision.clause,
-                rel,
-                decision.reason.split('.').next().unwrap_or("violation"),
-            );
+            result.governance_findings += scan.findings.len();
+            for decision in scan.findings {
+                let label = finding_label(opts.report_only);
+                println!(
+                    "{label:<5}  {}  {}  {}",
+                    decision.clause,
+                    scan.rel,
+                    finding_summary(&decision.reason),
+                );
+            }
         }
     }
 
@@ -210,10 +349,10 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
     if !opts.changed_only && opts.project_root.join("package-lock.json").exists() {
         if let Ok(audit_result) = npm_audit(&opts.project_root) {
             if audit_result.critical + audit_result.high > 0 {
-                result.violations += audit_result.critical + audit_result.high;
-                result.files_blocked += 1;
+                result.npm_audit_findings = audit_result.critical + audit_result.high;
+                let label = finding_label(opts.report_only);
                 println!(
-                    "BLOCK  UD-SEC-016  package.json  {} critical, {} high vulnerabilities in dependencies",
+                    "{label:<5}  UD-SEC-016  package.json  {} critical, {} high vulnerabilities in dependencies",
                     audit_result.critical, audit_result.high,
                 );
             } else if audit_result.total() > 0 {
@@ -225,13 +364,9 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
         }
     }
 
-    // Summary is printed AFTER the npm-audit block so its counts reflect any
-    // UD-SEC-016 CVE hits — otherwise a JS project with a critical CVE printed
-    // "0 blocked, 0 violations" and then a "BLOCK UD-SEC-016" line, exiting 1
-    // while the summary claimed a clean scan.
-    println!("{}", scan_summary(&result));
-
-    result.failed = result.files_blocked > 0 && !opts.report_only;
+    result.failed =
+        (result.governance_findings > 0 || result.npm_audit_findings > 0) && !opts.report_only;
+    println!("{}", scan_summary(&result, opts.report_only));
     Ok(result)
 }
 
@@ -345,16 +480,61 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Render the one-line scan summary from the FINAL [`CiResult`] — after the
-/// UD-SEC-016 npm-audit block has folded any CVE hits into `files_blocked` /
-/// `violations`. Keeping this pure (a function of the final counts) is what
-/// stops the printed summary from contradicting a subsequent `BLOCK` line or
-/// the process exit code.
-fn scan_summary(result: &CiResult) -> String {
+/// Render an honest summary of scan scope and counting semantics.
+fn scan_summary(result: &CiResult, report_only: bool) -> String {
+    let skipped = result.files_selected.saturating_sub(result.files_scanned);
+    let audit = if result.npm_audit_findings == 0 {
+        String::new()
+    } else {
+        format!(
+            " {} high/critical npm-audit finding(s) reported separately.",
+            result.npm_audit_findings
+        )
+    };
+    let mode = if report_only {
+        " Report-only mode: findings do not change the exit status."
+    } else {
+        ""
+    };
+    let governance = if report_only {
+        format!(
+            "{} file(s) with a governance hit, {} governance finding(s). The count is complete across all enabled content rules.",
+            result.files_blocked, result.governance_findings
+        )
+    } else {
+        format!(
+            "{} file(s) with a governance hit, {} first-hit finding(s). The enforcing gate stops after the first hit per file; run --report-only for the complete count.",
+            result.files_blocked, result.governance_findings
+        )
+    };
     format!(
-        "\nUmaDev: {} file(s) scanned, {} blocked, {} violation(s).",
-        result.files_scanned, result.files_blocked, result.violations,
+        "\nUmaDev scope: {}.\n\
+         UmaDev excluded: untracked ignored files (full Git-worktree scope), unsupported types, generated/vendor, and non-allowlisted dot-directories.\n\
+         UmaDev policy: path exclusions apply after the irreversible security floor.\n\
+         UmaDev: {} file(s) selected, {} scanned, {} unreadable/binary skipped; \
+         {governance}{audit}{mode}",
+        result.scan_scope.description(),
+        result.files_selected,
+        result.files_scanned,
+        skipped,
     )
+}
+
+fn finding_label(report_only: bool) -> &'static str {
+    if report_only {
+        "HIT"
+    } else {
+        "BLOCK"
+    }
+}
+
+/// Keep the first diagnostic sentence without treating a dot in `file.rs`,
+/// `package.json`, or a decimal as the sentence boundary.
+fn finding_summary(reason: &str) -> &str {
+    let first_line = reason.lines().next().unwrap_or("finding").trim();
+    first_line
+        .find(". ")
+        .map_or(first_line, |boundary| &first_line[..boundary])
 }
 
 /// Result of an `npm audit --json` scan.
@@ -476,16 +656,62 @@ fn parse_npm_audit(text: &str) -> Option<NpmAuditResult> {
     None
 }
 
-/// Walk the project root and collect all source files (by extension), skipping
-/// deps/build/VCS directories. When `changed_only` is set, restricts to
-/// `git diff` tracked files.
-fn collect_source_files(root: &Path, changed_only: bool) -> std::io::Result<Vec<PathBuf>> {
+/// Select governance-eligible files with an explicit, reproducible scope.
+fn collect_source_files(root: &Path, changed_only: bool) -> std::io::Result<FileSelection> {
     if changed_only {
-        return git_changed_files(root);
+        return Ok(FileSelection {
+            files: git_changed_files(root)?,
+            scope: CiScanScope::StagedIndex,
+        });
+    }
+    if let Some(files) = git_worktree_files(root) {
+        return Ok(FileSelection {
+            files,
+            scope: CiScanScope::GitWorktree,
+        });
     }
     let mut files = Vec::new();
     walk_dir(root, &mut files);
-    Ok(files)
+    sort_scan_files(root, &mut files);
+    Ok(FileSelection {
+        files,
+        scope: CiScanScope::FilesystemFallback,
+    })
+}
+
+fn normalized_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+fn sort_scan_files(root: &Path, files: &mut Vec<PathBuf>) {
+    files.sort_by_key(|path| normalized_relative_path(root, path));
+    files.dedup();
+}
+
+/// In a Git worktree, scan tracked files plus untracked files not excluded by
+/// standard ignore rules. A failed command means Git metadata is unavailable,
+/// so the caller uses the documented filesystem fallback.
+fn git_worktree_files(root: &Path) -> Option<Vec<PathBuf>> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(scan_paths_from_git_output(root, &output.stdout))
 }
 
 /// Recursive directory walk collecting source files.
@@ -506,9 +732,7 @@ fn walk_dir(dir: &Path, files: &mut Vec<PathBuf>) {
             // allowlist of security-relevant dot-dirs (.ssh / .aws / .github / ...) so a
             // committed secret or a weakened workflow there is scanned (it was silently
             // skipped by the blanket dot-prefix rule).
-            if SKIP_DIRS.contains(&name)
-                || (name.starts_with('.') && !SCAN_DOT_DIRS.contains(&name))
-            {
+            if should_skip_directory(name) {
                 continue;
             }
             walk_dir(&path, files);
@@ -516,15 +740,61 @@ fn walk_dir(dir: &Path, files: &mut Vec<PathBuf>) {
             let ext = path
                 .extension()
                 .and_then(|e| e.to_str())
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .to_ascii_lowercase();
             // Source by extension, OR a sensitive path regardless of extension, so
             // a committed `.env` / `*.pem` / `credentials` reaches the floor in a
             // full scan too (the same set the changed-only path pulls in).
-            if SCAN_EXTENSIONS.contains(&ext) || is_sensitive_scan_path(&path.to_string_lossy()) {
+            if SCAN_EXTENSIONS.contains(&ext.as_str())
+                || is_sensitive_scan_path(&path.to_string_lossy())
+            {
                 files.push(path);
             }
         }
     }
+}
+
+fn should_skip_directory(name: &str) -> bool {
+    SKIP_DIRS.contains(&name) || (name.starts_with('.') && !SCAN_DOT_DIRS.contains(&name))
+}
+
+/// Whether a repository-relative path lives under a directory excluded from
+/// governance scans. Only parent components are inspected, so a sensitive file
+/// such as `.env` is not mistaken for a dot-directory.
+fn has_skipped_directory(path: &Path) -> bool {
+    path.parent().is_some_and(|parent| {
+        parent.components().any(|component| {
+            let std::path::Component::Normal(name) = component else {
+                return false;
+            };
+            name.to_str().is_some_and(should_skip_directory)
+        })
+    })
+}
+
+fn is_scan_candidate(path: &str) -> bool {
+    let path_obj = Path::new(path);
+    if has_skipped_directory(path_obj) {
+        return false;
+    }
+    let ext = path_obj
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    SCAN_EXTENSIONS.contains(&ext.as_str()) || is_sensitive_scan_path(path)
+}
+
+fn scan_paths_from_git_output(root: &Path, output: &[u8]) -> Vec<PathBuf> {
+    let text = String::from_utf8_lossy(output);
+    let mut files: Vec<PathBuf> = text
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .filter(|path| is_scan_candidate(path))
+        .map(|path| root.join(path))
+        .collect();
+    sort_scan_files(root, &mut files);
+    files
 }
 
 /// Get the files in the STAGED index that differ from `HEAD` — the exact set a
@@ -532,8 +802,8 @@ fn walk_dir(dir: &Path, files: &mut Vec<PathBuf>) {
 /// staged scope (`--cached`), NOT the working tree: a `git diff HEAD` would also
 /// include unstaged edits, blocking a commit on a violation that isn't part of
 /// it. With no commits yet, `--cached` compares against the empty tree (all
-/// staged files appear as new), so it still works without the ls-files fallback;
-/// that fallback covers only the "not a git repo" case.
+/// staged files appear as new). Git failures yield an empty set (fail-open),
+/// never a broader tracked-file fallback that would violate `--changed-only`.
 fn git_changed_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     // `-c core.quotePath=false` + `-z`: emit NUL-separated, UNQUOTED paths so a
     // staged file with a non-ASCII (`café.tsx`) or spaced name is scanned rather
@@ -550,40 +820,15 @@ fn git_changed_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
             "--name-only",
             "-z",
             "--cached",
+            "--diff-filter=ACMR",
         ])
         .current_dir(root)
         .output();
     let out = match output {
-        Ok(o) if o.status.success() => o.stdout,
-        _ => {
-            // Not a git repo — fall back to ls-files (tracked, index == HEAD).
-            let ls = std::process::Command::new("git")
-                .args(["-c", "core.quotePath=false", "ls-files", "-z"])
-                .current_dir(root)
-                .output();
-            match ls {
-                Ok(o) if o.status.success() => o.stdout,
-                _ => return Ok(Vec::new()),
-            }
-        }
+        Ok(output) if output.status.success() => output.stdout,
+        _ => return Ok(Vec::new()),
     };
-    let text = String::from_utf8_lossy(&out);
-    let files: Vec<PathBuf> = text
-        .split('\0')
-        .filter(|l| !l.is_empty())
-        .filter(|l| {
-            let ext = Path::new(l)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or_default();
-            // Source by extension, OR a sensitive path (`.env` / `id_rsa` / `*.pem`
-            // / `.ssh/*` / `credentials`) regardless of extension — the floor must
-            // see a staged secret file even though it carries no source extension.
-            SCAN_EXTENSIONS.contains(&ext) || is_sensitive_scan_path(l)
-        })
-        .map(|l| root.join(l))
-        .collect();
-    Ok(files)
+    Ok(scan_paths_from_git_output(root, &out))
 }
 
 /// Read the STAGED content of `rel` (a workspace-relative, forward-slash path)
@@ -869,6 +1114,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(result.files_blocked, 1);
+        assert_eq!(result.governance_findings, 1);
         assert!(result.failed);
     }
 
@@ -883,7 +1129,40 @@ mod tests {
         })
         .unwrap();
         assert_eq!(result.files_blocked, 1);
+        assert_eq!(result.governance_findings, 1);
+        assert_eq!(finding_label(true), "HIT");
+        assert_eq!(finding_label(false), "BLOCK");
         assert!(!result.failed); // report-only → exit 0
+    }
+
+    #[test]
+    fn finding_summary_preserves_file_extensions_and_line_numbers() {
+        assert_eq!(
+            finding_summary(
+                "UmaDev: deep nesting at `src/app.rs:42` (UG-LINT-004). Extract a helper."
+            ),
+            "UmaDev: deep nesting at `src/app.rs:42` (UG-LINT-004)"
+        );
+        assert_eq!(finding_summary("one-line finding"), "one-line finding");
+    }
+
+    #[test]
+    fn ci_report_only_emits_all_enabled_findings_per_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("bad.ts"),
+            "export function echo(value: any) { console.log(value); return value; }",
+        )
+        .unwrap();
+        let result = run(&CiOptions {
+            report_only: true,
+            changed_only: false,
+            project_root: tmp.path().to_path_buf(),
+        })
+        .unwrap();
+        assert_eq!(result.files_blocked, 1);
+        assert!(result.governance_findings >= 2, "{result:?}");
+        assert!(!result.failed);
     }
 
     #[test]
@@ -941,6 +1220,94 @@ mod tests {
         assert!(!names.contains(&"data.json".to_string()));
     }
 
+    #[test]
+    fn filesystem_fallback_selection_is_sorted_and_explicit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("nested")).unwrap();
+        std::fs::write(tmp.path().join("z.ts"), "export const z = 1;").unwrap();
+        std::fs::write(
+            tmp.path().join("nested").join("m.ts"),
+            "export const m = 1;",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("a.ts"), "export const a = 1;").unwrap();
+
+        let selection = collect_source_files(tmp.path(), false).unwrap();
+        assert_eq!(selection.scope, CiScanScope::FilesystemFallback);
+        let paths: Vec<String> = selection
+            .files
+            .iter()
+            .map(|path| normalized_relative_path(tmp.path(), path))
+            .collect();
+        assert_eq!(paths, ["a.ts", "nested/m.ts", "z.ts"]);
+    }
+
+    #[test]
+    fn selected_and_actually_scanned_counts_are_distinct() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("clean.ts"), "export const clean = 1;").unwrap();
+        std::fs::write(tmp.path().join("binary.ts"), [0xff, 0xfe]).unwrap();
+
+        let result = run(&CiOptions {
+            report_only: true,
+            changed_only: false,
+            project_root: tmp.path().to_path_buf(),
+        })
+        .unwrap();
+        assert_eq!(result.files_selected, 2);
+        assert_eq!(result.files_scanned, 1);
+    }
+
+    #[test]
+    fn walk_collects_file_types_with_active_governance_rules() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let expected = [
+            "workflow.yml",
+            "config.yaml",
+            "script.sh",
+            "script.bash",
+            "script.zsh",
+            "styles.css",
+            "module.mjs",
+            "index.html",
+        ];
+        for name in expected {
+            std::fs::write(tmp.path().join(name), "clean fixture").unwrap();
+        }
+
+        let mut files = Vec::new();
+        walk_dir(tmp.path(), &mut files);
+        let names: std::collections::HashSet<String> = files
+            .iter()
+            .map(|file| file.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        for name in expected {
+            assert!(names.contains(name), "{name} must be scanned: {names:?}");
+        }
+    }
+
+    #[test]
+    fn ci_skips_generated_out_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("out")).unwrap();
+        std::fs::write(
+            tmp.path().join("out/generated.mjs"),
+            "export const icon = '🚀';",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("clean.mjs"), "export const label = 'Save';").unwrap();
+
+        let result = run(&CiOptions {
+            report_only: false,
+            changed_only: false,
+            project_root: tmp.path().to_path_buf(),
+        })
+        .unwrap();
+        assert_eq!(result.files_scanned, 1, "generated out/ must be skipped");
+        assert_eq!(result.files_blocked, 0);
+        assert!(!result.failed);
+    }
+
     // --- M2: changed-only uses the STAGED index, not the working tree -------
 
     /// Run a git command in `dir`; returns false if git is missing/fails.
@@ -958,6 +1325,49 @@ mod tests {
         git(dir, &["init", "-q"])
             && git(dir, &["config", "user.email", "t@t.test"])
             && git(dir, &["config", "user.name", "test"])
+    }
+
+    #[test]
+    fn full_git_scope_includes_tracked_and_untracked_nonignored_in_stable_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        if !init_repo(root) {
+            return;
+        }
+        std::fs::write(root.join(".gitignore"), "ignored.ts\nforced.ts\n").unwrap();
+        std::fs::write(root.join("tracked.ts"), "export const tracked = 1;\n").unwrap();
+        std::fs::write(root.join("forced.ts"), "export const forced = 1;\n").unwrap();
+        std::fs::write(root.join("untracked.ts"), "export const local = 1;\n").unwrap();
+        std::fs::write(root.join("ignored.ts"), "export const ignored = 1;\n").unwrap();
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::write(root.join(".github/workflows/ci.yml"), "name: CI\n").unwrap();
+        std::fs::create_dir(root.join(".hidden")).unwrap();
+        std::fs::write(root.join(".hidden/local.ts"), "export const hidden = 1;\n").unwrap();
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(
+            root.join("node_modules/generated.ts"),
+            "export const generated = 1;\n",
+        )
+        .unwrap();
+        assert!(git(root, &["add", "tracked.ts"]));
+        assert!(git(root, &["add", "-f", "forced.ts"]));
+
+        let selection = collect_source_files(root, false).unwrap();
+        assert_eq!(selection.scope, CiScanScope::GitWorktree);
+        let paths: Vec<String> = selection
+            .files
+            .iter()
+            .map(|path| normalized_relative_path(root, path))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                ".github/workflows/ci.yml",
+                "forced.ts",
+                "tracked.ts",
+                "untracked.ts",
+            ]
+        );
     }
 
     #[test]
@@ -990,6 +1400,45 @@ mod tests {
             result.files_blocked, 0,
             "must judge the STAGED blob, not the dirty working copy"
         );
+        assert!(!result.failed);
+    }
+
+    #[test]
+    fn changed_only_scans_new_rule_extensions_and_skips_generated_out() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        if !init_repo(root) {
+            return; // git not available — skip
+        }
+        std::fs::create_dir(root.join("out")).unwrap();
+        std::fs::write(root.join("workflow.yaml"), "name: clean\n").unwrap();
+        std::fs::write(
+            root.join("out/generated.mjs"),
+            "export const icon = '🚀';\n",
+        )
+        .unwrap();
+        assert!(git(root, &["add", "."]));
+
+        let listed = git_changed_files(root).unwrap();
+        assert!(
+            listed.iter().any(|path| path.ends_with("workflow.yaml")),
+            "YAML must enter changed-only governance: {listed:?}"
+        );
+        assert!(
+            listed
+                .iter()
+                .all(|path| !path.ends_with("out/generated.mjs")),
+            "generated out/ must stay outside changed-only governance: {listed:?}"
+        );
+
+        let result = run(&CiOptions {
+            report_only: false,
+            changed_only: true,
+            project_root: root.to_path_buf(),
+        })
+        .unwrap();
+        assert_eq!(result.files_scanned, 1);
+        assert_eq!(result.files_blocked, 0);
         assert!(!result.failed);
     }
 
@@ -1146,20 +1595,31 @@ mod tests {
     }
 
     #[test]
-    fn scan_summary_reflects_post_audit_counts() {
-        // Emulate the result AFTER the npm-audit block folded a critical CVE in:
-        // the summary must report the inflated counts, not the pre-audit "0
-        // blocked, 0 violations" that used to precede a `BLOCK UD-SEC-016` line.
+    fn scan_summary_distinguishes_enforcing_and_complete_report_counts() {
         let result = CiResult {
+            files_selected: 4,
             files_scanned: 3,
             files_blocked: 1,
-            violations: 2,
+            governance_findings: 3,
+            npm_audit_findings: 2,
+            scan_scope: CiScanScope::GitWorktree,
             failed: true,
         };
-        let line = scan_summary(&result);
-        assert!(line.contains("3 file(s) scanned"), "{line}");
-        assert!(line.contains("1 blocked"), "{line}");
-        assert!(line.contains("2 violation(s)"), "{line}");
+        let line = scan_summary(&result, true);
+        assert!(line.contains("tracked + untracked non-ignored"), "{line}");
+        assert!(line.contains("4 file(s) selected, 3 scanned"), "{line}");
+        assert!(line.contains("1 unreadable/binary skipped"), "{line}");
+        assert!(line.contains("1 file(s) with a governance hit"), "{line}");
+        assert!(line.contains("3 governance finding(s)"), "{line}");
+        assert!(line.contains("count is complete"), "{line}");
+        assert!(
+            line.contains("2 high/critical npm-audit finding(s)"),
+            "{line}"
+        );
+        assert!(line.contains("Report-only mode"), "{line}");
+        let enforcing = scan_summary(&result, false);
+        assert!(enforcing.contains("3 first-hit finding(s)"), "{enforcing}");
+        assert!(enforcing.contains("run --report-only"), "{enforcing}");
     }
 
     // --- UD-SEC-016: npm audit parsing ----------------------------------

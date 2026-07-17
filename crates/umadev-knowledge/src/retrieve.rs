@@ -4,28 +4,19 @@
 //! This is the single function the agent crate calls, replacing the old
 //! `phase_knowledge_digest` / `knowledge_top_files` internals. It decides:
 //! 1. Which `knowledge/` subdirs are relevant for the current phase.
-//! 2. Whether to use BM25 (default) or hybrid BM25+vector (when
-//!    `OPENAI_EMBED_KEY` is set).
+//! 2. Whether to use lexical BM25 or the default hybrid BM25+local-vector
+//!    channel (which degrades to BM25 when the verified model is unavailable).
 //! 3. RRF (Reciprocal Rank Fusion) to merge the two rankings when hybrid.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use umadev_spec::Phase;
 
 use crate::chunker::Chunk;
-use crate::index::{load_or_build_index_multi, Bm25Index};
+use crate::corpus::{knowledge_roots, CorpusSet};
+use crate::index::{load_or_build_index_corpus, Bm25Index};
 use crate::vector;
-
-/// Cross-platform home directory: `HOME` then `USERPROFILE` (Windows).
-/// Returns None when neither is set (fail-open). Previously only `HOME`
-/// was checked, which is usually unset on Windows.
-fn home_dir() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-        .map(PathBuf::from)
-}
 
 /// A retrieval hit: the chunk + a normalised 0..1 score.
 #[derive(Debug, Clone)]
@@ -41,13 +32,13 @@ pub struct ScoredChunk {
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum RetrievalEngine {
-    /// BM25 keyword retrieval only — offline, zero-dep. Opt in for air-gapped
-    /// builds; otherwise the default is `Hybrid` (which degrades to exactly
-    /// this when no embedding key is present).
+    /// BM25 keyword retrieval only — offline and zero-dependency. Opt in for
+    /// lexical-only retrieval; otherwise `Hybrid` degrades to this when no
+    /// embedding backend is available.
     Bm25,
-    /// BM25 + vector RRF fusion — the DEFAULT. Vector results only contribute
-    /// when an embedding backend is reachable (OpenAI key or local Ollama);
-    /// with neither, this behaves identically to `Bm25`, so it is always safe.
+    /// BM25 + vector RRF fusion — the default. The local candle model is tried
+    /// first; explicitly authorized cloud embedding is optional. With neither,
+    /// this behaves identically to `Bm25`.
     #[default]
     Hybrid,
 }
@@ -183,32 +174,27 @@ pub fn phase_subdirs(phase: Phase) -> &'static [&'static str] {
     }
 }
 
-/// The ordered list of source directories that make up the retrieval corpus:
-/// the curated `knowledge/` tree first, then the project-local
-/// `.umadev/learned/` and the global `~/.umadev/learned/` sediment dirs (each
-/// only when it exists). This is the EXACT dir list — and therefore the EXACT
-/// chunk ordering — that [`retrieve`] builds its BM25 index over.
-///
-/// Exposed (P0 semantic-layer fix) so the vector store is built over the SAME
-/// multi-dir index retrieval reads: only then does the store's per-chunk
-/// `chunk_idx` align with the index the fuser uses, so the BM25↔vector fusion
-/// can key on `chunk_idx` (collision-safe) rather than the ambiguous
-/// `(path, section)` pair. `knowledge_dir` is the curated root (usually
-/// `phases::knowledge_root(project_root)`).
+/// Compatibility projection of the path-based retrieval corpus. New product
+/// callers should retain [`corpus_set`] (or their discovered [`CorpusSet`]) and
+/// pass that same value to `retrieve_corpus*` and vector construction; reducing
+/// it to paths discards provenance.
 #[must_use]
 pub fn corpus_dirs(project_root: &Path, knowledge_dir: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![knowledge_dir.to_path_buf()];
-    let project_learned = project_root.join(".umadev/learned");
-    if project_learned.is_dir() {
-        dirs.push(project_learned);
+    knowledge_roots(project_root, Some(knowledge_dir), &[]).paths()
+}
+
+/// The exact provenance-aware source set used by lexical retrieval and vector
+/// indexing. Project knowledge is additive to bundled curated knowledge.
+#[must_use]
+pub fn corpus_set(
+    project_root: &Path,
+    knowledge_dir: &Path,
+    config: &RetrievalConfig,
+) -> CorpusSet {
+    if !config.enabled {
+        return CorpusSet::empty();
     }
-    if let Some(home) = home_dir() {
-        let global_learned = home.join(".umadev/learned");
-        if global_learned.is_dir() {
-            dirs.push(global_learned);
-        }
-    }
-    dirs
+    knowledge_roots(project_root, Some(knowledge_dir), &config.custom_dirs)
 }
 
 /// Run a retrieval query against the project's knowledge base.
@@ -293,9 +279,71 @@ pub fn retrieve_with_vector_and_expansion(
         return Vec::new();
     }
 
-    // Build / load the BM25 index over knowledge/ + any learned dirs.
-    let dirs = corpus_dirs(project_root, knowledge_dir);
-    let index = load_or_build_index_multi(project_root, &dirs);
+    let corpus = corpus_set(project_root, knowledge_dir, config);
+    retrieve_corpus_with_vector_and_expansion(
+        project_root,
+        &corpus,
+        config,
+        query,
+        phase,
+        query_vec,
+        expansion,
+    )
+}
+
+/// Retrieve from an already-discovered corpus. Product callers use this seam so
+/// lexical retrieval, vector indexing, previews, and digests consume the exact
+/// same ordered source set rather than rediscovering roots independently.
+#[must_use]
+pub fn retrieve_corpus(
+    project_root: &Path,
+    corpus: &CorpusSet,
+    config: &RetrievalConfig,
+    query: &str,
+    phase: Phase,
+) -> Vec<ScoredChunk> {
+    retrieve_corpus_with_vector(project_root, corpus, config, query, phase, None)
+}
+
+/// [`retrieve_corpus`] with a pre-embedded query vector.
+#[must_use]
+pub fn retrieve_corpus_with_vector(
+    project_root: &Path,
+    corpus: &CorpusSet,
+    config: &RetrievalConfig,
+    query: &str,
+    phase: Phase,
+    query_vec: Option<&[f32]>,
+) -> Vec<ScoredChunk> {
+    retrieve_corpus_with_vector_and_expansion(
+        project_root,
+        corpus,
+        config,
+        query,
+        phase,
+        query_vec,
+        None,
+    )
+}
+
+/// Provenance-aware retrieval with optional vector and HyDE channels.
+#[must_use]
+pub fn retrieve_corpus_with_vector_and_expansion(
+    project_root: &Path,
+    corpus: &CorpusSet,
+    config: &RetrievalConfig,
+    query: &str,
+    phase: Phase,
+    query_vec: Option<&[f32]>,
+    expansion: Option<&str>,
+) -> Vec<ScoredChunk> {
+    if !config.enabled || query.trim().is_empty() || corpus.is_empty() {
+        return Vec::new();
+    }
+
+    // Build/load the BM25 index over the caller's exact canonical,
+    // provenance-aware set. Vector construction receives this same set.
+    let index = load_or_build_index_corpus(project_root, corpus);
     if index.chunks.is_empty() {
         return Vec::new();
     }
@@ -316,6 +364,22 @@ pub fn retrieve_with_vector_and_expansion(
         bm25_masked
     };
     let query_bm25 = fuse_trigram_channel(&index, query, query_bigram, over_fetch);
+    // Preserve the untouched query as the primary channel, then add a bounded
+    // bilingual alias channel. Literal matches receive both RRF contributions;
+    // alias-only matches receive one, so inferred cross-language relevance can
+    // recover a miss without outranking stronger current-query evidence.
+    let expanded_query = crate::query_expansion::expand_bilingual_query(query);
+    let query_bm25 = if expanded_query == query {
+        query_bm25
+    } else {
+        let expanded_terms = index.mask_low_idf_terms(&expanded_query, idf_floor());
+        let expanded = index.search_terms(&expanded_terms, over_fetch);
+        if expanded.is_empty() {
+            query_bm25
+        } else {
+            rrf_fuse_bm25(&query_bm25, &expanded, RRF_K, over_fetch)
+        }
+    };
     // HyDE fusion: when a hypothetical-answer expansion is present and itself
     // matches something, RRF-fuse its ranking with the query's. Empty / no-match
     // expansion → identity (just the query ranking), preserving prior behaviour.
@@ -330,7 +394,18 @@ pub fn retrieve_with_vector_and_expansion(
         }
         _ => query_bm25,
     };
-    let bm25_hits = filter_by_phase(&index, &bm25_raw, phase, config.top_k);
+    // Metadata is a separate candidate-generation channel, not merely a boost
+    // applied after lexical truncation. This matters when a document title/tag
+    // names the user's concept but its body uses another language or vocabulary.
+    // Fuse at rank level so metadata cannot replace lexical evidence; when both
+    // channels select the same document chunk their agreement is rewarded.
+    let metadata = metadata_rank(&index, &expanded_query, &bm25_raw, over_fetch);
+    let bm25_raw = if metadata.is_empty() {
+        bm25_raw
+    } else {
+        rrf_fuse_bm25(&bm25_raw, &metadata, RRF_K, over_fetch)
+    };
+    let bm25_hits = filter_by_phase(&index, &bm25_raw, phase, over_fetch);
 
     // Vector fusion only when: hybrid engine, vector layer enabled, a query
     // vector was provided, AND the store actually has vectors. Whichever ranked
@@ -365,9 +440,9 @@ pub fn retrieve_with_vector_and_expansion(
             // de-bias), THEN run the fused ranking through `filter_by_phase` so the
             // vector channel can NOT reintroduce off-phase chunks the BM25 filter
             // excludes — e.g. a `design-systems` chunk in the Frontend phase (MED
-            // #2). Truncation to top_k happens inside the post-fusion phase filter.
+            // #2). Final top-k truncation happens after document diversification.
             let fused = rrf_fuse(&index, &bm25_raw, &vec_hits, RRF_K, over_fetch);
-            let fused = filter_by_phase(&index, &fused, phase, config.top_k);
+            let fused = filter_by_phase(&index, &fused, phase, over_fetch);
             if fused.is_empty() {
                 bm25_hits
             } else {
@@ -377,12 +452,303 @@ pub fn retrieve_with_vector_and_expansion(
     } else {
         bm25_hits
     };
-    // Retrieval-quality feedback: blend the cross-project per-chunk usefulness
-    // prior into the final score (a multiplicative weight, neutral 1.0 until a
-    // chunk is well-sampled). Loaded fail-open ONCE per query — a missing/corrupt
-    // store yields an empty prior, so a fresh corpus ranks exactly as before.
+    // Apply bounded metadata relevance, then blend the cross-project usefulness
+    // prior. A missing/corrupt store is neutral and never blocks retrieval.
+    let ranked = rerank_by_metadata(&index, &expanded_query, ranked);
     let usefulness = crate::usefulness::UsefulnessStore::load();
-    dedup_learned_chunks(normalise(&index, ranked, &usefulness))
+    diversify_paths(
+        dedup_learned_chunks(normalise(&index, ranked, &usefulness)),
+        config.top_k,
+    )
+}
+
+const MAX_QUERY_FIELD_TERMS: usize = 64;
+const MAX_FIELD_CHARS: usize = 2_048;
+const MAX_FIELD_TOKENS: usize = 128;
+const MAX_METADATA_BOOST: f64 = 0.5;
+const USEFULNESS_BLEND: f32 = 0.1;
+
+fn corpus_origin_weight(origin: crate::CorpusOrigin) -> f32 {
+    match origin {
+        // Project-authored policy is the team's local source of truth and must
+        // not be crowded out by a larger bundled library on an otherwise close
+        // match. The boost is deliberately bounded: materially stronger current
+        // evidence still wins.
+        crate::CorpusOrigin::ProjectCustom => 1.2,
+        crate::CorpusOrigin::ProjectSkillPackage => 1.1,
+        crate::CorpusOrigin::ProjectLearned => 1.05,
+        crate::CorpusOrigin::Unknown
+        | crate::CorpusOrigin::BundledCurated
+        | crate::CorpusOrigin::GlobalSafeLearned => 1.0,
+    }
+}
+
+#[derive(Default)]
+struct MetadataTokens {
+    title: BTreeSet<String>,
+    section: BTreeSet<String>,
+    tags: BTreeSet<String>,
+    domain: BTreeSet<String>,
+    path: BTreeSet<String>,
+}
+
+impl MetadataTokens {
+    fn from_chunk(chunk: &Chunk) -> Self {
+        let tags = chunk
+            .meta
+            .tags
+            .iter()
+            .take(MAX_FIELD_TOKENS)
+            .flat_map(|tag| bounded_tokens(tag, MAX_FIELD_TOKENS))
+            .take(MAX_FIELD_TOKENS)
+            .collect();
+        Self {
+            title: bounded_tokens(&chunk.meta.title, MAX_FIELD_TOKENS),
+            section: bounded_tokens(&chunk.meta.section, MAX_FIELD_TOKENS),
+            tags,
+            domain: bounded_tokens(&chunk.meta.domain, MAX_FIELD_TOKENS),
+            path: bounded_tokens(&chunk.meta.path, MAX_FIELD_TOKENS),
+        }
+    }
+
+    fn term_weight(&self, term: &str) -> f64 {
+        if self.title.contains(term) {
+            3.0
+        } else if self.tags.contains(term) {
+            2.5
+        } else if self.section.contains(term) {
+            1.75
+        } else if self.domain.contains(term) {
+            1.25
+        } else if self.path.contains(term) {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Rank at most one representative chunk per document using bounded metadata.
+///
+/// The representative is the document's strongest existing lexical candidate
+/// when possible, making agreement between channels address the same chunk id.
+/// Otherwise its first chunk is used, allowing a title/tag-only document into
+/// the over-fetched pool. IDF is computed over documents (not chunks), so a long
+/// document cannot dilute a term merely because its metadata is copied onto many
+/// sections.
+fn metadata_rank(
+    index: &Bm25Index,
+    query: &str,
+    lexical: &[(usize, f64)],
+    limit: usize,
+) -> Vec<(usize, f64)> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let query_terms = bounded_metadata_query_tokens(query);
+    if query_terms.is_empty() {
+        return Vec::new();
+    }
+    let lexical_rank = lexical
+        .iter()
+        .enumerate()
+        .map(|(rank, (idx, _))| (*idx, rank))
+        .collect::<HashMap<_, _>>();
+    let mut documents = HashMap::<String, (usize, usize, MetadataTokens)>::new();
+    for (idx, chunk) in index.chunks.iter().enumerate() {
+        let rank = lexical_rank.get(&idx).copied().unwrap_or(usize::MAX);
+        let entry = documents
+            .entry(chunk.meta.path.clone())
+            .or_insert_with(|| (idx, rank, MetadataTokens::from_chunk(chunk)));
+        if rank < entry.1 {
+            entry.0 = idx;
+            entry.1 = rank;
+        }
+    }
+    if documents.is_empty() {
+        return Vec::new();
+    }
+    let document_count = documents.len() as f64;
+    let term_idf = query_terms
+        .iter()
+        .map(|term| {
+            let frequency = documents
+                .values()
+                .filter(|(_, _, profile)| profile.term_weight(term) > 0.0)
+                .count() as f64;
+            let idf = ((document_count - frequency + 0.5) / (frequency + 0.5) + 1.0).ln();
+            (term, idf)
+        })
+        .collect::<Vec<_>>();
+    let mut ranked = documents
+        .into_values()
+        .filter_map(|(idx, _, profile)| {
+            let mut contributions = term_idf
+                .iter()
+                .filter_map(|(term, idf)| {
+                    let weight = profile.term_weight(term);
+                    (weight > 0.0).then_some(weight * *idf)
+                })
+                .collect::<Vec<_>>();
+            contributions.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let score = contributions.into_iter().take(3).sum::<f64>();
+            if score <= f64::EPSILON || !score.is_finite() {
+                return None;
+            }
+            score.is_finite().then_some((idx, score))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked.truncate(limit);
+    ranked
+}
+
+fn bounded_tokens(text: &str, max_tokens: usize) -> BTreeSet<String> {
+    let end = text
+        .char_indices()
+        .nth(MAX_FIELD_CHARS)
+        .map_or(text.len(), |(index, _)| index);
+    crate::tokenizer::tokenize(&text[..end])
+        .into_iter()
+        .take(max_tokens)
+        .collect()
+}
+
+fn bounded_metadata_query_tokens(text: &str) -> BTreeSet<String> {
+    let all = bounded_tokens(text, MAX_QUERY_FIELD_TERMS);
+    let phrases = all
+        .iter()
+        .filter(|term| term.chars().count() > 1)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if phrases.is_empty() {
+        all
+    } else {
+        phrases
+    }
+}
+
+/// Blend a bounded BM25F-style metadata signal into the lexical/vector rank.
+/// Each query term contributes at most its strongest field, so duplicating a
+/// word across title, tags, and path cannot manufacture relevance. Candidate-
+/// local IDF suppresses generic metadata while exact title/tag/path matches
+/// remain useful. Up to three distinct matches establish confidence, and the
+/// additive contribution is capped at half of the strongest lexical score;
+/// body relevance remains the primary channel, while an exact title/tag match
+/// can still recover a document whose body uses different vocabulary.
+fn rerank_by_metadata(
+    index: &Bm25Index,
+    query: &str,
+    hits: Vec<(usize, f64)>,
+) -> Vec<(usize, f64)> {
+    if hits.len() < 2 {
+        return hits;
+    }
+    let query_terms = bounded_metadata_query_tokens(query);
+    if query_terms.is_empty() || hits.iter().any(|(_, score)| !score.is_finite()) {
+        return hits;
+    }
+    let Some(profiles) = hits
+        .iter()
+        .map(|(idx, _)| index.chunks.get(*idx).map(MetadataTokens::from_chunk))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return hits;
+    };
+    let count = profiles.len() as f64;
+    let strongest_lexical = hits.iter().map(|(_, score)| *score).fold(0.0_f64, f64::max);
+    if strongest_lexical <= f64::EPSILON || !strongest_lexical.is_finite() {
+        return hits;
+    }
+    let term_idf = query_terms
+        .iter()
+        .map(|term| {
+            let document_frequency = profiles
+                .iter()
+                .filter(|candidate| candidate.term_weight(term) > 0.0)
+                .count() as f64;
+            let idf = ((count - document_frequency + 0.5) / (document_frequency + 0.5) + 1.0).ln();
+            (term, idf)
+        })
+        .collect::<Vec<_>>();
+    let evidence = profiles
+        .iter()
+        .map(|profile| {
+            let mut contributions = term_idf
+                .iter()
+                .filter_map(|(term, idf)| {
+                    let weight = profile.term_weight(term);
+                    (weight > 0.0).then_some(weight * *idf)
+                })
+                .collect::<Vec<_>>();
+            let matched = contributions.len();
+            contributions.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            (contributions.into_iter().take(3).sum::<f64>(), matched)
+        })
+        .collect::<Vec<_>>();
+    let max_relevance = evidence
+        .iter()
+        .map(|(relevance, _)| *relevance)
+        .fold(0.0_f64, f64::max);
+    if max_relevance <= f64::EPSILON || !max_relevance.is_finite() {
+        return hits;
+    }
+    let confidence_terms = query_terms.len().min(3) as f64;
+    let mut reranked = hits
+        .into_iter()
+        .zip(evidence)
+        .map(|((idx, score), (metadata, matched))| {
+            // One rare exact title/tag match is already useful for a mixed-language
+            // query (for example `WebSocket` plus Chinese reliability terms), but
+            // two or three independent matches should still be stronger. A square-
+            // root curve keeps that first signal material without letting repeated
+            // metadata tokens dominate the lexical body score.
+            let confidence =
+                (matched.min(confidence_terms as usize) as f64).sqrt() / confidence_terms.sqrt();
+            let metadata_contribution =
+                strongest_lexical * MAX_METADATA_BOOST * confidence * metadata / max_relevance;
+            let boosted = score + metadata_contribution;
+            (idx, if boosted.is_finite() { boosted } else { score })
+        })
+        .collect::<Vec<_>>();
+    reranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    reranked
+}
+
+/// Keep one highly-relevant document from consuming the entire prompt budget
+/// through many adjacent H2 chunks. Learned incident files may contribute up
+/// to two chunks; curated documents one. A second pass fills any spare
+/// slots, so diversity never turns a sparse result set into an empty one.
+fn diversify_paths(hits: Vec<ScoredChunk>, top_k: usize) -> Vec<ScoredChunk> {
+    if top_k == 0 {
+        return Vec::new();
+    }
+    let mut counts = HashMap::<String, usize>::new();
+    let mut selected = Vec::with_capacity(top_k);
+    let mut overflow = Vec::new();
+    for hit in hits {
+        let limit = if hit.chunk.meta.is_learned { 2 } else { 1 };
+        let count = counts.entry(hit.chunk.meta.path.clone()).or_default();
+        if *count < limit {
+            *count += 1;
+            selected.push(hit);
+        } else {
+            overflow.push(hit);
+        }
+    }
+    if selected.len() < top_k {
+        selected.extend(overflow.into_iter().take(top_k - selected.len()));
+    }
+    selected.truncate(top_k);
+    selected
 }
 
 /// Collapse duplicate sedimented-lesson chunks so the SAME learned lesson is
@@ -414,6 +780,13 @@ fn dedup_learned_chunks(hits: Vec<ScoredChunk>) -> Vec<ScoredChunk> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<ScoredChunk> = Vec::with_capacity(hits.len());
     for hit in hits {
+        // Upgrade quarantine: old auto-sediment pitfall markdown could contain
+        // raw stderr/requirements, and generic `general/error/*` advice was too
+        // coarse to act on. Filter it at the READ boundary so the very first
+        // post-upgrade retrieval is safe even before a delivery re-sediments.
+        if hit.chunk.meta.is_learned && is_quarantined_pitfall_chunk(&hit.chunk) {
+            continue;
+        }
         // Key on the FULL trimmed body, not just the first non-empty line. A prior
         // `(title, section, first_line)` key falsely collapsed two DISTINCT sub-chunks of
         // one oversized section that happen to share a first line — a ``` code fence, or a
@@ -432,6 +805,18 @@ fn dedup_learned_chunks(hits: Vec<ScoredChunk>) -> Vec<ScoredChunk> {
         // else: a byte-identical, lower-scored copy → drop it.
     }
     out
+}
+
+fn is_quarantined_pitfall_chunk(chunk: &crate::chunker::Chunk) -> bool {
+    let is_pitfall = chunk.meta.title.contains("[pitfall] Dev error")
+        || chunk.body.contains("# [pitfall] Dev error:");
+    if !is_pitfall {
+        return false;
+    }
+    if chunk.meta.title.contains("general/error/") || chunk.body.contains("general/error/") {
+        return true;
+    }
+    !chunk.meta.is_safe_learned_pitfall
 }
 
 /// Standard RRF constant. `k=60` is the value used by Elasticsearch and the
@@ -639,17 +1024,18 @@ fn idf_floor() -> f64 {
         .unwrap_or(1.0)
 }
 
-/// Applies a weak `quality_score` boost: a chunk with `quality_score: 95`
-/// gets ~1.24× its normalised score (clamped to 1.0), so curated docs rank
-/// slightly above equally-matching un-scored ones. Missing quality_score is
-/// treated as 50 (neutral).
+/// Applies a weak `quality_score` prior in the bounded range `0.95..=1.05`.
+/// A missing score is 50 and therefore exactly neutral (`1.0`). Quality may
+/// break a close relevance tie, but cannot rescue a substantially weaker hit.
 ///
-/// Then applies the **usefulness prior** ([`crate::usefulness`]) as a second
-/// multiplicative weight: a chunk with a proven track record (well-sampled
-/// helpful outcomes) lifts, a proven-unhelpful one sinks, both bounded to
-/// `0.3..=1.2` and clamped to a top score of `1.0`. `usefulness` is neutral
-/// (`1.0` for every chunk) on a fresh corpus, so this is a strict no-op until
-/// outcomes accumulate — BM25/vector relevance is BLENDED, never replaced.
+/// Then blends the **usefulness prior** ([`crate::usefulness`]) at 10% strength:
+/// the stored `0.3..=1.2` evidence becomes an effective `0.93..=1.02` weight.
+/// Outcome memory may break a close relevance tie, but cannot overturn a
+/// materially stronger current-query hit. Scores are normalised after sorting;
+/// this
+/// avoids saturating many strong hits at `1.0` and accidentally ordering those
+/// ties by corpus path. `usefulness` is neutral (`1.0` for every chunk) on a
+/// fresh corpus — BM25/vector relevance is blended, never replaced.
 fn normalise(
     index: &Bm25Index,
     hits: Vec<(usize, f64)>,
@@ -658,56 +1044,54 @@ fn normalise(
     if hits.is_empty() {
         return Vec::new();
     }
-    let max = hits
+    let raw_max = hits
         .iter()
-        .map(|(_, s)| *s)
+        .map(|(_, score)| *score)
+        .filter(|score| score.is_finite() && *score > 0.0)
         .fold(0.0_f64, f64::max)
         .max(1e-9);
     let min_score = min_score_filter();
-    // Attach the boosted score to each hit, carrying the chunk_idx for a
-    // deterministic tiebreak.
-    let mut scored: Vec<(usize, ScoredChunk)> = hits
+    let mut weighted: Vec<(usize, f32)> = hits
         .into_iter()
-        .map(|(idx, score)| {
-            let base = (score / max) as f32;
-            let qs = index.chunks[idx].quality_score.unwrap_or(50).clamp(0, 100);
-            // Usefulness prior: 1.0 until this chunk is well-sampled, then
-            // 0.3..=1.2 by its helpful ratio. Keyed on the same (path, section)
-            // identity the outcome recorder writes, so ranking and feedback agree.
-            let meta = &index.chunks[idx].meta;
-            let usefulness_w = usefulness.weight_for(&meta.path, &meta.section);
-            // Weak boost: score × (1 + quality/200) × usefulness. quality=50 →
-            // ×1.25, quality=100 → ×1.5, quality=0 → ×1.0; usefulness neutral 1.0.
-            // Clamped to 1.0 (top score stays normalised).
-            let boosted = (base * (1.0 + qs as f32 / 200.0) * usefulness_w).min(1.0);
-            (
-                idx,
-                ScoredChunk {
-                    chunk: index.chunks[idx].clone(),
-                    score: boosted,
-                },
-            )
+        .filter_map(|(idx, score)| {
+            let chunk = index.chunks.get(idx)?;
+            if !score.is_finite() || score <= 0.0 {
+                return None;
+            }
+            let base = (score / raw_max) as f32;
+            let qs = chunk.quality_score.unwrap_or(50).clamp(0, 100);
+            // Usefulness prior: 1.0 until this exact chunk body is well-sampled,
+            // then 0.3..=1.2 by its helpful ratio. Content identity prevents two
+            // colliding headings or a later edit from inheriting unrelated trust.
+            let meta = &chunk.meta;
+            let memory =
+                crate::usefulness::MemoryRef::from_parts(&meta.path, &meta.section, &chunk.body);
+            let usefulness_w = usefulness.weight_for_memory(&memory);
+            let usefulness_w = 1.0 + (usefulness_w - 1.0) * USEFULNESS_BLEND;
+            let quality_w = 0.95 + qs as f32 / 1_000.0;
+            let origin_w = corpus_origin_weight(chunk.meta.corpus_origin);
+            let boosted = base * quality_w * usefulness_w * origin_w;
+            boosted.is_finite().then_some((idx, boosted))
         })
         .collect();
-    // MED #3: actually RE-SORT by the boosted score (desc), tiebreak ascending
-    // chunk_idx for determinism. Previously the boost was attached but the list
-    // kept its raw-score order, so curated docs never ranked higher in ORDER (the
-    // boost only flipped the min_score gate). Sorting before the gate makes the
-    // quality boost reorder, and the new rank-0 is the genuine best (boosted).
-    scored.sort_by(|a, b| {
-        b.1.score
-            .partial_cmp(&a.1.score)
+    if weighted.is_empty() {
+        return Vec::new();
+    }
+    weighted.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
-    // Drop noise below the (configurable) threshold — but NEVER drop the top
-    // hit, so a real match can't vanish when min_score is raised high (e.g. 1.0
-    // would otherwise return empty unless quality_score == 100).
-    scored
+    let boosted_max = weighted[0].1.max(f32::EPSILON);
+    weighted
         .into_iter()
-        .enumerate()
-        .filter(|(rank, (_, sc))| *rank == 0 || sc.score >= min_score)
-        .map(|(_, (_, sc))| sc)
+        .filter_map(|(idx, score)| {
+            let score = (score / boosted_max).clamp(0.0, 1.0);
+            (score >= min_score).then(|| ScoredChunk {
+                chunk: index.chunks[idx].clone(),
+                score,
+            })
+        })
         .collect()
 }
 
@@ -847,6 +1231,7 @@ fn rrf_fuse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::load_or_build_index_multi;
     use std::fs;
     use std::path::PathBuf;
 
@@ -897,6 +1282,101 @@ mod tests {
     }
 
     #[test]
+    fn bilingual_alias_channel_recalls_an_english_only_document_from_chinese() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kd = tmp.path().join("knowledge");
+        fs::create_dir_all(kd.join("security")).unwrap();
+        fs::write(
+            kd.join("security/credential-rotation.md"),
+            "# Credential lifecycle\n\n## Rotation\n\nRotate authentication credentials on a bounded schedule.",
+        )
+        .unwrap();
+        let cfg = RetrievalConfig {
+            engine: RetrievalEngine::Bm25,
+            ..RetrievalConfig::default()
+        };
+        let hits = retrieve(tmp.path(), &kd, &cfg, "登录凭证轮换", Phase::Research);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.chunk.meta.path.contains("credential-rotation")),
+            "Chinese synonyms must recall the English-only source: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn bilingual_alias_channel_recalls_a_chinese_only_document_from_english() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kd = tmp.path().join("knowledge");
+        fs::create_dir_all(kd.join("backend")).unwrap();
+        fs::write(
+            kd.join("backend/payment.md"),
+            "# 支付可靠性\n\n## 请求处理\n\n支付接口必须使用幂等键，超时后允许安全重试。",
+        )
+        .unwrap();
+        let cfg = RetrievalConfig {
+            engine: RetrievalEngine::Bm25,
+            ..RetrievalConfig::default()
+        };
+        let hits = retrieve(
+            tmp.path(),
+            &kd,
+            &cfg,
+            "idempotent retry for payment",
+            Phase::Research,
+        );
+        assert!(
+            hits.iter()
+                .any(|hit| hit.chunk.meta.path.contains("payment")),
+            "English synonyms must recall the Chinese-only source: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn literal_query_evidence_outranks_alias_only_evidence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kd = tmp.path().join("knowledge");
+        fs::create_dir_all(kd.join("security")).unwrap();
+        fs::write(
+            kd.join("security/literal.md"),
+            "# 登录认证\n\n## 登录认证\n\n登录认证必须校验当前用户身份。",
+        )
+        .unwrap();
+        fs::write(
+            kd.join("security/alias-only.md"),
+            "# Authentication\n\n## Authentication\n\nAuthentication verifies the current user identity.",
+        )
+        .unwrap();
+        let cfg = RetrievalConfig {
+            engine: RetrievalEngine::Bm25,
+            ..RetrievalConfig::default()
+        };
+        let hits = retrieve(tmp.path(), &kd, &cfg, "登录认证", Phase::Research);
+        assert_eq!(
+            hits.first().map(|hit| hit.chunk.meta.path.as_str()),
+            Some("security/literal.md"),
+            "the untouched-query channel must outrank alias-only inference: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn unrelated_query_abstains_even_with_bilingual_expansion_enabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kd = seed_corpus(tmp.path());
+        let cfg = RetrievalConfig {
+            engine: RetrievalEngine::Bm25,
+            ..RetrievalConfig::default()
+        };
+        assert!(retrieve(
+            tmp.path(),
+            &kd,
+            &cfg,
+            "quasar pottery musical notation",
+            Phase::Research,
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn disabled_config_returns_empty() {
         let tmp = tempfile::TempDir::new().unwrap();
         let kd = seed_corpus(tmp.path());
@@ -904,7 +1384,14 @@ mod tests {
             enabled: false,
             ..RetrievalConfig::default()
         };
+        assert!(corpus_set(tmp.path(), &kd, &cfg).is_empty());
         assert!(retrieve(tmp.path(), &kd, &cfg, "login", Phase::Research).is_empty());
+        let explicit = CorpusSet::from_roots([(
+            kd,
+            crate::CorpusOrigin::ProjectCustom,
+            crate::CorpusScope::Project,
+        )]);
+        assert!(retrieve_corpus(tmp.path(), &explicit, &cfg, "login", Phase::Research).is_empty());
     }
 
     #[test]
@@ -990,6 +1477,183 @@ mod tests {
     }
 
     #[test]
+    fn metadata_fields_have_bounded_precedence() {
+        let chunk = crate::chunker::chunk_text(
+            "release-engineering/03-checklists/readiness-checklist.md",
+            "---\ntags: [rollback]\n---\n# Canary Guide\n\n## Failover Steps\n\nbody",
+        )
+        .remove(0);
+        let fields = MetadataTokens::from_chunk(&chunk);
+        for (term, expected) in [
+            ("canary", 3.0),
+            ("rollback", 2.5),
+            ("failover", 1.75),
+            ("release", 1.25),
+            ("readiness", 1.0),
+            ("unmatched", 0.0),
+        ] {
+            assert!((fields.term_weight(term) - expected).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn metadata_rerank_promotes_specific_hit_without_overriding_weak_hit() {
+        let body_only = crate::chunker::chunk_text(
+            "misc/other.md",
+            "# Other\n\n## Notes\n\nrelease rollback recovery details",
+        )
+        .remove(0);
+        let specific = crate::chunker::chunk_text(
+            "release-engineering/release-rollback.md",
+            "---\ntags: [recovery]\n---\n# Release Rollback\n\n## Guide\n\nbrief",
+        )
+        .remove(0);
+        let weak = crate::chunker::chunk_text(
+            "release-engineering/weak.md",
+            "# Release Rollback\n\n## Guide\n\nbrief",
+        )
+        .remove(0);
+        let index = Bm25Index::from_chunks(vec![body_only, specific, weak]);
+        let input = vec![(0, 1.0), (1, 0.8), (2, 0.4)];
+        let expected = vec![1, 0, 2];
+        for _ in 0..16 {
+            let ranked = rerank_by_metadata(&index, "release rollback recovery", input.clone());
+            assert_eq!(
+                ranked.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_rerank_fails_open_on_invalid_input() {
+        let chunk = crate::chunker::chunk_text("a.md", "# A\n\n## S\n\nbody").remove(0);
+        let index = Bm25Index::from_chunks(vec![chunk]);
+        let invalid_index = vec![(4, 1.0), (0, 0.8)];
+        assert_eq!(
+            rerank_by_metadata(&index, "body", invalid_index.clone()),
+            invalid_index
+        );
+        let non_finite = vec![(0, f64::NAN), (0, 0.8)];
+        let result = rerank_by_metadata(&index, "body", non_finite.clone());
+        assert!(result[0].1.is_nan());
+        assert_eq!(result[1], non_finite[1]);
+    }
+
+    #[test]
+    fn curated_metadata_channel_keeps_exact_language_document_candidates() {
+        let project = tempfile::tempdir().unwrap();
+        let knowledge = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("knowledge");
+        let index = load_or_build_index_multi(project.path(), &[knowledge]);
+        for (query, expected_path) in [
+            (
+                "Rust borrow checker ownership lifetime mutable reference Send Sync 并发安全",
+                "development/01-standards/rust-complete.md",
+            ),
+            (
+                "跨服务事务不用 2PC，比较 saga transactional outbox 补偿和幂等消费者",
+                "architecture/distributed-transactions.md",
+            ),
+        ] {
+            let lexical = index.search(query, 30);
+            let metadata = metadata_rank(&index, query, &lexical, 30);
+            let fused = rrf_fuse_bm25(&lexical, &metadata, RRF_K, 30);
+            let reranked = rerank_by_metadata(&index, query, fused);
+            let final_hits = diversify_paths(
+                dedup_learned_chunks(normalise(
+                    &index,
+                    reranked,
+                    &crate::usefulness::UsefulnessStore::default(),
+                )),
+                10,
+            );
+            assert!(
+                metadata
+                    .iter()
+                    .any(|(idx, _)| index.chunks[*idx].meta.path == expected_path),
+                "metadata candidate generation dropped {expected_path}"
+            );
+            let final_rank = final_hits
+                .iter()
+                .position(|hit| hit.chunk.meta.path == expected_path);
+            assert!(
+                final_rank.is_some_and(|rank| rank < 5),
+                "{expected_path} must survive metadata fusion in the top five; got {final_rank:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_diversification_samples_documents_before_overflow() {
+        let mut same = crate::chunker::chunk_text(
+            "guide/a.md",
+            "# A\n\n## One\n\none\n\n## Two\n\ntwo\n\n## Three\n\nthree",
+        );
+        let other = crate::chunker::chunk_text("guide/b.md", "# B\n\n## One\n\nbody").remove(0);
+        let hits = vec![
+            ScoredChunk {
+                chunk: same.remove(0),
+                score: 1.0,
+            },
+            ScoredChunk {
+                chunk: same.remove(0),
+                score: 0.9,
+            },
+            ScoredChunk {
+                chunk: other,
+                score: 0.8,
+            },
+        ];
+        let diverse = diversify_paths(hits.clone(), 2);
+        assert_eq!(
+            diverse
+                .iter()
+                .map(|hit| hit.chunk.meta.path.as_str())
+                .collect::<Vec<_>>(),
+            ["guide/a.md", "guide/b.md"]
+        );
+        assert_eq!(diversify_paths(hits, 3).len(), 3);
+    }
+
+    #[test]
+    fn learned_path_diversification_allows_two_incident_sections() {
+        let mut learned = crate::chunker::chunk_text(
+            "dependency/lesson.md",
+            "# Lesson\n\n## One\n\none\n\n## Two\n\ntwo\n\n## Three\n\nthree",
+        );
+        for chunk in &mut learned {
+            chunk.meta.is_learned = true;
+        }
+        let other =
+            crate::chunker::chunk_text("dependency/other.md", "# B\n\n## One\n\nbody").remove(0);
+        let mut hits = learned
+            .into_iter()
+            .enumerate()
+            .map(|(rank, chunk)| ScoredChunk {
+                chunk,
+                score: 1.0 - rank as f32 / 10.0,
+            })
+            .collect::<Vec<_>>();
+        hits.push(ScoredChunk {
+            chunk: other,
+            score: 0.6,
+        });
+        let diverse = diversify_paths(hits, 3);
+        assert_eq!(
+            diverse
+                .iter()
+                .filter(|hit| hit.chunk.meta.path == "dependency/lesson.md")
+                .count(),
+            2
+        );
+        assert!(diverse
+            .iter()
+            .any(|hit| hit.chunk.meta.path == "dependency/other.md"));
+    }
+
+    #[test]
     fn dedup_learned_chunks_collapses_duplicate_lessons() {
         // Two copies of ONE sedimented lesson (project + global) with different
         // paths but identical title + body → must collapse to a single hit.
@@ -1022,6 +1686,43 @@ mod tests {
         assert!(out
             .iter()
             .any(|h| h.chunk.meta.path.contains("design/tokens")));
+    }
+
+    #[test]
+    fn learned_pitfall_read_boundary_quarantines_generic_and_legacy_unsafe_chunks() {
+        let make = |title: &str, body: &str, is_safe: bool| {
+            let mut chunk = crate::chunker::chunk_text(
+                "dependency/legacy-pitfall.md",
+                &format!("# {title}\n\n## Symptom\n\n{body}"),
+            )
+            .remove(0);
+            chunk.meta.is_learned = true;
+            chunk.meta.is_safe_learned_pitfall = is_safe;
+            ScoredChunk { chunk, score: 1.0 }
+        };
+        let generic = make(
+            "[pitfall] Dev error: generic",
+            "signature general/error/failed and copied stderr",
+            false,
+        );
+        let unsafe_legacy = make(
+            "[pitfall] Dev error: module",
+            "signature dependency/module-not-found/lodash raw /Users/private",
+            false,
+        );
+        let prose_spoof = make(
+            "[pitfall] Dev error: module",
+            "copied text says Raw stderr and requirement text are intentionally excluded",
+            false,
+        );
+        let safe = make(
+            "[pitfall] Dev error: module",
+            "signature dependency/module-not-found/lodash",
+            true,
+        );
+        let out = dedup_learned_chunks(vec![generic, unsafe_legacy, prose_spoof, safe]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].chunk.meta.is_safe_learned_pitfall);
     }
 
     #[test]
@@ -1209,8 +1910,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let kd = seed_corpus(tmp.path());
         let cfg = RetrievalConfig::default();
-        // Bare query: only the login doc shares tokens.
-        let bare = retrieve(tmp.path(), &kd, &cfg, "sign-in flow", Phase::Research);
+        // Bare query shares no answer-vocabulary tokens with the postgres doc.
+        let bare = retrieve(tmp.path(), &kd, &cfg, "quasar request", Phase::Research);
         assert!(
             !bare.iter().any(|h| h.chunk.meta.path.contains("postgres")),
             "bare query should not reach the postgres doc"
@@ -1220,14 +1921,18 @@ mod tests {
             tmp.path(),
             &kd,
             &cfg,
-            "sign-in flow",
+            "quasar request",
             Phase::Research,
             None,
-            Some("Use shared_buffers and work_mem tuning for the database to scale logins."),
+            Some("Use shared_buffers and work_mem tuning for the database."),
         );
         assert!(
             fused.iter().any(|h| h.chunk.meta.path.contains("postgres")),
-            "HyDE expansion must recall the doc the bare query missed"
+            "HyDE expansion must recall the doc the bare query missed: {:?}",
+            fused
+                .iter()
+                .map(|hit| (&hit.chunk.meta.path, hit.score))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1325,12 +2030,13 @@ mod tests {
         )[0]
         .clone();
         let index = Bm25Index::from_chunks(vec![a, b, c]); // idx 0=a, 1=b, 2=c
-                                                           // Raw order a(1.0) > b(0.65) > c(0.6). After boost: a=1.0,
-                                                           // b=0.65×1.25=0.8125, c=0.6×1.5=0.9 → c must overtake b.
+                                                           // Raw order a(1.0) > b(0.65) > c(0.63). The default score is neutral,
+                                                           // while quality=100 contributes only 1.05×: c=0.6615, narrowly above b.
+                                                           // A materially weaker hit would remain lower.
                                                            // Empty usefulness store → every weight neutral 1.0, so this is purely the
                                                            // quality-boost reorder (proving the prior is a no-op on a fresh corpus).
         let store = crate::usefulness::UsefulnessStore::default();
-        let out = normalise(&index, vec![(0, 1.0), (1, 0.65), (2, 0.6)], &store);
+        let out = normalise(&index, vec![(0, 1.0), (1, 0.65), (2, 0.63)], &store);
         let paths: Vec<&str> = out.iter().map(|h| h.chunk.meta.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -1353,6 +2059,44 @@ mod tests {
             let paths: Vec<&str> = out.iter().map(|h| h.chunk.meta.path.as_str()).collect();
             assert_eq!(paths, vec!["a.md", "b.md"], "lower chunk_idx wins the tie");
         }
+    }
+
+    #[test]
+    fn normalise_preserves_close_score_order_without_saturation_ties() {
+        let higher = crate::chunker::chunk_text(
+            "z-higher.md",
+            "---\nquality_score: 100\n---\n# Higher\n\n## S\n\nbody",
+        )
+        .remove(0);
+        let lower = crate::chunker::chunk_text(
+            "a-lower.md",
+            "---\nquality_score: 100\n---\n# Lower\n\n## S\n\nbody",
+        )
+        .remove(0);
+        let index = Bm25Index::from_chunks(vec![higher, lower]);
+        let store = crate::usefulness::UsefulnessStore::default();
+        let out = normalise(&index, vec![(0, 1.0), (1, 0.99)], &store);
+        assert_eq!(out[0].chunk.meta.path, "z-higher.md");
+        assert!((out[0].score - 1.0).abs() < f32::EPSILON);
+        assert!(out[1].score < 1.0);
+    }
+
+    #[test]
+    fn project_corpus_breaks_close_ties_but_not_material_relevance() {
+        let mut bundled =
+            crate::chunker::chunk_text("guide.md", "# Bundled\n\n## S\n\nbundled").remove(0);
+        bundled.meta.corpus_origin = crate::CorpusOrigin::BundledCurated;
+        let mut project =
+            crate::chunker::chunk_text("guide.md", "# Project\n\n## S\n\nproject").remove(0);
+        project.meta.corpus_origin = crate::CorpusOrigin::ProjectCustom;
+        let index = Bm25Index::from_chunks(vec![bundled, project]);
+        let store = crate::usefulness::UsefulnessStore::default();
+
+        let tied = normalise(&index, vec![(0, 1.0), (1, 1.0)], &store);
+        assert_eq!(tied[0].chunk.meta.title, "Project");
+
+        let stronger_bundled = normalise(&index, vec![(0, 1.3), (1, 1.0)], &store);
+        assert_eq!(stronger_bundled[0].chunk.meta.title, "Bundled");
     }
 
     #[test]
@@ -1419,6 +2163,32 @@ mod tests {
             paths,
             vec!["b.md", "a.md"],
             "proven-unhelpful `a` sinks below unobserved `b` yet is kept: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn usefulness_memory_cannot_overturn_materially_stronger_current_evidence() {
+        let strong =
+            crate::chunker::chunk_text("strong.md", "# Strong\n\n## S\n\nexact current evidence")
+                [0]
+            .clone();
+        let weak =
+            crate::chunker::chunk_text("weak.md", "# Weak\n\n## S\n\nnearby evidence")[0].clone();
+        let index = Bm25Index::from_chunks(vec![strong, weak]);
+        let mut store = crate::usefulness::UsefulnessStore::default();
+        for _ in 0..crate::usefulness::MIN_SAMPLES {
+            store.record(&[("strong.md".into(), "S".into())], false);
+            store.record(&[("weak.md".into(), "S".into())], true);
+        }
+        let out = normalise(&index, vec![(0, 10.0), (1, 9.0)], &store);
+        let paths = out
+            .iter()
+            .map(|hit| hit.chunk.meta.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths.first(),
+            Some(&"strong.md"),
+            "even maximally opposed history must not beat an 11% relevance gap: {paths:?}"
         );
     }
 

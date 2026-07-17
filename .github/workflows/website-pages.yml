@@ -4,9 +4,13 @@ on:
   push:
     branches: [public-main, main]
     paths:
+      - "Cargo.toml"
+      - "npm/*/package.json"
+      - "npm/scripts/verify-version-lock.mjs"
       - "umadev-website/**"
       - ".github/workflows/website-pages.yml"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -26,17 +30,24 @@ jobs:
         working-directory: umadev-website
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: umadev-website/package-lock.json
 
+      - name: Verify release version lock
+        working-directory: ${{ github.workspace }}
+        run: node npm/scripts/verify-version-lock.mjs
+
       - name: Install dependencies
         run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=moderate
 
       - name: Lint
         run: npm run lint
@@ -49,7 +60,7 @@ jobs:
         run: npm run build
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
         with:
           path: umadev-website/out
 
@@ -63,4 +74,4 @@ jobs:
     steps:
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

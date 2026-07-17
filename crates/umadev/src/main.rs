@@ -51,6 +51,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use unicode_width::UnicodeWidthChar;
 
 use umadev_agent::ChannelSink;
 use umadev_agent::{
@@ -66,7 +67,7 @@ use umadev_spec::{CLAUSES, PHASE_CHAIN, SPEC_VERSION};
 #[command(
     name = "umadev",
     version,
-    about = "AI 编码的项目总监 Agent — 9-phase commercial delivery pipeline. Run `umadev` (no args) for the TUI. Drive your logged-in Claude Code / Codex / OpenCode CLI. No API key of its own — your existing base login is the brain.",
+    about = "AI 编码的项目总监 Agent — 9-phase commercial delivery pipeline. Run `umadev` (no args) for the TUI. Deeply integrates five first-class coding CLIs through vendor-specific machine protocols. No API key of its own — your existing base login is the brain.",
     long_about = None,
 )]
 struct Cli {
@@ -141,15 +142,13 @@ enum Command {
     /// Drive the pipeline from `research` to the first gate (`docs_confirm`).
     #[command(
         hide = true,
-        long_about = "Run the pipeline non-interactively from `research` to the first\n\
-                      gate (`docs_confirm`). Pick one of the three base CLIs:\n\
+        long_about = "Run the pipeline from `research` to the first\n\
+                      gate (`docs_confirm`). Pick one of the five first-class base CLIs:\n\
                       \n  \
-                      --backend claude-code    Anthropic Claude Code\n  \
-                      --backend codex          OpenAI Codex\n  \
-                      --backend opencode       OpenCode\n\
+                      --backend claude-code | codex | opencode | grok-build | kimi-code\n\
                       \n\
-                      All three drive the user's already-installed, already-logged-in\n\
-                      CLI — no API key needed.\n\
+	                      All five drive the user's already-installed, authenticated\n\
+	                      CLI — UmaDev itself needs no API key.\n\
                       \n\
                       Omitting --backend falls back to the internal offline templates\n\
                       (deterministic, no network) — a demo / CI fallback, NOT a base you\n\
@@ -186,10 +185,10 @@ enum Command {
         /// Force the continuous long-session path (one base session for the whole
         /// run — see `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`). This is now the
         /// DEFAULT for a host-CLI run, so the flag is rarely needed; it only
-        /// FORCES continuous on. To go back to the legacy per-phase single-shot
-        /// path, opt OUT with `UMADEV_CONTINUOUS=0` (or `UMADEV_LEGACY_RUN=1`).
-        /// Fail-open either way: if the continuous session can't start, the run
-        /// falls back to the single-shot path.
+        /// FORCES continuous on. The internal legacy per-phase path can be
+        /// selected explicitly for compatibility tests with
+        /// `UMADEV_CONTINUOUS=0` and `UMADEV_LEGACY_RUN=1`; a first-class session
+        /// failure never selects it silently.
         #[arg(long)]
         continuous: bool,
     },
@@ -309,7 +308,8 @@ enum Command {
                       every change request.",
         after_help = "EXAMPLES:\n  \
                       umadev revise \"把 OAuth 那段去掉,先做邮箱+密码 MVP\"\n  \
-                      umadev revise \"前端改成 Vue 而不是 React\""
+                      umadev revise \"前端改成 Vue 而不是 React\"\n  \
+                      umadev revise \"继续修改\" --backend grok-build"
     )]
     Revise {
         /// What needs to change. Free-form text.
@@ -317,6 +317,11 @@ enum Command {
         /// Workspace root; defaults to current directory.
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Explicitly select one of the current five bases. Required when the
+        /// persisted workflow belongs to a retired base; starts a safe
+        /// cross-base handoff without reusing the retired session id.
+        #[arg(long, value_enum)]
+        backend: Option<BackendArg>,
     },
     /// Roll the pipeline back to a previous state snapshot.
     #[command(
@@ -352,17 +357,17 @@ enum Command {
                       umadev usage | less      # paged"
     )]
     Usage,
-    /// Show what UmaDev has learned: high-frequency pitfalls + proven patterns.
+    /// Show reusable rules distilled by UmaDev (concrete incidents live in `/pitfalls`).
     #[command(
-        long_about = "Make UmaDev's self-evolution visible. Reads the pitfall knowledge\n\
-                      base and prints: high-frequency pitfalls (with how often each\n\
-                      recurred and whether its fix is now validated), the failed fixes\n\
-                      UmaDev is currently steering AWAY from, and the success patterns\n\
-                      that passed the quality gate and are safe to reuse.\n\
+        long_about = "Show the reusable rules UmaDev has distilled from concrete\n\
+                      incidents and mechanically verified outcomes. Each rule includes\n\
+                      its lifecycle status, recommendation, root cause, evidence source,\n\
+                      and UTC observation/verification times.\n\
                       \n\
-                      Read-only — reads `.umadev/learned/`, writes nothing and never\n\
-                      changes the learning logic. A project that hasn't hit any\n\
-                      pitfalls yet shows a friendly empty state.",
+                      This is deliberately different from the TUI `/pitfalls` view:\n\
+                      `/pitfalls` is the concrete incident ledger; `/lessons` contains\n\
+                      only reusable rules distilled from that evidence. Read-only —\n\
+                      reads `.umadev/learned/` and writes nothing.",
         after_help = "EXAMPLES:\n  \
                       umadev lessons                      # what's been learned here\n  \
                       umadev lessons --project-root ./app"
@@ -372,12 +377,37 @@ enum Command {
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
+    /// Inspect and control UmaDev's persisted memory without exposing content.
+    #[command(
+        long_about = "Inspect the exact project/global stores UmaDev persists and control\n\
+                      automatic capture or recall independently. Inventory reports only\n\
+                      store ids, locations, counts, bytes, and effective policy; it never\n\
+                      prints stored prompts or content. Configurable age retention has\n\
+                      a real, explicit soft-delete executor. Sensitive export and forget\n\
+                      require an exact scope plus --yes; forget is recoverable and never\n\
+                      pretends that a tombstone is physical erasure. Only rebuildable\n\
+                      indexes may be physically cleared by clear-cache.",
+        after_help = "EXAMPLES:\n  \
+                      umadev memory inventory --scope all\n  \
+                      umadev memory capture off --scope project --store conversation\n  \
+                      umadev memory recall off --scope global --store knowledge-utility\n  \
+                      umadev memory retention --scope project --store chat-sessions --days 30\n  \
+                      umadev memory retention --scope project --store chat-sessions --run --yes\n  \
+                      umadev memory export --scope project --output /tmp/umadev-memory.zip --yes\n  \
+                      umadev memory forget --scope project --store pitfalls --yes\n  \
+                      umadev memory clear-cache knowledge-index --yes"
+    )]
+    Memory {
+        /// Memory operation.
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
     /// Print the `UMADEV_HOST_SPEC_V1` specification.
     #[command(
         hide = true,
         long_about = "Print the UMADEV_HOST_SPEC_V1 specification — the normative\n\
-                      contract UmaDev enforces (31 clauses across 4 layers + 9\n\
-                      phases + 2 gates).",
+                      contract UmaDev enforces (34 clauses across four numbered\n\
+                      layers plus cross-cutting meta + 9 phases + 2 gates).",
         after_help = "EXAMPLES:\n  \
                       umadev spec               # full markdown\n  \
                       umadev spec --clauses     # clause table only\n  \
@@ -430,8 +460,9 @@ enum Command {
                       the delivery proof-pack). UmaDev owns no credentials and injects\n\
                       nothing — the deploy runs through whatever CLI you've logged in.\n\
                       \n\
-                      Fail-open: an unknown platform / missing CLI / failed deploy is\n\
-                      recorded as 'not deployed' with a manual hint, never an error.",
+                      An unknown platform / missing CLI / failed deploy is recorded as\n\
+                      'not deployed' with a manual hint; when --run was requested the\n\
+                      command also exits non-zero so CI cannot mistake it for success.",
         after_help = "EXAMPLES:\n  \
                       umadev deploy                 # detect + print the command\n  \
                       umadev deploy --run           # actually deploy + write proof\n  \
@@ -573,18 +604,24 @@ enum Command {
         /// PostToolUse audit (UD-EVID-002 — records the executed call, never
         /// blocks).
         check: String,
+        /// Internal project scope used by Kimi Code's user-level hook file.
+        /// Events whose actual working directory is outside this root fail
+        /// open immediately, so one project's hook cannot govern another.
+        #[arg(long, hide = true)]
+        project_root: Option<PathBuf>,
     },
     /// Install the UmaDev pre-write governance hook into a base CLI.
     ///
-    /// Currently supports Claude Code (writes `.claude/settings.json` with a
-    /// PreToolUse hook pointing at this binary). Codex is honestly
-    /// reported as unsupported — they rely on the quality-gate hard block
-    /// instead of real-time interception.
+    /// Supports Claude Code (project settings), Kimi Code (project-scoped
+    /// commands in its user hook registry), and a git pre-commit fallback.
+    /// Bases without a native hook surface rely on protocol approvals plus
+    /// the quality-gate hard block.
     #[command(
         long_about = "Install the UmaDev pre-write governance hook into a base CLI.\n\
                       \n\
                       Supported bases:\n  \
                       claude-code   writes .claude/settings.json PreToolUse hook\n  \
+                      kimi-code     merge-writes scoped Pre/PostToolUse hooks into Kimi config.toml\n  \
                       pre-commit    writes .git/hooks/pre-commit (runs `umadev ci --changed-only`)\n\
                       \n\
                       The hook checks every Write/Edit tool call, but HARD-BLOCKS only the\n\
@@ -593,14 +630,15 @@ enum Command {
                       bypass-immune). Craft/quality findings — emoji-as-icon (UD-CODE-001),\n\
                       hardcoded colors and AI-slop (UD-CODE-002) — are FLAGGED, not blocked:\n\
                       the post-write QC loop repairs them, so a single nit never stops the\n\
-                      base mid-write. Codex lacks a PreToolUse hook surface — use\n\
-                      `--base pre-commit` there instead."
+                      base mid-write. Bases without a native hook surface can use\n\
+                      `--base pre-commit` instead."
     )]
     Install {
-        /// Base to install into: `claude-code` (default) or `pre-commit`.
+        /// Base to install into: `claude-code` (default), `kimi-code`, or `pre-commit`.
         /// (The legacy `--host` spelling still works as an alias.)
         ///
         /// `claude-code` writes the PreToolUse hook into `.claude/settings.json`.
+        /// `kimi-code` installs root-scoped native hooks without replacing user hooks.
         /// `pre-commit` writes a git `pre-commit` hook into `.git/hooks/` that
         /// runs `umadev ci --changed-only` before every commit.
         #[arg(
@@ -685,7 +723,8 @@ enum Command {
     /// - `claude-code` (default) → `.mcp.json`
     /// - `codex` → `.codex/config.toml` (`[mcp_servers]`)
     /// - `opencode` → `opencode.json` (`mcp`)
-    /// - `all` → write to all three at once
+    /// - `grok-build` → `.grok/config.toml` (`[mcp_servers]`)
+    /// - `all` → write to all five at once
     ///
     /// Writers parse-merge (preserve your existing servers/keys/comments) and
     /// write atomically, so installing never clobbers your config.
@@ -698,7 +737,7 @@ enum Command {
         /// Server command (everything after `--`).
         /// e.g. `umadev mcp-manage install github -- npx -y @mcp/server-github`
         command: Vec<String>,
-        /// Target base: `claude-code` (default) | `codex` | `opencode` | `all`.
+        /// Target base id, or `all` (default: `claude-code`).
         #[arg(long, default_value = "claude-code")]
         backend: String,
         /// Workspace root; defaults to the project/git root above the cwd.
@@ -732,11 +771,172 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum MemoryAction {
+    /// List leaf stores, disk footprint, and effective capture/recall policy.
+    Inventory {
+        /// Inspect project, global, or both scopes.
+        #[arg(long, value_enum, default_value = "project")]
+        scope: MemoryInventoryScopeArg,
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    /// Enable or disable automatic capture without deleting existing data.
+    Capture {
+        /// Desired capture state.
+        #[arg(value_enum)]
+        state: MemoryToggleArg,
+        /// Required mutation boundary.
+        #[arg(long, value_enum)]
+        scope: MemoryMutationScopeArg,
+        /// Exact leaf store or group: lessons, learning, knowledge, conversation, derived, all.
+        #[arg(long)]
+        store: Option<String>,
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    /// Enable or disable automatic recall without deleting existing data.
+    Recall {
+        /// Desired recall state.
+        #[arg(value_enum)]
+        state: MemoryToggleArg,
+        /// Required mutation boundary.
+        #[arg(long, value_enum)]
+        scope: MemoryMutationScopeArg,
+        /// Exact leaf store or group: lessons, learning, knowledge, conversation, derived, all.
+        #[arg(long)]
+        store: Option<String>,
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    /// Inspect, configure, or explicitly run executable age retention.
+    Retention {
+        /// Inspect project, global, or both scopes.
+        #[arg(long, value_enum, default_value = "project")]
+        scope: MemoryInventoryScopeArg,
+        /// Exact leaf store. Required for --days, --clear, or --run.
+        #[arg(long)]
+        store: Option<String>,
+        /// Configure an age threshold in days; does not delete anything now.
+        #[arg(long, conflicts_with_all = ["clear", "run_now"])]
+        days: Option<u32>,
+        /// Remove the configured age threshold.
+        #[arg(long, conflicts_with_all = ["days", "run_now"])]
+        clear: bool,
+        /// Run the configured adapter now; stale files move to a recoverable tombstone.
+        #[arg(long = "run", conflicts_with_all = ["days", "clear"])]
+        run_now: bool,
+        /// Confirm a retention run that can move active files.
+        #[arg(long)]
+        yes: bool,
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    /// Export selected memory to a bounded ZIP without replacing an existing file.
+    Export {
+        /// Required authority boundary.
+        #[arg(long, value_enum)]
+        scope: MemoryMutationScopeArg,
+        /// Exact leaf or group; defaults to all stores in the selected scope.
+        #[arg(long)]
+        store: Option<String>,
+        /// Explicit absolute destination with an existing real parent directory.
+        #[arg(long)]
+        output: PathBuf,
+        /// Confirm that the archive may contain private prompts, facts, or code.
+        #[arg(long)]
+        yes: bool,
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    /// Move selected active memory into a recoverable soft-deletion tombstone.
+    Forget {
+        /// Required authority boundary.
+        #[arg(long, value_enum)]
+        scope: MemoryMutationScopeArg,
+        /// Exact leaf or explicitly named group (including `all`).
+        #[arg(long)]
+        store: String,
+        /// Confirm the recoverable move of active memory.
+        #[arg(long)]
+        yes: bool,
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    /// Clear one rebuildable project cache; authoritative memory is never touched.
+    ClearCache {
+        /// Cache to rebuild later.
+        #[arg(value_enum)]
+        store: MemoryCacheArg,
+        /// Confirm the cache deletion non-interactively.
+        #[arg(long)]
+        yes: bool,
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum MemoryInventoryScopeArg {
+    Project,
+    Global,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum MemoryMutationScopeArg {
+    Project,
+    Global,
+}
+
+impl From<MemoryMutationScopeArg> for umadev_agent::memory_control::MemoryScope {
+    fn from(value: MemoryMutationScopeArg) -> Self {
+        match value {
+            MemoryMutationScopeArg::Project => Self::Project,
+            MemoryMutationScopeArg::Global => Self::Global,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum MemoryToggleArg {
+    On,
+    Off,
+}
+
+impl MemoryToggleArg {
+    const fn enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum MemoryCacheArg {
+    KnowledgeIndex,
+    Repomap,
+}
+
+impl From<MemoryCacheArg> for umadev_agent::memory_control::MemoryStore {
+    fn from(value: MemoryCacheArg) -> Self {
+        match value {
+            MemoryCacheArg::KnowledgeIndex => Self::KnowledgeIndex,
+            MemoryCacheArg::Repomap => Self::RepoMap,
+        }
+    }
+}
+
 /// Host CLI backend selector for `umadev run --backend`.
 ///
-/// UmaDev drives exactly three base CLI bases. A unit test
+/// UmaDev drives five first-class base CLIs. A unit test
 /// asserts [`BACKEND_ARG_IDS`] stays equal to [`umadev_host::BACKEND_IDS`].
-#[derive(Debug, Copy, Clone, clap::ValueEnum)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
 enum BackendArg {
     /// Drive Claude Code CLI.
     ClaudeCode,
@@ -744,6 +944,10 @@ enum BackendArg {
     Codex,
     /// Drive OpenCode CLI.
     Opencode,
+    /// Drive xAI Grok Build through its ACP server.
+    GrokBuild,
+    /// Drive Moonshot Kimi Code CLI through its official ACP server.
+    KimiCode,
 }
 
 impl BackendArg {
@@ -752,6 +956,8 @@ impl BackendArg {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
             Self::Opencode => "opencode",
+            Self::GrokBuild => "grok-build",
+            Self::KimiCode => "kimi-code",
         }
     }
 
@@ -760,6 +966,8 @@ impl BackendArg {
             "claude-code" => Some(Self::ClaudeCode),
             "codex" => Some(Self::Codex),
             "opencode" => Some(Self::Opencode),
+            "grok-build" => Some(Self::GrokBuild),
+            "kimi-code" => Some(Self::KimiCode),
             _ => None,
         }
     }
@@ -767,12 +975,149 @@ impl BackendArg {
     /// Every id this enum can produce. Kept in sync with
     /// [`umadev_host::BACKEND_IDS`] by the `backend_arg_ids_match_host` test.
     fn all_ids() -> &'static [&'static str] {
-        &["claude-code", "codex", "opencode"]
+        &[
+            "claude-code",
+            "codex",
+            "opencode",
+            "grok-build",
+            "kimi-code",
+        ]
     }
 }
 
 /// Re-export so the sync test and help text can reference the canonical list.
-const BACKEND_ARG_IDS: &[&str] = &["claude-code", "codex", "opencode"];
+const BACKEND_ARG_IDS: &[&str] = &[
+    "claude-code",
+    "codex",
+    "opencode",
+    "grok-build",
+    "kimi-code",
+];
+
+/// Backend ids accepted by older releases but intentionally absent from the
+/// current product. They are recognized only to produce a safe migration
+/// message; no driver, command, picker item, or hidden profile is constructed.
+const RETIRED_BACKEND_IDS: &[&str] = &["cursor", "codebuddy", "cbc", "droid", "qwen", "qwen-code"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResumeBackendChoice {
+    backend: Option<BackendArg>,
+    /// The selected base differs from the one that owns the persisted session.
+    /// The old `base_session_id` must never cross this boundary.
+    cross_base_handoff: bool,
+    /// The user explicitly selected the base on this invocation.
+    explicit: bool,
+}
+
+/// Resolve a resume command's base without silently changing brains.
+///
+/// An explicit flag wins. Without one, a retired/unknown persisted id is an
+/// actionable error rather than an offline fallback or an automatic switch.
+fn resolve_resume_backend(
+    state: &umadev_agent::WorkflowState,
+    backend_override: Option<BackendArg>,
+) -> Result<ResumeBackendChoice> {
+    if let Some(backend) = backend_override {
+        return Ok(ResumeBackendChoice {
+            cross_base_handoff: !state.backend.is_empty() && state.backend != backend.id(),
+            backend: Some(backend),
+            explicit: true,
+        });
+    }
+    if state.backend.is_empty() {
+        return Ok(ResumeBackendChoice {
+            backend: None,
+            cross_base_handoff: false,
+            explicit: false,
+        });
+    }
+    if let Some(backend) = BackendArg::from_id(&state.backend) {
+        return Ok(ResumeBackendChoice {
+            backend: Some(backend),
+            cross_base_handoff: false,
+            explicit: false,
+        });
+    }
+    let kind = if RETIRED_BACKEND_IDS.contains(&state.backend.as_str()) {
+        "retired"
+    } else {
+        "unknown"
+    };
+    anyhow::bail!(
+        "workflow-state.json references {kind} backend `{}`. UmaDev will not \
+         silently switch the task or reuse that base's session. Re-run this \
+         command with `--backend <claude-code|codex|opencode|grok-build|kimi-code>` to \
+         choose the new base explicitly; existing artifacts and requirement are preserved.",
+        state.backend
+    )
+}
+
+/// Persist the base that now owns a workflow and its vendor session pointer.
+/// Call only after the replacement session/run has actually started, so a
+/// failed handoff cannot rewrite recoverable state.
+fn persist_workflow_base_identity(
+    project_root: &Path,
+    backend_id: &str,
+    base_session_id: Option<String>,
+    base_resume_identity: Option<umadev_runtime::BaseResumeIdentity>,
+) -> Result<()> {
+    let mut state = umadev_agent::read_workflow_state(project_root).ok_or_else(|| {
+        anyhow::anyhow!("workflow-state.json disappeared before the base session could be recorded")
+    })?;
+    state.backend = backend_id.to_string();
+    let base_session_id = base_session_id.filter(|id| !id.trim().is_empty());
+    state.base_resume_identity = base_session_id.as_ref().and(base_resume_identity);
+    state.base_session_id = base_session_id;
+    umadev_agent::write_workflow_state(project_root, &state)
+        .context("failed to persist the active base session")
+}
+
+/// Validate a workflow's authority-bearing vendor id for the next CLI launch.
+///
+/// Legacy workflow files may resume only on a non-Grok base when their separately
+/// persisted permission profile matches. Grok requires typed effective-state
+/// evidence plus a live native preflight; the current launch path cannot attest
+/// that preflight, so it always hands off through workflow artifacts to a fresh
+/// same-base session.
+fn eligible_workflow_resume_id(
+    state: &umadev_agent::WorkflowState,
+    backend_id: &str,
+    project_root: &Path,
+    permissions: umadev_runtime::BasePermissionProfile,
+) -> Option<String> {
+    if state.backend != backend_id {
+        return None;
+    }
+    let id = state
+        .base_session_id
+        .as_ref()
+        .filter(|id| !id.trim().is_empty())?;
+    let requested = umadev_runtime::BaseResumeIdentity::requested_for_launch(
+        backend_id,
+        project_root,
+        permissions,
+    )?;
+    let eligible = match state.base_resume_identity.as_ref() {
+        Some(saved) => saved.permits_resume_as(&requested, false),
+        None => backend_id != "grok-build" && state.resolved_permission_profile() == permissions,
+    };
+    eligible.then(|| id.clone())
+}
+
+fn session_resume_identity(
+    session: &dyn umadev_runtime::BaseSession,
+    backend_id: &str,
+    project_root: &Path,
+    permissions: umadev_runtime::BasePermissionProfile,
+) -> Option<umadev_runtime::BaseResumeIdentity> {
+    session.resume_identity().cloned().or_else(|| {
+        umadev_runtime::BaseResumeIdentity::requested_for_launch(
+            backend_id,
+            project_root,
+            permissions,
+        )
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -780,11 +1125,13 @@ async fn main() -> Result<()> {
 
     // The TUI owns the alternate screen, so a log line written to the terminal
     // corrupts the display and sticks in the input box. Detect the TUI launch
-    // (no subcommand + a real TTY) and route logs to a file in that case;
+    // (no subcommand + terminal stdin and stdout) and route logs to a file in
+    // that case;
     // every CLI verb keeps logging to the terminal as before.
     let is_tui = launches_tui(
         cli.command.is_some(),
         std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
     );
     init_tracing(is_tui);
 
@@ -824,11 +1171,11 @@ async fn main() -> Result<()> {
     // In a non-TTY environment (piped output, CI, docker), fall back to
     // printing help instead of crashing on terminal setup.
     let Some(command) = cli.command else {
-        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        if is_tui {
             return cmd_tui().await;
         }
         eprintln!(
-            "umadev: no terminal detected — showing help.
+            "umadev: interactive terminal input/output not detected — showing help.
 "
         );
         Cli::command().print_help()?;
@@ -850,14 +1197,14 @@ async fn main() -> Result<()> {
             mode,
             continuous,
         } => {
-            cmd_run(RunArgs {
+            Box::pin(cmd_run(RunArgs {
                 requirement,
                 backend,
                 project_root,
                 slug,
                 mode,
                 continuous,
-            })
+            }))
             .await
         }
         Command::Quick {
@@ -887,8 +1234,12 @@ async fn main() -> Result<()> {
         Command::Continue {
             project_root,
             backend,
-        } => cmd_continue(project_root, backend).await,
-        Command::Revise { text, project_root } => cmd_revise(text, project_root).await,
+        } => Box::pin(cmd_continue(project_root, backend)).await,
+        Command::Revise {
+            text,
+            project_root,
+            backend,
+        } => Box::pin(cmd_revise(text, project_root, backend)).await,
         Command::Rollback {
             timestamp,
             project_root,
@@ -896,6 +1247,7 @@ async fn main() -> Result<()> {
         Command::History { project_root } => cmd_history(project_root),
         Command::Usage => cmd_usage(),
         Command::Lessons { project_root } => cmd_lessons(project_root),
+        Command::Memory { action } => cmd_memory(action),
         Command::Spec { clauses } => cmd_spec(clauses),
         Command::Verify {
             project_root,
@@ -921,7 +1273,10 @@ async fn main() -> Result<()> {
         Command::Doctor { project_root, fix } => cmd_doctor(project_root, fix).await,
         Command::Examples => cmd_examples(),
         Command::Guide => cmd_guide(),
-        Command::Hook { check } => cmd_hook(check),
+        Command::Hook {
+            check,
+            project_root,
+        } => cmd_hook(check, project_root),
         Command::Install { host, project_root } => cmd_install(host, project_root),
         Command::Uninstall {
             base,
@@ -966,13 +1321,30 @@ fn cmd_guide() -> Result<()> {
     Ok(())
 }
 
-fn cmd_hook(check: String) -> Result<()> {
+fn cmd_hook(check: String, scoped_project_root: Option<PathBuf>) -> Result<()> {
     // Read the PreToolUse payload from stdin.
     use std::io::Read;
     let mut stdin = String::new();
     let _ = std::io::stdin().read_to_string(&mut stdin);
     // Load the per-project policy from .umadev/rules.toml (fail-open default).
-    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let actual_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let project_root = scoped_project_root.as_deref().map_or_else(
+        || actual_cwd.clone(),
+        |root| std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
+    );
+    if scoped_project_root.is_some() {
+        let actual_cwd = std::fs::canonicalize(&actual_cwd).unwrap_or_else(|_| actual_cwd.clone());
+        if !actual_cwd.starts_with(&project_root) {
+            // Kimi's hook registry is user-level. Every row installed by
+            // UmaDev carries its project root, and an unrelated workspace
+            // must pay only this bounded no-op. Pre hooks need an explicit
+            // allow object; observation-only post hooks can return silently.
+            if check != "tool-audit" && check != "post-tool" {
+                hook::print_decision(&umadev_governance::Decision::pass());
+            }
+            return Ok(());
+        }
+    }
 
     // ── PostToolUse AUDIT path (UD-EVID-002 / Layer-3 "PostToolUse hooks audit
     // results", spec §7.3 `tool-audit`) ──────────────────────────────────────
@@ -1049,7 +1421,8 @@ fn cmd_hook(check: String) -> Result<()> {
 }
 
 /// The pure decision core of [`cmd_hook`], split out so the whole rule-scan can
-/// be wrapped in one `catch_unwind`. Returns the governance [`Decision`] for the
+/// be wrapped in one `catch_unwind`. Returns the governance
+/// [`umadev_governance::Decision`] for the
 /// given `check` name and stdin payload. Fail-open by construction: an unknown
 /// check name passes through; a panic inside any rule is caught by the caller
 /// and collapses to `Decision::pass()`.
@@ -1120,6 +1493,24 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
                 println!("       a specific project directory instead.");
             }
         }
+        "kimi-code" | "kimi" => {
+            if let Some(path) = hook::install_kimi_hook(&root)? {
+                println!("[ok] Installed project-scoped UmaDev hooks for Kimi Code.");
+                println!("  → {}", path.display());
+                println!();
+                println!("Kimi's hook registry is user-level, but every UmaDev command is scoped");
+                println!("to this exact project root and fails open immediately elsewhere.");
+                println!(
+                    "PreToolUse governs Write/Edit/Bash; PostToolUse records the audit trail."
+                );
+                println!();
+                println!("To remove: umadev uninstall --base kimi-code");
+            } else {
+                println!("[skip] Refusing a Kimi hook scoped to your home directory because");
+                println!("       it would cover every nested project. Run this command inside");
+                println!("       the specific project you want UmaDev to govern.");
+            }
+        }
         "pre-commit" => {
             // Resolve the git repo ROOT by walking UP for `.git`, so
             // `umadev install --base pre-commit` works from any subdirectory of
@@ -1139,11 +1530,31 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
         }
         other => {
             anyhow::bail!(
-                "Unknown install host '{other}'. Supported: `claude-code`, `pre-commit`."
+                "Unknown install host '{other}'. Supported: `claude-code`, `kimi-code`, `pre-commit`."
             );
         }
     }
     Ok(())
+}
+
+fn activate_realtime_governance_hook(backend_id: &str, project_root: &Path) {
+    let result = match backend_id {
+        "claude-code" => hook::install_claude_hook(project_root),
+        "kimi-code" => hook::install_kimi_hook(project_root),
+        _ => return,
+    };
+    match result {
+        Ok(Some(path)) => eprintln!(
+            "  [governance] real-time Pre/PostToolUse hooks active ({})",
+            path.display()
+        ),
+        Ok(None) => eprintln!(
+            "  [governance] native hooks skipped: the selected project root is the user home"
+        ),
+        Err(error) => eprintln!(
+            "  [governance] native hook install failed open ({error}); protocol audit and final quality gates remain active"
+        ),
+    }
 }
 
 fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>) -> Result<()> {
@@ -1154,6 +1565,10 @@ fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>)
             "claude-code" => {
                 hook::uninstall_claude_hook(&root)?;
                 println!("[ok] Removed UmaDev PreToolUse hook from Claude Code settings.");
+            }
+            "kimi-code" | "kimi" => {
+                hook::uninstall_kimi_hook(&root)?;
+                println!("[ok] Removed this project's UmaDev hooks from Kimi Code config.");
             }
             "pre-commit" => {
                 // Resolve the GIT ROOT (walk up) - the same root `install --base
@@ -1179,7 +1594,7 @@ fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>)
     for d in &state_dirs {
         println!("  - global config + data:  {}", d.display());
     }
-    println!("  - this project's governance hooks (.claude/settings.json, .git/hooks/pre-commit)");
+    println!("  - this project's governance hooks (Claude Code, Kimi Code, git pre-commit)");
     if let Some(e) = &exe {
         println!("  - the umadev binary:     {}", e.display());
     }
@@ -1196,6 +1611,7 @@ fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>)
     }
     // 2. This project's governance hooks (best-effort; fail-open).
     let _ = hook::uninstall_claude_hook(&root);
+    let _ = hook::uninstall_kimi_hook(&root);
     let git_root = find_git_root_from(&root).unwrap_or_else(|| root.clone());
     let _ = uninstall_pre_commit_hook(&git_root);
     println!("[ok] Removed this project's governance hooks (if present).");
@@ -1372,7 +1788,7 @@ fn cmd_mcp(transport: String) -> Result<()> {
 
 /// `umadev mcp-manage` — install/list/remove MCP servers for a chosen base.
 ///
-/// `backend` is one of `claude-code` (default) / `codex` / `opencode` / `all`.
+/// `backend` is one of the five first-class base ids, or `all`.
 /// Each base discovers MCP servers from a DIFFERENT config file in a DIFFERENT
 /// format; `mcp_manager` writes the right one (parse-merged + atomic).
 fn cmd_mcp_manage(
@@ -1384,7 +1800,7 @@ fn cmd_mcp_manage(
 ) -> Result<()> {
     let root = resolve_workspace_root(project_root);
 
-    // `all` fans out over the three bases; otherwise a single base.
+    // `all` fans out over the five bases; otherwise a single base.
     let backends: Vec<mcp_manager::Backend> = if backend == "all" {
         mcp_manager::Backend::ALL.to_vec()
     } else {
@@ -1715,10 +2131,13 @@ async fn cmd_doctor(project_root: Option<PathBuf>, fix: bool) -> Result<()> {
 
 /// `true` when this invocation launches the interactive TUI — the only path
 /// that owns the alternate screen and must therefore NOT log to the terminal.
-/// The TUI launches with no subcommand on a real TTY; a piped/CI run (no TTY)
-/// prints help instead, and any subcommand is a plain CLI verb.
-fn launches_tui(has_subcommand: bool, stdin_is_tty: bool) -> bool {
-    !has_subcommand && stdin_is_tty
+/// The TUI launches with no subcommand only when both its input and render sink
+/// are terminals. A redirected stdout must never enter raw/alternate-screen mode
+/// and write control frames into a file, even when stdin is still an interactive
+/// terminal. Stderr is not part of the frame stream, so it is deliberately not a
+/// launch prerequisite.
+fn launches_tui(has_subcommand: bool, stdin_is_tty: bool, stdout_is_tty: bool) -> bool {
+    !has_subcommand && stdin_is_tty && stdout_is_tty
 }
 
 /// Initialize the tracing subscriber.
@@ -1782,81 +2201,20 @@ fn open_log_file_in(home: &std::path::Path) -> Option<std::fs::File> {
         .ok()
 }
 
-fn generate_project_index_section(report: &umadev_agent::AdoptReport) -> String {
-    let mut s = String::new();
-    s.push_str("## Project (auto-analyzed by `umadev init` - re-run to refresh)\n\n");
-    let stack = if report.stack.trim().is_empty() {
-        "unknown"
-    } else {
-        report.stack.trim()
-    };
-    s.push_str(&format!("- **Stack**: {stack}\n"));
-    if !report.dev_server.trim().is_empty() {
-        s.push_str(&format!("- **Dev server**: {}\n", report.dev_server.trim()));
-    }
-    if report.indexed_files > 0 {
-        s.push_str(&format!(
-            "- **Indexed source**: {} files -> {} retrievable chunks\n",
-            report.indexed_files, report.indexed_chunks
-        ));
-    }
-    if report.api_endpoints > 0 {
-        s.push_str(&format!(
-            "- **API surface**: {} endpoints reverse-derived to the contract baseline\n",
-            report.api_endpoints
-        ));
-    }
-    if !report.commands.is_empty() {
-        s.push_str("\n### Build / test / lint\n\n");
-        for c in &report.commands {
-            s.push_str(&format!("- **{}**: `{}`\n", c.name, c.command));
-        }
-    }
-    if !report.adopted_at.trim().is_empty() {
-        s.push_str(&format!(
-            "\n_Last analyzed: {}_\n",
-            report.adopted_at.trim()
-        ));
-    }
-    s
-}
-
-fn upsert_managed_section(existing: &str, section: &str) -> String {
-    const BEGIN: &str = "<!-- umadev:project:begin -->";
-    const END: &str = "<!-- umadev:project:end -->";
-    let block = format!("{BEGIN}\n{section}{END}\n");
-    if let (Some(b), Some(e)) = (existing.find(BEGIN), existing.find(END)) {
-        if e >= b {
-            let mut out = String::with_capacity(existing.len() + block.len());
-            out.push_str(&existing[..b]);
-            out.push_str(&block);
-            out.push_str(&existing[e + END.len()..]);
-            return out;
-        }
-    }
-    let mut out = existing.trim_end().to_string();
-    if !out.is_empty() {
-        out.push_str("\n\n");
-    }
-    out.push_str(&block);
-    out
-}
-
 fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) -> Result<()> {
     let workspace = resolve_root(project_root)?;
     let slug = match slug {
         Some(s) if !s.is_empty() => s,
         _ => infer_slug(&workspace),
     };
-    let manifest = umadev_agent::SpecManifest::new(&slug);
-    let path = manifest
-        .write_to(&workspace, force)
-        .with_context(|| format!("write {}", workspace.join("umadev.yaml").display()))?;
-
-    // Scaffold design infrastructure into the workspace so RAG and
-    // /design work out of the box. Uses include_str! so the files are
-    // embedded in the binary — no external data directory needed.
-    let scaffolded = scaffold_design_infrastructure(&workspace);
+    let init_options = umadev_agent::ProjectInitOptions {
+        slug,
+        force_manifest: force,
+    };
+    let init_report = umadev_agent::initialize_project(&workspace, &init_options)
+        .with_context(|| format!("initialise {}", workspace.display()))?;
+    let manifest = &init_report.manifest;
+    let path = &init_report.manifest_path;
 
     // Write a default .umadevrc config template so users can discover the
     // knowledge / quality / pipeline configuration surface. Idempotent.
@@ -1866,8 +2224,8 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
 # Docs: https://github.com/umacloud/umadev/blob/main/crates/umadev-agent/src/config.rs\n\
 \n[quality]\nthreshold = 90           # minimum weighted score to pass the quality gate\nskip_checks = []         # e.g. [\"Dark mode support\"]\n\
 \n[pipeline]\nskip_phases = []         # e.g. [\"research\"]\nmax_review_rounds = 3    # doc structural review retries\nauto_approve_gates = true # autonomous mode: auto-approve all gates (like /goal)\n\
-\n[knowledge]\nenabled = true           # enable BM25 / hybrid expert-knowledge retrieval\nengine = \"bm25\"          # bm25 (offline) or hybrid (needs OPENAI_API_KEY)\ntop_k = 6                # knowledge chunks injected per phase\n\
-\n[codex]\n# Codex launch sandbox: read-only | workspace-write (default, safe) | danger-full-access.\n# The default blocks local dev servers (npm start for React/Electron) and git commits;\n# set danger-full-access to allow them (high-risk -- you accept the system-environment risk).\nsandbox_mode = \"workspace-write\"\n";
+\n[knowledge]\nenabled = true           # enable curated expert-knowledge retrieval\nengine = \"hybrid\"        # local vector + BM25; falls back to BM25 if unavailable\ntop_k = 6                # knowledge chunks injected per phase\n\
+\n[codex]\n# Codex main-worker access: danger-full-access (default) gives normal development\n# access to subprocesses, network, local ports, git, and the filesystem. Set\n# workspace-write or read-only here only when you intentionally want to restrict it.\nsandbox_mode = \"danger-full-access\"\n";
         let _ = std::fs::write(&umadevrc, template);
         println!("  config:  {}", umadevrc.display());
     }
@@ -1883,9 +2241,10 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
              This project is managed by **UmaDev** ({version}), an AI coding project-director Agent.\n\n\
              ## How this works\n\n\
              1. UmaDev orchestrates a 9-phase pipeline (clarify → research → docs → spec → frontend → backend → quality → delivery).\n\
-             2. Each phase, UmaDev writes a **coach prompt** to `.umadev/coach/CURRENT.md`.\n\
-             3. **Read `.umadev/coach/CURRENT.md` at the start of every task** — it contains your role, task, and constraints.\n\
-             4. After completing the phase output, run `umadev continue` to advance.\n\n\
+             2. During an active pipeline, UmaDev writes the dispatched phase's **coach prompt** to `.umadev/coach/CURRENT.md`.\n\
+             3. The latest user message is the current objective. Read `CURRENT.md` only when the current turn explicitly dispatches that active phase (or the user explicitly asks to continue); the file's mere presence never authorizes resuming old work.\n\
+             4. Existing plans, run notes, output documents, and earlier conversation are context only. Do not widen scope or fix adjacent issues unless the user asks.\n\
+             5. After completing an explicitly active pipeline phase, run `umadev continue` to advance.\n\n\
              ## Rules (non-negotiable)\n\n\
              - **No emoji as functional icons** — use Lucide / Heroicons / Tabler icon libraries.\n\
              - **No hardcoded colors** — use CSS design tokens (Tailwind config).\n\
@@ -1905,49 +2264,6 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
         println!("  claude:  {}", claude_md.display());
     }
 
-    // Project analysis (the local analogue of Claude Code's `/init`): detect the
-    // stack + build/test/lint commands and index the source, then write a MANAGED
-    // `## Project` section into CLAUDE.md. Re-running `umadev init` REFRESHES only
-    // that section (everything else — the governance preamble + any hand edits — is
-    // preserved). Fail-open: `run_adopt` never errors, so an empty / sparse project
-    // just yields a minimal section.
-    // init is NOT adopt: it must not brand a fresh workspace brownfield. run_adopt writes
-    // the .umadev/adopt.json marker + UMADEV.md brief as a side effect, and the marker makes
-    // the NEXT `umadev run` see is_adopted()==true and inject "work incrementally, never
-    // regenerate" into what should be a greenfield build. So keep run_adopt ANALYSIS
-    // (stack/commands/index) for the CLAUDE.md Project refresh, but UNDO the brownfield
-    // branding when THIS init created it (a pre-existing real adopt is left intact).
-    let was_adopted = umadev_agent::is_adopted(&workspace);
-    // Capture whether a UMADEV.md ALREADY existed (a hand-authored one) before run_adopt so
-    // init only ever removes the brief it ITSELF wrote - is_adopted keys on adopt.json, so a
-    // user UMADEV.md with no marker would otherwise be destroyed by a plain init (L2).
-    let umadev_md = workspace.join("UMADEV.md");
-    let umadev_md_pre_existed = umadev_md.exists();
-    let report = umadev_agent::run_adopt(&workspace);
-    if !was_adopted {
-        let _ = std::fs::remove_file(workspace.join(".umadev").join("adopt.json"));
-        if !umadev_md_pre_existed {
-            let _ = std::fs::remove_file(&umadev_md);
-        }
-    }
-    let existing = std::fs::read_to_string(&claude_md).unwrap_or_default();
-    let refreshed = upsert_managed_section(&existing, &generate_project_index_section(&report));
-    if std::fs::write(&claude_md, refreshed).is_ok() {
-        println!(
-            "  project: {} · {} source files · {} commands (CLAUDE.md ## Project refreshed)",
-            report.stack,
-            report.indexed_files,
-            report.commands.len()
-        );
-    }
-
-    // Generate .umadev/rules.toml template so users can discover the
-    // governance customization surface. Idempotent — won't overwrite.
-    let rules_path = umadev_governance::Policy::write_default_template(&workspace);
-    if let Ok(p) = &rules_path {
-        println!("  rules:   {}", p.display());
-    }
-
     // Generate .gitignore with UmaDev-specific entries.
     let gitignore = workspace.join(".gitignore");
     if !gitignore.is_file() {
@@ -1964,23 +2280,23 @@ opencode.json
         println!("  gitignore: {}", gitignore.display());
     }
 
-    println!("UmaDev workspace initialised.");
+    println!("UmaDev workspace initialised with project-aware analysis.");
+    println!("{}", init_report.render_summary(cli_lang()));
     println!("  manifest: {}", path.display());
     println!(
-        "  spec: {} | level: {} | profile: {} | slug: {slug}",
+        "  spec: {} | level: {} | profile: {} | slug: {}",
         umadev_spec::SPEC_VERSION,
         manifest.level.as_str(),
         manifest.profile.as_str(),
+        init_report.effective_slug(),
     );
-    if scaffolded > 0 {
-        println!("  design: {scaffolded} files scaffolded into knowledge/");
-    }
     println!("\nNext steps:");
     println!("  umadev                          # launch the TUI (recommended)");
     println!("  umadev run \"<requirement>\"      # or scripted / CI form");
     println!();
     println!("Inside the TUI:");
-    println!("  /claude, /codex, /opencode   switch base CLI (each uses its OWN login + model)");
+    println!("  /claude /codex /opencode /grok /kimi");
+    println!("                                 switch base CLI (each uses its OWN login + model)");
     println!("  /status                      show the active base and its driving model");
     Ok(())
 }
@@ -2069,328 +2385,6 @@ fn cmd_adopt(path: Option<PathBuf>, project_root: Option<PathBuf>) -> Result<()>
     Ok(())
 }
 
-fn scaffold_design_infrastructure(workspace: &Path) -> usize {
-    let files: &[(&str, &str)] = &[
-        (
-            "knowledge/design-systems/modern-minimal.md",
-            include_str!("../../../knowledge/design-systems/modern-minimal.md"),
-        ),
-        (
-            "knowledge/design-systems/editorial-clean.md",
-            include_str!("../../../knowledge/design-systems/editorial-clean.md"),
-        ),
-        (
-            "knowledge/design-systems/tech-utility.md",
-            include_str!("../../../knowledge/design-systems/tech-utility.md"),
-        ),
-        (
-            "knowledge/design-systems/soft-warm.md",
-            include_str!("../../../knowledge/design-systems/soft-warm.md"),
-        ),
-        (
-            "knowledge/design-systems/bold-geometric.md",
-            include_str!("../../../knowledge/design-systems/bold-geometric.md"),
-        ),
-        (
-            "knowledge/design-systems/00-craft-rules.md",
-            include_str!("../../../knowledge/design-systems/00-craft-rules.md"),
-        ),
-        (
-            "knowledge/design-systems/anti-ai-slop.md",
-            include_str!("../../../knowledge/design-systems/anti-ai-slop.md"),
-        ),
-        (
-            "knowledge/design-systems/brutalist-bold.md",
-            include_str!("../../../knowledge/design-systems/brutalist-bold.md"),
-        ),
-        (
-            "knowledge/design-systems/glass-aurora.md",
-            include_str!("../../../knowledge/design-systems/glass-aurora.md"),
-        ),
-        (
-            "knowledge/design-systems/premium-luxury.md",
-            include_str!("../../../knowledge/design-systems/premium-luxury.md"),
-        ),
-        (
-            "knowledge/design-systems/product-type-design-map.md",
-            include_str!("../../../knowledge/design-systems/product-type-design-map.md"),
-        ),
-        (
-            "knowledge/design-systems/aesthetic-families.md",
-            include_str!("../../../knowledge/design-systems/aesthetic-families.md"),
-        ),
-        (
-            "knowledge/design-systems/design-system-deep-dive.md",
-            include_str!("../../../knowledge/design-systems/design-system-deep-dive.md"),
-        ),
-        (
-            "knowledge/seed-templates/saas-landing.md",
-            include_str!("../../../knowledge/seed-templates/saas-landing.md"),
-        ),
-        (
-            "knowledge/seed-templates/dashboard.md",
-            include_str!("../../../knowledge/seed-templates/dashboard.md"),
-        ),
-        (
-            "knowledge/seed-templates/blog-content.md",
-            include_str!("../../../knowledge/seed-templates/blog-content.md"),
-        ),
-        (
-            "knowledge/seed-templates/e-commerce.md",
-            include_str!("../../../knowledge/seed-templates/e-commerce.md"),
-        ),
-        (
-            "knowledge/seed-templates/auth-system.md",
-            include_str!("../../../knowledge/seed-templates/auth-system.md"),
-        ),
-        (
-            "knowledge/seed-templates/settings-page.md",
-            include_str!("../../../knowledge/seed-templates/settings-page.md"),
-        ),
-        (
-            "knowledge/seed-templates/docs-site.md",
-            include_str!("../../../knowledge/seed-templates/docs-site.md"),
-        ),
-        // Expert methodology knowledge
-        (
-            "knowledge/experts/product-manager/methodology.md",
-            include_str!("../../../knowledge/experts/product-manager/methodology.md"),
-        ),
-        (
-            "knowledge/experts/architect/api-design.md",
-            include_str!("../../../knowledge/experts/architect/api-design.md"),
-        ),
-        (
-            "knowledge/experts/architect/security.md",
-            include_str!("../../../knowledge/experts/architect/security.md"),
-        ),
-        (
-            "knowledge/experts/frontend-lead/methodology.md",
-            include_str!("../../../knowledge/experts/frontend-lead/methodology.md"),
-        ),
-        (
-            "knowledge/experts/backend-lead/methodology.md",
-            include_str!("../../../knowledge/experts/backend-lead/methodology.md"),
-        ),
-        (
-            "knowledge/experts/qa-lead/test-strategy.md",
-            include_str!("../../../knowledge/experts/qa-lead/test-strategy.md"),
-        ),
-        (
-            "knowledge/experts/uiux-designer/methodology.md",
-            include_str!("../../../knowledge/experts/uiux-designer/methodology.md"),
-        ),
-        (
-            "knowledge/experts/devops/methodology.md",
-            include_str!("../../../knowledge/experts/devops/methodology.md"),
-        ),
-        // Engineering-structure standards — how to layer, package, and write
-        // the service layer for a commercial-grade codebase. Seeded so they get
-        // BM25-indexed and injected into the backend / frontend phases.
-        (
-            "knowledge/backend/01-standards/application-layering-and-packaging.md",
-            include_str!(
-                "../../../knowledge/backend/01-standards/application-layering-and-packaging.md"
-            ),
-        ),
-        (
-            "knowledge/frontend/01-standards/frontend-architecture-and-layering.md",
-            include_str!(
-                "../../../knowledge/frontend/01-standards/frontend-architecture-and-layering.md"
-            ),
-        ),
-        (
-            "knowledge/backend/01-standards/api-and-error-conventions.md",
-            include_str!("../../../knowledge/backend/01-standards/api-and-error-conventions.md"),
-        ),
-        (
-            "knowledge/backend/01-standards/data-modeling-and-persistence.md",
-            include_str!(
-                "../../../knowledge/backend/01-standards/data-modeling-and-persistence.md"
-            ),
-        ),
-        (
-            "knowledge/backend/01-standards/config-and-observability.md",
-            include_str!("../../../knowledge/backend/01-standards/config-and-observability.md"),
-        ),
-        (
-            "knowledge/security/01-standards/secure-coding-baseline.md",
-            include_str!("../../../knowledge/security/01-standards/secure-coding-baseline.md"),
-        ),
-        (
-            "knowledge/testing/01-standards/test-strategy-and-layering.md",
-            include_str!("../../../knowledge/testing/01-standards/test-strategy-and-layering.md"),
-        ),
-        (
-            "knowledge/cicd/01-standards/deployment-and-delivery-standard.md",
-            include_str!(
-                "../../../knowledge/cicd/01-standards/deployment-and-delivery-standard.md"
-            ),
-        ),
-        (
-            "knowledge/performance/01-standards/performance-and-scalability.md",
-            include_str!(
-                "../../../knowledge/performance/01-standards/performance-and-scalability.md"
-            ),
-        ),
-        // Core feature standards — auth & forms are in every commercial app and
-        // the most security/UX-critical to get right.
-        (
-            "knowledge/backend/01-standards/auth-implementation.md",
-            include_str!("../../../knowledge/backend/01-standards/auth-implementation.md"),
-        ),
-        (
-            "knowledge/frontend/01-standards/forms-and-validation.md",
-            include_str!("../../../knowledge/frontend/01-standards/forms-and-validation.md"),
-        ),
-        (
-            "knowledge/backend/01-standards/payment-integration.md",
-            include_str!("../../../knowledge/backend/01-standards/payment-integration.md"),
-        ),
-        (
-            "knowledge/backend/01-standards/file-upload-and-storage.md",
-            include_str!("../../../knowledge/backend/01-standards/file-upload-and-storage.md"),
-        ),
-        (
-            "knowledge/backend/01-standards/background-jobs-and-async.md",
-            include_str!("../../../knowledge/backend/01-standards/background-jobs-and-async.md"),
-        ),
-        (
-            "knowledge/backend/01-standards/email-and-notifications.md",
-            include_str!("../../../knowledge/backend/01-standards/email-and-notifications.md"),
-        ),
-        (
-            "knowledge/backend/01-standards/search-and-filtering.md",
-            include_str!("../../../knowledge/backend/01-standards/search-and-filtering.md"),
-        ),
-        (
-            "knowledge/backend/01-standards/realtime-and-websocket.md",
-            include_str!("../../../knowledge/backend/01-standards/realtime-and-websocket.md"),
-        ),
-        (
-            "knowledge/frontend/01-standards/i18n-and-localization.md",
-            include_str!("../../../knowledge/frontend/01-standards/i18n-and-localization.md"),
-        ),
-        (
-            "knowledge/frontend/01-standards/accessibility-standard.md",
-            include_str!("../../../knowledge/frontend/01-standards/accessibility-standard.md"),
-        ),
-        // Deep design assets — the full token architecture + complete a11y
-        // spec. These are the backbone of premium, non-AI-looking UI.
-        (
-            "knowledge/frontend/01-standards/design-tokens-complete.md",
-            include_str!("../../../knowledge/frontend/01-standards/design-tokens-complete.md"),
-        ),
-        (
-            "knowledge/frontend/01-standards/accessibility-complete.md",
-            include_str!("../../../knowledge/frontend/01-standards/accessibility-complete.md"),
-        ),
-        // Multi-platform standards —商业开发不只 web：移动/桌面/小程序/鸿蒙/跨平台。
-        (
-            "knowledge/cross-platform/01-standards/platform-selection-and-architecture.md",
-            include_str!(
-                "../../../knowledge/cross-platform/01-standards/platform-selection-and-architecture.md"
-            ),
-        ),
-        (
-            "knowledge/cross-platform/01-standards/cross-platform-frameworks.md",
-            include_str!(
-                "../../../knowledge/cross-platform/01-standards/cross-platform-frameworks.md"
-            ),
-        ),
-        (
-            "knowledge/mobile/01-standards/mobile-app-standard.md",
-            include_str!("../../../knowledge/mobile/01-standards/mobile-app-standard.md"),
-        ),
-        (
-            "knowledge/harmony/01-standards/harmonyos-arkts-standard.md",
-            include_str!("../../../knowledge/harmony/01-standards/harmonyos-arkts-standard.md"),
-        ),
-        (
-            "knowledge/miniprogram/01-standards/miniprogram-standard.md",
-            include_str!("../../../knowledge/miniprogram/01-standards/miniprogram-standard.md"),
-        ),
-        (
-            "knowledge/desktop/01-standards/desktop-app-standard.md",
-            include_str!("../../../knowledge/desktop/01-standards/desktop-app-standard.md"),
-        ),
-        // Official platform DESIGN guidelines — Apple HIG / Material 3 /
-        // HarmonyOS Design / WeChat mini-program design. This is where a raw
-        // base CLI most often produces non-native-looking UI.
-        (
-            "knowledge/mobile/01-standards/ios-design-hig.md",
-            include_str!("../../../knowledge/mobile/01-standards/ios-design-hig.md"),
-        ),
-        (
-            "knowledge/mobile/01-standards/android-material-design.md",
-            include_str!("../../../knowledge/mobile/01-standards/android-material-design.md"),
-        ),
-        (
-            "knowledge/harmony/01-standards/harmonyos-design.md",
-            include_str!("../../../knowledge/harmony/01-standards/harmonyos-design.md"),
-        ),
-        (
-            "knowledge/miniprogram/01-standards/miniprogram-design.md",
-            include_str!("../../../knowledge/miniprogram/01-standards/miniprogram-design.md"),
-        ),
-        (
-            "knowledge/desktop/01-standards/desktop-design.md",
-            include_str!("../../../knowledge/desktop/01-standards/desktop-design.md"),
-        ),
-        // Web framework official best practices + AI/LLM application standard —
-        // high-volume areas where a raw base CLI most often misses official
-        // patterns (Next App Router caching/RSC) or builds unsafe AI apps.
-        (
-            "knowledge/frontend/01-standards/web-framework-best-practices.md",
-            include_str!(
-                "../../../knowledge/frontend/01-standards/web-framework-best-practices.md"
-            ),
-        ),
-        (
-            "knowledge/backend/01-standards/llm-application-standard.md",
-            include_str!("../../../knowledge/backend/01-standards/llm-application-standard.md"),
-        ),
-        (
-            "knowledge/frontend/01-standards/seo-and-web-vitals.md",
-            include_str!("../../../knowledge/frontend/01-standards/seo-and-web-vitals.md"),
-        ),
-        (
-            "knowledge/cicd/01-standards/release-and-store-submission.md",
-            include_str!("../../../knowledge/cicd/01-standards/release-and-store-submission.md"),
-        ),
-        (
-            "knowledge/backend/01-standards/analytics-and-growth.md",
-            include_str!("../../../knowledge/backend/01-standards/analytics-and-growth.md"),
-        ),
-        (
-            "knowledge/backend/01-standards/backend-framework-idioms.md",
-            include_str!("../../../knowledge/backend/01-standards/backend-framework-idioms.md"),
-        ),
-        (
-            "knowledge/backend/01-standards/microservices-and-distributed.md",
-            include_str!("../../../knowledge/backend/01-standards/microservices-and-distributed.md"),
-        ),
-        (
-            "knowledge/frontend/01-standards/admin-dashboard-and-crud.md",
-            include_str!("../../../knowledge/frontend/01-standards/admin-dashboard-and-crud.md"),
-        ),
-    ];
-    let mut count = 0;
-    for (rel, content) in files {
-        let target = workspace.join(rel);
-        if target.exists() {
-            continue;
-        }
-        if let Some(parent) = target.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if std::fs::write(&target, content).is_ok() {
-            count += 1;
-        }
-    }
-    count
-}
-
 /// Launch the conversational TUI. With no CLI flags this is the
 /// recommended entry — same as running `umadev` bare.
 async fn cmd_tui() -> Result<()> {
@@ -2401,6 +2395,12 @@ async fn cmd_tui() -> Result<()> {
     // Idempotent + merges; inert for codex/opencode/offline (they don't read
     // `.claude/settings.json`), so it's safe to install unconditionally.
     let _ = hook::install_claude_hook(&project_root);
+    // Kimi's registry is user-level rather than project-local, so only touch it
+    // when Kimi is the user's selected base. Each installed command still
+    // carries an exact project scope and immediately fails open elsewhere.
+    if umadev_tui::config::load().backend.as_deref() == Some("kimi-code") {
+        let _ = hook::install_kimi_hook(&project_root);
+    }
     let opts = umadev_tui::LaunchOptions {
         project_root,
         slug: String::new(),
@@ -2424,10 +2424,10 @@ struct RunArgs {
     /// Force the continuous long-session run path (one base session for the whole
     /// run). The continuous path is now the DEFAULT for a host-CLI run via
     /// [`umadev_agent::continuous_enabled_from_env`]; this flag only OR's in a
-    /// force-on (so `--continuous` still works, but is rarely needed). Opt OUT
-    /// back to single-shot with `UMADEV_CONTINUOUS=0` / `UMADEV_LEGACY_RUN=1`.
-    /// Fail-open back to single-shot if the session can't start. `quick` never
-    /// sets this (the lean track is already single-shot).
+    /// force-on (so `--continuous` still works, but is rarely needed). The
+    /// single-shot compatibility path is selected only by an explicit legacy
+    /// opt-out; a first-class session failure is surfaced. `quick` never sets
+    /// this (the lean track is intentionally single-shot).
     continuous: bool,
 }
 
@@ -2496,11 +2496,25 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
         // Now the base's body is visible: which file it writes, which command it
         // runs, and its streamed reasoning, exactly like the TUI render path.
         EngineEvent::WorkerStream { event } => match event {
-            umadev_runtime::StreamEvent::ToolUse { name, detail, .. } => {
+            umadev_runtime::StreamEvent::ToolUse { name, detail, .. }
+            | umadev_runtime::StreamEvent::ToolUseCorrelated { name, detail, .. } => {
                 let d = detail.chars().take(100).collect::<String>();
                 eprintln!("  ● [{name}] {d}");
             }
-            umadev_runtime::StreamEvent::ToolResult { ok, summary } => {
+            umadev_runtime::StreamEvent::ToolProgressCorrelated { title, .. } => {
+                let title = title.chars().take(100).collect::<String>();
+                eprintln!("    · {title}");
+            }
+            // Assistant text and live process output both stream verbatim. A
+            // process delta is non-terminal, so this arm deliberately adds no
+            // `[ok]`; only ToolResult below communicates the final verdict.
+            umadev_runtime::StreamEvent::Text { delta }
+            | umadev_runtime::StreamEvent::ToolOutputDelta { delta }
+            | umadev_runtime::StreamEvent::ToolOutputDeltaCorrelated { delta, .. } => {
+                eprint!("{delta}");
+            }
+            umadev_runtime::StreamEvent::ToolResult { ok, summary }
+            | umadev_runtime::StreamEvent::ToolResultCorrelated { ok, summary, .. } => {
                 let tag = if *ok { "ok" } else { "fail" };
                 let s = summary.chars().take(100).collect::<String>();
                 if !s.trim().is_empty() {
@@ -2510,16 +2524,11 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
             umadev_runtime::StreamEvent::Warning { message } => {
                 eprintln!("  [warn] {message}");
             }
-            // Streamed reasoning deltas: print inline without a newline per delta
-            // so a sentence reads as a sentence, not one word per line.
-            umadev_runtime::StreamEvent::Text { delta } => {
-                eprint!("{delta}");
-            }
-            // A "thinking" pulse carries no content, and streamed reasoning
-            // (extended thinking) would interleave confusingly with the answer on
-            // the plain CLI log — the TUI folds reasoning into a collapsed
-            // `[thinking]` block, but here we keep the log clean and skip both.
-            umadev_runtime::StreamEvent::Thinking
+            // Snapshots need a mutable row and reasoning is TUI-folded; neither
+            // belongs in the append-only CLI log.
+            umadev_runtime::StreamEvent::ToolOutputSnapshot { .. }
+            | umadev_runtime::StreamEvent::ToolOutputSnapshotCorrelated { .. }
+            | umadev_runtime::StreamEvent::Thinking
             | umadev_runtime::StreamEvent::ThinkingDelta(_) => {}
         },
         // Wave-1 director surface on the CLI: route decision, owned plan, step
@@ -2625,13 +2634,8 @@ fn new_run_session_id() -> String {
     )
 }
 
-/// Derive the continuous session's autonomy flag from the trust tier: only
-/// `auto` lets the base write unattended end-to-end; `guarded` / `plan` keep
-/// the human-in-the-loop posture (the gate pauses do the gating, and the
-/// per-turn approval floor still denies irreversible actions). Mirrors how the
-/// single-shot path reads `mode.gates_auto_approve()`.
-fn continuous_autonomous(mode: umadev_agent::TrustMode) -> bool {
-    mode.gates_auto_approve()
+fn base_permissions(mode: umadev_agent::TrustMode) -> umadev_runtime::BasePermissionProfile {
+    mode.base_permissions()
 }
 
 /// Map the start phase of the NEXT continuous block from the gate the prior
@@ -2806,11 +2810,29 @@ fn prepend_firmware(firmware: &str, goal: String) -> String {
     format!("{firmware}\n\n---\n\n{goal}")
 }
 
+/// Whether this base needs UmaDev's standing firmware prepended to its first
+/// directive. Claude Code and Grok Build receive the same bytes through native
+/// creation-time system/rules fields; prefixing them again would duplicate the
+/// instructions. Codex, OpenCode, and Kimi Code expose no equivalent stable
+/// slot in their audited transport, so they use the universal first-turn path.
+fn firmware_requires_directive_prefix(backend_id: &str) -> bool {
+    !matches!(backend_id, "claude-code" | "grok-build")
+}
+
 /// How a director-driven `/run` (Wave 1) settled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DirectorOutcome {
-    /// The director finished its turn cleanly AND the objective source-present
-    /// hard-gate is satisfied (or it legitimately only answered, no build claim).
+    /// Plan/read-only mode deliberately did not execute the requested build.
+    /// This must never be rendered as "build complete".
+    Planned,
+    /// The Director parked at a confirmation gate. This is a successful CLI
+    /// settle (exit 0), but it is not a completed build and must render its gate.
+    Paused {
+        /// The confirmation gate that still needs a user decision.
+        gate: Gate,
+    },
+    /// The director finished its turn cleanly and every applicable mechanical
+    /// completion gate passed.
     Done,
     /// The director's turn failed (session died / base error) OR the source-present
     /// hard-gate tripped (claimed a build but the workspace has zero real source).
@@ -2824,6 +2846,23 @@ enum DirectorOutcome {
 /// `umadev run … && next` proceeds as if the build succeeded. `Done` is success.
 fn director_outcome_is_failure(outcome: &DirectorOutcome) -> bool {
     matches!(outcome, DirectorOutcome::HardStop(_))
+}
+
+/// Honest terminal line for a CLI Director outcome.
+///
+/// Kept as a pure mapping so a defensive gate pause can never fall through to
+/// the completed-build wording merely because headless runs normally auto-drive.
+fn director_outcome_report(outcome: &DirectorOutcome) -> String {
+    match outcome {
+        DirectorOutcome::Planned => umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
+        DirectorOutcome::Paused { gate } => {
+            umadev_i18n::tlf("director.run_paused", &[gate.id_str()])
+        }
+        DirectorOutcome::Done => umadev_i18n::tl("director.run_done").to_string(),
+        DirectorOutcome::HardStop(reason) => {
+            umadev_i18n::tlf("continuous.hardstop_report", &[reason])
+        }
+    }
 }
 
 /// Whether a single-shot [`RunReport`] must map to a **non-zero process exit**.
@@ -2882,6 +2921,20 @@ async fn drive_director_run(
 ) -> Result<DirectorOutcome> {
     use umadev_agent::DirectorLoopOutcome;
 
+    // Defensive no-write ceiling for direct callers. `cmd_run` rejects Plan
+    // before opening a backend session; this inner boundary additionally proves
+    // no run lock, branch isolation, or `.umadev/*` state can be created if the
+    // driver is invoked programmatically.
+    if !options.mode.executes() {
+        events.emit(umadev_agent::EngineEvent::Note(
+            umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
+        ));
+        events.emit(umadev_agent::EngineEvent::Note(
+            umadev_i18n::tl("mode.plan.gate").to_string(),
+        ));
+        return Ok(DirectorOutcome::Planned);
+    }
+
     // Single-writer run-lock for the whole director run — the SAME guard the
     // pipeline's `run_continuous_block` / `run_initial_block` hold. Held for this
     // function's scope, dropped on return. A different LIVE run holding it is the
@@ -2915,13 +2968,10 @@ async fn drive_director_run(
     // orchestrates with its team however it judges fit (no fixed phase checklist).
     let goal = umadev_agent::experts::director_build_directive(&options.requirement);
 
-    // Wave 2 (firmware injection): the caller passes `firmware` ONLY for bases that
-    // could NOT take it natively as a system prompt (codex / opencode) — claude
-    // already received it via `session_for`'s `--append-system-prompt`, so the
-    // caller passes `None` there to avoid restating the identity. For the bases that
-    // need it, FRONT-LOAD the same firmware onto the first directive (the universal
-    // fail-open path). Fail-open: `None` / empty firmware → the goal directive is
-    // byte-for-byte unchanged.
+    // Wave 2 (firmware injection): the caller passes `firmware` only for bases
+    // without a native creation-time system/rules slot. Claude and Grok already
+    // received it in `session_for`; Codex, OpenCode, and Kimi receive it here.
+    // Fail-open: `None` / empty firmware leaves the goal byte-for-byte unchanged.
     let directive = match firmware {
         Some(fw) => prepend_firmware(fw, goal),
         None => goal,
@@ -2946,12 +2996,13 @@ async fn drive_director_run(
     // context — same wiring as the TUI drive. Fail-open: a surface that can't
     // serve (offline / unknown backend) leaves those seats on their read-only
     // fork, exactly today's path.
-    let reply = match umadev_agent::critics::with_cold_surface(
+    let reply = match Box::pin(umadev_agent::critics::with_cold_surface(
         umadev_tui::cold_judge_surface(&options.backend, &options.model, &options.project_root),
         umadev_agent::drive_director_loop_routed(session, options, events, directive, Some(&route)),
-    )
+    ))
     .await
     {
+        DirectorLoopOutcome::Planned { .. } => return Ok(DirectorOutcome::Planned),
         DirectorLoopOutcome::Done { reply } => reply,
         // A session that died / a turn that failed is an honest hard stop (never
         // disguised as a build).
@@ -2961,11 +3012,7 @@ async fn drive_director_run(
         // headless CLI drive. If it ever surfaces, report it honestly as a paused
         // (not failed) run and point at the resume surface.
         DirectorLoopOutcome::PausedAtGate { gate } => {
-            events.emit(umadev_agent::EngineEvent::Note(format!(
-                "run paused at gate `{}` — reopen the TUI (`umadev`) and approve, or `umadev continue`",
-                gate.id_str()
-            )));
-            return Ok(DirectorOutcome::Done);
+            return Ok(DirectorOutcome::Paused { gate });
         }
     };
 
@@ -2987,7 +3034,9 @@ async fn drive_director_run(
 /// `resolve_and_publish_codex_sandbox` precedence: an override already in effect
 /// (seeded from an external `UMADEV_CODEX_SANDBOX` launch env, or set earlier)
 /// wins and is NOT clobbered (`None`); otherwise the project's `.umadevrc` choice
-/// is resolved (fail-open → `workspace-write`) and returned so the caller
+/// is resolved (missing section → the product's `danger-full-access` execution
+/// default; an explicitly invalid value restricts to `workspace-write`) and
+/// returned so the caller
 /// publishes it. Pure + unit-testable: reads no process-global state and writes
 /// none.
 fn codex_sandbox_to_publish(
@@ -3013,11 +3062,20 @@ fn codex_sandbox_to_publish(
 /// `umadev_host::codex_session::set_codex_sandbox`). Without this the CLI silently
 /// ignored `.umadevrc` `[codex] sandbox_mode` (it only took effect in the TUI, so
 /// e.g. a `danger-full-access` project could never boot its dev server headless).
-/// Fail-open: no `.umadevrc` / no `[codex]` section → the safe `workspace-write`
-/// default (today's behaviour); an external launch override already in effect is
-/// respected, never clobbered.
+/// No `.umadevrc` / no `[codex]` section → `danger-full-access`, because the
+/// coding worker must be able to install packages, bind local ports, use git,
+/// and reach the network. An external launch override already in effect is
+/// respected and never clobbered.
 fn publish_codex_sandbox_from_rc(project_root: &std::path::Path) {
     let existing = umadev_host::codex_session::codex_sandbox_override();
+    if existing.as_deref().is_none_or(str::is_empty)
+        && matches!(
+            umadev_agent::config::migrate_legacy_generated_codex_sandbox(project_root),
+            Ok(true)
+        )
+    {
+        eprintln!("  [config] migrated UmaDev's legacy Codex default to danger-full-access");
+    }
     if let Some(mode) = codex_sandbox_to_publish(existing, project_root) {
         umadev_host::codex_session::set_codex_sandbox(Some(mode.as_codex_arg()));
     }
@@ -3037,7 +3095,7 @@ fn warn_if_model_provider_ignored(project_root: &std::path::Path) {
             "  [config] .umadevrc [model] provider = {provider:?} is IGNORED — UmaDev owns \
              no model endpoint and does not route models; the base CLI's own login/config \
              decides which model runs. Configure the model in your base CLI (claude-code / \
-             codex / opencode), or remove [model] from .umadevrc to silence this."
+             codex / opencode / grok-build), or remove [model] from .umadevrc to silence this."
         );
     }
 }
@@ -3052,9 +3110,18 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
+    let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
+    // The director `/run` surface is an execution command. In Plan mode it must
+    // settle before hook installation, backend probing/session creation,
+    // `runner.start()`, run-lock/branch setup, or any `.umadev/*` persistence.
+    // Normal conversation remains available for read-only research/planning.
+    if !mode.executes() {
+        println!("{}", umadev_i18n::tl("continuous.plan_mode_skip"));
+        println!("{}", umadev_i18n::tl("mode.plan.gate"));
+        return Ok(());
+    }
     // A dead `[model] provider` fails LOUD, not silent (UmaDev routes no models).
     warn_if_model_provider_ignored(&project_root);
-    let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
     let opts = RunOptions {
         project_root: project_root.clone(),
         requirement: args.requirement,
@@ -3078,8 +3145,9 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     //   --backend <host>  → drive a logged-in base CLI as the worker
     //   (default)         → offline deterministic templates
     let (report, runtime_label) = if let Some(backend) = args.backend {
-        let mut driver = umadev_host::driver_for(backend.id())
-            .ok_or_else(|| anyhow::anyhow!("unknown backend `{}`", backend.id()))?;
+        let mut driver =
+            umadev_host::driver_for_with_permissions(backend.id(), base_permissions(mode))
+                .ok_or_else(|| anyhow::anyhow!("unknown backend `{}`", backend.id()))?;
         // Run the base subprocess IN the project root — it reads/writes files
         // relative to its cwd, which differs from the launching cwd whenever
         // `--project-root` points elsewhere.
@@ -3097,27 +3165,21 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         // creates the session; later phases resume it (the base remembers the PRD
         // when it writes code). fail-open: a driver that can't pin a session just
         // ignores these (no-op default), keeping the old per-call behavior.
-        driver.set_session_id(Some(new_run_session_id()));
+        // Claude can create a caller-chosen UUID. Codex cannot: its exact native
+        // thread id is minted by `thread.started` and captured by CodexDriver.
+        // Never hand Codex a synthetic id (and never fall back to `--last`).
+        if backend.id() != "codex" {
+            driver.set_session_id(Some(new_run_session_id()));
+        }
         driver.set_continue_session(true);
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
-                // Real-time governance: install the PreToolUse hook so the
-                // driven `claude` subprocess fires our governor on EVERY file
-                // write (not just the doc-embedded code the quality gate scans).
-                // Idempotent + merges, so it never clobbers the user's
-                // .claude/settings.json. This is the "hooks auto-registered"
-                // behavior CLAUDE.md promises — without it the base writes
-                // ungoverned in real time. Claude Code is the only base with a
-                // PreToolUse hook surface.
-                if backend.id() == "claude-code" {
-                    if let Ok(Some(p)) = hook::install_claude_hook(&project_root) {
-                        eprintln!(
-                            "  [governance] real-time PreToolUse hook active ({})",
-                            p.display()
-                        );
-                    }
-                }
+                // Claude and the source-audited Kimi release expose native
+                // pre/post tool hooks. Both installers merge idempotently and
+                // fail open; Kimi's user-level registry command is constrained
+                // to this exact project root.
+                activate_realtime_governance_hook(backend.id(), &project_root);
             }
             umadev_host::ProbeResult::NotInstalled { program } => {
                 anyhow::bail!(
@@ -3143,12 +3205,9 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         // research → docs → code without re-priming) instead of a fresh per-phase
         // base process. `continuous_enabled_from_env` is now default-ON and only an
         // explicit opt-out (`UMADEV_CONTINUOUS=0` / `UMADEV_LEGACY_RUN=1`) selects
-        // the legacy single-shot path; `--continuous` still force-ON's it. The two
-        // paths COEXIST so the field is reversible without a code change.
-        // **Fail-open:** if the continuous session can't start, we fall through to
-        // the single-shot driver path below — the run never dies just because the
-        // long-session brain was unreachable. (Offline / non-host runs never reach
-        // this branch — it's inside `if let Some(backend)`.)
+        // the legacy single-shot path; `--continuous` still force-ON's it. A
+        // session-start failure is explicit: silently changing to a per-phase
+        // brain would lose typed interaction, resume, and accumulated context.
         // Wave 1 (docs/AGENT_WIELDS_BASE_ARCHITECTURE.md §5): an explicit `/run` is
         // the DIRECTOR-driven agentic path by DEFAULT — the director leads its team
         // to build the goal as a full commercial product however it judges fit, NOT
@@ -3175,11 +3234,12 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                     umadev_agent::compose_firmware(&project_root, &route, &opts.requirement).await;
                 (!fw.trim().is_empty()).then_some(fw)
             };
+            let launch_permissions = base_permissions(mode);
             match umadev_host::session_for(
                 backend.id(),
                 &project_root,
                 &opts.model,
-                continuous_autonomous(mode),
+                launch_permissions,
                 director_firmware.as_deref(),
             )
             .await
@@ -3189,6 +3249,15 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                         "{}",
                         umadev_i18n::tlf("continuous.session_active", &[backend.id()])
                     );
+                    let base_session_id = session.session_id().map(str::to_string);
+                    let base_resume_identity = base_session_id.as_ref().and_then(|_| {
+                        session_resume_identity(
+                            session.as_ref(),
+                            backend.id(),
+                            &project_root,
+                            launch_permissions,
+                        )
+                    });
                     if legacy_pipeline {
                         // ── LEGACY (opt-in): the fixed 9-phase continuous pipeline ──
                         // Capture the requirement before `opts` moves into the runner —
@@ -3201,6 +3270,12 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                         let runner =
                             AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), opts);
                         runner.start().context("failed to start agent")?;
+                        persist_workflow_base_identity(
+                            &project_root,
+                            backend.id(),
+                            base_session_id,
+                            base_resume_identity,
+                        )?;
                         let (runner, printer) = attach_live_sink(runner);
                         let outcome = drive_continuous_run(&runner, session.as_mut(), mode).await;
                         // Always end the session (release the process / server),
@@ -3229,6 +3304,12 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                     let runner =
                         AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), opts);
                     runner.start().context("failed to start agent")?;
+                    persist_workflow_base_identity(
+                        &project_root,
+                        backend.id(),
+                        base_session_id,
+                        base_resume_identity,
+                    )?;
                     // Build the live sink ourselves so the director drainer can emit
                     // through it (the same WorkerStream render path the pipeline uses).
                     let (sink, mut rx) = ChannelSink::new();
@@ -3238,22 +3319,20 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                             print_engine_event(&event);
                         }
                     });
-                    // claude already took the firmware NATIVELY (system prompt) via
-                    // `session_for`; codex / opencode have no native slot, so they get
-                    // it through the first-directive prefix instead. Pass the firmware
-                    // to the director loop ONLY for the non-native bases so claude is
-                    // never double-injected.
-                    let directive_firmware = if backend.id() == "claude-code" {
-                        None
-                    } else {
+                    // Claude and Grok already took the firmware through their
+                    // native creation-time fields. The remaining bases, including
+                    // Kimi, receive it exactly once through the first directive.
+                    let directive_firmware = if firmware_requires_directive_prefix(backend.id()) {
                         director_firmware.as_deref()
+                    } else {
+                        None
                     };
-                    let outcome = drive_director_run(
+                    let outcome = Box::pin(drive_director_run(
                         &sink,
                         session.as_mut(),
                         &director_opts,
                         directive_firmware,
-                    )
+                    ))
                     .await;
                     drop(runner);
                     // Always end the session (release the process / server).
@@ -3261,36 +3340,27 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                     drop(sink);
                     let _ = printer.await;
                     let outcome = outcome?;
-                    match &outcome {
-                        DirectorOutcome::Done => {
-                            println!("{}", umadev_i18n::tl("director.run_done"));
-                        }
-                        DirectorOutcome::HardStop(reason) => {
-                            println!(
-                                "{}",
-                                umadev_i18n::tlf("continuous.hardstop_report", &[reason])
-                            );
-                        }
-                    }
+                    println!("{}", director_outcome_report(&outcome));
                     println!("  workspace: {}", project_root.display());
                     println!("  runtime: {label}");
                     // The honest report is already printed above; a HardStop must
                     // still map to a non-zero exit so `umadev run … && next` does
                     // not proceed as if the build succeeded (these verbs are
-                    // documented for scripting/CI). A clean `Done` exits 0.
+                    // documented for scripting/CI). A clean `Done`, a read-only
+                    // `Planned`, and an honestly resumable `Paused` all exit 0.
                     if director_outcome_is_failure(&outcome) {
                         anyhow::bail!("`umadev run` halted before completion (hard stop)");
                     }
                     return Ok(());
                 }
                 Err(e) => {
-                    eprintln!(
-                        "{}",
-                        umadev_i18n::tlf("continuous.session_unavailable", &[&e.to_string()])
+                    anyhow::bail!(
+                        "could not start the continuous `{}` session: {e}. No \
+                         single-shot fallback was started because it would lose the \
+                         base conversation and interactive protocol. Check the base \
+                         login/version and retry.",
+                        backend.id()
                     );
-                    // Fall through to the single-shot driver path below with `opts`
-                    // intact — fail-open: the run never dies just because the
-                    // long-session brain (director or legacy) was unreachable.
                 }
             }
         }
@@ -3384,28 +3454,27 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
     };
 
     let (report, runtime_label) = if let Some(backend) = args.backend {
-        let mut driver = umadev_host::driver_for(backend.id())
-            .ok_or_else(|| anyhow::anyhow!("unknown backend `{}`", backend.id()))?;
+        let mut driver =
+            umadev_host::driver_for_with_permissions(backend.id(), base_permissions(mode))
+                .ok_or_else(|| anyhow::anyhow!("unknown backend `{}`", backend.id()))?;
         driver.set_workspace(project_root.clone());
+        if backend.id() == "codex" {
+            publish_codex_sandbox_from_rc(&project_root);
+        }
         // Long-session model: pin a fresh session id + enable continuation so the
         // base reuses ONE session across this run's serial phases instead of a
         // fresh, context-re-feeding `--print` process per phase. The first call
         // creates the session; later phases resume it (the base remembers the PRD
         // when it writes code). fail-open: a driver that can't pin a session just
         // ignores these (no-op default), keeping the old per-call behavior.
-        driver.set_session_id(Some(new_run_session_id()));
+        if backend.id() != "codex" {
+            driver.set_session_id(Some(new_run_session_id()));
+        }
         driver.set_continue_session(true);
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
-                if backend.id() == "claude-code" {
-                    if let Ok(Some(p)) = hook::install_claude_hook(&project_root) {
-                        eprintln!(
-                            "  [governance] real-time PreToolUse hook active ({})",
-                            p.display()
-                        );
-                    }
-                }
+                activate_realtime_governance_hook(backend.id(), &project_root);
             }
             umadev_host::ProbeResult::NotInstalled { program } => {
                 anyhow::bail!(
@@ -3417,12 +3486,6 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
             umadev_host::ProbeResult::Unhealthy { detail } => {
                 anyhow::bail!("backend `{}` is unhealthy: {detail}", backend.id());
             }
-        }
-        // Headless parity with the TUI: publish `.umadevrc` `[codex] sandbox_mode`
-        // into the codex driver's shared override so `--backend codex` honours the
-        // user's sandbox choice. No-op for the other bases (only codex reads it).
-        if backend.id() == "codex" {
-            publish_codex_sandbox_from_rc(&project_root);
         }
         let label = format!(
             "Base CLI worker — {} ({}) · lightweight track",
@@ -3480,9 +3543,17 @@ fn require_recorded_requirement(state: &umadev_agent::WorkflowState) -> Result<S
     Ok(state.requirement.clone())
 }
 
+/// Permission tier inherited by CLI continuation surfaces. The state owns the
+/// original run's posture; states written before the field existed resolve to
+/// Guarded through `resolved_permission_profile`.
+fn trust_for_resume(state: &umadev_agent::WorkflowState) -> umadev_agent::TrustMode {
+    umadev_agent::TrustMode::from_base_permissions(state.resolved_permission_profile())
+}
+
 /// `umadev redo <phase>` — re-run a single named phase using the prior run's
 /// persisted context. Resolves the backend the same way `continue` does
-/// (explicit flag > persisted state > offline). Rejects an unknown phase name
+/// (explicit flag > persisted state > offline only when the original state was
+/// already offline). Rejects an unknown phase name
 /// and a missing prior run with a friendly message.
 async fn cmd_redo(
     phase_name: String,
@@ -3517,17 +3588,19 @@ async fn cmd_redo(
         state.slug.clone()
     };
     let requirement = require_recorded_requirement(&state)?;
-    // backend: explicit flag > persisted state > offline.
-    let backend_id: Option<String> = backend_override
-        .as_ref()
-        .map(|b| b.id().to_string())
-        .or_else(|| {
-            if state.backend.is_empty() {
-                None
-            } else {
-                Some(state.backend.clone())
-            }
-        });
+    let trust = trust_for_resume(&state);
+    // backend: explicit flag > persisted state > offline. Retired/unknown state
+    // never silently changes brains.
+    let backend_choice = resolve_resume_backend(&state, backend_override)?;
+    let backend_id = backend_choice.backend.map(|b| b.id().to_string());
+    if backend_choice.cross_base_handoff {
+        eprintln!(
+            "[migration] handing the persisted requirement/artifacts from `{}` to `{}`; \
+             the previous vendor session id will not be reused.",
+            state.backend,
+            backend_choice.backend.map_or("offline", BackendArg::id)
+        );
+    }
 
     let opts = RunOptions {
         project_root: project_root.clone(),
@@ -3537,10 +3610,9 @@ async fn cmd_redo(
         backend: backend_id.clone().unwrap_or_default(),
         design_system: String::new(),
         seed_template: String::new(),
-        // Resume paths honour the existing gate semantics (the user explicitly
-        // invoked `continue`); `plan` read-only gating only applies to the
-        // initial `run`, so resume defaults to guarded.
-        mode: umadev_agent::TrustMode::Guarded,
+        // Preserve the originating run's permission posture. A legacy state
+        // without the field resolves to Guarded in `WorkflowState`.
+        mode: trust,
         // Snapshot the strict-coverage opt-in here at the app boundary (read env
         // once), not live in the runner — a mid-run env read races in parallel.
         strict_coverage: umadev_agent::strict_coverage_from_env(),
@@ -3557,36 +3629,34 @@ async fn cmd_redo(
         None,
     );
 
-    let (report, runtime_label) = if let Some(id) = backend_id {
-        let backend = BackendArg::from_id(&id)
-            .ok_or_else(|| anyhow::anyhow!("unknown backend `{id}` in workflow-state.json"))?;
-        let mut driver = umadev_host::driver_for(backend.id())
-            .ok_or_else(|| anyhow::anyhow!("no driver registered for `{}`", backend.id()))?;
+    let (report, runtime_label) = if let Some(backend) = backend_choice.backend {
+        let mut driver =
+            umadev_host::driver_for_with_permissions(backend.id(), base_permissions(trust))
+                .ok_or_else(|| anyhow::anyhow!("no driver registered for `{}`", backend.id()))?;
         driver.set_workspace(project_root.clone());
+        if backend.id() == "codex" {
+            publish_codex_sandbox_from_rc(&project_root);
+        }
         // Long-session model: pin a fresh session id + enable continuation so the
         // base reuses ONE session across this run's serial phases instead of a
         // fresh, context-re-feeding `--print` process per phase. The first call
         // creates the session; later phases resume it (the base remembers the PRD
         // when it writes code). fail-open: a driver that can't pin a session just
         // ignores these (no-op default), keeping the old per-call behavior.
-        driver.set_session_id(Some(new_run_session_id()));
+        if backend.id() != "codex" {
+            driver.set_session_id(Some(new_run_session_id()));
+        }
         driver.set_continue_session(true);
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
-                if backend.id() == "claude-code" {
-                    if let Ok(Some(p)) = hook::install_claude_hook(&project_root) {
-                        eprintln!(
-                            "  [governance] real-time PreToolUse hook active ({})",
-                            p.display()
-                        );
-                    }
-                }
+                activate_realtime_governance_hook(backend.id(), &project_root);
             }
             umadev_host::ProbeResult::NotInstalled { program } => {
                 anyhow::bail!(
                     "backend `{}` not available: `{program}` is not on PATH. \
-                     Omit --backend to re-run offline.",
+                     Install and log in to that base, or start a new offline run \
+                     explicitly instead of changing this workflow's brain.",
                     backend.id()
                 );
             }
@@ -3608,6 +3678,10 @@ async fn cmd_redo(
             .context("redo phase failure")?;
         drop(runner);
         let _ = printer.await;
+        // `redo` used the single-shot driver surface, so its new work does not
+        // belong to the prior vendor-native continuous transcript. Clear that
+        // pointer after success, including same-base redo.
+        persist_workflow_base_identity(&project_root, backend.id(), None, None)?;
         (report, label)
     } else {
         let label = format!("Offline deterministic templates · redo {}", phase.id());
@@ -3853,18 +3927,20 @@ async fn drive_gate_block(
         Some(r) => r,
         None => require_recorded_requirement(state)?,
     };
+    let trust = trust_for_resume(state);
 
-    // Resolve backend: explicit flag > persisted state > offline.
-    let backend_id: Option<String> = backend_override
-        .as_ref()
-        .map(|b| b.id().to_string())
-        .or_else(|| {
-            if state.backend.is_empty() {
-                None
-            } else {
-                Some(state.backend.clone())
-            }
-        });
+    // Resolve backend: explicit flag > persisted state > offline. A retired or
+    // unknown stored id requires an explicit handoff and never falls through.
+    let backend_choice = resolve_resume_backend(state, backend_override)?;
+    let backend_id = backend_choice.backend.map(|b| b.id().to_string());
+    if backend_choice.cross_base_handoff {
+        eprintln!(
+            "[migration] handing the persisted requirement/artifacts from `{}` to `{}`; \
+             the previous vendor session id will not be reused.",
+            state.backend,
+            backend_choice.backend.map_or("offline", BackendArg::id)
+        );
+    }
 
     let opts = RunOptions {
         project_root: project_root.to_path_buf(),
@@ -3877,19 +3953,18 @@ async fn drive_gate_block(
         backend: backend_id.clone().unwrap_or_default(),
         design_system: String::new(),
         seed_template: String::new(),
-        // Resume paths default to guarded — see the `continue` path above.
-        mode: umadev_agent::TrustMode::Guarded,
+        // Keep `/continue` and `/revise` on the originating run's posture.
+        mode: trust,
         // Snapshot the strict-coverage opt-in here at the app boundary (read env
         // once), not live in the runner — a mid-run env read races in parallel.
         strict_coverage: umadev_agent::strict_coverage_from_env(),
     };
 
     let use_runtime = backend_id.is_some();
-    let (report, runtime_label) = if let Some(id) = backend_id {
-        let backend = BackendArg::from_id(&id)
-            .ok_or_else(|| anyhow::anyhow!("unknown backend `{id}` in workflow-state.json"))?;
-        let mut driver = umadev_host::driver_for(backend.id())
-            .ok_or_else(|| anyhow::anyhow!("no driver registered for `{}`", backend.id()))?;
+    let (report, runtime_label) = if let Some(backend) = backend_choice.backend {
+        let mut driver =
+            umadev_host::driver_for_with_permissions(backend.id(), base_permissions(trust))
+                .ok_or_else(|| anyhow::anyhow!("no driver registered for `{}`", backend.id()))?;
         driver.set_workspace(project_root.to_path_buf());
         // Headless parity with the TUI: publish `.umadevrc` `[codex] sandbox_mode`
         // into the codex driver's shared override BEFORE a continuous resume, so a
@@ -3901,27 +3976,13 @@ async fn drive_gate_block(
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
-                // Real-time governance: install the PreToolUse hook so the
-                // driven `claude` subprocess fires our governor on EVERY file
-                // write (not just the doc-embedded code the quality gate scans).
-                // Idempotent + merges, so it never clobbers the user's
-                // .claude/settings.json. This is the "hooks auto-registered"
-                // behavior CLAUDE.md promises — without it the base writes
-                // ungoverned in real time. Claude Code is the only base with a
-                // PreToolUse hook surface.
-                if backend.id() == "claude-code" {
-                    if let Ok(Some(p)) = hook::install_claude_hook(project_root) {
-                        eprintln!(
-                            "  [governance] real-time PreToolUse hook active ({})",
-                            p.display()
-                        );
-                    }
-                }
+                activate_realtime_governance_hook(backend.id(), project_root);
             }
             umadev_host::ProbeResult::NotInstalled { program } => {
                 anyhow::bail!(
                     "backend `{}` not available: `{program}` is not on PATH. \
-                     Install / log in to the base CLI first, or omit --backend to fall back to offline.",
+                     Install / log in to the base CLI first; this workflow will not \
+                     silently change to offline or another brain.",
                     backend.id()
                 );
             }
@@ -3935,19 +3996,11 @@ async fn drive_gate_block(
             backend.id()
         );
 
-        // P0-A (CLI continue): when the DEFAULT continuous path is active, a
-        // `continue` must resume on the SAME continuous engine from the door the
-        // run actually paused at — NOT silently fall back to the single-shot
-        // `continue_from_gate` (which re-feeds the base via per-phase `--print`
-        // processes, a different engine + a different gate set than the run was
-        // built on). The prior process's live base session is gone, so we open a
-        // FRESH continuous session and drive from the gate-anchored resume phase;
-        // the continuous directives reference "the approved documents you wrote",
-        // which are on disk, so the fresh session is coherent. Revise stays on the
-        // single-shot regen path (it rewrites the producing block's artifacts).
-        // Fail-open: if the continuous session can't open, fall through to the
-        // single-shot continue below — `continue` still works, just on the legacy
-        // engine, never a dead end.
+        // CLI continue on a continuous-origin workflow must reopen the base's
+        // SAME vendor session. It never silently changes into the legacy
+        // single-shot product. An explicit `--backend` is the user's instruction
+        // to start a fresh session (and, when different, a cross-base handoff);
+        // without it, a missing id or failed resume is an actionable error.
         //
         // Engine match: resume on the SAME engine the run was actually driven on.
         // The continuous driver stamps its persisted state note with a "continuous
@@ -3964,18 +4017,52 @@ async fn drive_gate_block(
             && gate != Gate::ClarifyGate
             && umadev_agent::continuous_enabled_from_env()
         {
-            let trust = umadev_agent::TrustMode::Guarded;
-            match umadev_host::session_for(
-                backend.id(),
-                project_root,
-                &opts.model,
-                continuous_autonomous(trust),
-                // Legacy continuous resume: the per-phase directives carry the role +
-                // spec framing (the pre-Wave-2 behaviour), so no firmware here.
-                None,
-            )
-            .await
+            let launch_permissions = base_permissions(trust);
+            let eligible_resume_id = (!backend_choice.explicit)
+                .then(|| {
+                    eligible_workflow_resume_id(
+                        state,
+                        backend.id(),
+                        project_root,
+                        launch_permissions,
+                    )
+                })
+                .flatten();
+            let opening_fresh = backend_choice.explicit || eligible_resume_id.is_none();
+            if !backend_choice.explicit
+                && state.base_session_id.is_some()
+                && eligible_resume_id.is_none()
             {
+                eprintln!(
+                    "  [resume] saved vendor session is not eligible under the current base, \
+                     canonical workspace, permission profile, or effective sandbox evidence; \
+                     starting a fresh `{}` session and preserving workflow artifacts.",
+                    backend.id()
+                );
+            }
+            let opened = if opening_fresh {
+                umadev_host::session_for(
+                    backend.id(),
+                    project_root,
+                    &opts.model,
+                    launch_permissions,
+                    None,
+                )
+                .await
+            } else if let Some(resume_id) = eligible_resume_id.as_deref() {
+                umadev_host::session_for_resume(
+                    backend.id(),
+                    project_root,
+                    &opts.model,
+                    launch_permissions,
+                    None,
+                    resume_id,
+                )
+                .await
+            } else {
+                unreachable!("opening_fresh covers an ineligible resume identity")
+            };
+            match opened {
                 Ok(mut session) => {
                     println!(
                         "{}",
@@ -3985,6 +4072,21 @@ async fn drive_gate_block(
                     let runner =
                         AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), opts);
                     runner.start().context("failed to start agent")?;
+                    let live_session_id = session.session_id().map(str::to_string);
+                    let live_resume_identity = live_session_id.as_ref().and_then(|_| {
+                        session_resume_identity(
+                            session.as_ref(),
+                            backend.id(),
+                            project_root,
+                            launch_permissions,
+                        )
+                    });
+                    persist_workflow_base_identity(
+                        project_root,
+                        backend.id(),
+                        live_session_id,
+                        live_resume_identity,
+                    )?;
                     let (runner, printer) = attach_live_sink(runner);
                     let start_after = continuous_resume_phase(gate);
                     let outcome =
@@ -3998,11 +4100,17 @@ async fn drive_gate_block(
                     return Ok(());
                 }
                 Err(e) => {
-                    eprintln!(
-                        "{}",
-                        umadev_i18n::tlf("continuous.session_unavailable", &[&e.to_string()])
+                    anyhow::bail!(
+                        "could not {} the continuous `{}` session: {e}. No legacy \
+                         fallback was started. Check the base login/version, then retry{}.",
+                        if opening_fresh { "start" } else { "resume" },
+                        backend.id(),
+                        if opening_fresh {
+                            ""
+                        } else {
+                            " or pass the same --backend explicitly to request a fresh session"
+                        }
                     );
-                    // Fall through to the single-shot continue with `opts` intact.
                 }
             }
         }
@@ -4018,6 +4126,11 @@ async fn drive_gate_block(
         .context("pipeline failure")?;
         drop(runner);
         let _ = printer.await;
+        // This branch used the explicit legacy/single-shot engine, so no
+        // vendor-native continuous session owns its new context. Clear any old
+        // pointer (especially after a cross-base migration) only after the block
+        // succeeded.
+        persist_workflow_base_identity(project_root, backend.id(), None, None)?;
         (report, label)
     } else {
         let runner = AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), opts);
@@ -4059,6 +4172,19 @@ async fn cmd_continue(
             path.display()
         ),
     };
+
+    // Director runs persist a typed plan whose Done/Pending statuses are the
+    // authoritative resume point. Route these runs back into the Director
+    // scheduler before interpreting the legacy phase/gate state; otherwise a
+    // CLI `continue` re-runs a fixed gate block and discards the completed DAG.
+    if umadev_agent::has_resumable_director_plan(&project_root) {
+        return Box::pin(drive_director_continue(
+            &project_root,
+            &state,
+            backend_override,
+        ))
+        .await;
+    }
     let gate = resolve_active_gate(&state)?;
 
     // Record the approval as evidence
@@ -4089,7 +4215,190 @@ async fn cmd_continue(
     .await
 }
 
-async fn cmd_revise(text: String, project_root: Option<PathBuf>) -> Result<()> {
+async fn drive_director_continue(
+    project_root: &Path,
+    state: &umadev_agent::WorkflowState,
+    backend_override: Option<BackendArg>,
+) -> Result<()> {
+    let requirement = require_recorded_requirement(state)?;
+    let slug = if state.slug.trim().is_empty() {
+        infer_slug(project_root)
+    } else {
+        state.slug.clone()
+    };
+    let trust = trust_for_resume(state);
+    if !trust.executes() {
+        println!("{}", umadev_i18n::tl("continuous.plan_mode_skip"));
+        println!("{}", umadev_i18n::tl("mode.plan.gate"));
+        return Ok(());
+    }
+    let choice = resolve_resume_backend(state, backend_override)?;
+    let backend = choice.backend.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the persisted Director plan has no host backend; pass --backend to resume it explicitly"
+        )
+    })?;
+    if choice.cross_base_handoff {
+        eprintln!(
+            "[migration] handing the persisted Director plan from `{}` to `{}`; \
+             the previous vendor session id will not be reused.",
+            state.backend,
+            backend.id()
+        );
+    }
+
+    let permissions = base_permissions(trust);
+    let mut probe = umadev_host::driver_for_with_permissions(backend.id(), permissions)
+        .ok_or_else(|| anyhow::anyhow!("no driver registered for `{}`", backend.id()))?;
+    probe.set_workspace(project_root.to_path_buf());
+    if backend.id() == "codex" {
+        publish_codex_sandbox_from_rc(project_root);
+    }
+    match probe.probe().await {
+        umadev_host::ProbeResult::Ready { version, .. } => {
+            println!("Backend {} ready ({version}).", probe.display_name());
+            activate_realtime_governance_hook(backend.id(), project_root);
+        }
+        umadev_host::ProbeResult::NotInstalled { program } => anyhow::bail!(
+            "backend `{}` is not available: `{program}` is not on PATH; the Director plan was left unchanged",
+            backend.id()
+        ),
+        umadev_host::ProbeResult::Unhealthy { detail } => anyhow::bail!(
+            "backend `{}` is unhealthy: {detail}; the Director plan was left unchanged",
+            backend.id()
+        ),
+    }
+
+    let opts = RunOptions {
+        project_root: project_root.to_path_buf(),
+        requirement,
+        slug,
+        model: String::new(),
+        backend: backend.id().to_string(),
+        design_system: String::new(),
+        seed_template: String::new(),
+        mode: trust,
+        strict_coverage: umadev_agent::strict_coverage_from_env(),
+    };
+    let route = umadev_agent::router::for_run(&opts.requirement);
+    let firmware = umadev_agent::compose_firmware(project_root, &route, &opts.requirement).await;
+    let firmware = (!firmware.trim().is_empty()).then_some(firmware);
+
+    // A saved id is authority-bearing only for the same vendor, canonical
+    // workspace, permission profile, and effective sandbox. An explicit base
+    // choice requests a fresh handoff. Grok intentionally falls through to a
+    // fresh session because its ACP resume cannot attest the applied sandbox.
+    let resume_id = (!choice.explicit)
+        .then(|| eligible_workflow_resume_id(state, backend.id(), project_root, permissions))
+        .flatten();
+    let mut session = if let Some(id) = resume_id.as_deref() {
+        umadev_host::session_for_resume(
+            backend.id(),
+            project_root,
+            &opts.model,
+            permissions,
+            firmware.as_deref(),
+            id,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "could not resume the owned `{}` session; no fresh brain or legacy pipeline was substituted",
+                backend.id()
+            )
+        })?
+    } else {
+        if state.base_session_id.is_some() && !choice.explicit {
+            eprintln!(
+                "  [resume] saved vendor session is not eligible under the current identity; \
+                 opening a fresh `{}` session while preserving the typed plan and artifacts.",
+                backend.id()
+            );
+        }
+        umadev_host::session_for(
+            backend.id(),
+            project_root,
+            &opts.model,
+            permissions,
+            firmware.as_deref(),
+        )
+        .await
+        .with_context(|| format!("could not open a `{}` Director session", backend.id()))?
+    };
+    println!(
+        "{}",
+        umadev_i18n::tlf("continuous.session_active", &[backend.id()])
+    );
+    let live_session_id = session.session_id().map(str::to_string);
+    let live_resume_identity = live_session_id.as_ref().and_then(|_| {
+        session_resume_identity(session.as_ref(), backend.id(), project_root, permissions)
+    });
+    persist_workflow_base_identity(
+        project_root,
+        backend.id(),
+        live_session_id,
+        live_resume_identity,
+    )?;
+
+    let _run_lock = umadev_agent::run_lock::RunLock::acquire_for_run(project_root)?;
+    let (sink, mut rx) = ChannelSink::new();
+    let sink: Arc<dyn umadev_agent::EventSink> = Arc::new(sink);
+    let printer = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            print_engine_event(&event);
+        }
+    });
+    let outcome = Box::pin(umadev_agent::critics::with_cold_surface(
+        umadev_tui::cold_judge_surface(backend.id(), &opts.model, project_root),
+        umadev_agent::drive_director_loop_resume(session.as_mut(), &opts, &sink, &route),
+    ))
+    .await;
+    let settled_id = session.session_id().map(str::to_string);
+    let settled_identity = settled_id.as_ref().and_then(|_| {
+        session_resume_identity(session.as_ref(), backend.id(), project_root, permissions)
+    });
+    let _ = session.end().await;
+    drop(sink);
+    let _ = printer.await;
+    persist_workflow_base_identity(project_root, backend.id(), settled_id, settled_identity)?;
+
+    let outcome = outcome.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the persisted Director plan could not be resumed; it was left intact and no legacy block was started"
+        )
+    })?;
+    let settled = match outcome {
+        umadev_agent::DirectorLoopOutcome::Planned { .. } => DirectorOutcome::Planned,
+        umadev_agent::DirectorLoopOutcome::Done { reply } => {
+            if umadev_tui::claims_code_changes(&reply)
+                && umadev_agent::acceptance::source_files(project_root).is_empty()
+            {
+                DirectorOutcome::HardStop(
+                    umadev_i18n::tl("director.no_source_hardstop").to_string(),
+                )
+            } else {
+                DirectorOutcome::Done
+            }
+        }
+        umadev_agent::DirectorLoopOutcome::Failed(reason) => DirectorOutcome::HardStop(reason),
+        umadev_agent::DirectorLoopOutcome::PausedAtGate { gate } => {
+            DirectorOutcome::Paused { gate }
+        }
+    };
+    println!("{}", director_outcome_report(&settled));
+    println!("  workspace: {}", project_root.display());
+    println!("  runtime: Base CLI worker — {}", backend.id());
+    if director_outcome_is_failure(&settled) {
+        anyhow::bail!("`umadev continue` halted before completion (hard stop)");
+    }
+    Ok(())
+}
+
+async fn cmd_revise(
+    text: String,
+    project_root: Option<PathBuf>,
+    backend_override: Option<BackendArg>,
+) -> Result<()> {
     let project_root = resolve_root(project_root)?;
     let state = match umadev_agent::read_workflow_state_diagnostic(&project_root) {
         umadev_agent::ReadState::Ok(s) => s,
@@ -4140,7 +4449,7 @@ async fn cmd_revise(text: String, project_root: Option<PathBuf>) -> Result<()> {
                 &project_root,
                 &state,
                 gate,
-                None,
+                backend_override,
                 Some(revised),
                 GateBlock::Revise,
             )
@@ -4149,7 +4458,7 @@ async fn cmd_revise(text: String, project_root: Option<PathBuf>) -> Result<()> {
         GateOutcome::Approved => {
             // Defensive: user said "继续" via revise — treat as approval.
             println!("input parsed as approval; treating as `continue`.");
-            cmd_continue(Some(project_root), None).await
+            Box::pin(cmd_continue(Some(project_root), backend_override)).await
         }
         GateOutcome::Cancelled => {
             anyhow::bail!("user cancelled the pipeline");
@@ -4239,167 +4548,660 @@ fn cli_lang() -> umadev_i18n::Lang {
     lang
 }
 
-/// `umadev usage` — print recorded worker token usage per run / per phase, with
-/// run + grand totals and a rough advisory cost estimate. Pure read of
-/// `~/.umadev/usage.jsonl`; fail-open empty state when nothing is recorded.
+/// `umadev usage` — print quality-aware worker usage without inventing token
+/// precision or provider cost. Pure read of the bounded durable ledger.
 fn cmd_usage() -> Result<()> {
     let lang = cli_lang();
     let report = umadev_agent::runner::usage_report();
-    if report.is_empty() {
-        println!("{}", umadev_i18n::t(lang, "usage.empty"));
-        return Ok(());
-    }
-    let total_calls = report.total_calls.to_string();
-    let run_count = report.runs.len().to_string();
     println!(
         "{}",
-        umadev_i18n::tf(lang, "usage.title", &[&total_calls, &run_count])
+        umadev_tui::usage_view::format_usage_report(lang, &report)
     );
-    println!();
-    for run in &report.runs {
-        let idx = run.index.to_string();
-        let backends = if run.backends.is_empty() {
-            "offline".to_string()
-        } else {
-            run.backends.join(", ")
-        };
-        println!(
-            "{}",
-            umadev_i18n::tf(lang, "usage.run_header", &[&idx, &backends])
-        );
-        for p in &run.phases {
-            let calls = p.calls.to_string();
-            let tokens = p.tokens.to_string();
-            println!(
-                "{}",
-                umadev_i18n::tf(lang, "usage.phase_line", &[&p.phase, &calls, &tokens])
-            );
-        }
-        let rcalls = run.calls.to_string();
-        let rtokens = run.tokens.to_string();
-        println!(
-            "{}",
-            umadev_i18n::tf(lang, "usage.run_total", &[&rcalls, &rtokens])
-        );
-        println!();
-    }
-    let grand = report.total_tokens.to_string();
-    println!("{}", umadev_i18n::tf(lang, "usage.grand_total", &[&grand]));
-    let cost = format!(
-        "{:.2}",
-        umadev_agent::runner::rough_cost_usd(report.total_tokens)
-    );
-    println!("{}", umadev_i18n::tf(lang, "usage.cost_estimate", &[&cost]));
-    println!("{}", umadev_i18n::t(lang, "usage.note_combined"));
     Ok(())
 }
 
-/// `umadev lessons` — print what UmaDev has learned in this workspace: high-
-/// frequency pitfalls, the failed fixes it now steers away from, and validated
-/// success patterns. Pure read of `.umadev/learned/`; never mutates the KB.
+/// `umadev lessons` — print reusable rules distilled from concrete incidents
+/// and verified outcomes. Incident rows themselves belong to TUI `/pitfalls`.
+/// Pure read of `.umadev/learned/`; never mutates the KB.
 fn cmd_lessons(project_root: Option<PathBuf>) -> Result<()> {
     let lang = cli_lang();
     let project_root = resolve_root(project_root)?;
     let report = umadev_agent::lessons::lessons_report(&project_root);
-    if report.is_empty() {
-        println!("{}", umadev_i18n::t(lang, "lessons.empty"));
-        return Ok(());
-    }
-    println!("{}", umadev_i18n::t(lang, "lessons.title"));
-    let e = report.efficacy;
-    println!(
-        "{}",
-        umadev_i18n::tf(
-            lang,
-            "lessons.efficacy",
-            &[
-                &e.total.to_string(),
-                &e.validated.to_string(),
-                &e.recurring.to_string(),
-                &e.active.to_string(),
-            ],
-        )
-    );
-    println!();
-
-    if !report.top_pitfalls.is_empty() {
-        println!("{}", umadev_i18n::t(lang, "lessons.top_header"));
-        for p in &report.top_pitfalls {
-            let (icon, status_key) = status_chrome(p.status);
-            let status = umadev_i18n::t(lang, status_key);
-            println!(
-                "{}",
-                umadev_i18n::tf(
-                    lang,
-                    "lessons.pitfall_line",
-                    &[icon, &p.title, &p.hits.to_string(), status],
-                )
-            );
-            if !p.fix.is_empty() {
-                println!(
-                    "{}",
-                    umadev_i18n::tf(lang, "lessons.pitfall_fix", &[&truncate_cli(&p.fix, 200)])
-                );
-            }
-            if !p.context.is_empty() {
-                println!(
-                    "{}",
-                    umadev_i18n::tf(lang, "lessons.pitfall_ctx", &[&p.context.join(", ")])
-                );
-            }
-        }
-        println!();
-    }
-
-    // Failed fixes UmaDev is now steering away from (deduped across pitfalls).
-    let mut avoid: Vec<String> = Vec::new();
-    for p in &report.recurring {
-        for f in &p.failed_fixes {
-            let f = truncate_cli(f, 160);
-            if !avoid.contains(&f) {
-                avoid.push(f);
-            }
-        }
-    }
-    if !avoid.is_empty() {
-        println!("{}", umadev_i18n::t(lang, "lessons.recurring_header"));
-        for f in &avoid {
-            println!("{}", umadev_i18n::tf(lang, "lessons.avoid_line", &[f]));
-        }
-        println!();
-    }
-
-    if !report.validated_patterns.is_empty() {
-        println!("{}", umadev_i18n::t(lang, "lessons.validated_header"));
-        for v in &report.validated_patterns {
-            println!(
-                "{}",
-                umadev_i18n::tf(lang, "lessons.validated_line", &[&v.title, &v.summary])
-            );
-        }
-    }
+    println!("{}", format_lessons_report(lang, &report));
     Ok(())
 }
 
-/// Map a pitfall status to its (icon, i18n status-label key) for the lessons view.
-fn status_chrome(status: umadev_agent::lessons::PitfallStatus) -> (&'static str, &'static str) {
-    use umadev_agent::lessons::PitfallStatus;
-    match status {
-        PitfallStatus::Validated => ("[ok]", "lessons.status.validated"),
-        PitfallStatus::Recurring => ("[warn]", "lessons.status.recurring"),
-        PitfallStatus::Active => ("[pitfall]", "lessons.status.active"),
+fn memory_scopes(
+    scope: MemoryInventoryScopeArg,
+) -> &'static [umadev_agent::memory_control::MemoryScope] {
+    use umadev_agent::memory_control::MemoryScope;
+    match scope {
+        MemoryInventoryScopeArg::Project => &[MemoryScope::Project],
+        MemoryInventoryScopeArg::Global => &[MemoryScope::Global],
+        MemoryInventoryScopeArg::All => &[MemoryScope::Project, MemoryScope::Global],
     }
 }
 
-/// Truncate a string to `max` chars with an ellipsis (char-safe). Local helper
-/// so CLI output stays tidy without pulling the agent crate's private one.
-fn truncate_cli(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
+fn memory_state_label(lang: umadev_i18n::Lang, value: Option<bool>) -> &'static str {
+    match (lang, value) {
+        (umadev_i18n::Lang::ZhCn, Some(true)) => "开",
+        (umadev_i18n::Lang::ZhCn, Some(false)) => "关",
+        (umadev_i18n::Lang::ZhTw, Some(true)) => "開",
+        (umadev_i18n::Lang::ZhTw, Some(false)) => "關",
+        (_, Some(true)) => "on",
+        (_, Some(false)) => "off",
+        _ => "—",
     }
-    let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
-    t.push('…');
-    t
+}
+
+fn fixed_retention_summary(store: umadev_agent::memory_control::MemoryStore) -> &'static str {
+    use umadev_agent::memory_control::MemoryStore;
+    match store {
+        MemoryStore::Pitfalls => "300 actionable + 300 candidate",
+        MemoryStore::Beliefs => "200 rows",
+        MemoryStore::PitfallReflections => "3 per signature",
+        MemoryStore::Facts => "64 facts",
+        MemoryStore::RunNotes => "2 generations, 256 KiB each",
+        MemoryStore::Recipes => "128 recipes/2 MiB; journal 8192/4 MiB",
+        MemoryStore::LearnedSkills => "200 skills/2 MiB; receipts 4096",
+        MemoryStore::InputHistory => "100 prompts",
+        _ => "active fixed bound",
+    }
+}
+
+fn memory_retention_label(entry: &umadev_agent::memory_control::MemoryInventoryEntry) -> String {
+    use umadev_agent::memory_control::RetentionEnforcement;
+    match entry.retention_enforcement {
+        RetentionEnforcement::Fixed => format!("fixed: {}", fixed_retention_summary(entry.store)),
+        RetentionEnforcement::PolicyOnly => entry.retention_days.map_or_else(
+            || "age-based: not configured".to_string(),
+            |days| format!("age-based: {days}d (recoverable soft-delete executor)"),
+        ),
+        RetentionEnforcement::Unsupported => "unsupported".to_string(),
+    }
+}
+
+fn format_memory_inventory(
+    lang: umadev_i18n::Lang,
+    inventory: &umadev_agent::memory_control::MemoryInventory,
+    scope: umadev_agent::memory_control::MemoryScope,
+    retention_only: bool,
+) -> String {
+    let title = match lang {
+        umadev_i18n::Lang::ZhCn => "记忆清单",
+        umadev_i18n::Lang::ZhTw => "記憶清單",
+        umadev_i18n::Lang::En => "Memory inventory",
+    };
+    let mut out = format!("{title} · {}", scope.id());
+    if inventory.policy_error.is_some() {
+        let warning = match lang {
+            umadev_i18n::Lang::ZhCn => "策略不可用；自动捕获与召回已保守关闭",
+            umadev_i18n::Lang::ZhTw => "策略不可用；自動擷取與召回已保守關閉",
+            umadev_i18n::Lang::En => {
+                "policy unavailable; automatic capture and recall are conservatively off"
+            }
+        };
+        out.push_str(&format!("\n[warn] {warning}"));
+    }
+    if inventory.entries.is_empty() {
+        let empty = match lang {
+            umadev_i18n::Lang::ZhCn => "此范围没有可用存储。",
+            umadev_i18n::Lang::ZhTw => "此範圍沒有可用儲存。",
+            umadev_i18n::Lang::En => "No stores are available in this scope.",
+        };
+        out.push_str(&format!("\n{empty}"));
+        return out;
+    }
+    for entry in &inventory.entries {
+        let retention = memory_retention_label(entry);
+        if retention_only {
+            out.push_str(&format!("\n- {} · {retention}", entry.store.id()));
+            continue;
+        }
+        out.push_str(&format!(
+            "\n- {} · files={} · bytes={} · capture={} · recall={} · retention={retention}",
+            entry.store.id(),
+            entry.files,
+            entry.bytes,
+            memory_state_label(lang, entry.capture),
+            memory_state_label(lang, entry.recall),
+        ));
+        if !entry.locations.is_empty() {
+            out.push_str(&format!("\n  paths: {}", entry.locations.join(", ")));
+        }
+    }
+    out
+}
+
+fn cmd_memory(action: MemoryAction) -> Result<()> {
+    use umadev_agent::memory_control::{self, MemoryScope, MemorySelector, MemoryStore};
+
+    match action {
+        MemoryAction::Inventory {
+            scope,
+            project_root,
+        } => {
+            let lang = cli_lang();
+            let root = resolve_root(project_root)?;
+            for (index, scope) in memory_scopes(scope).iter().copied().enumerate() {
+                if index > 0 {
+                    println!();
+                }
+                let inventory = memory_control::inventory(&root, scope);
+                println!(
+                    "{}",
+                    format_memory_inventory(lang, &inventory, scope, false)
+                );
+            }
+            Ok(())
+        }
+        MemoryAction::Retention {
+            scope,
+            store,
+            days,
+            clear,
+            run_now,
+            yes,
+            project_root,
+        } => {
+            let lang = cli_lang();
+            let root = resolve_root(project_root)?;
+            let selected_store = store
+                .as_deref()
+                .map(|value| match MemorySelector::parse(value) {
+                    Some(MemorySelector::Store(store)) => Ok(store),
+                    Some(MemorySelector::Group(_)) => anyhow::bail!(
+                        "retention requires one exact leaf store, not group `{value}`"
+                    ),
+                    None => anyhow::bail!("unknown memory store `{value}`"),
+                })
+                .transpose()?;
+            let mutation_count =
+                usize::from(days.is_some()) + usize::from(clear) + usize::from(run_now);
+            if mutation_count > 1 {
+                anyhow::bail!("choose exactly one of --days, --clear, or --run");
+            }
+            if mutation_count == 0 {
+                if yes {
+                    anyhow::bail!("--yes is meaningful only with --run");
+                }
+                for (index, scope) in memory_scopes(scope).iter().copied().enumerate() {
+                    if index > 0 {
+                        println!();
+                    }
+                    let mut inventory = memory_control::inventory(&root, scope);
+                    if let Some(store) = selected_store {
+                        inventory.entries.retain(|entry| entry.store == store);
+                    }
+                    println!("{}", format_memory_inventory(lang, &inventory, scope, true));
+                }
+                return Ok(());
+            }
+            let mutation_scope = match scope {
+                MemoryInventoryScopeArg::Project => MemoryScope::Project,
+                MemoryInventoryScopeArg::Global => MemoryScope::Global,
+                MemoryInventoryScopeArg::All => {
+                    anyhow::bail!("retention mutations require one explicit scope, not `all`")
+                }
+            };
+            let store = selected_store
+                .ok_or_else(|| anyhow::anyhow!("--store is required for retention mutation"))?;
+            if let Some(days) = days {
+                if yes {
+                    anyhow::bail!("--yes is meaningful only with --run");
+                }
+                memory_control::update_retention(&root, mutation_scope, store, Some(days))?;
+                println!(
+                    "[ok] retention scope={} store={} days={} · not run",
+                    mutation_scope.id(),
+                    store.id(),
+                    days
+                );
+                return Ok(());
+            }
+            if clear {
+                if yes {
+                    anyhow::bail!("--yes is meaningful only with --run");
+                }
+                memory_control::update_retention(&root, mutation_scope, store, None)?;
+                println!(
+                    "[ok] retention cleared scope={} store={}",
+                    mutation_scope.id(),
+                    store.id()
+                );
+                return Ok(());
+            }
+            if !yes {
+                anyhow::bail!(
+                    "retention run requires --yes; stale files move to a recoverable tombstone"
+                );
+            }
+            let report = memory_control::enforce_retention(&root, mutation_scope, store)?;
+            println!(
+                "[ok] retention run scope={} store={} days={} scanned={} moved={} bytes={} tombstone={}",
+                mutation_scope.id(),
+                report.store.id(),
+                report
+                    .retention_days
+                    .map_or_else(|| "none".to_string(), |days| days.to_string()),
+                report.scanned_files,
+                report.forgotten_files,
+                report.bytes,
+                report.tombstone_id.as_deref().unwrap_or("none")
+            );
+            Ok(())
+        }
+        MemoryAction::Export {
+            scope,
+            store,
+            output,
+            yes,
+            project_root,
+        } => {
+            let root = resolve_root(project_root)?;
+            let scope = MemoryScope::from(scope);
+            let selector = store.as_deref().map_or_else(
+                || Some(MemorySelector::Group(memory_control::MemoryGroup::All)),
+                MemorySelector::parse,
+            );
+            let selector = selector.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown memory store/group `{}`",
+                    store.as_deref().unwrap_or("all")
+                )
+            })?;
+            let stores = selector.stores(scope);
+            if stores.is_empty() {
+                anyhow::bail!("memory selector has no store in scope `{}`", scope.id());
+            }
+            let report = memory_control::export(&root, scope, &stores, &output, yes)?;
+            println!(
+                "[ok] exported scope={} files={} bytes={} stores={} output={}",
+                scope.id(),
+                report.files,
+                report.bytes,
+                report
+                    .stores
+                    .iter()
+                    .map(|store| store.id())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                report.destination.display()
+            );
+            Ok(())
+        }
+        MemoryAction::Forget {
+            scope,
+            store,
+            yes,
+            project_root,
+        } => {
+            let root = resolve_root(project_root)?;
+            let scope = MemoryScope::from(scope);
+            let selector = MemorySelector::parse(&store)
+                .ok_or_else(|| anyhow::anyhow!("unknown memory store/group `{store}`"))?;
+            let mut stores = selector.stores(scope);
+            // Lifecycle records cannot recursively forget themselves. An
+            // explicit `--store all` means every eligible active store.
+            stores.retain(|store| {
+                !matches!(store, MemoryStore::Tombstones | MemoryStore::DeletionAudit)
+            });
+            if stores.is_empty() {
+                anyhow::bail!(
+                    "memory selector has no forgettable store in scope `{}`",
+                    scope.id()
+                );
+            }
+            let report = memory_control::forget(&root, scope, &stores, yes)?;
+            println!(
+                "[ok] soft-forgot scope={} files={} bytes={} stores={} tombstone={} · recoverable, not physical erasure",
+                scope.id(),
+                report.files,
+                report.bytes,
+                report
+                    .stores
+                    .iter()
+                    .map(|store| store.id())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                report.tombstone_id.as_deref().unwrap_or("none")
+            );
+            Ok(())
+        }
+        MemoryAction::Capture {
+            state,
+            scope,
+            store,
+            project_root,
+        } => {
+            let root = resolve_root(project_root)?;
+            let scope = MemoryScope::from(scope);
+            if let Some(selector) = store.as_deref() {
+                let selector = MemorySelector::parse(selector).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown memory store/group `{selector}`; run `umadev memory inventory --scope all`"
+                    )
+                })?;
+                let stores = selector.capture_stores(scope);
+                memory_control::update_capture_stores(&root, scope, &stores, state.enabled())?;
+                println!(
+                    "[ok] capture={} scope={} stores={}",
+                    memory_state_label(cli_lang(), Some(state.enabled())),
+                    scope.id(),
+                    stores
+                        .iter()
+                        .map(|store| store.id())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            } else {
+                memory_control::update_capture(&root, scope, None, state.enabled())?;
+                println!(
+                    "[ok] capture={} scope={} stores=all-configurable",
+                    memory_state_label(cli_lang(), Some(state.enabled())),
+                    scope.id()
+                );
+            }
+            Ok(())
+        }
+        MemoryAction::Recall {
+            state,
+            scope,
+            store,
+            project_root,
+        } => {
+            let root = resolve_root(project_root)?;
+            let scope = MemoryScope::from(scope);
+            if let Some(selector) = store.as_deref() {
+                let selector = MemorySelector::parse(selector).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown memory store/group `{selector}`; run `umadev memory inventory --scope all`"
+                    )
+                })?;
+                let stores = selector.recall_stores(scope);
+                memory_control::update_recall_stores(&root, scope, &stores, state.enabled())?;
+                println!(
+                    "[ok] recall={} scope={} stores={}",
+                    memory_state_label(cli_lang(), Some(state.enabled())),
+                    scope.id(),
+                    stores
+                        .iter()
+                        .map(|store| store.id())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            } else {
+                memory_control::update_recall(&root, scope, None, state.enabled())?;
+                println!(
+                    "[ok] recall={} scope={} stores=all-configurable",
+                    memory_state_label(cli_lang(), Some(state.enabled())),
+                    scope.id()
+                );
+            }
+            Ok(())
+        }
+        MemoryAction::ClearCache {
+            store,
+            yes,
+            project_root,
+        } => {
+            if !yes {
+                anyhow::bail!(
+                    "cache deletion requires --yes; authoritative memory is never cleared by this action"
+                );
+            }
+            let root = resolve_root(project_root)?;
+            let store = MemoryStore::from(store);
+            let (files, bytes) = memory_control::clear_derived_cache(&root, store)?;
+            println!(
+                "[ok] cleared {} · files={} · bytes={}",
+                store.id(),
+                files,
+                bytes
+            );
+            Ok(())
+        }
+    }
+}
+
+const LESSONS_LINE_WIDTH: usize = 80;
+
+fn curated_lesson_status_key(status: umadev_agent::lessons::CuratedLessonStatus) -> &'static str {
+    use umadev_agent::lessons::CuratedLessonStatus;
+    match status {
+        CuratedLessonStatus::Hypothesis => "lessons.status.hypothesis",
+        CuratedLessonStatus::Corroborated => "lessons.status.corroborated",
+        CuratedLessonStatus::Validated => "lessons.status.validated",
+        CuratedLessonStatus::Invalidated => "lessons.status.invalidated",
+    }
+}
+
+fn curated_lesson_source(lang: umadev_i18n::Lang, source_kind: &str) -> String {
+    match source_kind {
+        "pitfall" => umadev_i18n::t(lang, "lessons.source.pitfall").to_string(),
+        "belief" => umadev_i18n::t(lang, "lessons.source.belief").to_string(),
+        "validated_pattern" => umadev_i18n::t(lang, "lessons.source.validated_pattern").to_string(),
+        other => umadev_i18n::tf(lang, "lessons.source.other", &[other]),
+    }
+}
+
+/// Terminal-cell width using the same Unicode width table as the TUI so CJK,
+/// combining marks, emoji, and ordinary non-ASCII letters wrap consistently.
+fn lesson_display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
+}
+
+fn split_lesson_token(token: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(1);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for ch in token.chars() {
+        let char_width = lesson_display_width(&ch.to_string());
+        if !current.is_empty() && current_width + char_width > max_width {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += char_width;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn wrap_lesson_text(text: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for token in text.split_whitespace() {
+        let token_width = lesson_display_width(token);
+        let separator = usize::from(!current.is_empty());
+        if token_width <= max_width
+            && lesson_display_width(&current) + separator + token_width <= max_width
+        {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(token);
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        if token_width <= max_width {
+            current.push_str(token);
+            continue;
+        }
+        let chunks = split_lesson_token(token, max_width);
+        let chunk_count = chunks.len();
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            if index + 1 == chunk_count {
+                current = chunk;
+            } else {
+                lines.push(chunk);
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn wrap_lesson_message(message: &str) -> String {
+    message
+        .lines()
+        .flat_map(|line| wrap_lesson_text(line, LESSONS_LINE_WIDTH))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn push_lesson_field(out: &mut String, prefix: &str, value: &str) {
+    let prefix = format!("{prefix} ");
+    let prefix_width = lesson_display_width(&prefix);
+    let available = LESSONS_LINE_WIDTH.saturating_sub(prefix_width).max(16);
+    let lines = wrap_lesson_text(value, available);
+    if lines.is_empty() {
+        return;
+    }
+    let continuation = " ".repeat(prefix_width);
+    for (index, line) in lines.iter().enumerate() {
+        if index == 0 {
+            out.push_str(&prefix);
+        } else {
+            out.push_str(&continuation);
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
+/// Format the reusable-rule view for the scriptable CLI. Concrete incident
+/// rows (`top_pitfalls`, `recurring`) and the legacy duplicated pattern list are
+/// deliberately ignored: those details belong to `/pitfalls`, while validated
+/// patterns are already represented once in `curated_lessons`.
+fn format_lessons_report(
+    lang: umadev_i18n::Lang,
+    report: &umadev_agent::lessons::LessonsReport,
+) -> String {
+    if report.is_empty() {
+        let mut messages = Vec::new();
+        if report.has_incidents() {
+            messages.push(umadev_i18n::tf(
+                lang,
+                "lessons.incidents_pending",
+                &[&report.efficacy.total.to_string()],
+            ));
+        }
+        if report.has_unclassified_candidates() {
+            messages.push(umadev_i18n::tf(
+                lang,
+                "lessons.candidates_pending",
+                &[
+                    &report.efficacy.unclassified_candidates.to_string(),
+                    &report.efficacy.unclassified_candidate_hits.to_string(),
+                ],
+            ));
+        }
+        if messages.is_empty() {
+            messages.push(umadev_i18n::t(lang, "lessons.empty").to_string());
+        }
+        return wrap_lesson_message(&messages.join("\n\n"));
+    }
+
+    let unknown = umadev_i18n::t(lang, "lessons.time.unknown");
+    let legacy_missing = umadev_i18n::t(lang, "lessons.time.legacy_missing");
+    let unverified = umadev_i18n::t(lang, "lessons.time.unverified");
+    let mut out = umadev_i18n::t(lang, "lessons.title").to_string();
+    for (index, lesson) in report.curated_lessons.iter().enumerate() {
+        out.push_str("\n\n");
+        let status = umadev_i18n::t(lang, curated_lesson_status_key(lesson.status));
+        let item_prefix = umadev_i18n::tf(
+            lang,
+            "lessons.item_prefix",
+            &[&(index + 1).to_string(), status],
+        );
+        let title = if lesson.source_kind == "pitfall"
+            && lesson
+                .source_signatures
+                .first()
+                .is_some_and(|signature| signature == lesson.title.trim())
+        {
+            umadev_i18n::tf(lang, "lessons.pitfall_title", &[lesson.title.trim()])
+        } else if lesson.title.trim().is_empty() {
+            unknown.to_string()
+        } else {
+            lesson.title.trim().to_string()
+        };
+        push_lesson_field(&mut out, &item_prefix, &title);
+        push_lesson_field(
+            &mut out,
+            umadev_i18n::t(lang, "lessons.rule_prefix"),
+            if lesson.rule.trim().is_empty() {
+                unknown
+            } else {
+                lesson.rule.trim()
+            },
+        );
+        push_lesson_field(
+            &mut out,
+            umadev_i18n::t(lang, "lessons.root_cause_prefix"),
+            if lesson.root_cause.trim().is_empty() {
+                unknown
+            } else {
+                lesson.root_cause.trim()
+            },
+        );
+        let source = curated_lesson_source(lang, &lesson.source_kind);
+        let evidence = umadev_i18n::tf(
+            lang,
+            "lessons.evidence_value",
+            &[&lesson.evidence_count.to_string(), &source],
+        );
+        push_lesson_field(
+            &mut out,
+            umadev_i18n::t(lang, "lessons.evidence_prefix"),
+            &evidence,
+        );
+        if !lesson.source_signatures.is_empty() {
+            push_lesson_field(
+                &mut out,
+                umadev_i18n::t(lang, "lessons.signatures_prefix"),
+                &lesson.source_signatures.join(", "),
+            );
+        }
+        let first_observed = if lesson.first_observed_at.trim().is_empty() {
+            unknown.to_string()
+        } else if !lesson.timeline_complete {
+            umadev_i18n::tf(
+                lang,
+                "lessons.time.legacy_value",
+                &[lesson.first_observed_at.trim()],
+            )
+        } else {
+            lesson.first_observed_at.trim().to_string()
+        };
+        push_lesson_field(
+            &mut out,
+            umadev_i18n::t(lang, "lessons.first_observed_prefix"),
+            &first_observed,
+        );
+        push_lesson_field(
+            &mut out,
+            umadev_i18n::t(lang, "lessons.last_observed_prefix"),
+            lesson.last_observed_at.as_deref().unwrap_or(legacy_missing),
+        );
+        push_lesson_field(
+            &mut out,
+            umadev_i18n::t(lang, "lessons.last_verified_prefix"),
+            lesson.last_verified_at.as_deref().unwrap_or(unverified),
+        );
+    }
+    out.trim_end().to_string()
 }
 
 /// `umadev rollback <id>` — take this workspace back to a recorded state.
@@ -4762,8 +5564,9 @@ fn print_runtime_proof(lang: umadev_i18n::Lang, proof: &umadev_agent::RuntimePro
 }
 
 /// `umadev deploy` — the post-delivery handoff. Detects the deploy target and,
-/// with `--run`, executes the deploy (fail-open) and writes the deploy-proof
-/// that folds into the proof-pack. Without `--run` it only prints the recipe.
+/// with `--run`, executes the deploy and writes the deploy-proof that folds into
+/// the proof-pack. Without `--run` it only prints the recipe. A requested deploy
+/// that fails returns non-zero after persisting its failure proof.
 async fn cmd_deploy(
     project_root: Option<PathBuf>,
     run: bool,
@@ -4777,6 +5580,9 @@ async fn cmd_deploy(
     let target = umadev_agent::detect_deploy_target(&project_root);
     if target == umadev_agent::DeployTarget::None && command.is_none() {
         println!("{}", umadev_i18n::t(lang, "deploy.no_target"));
+        if run {
+            anyhow::bail!("deploy was requested but no target or explicit --command was available");
+        }
         return Ok(());
     }
     println!(
@@ -4798,6 +5604,9 @@ async fn cmd_deploy(
     // real deploy. The deploy is the user's outward-facing action.
     if !run {
         return Ok(());
+    }
+    if recipe.trim().is_empty() {
+        anyhow::bail!("deploy was requested but the deploy command is empty");
     }
 
     // Reversibility floor (fail-SAFE, the inverse of governance fail-open): a
@@ -4864,15 +5673,20 @@ async fn cmd_deploy(
             );
         }
     }
-    match umadev_agent::write_deploy_proof(&project_root, &proof) {
-        Ok(path) => println!(
+    if let Err(e) = umadev_agent::write_deploy_proof(&project_root, &proof).map(|path| {
+        println!(
             "{}",
             umadev_i18n::tf(lang, "deploy.proof_written", &[&path.display().to_string()])
-        ),
-        Err(e) => println!(
+        );
+    }) {
+        println!(
             "{}",
             umadev_i18n::tf(lang, "deploy.exec_failed", &[&recipe, &e.to_string()])
-        ),
+        );
+        anyhow::bail!("deploy proof could not be written: {e}");
+    }
+    if let umadev_agent::DeployStatus::NotDeployed(reason) = &proof.status {
+        anyhow::bail!("deploy did not complete: {reason}");
     }
     Ok(())
 }
@@ -5037,18 +5851,20 @@ fn cmd_report(slug: Option<String>, project_root: Option<PathBuf>, review: bool)
 ///     committing directly on the default branch), push, and `gh pr create`
 ///     with the generated body.
 ///
-/// Fail-open throughout: any failing precondition or external-command error
-/// prints the manual recipe and returns Ok — never a crash, never a force-push,
-/// never a rewrite of the user's existing commits.
-/// The allowlist of the CURRENT run's OWN deliverable paths (workspace-relative)
-/// that `pr --create` stages — the docs UmaDev wrote under `output/` named
-/// `<slug>-*` and this run's delivery bundle `release/proof-pack-<slug>-*.zip`,
-/// each only when it exists on disk.
+/// Any failing precondition or external-command error prints the manual recipe
+/// and returns a non-zero command result — never a crash, never a force-push,
+/// never a rewrite of the user's existing commits. A requested publication that
+/// did not happen must not look successful to a script or CI job.
+/// The allowlist of the CURRENT run's OWN generated evidence paths
+/// (workspace-relative) that `pr --create` stages — the docs UmaDev wrote under
+/// `output/` named `<slug>-*` and this run's delivery bundle
+/// `release/proof-pack-<slug>-*.zip`, each only when it exists on disk.
 ///
 /// Scoped to THIS run's `slug`, never the whole `output/`/`release/` dirs: those
 /// accumulate artifacts across runs, so staging the entire dir would sweep a
 /// PRIOR run's (or a different feature's) leftovers into this PR. The sanitized
-/// slug is derived from the public [`pr_body_rel_path`] (`output/<slug>-pr-body.md`),
+/// slug is derived from the public [`umadev_agent::pr::pr_body_rel_path`]
+/// (`output/<slug>-pr-body.md`),
 /// so it matches the on-disk names for any slug without re-implementing a
 /// drift-prone sanitizer here.
 ///
@@ -5090,6 +5906,48 @@ fn pr_artifact_paths(project_root: &Path, slug: &str) -> Vec<String> {
     }
     out.sort();
     out
+}
+
+/// A trustworthy answer to “which paths belong in this run's PR?”.
+///
+/// Source paths come from the pre-run shadow-repository baseline, so unrelated
+/// edits that were already present when the run began are not swept into the
+/// commit. Generated `output/` and `release/` paths are replaced by the
+/// slug-scoped allowlist above, preventing another run's artifacts from leaking
+/// into this PR. An unreadable or over-limit diff is not treated as an empty
+/// change set: publishing without knowing what the run changed would recreate a
+/// source-less (or partial) PR.
+#[derive(Debug, PartialEq, Eq)]
+enum PrStagePaths {
+    Ready(Vec<String>),
+    Unavailable,
+    TooLarge(usize),
+}
+
+fn is_pr_generated_path(path: &str) -> bool {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    [".umadev/", ".git/", ".claude/", "output/", "release/"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+fn pr_stage_paths(project_root: &Path, slug: &str) -> PrStagePaths {
+    let changed = match umadev_agent::checkpoint::run_diff_since_baseline(project_root) {
+        umadev_agent::checkpoint::RunDiff::Changed(changed) => changed,
+        umadev_agent::checkpoint::RunDiff::Unavailable => return PrStagePaths::Unavailable,
+        umadev_agent::checkpoint::RunDiff::TooLarge(count) => {
+            return PrStagePaths::TooLarge(count);
+        }
+    };
+    let mut paths = changed
+        .into_iter()
+        .map(|changed| changed.path)
+        .filter(|path| !is_pr_generated_path(path))
+        .collect::<Vec<_>>();
+    paths.extend(pr_artifact_paths(project_root, slug));
+    paths.sort();
+    paths.dedup();
+    PrStagePaths::Ready(paths)
 }
 
 fn cmd_pr(
@@ -5166,6 +6024,9 @@ fn cmd_pr(
             "\n{}",
             umadev_agent::manual_steps(&readiness, &slug, &body_rel)
         );
+        if create {
+            anyhow::bail!("PR was not created: one or more readiness checks failed");
+        }
         return Ok(());
     }
     if !create {
@@ -5178,26 +6039,44 @@ fn cmd_pr(
     // escalates to a confirmation REGARDLESS of mode (auto cannot skip it). We
     // protect the user's repo, so in doubt we confirm. `--yes` is the explicit
     // script/CI bypass; the push + PR-create are audited regardless.
-    // The EXACT artifact set this PR will stage + commit (never the whole tree).
-    // If nothing of the run's exists, there's nothing to publish → manual recipe.
-    let artifacts = pr_artifact_paths(&project_root, &slug);
-    if artifacts.is_empty() {
+    // The exact run-scoped source + evidence set this PR will stage. A missing or
+    // truncated run diff is a publication blocker: guessing would either omit the
+    // implementation or sweep unrelated work into a remote branch.
+    let stage_paths = match pr_stage_paths(&project_root, &slug) {
+        PrStagePaths::Ready(paths) => paths,
+        PrStagePaths::Unavailable => {
+            println!(
+                "Cannot establish this run's source diff (missing/unreadable run baseline); refusing to publish a partial PR. \
+                 无法确认本轮源码差异，已拒绝发布不完整 PR。"
+            );
+            return pr_fallback(&readiness, &slug, &body_rel, lang);
+        }
+        PrStagePaths::TooLarge(count) => {
+            println!(
+                "This run changed {count}+ files, beyond the {}-file verified-diff limit; split the run before publishing. \
+                 本轮改动超过可验证上限，请拆分后再发布。",
+                umadev_agent::checkpoint::MAX_CHANGED_FILES
+            );
+            return pr_fallback(&readiness, &slug, &body_rel, lang);
+        }
+    };
+    if stage_paths.is_empty() {
         println!(
-            "No run artifacts (output/ or release/) to stage — nothing to commit for a PR. \
-             没有可提交的运行产物。"
+            "No source or evidence paths changed in this run — nothing to commit for a PR. \
+             本轮没有可提交的源码或证据。"
         );
         return pr_fallback(&readiness, &slug, &body_rel, lang);
     }
     let push_cmd = format!("git push -u origin {}", plan.head_branch);
     let mode = umadev_agent::TrustMode::Auto; // strictest caller; floor still gates
     if umadev_agent::requires_confirmation(mode, &push_cmd, "") && !yes {
-        // List EXACTLY what will be staged/committed so the user can see we are
-        // not sweeping their whole tree (only the run's own deliverables).
+        // List exactly what will be staged so the user can verify both the source
+        // implementation and the run evidence before the network action.
         let prompt = format!(
-            "About to stage + commit ONLY these run artifacts: {}\n\
+            "About to stage + commit ONLY these run-owned paths: {}\n\
              then push `{}` and open a PR (IRREVERSIBLE network action). Proceed? \
-             即将仅提交以上运行产物并推送分支开 PR(不可逆网络动作),确认继续?",
-            artifacts.join(", "),
+             即将仅提交以上本轮源码与证据并推送分支开 PR(不可逆网络动作),确认继续?",
+            stage_paths.join(", "),
             plan.head_branch
         );
         if !confirm(&prompt) {
@@ -5219,9 +6098,9 @@ fn cmd_pr(
         }
     }
 
-    // 4. Ready + --create → drive git + gh. Each step is fail-open: on the first
-    //    error we stop and fall back to the manual recipe, leaving the repo as
-    //    we found it (no force, no history rewrite).
+    // 4. Ready + --create → drive git + gh. On the first error we stop, print
+    //    the manual recipe, and return non-zero while leaving the repo in a
+    //    recoverable state (no force, no history rewrite).
     if plan.needs_new_branch {
         // SAFETY: HEAD is on the default branch — branch first, never commit on
         // it directly. `git switch -c` is non-destructive (creates + checks out).
@@ -5234,12 +6113,11 @@ fn cmd_pr(
         }
     }
     println!("{}", umadev_i18n::t(lang, "pr.committing"));
-    // Stage ONLY the run's artifacts (output/ + release/) — pathspec-scoped,
-    // never `git add -A`. `add -- <paths>` cannot reach outside this allowlist,
-    // so unrelated WIP / stray secrets / build junk in the dirty tree are never
-    // committed or pushed.
+    // Stage only the paths proven to have changed since this run's baseline plus
+    // its slug-scoped evidence. `add -- <paths>` cannot reach unrelated WIP that
+    // predates the run; `git add -A` is deliberately never used.
     let mut add_args: Vec<&str> = vec!["add", "--"];
-    add_args.extend(artifacts.iter().map(String::as_str));
+    add_args.extend(stage_paths.iter().map(String::as_str));
     if !run_pr_git(&project_root, &add_args) {
         return pr_fallback(&readiness, &slug, &body_rel, lang);
     }
@@ -5324,7 +6202,7 @@ fn cmd_pr(
     Ok(())
 }
 
-/// Run a git subcommand in `project_root` for the PR flow, printing a fail-open
+/// Run a git subcommand in `project_root` for the PR flow, printing an actionable
 /// notice on error. Returns `true` on success. Never panics, never `--force`.
 fn run_pr_git(project_root: &Path, args: &[&str]) -> bool {
     match std::process::Command::new("git")
@@ -5353,9 +6231,9 @@ fn run_pr_git(project_root: &Path, args: &[&str]) -> bool {
     }
 }
 
-/// Common fail-open exit for the `--create` path: a step failed, so print the
-/// manual recipe (which is safe + force-free) and return Ok. The repo is left
-/// as we found it; we never retry destructively.
+/// Common failure exit for the `--create` path: print the safe, force-free
+/// manual recipe and return non-zero. The repo remains recoverable; we never
+/// retry destructively or report a publication that did not happen as success.
 fn pr_fallback(
     readiness: &umadev_agent::PrReadiness,
     slug: &str,
@@ -5364,7 +6242,7 @@ fn pr_fallback(
 ) -> Result<()> {
     println!("\n{}", umadev_i18n::t(lang, "pr.fallback"));
     println!("{}", umadev_agent::manual_steps(readiness, slug, body_rel));
-    Ok(())
+    anyhow::bail!("PR was not created; see the manual recovery steps above")
 }
 
 fn print_state(s: &WorkflowState) {
@@ -5520,6 +6398,182 @@ fn infer_slug(project_root: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_curated_lesson(
+        title: &str,
+        status: umadev_agent::CuratedLessonStatus,
+    ) -> umadev_agent::CuratedLessonEntry {
+        umadev_agent::CuratedLessonEntry {
+            title: title.to_string(),
+            rule: "Read the first actionable diagnostic, reproduce it minimally, then verify the documented API before changing code.".to_string(),
+            root_cause: "The implementation guessed an API from a generic failure instead of grounding the fix in a reproducible diagnostic.".to_string(),
+            evidence_count: 2,
+            status,
+            source_kind: "pitfall".to_string(),
+            source_signatures: vec!["rust/error/e0425".to_string()],
+            first_observed_at: "2026-07-14T01:02:03Z".to_string(),
+            last_observed_at: Some("2026-07-15T02:03:04Z".to_string()),
+            last_verified_at: Some("2026-07-15T03:04:05Z".to_string()),
+            timeline_complete: true,
+        }
+    }
+
+    fn legacy_top_pitfall_marker() -> umadev_agent::PitfallEntry {
+        umadev_agent::PitfallEntry {
+            title: "TOP_PITFALL_MUST_NOT_RENDER".to_string(),
+            signature: "test/top-pitfall".to_string(),
+            hits: 99,
+            status: umadev_agent::PitfallStatus::Recurring,
+            fix: "legacy duplicate".to_string(),
+            root_cause: "legacy duplicate".to_string(),
+            context: Vec::new(),
+            failed_fixes: Vec::new(),
+            first_observed_at: "2026-07-14T01:02:03Z".to_string(),
+            last_observed_at: None,
+            last_recurred_at: None,
+            last_verified_at: None,
+            recent_evidence_count: 0,
+            timeline_complete: false,
+            recent_observations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lessons_cli_formatter_has_a_true_empty_state() {
+        let body = format_lessons_report(
+            umadev_i18n::Lang::ZhCn,
+            &umadev_agent::LessonsReport::default(),
+        );
+        assert!(body.contains("还没有提炼出可复用的经验规则"));
+        assert!(body.contains("/pitfalls"));
+        assert!(!body.contains("已有 0 个具体事故"));
+    }
+
+    #[test]
+    fn lessons_cli_formatter_explains_incidents_not_yet_distilled() {
+        let mut report = umadev_agent::LessonsReport::default();
+        report.efficacy.total = 2;
+        report.efficacy.active = 2;
+        let body = format_lessons_report(umadev_i18n::Lang::ZhCn, &report);
+        assert!(body.contains("已有 2 个具体事故"));
+        assert!(body.contains("尚未形成可复用规则"));
+        assert!(body.contains("/pitfalls"));
+    }
+
+    #[test]
+    fn lessons_cli_formatter_explains_repeated_unclassified_candidates() {
+        let mut report = umadev_agent::LessonsReport::default();
+        report.efficacy.unclassified_candidates = 1;
+        report.efficacy.unclassified_candidate_hits = 2;
+        let body = format_lessons_report(umadev_i18n::Lang::ZhCn, &report);
+        assert!(body.contains("1 个待分类候选"));
+        assert!(body.contains("2 次独立失败回合"));
+        assert!(body.contains("不会伪造修法"));
+        assert!(body.contains("/pitfalls"));
+        assert!(!body.contains("已有 0 个具体事故"));
+    }
+
+    #[test]
+    fn lessons_cli_shows_two_precise_episodes_as_a_corroborated_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        for _ in 0..2 {
+            let _ = umadev_agent::capture_dev_errors_detailed(
+                tmp.path(),
+                std::slice::from_ref(&error),
+                "demo",
+                "requirement",
+            );
+        }
+        let report = umadev_agent::lessons_report(tmp.path());
+        assert_eq!(report.curated_lessons.len(), 1);
+        assert_eq!(
+            report.curated_lessons[0].status,
+            umadev_agent::CuratedLessonStatus::Corroborated
+        );
+        let body = format_lessons_report(umadev_i18n::Lang::ZhCn, &report);
+        assert!(body.contains("已印证"));
+        assert!(body.contains("规避复发踩坑:"));
+        assert!(!body.contains("Avoid recurring pitfall"));
+        assert!(body.contains("lodash"));
+        assert!(body.contains('2'));
+    }
+
+    #[test]
+    fn lessons_cli_formatter_renders_only_curated_rules_with_auditable_fields() {
+        let mut report = umadev_agent::LessonsReport {
+            curated_lessons: vec![
+                sample_curated_lesson("PENDING_RULE", umadev_agent::CuratedLessonStatus::Pending),
+                sample_curated_lesson(
+                    "VALIDATED_RULE",
+                    umadev_agent::CuratedLessonStatus::Validated,
+                ),
+                sample_curated_lesson(
+                    "REVISION_RULE",
+                    umadev_agent::CuratedLessonStatus::NeedsRevision,
+                ),
+            ],
+            ..Default::default()
+        };
+        report.curated_lessons[2].timeline_complete = false;
+        report.curated_lessons[2].last_observed_at = None;
+        report.top_pitfalls.push(legacy_top_pitfall_marker());
+        report
+            .validated_patterns
+            .push(umadev_agent::ValidatedEntry {
+                title: "LEGACY_PATTERN_MUST_NOT_RENDER".to_string(),
+                summary: "duplicate".to_string(),
+            });
+
+        let body = format_lessons_report(umadev_i18n::Lang::ZhCn, &report);
+        for expected in [
+            "PENDING_RULE",
+            "VALIDATED_RULE",
+            "REVISION_RULE",
+            "假设",
+            "已验证",
+            "已失效",
+            "规则:",
+            "根因:",
+            "2 条",
+            "踩坑事故",
+            "rust/error/e0425",
+            "首次观察(UTC):",
+            "最近观察(UTC):",
+            "最近验证(UTC):",
+            "旧数据记录时间",
+            "旧数据无逐次时间",
+        ] {
+            assert!(body.contains(expected), "missing {expected:?}:\n{body}");
+        }
+        assert!(!body.contains("TOP_PITFALL_MUST_NOT_RENDER"));
+        assert!(!body.contains("LEGACY_PATTERN_MUST_NOT_RENDER"));
+        assert!(
+            body.lines()
+                .all(|line| lesson_display_width(line) <= LESSONS_LINE_WIDTH),
+            "formatter emitted a row wider than 80 cells:\n{body}"
+        );
+    }
+
+    #[test]
+    fn lessons_cli_formatter_does_not_hide_rules_after_twelve() {
+        let report = umadev_agent::LessonsReport {
+            curated_lessons: (0..14)
+                .map(|index| {
+                    sample_curated_lesson(
+                        &format!("RULE_{index}"),
+                        umadev_agent::CuratedLessonStatus::Pending,
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let body = format_lessons_report(umadev_i18n::Lang::En, &report);
+        assert!(
+            body.contains("RULE_13"),
+            "the 14th rule was hidden:\n{body}"
+        );
+    }
 
     #[test]
     fn an_explicit_project_root_is_healed_before_the_verb_acts_on_it() {
@@ -5749,66 +6803,6 @@ mod tests {
     }
 
     #[test]
-    fn upsert_managed_section_appends_then_refreshes_in_place_preserving_edits() {
-        // First run: no markers yet → the managed block is APPENDED, the preamble kept.
-        let preamble = "# CLAUDE.md — UmaDev managed project\n\nGovernance preamble.\n";
-        let v1 = upsert_managed_section(preamble, "## Project\n\n- Stack: rust\n");
-        assert!(v1.contains("Governance preamble."), "preamble preserved");
-        assert!(
-            v1.contains("<!-- umadev:project:begin -->"),
-            "managed block added"
-        );
-        assert!(v1.contains("- Stack: rust"), "section content present");
-
-        // A user hand-edits OUTSIDE the managed block.
-        let edited = v1.replace("Governance preamble.", "Governance preamble.\nMY OWN NOTE.");
-
-        // Re-run: ONLY the managed section is replaced; the user's note survives and
-        // the block is NOT duplicated.
-        let v2 = upsert_managed_section(&edited, "## Project\n\n- Stack: node\n");
-        assert!(
-            v2.contains("MY OWN NOTE."),
-            "user edits outside the block are preserved"
-        );
-        assert!(
-            v2.contains("- Stack: node"),
-            "section refreshed to the new analysis"
-        );
-        assert!(
-            !v2.contains("- Stack: rust"),
-            "stale section content is gone"
-        );
-        assert_eq!(
-            v2.matches("<!-- umadev:project:begin -->").count(),
-            1,
-            "the managed block is refreshed in place, never duplicated"
-        );
-    }
-
-    #[test]
-    fn generate_project_index_section_reflects_the_analysis() {
-        let report = umadev_agent::AdoptReport {
-            mode: "brownfield".into(),
-            adopted_at: "2026-07-06T00:00:00Z".into(),
-            stack: "rust".into(),
-            dev_server: String::new(),
-            commands: vec![umadev_agent::DetectedCommand {
-                name: "test".into(),
-                command: "cargo test --workspace".into(),
-            }],
-            api_endpoints: 0,
-            indexed_files: 12,
-            indexed_chunks: 34,
-            artifacts: vec![],
-            notes: vec![],
-        };
-        let s = generate_project_index_section(&report);
-        assert!(s.contains("Stack") && s.contains("rust"));
-        assert!(s.contains("12 files") && s.contains("34"));
-        assert!(s.contains("cargo test --workspace"));
-    }
-
-    #[test]
     fn project_root_or_cwd_prefers_explicit_then_falls_back() {
         // Explicit --project-root always wins, verbatim.
         let explicit = PathBuf::from("/some/explicit/root");
@@ -5949,6 +6943,73 @@ mod tests {
     }
 
     #[test]
+    fn pr_stage_paths_includes_this_runs_source_and_slug_evidence_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.rs"), "fn before() {}\n").unwrap();
+        // This edit predates UmaDev's run and must never be swept into its PR.
+        std::fs::write(root.join("unrelated-wip.txt"), "user work\n").unwrap();
+        umadev_agent::create_run_baseline(root, "app").expect("run baseline");
+
+        std::fs::write(root.join("src/app.rs"), "fn after() {}\n").unwrap();
+        std::fs::write(root.join("src/new.rs"), "fn new() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(root.join("output/app-pr-body.md"), "# body\n").unwrap();
+        std::fs::write(root.join("output/other-pr-body.md"), "# other\n").unwrap();
+        std::fs::create_dir_all(root.join("release")).unwrap();
+        std::fs::write(root.join("release/proof-pack-app-001.zip"), [0_u8; 4]).unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(root.join(".claude/settings.json"), "{}\n").unwrap();
+
+        let PrStagePaths::Ready(staged) = pr_stage_paths(root, "app") else {
+            panic!("the run diff should be available");
+        };
+        assert_eq!(
+            staged,
+            vec![
+                "output/app-pr-body.md".to_string(),
+                "release/proof-pack-app-001.zip".to_string(),
+                "src/app.rs".to_string(),
+                "src/new.rs".to_string(),
+            ]
+        );
+        assert!(!staged.iter().any(|path| path.contains("unrelated-wip")));
+        assert!(!staged.iter().any(|path| path.contains("other-pr-body")));
+        assert!(!staged.iter().any(|path| path.starts_with(".claude/")));
+    }
+
+    #[test]
+    fn pr_stage_paths_preserves_deletions_and_refuses_unknown_diff() {
+        let no_baseline = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            pr_stage_paths(no_baseline.path(), "app"),
+            PrStagePaths::Unavailable
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/obsolete.rs"), "fn old() {}\n").unwrap();
+        umadev_agent::create_run_baseline(root, "app").expect("run baseline");
+        std::fs::remove_file(root.join("src/obsolete.rs")).unwrap();
+
+        assert_eq!(
+            pr_stage_paths(root, "app"),
+            PrStagePaths::Ready(vec!["src/obsolete.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn pr_generated_path_filter_is_cross_platform_and_prefix_bounded() {
+        assert!(is_pr_generated_path("output/demo-prd.md"));
+        assert!(is_pr_generated_path(".CLAUDE\\settings.json"));
+        assert!(is_pr_generated_path("release/proof-pack-demo.zip"));
+        assert!(!is_pr_generated_path("src/output/parser.rs"));
+        assert!(!is_pr_generated_path("output-report.md"));
+    }
+
+    #[test]
     fn pr_body_lives_under_the_change_ignored_output_dir() {
         // Fix (a) invariant: the PR body we generate lands under `output/`, which
         // the readiness has_changes judgment ignores — and we now assess readiness
@@ -6059,19 +7120,55 @@ mod tests {
         }
     }
 
+    fn proportional_director_test_opts(root: &Path) -> RunOptions {
+        let mut options = director_test_opts(root);
+        // This exact goal is intentionally Light/Fast: the smoke below verifies a
+        // proportional one-step build, not the normalized full-product plan that a
+        // login system correctly expands into docs, tests, design tokens, and code.
+        options.requirement = "做一个小工具帮我格式化 JSON".to_string();
+        let route = umadev_agent::router::for_run(&options.requirement);
+        assert!(
+            !route.depth.is_deliberate(),
+            "the CLI smoke fixture must stay proportional/Fast"
+        );
+        options
+    }
+
     #[tokio::test]
     async fn director_run_hardstops_on_claimed_build_with_zero_source() {
-        // The director CLAIMS a build (a change verb in its final text) but the
-        // session wrote nothing -> the objective source-present hard-gate makes it
-        // an honest HardStop, never a Done. This is the deterministic floor.
+        // A proportional one-step plan completes all three bounded work/fix turns
+        // without producing its declared source artifact. The objective QC floor
+        // must retain that evidence as an honest HardStop, never infer Done from
+        // any of the base's success-shaped prose.
         use umadev_runtime::{SessionEvent, TurnStatus};
         let tmp = tempfile::TempDir::new().unwrap();
-        let opts = director_test_opts(tmp.path());
+        let opts = proportional_director_test_opts(tmp.path());
         let sink: Arc<dyn umadev_agent::EventSink> =
             Arc::new(umadev_agent::RecordingSink::default());
         let mut session = FakeDirectorSession::new(
             [
-                SessionEvent::TextDelta("I implemented the login page".to_string()),
+                // Planning turn: explicitly one proportional build step.
+                SessionEvent::TextDelta(
+                    r#"{"steps":[{"id":"s1","title":"Build formatter","seat":"backend-engineer","kind":"build","depends_on":[],"acceptance":"source-present","files":{"create":["src/main.rs"],"modify":[]}}],"risks":[],"open_questions":[]}"#
+                        .to_string(),
+                ),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+                // Initial work turn plus both bounded QC-fix turns. All narrate
+                // success, but none creates source; prose must never satisfy QC.
+                SessionEvent::TextDelta("I implemented the formatter".to_string()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+                SessionEvent::TextDelta("I fixed every reported issue".to_string()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+                SessionEvent::TextDelta("Everything is now complete".to_string()),
                 SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
                     usage: None,
@@ -6080,39 +7177,46 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let outcome = drive_director_run(&sink, &mut session, &opts, None)
+        let outcome = Box::pin(drive_director_run(&sink, &mut session, &opts, None))
             .await
             .unwrap();
+        let DirectorOutcome::HardStop(reason) = outcome else {
+            panic!("success prose + zero source must hard-stop")
+        };
         assert!(
-            matches!(outcome, DirectorOutcome::HardStop(_)),
-            "claimed build + zero source must hard-stop, got {outcome:?}"
+            reason.contains("source-present") && reason.contains("0 source file(s)"),
+            "HardStop must retain the objective missing-artifact evidence: {reason}; sent={:?}",
+            session.sent.lock().unwrap()
         );
     }
 
     #[tokio::test]
     async fn director_run_done_when_real_source_lands() {
-        // The session's work landed a real source file -> the hard-gate is
-        // satisfied and the run is Done. (We pre-seed the file to model the base's
-        // write, since the fake session has no real tool loop.)
+        // This is deliberately a proportional Light/Fast build with a one-step
+        // plan. Its one declared source artifact is enough for THAT scoped task;
+        // it is not evidence that a full login-product plan's docs/tests/tokens are
+        // complete. (We pre-seed the file to model the fake base's write.)
         use umadev_runtime::{SessionEvent, TurnStatus};
         let tmp = tempfile::TempDir::new().unwrap();
-        let seeded = tmp.path().join("App.tsx");
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let seeded = src.join("main.rs");
         // Genuinely clean content (no emoji/color/craft violation) so the QC
         // governance scan — which now runs for EVERY backend, claude included —
         // returns empty and the build settles `Done` in one turn. A craft nit here
         // would (correctly) trigger the fix loop, which this single-turn fake
         // session can't satisfy.
-        std::fs::write(seeded, "export const APP_NAME = \"ledger\";\n").unwrap();
-        let opts = director_test_opts(tmp.path());
+        std::fs::write(seeded, "fn main() {}\n").unwrap();
+        let opts = proportional_director_test_opts(tmp.path());
         let sink: Arc<dyn umadev_agent::EventSink> =
             Arc::new(umadev_agent::RecordingSink::default());
         let mut tool_input = serde_json::Map::new();
-        tool_input.insert(target_key(), serde_json::json!("App.tsx"));
+        tool_input.insert(target_key(), serde_json::json!("src/main.rs"));
         let mut session = FakeDirectorSession::new(
             [
                 // Turn 1 — the planning turn (main session) replies with a JSON plan.
                 SessionEvent::TextDelta(
-                    r#"{"steps":[{"id":"s1","title":"Build it","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"}],"risks":[],"open_questions":[]}"#
+                    r#"{"steps":[{"id":"s1","title":"Build formatter","seat":"backend-engineer","kind":"build","depends_on":[],"acceptance":"source-present","files":{"create":["src/main.rs"],"modify":[]}}],"risks":[],"open_questions":[]}"#
                         .to_string(),
                 ),
                 SessionEvent::TurnDone {
@@ -6124,7 +7228,7 @@ mod tests {
                     name: "Write".to_string(),
                     input: serde_json::Value::Object(tool_input),
                 },
-                SessionEvent::TextDelta("Created App.tsx with the login form".to_string()),
+                SessionEvent::TextDelta("Created the JSON formatter".to_string()),
                 SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
                     usage: None,
@@ -6133,10 +7237,118 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let outcome = drive_director_run(&sink, &mut session, &opts, None)
+        let outcome = Box::pin(drive_director_run(&sink, &mut session, &opts, None))
             .await
             .unwrap();
-        assert_eq!(outcome, DirectorOutcome::Done);
+        assert_eq!(
+            outcome,
+            DirectorOutcome::Done,
+            "sent={:?}",
+            session.sent.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_continue_routes_a_persisted_director_plan_before_legacy_gate_logic() {
+        use umadev_agent::plan_state::{
+            AcceptanceSpec, Plan, PlanStep, StepFiles, StepKind, StepStatus,
+        };
+        use umadev_agent::Seat;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let plan = Plan {
+            steps: vec![PlanStep {
+                id: "remaining".to_string(),
+                title: "finish the implementation".to_string(),
+                seat: Seat::BackendEngineer,
+                kind: StepKind::Build,
+                depends_on: Vec::new(),
+                acceptance: AcceptanceSpec::SourcePresent,
+                evidence: Vec::new(),
+                files: StepFiles {
+                    create: vec!["src/main.rs".to_string()],
+                    modify: Vec::new(),
+                },
+                status: StepStatus::Pending,
+            }],
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        };
+        umadev_agent::plan_state::save(&plan, root).unwrap();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Research);
+        state.requirement = "finish the existing build".to_string();
+        state.slug = "demo".to_string();
+        // Reaching legacy gate parsing would fail on this value. The persisted
+        // Director plan must win, and Plan mode must settle before opening a base.
+        state.active_gate = "not-a-legacy-gate".to_string();
+        state.permission_profile = Some(umadev_runtime::BasePermissionProfile::Plan);
+        umadev_agent::write_workflow_state(root, &state).unwrap();
+
+        Box::pin(cmd_continue(Some(root.to_path_buf()), None))
+            .await
+            .expect("Plan mode settles read-only before opening a backend");
+        let saved = umadev_agent::plan_state::load(root).unwrap();
+        assert_eq!(saved.steps[0].status, StepStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn director_full_build_never_treats_one_source_file_as_complete_product() {
+        // Control for the proportional smoke above: the original login-page goal is
+        // a deliberate/full build. Even when the brain proposes one frontend step,
+        // normalization expands the owned plan with the required product artifacts.
+        // A lone source file therefore cannot turn the full run into fake Done.
+        use umadev_runtime::{SessionEvent, TurnStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let opts = director_test_opts(tmp.path());
+        let route = umadev_agent::router::for_run(&opts.requirement);
+        assert!(
+            route.depth.is_deliberate(),
+            "the full-build control must exercise normalized product planning"
+        );
+        let sink: Arc<dyn umadev_agent::EventSink> =
+            Arc::new(umadev_agent::RecordingSink::default());
+        let mut tool_input = serde_json::Map::new();
+        tool_input.insert(target_key(), serde_json::json!("src/main.rs"));
+        let mut session = FakeDirectorSession::new(
+            [
+                SessionEvent::TextDelta(
+                    r#"{"steps":[{"id":"s1","title":"Build login page","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present","files":{"create":["src/login.rs"],"modify":[]}}],"risks":[],"open_questions":[]}"#
+                        .to_string(),
+                ),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+                SessionEvent::ToolCall {
+                    name: "Write".to_string(),
+                    input: serde_json::Value::Object(tool_input),
+                },
+                SessionEvent::TextDelta("Created the login source".to_string()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let outcome = Box::pin(drive_director_run(&sink, &mut session, &opts, None))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, DirectorOutcome::HardStop(_)),
+            "one source file cannot satisfy a full product plan: {outcome:?}"
+        );
+        let plan = umadev_agent::plan_state::load(tmp.path()).expect("normalized plan persists");
+        let (done, total) = plan.progress();
+        assert!(
+            total > 1 && done < total,
+            "full-build normalization must retain unfinished product artifacts: {done}/{total}"
+        );
     }
 
     #[tokio::test]
@@ -6149,12 +7361,57 @@ mod tests {
             Arc::new(umadev_agent::RecordingSink::default());
         // No events at all -> next_event yields None immediately.
         let mut session = FakeDirectorSession::new(std::collections::VecDeque::new());
-        let outcome = drive_director_run(&sink, &mut session, &opts, None)
+        let outcome = Box::pin(drive_director_run(&sink, &mut session, &opts, None))
             .await
             .unwrap();
         assert!(
             matches!(outcome, DirectorOutcome::HardStop(_)),
             "a dead session must fail open to a HardStop"
+        );
+    }
+
+    #[tokio::test]
+    async fn director_plan_outcome_precedes_lock_branch_state_and_base_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut opts = director_test_opts(tmp.path());
+        opts.mode = umadev_agent::TrustMode::Plan;
+        let sink: Arc<dyn umadev_agent::EventSink> =
+            Arc::new(umadev_agent::RecordingSink::default());
+        let mut session = FakeDirectorSession::new(std::collections::VecDeque::new());
+
+        let outcome = Box::pin(drive_director_run(&sink, &mut session, &opts, None))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, DirectorOutcome::Planned);
+        assert!(session.sent.lock().unwrap().is_empty());
+        assert!(
+            !tmp.path().join(".umadev/run.lock").exists()
+                && !tmp.path().join(".umadev/workflow-state.json").exists()
+                && !tmp.path().join(".umadev/governance-context.json").exists(),
+            "Plan settles before CLI Director persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_run_plan_mode_returns_before_runner_start_or_offline_artifacts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        Box::pin(cmd_run(RunArgs {
+            requirement: "build a login page".into(),
+            backend: None,
+            project_root: Some(tmp.path().to_path_buf()),
+            slug: "demo".into(),
+            mode: "plan".into(),
+            continuous: false,
+        }))
+        .await
+        .unwrap();
+
+        assert!(
+            !tmp.path().join(".umadev").exists()
+                && !tmp.path().join("output").exists()
+                && !tmp.path().join("release").exists(),
+            "the CLI Plan boundary must precede AgentRunner::start and all artifacts"
         );
     }
 
@@ -6169,6 +7426,15 @@ mod tests {
         // Fail-open on empty firmware.
         assert_eq!(prepend_firmware("", "GOAL".to_string()), "GOAL");
         assert_eq!(prepend_firmware("   ", "GOAL".to_string()), "GOAL");
+    }
+
+    #[test]
+    fn firmware_is_injected_exactly_once_on_every_first_class_base() {
+        assert!(!firmware_requires_directive_prefix("claude-code"));
+        assert!(!firmware_requires_directive_prefix("grok-build"));
+        assert!(firmware_requires_directive_prefix("codex"));
+        assert!(firmware_requires_directive_prefix("opencode"));
+        assert!(firmware_requires_directive_prefix("kimi-code"));
     }
 
     #[test]
@@ -6205,12 +7471,12 @@ mod tests {
 
     #[test]
     fn codex_sandbox_to_publish_defaults_when_no_config() {
-        // No `.umadevrc` at all → the safe `workspace-write` baseline (fail-open,
-        // today's default behaviour unchanged).
+        // No `.umadevrc` at all → a complete development environment for the
+        // main coding worker.
         let tmp = tempfile::TempDir::new().unwrap();
         assert_eq!(
             codex_sandbox_to_publish(None, tmp.path()),
-            Some(umadev_agent::config::CodexSandbox::WorkspaceWrite),
+            Some(umadev_agent::config::CodexSandbox::DangerFullAccess),
         );
     }
 
@@ -6292,9 +7558,14 @@ mod tests {
         let sent = session.sent.clone();
         let mut session = session;
         let firmware = "YOU ARE UmaDev — a senior project director.";
-        let _ = drive_director_run(&sink, &mut session, &opts, Some(firmware))
-            .await
-            .unwrap();
+        let _ = Box::pin(drive_director_run(
+            &sink,
+            &mut session,
+            &opts,
+            Some(firmware),
+        ))
+        .await
+        .unwrap();
         let directives = sent.lock().unwrap();
         // The director loop may send a JSON-only PLAN turn first (over the main
         // session); the GOAL build directive is the one the firmware was prepended
@@ -6321,16 +7592,33 @@ mod tests {
     }
 
     #[test]
-    fn launches_tui_only_on_no_subcommand_and_a_tty() {
+    fn launches_tui_only_on_no_subcommand_and_terminal_input_output() {
         // The only path that owns the alternate screen → must log to a file.
-        assert!(launches_tui(false, true), "no subcommand + TTY → TUI");
-        // A subcommand is a plain CLI verb (logs to terminal as before).
-        assert!(!launches_tui(true, true), "a subcommand is not the TUI");
-        // No TTY (piped / CI) prints help, never the TUI.
-        assert!(!launches_tui(false, false), "no TTY → not the TUI");
         assert!(
-            !launches_tui(true, false),
-            "subcommand + no TTY → not the TUI"
+            launches_tui(false, true, true),
+            "no subcommand + terminal stdin/stdout → TUI"
+        );
+        // A subcommand is a plain CLI verb (logs to terminal as before).
+        assert!(
+            !launches_tui(true, true, true),
+            "a subcommand is not the TUI"
+        );
+        // Redirected input or output prints help, never entering raw/full-screen.
+        assert!(
+            !launches_tui(false, false, true),
+            "piped stdin → not the TUI"
+        );
+        assert!(
+            !launches_tui(false, true, false),
+            "redirected stdout → not the TUI"
+        );
+        assert!(
+            !launches_tui(false, false, false),
+            "no terminal streams → not the TUI"
+        );
+        assert!(
+            !launches_tui(true, false, false),
+            "subcommand + no terminal streams → not the TUI"
         );
     }
 
@@ -6372,6 +7660,118 @@ mod tests {
         );
     }
 
+    #[test]
+    fn memory_mutations_require_an_explicit_scope() {
+        assert!(Cli::try_parse_from(["umadev", "memory", "capture", "off"]).is_err());
+        let cli = Cli::try_parse_from([
+            "umadev",
+            "memory",
+            "capture",
+            "off",
+            "--scope",
+            "project",
+            "--store",
+            "conversation",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Memory {
+                action: MemoryAction::Capture {
+                    state: MemoryToggleArg::Off,
+                    scope: MemoryMutationScopeArg::Project,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn memory_inventory_supports_both_scopes_and_cache_clear_requires_yes_at_runtime() {
+        let cli = Cli::try_parse_from(["umadev", "memory", "inventory", "--scope", "all"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Memory {
+                action: MemoryAction::Inventory {
+                    scope: MemoryInventoryScopeArg::All,
+                    ..
+                }
+            })
+        ));
+
+        let temp = tempfile::tempdir().unwrap();
+        let result = cmd_memory(MemoryAction::ClearCache {
+            store: MemoryCacheArg::KnowledgeIndex,
+            yes: false,
+            project_root: Some(temp.path().to_path_buf()),
+        });
+        assert!(result.unwrap_err().to_string().contains("--yes"));
+    }
+
+    #[test]
+    fn memory_lifecycle_commands_require_scope_and_confirmation() {
+        assert!(Cli::try_parse_from([
+            "umadev",
+            "memory",
+            "export",
+            "--output",
+            "/tmp/memory.zip",
+            "--yes",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "umadev", "memory", "forget", "--store", "pitfalls", "--yes",
+        ])
+        .is_err());
+
+        let temp = tempfile::tempdir().unwrap();
+        let forget = cmd_memory(MemoryAction::Forget {
+            scope: MemoryMutationScopeArg::Project,
+            store: "pitfalls".to_string(),
+            yes: false,
+            project_root: Some(temp.path().to_path_buf()),
+        });
+        assert!(forget.unwrap_err().to_string().contains("confirmation"));
+
+        let run = cmd_memory(MemoryAction::Retention {
+            scope: MemoryInventoryScopeArg::Project,
+            store: Some("chat-sessions".to_string()),
+            days: None,
+            clear: false,
+            run_now: true,
+            yes: false,
+            project_root: Some(temp.path().to_path_buf()),
+        });
+        assert!(run.unwrap_err().to_string().contains("--yes"));
+    }
+
+    #[test]
+    fn memory_export_creates_a_new_bounded_archive_and_never_replaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory = temp.path().join(".umadev/memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        std::fs::write(memory.join("facts.jsonl"), b"private test fact\n").unwrap();
+        let output = temp.path().join("memory-export.zip");
+        cmd_memory(MemoryAction::Export {
+            scope: MemoryMutationScopeArg::Project,
+            store: Some("facts".to_string()),
+            output: output.clone(),
+            yes: true,
+            project_root: Some(temp.path().to_path_buf()),
+        })
+        .unwrap();
+        assert!(output.is_file());
+
+        let second = cmd_memory(MemoryAction::Export {
+            scope: MemoryMutationScopeArg::Project,
+            store: Some("facts".to_string()),
+            output,
+            yes: true,
+            project_root: Some(temp.path().to_path_buf()),
+        });
+        assert!(second.unwrap_err().to_string().contains("never replaces"));
+    }
+
     /// Every selector id must resolve through driver_for — i.e. selecting a
     /// backend in the CLI can never 404 at driver-build time.
     #[test]
@@ -6392,6 +7792,179 @@ mod tests {
                 BackendArg::from_id(id).unwrap_or_else(|| panic!("from_id({id}) returned None"));
             assert_eq!(var.id(), *id, "id()/from_id() not inverse for {id}");
         }
+    }
+
+    #[test]
+    fn retired_backends_have_no_cli_variant_or_driver() {
+        for id in RETIRED_BACKEND_IDS {
+            assert!(BackendArg::from_id(id).is_none(), "{id} has a CLI variant");
+            assert!(umadev_host::driver_for(id).is_none(), "{id} has a driver");
+        }
+    }
+
+    #[test]
+    fn run_help_exposes_exactly_the_five_product_bases() {
+        let mut command = Cli::command();
+        let run = command.find_subcommand_mut("run").expect("run command");
+        let help = run.render_long_help().to_string();
+        for id in BACKEND_ARG_IDS {
+            assert!(help.contains(id), "run help omitted {id}: {help}");
+        }
+        for retired in RETIRED_BACKEND_IDS {
+            assert!(
+                !help.contains(retired),
+                "run help still exposes retired backend {retired}: {help}"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_workflow_requires_an_explicit_safe_handoff() {
+        for retired in ["cursor", "codebuddy", "droid", "qwen-code"] {
+            let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+            state.backend = retired.to_string();
+            state.base_session_id = Some("retired-session".to_string());
+            let error = resolve_resume_backend(&state, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("silently switch"), "{error}");
+            assert!(error.contains("--backend"), "{error}");
+
+            let choice = resolve_resume_backend(&state, Some(BackendArg::GrokBuild)).unwrap();
+            assert_eq!(choice.backend, Some(BackendArg::GrokBuild));
+            assert!(choice.cross_base_handoff);
+            assert!(choice.explicit);
+        }
+    }
+
+    #[test]
+    fn current_and_offline_workflow_resolution_is_stable() {
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Docs);
+        let offline = resolve_resume_backend(&state, None).unwrap();
+        assert_eq!(offline.backend, None);
+        assert!(!offline.cross_base_handoff);
+
+        state.backend = "codex".to_string();
+        let current = resolve_resume_backend(&state, None).unwrap();
+        assert_eq!(current.backend, Some(BackendArg::Codex));
+        assert!(!current.cross_base_handoff);
+        assert!(!current.explicit);
+    }
+
+    #[test]
+    fn successful_cross_base_identity_never_keeps_the_old_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+        state.backend = "cursor".to_string();
+        state.base_session_id = Some("cursor-session-must-not-cross".to_string());
+        umadev_agent::write_workflow_state(tmp.path(), &state).unwrap();
+
+        persist_workflow_base_identity(tmp.path(), "grok-build", None, None).unwrap();
+        let migrated = umadev_agent::read_workflow_state(tmp.path()).unwrap();
+        assert_eq!(migrated.backend, "grok-build");
+        assert_eq!(migrated.base_session_id, None);
+        assert_eq!(migrated.base_resume_identity, None);
+    }
+
+    #[test]
+    fn workflow_vendor_id_requires_exact_typed_launch_identity() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+        state.backend = "codex".to_string();
+        state.base_session_id = Some("codex-thread".to_string());
+        state.permission_profile = Some(umadev_runtime::BasePermissionProfile::Guarded);
+        state.base_resume_identity = umadev_runtime::BaseResumeIdentity::requested_for_launch(
+            "codex",
+            workspace.path(),
+            umadev_runtime::BasePermissionProfile::Guarded,
+        );
+
+        assert_eq!(
+            eligible_workflow_resume_id(
+                &state,
+                "codex",
+                workspace.path(),
+                umadev_runtime::BasePermissionProfile::Guarded,
+            )
+            .as_deref(),
+            Some("codex-thread")
+        );
+        assert_eq!(
+            eligible_workflow_resume_id(
+                &state,
+                "codex",
+                other.path(),
+                umadev_runtime::BasePermissionProfile::Guarded,
+            ),
+            None
+        );
+        assert_eq!(
+            eligible_workflow_resume_id(
+                &state,
+                "codex",
+                workspace.path(),
+                umadev_runtime::BasePermissionProfile::Auto,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn workflow_grok_requested_only_and_legacy_ids_always_open_fresh() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+        state.backend = "grok-build".to_string();
+        state.base_session_id = Some("grok-session".to_string());
+        state.base_resume_identity = umadev_runtime::BaseResumeIdentity::requested_for_launch(
+            "grok-build",
+            workspace.path(),
+            umadev_runtime::BasePermissionProfile::Guarded,
+        );
+        assert_eq!(
+            eligible_workflow_resume_id(
+                &state,
+                "grok-build",
+                workspace.path(),
+                umadev_runtime::BasePermissionProfile::Guarded,
+            ),
+            None
+        );
+
+        state.base_resume_identity = None;
+        assert_eq!(
+            eligible_workflow_resume_id(
+                &state,
+                "grok-build",
+                workspace.path(),
+                umadev_runtime::BasePermissionProfile::Guarded,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_native_workflow_id_never_crosses_permission_profiles() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+        state.backend = "claude-code".to_string();
+        state.base_session_id = Some("legacy-claude-session".to_string());
+        state.base_resume_identity = None;
+        state.permission_profile = Some(umadev_runtime::BasePermissionProfile::Guarded);
+        assert!(eligible_workflow_resume_id(
+            &state,
+            "claude-code",
+            workspace.path(),
+            umadev_runtime::BasePermissionProfile::Guarded,
+        )
+        .is_some());
+        assert!(eligible_workflow_resume_id(
+            &state,
+            "claude-code",
+            workspace.path(),
+            umadev_runtime::BasePermissionProfile::Auto,
+        )
+        .is_none());
     }
 
     /// Pull a subcommand's `long_about` text out of the clap command tree so we
@@ -6476,13 +8049,38 @@ mod tests {
 
     // ---- continuous long-session run path wiring ----
 
-    /// Only `auto` makes the continuous session autonomous; `guarded` / `plan`
-    /// keep the human-in-the-loop posture (gate pauses + the approval floor).
+    /// Guarded and Auto both grant the worker normal development access; only
+    /// Plan is read-only. Gate auto-approval remains a separate policy.
     #[test]
-    fn continuous_autonomous_only_for_auto() {
-        assert!(continuous_autonomous(umadev_agent::TrustMode::Auto));
-        assert!(!continuous_autonomous(umadev_agent::TrustMode::Guarded));
-        assert!(!continuous_autonomous(umadev_agent::TrustMode::Plan));
+    fn base_permission_profiles_preserve_all_three_modes() {
+        assert_eq!(
+            base_permissions(umadev_agent::TrustMode::Auto),
+            umadev_runtime::BasePermissionProfile::Auto
+        );
+        assert_eq!(
+            base_permissions(umadev_agent::TrustMode::Guarded),
+            umadev_runtime::BasePermissionProfile::Guarded
+        );
+        assert_eq!(
+            base_permissions(umadev_agent::TrustMode::Plan),
+            umadev_runtime::BasePermissionProfile::Plan
+        );
+    }
+
+    #[test]
+    fn cli_resume_preserves_plan_auto_and_defaults_legacy_to_guarded() {
+        use umadev_agent::TrustMode;
+        use umadev_runtime::BasePermissionProfile;
+
+        for (profile, expected) in [
+            (Some(BasePermissionProfile::Plan), TrustMode::Plan),
+            (Some(BasePermissionProfile::Auto), TrustMode::Auto),
+            (None, TrustMode::Guarded),
+        ] {
+            let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+            state.permission_profile = profile;
+            assert_eq!(trust_for_resume(&state), expected);
+        }
     }
 
     /// The next continuous block resumes at the gate-anchored start phase — the
@@ -6553,11 +8151,32 @@ mod tests {
 
     #[test]
     fn director_outcome_exit_mapping() {
-        // `Done` succeeds (exit 0); `HardStop` fails (non-zero).
+        // `Done` succeeds, `Planned` is an honest no-op success, a confirmation
+        // pause is an honest resumable success, and only HardStop exits non-zero.
         assert!(!director_outcome_is_failure(&DirectorOutcome::Done));
+        assert!(!director_outcome_is_failure(&DirectorOutcome::Planned));
+        assert!(!director_outcome_is_failure(&DirectorOutcome::Paused {
+            gate: Gate::DocsConfirm,
+        }));
         assert!(director_outcome_is_failure(&DirectorOutcome::HardStop(
             "session died".into()
         )));
+    }
+
+    #[test]
+    fn director_paused_outcome_names_gate_and_never_renders_build_complete() {
+        let report = director_outcome_report(&DirectorOutcome::Paused {
+            gate: Gate::PreviewConfirm,
+        });
+        assert!(
+            report.contains("preview_confirm"),
+            "the paused report must identify the unresolved gate: {report}"
+        );
+        assert_ne!(
+            report,
+            umadev_i18n::tl("director.run_done"),
+            "a defensive CLI pause must never print the completed-build line"
+        );
     }
 
     #[test]
@@ -6680,6 +8299,8 @@ mod tests {
             note: "Advanced to docs".to_string(),
             backend: String::new(),
             base_session_id: None,
+            base_resume_identity: None,
+            permission_profile: None,
             spec_version: "UMADEV_HOST_SPEC_V1".to_string(),
         };
         let gate = resolve_active_gate(&state).expect("should recover");
@@ -6702,6 +8323,8 @@ mod tests {
             note: note.to_string(),
             backend: String::new(),
             base_session_id: None,
+            base_resume_identity: None,
+            permission_profile: None,
             spec_version: "UMADEV_HOST_SPEC_V1".to_string(),
         }
     }

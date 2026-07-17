@@ -128,6 +128,26 @@ pub enum AcceptanceSpec {
 }
 
 impl AcceptanceSpec {
+    /// Human-readable mechanical bar used in a step's rework directive.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::SourcePresent => "real source files exist on disk",
+            Self::BuildTest => "the project's build/test passes",
+            Self::Contract => "the frontend↔backend API contract holds",
+            Self::DesignTokensPresent => {
+                "the design-tokens.{json,css} design system exists on disk"
+            }
+            Self::DesignTokensConform => {
+                "the design system CONFORMS: >=6 color roles each with a paired `on-` foreground, \
+                 a >=4-step type scale, a 4pt spacing scale, a radius scale, motion tokens; every \
+                 (surface, on-surface) pair measured against WCAG; the UI drawing from the tokens; \
+                 no AI-purple brand hue"
+            }
+            Self::ReviewClean => "the review team raises no blocking issue",
+            Self::TurnSettled => "the work turn completes",
+        }
+    }
+
     /// Tolerant parse of a brain-supplied acceptance string; defaults to the
     /// honesty floor ([`Self::SourcePresent`]) for a build step — the safest
     /// non-trivial criterion when the brain is vague.
@@ -608,9 +628,12 @@ const TEST_AUTHORING_DIR: &str = "tests";
 /// name that exists as a directory) claims the whole subtree, so a step can claim
 /// `src/api/` without enumerating every file it will write there.
 ///
-/// Optional by contract: the planner prompt ASKS for it, but a plan that omits it is
-/// perfectly valid and simply disables the scope check for that run (fail-open — the
-/// check never invents a finding out of an absent declaration).
+/// Required for every mutating [`StepKind::Build`] step. Exact file evidence is
+/// losslessly projected into this surface during normalisation; a remaining empty
+/// surface is an under-specified execution contract and is repaired by the planner
+/// before a writer may start. Older persisted plans still deserialize through the
+/// default, but resume preflight reports the missing contract instead of silently
+/// disabling scope enforcement.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepFiles {
     /// Repo-relative paths (or directory prefixes) this step will CREATE.
@@ -669,9 +692,9 @@ pub struct PlanStep {
     pub evidence: Vec<EvidenceContract>,
     /// The step's DECLARED FILE SURFACE — what it says it will create / modify (see
     /// [`StepFiles`]). Read by the scope-creep floor ([`crate::scope_creep`]) to
-    /// decide whether a change in the working tree belongs to ANY step. Optional:
-    /// `#[serde(default)]` so older `plan.json` files still load, and a plan where NO
-    /// step declares a surface simply disables the check (fail-open).
+    /// decide whether a change in the working tree belongs to ANY step. The serde
+    /// default exists only for old `plan.json` compatibility; execution preflight
+    /// rejects a mutating step that still has no surface after evidence inference.
     #[serde(default)]
     pub files: StepFiles,
     /// Lifecycle status (persisted, so the plan resumes).
@@ -679,6 +702,19 @@ pub struct PlanStep {
 }
 
 impl PlanStep {
+    /// Typed evidence summary when present, otherwise the coarse acceptance bar.
+    pub(crate) fn criterion_label(&self) -> String {
+        if self.evidence.is_empty() {
+            self.acceptance.label().to_string()
+        } else {
+            self.evidence
+                .iter()
+                .map(EvidenceContract::label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+
     /// Whether this step already carries a falsifiable contract stronger than the bare
     /// source-present floor — via a strong typed [`EvidenceContract`] OR a non-trivial
     /// [`AcceptanceSpec`]. A BUILD step that does NOT is "under-specified":
@@ -800,7 +836,7 @@ impl Plan {
     /// Computed as reverse-reachability over `depends_on` (which points UPSTREAM, a
     /// step → its prerequisites): the edges are inverted to a downstream adjacency, then
     /// walked from `step_id`. Cycle-safe — a `visited` set bounds the walk even if a
-    /// residual cycle survived (the DAG is normally acyclic, see [`Self::normalized`]);
+    /// residual cycle survived (the DAG is normally acyclic after internal normalization);
     /// the start node itself is excluded. Returns 0 for an unknown id (fail-open). Pure.
     #[must_use]
     pub fn blast_radius(&self, step_id: &str) -> usize {
@@ -933,10 +969,10 @@ impl Plan {
     /// **BOUNDED RE-PLAN merge** — replace a blocked subtree with a validated
     /// replacement sub-DAG. `replaced` is the set of step ids being retired (the blocked
     /// step + its stranded pending dependents, from [`Self::stranded_dependents`]);
-    /// `new_steps` is the brain's proposed replacement (parsed via [`parse_brain_steps`]).
+    /// `new_steps` is the brain's proposed replacement (parsed by the internal brain-step parser).
     ///
     /// The whole merged plan (the SURVIVING steps + the new steps) is re-validated
-    /// through the EXISTING [`Self::normalized`] machinery — dedup by id, dangling-dep
+    /// through the EXISTING internal normalization machinery — dedup by id, dangling-dep
     /// strip, cycle-break, and the per-seat / falsifiability evidence floors — so a
     /// re-planned subtree faces the identical structural discipline (and later the
     /// identical acceptance floor) as a freshly-synthesised plan. `normalized` resets
@@ -1122,9 +1158,24 @@ impl Plan {
         if doc_skeleton.is_some() {
             self.enforce_red_green_floor();
         }
+        // EXECUTION-CONTRACT SURFACE. A path-bearing evidence contract already says
+        // exactly which file the step must create/modify, so project that same path
+        // into `files` when the brain omitted the redundant declaration. Generic
+        // BuildClean/SourcePresent steps stay empty and are re-asked/blocked rather
+        // than receiving a guessed broad directory.
+        self.infer_execution_surfaces();
         self.risks.retain(|r| !r.trim().is_empty());
         self.open_questions.retain(|q| !q.trim().is_empty());
         Some(self)
+    }
+
+    /// Losslessly infer file surfaces from exact typed evidence. Kept as one method
+    /// so fresh synthesis, re-plan normalisation, and old-plan loading share the same
+    /// migration semantics.
+    fn infer_execution_surfaces(&mut self) {
+        for step in &mut self.steps {
+            crate::execution_contract::infer_step_surface(step);
+        }
     }
 
     /// **RED→GREEN FLOOR** — upgrade a code step's `test-passes <name>` claim into the
@@ -1932,7 +1983,13 @@ pub fn save(plan: &Plan, root: &Path) -> std::io::Result<PathBuf> {
 pub fn load(root: &Path) -> Option<Plan> {
     let path = root.join(".umadev").join("plan.json");
     let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<Plan>(&text).ok()
+    let mut plan = serde_json::from_str::<Plan>(&text).ok()?;
+    // Backward-compatible migration for plans written before file surfaces became
+    // a hard execution contract. Exact FileExists/FileContains evidence can be
+    // projected without guessing; any genuinely under-specified Build step remains
+    // empty and resume preflight reports it before opening a writer.
+    plan.infer_execution_surfaces();
+    Some(plan)
 }
 
 /// The brain's raw plan reply — tolerant so a partial / sloppy JSON still parses.
@@ -1970,21 +2027,20 @@ struct BrainStep {
     /// falls back to its [`AcceptanceSpec`].
     #[serde(default)]
     evidence: Vec<serde_json::Value>,
-    /// The brain's PROPOSED file surface for this step (`{"create":[…],"modify":[…]}`)
-    /// — the declaration the scope-creep floor holds the working tree against. Parsed
-    /// as a raw value so a sloppy shape (a bare array, a string, a missing key) can
-    /// never fail the whole plan parse; [`parse_brain_files`] normalises it and yields
-    /// an EMPTY surface on anything it cannot read (fail-open → the check stays silent
-    /// for that step).
+    /// The brain's REQUIRED file surface for this step
+    /// (`{"create":[…],"modify":[…]}`) — the declaration the execution contract
+    /// holds the working tree against. Parsed as a raw value so one sloppy field does
+    /// not lose the rest of the plan; exact evidence may repair it, otherwise
+    /// execution preflight blocks and asks for a corrected plan.
     #[serde(default)]
     files: serde_json::Value,
 }
 
 /// Normalise the brain's proposed per-step file surface into an owned [`StepFiles`].
 ///
-/// Tolerant by design — the declaration is a HINT the brain volunteers, and a plan
-/// that fumbles the shape must degrade to "declared nothing" (which disables the
-/// scope check for that step), never to a parse failure:
+/// Tolerant at the parsing boundary — a malformed declaration becomes empty so the
+/// whole JSON reply remains inspectable, then the explicit execution-contract
+/// preflight repairs/rejects it before mutation:
 /// - `{"create":["a"],"modify":["b"]}` — the canonical object form.
 /// - `["a","b"]` — a bare array is read as `modify` (the conservative reading: an
 ///   un-annotated path is not claimed as a NEW file).
@@ -2070,10 +2126,36 @@ async fn drain_plan_turn(
     directive: String,
     deadline: std::time::Instant,
 ) -> Option<String> {
+    drain_plan_turn_traced(session, directive, deadline, None)
+        .await
+        .text
+}
+
+struct TracedPlanTurn {
+    text: Option<String>,
+    recipe_receipt: Option<(PathBuf, crate::recipes::RecipeReceipt)>,
+}
+
+/// The plan drain with an optional prepared recipe prior. The receipt is committed
+/// only *after* `send_turn` accepts the complete directive, which is the exact
+/// delivery seam; a lookup or a failed transport write is never counted as use.
+async fn drain_plan_turn_traced(
+    session: &mut dyn BaseSession,
+    directive: String,
+    deadline: std::time::Instant,
+    prepared_recipe: Option<(PathBuf, crate::recipes::PreparedRecipePrior)>,
+) -> TracedPlanTurn {
     use umadev_runtime::{ApprovalDecision, SessionEvent};
-    if session.send_turn(directive).await.is_err() {
-        return None;
+    if session.send_turn(directive.clone()).await.is_err() {
+        return TracedPlanTurn {
+            text: None,
+            recipe_receipt: None,
+        };
     }
+    let recipe_receipt = prepared_recipe.and_then(|(dir, prepared)| {
+        crate::recipes::commit_recipe_prior_sent(&dir, prepared, &directive)
+            .map(|receipt| (dir, receipt))
+    });
     let mut text = String::new();
     loop {
         // LOW #5: bound each event wait by the SHARED run deadline (capped at the
@@ -2097,27 +2179,89 @@ async fn drain_plan_turn(
                     .is_err()
                 {
                     let _ = session.interrupt().await;
-                    return None;
+                    return TracedPlanTurn {
+                        text: None,
+                        recipe_receipt,
+                    };
                 }
             }
             // A JSON-only plan turn should emit no other tools; ignore anything else
             // and let the next-event timeout bound a misbehaving turn.
             Ok(Some(_)) => {}
-            Ok(None) | Err(_) => return None,
+            Ok(None) | Err(_) => {
+                return TracedPlanTurn {
+                    text: None,
+                    recipe_receipt,
+                }
+            }
         }
     }
     let text = text.trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
+    TracedPlanTurn {
+        text: (!text.is_empty()).then_some(text),
+        recipe_receipt,
     }
 }
 
-/// Ask the borrowed brain to decompose the requirement into an owned [`Plan`] DAG.
-/// Runs as the session's first (JSON-only) turn; fail-open to `None` on any
-/// failure so the caller falls back to the plain single-turn build.
-pub async fn synthesize_plan(
+/// Plan plus the exact recipe receipt (when a prior was actually accepted by the
+/// base transport). The receipt survives parse failure so the final fallback build
+/// can still settle that sent influence honestly.
+pub(crate) struct PlanSynthesis {
+    pub plan: Option<Plan>,
+    pub recipe_receipt: Option<(PathBuf, crate::recipes::RecipeReceipt)>,
+}
+
+async fn repair_execution_surfaces(
+    session: &mut dyn BaseSession,
+    plan: &mut Plan,
+    missing: &[String],
+    deadline: std::time::Instant,
+) {
+    let current = serde_json::to_string_pretty(plan).unwrap_or_default();
+    let repair = format!(
+        "The plan below is structurally valid, but its execution contract is incomplete. \
+         Build step id(s) [{}] have no `files` surface. Return the SAME full JSON plan \
+         with the SAME step ids, titles, seats, dependencies, acceptance and evidence; \
+         only fill each missing `files` object as \
+         {{\"create\":[\"workspace/relative/path\"],\"modify\":[\"workspace/relative/path\"]}}. \
+         Every path must be proportional to the requirement; never use `.`, `/`, `**`, \
+         or a repository-wide catch-all. Return exactly one JSON object, no markdown, \
+         prose, tools, commands, or file writes.\n\nCurrent plan:\n{current}",
+        missing.join(", ")
+    );
+    let Some(repair_text) = drain_plan_turn(session, repair, deadline).await else {
+        return;
+    };
+    let Some(repair_json) = crate::continuous::extract_json_object(&repair_text) else {
+        return;
+    };
+    let Ok(repaired) = serde_json::from_str::<BrainPlan>(&repair_json) else {
+        return;
+    };
+    let surfaces: std::collections::HashMap<String, StepFiles> = repaired
+        .steps
+        .into_iter()
+        .filter_map(|step| {
+            let id = step.id.trim().to_string();
+            let files = parse_brain_files(&step.files);
+            (!id.is_empty() && !files.is_empty()).then_some((id, files))
+        })
+        .collect();
+    for step in &mut plan.steps {
+        if step.kind != StepKind::Build || !step.files.is_empty() {
+            continue;
+        }
+        let Some(files) = surfaces.get(&step.id) else {
+            continue;
+        };
+        step.files = files.clone();
+    }
+    plan.infer_execution_surfaces();
+}
+
+/// Traced planning entry used by the director. Unlike the compatibility wrapper,
+/// it returns the exact sent-prior receipt for terminal PASS/FAIL settlement.
+pub(crate) async fn synthesize_plan_traced(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     requirement: &str,
@@ -2126,7 +2270,7 @@ pub async fn synthesize_plan(
     // whole deliberate build (planning + build) shares one clock instead of the old
     // fixed 180s-per-event timeout that left planning unattributed to the budget.
     deadline: std::time::Instant,
-) -> Option<Plan> {
+) -> PlanSynthesis {
     // `options.project_root` feeds the success-recipe fingerprint recall below;
     // model/trust already live on the session.
     let team: Vec<&str> = route.team.iter().map(|s| s.role_id()).collect();
@@ -2166,13 +2310,15 @@ pub async fn synthesize_plan(
          head, and runs it again (it must PASS). Name a test that genuinely could not have \
          passed before this step. Never put it on the step that AUTHORS the test — an \
          authored test is expected to be red until the code lands. \
-         `files` (OPTIONAL but STRONGLY preferred): the step's file surface, \
+         `files` (REQUIRED for EVERY build step): the step's complete file surface, \
          {{\"create\":[\"src/api/login.ts\"],\"modify\":[\"src/routes.ts\"]}} — the paths this \
          step will bring into existence or edit (a trailing `/` claims a whole directory). \
          UmaDev holds the working tree against the UNION of every step's surface: a NEW \
-         source file, a NEW dependency, or a NEW public route that NO step claimed is \
-         out-of-scope work and blocks. So declare where each step will write; if a change \
-         is genuinely needed, it belongs in some step's surface. \
+         source file, dependency, public route, OR edit that NO step claimed is \
+         out-of-scope work and blocks. A build step with no file surface cannot start. \
+         Declare every file/directory the step may write; if a change is genuinely needed, \
+         it belongs in some step's surface. Never use a repository-wide catch-all such as \
+         `.` or `/`; keep the surface proportional to this requirement. \
          Team-deliverable rules (UmaDev enforces ALL of these STRUCTURALLY after parsing — \
          a missing tokens/QA step is inserted and the ordering edges are wired — so a plan \
          that already honours them survives normalisation unchanged): \
@@ -2199,17 +2345,27 @@ pub async fn synthesize_plan(
     let user = format!("Requirement:\n{requirement}");
 
     // SUCCESS-RECIPE RECALL (a PRIOR, never a template): look up the closest past
-    // CLEAN build of a similar stack/kind/feature in the cross-project recipe store
+    // CLEAN build of a similar stack/kind/feature in this project's private recipe store
     // and inject its proven plan SHAPE as an adaptable hint the brain may reuse or
-    // ignore. Fail-open at every step — no home dir, no match, or a read error yields
+    // ignore. Fail-open at every step — no safe store, no match, or a read error yields
     // an empty prior, and the plan is synthesised exactly as before. Bounded to one
     // best recipe within [`crate::recipes::RECIPE_PRIOR_BUDGET`].
-    let recipe_prior = crate::recipes::recipes_dir()
-        .and_then(|dir| {
-            let fp = crate::recipes::fingerprint_for(&options.project_root, route, requirement);
-            crate::recipes::recall_prior_block(&dir, &fp, crate::recipes::RECIPE_PRIOR_BUDGET)
-        })
-        .map(|block| format!("{block}\n\n"))
+    let recipe_dir = if crate::memory_control::recall_enabled(
+        &options.project_root,
+        crate::memory_control::MemoryScope::Project,
+        crate::memory_control::MemoryStore::Recipes,
+    ) {
+        crate::recipes::project_recipes_dir(&options.project_root)
+    } else {
+        None
+    };
+    let prepared_recipe = recipe_dir.as_ref().and_then(|dir| {
+        let fp = crate::recipes::fingerprint_for(&options.project_root, route, requirement);
+        crate::recipes::prepare_recipe_prior(dir, &fp, crate::recipes::RECIPE_PRIOR_BUDGET)
+    });
+    let recipe_prior = prepared_recipe
+        .as_ref()
+        .map(|prior| format!("{}\n\n", prior.block()))
         .unwrap_or_default();
 
     // Run the planning turn on the MAIN session — NOT a fork. claude cannot
@@ -2223,9 +2379,32 @@ pub async fn synthesize_plan(
          no code fence, no prose. Do NOT write any files or run any commands in this \
          turn; this is the PLAN only.\n\n{user}"
     );
-    let text = drain_plan_turn(session, directive, deadline).await?;
-    let json = crate::continuous::extract_json_object(&text)?;
-    let raw: BrainPlan = serde_json::from_str(&json).ok()?;
+    let traced = drain_plan_turn_traced(
+        session,
+        directive,
+        deadline,
+        recipe_dir.zip(prepared_recipe),
+    )
+    .await;
+    let recipe_receipt = traced.recipe_receipt;
+    let Some(text) = traced.text else {
+        return PlanSynthesis {
+            plan: None,
+            recipe_receipt,
+        };
+    };
+    let Some(json) = crate::continuous::extract_json_object(&text) else {
+        return PlanSynthesis {
+            plan: None,
+            recipe_receipt,
+        };
+    };
+    let Ok(raw) = serde_json::from_str::<BrainPlan>(&json) else {
+        return PlanSynthesis {
+            plan: None,
+            recipe_receipt,
+        };
+    };
     let plan = Plan {
         steps: raw.steps.into_iter().map(brain_step_to_plan_step).collect(),
         risks: raw.risks,
@@ -2241,7 +2420,60 @@ pub async fn synthesize_plan(
         .depth
         .is_deliberate()
         .then(|| (options.effective_slug(), route.needs_ui()));
-    plan.normalized(doc_skeleton.as_ref().map(|(s, ui)| (s.as_str(), *ui)))
+    let Some(mut plan) = plan.normalized(doc_skeleton.as_ref().map(|(s, ui)| (s.as_str(), *ui)))
+    else {
+        return PlanSynthesis {
+            plan: None,
+            recipe_receipt,
+        };
+    };
+
+    // EXECUTION-CONTRACT REPAIR (one bounded JSON-only re-ask). Exact evidence
+    // inference above repairs many redundant omissions. For any Build step that is
+    // still missing a surface, do not silently disable the scope floor and do not
+    // throw away/rewrite the DAG: ask the same coordinator ONCE to fill only the
+    // missing `files` objects, then merge those fields back by stable step id. If the
+    // repair is unavailable or still vague, return the inspectable plan unchanged;
+    // the writer preflight will fail explicitly before mutation.
+    let missing: Vec<String> = plan
+        .steps
+        .iter()
+        .filter(|step| step.kind == StepKind::Build && step.files.is_empty())
+        .map(|step| step.id.clone())
+        .collect();
+    let repair_has_time = deadline.saturating_duration_since(std::time::Instant::now())
+        >= std::time::Duration::from_secs(5);
+    if !missing.is_empty() && repair_has_time {
+        repair_execution_surfaces(session, &mut plan, &missing, deadline).await;
+    }
+    if let Some((dir, receipt)) = &recipe_receipt {
+        let _ = crate::recipes::bind_recipe_receipt_to_plan(dir, receipt, &plan);
+    }
+    PlanSynthesis {
+        plan: Some(plan),
+        recipe_receipt,
+    }
+}
+
+/// Backward-compatible planning API. Callers that do not participate in the
+/// delivery lifecycle cannot attribute an eventual result, so any sent recipe prior
+/// is immediately settled UNKNOWN instead of left pending or guessed successful.
+pub async fn synthesize_plan(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    requirement: &str,
+    route: &RoutePlan,
+    deadline: std::time::Instant,
+) -> Option<Plan> {
+    let synthesis = synthesize_plan_traced(session, options, requirement, route, deadline).await;
+    if let Some((dir, receipt)) = &synthesis.recipe_receipt {
+        let _ = crate::recipes::settle_recipe_receipt(
+            dir,
+            receipt,
+            crate::recipes::RecipeOutcome::Unknown,
+        );
+    }
+    synthesis.plan
 }
 
 /// Map ONE tolerant [`BrainStep`] into an owned [`PlanStep`] — the shared node parse
@@ -2561,6 +2793,7 @@ mod tests {
             std::sync::Arc<std::sync::Mutex<Vec<(String, umadev_runtime::ApprovalDecision)>>>,
         interrupts: std::sync::Arc<std::sync::Mutex<usize>>,
         respond_fails: bool,
+        send_fails: bool,
     }
 
     impl ScriptedSession {
@@ -2570,7 +2803,14 @@ mod tests {
                 responded: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 interrupts: std::sync::Arc::new(std::sync::Mutex::new(0)),
                 respond_fails,
+                send_fails: false,
             }
+        }
+
+        fn failing_send() -> Self {
+            let mut session = Self::new(Vec::new(), false);
+            session.send_fails = true;
+            session
         }
     }
 
@@ -2580,7 +2820,13 @@ mod tests {
             &mut self,
             _directive: String,
         ) -> Result<(), umadev_runtime::SessionError> {
-            Ok(())
+            if self.send_fails {
+                Err(umadev_runtime::SessionError::Send(
+                    "scripted send failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
         async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
             self.events.pop_front()
@@ -2609,6 +2855,35 @@ mod tests {
         async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn repair_execution_surfaces_merges_only_missing_build_files() {
+        use umadev_runtime::{SessionEvent, TurnStatus};
+        let mut plan = plan(vec![step("api", &[]), step("ui", &[])]);
+        plan.steps[1].files.modify.push("src/ui.rs".into());
+        let mut session = ScriptedSession::new(
+            vec![
+                SessionEvent::TextDelta(
+                    r#"{"steps":[{"id":"api","files":{"create":["src/api.rs"]}},{"id":"ui","files":{"modify":["unexpected.rs"]}}]}"#
+                        .into(),
+                ),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ],
+            false,
+        );
+        repair_execution_surfaces(
+            &mut session,
+            &mut plan,
+            &["api".into()],
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(plan.steps[0].files.create, ["src/api.rs"]);
+        assert_eq!(plan.steps[1].files.modify, ["src/ui.rs"]);
     }
 
     #[tokio::test]
@@ -2650,6 +2925,82 @@ mod tests {
             "the approval was answered, not left dangling"
         );
         assert_eq!(replies[0], ("req-1".to_string(), ApprovalDecision::Deny));
+    }
+
+    #[tokio::test]
+    async fn recipe_use_is_counted_only_after_plan_transport_accepts_directive() {
+        use umadev_runtime::{SessionEvent, TurnStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let recipe = crate::recipes::Recipe {
+            fingerprint: crate::recipes::Fingerprint {
+                stack: "node".into(),
+                kind: "greenfield".into(),
+                shape: vec!["todo".into()],
+            },
+            plan_skeleton: vec!["frontend-engineer · scaffold".into()],
+            key_scaffold: Vec::new(),
+            patterns: Vec::new(),
+            stats: crate::recipes::OutcomeStats::default(),
+        };
+        assert!(crate::recipes::capture_recipe(tmp.path(), recipe));
+        let query = crate::recipes::Fingerprint {
+            stack: "node".into(),
+            kind: "greenfield".into(),
+            shape: vec!["todo".into()],
+        };
+
+        let prepared = crate::recipes::prepare_recipe_prior(
+            tmp.path(),
+            &query,
+            crate::recipes::RECIPE_PRIOR_BUDGET,
+        )
+        .unwrap();
+        let directive = format!("{}\nfinal plan prompt", prepared.block());
+        let mut rejected = ScriptedSession::failing_send();
+        let rejected = drain_plan_turn_traced(
+            &mut rejected,
+            directive,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            Some((tmp.path().to_path_buf(), prepared)),
+        )
+        .await;
+        assert!(rejected.recipe_receipt.is_none());
+        assert_eq!(
+            crate::recipes::load_recipes(tmp.path())[0]
+                .stats
+                .times_reused,
+            0,
+            "a failed send is not a use"
+        );
+
+        let prepared = crate::recipes::prepare_recipe_prior(
+            tmp.path(),
+            &query,
+            crate::recipes::RECIPE_PRIOR_BUDGET,
+        )
+        .unwrap();
+        let directive = format!("{}\nfinal plan prompt", prepared.block());
+        let mut accepted = ScriptedSession::new(
+            vec![
+                SessionEvent::TextDelta("{\"steps\":[]}".into()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ],
+            false,
+        );
+        let accepted = drain_plan_turn_traced(
+            &mut accepted,
+            directive,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            Some((tmp.path().to_path_buf(), prepared)),
+        )
+        .await;
+        assert!(accepted.recipe_receipt.is_some());
+        let stats = &crate::recipes::load_recipes(tmp.path())[0].stats;
+        assert_eq!(stats.times_reused, 1);
+        assert_eq!(stats.pending_reuses, 1);
     }
 
     #[tokio::test]
@@ -3246,7 +3597,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_step_with_evidence_round_trips_through_save_load() {
+    fn load_migrates_exact_evidence_into_the_execution_surface() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
         let mut s = step("a", &[]);
@@ -3263,9 +3614,11 @@ mod tests {
         let p = plan(vec![s]);
         save(&p, dir).expect("save ok");
         let loaded = load(dir).expect("load ok");
+        assert_eq!(loaded.steps[0].evidence, p.steps[0].evidence);
         assert_eq!(
-            loaded, p,
-            "the typed evidence contract survives persistence"
+            loaded.steps[0].files.create,
+            ["src/App.tsx"],
+            "legacy plans gain the same exact path their verifier already requires"
         );
     }
 

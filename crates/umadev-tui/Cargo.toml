@@ -14,8 +14,10 @@ umadev-host = { workspace = true }
 umadev-runtime = { workspace = true }
 umadev-spec = { workspace = true }
 umadev-i18n = { workspace = true }
+umadev-state = { workspace = true }
 
 ratatui = { workspace = true }
+ratatui-crossterm = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
 # Grapheme-cluster segmentation for the input model: the caret / backspace /

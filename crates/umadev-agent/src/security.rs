@@ -919,11 +919,14 @@ mod tests {
         // so a committed private key was reported "ready to merge".
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let key_body = "A".repeat(80);
         std::fs::write(
             tmp.path().join("src/config.py"),
-            "PRIVATE = \"\"\"-----BEGIN RSA PRIVATE KEY-----\n\
-             MIIEowIBAAKCAQEAabcdef0123456789\n\
-             -----END RSA PRIVATE KEY-----\"\"\"\n",
+            format!(
+                "PRIVATE = \"\"\"-----BEGIN RSA PRIVATE KEY-----\n\
+                 {key_body}\n\
+                 -----END RSA PRIVATE KEY-----\"\"\"\n"
+            ),
         )
         .unwrap();
         let scan = run_security_scan(tmp.path());

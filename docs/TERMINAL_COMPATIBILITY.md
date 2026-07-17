@@ -7,6 +7,8 @@ protocol tests and the real-terminal matrix below.
 
 ## Runtime invariants
 
+- The TUI starts only when both stdin and its stdout render sink are terminals;
+  redirected or piped output never enables raw or alternate-screen mode.
 - One stdout writer owns every frame and out-of-band control sequence.
 - Alternate-screen entry happens once. Focus and resume only reassert
   level-triggered modes.
@@ -47,6 +49,7 @@ release issue.
 | Streaming | A long mixed CJK/ASCII response has no row drift, wrap cascade, cursor sweep, or input lag |
 | Mouse and clipboard | Wheel, drag selection, copy, `/mouse`, local/SSH/tmux clipboard paths do not leak SGR bytes into input |
 | Theme | Dark and light backgrounds remain readable; use `UMADEV_THEME` where OSC 11 is unavailable |
+| Redirection | Piped stdin, redirected stdout, and non-interactive CI print ordinary help; no raw mode or terminal control frame reaches a file/pipe |
 
 ## Automated release gates
 
@@ -59,9 +62,16 @@ release issue.
   and teardown symmetry
 - tokenizer/decoder split-boundary tests for keys, mouse, paste, focus, and
   terminal responses
-- Linux PTY launch smoke test
+- native real-process pseudo-terminal smoke on all three CI operating systems:
+  Unix PTY on Linux/macOS and ConPTY on Windows; the complete binary must render,
+  repaint after narrow/wide resize, preserve an atomic multiline CJK/emoji
+  bracketed paste whose first line is `/quit`, accept an intentional `/quit`,
+  exit successfully, and show no panic
 - npm distribution smoke test, including main-package/platform-package/binary
-  version-split repair
+  version-split repair; on Windows the gate keeps a real copied `.exe` running,
+  lets a stand-in package manager return success, and requires the updater to
+  reject the still-split install with EPERM recovery guidance rather than print
+  a false success
 
 Automated gates are necessary but do not replace the graphical release matrix.
 A release with an untested required cell is unverified, not "probably fixed."

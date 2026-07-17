@@ -5,7 +5,7 @@ UmaDev — common workflows
 -------------------------------
     umadev init                            # scaffold workspace (design systems + templates)
     umadev                                 # launch the chat TUI
-                                              # first time: pick claude-code, codex, or opencode
+                                              # first time: pick one of 5 bases (3 vendor transports + Grok/Kimi ACP)
                                               # then /design modern-minimal (optional)
                                               # type naturally -> the base decides chat vs pipeline
                                               # at each gate press 'c' (or /continue)
@@ -16,7 +16,7 @@ UmaDev — common workflows
 ----------------------------------------
     just type            send to the current base for chat-vs-run routing
                          (or revision if a gate is open)
-    /claude /codex /opencode
+    /claude /codex /opencode /grok /kimi
                          switch the base (saves to ~/.umadev/config.toml)
     /offline             switch to deterministic templates (demo / CI)
     /model <id>          override the base's model for this session

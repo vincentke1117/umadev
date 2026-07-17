@@ -731,10 +731,10 @@ fn node_package_manager(workspace: &Path) -> (&'static str, &'static [&'static s
 /// Detect the project kind from workspace files.
 ///
 /// Order matters: a workspace containing both `package.json` and
-/// `Cargo.toml` is reported as Node — projects with a frontend take
-/// priority because frontend errors are louder. Deno is checked before
-/// Node because a `deno.json` repo may also carry a `package.json` for
-/// editor tooling while building with Deno.
+/// `Cargo.toml` is reported as Rust. A root Cargo manifest is the stronger
+/// project signal, while Rust backend, Tauri, and wasm-bindgen repositories
+/// commonly also carry a root Node manifest. Deno is checked before both
+/// because a `deno.json` repository may carry either manifest for tooling.
 #[must_use]
 pub fn detect_project(workspace: &Path) -> ProjectKind {
     if workspace.join("deno.json").is_file() || workspace.join("deno.jsonc").is_file() {
@@ -952,7 +952,7 @@ fn effective_timeout(step_timeout_secs: u64, global_override: Option<u64>) -> u6
 /// [`DEFAULT_TIMEOUT_SECS`].
 ///
 /// On timeout the partial stdout/stderr already produced is still captured
-/// (up to [`CAPTURE_CAP`]) so the auditor sees the build's last words
+/// (up to the internal capture limit) so the auditor sees the build's last words
 /// before the kill, rather than an empty buffer.
 pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
     let kind = detect_project(workspace);

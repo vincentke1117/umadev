@@ -19,15 +19,67 @@
 //! 2) which turns them into retrievable markdown.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::fswalk::{classify_no_follow, EntryKind};
+use crate::memory_control::{capture_enabled, recall_enabled, MemoryScope, MemoryStore};
 use crate::phases::QualityCheck;
 use umadev_contract::ApiSpec;
+
+fn project_capture_enabled(project_root: &Path, store: MemoryStore) -> bool {
+    capture_enabled(project_root, MemoryScope::Project, store)
+}
+
+fn project_recall_enabled(project_root: &Path, store: MemoryStore) -> bool {
+    recall_enabled(project_root, MemoryScope::Project, store)
+}
+
+fn raw_lesson_store(filename: &str) -> Option<MemoryStore> {
+    match filename {
+        "quality-failures.jsonl" => Some(MemoryStore::QualityFailures),
+        "gate-revisions.jsonl" => Some(MemoryStore::GateRevisions),
+        "validated-decisions.jsonl" => Some(MemoryStore::ValidatedPatterns),
+        "tech-debt.jsonl" => Some(MemoryStore::TechDebt),
+        DEV_ERRORS_FILE => Some(MemoryStore::Pitfalls),
+        BELIEFS_FILE => Some(MemoryStore::Beliefs),
+        _ => None,
+    }
+}
+
+static RAW_STORE_PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct RawStoreLock {
+    _process: std::sync::MutexGuard<'static, ()>,
+    _cross_process: umadev_state::store_lock::StoreLock,
+}
+
+fn acquire_raw_store_lock(project_root: &Path, filename: &str) -> Option<RawStoreLock> {
+    let store = raw_lesson_store(filename)?;
+    // The filesystem lease is cross-process but intentionally non-queued. A
+    // tight writer loop in one thread could otherwise repeatedly reacquire it
+    // and starve a sibling until the bounded lease timeout. Queue contenders
+    // inside this process first, then take the authoritative cross-process lock.
+    let process = RAW_STORE_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match umadev_state::store_lock::acquire(project_root, store) {
+        Ok(cross_process) => Some(RawStoreLock {
+            _process: process,
+            _cross_process: cross_process,
+        }),
+        Err(error) => {
+            tracing::warn!(
+                store = store.id(),
+                %error,
+                "lesson store write not committed because its cross-process lock was unavailable"
+            );
+            None
+        }
+    }
+}
 
 /// Where raw captured experience lives (before sediment turns it into .md).
 pub const RAW_DIR: &str = ".umadev/learned/_raw";
@@ -48,44 +100,16 @@ pub const BELIEFS_FILE: &str = "beliefs.jsonl";
 /// base-generated correction strategies for pitfalls that recurred after a
 /// warning. One JSONL file per (normalised) signature.
 pub const REFLECTIONS_DIR: &str = ".umadev/reflections";
-/// Snapshot of the NON-pitfall / belief lesson identities surfaced into the most
-/// recent recall (the `(domain, title, first_seen)` triples). Written at
-/// injection time by [`relevant_lessons_for_prompt_ranked`] and consumed by the
-/// runner at the next verify pass/fail to feed [`apply_trust_for_identities`] —
-/// the trust reflux for failures / revisions / validated patterns / beliefs that
-/// the dev-error signature reflux does not cover. Lives under [`RAW_DIR`].
-pub const SURFACED_IDENTITIES_FILE: &str = "surfaced-identities.json";
-
 /// How many recent reflections to retain per signature. Small — we only need
 /// the latest distilled strategy plus a little history for context, not a full
 /// audit trail (the audit log already covers that).
 const MAX_REFLECTIONS_PER_SIG: usize = 3;
-
-/// Process-wide lock serialising **every** read-modify-write of
-/// [`DEV_ERRORS_FILE`] (`dev-errors.jsonl`) across all of its mutators
-/// ([`capture_dev_errors`], [`record_pitfall_strategy`],
-/// [`record_pitfall_injections`], [`mark_pitfalls_resolved`],
-/// [`apply_dev_error_trust`], [`apply_trust_for_signatures`]).
-///
-/// The temp-write-then-rename in [`write_atomic`] prevents a *torn* file, but a
-/// single atomic write does NOT prevent a *lost update*: two mutators running
-/// concurrently each read state S, mutate independently, and the later writer
-/// clobbers the earlier writer's record — silently dropping a captured pitfall
-/// or an efficacy/trust update and degrading the self-learning memory.
-/// Concurrency is real (the parallel docs fan-out drives two forked bases), so
-/// the read-mutate-write must be serialised ACROSS functions — a per-function
-/// lock only excludes a function against itself. One shared lock fixes that.
-static DEV_ERRORS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Acquire [`DEV_ERRORS_LOCK`], recovering from poison so a panic in another
-/// holder never blocks or panics this fail-open path. The returned guard must
-/// be held for the WHOLE read-modify-write of `dev-errors.jsonl`. Callers are
-/// synchronous, so the guard is never held across an `await`.
-fn lock_dev_errors() -> std::sync::MutexGuard<'static, ()> {
-    DEV_ERRORS_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+const MAX_RAW_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RAW_LINE_BYTES: usize = 256 * 1024;
+const MAX_RAW_LEDGER_LINES: usize = 10_000;
+const MAX_REFLECTION_LEDGER_BYTES: u64 = 256 * 1024;
+const MAX_REFLECTION_LINE_BYTES: usize = 64 * 1024;
+const MAX_REFLECTION_LEDGER_LINES: usize = 64;
 
 /// The kind of captured experience.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,13 +156,10 @@ pub struct Lesson {
     pub keywords: Vec<String>,
     /// The requirement that triggered this lesson.
     pub source_requirement: String,
-    /// ISO-8601 UTC timestamp of the last time this lesson was REINFORCED — set at
-    /// creation, and refreshed when the lesson proves HELPFUL (injected into a turn
-    /// whose verify/quality gate then PASSES, see [`Lesson::apply_trust_feedback`]).
-    /// This is the recency basis for [`lesson_decay_score`] / eviction, giving
-    /// **usage-driven decay**: a lesson that keeps earning its place stays fresh and
-    /// is not evicted on clock-age alone, while one that's never helpful decays
-    /// normally. (A pure recurrence still bumps `occurrences` + `trust`, not this.)
+    /// ISO-8601 UTC timestamp of the FIRST observation. This is immutable after
+    /// capture: refreshing a field named `first_seen` on a later reward made the
+    /// audit trail lie about when a pitfall was originally learned. Dev-error
+    /// recency is derived from its explicit observation timeline instead.
     pub first_seen: String,
     /// Stable dedup signature (populated for [`LessonKind::DevError`] from
     /// [`crate::error_kb::ErrorInsight::signature`]; empty for older kinds that
@@ -158,12 +179,11 @@ pub struct Lesson {
     /// intersects it — precise, prose-independent triggering.
     #[serde(default)]
     pub context: Vec<String>,
-    /// Efficacy tracking — the pitfall-fix half (`injected` / `recurred_after_warning`
-    /// / `proven_fix` / …) closes the loop on whether a `DevError` fix achieved
-    /// "一次过", and the general `helpful` / `harmful` tally records the RECALL
-    /// outcome (recalled-then-passed vs recalled-then-failed) for ANY lesson kind.
-    /// `None` until first observed: written on first outcome feedback (see
-    /// [`Lesson::apply_trust_feedback`]) or first pitfall injection.
+    /// Pitfall observation/fix-attempt lifecycle plus legacy explicit feedback
+    /// counters. Production settlement is exact only for a committed pitfall
+    /// repair token. Passive lesson/chunk recall does not update `helpful`,
+    /// `harmful`, or `trust`, because prompt assembly cannot yet return exact IDs
+    /// that reached one host turn.
     #[serde(default)]
     pub efficacy: Option<PitfallEfficacy>,
     /// `true` once the memory-reconcile step judged this lesson superseded /
@@ -174,16 +194,10 @@ pub struct Lesson {
     /// readable, and a row that has never been reconciled stays `false`.
     #[serde(default)]
     pub invalidated: bool,
-    /// Trust signal in `[0, 1]`, neutral [`NEUTRAL_TRUST`] until proven. This
-    /// upgrades "was this lesson reused?" into "did reusing it actually help?":
-    /// when a lesson is injected and the subsequent verify/quality gate PASSES it
-    /// earns a small reward; when it's injected and the build still FAILS it takes
-    /// a larger penalty (asymmetric — one bad outcome should cost more than one
-    /// good one earns). The score multiplies into [`lesson_decay_score`], so a
-    /// distrusted lesson sinks in recall and a trusted one floats up. `0` (the
-    /// numeric default) is remapped to [`NEUTRAL_TRUST`] via [`Lesson::trust`] so
-    /// pre-existing JSONL rows (written before this field existed, or never given
-    /// feedback) are treated as neutral, never as "fully distrusted".
+    /// Legacy/explicit trust signal in `[0, 1]`. Production passive recall leaves
+    /// it neutral; only callers that already possess a causally exact identity may
+    /// use the low-level feedback API. `0` is remapped to [`NEUTRAL_TRUST`] so old
+    /// or never-settled rows are never treated as fully distrusted.
     #[serde(default)]
     pub trust: f32,
     /// For a [`LessonKind::Belief`]: how many raw lessons this belief folds. A
@@ -193,7 +207,7 @@ pub struct Lesson {
     /// lessons it folds is tracked separately in [`Lesson::evidence`].
     #[serde(default)]
     pub evidence_count: u32,
-    /// For a [`LessonKind::Belief`]: the stable [`lesson_identity`]-style keys of
+    /// For a [`LessonKind::Belief`]: the stable internal lesson-identity keys of
     /// the raw lessons it folds, so retrieval can demote those exact originals as
     /// "evidence" and re-folding can recognise already-covered lessons. Each entry
     /// is `"domain\u{0}title"` (domain + title; `first_seen` is intentionally
@@ -203,21 +217,13 @@ pub struct Lesson {
     pub evidence: Vec<String>,
 }
 
-/// The neutral starting trust for a lesson that has never received pass/fail
-/// feedback. Mid-scale so the first reward nudges it up and the first penalty
-/// nudges it down without either dominating.
+/// Neutral trust for an un-attributed lesson.
 pub const NEUTRAL_TRUST: f32 = 0.5;
 
-/// Reward added to a lesson's trust when a verify/quality gate PASSES after that
-/// lesson was injected. Deliberately SMALL — accumulating evidence of "this
-/// helped" should be gradual.
+/// Reward used only by explicit low-level feedback callers/tests.
 const TRUST_REWARD: f32 = 0.05;
 
-/// Penalty subtracted from a lesson's trust when the build/test still FAILS
-/// after that lesson was injected. Deliberately LARGER than the reward
-/// (asymmetric): a lesson whose advice coincided with a failure is more
-/// informative than one that coincided with a pass, so a single bad outcome
-/// moves it further than a single good one.
+/// Penalty used only by explicit low-level feedback callers/tests.
 const TRUST_PENALTY: f32 = 0.10;
 
 /// Lower clamp on trust — a lesson never reaches exactly 0 (which would zero out
@@ -240,16 +246,17 @@ const EFFICACY_MIN_SAMPLES: u32 = 4;
 /// but genuinely useful lesson is not culled.
 const EFFICACY_POISON_RATIO: f64 = 0.25;
 
-/// Tracks whether a pitfall's fix actually works once we start warning about it.
-///
-/// The mechanism is self-contained per record (no global run counter): each
-/// time the pitfall is surfaced into a worker prompt we snapshot its hit count
-/// in [`Self::occ_at_injection`]. If the count later grows, the warning failed
-/// to prevent recurrence ([`Self::recurred_after_warning`]); if it stays flat
-/// across a later injection, the fix is working.
+/// Tracks pitfall episodes and exact repair-attempt settlement. Older fields are
+/// retained for JSON compatibility, but production never infers success from
+/// absence of recurrence or from passive prompt recall.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PitfallEfficacy {
-    /// How many times this pitfall has been surfaced to the worker as a warning.
+    /// `1` means outcome fields prefixed `exact_` came from an exact committed
+    /// repair token. Missing/zero rows are legacy broad-attribution data and are
+    /// retained for audit but behaviorally neutral.
+    #[serde(default)]
+    pub outcome_attribution_version: u8,
+    /// Legacy/explicit count; passive retrieval does not increment it.
     pub injected: u32,
     /// Hit count at the moment of the last injection — the baseline we compare
     /// against to detect "recurred despite being warned about".
@@ -274,39 +281,162 @@ pub struct PitfallEfficacy {
     /// recurrence (not a template). Where [`Self::failed_fixes`] records what NOT
     /// to re-run, this records what to do INSTEAD: a different, simple,
     /// higher-altitude approach that sidesteps the way the previous fixes failed.
-    /// Populated only by [`reflect_on_recurrence`] when the pitfall recurred after
+    /// Populated only by the recurrence-reflection path when the pitfall recurred after
     /// a warning, and surfaced ahead of the failed-fix ledger on the next match.
     /// Empty until reflection runs. `#[serde(default)]` keeps older rows readable.
     #[serde(default)]
     pub next_strategy: String,
-    /// OUTCOME-efficacy tally (GENERAL — valid for any lesson kind, not just
-    /// pitfalls): how many times the owning lesson was RECALLED into a step whose
-    /// acceptance verdict then PASSED. Distinct from [`Lesson::trust`] (a smoothed
-    /// pass/fail EMA): these are the raw DISCRETE counts, so the efficacy prune
-    /// gate can require a real MINIMUM SAMPLE SIZE — something a single float can
-    /// never express (it can't tell "one bad outcome" from "six"). Bumped only via
-    /// [`Lesson::apply_trust_feedback`], the one choke-point every recall-outcome
-    /// trust update already passes through. `#[serde(default)]` keeps older rows
-    /// readable and un-observed lessons at `0`.
+    /// Legacy/explicit helpful tally. Production passive recall does not mutate
+    /// it; retained for compatibility and callers with their own exact identity.
     #[serde(default)]
     pub helpful: u32,
-    /// OUTCOME-efficacy tally: how many times the owning lesson was recalled into a
-    /// step that then still FAILED (its signature/identity recurred DESPITE the
-    /// injection). The harmful half of [`Self::helpful`]; together they give the
-    /// helpful ratio the recall ranking and the poison-prune gate read.
+    /// Legacy/explicit harmful tally; not written by production passive recall.
     #[serde(default)]
     pub harmful: u32,
+    /// Exact-token helpful outcomes (trusted for behavior only at version 1).
+    #[serde(default)]
+    pub exact_helpful: u32,
+    /// Exact-token same-signature failures (trusted only at version 1).
+    #[serde(default)]
+    pub exact_harmful: u32,
+    /// Most recent independent failure episode after the first observation.
+    /// Empty for a one-off and for legacy rows written before timeline tracking.
+    #[serde(default)]
+    pub last_recurred_at: String,
+    /// Most recent exact settlement in which a committed repair attempt failed.
+    #[serde(default)]
+    pub last_fix_failed_at: String,
+    /// Most recent time an actual post-fix build/test pass proved the fix worked.
+    /// Passive recall never writes this field.
+    #[serde(default)]
+    pub last_verified_at: String,
+    /// Versioned exact-token failure timestamp. Legacy unversioned timestamps
+    /// never influence lifecycle.
+    #[serde(default)]
+    pub exact_last_fix_failed_at: String,
+    /// Versioned exact-token mechanical-pass timestamp.
+    #[serde(default)]
+    pub exact_last_verified_at: String,
+    /// Bounded provenance window for the episodes contributing to `occurrences`.
+    /// Raw stderr is deliberately not retained: the stable evidence hash and
+    /// episode id make the count auditable without copying secrets/log bulk.
+    #[serde(default)]
+    pub recent_observations: Vec<PitfallObservation>,
+    /// Latest successful outcome attributed to this lesson for usage-decay.
+    /// Kept separate so `Lesson::first_seen` remains immutable/auditable.
+    #[serde(default)]
+    pub last_reinforced_at: String,
+    /// Versioned exact-token reinforcement timestamp used by behavior.
+    #[serde(default)]
+    pub exact_last_reinforced_at: String,
+    /// Attempt tokens committed to a real host turn but not yet settled by its
+    /// deterministic acceptance result. A token is consumed exactly once.
+    #[serde(default)]
+    pub pending_fix_attempts: Vec<String>,
 }
 
-/// Lifecycle of a pitfall's fix, derived from its efficacy record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One auditable, privacy-bounded pitfall observation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PitfallObservation {
+    /// ISO-8601 UTC time at which the capture episode was committed.
+    pub observed_at: String,
+    /// Process-local unique id for one capture episode/turn.
+    pub episode_id: String,
+    /// Stable opaque hash of the representative error evidence (raw text omitted).
+    pub evidence_hash: String,
+    /// Typed source that produced the evidence (for example a host tool failure
+    /// or UmaDev's exact mechanical repair verifier).
+    #[serde(default)]
+    pub source: String,
+    /// Evidence-producing base/component. This is never inferred from model
+    /// prose; the capture/settlement boundary writes it explicitly.
+    #[serde(default)]
+    pub base: String,
+    /// Version of [`Self::base`] that produced the evidence.
+    #[serde(default)]
+    pub base_version: String,
+    /// Privacy-safe workspace ownership scope (`project:<opaque hash>`).
+    #[serde(default)]
+    pub workspace_scope: String,
+    /// Whether this row is an observation, a causally attributed repair
+    /// success/failure, or a same-id contradiction.
+    #[serde(default)]
+    pub outcome: KnowledgeEvidenceOutcome,
+    /// Exact repair-attempt token for success/failure outcomes. Empty for a
+    /// plain observation.
+    #[serde(default)]
+    pub causal_attempt_id: String,
+}
+
+/// Typed outcome carried by one knowledge evidence record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeEvidenceOutcome {
+    /// One independent failure/experience observation.
+    #[default]
+    Observed,
+    /// A committed repair token passed its matching mechanical verifier.
+    FixSucceeded,
+    /// A committed repair token still failed with the same signature.
+    FixFailed,
+    /// The same evidence id arrived with incompatible content/outcomes.
+    Conflict,
+}
+
+/// Auditable knowledge lifecycle. Similarity may group candidate evidence but
+/// cannot produce [`Self::Validated`]; only a complete causal success can.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PitfallStatus {
-    /// Newly recorded, fix unproven (never surfaced, or surfaced this round).
-    Active,
-    /// Warned about and did NOT recur since — the fix is working ("一次过").
+    /// One observation, or legacy aggregate data without independent evidence.
+    #[default]
+    Hypothesis,
+    /// At least two distinct evidence ids support the same incident/rule.
+    Corroborated,
+    /// At least one complete, causally attributed repair success and no newer
+    /// conflicting failure.
     Validated,
-    /// Recurred despite being warned about — the fix is insufficient, escalate.
-    Recurring,
+    /// Explicit invalidation, a same-id contradiction, or a newer causal
+    /// failure that revoked a prior successful rule.
+    Invalidated,
+}
+
+impl PitfallStatus {
+    /// Compatibility alias for callers compiled against the pre-state-machine
+    /// API. New code should use [`Self::Hypothesis`].
+    #[allow(non_upper_case_globals)]
+    pub const Active: Self = Self::Hypothesis;
+    /// Compatibility alias for the old "recurring fix" state. A repair that
+    /// failed after validation now invalidates that advice.
+    #[allow(non_upper_case_globals)]
+    pub const Recurring: Self = Self::Invalidated;
+}
+
+/// Evidence available when settling one committed pitfall repair turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PitfallFixAttemptResult {
+    /// The corresponding mechanical gate passed (and was not skipped).
+    Passed,
+    /// The gate failed with its actual stderr/evidence. Settlement verifies that
+    /// this evidence still contains the attempt's exact normalized signature.
+    VerificationFailed(String),
+    /// Skip, unavailable verifier, interrupted turn, or otherwise no causal
+    /// pass/fail evidence for the attempted signature.
+    Unknown,
+}
+
+/// Exact-once result of consuming an attempt token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PitfallFixSettlement {
+    /// The exact attempt was mechanically verified as passing.
+    Passed,
+    /// Verification still contained the exact attempted pitfall signature.
+    SameSignatureFailed,
+    /// The token was consumed, but evidence was absent or only showed another
+    /// error; no trust or fix-lifecycle state changed.
+    Inconclusive,
+    /// The token was empty, unknown, already consumed, or no longer actionable.
+    NotFound,
 }
 
 impl Lesson {
@@ -316,17 +446,141 @@ impl Lesson {
         self.occurrences.max(1)
     }
 
+    /// First observation timestamp (legacy field name retained on disk).
+    #[must_use]
+    pub fn first_observed_at(&self) -> &str {
+        self.first_seen.as_str()
+    }
+
+    /// Latest recurrence timestamp, when timeline data exists.
+    #[must_use]
+    pub fn last_recurred_at(&self) -> Option<&str> {
+        self.efficacy
+            .as_ref()
+            .map(|e| e.last_recurred_at.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Latest mechanically verified fix timestamp, when available.
+    #[must_use]
+    pub fn last_verified_at(&self) -> Option<&str> {
+        self.efficacy.as_ref().and_then(|efficacy| {
+            efficacy
+                .recent_observations
+                .iter()
+                .filter(|evidence| {
+                    evidence.outcome == KnowledgeEvidenceOutcome::FixSucceeded
+                        && evidence_has_complete_causal_provenance(evidence)
+                })
+                .max_by(|left, right| left.observed_at.cmp(&right.observed_at))
+                .map(|evidence| evidence.observed_at.as_str())
+        })
+    }
+
+    fn last_observed_at(&self) -> &str {
+        self.audited_last_observed_at()
+            .unwrap_or_else(|| self.first_observed_at())
+    }
+
+    fn last_reinforced_at(&self) -> Option<&str> {
+        self.efficacy
+            .as_ref()
+            .filter(|e| e.outcome_attribution_version == 1)
+            .map(|e| e.exact_last_reinforced_at.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn audited_last_observed_at(&self) -> Option<&str> {
+        self.efficacy
+            .as_ref()
+            .into_iter()
+            .flat_map(|efficacy| efficacy.recent_observations.iter())
+            .map(|evidence| evidence.observed_at.trim())
+            .filter(|at| !at.is_empty())
+            .chain(self.last_recurred_at())
+            .chain((self.hits() <= 1).then(|| self.first_observed_at()))
+            .max()
+    }
+
+    fn audited_first_observed_at(&self) -> &str {
+        self.efficacy
+            .as_ref()
+            .into_iter()
+            .flat_map(|efficacy| efficacy.recent_observations.iter())
+            .map(|evidence| evidence.observed_at.trim())
+            .chain(std::iter::once(self.first_observed_at()))
+            .filter(|at| !at.is_empty())
+            .min()
+            .unwrap_or_default()
+    }
+
+    fn timeline_complete(&self) -> bool {
+        usize::try_from(self.hits()).is_ok_and(|hits| hits == self.observation_evidence_count())
+    }
+
+    /// Number of distinct retained evidence ids, including contradictory rows.
+    /// This intentionally does not
+    /// expose the legacy aggregate `occurrences`: a row saying "226 hits" with
+    /// no per-episode provenance has zero independently auditable evidence.
+    #[must_use]
+    pub fn knowledge_evidence_count(&self) -> usize {
+        self.efficacy.as_ref().map_or(0, |efficacy| {
+            efficacy
+                .recent_observations
+                .iter()
+                .map(|evidence| evidence.episode_id.as_str())
+                .filter(|id| !id.trim().is_empty())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        })
+    }
+
+    fn corroborating_evidence_count(&self) -> usize {
+        self.efficacy.as_ref().map_or(0, |efficacy| {
+            efficacy
+                .recent_observations
+                .iter()
+                .filter(|evidence| evidence.outcome != KnowledgeEvidenceOutcome::Conflict)
+                .map(|evidence| evidence.episode_id.as_str())
+                .filter(|id| !id.trim().is_empty())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        })
+    }
+
+    fn observation_evidence_count(&self) -> usize {
+        self.efficacy.as_ref().map_or(0, |efficacy| {
+            efficacy
+                .recent_observations
+                .iter()
+                .filter(|evidence| {
+                    matches!(
+                        evidence.outcome,
+                        KnowledgeEvidenceOutcome::Observed | KnowledgeEvidenceOutcome::Conflict
+                    )
+                })
+                .map(|evidence| evidence.episode_id.as_str())
+                .filter(|id| !id.trim().is_empty())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        })
+    }
+
     /// Trust in `[TRUST_FLOOR, 1]`, normalised so a legacy / never-rated row
-    /// (stored `0.0`) reads as [`NEUTRAL_TRUST`] rather than "fully distrusted".
-    /// Any non-positive or non-finite stored value (a hand-edited row) also maps
-    /// to neutral — fail-open: a corrupt trust never silently buries a lesson.
+    /// reads as [`NEUTRAL_TRUST`]. Only versioned exact-token counters influence
+    /// behavior; the old `trust` float is retained solely for audit/migration.
     #[must_use]
     pub fn trust(&self) -> f32 {
-        if self.trust.is_finite() && self.trust > 0.0 {
-            self.trust.clamp(TRUST_FLOOR, 1.0)
-        } else {
-            NEUTRAL_TRUST
-        }
+        let Some(efficacy) = self
+            .efficacy
+            .as_ref()
+            .filter(|efficacy| efficacy.outcome_attribution_version == 1)
+        else {
+            return NEUTRAL_TRUST;
+        };
+        let reward = efficacy.exact_helpful as f32 * TRUST_REWARD;
+        let penalty = efficacy.exact_harmful as f32 * TRUST_PENALTY;
+        (NEUTRAL_TRUST + reward - penalty).clamp(TRUST_FLOOR, 1.0)
     }
 
     /// Apply one trust feedback step IN PLACE: `passed` adds [`TRUST_REWARD`],
@@ -335,14 +589,18 @@ impl Lesson {
     /// clamps to `[TRUST_FLOOR, 1.0]`. Pure mutation — saving the row is the
     /// caller's job.
     fn apply_trust_feedback(&mut self, passed: bool) {
-        let base = self.trust();
+        // Legacy compatibility/audit primitive. Deliberately does not set the
+        // exact attribution version, so these values remain behaviorally neutral.
+        let base = if self.trust.is_finite() && self.trust > 0.0 {
+            self.trust.clamp(TRUST_FLOOR, 1.0)
+        } else {
+            NEUTRAL_TRUST
+        };
         let next = if passed {
-            // Helpful (injected → the gate then PASSED): besides the trust reward,
-            // refresh the recency basis so this lesson resists clock-age decay /
-            // eviction (usage-driven decay — a lesson that keeps EARNING its place
-            // stays fresh). A never-helpful lesson is never refreshed and decays
-            // normally. Only on success: a failure should not buy freshness.
-            self.first_seen = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            let reinforced_at = utc_now_iso();
+            self.efficacy
+                .get_or_insert_with(PitfallEfficacy::default)
+                .last_reinforced_at = reinforced_at;
             base + TRUST_REWARD
         } else {
             base - TRUST_PENALTY
@@ -362,13 +620,40 @@ impl Lesson {
         }
     }
 
+    /// Apply outcome feedback authorised by an exact committed repair token.
+    fn apply_exact_trust_feedback(&mut self, passed: bool) {
+        let efficacy = self.efficacy.get_or_insert_with(PitfallEfficacy::default);
+        if efficacy.outcome_attribution_version != 1 {
+            // Quarantine every broad-attribution field on first exact outcome.
+            // Raw legacy counters/timestamps remain on disk for audit, but exact
+            // behavior starts from a clean neutral lineage.
+            efficacy.exact_helpful = 0;
+            efficacy.exact_harmful = 0;
+            efficacy.exact_last_reinforced_at.clear();
+            efficacy.exact_last_fix_failed_at.clear();
+            efficacy.exact_last_verified_at.clear();
+            efficacy.recurred_after_warning = false;
+            efficacy.proven_fix = false;
+            efficacy.failed_fixes.clear();
+            efficacy.next_strategy.clear();
+            efficacy.outcome_attribution_version = 1;
+        }
+        if passed {
+            efficacy.exact_helpful = efficacy.exact_helpful.saturating_add(1);
+            efficacy.exact_last_reinforced_at = utc_now_iso();
+        } else {
+            efficacy.exact_harmful = efficacy.exact_harmful.saturating_add(1);
+        }
+    }
+
     /// Total OUTCOME observations recorded for this lesson (`helpful + harmful`) —
     /// the SAMPLE SIZE the efficacy prune gate reads. `0` when never observed.
     #[must_use]
     pub fn efficacy_samples(&self) -> u32 {
         self.efficacy
             .as_ref()
-            .map_or(0, |e| e.helpful.saturating_add(e.harmful))
+            .filter(|e| e.outcome_attribution_version == 1)
+            .map_or(0, |e| e.exact_helpful.saturating_add(e.exact_harmful))
     }
 
     /// Helpful ratio `helpful / (helpful + harmful)` in `[0, 1]` once at least one
@@ -378,11 +663,14 @@ impl Lesson {
     #[must_use]
     pub fn helpful_ratio(&self) -> Option<f64> {
         let e = self.efficacy.as_ref()?;
-        let total = e.helpful.saturating_add(e.harmful);
+        if e.outcome_attribution_version != 1 {
+            return None;
+        }
+        let total = e.exact_helpful.saturating_add(e.exact_harmful);
         if total == 0 {
             return None;
         }
-        Some(f64::from(e.helpful) / f64::from(total))
+        Some(f64::from(e.exact_helpful) / f64::from(total))
     }
 
     /// `true` when this is a precisely-recognised pitfall (a classified error
@@ -393,22 +681,67 @@ impl Lesson {
         !self.signature.is_empty() && !self.signature.starts_with("general/")
     }
 
-    /// Derive the fix lifecycle from the efficacy record.
+    /// Whether a pitfall is precise enough to influence future work. Generic
+    /// fallbacks stay in the raw JSONL ledger for audit, but cannot be recalled,
+    /// reported as advice, sedimented, or promoted.
+    #[must_use]
+    pub fn is_actionable_pitfall(&self) -> bool {
+        self.kind != LessonKind::DevError || self.is_recognized()
+    }
+
+    /// A precise, non-invalidated incident that may influence product behavior.
+    #[must_use]
+    pub fn is_live_actionable_pitfall(&self) -> bool {
+        self.kind == LessonKind::DevError && self.is_recognized() && !self.invalidated
+    }
+
+    /// Derive the strict knowledge lifecycle from auditable evidence.
+    /// Similarity and aggregate hit counts never enter this decision.
     #[must_use]
     pub fn pitfall_status(&self) -> PitfallStatus {
-        match &self.efficacy {
-            Some(e) if e.recurred_after_warning => PitfallStatus::Recurring,
-            // Direct proof: an in-run fix made the build pass again.
-            Some(e) if e.proven_fix => PitfallStatus::Validated,
-            // Inferred: survived a full inject→run→inject cycle (≥2 warnings)
-            // with no recurrence — so a single optimistic warning never
-            // prematurely damps a pitfall that hasn't truly been beaten.
-            Some(e) if e.injected >= 2 && self.hits() <= e.occ_at_injection => {
-                PitfallStatus::Validated
-            }
-            _ => PitfallStatus::Active,
+        if self.invalidated {
+            return PitfallStatus::Invalidated;
+        }
+        let Some(efficacy) = self.efficacy.as_ref() else {
+            return PitfallStatus::Hypothesis;
+        };
+        if efficacy
+            .recent_observations
+            .iter()
+            .any(|evidence| evidence.outcome == KnowledgeEvidenceOutcome::Conflict)
+        {
+            return PitfallStatus::Invalidated;
+        }
+        let latest_causal = efficacy
+            .recent_observations
+            .iter()
+            .filter(|evidence| {
+                matches!(
+                    evidence.outcome,
+                    KnowledgeEvidenceOutcome::FixSucceeded | KnowledgeEvidenceOutcome::FixFailed
+                ) && evidence_has_complete_causal_provenance(evidence)
+            })
+            .max_by(|left, right| left.observed_at.cmp(&right.observed_at));
+        match latest_causal.map(|evidence| evidence.outcome) {
+            Some(KnowledgeEvidenceOutcome::FixSucceeded) => PitfallStatus::Validated,
+            Some(KnowledgeEvidenceOutcome::FixFailed) => PitfallStatus::Invalidated,
+            _ if self.corroborating_evidence_count() >= 2 => PitfallStatus::Corroborated,
+            _ => PitfallStatus::Hypothesis,
         }
     }
+}
+
+fn evidence_has_complete_causal_provenance(evidence: &PitfallObservation) -> bool {
+    evidence.outcome != KnowledgeEvidenceOutcome::Observed
+        && !evidence.episode_id.trim().is_empty()
+        && !evidence.evidence_hash.trim().is_empty()
+        && !evidence.source.trim().is_empty()
+        && !evidence.base.trim().is_empty()
+        && !evidence.base_version.trim().is_empty()
+        && evidence.base_version != "unknown"
+        && evidence.workspace_scope.starts_with("project:")
+        && !evidence.causal_attempt_id.trim().is_empty()
+        && chrono::DateTime::parse_from_rfc3339(&evidence.observed_at).is_ok()
 }
 
 /// Capture quality-gate failures + warnings as raw lessons.
@@ -422,7 +755,11 @@ pub fn capture_quality_failures(
     slug: &str,
     requirement: &str,
 ) {
+    if !project_capture_enabled(project_root, MemoryStore::QualityFailures) {
+        return;
+    }
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let capture_id = next_capture_episode_id(&utc_now_iso());
     let mut lessons: Vec<Lesson> = Vec::new();
     for check in checks
         .iter()
@@ -469,18 +806,25 @@ pub fn capture_quality_failures(
             signature: String::new(),
             occurrences: 1,
             context: Vec::new(),
-            efficacy: None,
+            efficacy: Some(observed_lesson_efficacy(
+                project_root,
+                &format!("{capture_id}:{}", check.name),
+                &format!("{}\0{}\0{}", check.name, check.status, check.details),
+                "quality-gate-failure",
+                &now,
+            )),
             invalidated: false,
             trust: NEUTRAL_TRUST,
             evidence_count: 0,
             evidence: Vec::new(),
         });
     }
-    append_raw_lessons(project_root, "quality-failures.jsonl", &lessons);
+    let committed = append_raw_lessons(project_root, "quality-failures.jsonl", &lessons);
     // Record-time contradiction control: demote the lower-standing side of any
     // genuine conflict this new lesson introduces (fail-open, no-op when empty).
-    if !lessons.is_empty() {
+    if committed && !lessons.is_empty() {
         let _ = resolve_new_lesson_conflicts(project_root, &lessons);
+        let _ = fold_beliefs(project_root);
     }
 }
 
@@ -498,26 +842,34 @@ pub fn capture_gate_revision(
     let now = Utc::now();
     let ts = now.format("%Y%m%dT%H%M%SZ");
     let date = now.format("%Y-%m-%d");
-
-    // 1. Write the ADR (decision record) — fulfills spec §5.4.
     let dec_dir = project_root.join(DECISIONS_DIR);
-    let _ = fs::create_dir_all(&dec_dir);
     let adr_path = dec_dir.join(format!("{gate}-{ts}.md"));
-    let adr_body = format!(
-        "# ADR: {gate} revision\n\n\
-         **Date:** {date}\n\n\
-         **Status:** Revised\n\n\
-         **Requirement:** {requirement}\n\n\
-         ## Decision\n\n\
-         The user requested the following revision at the {gate} gate:\n\n\
-         > {revision_text}\n\n\
-         ## Context\n\n\
-         This revision feedback is captured as a decision record so future runs \
-         of the pipeline understand why the artifacts changed at this gate. The \
-         underlying worker will regenerate the block with this feedback folded \
-         into the requirement.\n",
-    );
-    let _ = fs::write(&adr_path, adr_body);
+
+    // The proof ADR and the reusable lesson are distinct leaf stores. A user may
+    // retain one without authorising the other; neither toggle changes the gate's
+    // actual revision flow.
+    if project_capture_enabled(project_root, MemoryStore::GateAdrs) {
+        let _ = fs::create_dir_all(&dec_dir);
+        let adr_body = format!(
+            "# ADR: {gate} revision\n\n\
+             **Date:** {date}\n\n\
+             **Status:** Revised\n\n\
+             **Requirement:** {requirement}\n\n\
+             ## Decision\n\n\
+             The user requested the following revision at the {gate} gate:\n\n\
+             > {revision_text}\n\n\
+             ## Context\n\n\
+             This revision feedback is captured as a decision record so future runs \
+             of the pipeline understand why the artifacts changed at this gate. The \
+             underlying worker will regenerate the block with this feedback folded \
+             into the requirement.\n",
+        );
+        let _ = fs::write(&adr_path, adr_body);
+    }
+
+    if !project_capture_enabled(project_root, MemoryStore::GateRevisions) {
+        return adr_path;
+    }
 
     // 2. Append a raw Revision lesson.
     let domain = if gate.contains("docs") {
@@ -545,16 +897,24 @@ pub fn capture_gate_revision(
         signature: String::new(),
         occurrences: 1,
         context: Vec::new(),
-        efficacy: None,
+        efficacy: Some(observed_lesson_efficacy(
+            project_root,
+            &format!("gate-revision:{gate}:{ts}"),
+            &format!("{gate}\0{revision_text}"),
+            "human-gate-revision",
+            &now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )),
         invalidated: false,
         trust: NEUTRAL_TRUST,
         evidence_count: 0,
         evidence: Vec::new(),
     };
     let lessons = [lesson];
-    append_raw_lessons(project_root, "gate-revisions.jsonl", &lessons);
-    // Record-time contradiction control (fail-open).
-    let _ = resolve_new_lesson_conflicts(project_root, &lessons);
+    if append_raw_lessons(project_root, "gate-revisions.jsonl", &lessons) {
+        // Record-time contradiction control (fail-open).
+        let _ = resolve_new_lesson_conflicts(project_root, &lessons);
+        let _ = fold_beliefs(project_root);
+    }
 
     adr_path
 }
@@ -585,7 +945,13 @@ pub fn capture_validated_patterns(
     unimplemented_paths: &[String],
     quality_passed: bool,
 ) {
-    if spec.is_empty() {
+    if !project_capture_enabled(project_root, MemoryStore::ValidatedPatterns) {
+        return;
+    }
+    // "Validated" is an evidence claim, not a category label. Source presence
+    // alone is insufficient: only a mechanically passing quality gate may mint
+    // a reusable validated pattern.
+    if spec.is_empty() || !quality_passed {
         return;
     }
     // Keep only endpoints whose path is NOT in the unimplemented-gap set — i.e.
@@ -608,17 +974,13 @@ pub fn capture_validated_patterns(
         return;
     }
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let capture_id = next_capture_episode_id(&utc_now_iso());
     let entity_summary = implemented.join(", ");
     let keywords = extract_keywords(slug, &entity_summary, requirement);
     // Wording is evidence-accurate: "implemented (source-verified)" always; the
     // gate-passed claim is added ONLY when the gate actually passed.
-    let gate_line = if quality_passed {
-        "These endpoints were implemented (verified against the delivered source) \
-         and the run passed the quality gate."
-    } else {
-        "These endpoints were implemented (verified against the delivered source). \
-         Note: the quality gate did NOT pass on this run."
-    };
+    let gate_line = "These endpoints were implemented (verified against the delivered source) \
+                     and the run passed the quality gate.";
     let lesson = Lesson {
         kind: LessonKind::ValidatedPattern,
         domain: "api".to_string(),
@@ -635,20 +997,28 @@ pub fn capture_validated_patterns(
             .to_string(),
         keywords,
         source_requirement: requirement.to_string(),
-        first_seen: now,
+        first_seen: now.clone(),
         signature: String::new(),
         occurrences: 1,
         context: Vec::new(),
-        efficacy: None,
+        efficacy: Some(observed_lesson_efficacy(
+            project_root,
+            &format!("validated-pattern:{capture_id}"),
+            &entity_summary,
+            "source-verified-quality-pass",
+            &now,
+        )),
         invalidated: false,
         trust: NEUTRAL_TRUST,
         evidence_count: 0,
         evidence: Vec::new(),
     };
     let lessons = [lesson];
-    append_raw_lessons(project_root, "validated-decisions.jsonl", &lessons);
-    // Record-time contradiction control (fail-open).
-    let _ = resolve_new_lesson_conflicts(project_root, &lessons);
+    if append_raw_lessons(project_root, "validated-decisions.jsonl", &lessons) {
+        // Record-time contradiction control (fail-open).
+        let _ = resolve_new_lesson_conflicts(project_root, &lessons);
+        let _ = fold_beliefs(project_root);
+    }
 }
 
 /// Minimum [`crate::tech_debt::DebtKind::severity`] a debt item must reach to
@@ -665,7 +1035,7 @@ const TECH_DEBT_LESSON_MIN_SEVERITY: u8 = 4;
 /// JSONL ledger — they never reached the capture→sediment→retrieve loop, so the
 /// worker was never *reminded* "you keep shipping docs with filler text; write
 /// real content". This closes that gap: each debt KIND that crosses
-/// [`TECH_DEBT_LESSON_MIN_SEVERITY`] becomes one [`LessonKind::Failure`] lesson
+/// the internal severity threshold becomes one [`LessonKind::Failure`] lesson
 /// (deduped by kind so a doc with 40 `Lorem ipsum` lines yields ONE lesson, not
 /// 40), keyed under the `governance` domain. Returns how many lessons were
 /// written. Fail-open: a write error never blocks the quality gate.
@@ -674,6 +1044,9 @@ pub fn capture_tech_debt(
     items: &[crate::tech_debt::DebtItem],
     requirement: &str,
 ) -> usize {
+    if !project_capture_enabled(project_root, MemoryStore::TechDebt) {
+        return 0;
+    }
     use crate::tech_debt::DebtKind;
     // Group significant items by kind so each distinct debt KIND yields one
     // lesson regardless of how many lines carry it. Keep a sample file:line and
@@ -693,6 +1066,7 @@ pub fn capture_tech_debt(
         return 0;
     }
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let capture_id = next_capture_episode_id(&utc_now_iso());
     let mut lessons: Vec<Lesson> = Vec::new();
     for (kind, (count, sample)) in by_kind {
         let kind_name = serde_json::to_string(&kind)
@@ -742,18 +1116,28 @@ pub fn capture_tech_debt(
             signature: String::new(),
             occurrences: 1,
             context: Vec::new(),
-            efficacy: None,
+            efficacy: Some(observed_lesson_efficacy(
+                project_root,
+                &format!("tech-debt:{capture_id}:{kind_name}"),
+                &format!("{kind_name}\0{count}\0{sample}"),
+                "governance-tech-debt",
+                &now,
+            )),
             invalidated: false,
             trust: NEUTRAL_TRUST,
             evidence_count: 0,
             evidence: Vec::new(),
         });
     }
-    let written = lessons.len();
-    append_raw_lessons(project_root, "tech-debt.jsonl", &lessons);
+    let written = if append_raw_lessons(project_root, "tech-debt.jsonl", &lessons) {
+        lessons.len()
+    } else {
+        0
+    };
     // Record-time contradiction control (fail-open, no-op when empty).
-    if !lessons.is_empty() {
+    if written > 0 {
         let _ = resolve_new_lesson_conflicts(project_root, &lessons);
+        let _ = fold_beliefs(project_root);
     }
     written
 }
@@ -767,19 +1151,140 @@ pub fn capture_tech_debt(
 /// against already-captured dev errors — so the SAME pitfall is recorded once,
 /// not once per occurrence. Returns the number of NEW lessons written.
 ///
-/// Fail-open: any I/O error is swallowed and the pipeline continues.
+/// Compatibility wrapper returning only the number of newly-created incident
+/// signatures. Callers that surface learning progress should use
+/// [`capture_dev_errors_detailed`] so a recurrence (especially the second hit
+/// that creates a reusable rule) is not silent.
 pub fn capture_dev_errors(
     project_root: &Path,
     raw_errors: &[String],
     slug: &str,
     requirement: &str,
 ) -> usize {
-    // Shared process-wide lock serialising this KB read-modify-write against
-    // EVERY other dev-errors.jsonl mutator (not just this function), so the
-    // parallel docs fan-out's two forked bases can't clobber each other's
-    // record. Held for the whole read-mutate-write below.
-    let _kb_guard = lock_dev_errors();
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    capture_dev_errors_detailed(project_root, raw_errors, slug, requirement).new_incidents
+}
+
+/// Structured result of one capture episode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PitfallCaptureOutcome {
+    /// Precise signatures first admitted to the actionable ledger.
+    pub new_incidents: usize,
+    /// Existing precise signatures observed again in this episode.
+    pub recurrent_incidents: usize,
+    /// Incidents that crossed from a one-off into a reusable curated rule.
+    pub newly_curated_rules: usize,
+    /// New privacy-safe unknown fingerprints retained for classification audit.
+    pub new_unclassified_candidates: usize,
+    /// Existing unknown fingerprints observed in another independent episode.
+    pub recurrent_unclassified_candidates: usize,
+    /// Distinct signature observations committed after within-episode dedupe.
+    pub observations: usize,
+}
+
+impl PitfallCaptureOutcome {
+    /// Merge another independently-bounded event outcome into this turn summary.
+    pub fn absorb(&mut self, other: Self) {
+        self.new_incidents = self.new_incidents.saturating_add(other.new_incidents);
+        self.recurrent_incidents = self
+            .recurrent_incidents
+            .saturating_add(other.recurrent_incidents);
+        self.newly_curated_rules = self
+            .newly_curated_rules
+            .saturating_add(other.newly_curated_rules);
+        self.new_unclassified_candidates = self
+            .new_unclassified_candidates
+            .saturating_add(other.new_unclassified_candidates);
+        self.recurrent_unclassified_candidates = self
+            .recurrent_unclassified_candidates
+            .saturating_add(other.recurrent_unclassified_candidates);
+        self.observations = self.observations.saturating_add(other.observations);
+    }
+
+    /// User-visible progress notes. Recurrences are intentionally visible even
+    /// when no new signature was created; the second episode announces the new
+    /// pending rule instead of making self-evolution look inert.
+    #[must_use]
+    pub fn progress_notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.new_incidents > 0 {
+            notes.push(umadev_i18n::tlf(
+                "lessons.progress.new_incidents",
+                &[&self.new_incidents.to_string()],
+            ));
+        }
+        if self.recurrent_incidents > 0 {
+            notes.push(umadev_i18n::tlf(
+                "lessons.progress.recurrent_incidents",
+                &[&self.recurrent_incidents.to_string()],
+            ));
+        }
+        if self.newly_curated_rules > 0 {
+            notes.push(umadev_i18n::tlf(
+                "lessons.progress.new_rules",
+                &[&self.newly_curated_rules.to_string()],
+            ));
+        }
+        if self.new_unclassified_candidates > 0 {
+            notes.push(umadev_i18n::tlf(
+                "lessons.progress.new_candidates",
+                &[&self.new_unclassified_candidates.to_string()],
+            ));
+        }
+        if self.recurrent_unclassified_candidates > 0 {
+            notes.push(umadev_i18n::tlf(
+                "lessons.progress.recurrent_candidates",
+                &[&self.recurrent_unclassified_candidates.to_string()],
+            ));
+        }
+        notes
+    }
+}
+
+/// Capture one failure event/episode and return both new and recurrent progress.
+/// Multiple copies of the same signature inside `raw_errors` count once; callers
+/// should invoke this once per independently executed failed tool/check.
+/// Fail-open: any I/O error is swallowed and the pipeline continues.
+pub fn capture_dev_errors_detailed(
+    project_root: &Path,
+    raw_errors: &[String],
+    slug: &str,
+    requirement: &str,
+) -> PitfallCaptureOutcome {
+    let now = utc_now_iso();
+    let evidence_id = next_capture_episode_id(&now);
+    capture_dev_errors_detailed_with_evidence_id(
+        project_root,
+        raw_errors,
+        slug,
+        requirement,
+        &evidence_id,
+    )
+}
+
+/// Capture one explicitly identified failure episode. Replaying the same
+/// `evidence_id` is idempotent across threads/processes; it cannot inflate
+/// occurrences or move a rule from hypothesis to corroborated.
+pub fn capture_dev_errors_detailed_with_evidence_id(
+    project_root: &Path,
+    raw_errors: &[String],
+    _slug: &str,
+    requirement: &str,
+    evidence_id: &str,
+) -> PitfallCaptureOutcome {
+    if evidence_id.trim().is_empty() {
+        return PitfallCaptureOutcome::default();
+    }
+    if !project_capture_enabled(project_root, MemoryStore::Pitfalls) {
+        return PitfallCaptureOutcome::default();
+    }
+    // Serialize the complete RMW across every UmaDev process sharing this
+    // project. Failure stays fail-open, but an unlocked stale snapshot is never
+    // allowed to replace the authoritative ledger.
+    let Some(_kb_guard) = acquire_raw_store_lock(project_root, DEV_ERRORS_FILE) else {
+        return PitfallCaptureOutcome::default();
+    };
+    let now = utc_now_iso();
+    let episode_id = privacy_fingerprint("umadev:knowledge-evidence-id:v1", evidence_id.trim());
     // The tech-stack fingerprint present *right now* — stamped onto each
     // pitfall so triggering can later match "same situation", not prose.
     let context = project_context_tokens(project_root);
@@ -810,14 +1315,20 @@ pub fn capture_dev_errors(
         }
     }
 
-    let mut new_count = 0usize;
+    let mut outcome = PitfallCaptureOutcome::default();
     let mut changed = false;
+    // One call represents one failure episode/turn. A streaming host can emit
+    // the same failed tool result repeatedly (or stderr + a summary of it), so
+    // counting each raw line inflated one real failure into dozens of "hits".
+    // Collapse by the stable signature before touching persistent counts.
+    let mut seen_in_episode = std::collections::HashSet::new();
     for raw in raw_errors {
         let text = raw.trim();
         if text.is_empty() || !crate::error_kb::looks_like_error(text) {
             continue;
         }
         let mut insight = crate::error_kb::classify_error(text);
+        let actionable = insight.recognized;
         // Stabilise the dedup key: strip volatile parts (relative-path
         // prefixes, version suffixes, line/col numbers) that leak into the
         // discriminator segment so the SAME root cause collapses to ONE
@@ -825,105 +1336,646 @@ pub fn capture_dev_errors(
         // [`normalize_signature`]). Without this, `occurrences` would stay
         // stuck at 1 for a recurring pitfall whose offending path or version
         // string differs run-to-run, and the frequency signal would be lost.
-        insight.signature = normalize_signature(&insight.signature);
+        if actionable {
+            insight.signature = precise_actionable_signature(&insight.signature, text);
+        } else {
+            // Unknown errors still need auditable frequency/time evidence, but
+            // must never return to the old `general/error/failed` mega-bucket.
+            // Cluster only by an opaque hash of a volatility-reduced form; no
+            // raw text or candidate normalization is persisted or injected.
+            insight.signature = unclassified_candidate_signature(text);
+            let fingerprint = insight.signature.rsplit('/').next().unwrap_or("unknown");
+            insight.category = "general".to_string();
+            insight.title = format!("待分类错误候选 {}", &fingerprint[..12]);
+            insight.fix.clear();
+            insight.root_cause.clear();
+            insight.keywords.clear();
+        }
+        if insight.signature.is_empty() || !seen_in_episode.insert(insight.signature.clone()) {
+            continue;
+        }
+        let observation = PitfallObservation {
+            observed_at: now.clone(),
+            episode_id: episode_id.clone(),
+            evidence_hash: privacy_fingerprint("umadev:pitfall-evidence:v1", text),
+            source: "host-tool-failure".to_string(),
+            base: "umadev-host-adapter".to_string(),
+            base_version: env!("CARGO_PKG_VERSION").to_string(),
+            workspace_scope: project_workspace_scope(project_root),
+            outcome: KnowledgeEvidenceOutcome::Observed,
+            causal_attempt_id: String::new(),
+        };
+        // If this exact privacy fingerprint was previously unknown but a newer
+        // classifier now recognises it, migrate its count/timeline into the
+        // precise row. The candidate remains invalidated in raw storage as a
+        // safe promotion audit record; it never becomes advice itself.
+        let migrated_candidate = actionable
+            .then(|| unclassified_candidate_signature(text))
+            .and_then(|candidate_signature| {
+                store
+                    .iter()
+                    .position(|lesson| {
+                        !lesson.invalidated && lesson.signature == candidate_signature
+                    })
+                    .map(|candidate_index| {
+                        let candidate = &mut store[candidate_index];
+                        let migrated = (
+                            candidate.hits(),
+                            candidate.first_seen.clone(),
+                            candidate
+                                .efficacy
+                                .as_ref()
+                                .map(|efficacy| efficacy.recent_observations.clone())
+                                .unwrap_or_default(),
+                        );
+                        candidate.invalidated = true;
+                        candidate.body = format!(
+                            "Privacy-safe candidate promoted to precise signature `{}`; \
+                             retained only for audit.",
+                            insight.signature
+                        );
+                        migrated
+                    })
+            });
         if let Some(&i) = idx.get(&insight.signature) {
+            let was_curated = actionable
+                && !store[i].invalidated
+                && store[i].pitfall_status() != PitfallStatus::Hypothesis;
+            if store[i].invalidated {
+                // A fresh independent episode is new evidence that re-activates
+                // an invalidated precise pitfall. Preserve only its auditable
+                // observation tail; stale lifecycle/trust judgments do not
+                // silently govern the revived incident.
+                let observations = store[i]
+                    .efficacy
+                    .as_ref()
+                    .map(|e| e.recent_observations.clone())
+                    .unwrap_or_default();
+                store[i].invalidated = false;
+                store[i].trust = NEUTRAL_TRUST;
+                store[i].efficacy = Some(PitfallEfficacy {
+                    recent_observations: observations,
+                    ..PitfallEfficacy::default()
+                });
+            }
+            if let Some((candidate_hits, candidate_first, candidate_observations)) =
+                &migrated_candidate
+            {
+                store[i].occurrences = store[i].hits().saturating_add(*candidate_hits);
+                if store[i].first_seen.is_empty()
+                    || (!candidate_first.is_empty() && candidate_first < &store[i].first_seen)
+                {
+                    store[i].first_seen.clone_from(candidate_first);
+                }
+                let efficacy = store[i]
+                    .efficacy
+                    .get_or_insert_with(PitfallEfficacy::default);
+                for prior in candidate_observations {
+                    let _ = remember_observation(efficacy, prior.clone());
+                }
+            }
+            let evidence_result = {
+                let efficacy = store[i]
+                    .efficacy
+                    .get_or_insert_with(PitfallEfficacy::default);
+                remember_observation(efficacy, observation)
+            };
+            match evidence_result {
+                RememberEvidence::Duplicate => continue,
+                RememberEvidence::Conflict => {
+                    changed = true;
+                    continue;
+                }
+                RememberEvidence::Inserted => {}
+            }
             // Recurrence → frequency++ and absorb any new context tokens.
             store[i].occurrences = store[i].hits().saturating_add(1);
             merge_tokens(&mut store[i].context, &context, 24);
-            // Efficacy: if we had ALREADY warned the worker about this pitfall
-            // (it was injected) and it recurred anyway, the recorded fix is
-            // insufficient — flag it so recall escalates it next time.
-            let occ_now = store[i].occurrences;
-            let recorded_fix = store[i].fix.clone();
-            if let Some(eff) = store[i].efficacy.as_mut() {
-                // Recurred after we either warned the worker (injected) OR
-                // marked an in-run fix as proven — both mean the recorded fix
-                // did NOT hold. Without the `proven_fix` arm a pitfall that was
-                // auto-fix-validated (injected still 0) would keep reporting as
-                // "Validated" even as it bites again every run.
-                if (eff.injected >= 1 || eff.proven_fix) && occ_now > eff.occ_at_injection {
-                    eff.recurred_after_warning = true;
-                    eff.proven_fix = false;
-                    // Remember that THIS fix was already tried and failed, so
-                    // the next injection steers the base away from it toward a
-                    // different approach instead of re-loading it.
-                    remember_failed_fix(eff, &recorded_fix);
-                }
+            // Frequency/timeline always advances for the independent episode.
+            let eff = store[i]
+                .efficacy
+                .get_or_insert_with(PitfallEfficacy::default);
+            eff.last_recurred_at.clone_from(&now);
+            // Do not infer a repair outcome from recurrence alone. Even an exact
+            // signature may be emitted before/after an interrupted repair turn;
+            // only settle_pitfall_fix_attempt(token, ...) may change the fix
+            // lifecycle or failed-fix ledger.
+            if actionable {
+                outcome.recurrent_incidents = outcome.recurrent_incidents.saturating_add(1);
+            } else {
+                outcome.recurrent_unclassified_candidates =
+                    outcome.recurrent_unclassified_candidates.saturating_add(1);
+            }
+            outcome.observations = outcome.observations.saturating_add(1);
+            if actionable
+                && !was_curated
+                && store[i].pitfall_status() == PitfallStatus::Corroborated
+            {
+                outcome.newly_curated_rules = outcome.newly_curated_rules.saturating_add(1);
             }
             changed = true;
             continue;
         }
-        let mut keywords = insight.keywords.clone();
-        for kw in extract_keywords(&insight.title, text, requirement) {
-            if !keywords.contains(&kw) {
-                keywords.push(kw);
-            }
-        }
-        keywords.truncate(20);
+        // Persist only classifier-derived, structural terms. Raw stderr and the
+        // business requirement may contain tokens, absolute paths, signed URLs,
+        // or private project names; the evidence hash supplies audit identity
+        // without turning the cross-project KB into a data-exfiltration surface.
+        let keywords = if actionable {
+            safe_dev_error_keywords(&insight)
+        } else {
+            vec!["unclassified".to_string(), "candidate".to_string()]
+        };
         idx.insert(insight.signature.clone(), store.len());
+        let (candidate_hits, candidate_first, candidate_observations) =
+            migrated_candidate.unwrap_or_else(|| (0, now.clone(), Vec::new()));
+        let mut initial_efficacy = PitfallEfficacy::default();
+        for prior in candidate_observations {
+            let _ = remember_observation(&mut initial_efficacy, prior);
+        }
+        let _ = remember_observation(&mut initial_efficacy, observation);
+        let first_seen = if candidate_hits > 0 && !candidate_first.is_empty() {
+            candidate_first
+        } else {
+            now.clone()
+        };
+        let initial_hits = 1u32.saturating_add(candidate_hits);
+        if initial_hits >= 2 {
+            initial_efficacy.last_recurred_at.clone_from(&now);
+        }
         store.push(Lesson {
             kind: LessonKind::DevError,
             domain: insight.category.clone(),
             // Title carries the signature so sediment dedups recurrences by
             // (domain, title) too — belt and suspenders with the seen-set.
             title: format!("踩坑 [{}]: {}", insight.signature, insight.title),
-            body: format!(
-                "During the {slug} run, this error was hit:\n\n{snippet}\n\n\
-                 Signature: {sig}\n\nRequirement: {requirement}",
-                snippet = truncate(text, 500),
-                sig = insight.signature,
-            ),
+            body: if actionable {
+                format!(
+                    "A recognised development-error episode matched signature `{}`. \
+                     Raw stderr and requirement text are intentionally excluded; \
+                     inspect the bounded evidence hash in the raw timeline when auditing.",
+                    insight.signature
+                )
+            } else {
+                "An unclassified error candidate was observed. Raw evidence and requirement \
+                 text are intentionally excluded; this record is quarantine-only until a \
+                 precise classifier can identify a root cause."
+                    .to_string()
+            },
             fix: insight.fix.clone(),
             root_cause: insight.root_cause.clone(),
             keywords,
-            source_requirement: requirement.to_string(),
-            first_seen: now.clone(),
+            source_requirement: format!(
+                "requirement-{}",
+                privacy_fingerprint("umadev:pitfall-requirement:v1", requirement)
+            ),
+            first_seen,
             signature: insight.signature,
-            occurrences: 1,
-            context: context.clone(),
-            efficacy: None,
+            occurrences: initial_hits,
+            context: if actionable {
+                context.clone()
+            } else {
+                Vec::new()
+            },
+            efficacy: Some(initial_efficacy),
             invalidated: false,
             trust: NEUTRAL_TRUST,
             evidence_count: 0,
             evidence: Vec::new(),
         });
-        new_count += 1;
+        if actionable {
+            outcome.new_incidents = outcome.new_incidents.saturating_add(1);
+            if store
+                .last()
+                .is_some_and(|lesson| lesson.pitfall_status() == PitfallStatus::Corroborated)
+            {
+                outcome.newly_curated_rules = outcome.newly_curated_rules.saturating_add(1);
+            }
+        } else {
+            outcome.new_unclassified_candidates =
+                outcome.new_unclassified_candidates.saturating_add(1);
+        }
+        outcome.observations = outcome.observations.saturating_add(1);
         changed = true;
     }
 
     if changed {
         prune_pitfalls(&mut store);
-        write_raw_lessons(project_root, DEV_ERRORS_FILE, &store);
+        if !write_raw_lessons_unlocked(project_root, DEV_ERRORS_FILE, &store) {
+            // Fail-open means development continues, not that we claim a write
+            // succeeded. Returning an empty outcome suppresses every [learned]
+            // note when mkdir/temp-write/rename failed (notably a locked target
+            // on Windows); the next real episode can retry honestly.
+            outcome = PitfallCaptureOutcome::default();
+        }
     }
-    new_count
+    outcome
+}
+
+fn safe_dev_error_keywords(insight: &crate::error_kb::ErrorInsight) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in insight
+        .signature
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .chain(std::iter::once(insight.category.as_str()))
+    {
+        let token = token.trim().to_ascii_lowercase();
+        if token.len() >= 3 && !out.contains(&token) {
+            out.push(token);
+        }
+    }
+    out.truncate(16);
+    out
+}
+
+fn privacy_fingerprint(domain: &str, value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn project_workspace_scope(project_root: &Path) -> String {
+    let canonical = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    format!(
+        "project:{}",
+        privacy_fingerprint(
+            "umadev:knowledge-workspace-scope:v1",
+            &canonical.to_string_lossy()
+        )
+    )
+}
+
+fn observed_lesson_efficacy(
+    project_root: &Path,
+    evidence_id: &str,
+    evidence_material: &str,
+    source: &str,
+    observed_at: &str,
+) -> PitfallEfficacy {
+    let mut efficacy = PitfallEfficacy::default();
+    let _ = remember_observation(
+        &mut efficacy,
+        PitfallObservation {
+            observed_at: observed_at.to_string(),
+            episode_id: privacy_fingerprint("umadev:lesson-evidence-id:v1", evidence_id),
+            evidence_hash: privacy_fingerprint("umadev:lesson-evidence:v1", evidence_material),
+            source: source.to_string(),
+            base: "umadev".to_string(),
+            base_version: env!("CARGO_PKG_VERSION").to_string(),
+            workspace_scope: project_workspace_scope(project_root),
+            outcome: KnowledgeEvidenceOutcome::Observed,
+            causal_attempt_id: String::new(),
+        },
+    );
+    efficacy
+}
+
+fn normalize_unclassified_evidence(value: &str) -> String {
+    let mut normalized = String::new();
+    for token in value.split_whitespace().take(160) {
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        if token.contains(['/', '\\']) {
+            // Do not collapse every endpoint/module/path into one mega
+            // candidate. Hash the volatility-reduced token so `/foo` and
+            // `/bar` stay distinct without persisting either raw value; numeric
+            // ids/ports/line numbers still collapse across otherwise-identical
+            // events.
+            let reduced = normalize_volatile_digits(token, 96);
+            let path_hash = privacy_fingerprint("umadev:candidate-path-token:v1", &reduced);
+            normalized.push_str("<path:");
+            normalized.push_str(&path_hash[..8]);
+            normalized.push('>');
+            continue;
+        }
+        normalized.push_str(&normalize_volatile_digits(token, 96));
+    }
+    normalized
+}
+
+fn normalize_volatile_digits(value: &str, max_chars: usize) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_digit = false;
+    for ch in value.chars().take(max_chars) {
+        if ch.is_ascii_digit() {
+            if !previous_was_digit {
+                normalized.push('#');
+            }
+            previous_was_digit = true;
+        } else {
+            normalized.extend(ch.to_lowercase());
+            previous_was_digit = false;
+        }
+    }
+    normalized
+}
+
+fn unclassified_candidate_signature(value: &str) -> String {
+    let fingerprint = privacy_fingerprint(
+        "umadev:unclassified-error-candidate:v1",
+        &normalize_unclassified_evidence(value),
+    );
+    format!("general/candidate/{}", &fingerprint[..20])
+}
+
+fn canonical_evidence_shape(value: &str) -> String {
+    let mut lines: Vec<String> = value
+        .lines()
+        .take(64)
+        .map(normalize_unclassified_evidence)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines.sort();
+    lines.dedup();
+    if lines.is_empty() {
+        normalize_unclassified_evidence(value)
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// Add a privacy-safe evidence discriminator to classifier families that have
+/// no root-cause discriminator of their own. This prevents two unrelated tests,
+/// type errors, panics, or syntax errors from accumulating one misleading count
+/// or sharing a repair outcome merely because the classifier family is fixed.
+fn precise_actionable_signature(classified_signature: &str, evidence: &str) -> String {
+    let base = normalize_signature(classified_signature);
+    if base.split('/').count() >= 3 {
+        return base;
+    }
+    let shape = canonical_evidence_shape(evidence);
+    let fingerprint = privacy_fingerprint("umadev:coarse-error-evidence:v1", &shape);
+    let confidence = if shape.split_whitespace().count() >= 4 && shape.chars().count() >= 24 {
+        "e"
+    } else {
+        "u"
+    };
+    format!("{base}/{confidence}-{}", &fingerprint[..20])
+}
+
+/// Number of recent episode records retained per pitfall. The aggregate hit
+/// count remains lifetime data; this bounded tail is the inspectable evidence
+/// window and prevents logs/secrets from growing without limit.
+const MAX_RECENT_OBSERVATIONS: usize = 8;
+
+static CAPTURE_EPISODE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn utc_now_iso() -> String {
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn next_capture_episode_id(now: &str) -> String {
+    let seq = CAPTURE_EPISODE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "{}-{}-{seq}",
+        now.replace([':', '.', '-'], ""),
+        std::process::id()
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RememberEvidence {
+    Inserted,
+    Duplicate,
+    Conflict,
+}
+
+fn remember_observation(
+    efficacy: &mut PitfallEfficacy,
+    observation: PitfallObservation,
+) -> RememberEvidence {
+    // Idempotence when a caller intentionally retries/commits the same evidence
+    // id. Reusing that id for different content is a typed contradiction, not a
+    // second vote and never a silent last-writer-wins replacement.
+    if let Some(old) = efficacy
+        .recent_observations
+        .iter_mut()
+        .find(|old| old.episode_id == observation.episode_id)
+    {
+        // `observed_at` is assigned by the receiver and can differ when the
+        // producer retries after a timeout. Evidence identity and its typed
+        // payload, not receipt time, decide idempotence.
+        if same_evidence_payload(old, &observation) {
+            return RememberEvidence::Duplicate;
+        }
+        old.outcome = KnowledgeEvidenceOutcome::Conflict;
+        old.source = "conflicting-evidence-id".to_string();
+        old.causal_attempt_id.clear();
+        return RememberEvidence::Conflict;
+    }
+    efficacy.recent_observations.push(observation);
+    if efficacy.recent_observations.len() > MAX_RECENT_OBSERVATIONS {
+        let overflow = efficacy.recent_observations.len() - MAX_RECENT_OBSERVATIONS;
+        efficacy.recent_observations.drain(0..overflow);
+    }
+    RememberEvidence::Inserted
+}
+
+fn same_evidence_payload(left: &PitfallObservation, right: &PitfallObservation) -> bool {
+    left.episode_id == right.episode_id
+        && left.evidence_hash == right.evidence_hash
+        && left.source == right.source
+        && left.base == right.base
+        && left.base_version == right.base_version
+        && left.workspace_scope == right.workspace_scope
+        && left.outcome == right.outcome
+        && left.causal_attempt_id == right.causal_attempt_id
+}
+
+/// Read the actionable incident ledger as one row per normalised signature.
+///
+/// Older releases could leave a pre-normalisation row beside a newer shadow row
+/// for the same root cause. The raw JSONL remains untouched for audit, but every
+/// product-facing read uses this canonical projection so counts, lifecycle, and
+/// timestamps are not split across duplicate cards.
+fn read_canonical_pitfalls(project_root: &Path) -> Vec<Lesson> {
+    let mut canonical = Vec::<Lesson>::new();
+    let mut by_signature = std::collections::HashMap::<String, usize>::new();
+    for mut lesson in read_raw_lessons(project_root, DEV_ERRORS_FILE)
+        .into_iter()
+        .filter(|lesson| lesson.kind == LessonKind::DevError && lesson.is_recognized())
+    {
+        let signature = normalize_signature(&lesson.signature);
+        if signature.is_empty() {
+            continue;
+        }
+        lesson.signature.clone_from(&signature);
+        if let Some(&index) = by_signature.get(&signature) {
+            merge_canonical_pitfall(&mut canonical[index], lesson);
+        } else {
+            by_signature.insert(signature, canonical.len());
+            canonical.push(lesson);
+        }
+    }
+    canonical
+}
+
+fn read_unclassified_candidate_lessons(project_root: &Path, min_hits: u32) -> Vec<Lesson> {
+    let mut candidates: Vec<Lesson> = read_raw_lessons(project_root, DEV_ERRORS_FILE)
+        .into_iter()
+        .filter(|lesson| {
+            lesson.kind == LessonKind::DevError
+                && !lesson.invalidated
+                && lesson.signature.starts_with("general/candidate/")
+                && lesson.hits() >= min_hits
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        b.hits()
+            .cmp(&a.hits())
+            .then_with(|| b.last_observed_at().cmp(a.last_observed_at()))
+    });
+    candidates
+}
+
+fn merge_canonical_pitfall(dst: &mut Lesson, src: Lesson) {
+    let dst_hits = dst.hits();
+    let src_hits = src.hits();
+    dst.occurrences = dst_hits.saturating_add(src_hits);
+    dst.invalidated |= src.invalidated;
+
+    if dst.first_seen.is_empty() || (!src.first_seen.is_empty() && src.first_seen < dst.first_seen)
+    {
+        dst.first_seen.clone_from(&src.first_seen);
+    }
+    merge_tokens(&mut dst.context, &src.context, 24);
+    if src_hits > dst_hits {
+        dst.title.clone_from(&src.title);
+        dst.body.clone_from(&src.body);
+        dst.fix.clone_from(&src.fix);
+        dst.root_cause.clone_from(&src.root_cause);
+        dst.keywords.clone_from(&src.keywords);
+        dst.source_requirement.clone_from(&src.source_requirement);
+    }
+
+    let Some(src_eff) = src.efficacy else {
+        return;
+    };
+    let dst_eff = dst.efficacy.get_or_insert_with(PitfallEfficacy::default);
+    dst_eff.injected = dst_eff.injected.saturating_add(src_eff.injected);
+    dst_eff.occ_at_injection = dst_eff
+        .occ_at_injection
+        .saturating_add(src_eff.occ_at_injection);
+    dst_eff.helpful = dst_eff.helpful.saturating_add(src_eff.helpful);
+    dst_eff.harmful = dst_eff.harmful.saturating_add(src_eff.harmful);
+    if src_eff.last_recurred_at > dst_eff.last_recurred_at {
+        dst_eff.last_recurred_at = src_eff.last_recurred_at;
+    }
+    if src_eff.last_fix_failed_at > dst_eff.last_fix_failed_at {
+        dst_eff.last_fix_failed_at = src_eff.last_fix_failed_at;
+    }
+    if src_eff.last_verified_at > dst_eff.last_verified_at {
+        dst_eff.last_verified_at = src_eff.last_verified_at;
+    }
+    if src_eff.last_reinforced_at > dst_eff.last_reinforced_at {
+        dst_eff.last_reinforced_at = src_eff.last_reinforced_at;
+    }
+
+    // Only versioned exact-token outcomes merge into behavior. Legacy broad
+    // snapshot/signature counters and lifecycle booleans remain above as raw
+    // audit fields, but cannot poison ranking/status after upgrade.
+    if src_eff.outcome_attribution_version == 1 {
+        if dst_eff.outcome_attribution_version != 1 {
+            dst_eff.outcome_attribution_version = 1;
+            dst_eff.exact_helpful = 0;
+            dst_eff.exact_harmful = 0;
+            dst_eff.exact_last_reinforced_at.clear();
+            dst_eff.exact_last_fix_failed_at.clear();
+            dst_eff.exact_last_verified_at.clear();
+            dst_eff.failed_fixes.clear();
+            dst_eff.next_strategy.clear();
+        }
+        dst_eff.exact_helpful = dst_eff.exact_helpful.saturating_add(src_eff.exact_helpful);
+        dst_eff.exact_harmful = dst_eff.exact_harmful.saturating_add(src_eff.exact_harmful);
+        if src_eff.exact_last_reinforced_at > dst_eff.exact_last_reinforced_at {
+            dst_eff.exact_last_reinforced_at = src_eff.exact_last_reinforced_at;
+        }
+        if src_eff.exact_last_fix_failed_at > dst_eff.exact_last_fix_failed_at {
+            dst_eff.exact_last_fix_failed_at = src_eff.exact_last_fix_failed_at;
+        }
+        if src_eff.exact_last_verified_at > dst_eff.exact_last_verified_at {
+            dst_eff.exact_last_verified_at = src_eff.exact_last_verified_at;
+        }
+        if !src_eff.next_strategy.trim().is_empty() {
+            dst_eff.next_strategy = src_eff.next_strategy.clone();
+        }
+        merge_tokens(&mut dst_eff.failed_fixes, &src_eff.failed_fixes, 8);
+    }
+    if dst_eff.outcome_attribution_version == 1 {
+        let exact_failed = &dst_eff.exact_last_fix_failed_at;
+        let exact_passed = &dst_eff.exact_last_verified_at;
+        dst_eff.recurred_after_warning =
+            !exact_failed.is_empty() && (exact_passed.is_empty() || exact_failed >= exact_passed);
+        dst_eff.proven_fix =
+            !exact_passed.is_empty() && (exact_failed.is_empty() || exact_passed > exact_failed);
+    } else {
+        dst_eff.recurred_after_warning = false;
+        dst_eff.proven_fix = false;
+    }
+    merge_tokens(
+        &mut dst_eff.pending_fix_attempts,
+        &src_eff.pending_fix_attempts,
+        4,
+    );
+    for observation in src_eff.recent_observations {
+        remember_observation(dst_eff, observation);
+    }
+    dst_eff
+        .recent_observations
+        .sort_by(|a, b| a.observed_at.cmp(&b.observed_at));
 }
 
 /// Hard cap on distinct pitfalls kept in `dev-errors.jsonl` so a long-lived
 /// commercial repo's KB never bloats. Generous — most projects stay well under.
 const MAX_DEV_PITFALLS: usize = 300;
+const MAX_UNCLASSIFIED_CANDIDATES: usize = 300;
 
 /// Evict the least-valuable pitfalls when the store exceeds [`MAX_DEV_PITFALLS`].
 ///
-/// Keep priority is tiered by fix lifecycle first — still-failing (`Recurring`)
-/// outranks unproven (`Active`), which outranks solved (`Validated`) — so a
-/// pitfall whose fix is still failing is NEVER evicted before a handled one.
+/// Keep priority is tiered by the strict evidence lifecycle first: invalidated
+/// repair advice is retained for audit, then independently corroborated risks,
+/// then single-observation hypotheses, and finally handled (`Validated`) rows.
 /// WITHIN a tier, eviction is by the recency·importance decay score
 /// rather than a hard LRU: an old, low-importance lesson
 /// is dropped before a recent or frequently-hit one even if their raw timestamps
 /// would order them the other way. (Relevance has no query at prune time, so it
 /// is the constant floor and drops out of the WITHIN-tier comparison.)
 fn prune_pitfalls(store: &mut Vec<Lesson>) {
-    if store.len() <= MAX_DEV_PITFALLS {
+    let actionable_count = store.iter().filter(|l| l.is_recognized()).count();
+    let candidate_count = store
+        .iter()
+        .filter(|lesson| lesson.signature.starts_with("general/candidate/"))
+        .count();
+    if actionable_count <= MAX_DEV_PITFALLS && candidate_count <= MAX_UNCLASSIFIED_CANDIDATES {
         return;
+    }
+    // Legacy generic rows remain immutable audit evidence. New privacy-safe
+    // candidates have their own bound so unique noisy stderr cannot turn every
+    // full-file RMW into unbounded disk/O(n²) growth.
+    let mut actionable = Vec::new();
+    let mut candidates = Vec::new();
+    let mut legacy_quarantine = Vec::new();
+    for lesson in std::mem::take(store) {
+        if lesson.is_recognized() {
+            actionable.push(lesson);
+        } else if lesson.signature.starts_with("general/candidate/") {
+            candidates.push(lesson);
+        } else {
+            legacy_quarantine.push(lesson);
+        }
     }
     let now = Utc::now();
     let empty_query = std::collections::HashSet::new();
     let rank = |l: &Lesson| match l.pitfall_status() {
-        PitfallStatus::Recurring => 0u8,
-        PitfallStatus::Active => 1,
-        PitfallStatus::Validated => 2,
+        PitfallStatus::Invalidated => 0u8,
+        PitfallStatus::Corroborated => 1,
+        PitfallStatus::Hypothesis => 2,
+        PitfallStatus::Validated => 3,
     };
-    store.sort_by(|a, b| {
+    actionable.sort_by(|a, b| {
         rank(a).cmp(&rank(b)).then_with(|| {
             // Higher decay score = keep → sort it earlier (descending).
             let sa = lesson_decay_score(a, &empty_query, now);
@@ -931,10 +1983,19 @@ fn prune_pitfalls(store: &mut Vec<Lesson>) {
             sb.partial_cmp(&sa)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 // Final deterministic tiebreak so equal scores prune stably.
-                .then_with(|| b.first_seen.cmp(&a.first_seen))
+                .then_with(|| b.last_observed_at().cmp(a.last_observed_at()))
         })
     });
-    store.truncate(MAX_DEV_PITFALLS);
+    actionable.truncate(MAX_DEV_PITFALLS);
+    candidates.sort_by(|a, b| {
+        b.hits()
+            .cmp(&a.hits())
+            .then_with(|| b.last_observed_at().cmp(a.last_observed_at()))
+    });
+    candidates.truncate(MAX_UNCLASSIFIED_CANDIDATES);
+    store.extend(legacy_quarantine);
+    store.extend(candidates);
+    store.extend(actionable);
 }
 
 /// The current project's tech-stack fingerprint: lowercased dependency names
@@ -1107,33 +2168,33 @@ only — a few sentences, imperative voice, no preamble, no code dump."
 ///
 /// Fail-open: an empty strategy, a missing store, or any I/O error is a no-op —
 /// the caller falls back to the existing template path. Holds
-/// [`DEV_ERRORS_LOCK`] for the dev-errors read-modify-write so it never races
-/// the capture path (or any other dev-errors mutator).
+/// the cross-process pitfalls-store lock for the complete read-modify-write so
+/// it never races the capture path (or any other dev-errors mutator).
 pub fn record_pitfall_strategy(project_root: &Path, signature: &str, strategy: &str) -> bool {
+    if !project_capture_enabled(project_root, MemoryStore::PitfallReflections)
+        || !project_capture_enabled(project_root, MemoryStore::Pitfalls)
+    {
+        return false;
+    }
     let strategy = strategy.trim();
     if strategy.is_empty() {
         return false;
     }
-    let _kb_guard = lock_dev_errors();
+    let Some(_kb_guard) = acquire_raw_store_lock(project_root, DEV_ERRORS_FILE) else {
+        return false;
+    };
     let sig = normalize_signature(signature);
     let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
     if store.is_empty() {
         return false;
     }
-    let mut hit: Option<&Lesson> = None;
     let mut changed = false;
     for l in &mut store {
-        if l.kind == LessonKind::DevError && l.signature == sig {
+        if l.is_live_actionable_pitfall() && normalize_signature(&l.signature) == sig {
             let occ = l.hits();
             let eff = l.efficacy.get_or_insert(PitfallEfficacy {
-                injected: 0,
                 occ_at_injection: occ,
-                recurred_after_warning: false,
-                proven_fix: false,
-                failed_fixes: Vec::new(),
-                next_strategy: String::new(),
-                helpful: 0,
-                harmful: 0,
+                ..PitfallEfficacy::default()
             });
             eff.next_strategy = truncate(strategy, 600);
             changed = true;
@@ -1142,34 +2203,49 @@ pub fn record_pitfall_strategy(project_root: &Path, signature: &str, strategy: &
     if !changed {
         return false;
     }
-    // Snapshot for the sliding window BEFORE the write borrow ends.
-    if let Some(l) = store
+    let reflection = store
         .iter()
-        .find(|l| l.kind == LessonKind::DevError && l.signature == sig)
-    {
-        hit = Some(l);
+        .find(|l| l.is_live_actionable_pitfall() && normalize_signature(&l.signature) == sig)
+        .map(|lesson| Reflection {
+            signature: sig.clone(),
+            occurrences: lesson.hits(),
+            strategy: truncate(strategy, 600),
+            at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        });
+    // Never announce/append a reflection until the authoritative pitfall row
+    // committed. A locked Windows target or failed rename is a silent no-op.
+    if !write_raw_lessons_unlocked(project_root, DEV_ERRORS_FILE, &store) {
+        return false;
     }
-    if let Some(l) = hit {
-        append_reflection(
-            project_root,
-            &Reflection {
-                signature: sig.clone(),
-                occurrences: l.hits(),
-                strategy: truncate(strategy, 600),
-                at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            },
-        );
+    if let Some(reflection) = reflection {
+        append_reflection(project_root, &reflection);
     }
-    write_raw_lessons(project_root, DEV_ERRORS_FILE, &store);
     true
 }
 
 /// Append a reflection to its per-signature sliding window
 /// (`.umadev/reflections/<slug>.jsonl`), keeping only the most recent
 /// [`MAX_REFLECTIONS_PER_SIG`]. Fail-open.
-fn append_reflection(project_root: &Path, r: &Reflection) {
+fn append_reflection(project_root: &Path, r: &Reflection) -> bool {
+    let Some(_guard) =
+        (match umadev_state::store_lock::acquire(project_root, MemoryStore::PitfallReflections) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                tracing::warn!(
+                    store = MemoryStore::PitfallReflections.id(),
+                    %error,
+                    "pitfall reflection was not committed because its store lock was unavailable"
+                );
+                None
+            }
+        })
+    else {
+        return false;
+    };
     let dir = project_root.join(REFLECTIONS_DIR);
-    let _ = fs::create_dir_all(&dir);
+    if fs::create_dir_all(&dir).is_err() || !real_dir_no_follow(&dir) {
+        return false;
+    }
     // Signature → filesystem-safe slug.
     let slug: String = r
         .signature
@@ -1177,15 +2253,42 @@ fn append_reflection(project_root: &Path, r: &Reflection) {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let path = dir.join(format!("{slug}.jsonl"));
-    let mut window: Vec<Reflection> = fs::read_to_string(&path)
-        .ok()
-        .map(|text| {
-            text.lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(|l| serde_json::from_str::<Reflection>(l).ok())
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut window = match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Ok(metadata) if umadev_state::fs::metadata_is_real_file(&metadata) => {
+            let Ok(bytes) = umadev_state::fs::read_bounded(&path, MAX_REFLECTION_LEDGER_BYTES)
+            else {
+                tracing::warn!(path = %path.display(), "oversized or unreadable reflection ledger was isolated from RMW");
+                return false;
+            };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                tracing::warn!(path = %path.display(), "non-UTF-8 reflection ledger was isolated from RMW");
+                return false;
+            };
+            let mut entries = Vec::new();
+            for (index, line) in text.lines().enumerate() {
+                if index >= MAX_REFLECTION_LEDGER_LINES {
+                    tracing::warn!(path = %path.display(), "reflection ledger exceeded its record limit");
+                    return false;
+                }
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if line.len() > MAX_REFLECTION_LINE_BYTES {
+                    tracing::warn!(path = %path.display(), "oversized reflection record was isolated from RMW");
+                    return false;
+                }
+                if let Ok(entry) = serde_json::from_str::<Reflection>(line) {
+                    entries.push(entry);
+                }
+            }
+            entries
+        }
+        _ => {
+            tracing::warn!(path = %path.display(), "unsafe reflection ledger was isolated from RMW");
+            return false;
+        }
+    };
     window.push(r.clone());
     let len = window.len();
     if len > MAX_REFLECTIONS_PER_SIG {
@@ -1193,14 +2296,21 @@ fn append_reflection(project_root: &Path, r: &Reflection) {
     }
     let mut buf = String::new();
     for entry in &window {
-        if let Ok(line) = serde_json::to_string(entry) {
-            buf.push_str(&line);
-            buf.push('\n');
+        let Ok(line) = serde_json::to_string(entry) else {
+            return false;
+        };
+        if line.len() > MAX_REFLECTION_LINE_BYTES
+            || buf.len().saturating_add(line.len()).saturating_add(1)
+                > usize::try_from(MAX_REFLECTION_LEDGER_BYTES).unwrap_or(usize::MAX)
+        {
+            return false;
         }
+        buf.push_str(&line);
+        buf.push('\n');
     }
     // Atomic (temp+rename): a crash/kill between a plain truncate-write's truncate and
     // its flush would leave this learned-KB file EMPTY/torn - every recorded pitfall lost.
-    let _ = write_atomic(&path, &buf);
+    write_atomic(&path, &buf).is_ok()
 }
 
 /// Merge `incoming` tokens into `dst` (deduped), capping at `max`.
@@ -1217,90 +2327,205 @@ fn merge_tokens(dst: &mut Vec<String>, incoming: &[String], max: usize) {
 
 /// Overwrite a raw JSONL file with `lessons` (one per line). Fail-open.
 /// Used by the read-modify-write dev-error path so per-pitfall frequency stays
-/// on a single line instead of growing one line per occurrence.
-fn write_raw_lessons(project_root: &Path, filename: &str, lessons: &[Lesson]) {
-    let raw_dir = project_root.join(RAW_DIR);
-    let _ = fs::create_dir_all(&raw_dir);
-    let path = raw_dir.join(filename);
-    let mut buf = String::new();
-    for lesson in lessons {
-        if let Ok(line) = serde_json::to_string(lesson) {
-            buf.push_str(&line);
-            buf.push('\n');
-        }
-    }
-    // Atomic (temp+rename): a crash/kill between a plain truncate-write's truncate and
-    // its flush would leave this learned-KB file EMPTY/torn - every recorded pitfall lost.
-    let _ = write_atomic(&path, &buf);
+/// on a single line instead of growing one line per occurrence. Returns whether
+/// the atomic rename committed, so user-facing capture code never announces a
+/// lesson that only existed in memory.
+#[derive(Default)]
+struct RawLessonLedger {
+    lessons: Vec<Lesson>,
+    opaque_lines: Vec<String>,
 }
 
-/// Atomically write `body` to `path` via a unique temp file + rename, so a
-/// reader (or a concurrent writer in another process) never observes a torn /
-/// partially-written file. Used for the SHARED global learned dir, which is not
-/// covered by the per-project run lock. The temp name carries the process id and
-/// a high-resolution timestamp so two concurrent writers don't collide on the
-/// temp file itself. Best-effort cleanup of the temp on a rename failure.
-/// Returns the rename result so the caller can fail-open.
-fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = dir.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("lesson"),
-        std::process::id(),
-        stamp,
-    ));
-    fs::write(&tmp, body)?;
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Rename can fail across some filesystems / on Windows if the target
-            // is momentarily locked; clean the temp so we don't litter.
-            let _ = fs::remove_file(&tmp);
-            Err(e)
+fn read_raw_lesson_ledger(path: &Path) -> std::io::Result<RawLessonLedger> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RawLessonLedger::default());
+        }
+        Ok(metadata) if umadev_state::fs::metadata_is_real_file(&metadata) => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "raw lesson ledger is not a regular file",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    let bytes = umadev_state::fs::read_bounded(path, MAX_RAW_LEDGER_BYTES)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut ledger = RawLessonLedger::default();
+    let mut records = 0usize;
+    for line in text.lines() {
+        records = records.saturating_add(1);
+        if records > MAX_RAW_LEDGER_LINES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "raw lesson ledger exceeds its record limit",
+            ));
+        }
+        if line.len() > MAX_RAW_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "raw lesson record exceeds its byte limit",
+            ));
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Lesson>(line) {
+            Ok(lesson) => ledger.lessons.push(lesson),
+            Err(_) => ledger.opaque_lines.push(line.to_string()),
         }
     }
+    Ok(ledger)
+}
+
+fn render_raw_lesson_ledger(
+    lessons: &[Lesson],
+    opaque_lines: &[String],
+) -> std::io::Result<String> {
+    if lessons.len().saturating_add(opaque_lines.len()) > MAX_RAW_LEDGER_LINES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "raw lesson ledger exceeds its record limit",
+        ));
+    }
+    let max_total = usize::try_from(MAX_RAW_LEDGER_BYTES).unwrap_or(usize::MAX);
+    let mut body = String::new();
+    for lesson in lessons {
+        let line = serde_json::to_string(lesson)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if line.len() > MAX_RAW_LINE_BYTES
+            || body.len().saturating_add(line.len()).saturating_add(1) > max_total
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "raw lesson output exceeds its byte limit",
+            ));
+        }
+        body.push_str(&line);
+        body.push('\n');
+    }
+    for line in opaque_lines {
+        if line.len() > MAX_RAW_LINE_BYTES
+            || body.len().saturating_add(line.len()).saturating_add(1) > max_total
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "raw lesson output exceeds its byte limit",
+            ));
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    Ok(body)
+}
+
+fn write_raw_lessons_unlocked(project_root: &Path, filename: &str, lessons: &[Lesson]) -> bool {
+    let Some(raw_dir) = ensure_raw_lessons_dir(project_root) else {
+        return false;
+    };
+    let path = raw_dir.join(filename);
+    // A malformed legacy line cannot influence behavior because readers skip
+    // it, but silently deleting it during an unrelated read-modify-write would
+    // break the append-only audit posture. Carry every unparseable non-empty
+    // line forward verbatim; later valid writes neither duplicate nor repair it.
+    let Ok(existing) = read_raw_lesson_ledger(&path) else {
+        tracing::warn!(path = %path.display(), "raw lesson ledger was not overwritten because bounded validation failed");
+        return false;
+    };
+    let Ok(buf) = render_raw_lesson_ledger(lessons, &existing.opaque_lines) else {
+        tracing::warn!(path = %path.display(), "raw lesson ledger output exceeded a safety bound");
+        return false;
+    };
+    // Atomic (temp+rename): a crash/kill between a plain truncate-write's truncate and
+    // its flush would leave this learned-KB file EMPTY/torn - every recorded pitfall lost.
+    write_atomic(&path, &buf).is_ok()
+}
+
+#[cfg(test)]
+fn write_raw_lessons(project_root: &Path, filename: &str, lessons: &[Lesson]) -> bool {
+    let Some(_guard) = acquire_raw_store_lock(project_root, filename) else {
+        return false;
+    };
+    write_raw_lessons_unlocked(project_root, filename, lessons)
+}
+
+/// Atomically and durably replace `path` through the shared no-follow state
+/// primitive. Returns the commit result so callers can fail open honestly.
+fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FORCE_ATOMIC_WRITE_FAILURE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("forced atomic-write failure"));
+    }
+    umadev_state::fs::atomic_write(path, body.as_bytes())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_ATOMIC_WRITE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn with_forced_atomic_write_failure<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORCE_ATOMIC_WRITE_FAILURE.with(|forced| forced.set(false));
+        }
+    }
+    FORCE_ATOMIC_WRITE_FAILURE.with(|forced| forced.set(true));
+    let _reset = Reset;
+    f()
 }
 
 /// Append lessons to a raw JSONL file. Fail-open (best-effort write).
-fn append_raw_lessons(project_root: &Path, filename: &str, lessons: &[Lesson]) {
+fn append_raw_lessons(project_root: &Path, filename: &str, lessons: &[Lesson]) -> bool {
     if lessons.is_empty() {
-        return;
+        return true;
     }
-    let raw_dir = project_root.join(RAW_DIR);
-    let _ = fs::create_dir_all(&raw_dir);
+    let Some(_guard) = acquire_raw_store_lock(project_root, filename) else {
+        return false;
+    };
+    let Some(raw_dir) = ensure_raw_lessons_dir(project_root) else {
+        return false;
+    };
     let path = raw_dir.join(filename);
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        for lesson in lessons {
-            if let Ok(line) = serde_json::to_string(lesson) {
-                let _ = writeln!(f, "{line}");
-            }
-        }
-    }
+    // Rebuild through the no-follow atomic writer instead of opening in append
+    // mode; a hostile final-component link is rejected without touching it.
+    let Ok(mut ledger) = read_raw_lesson_ledger(&path) else {
+        tracing::warn!(path = %path.display(), "raw lesson append was not committed because bounded validation failed");
+        return false;
+    };
+    ledger.lessons.extend_from_slice(lessons);
+    let Ok(body) = render_raw_lesson_ledger(&ledger.lessons, &ledger.opaque_lines) else {
+        tracing::warn!(path = %path.display(), "raw lesson append exceeded a safety bound");
+        return false;
+    };
+    write_atomic(&path, &body).is_ok()
 }
 
-/// Read all raw lessons from a file. Returns empty vec on missing/malformed.
+/// Read all valid raw lessons from a file. Missing files return empty; malformed
+/// lines are excluded from behavior but preserved by the internal raw-lesson writer.
 #[must_use]
 pub fn read_raw_lessons(project_root: &Path, filename: &str) -> Vec<Lesson> {
-    let path = project_root.join(RAW_DIR).join(filename);
-    let Ok(text) = fs::read_to_string(&path) else {
+    let Some(raw_dir) = existing_raw_lessons_dir(project_root) else {
         return Vec::new();
     };
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<Lesson>(l).ok())
-        .collect()
+    let path = raw_dir.join(filename);
+    match read_raw_lesson_ledger(&path) {
+        Ok(ledger) => ledger.lessons,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "raw lesson ledger was isolated from behavior");
+            Vec::new()
+        }
+    }
 }
 
 /// Read ALL raw lessons across all files. Deliberately EXCLUDES the derived
 /// belief ledger ([`BELIEFS_FILE`]) — beliefs are folded FROM these raw lessons,
 /// so the reconcile/sediment paths that call this must not see them as fresh
-/// input (that would re-fold a fold). Retrieval uses [`read_lessons_for_recall`]
+/// input (that would re-fold a fold). Retrieval uses the internal recall reader
 /// instead, which adds beliefs as first-class candidates.
 #[must_use]
 pub fn read_all_raw_lessons(project_root: &Path) -> Vec<Lesson> {
@@ -1322,8 +2547,25 @@ pub fn read_all_raw_lessons(project_root: &Path) -> Vec<Lesson> {
 /// the belief-preference in selection, win over) their own raw evidence.
 #[must_use]
 fn read_lessons_for_recall(project_root: &Path) -> Vec<Lesson> {
-    let mut all = read_all_raw_lessons(project_root);
-    all.extend(read_raw_lessons(project_root, BELIEFS_FILE));
+    // Prompt recall is leaf-store aware. Reporting/audit readers deliberately use
+    // `read_all_raw_lessons` instead, so a recall toggle never hides inventory or
+    // provenance from the user.
+    let mut all = Vec::new();
+    for (file, store) in [
+        ("quality-failures.jsonl", MemoryStore::QualityFailures),
+        ("gate-revisions.jsonl", MemoryStore::GateRevisions),
+        ("validated-decisions.jsonl", MemoryStore::ValidatedPatterns),
+        ("tech-debt.jsonl", MemoryStore::TechDebt),
+        (DEV_ERRORS_FILE, MemoryStore::Pitfalls),
+        (BELIEFS_FILE, MemoryStore::Beliefs),
+    ] {
+        if project_recall_enabled(project_root, store) {
+            all.extend(read_raw_lessons(project_root, file));
+        }
+    }
+    // Preserve generic dev-error rows in raw storage for provenance, but never
+    // let low-information fallbacks influence a future prompt.
+    all.retain(|l| !l.invalidated && l.is_actionable_pitfall());
     all
 }
 
@@ -1540,6 +2782,19 @@ fn truncate(s: &str, max: usize) -> String {
     t
 }
 
+/// Validate a lesson domain before using it as one filesystem path component.
+/// Generated domains are short ASCII taxonomy ids (`dependency`, `api`, ...).
+/// A malformed or hand-edited raw row is retained for audit but never allowed
+/// to turn `../`, an absolute path, or a newline into a sediment write target.
+fn safe_domain_segment(domain: &str) -> Option<&str> {
+    (!domain.is_empty()
+        && domain.len() <= 64
+        && domain
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+    .then_some(domain)
+}
+
 // =====================================================================
 // Step 2: Sediment — turn raw JSONL lessons into retrievable markdown.
 // =====================================================================
@@ -1552,21 +2807,101 @@ fn truncate(s: &str, max: usize) -> String {
 /// usually unset on Windows — so global experience silently never loaded.
 #[must_use]
 pub fn global_learned_dir() -> Option<PathBuf> {
-    let home = home_dir()?;
-    let dir = home.join(GLOBAL_LEARNED_DIRNAME);
-    // Bootstrap: create the dir so a fresh machine can accumulate global
-    // experience (before this fix, promote_to_global silently did nothing
-    // on machines where ~/.umadev/learned/ didn't exist yet).
-    if dir.is_dir() {
-        Some(dir)
-    } else {
-        let _ = std::fs::create_dir_all(&dir);
-        Some(dir)
+    let dir = ensure_managed_learned_dir(&home_dir()?)?;
+    quarantine_unsafe_global_sediments_at(&dir);
+    global_learned_tree_is_real(&dir).then_some(dir)
+}
+
+fn real_dir_no_follow(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+}
+
+/// Create one managed directory component without following an existing link.
+fn ensure_real_child_dir(parent: &Path, child: &Path) -> bool {
+    if !real_dir_no_follow(parent) {
+        return false;
     }
+    match fs::symlink_metadata(child) {
+        Ok(meta) => meta.file_type().is_dir(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let _ = fs::create_dir(child);
+            real_dir_no_follow(parent) && real_dir_no_follow(child)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Resolve a user-selected boundary while refusing links in UmaDev-managed
+/// components. The boundary itself may legitimately be a symlink (workspace
+/// aliases and managed home directories are common), so only `.umadev` and
+/// `learned` are subject to the no-follow rule.
+fn managed_learned_components(boundary: &Path) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let boundary = fs::canonicalize(boundary).ok()?;
+    if !real_dir_no_follow(&boundary) {
+        return None;
+    }
+    let umadev_root = boundary.join(".umadev");
+    let learned = umadev_root.join("learned");
+    Some((boundary, umadev_root, learned))
+}
+
+fn ensure_managed_learned_dir(boundary: &Path) -> Option<PathBuf> {
+    let (boundary, umadev_root, learned) = managed_learned_components(boundary)?;
+    if !ensure_real_child_dir(&boundary, &umadev_root)
+        || !ensure_real_child_dir(&umadev_root, &learned)
+    {
+        return None;
+    }
+    Some(learned)
+}
+
+fn existing_managed_learned_dir(boundary: &Path) -> Option<PathBuf> {
+    let (_, umadev_root, learned) = managed_learned_components(boundary)?;
+    (real_dir_no_follow(&umadev_root) && real_dir_no_follow(&learned)).then_some(learned)
+}
+
+fn ensure_raw_lessons_dir(project_root: &Path) -> Option<PathBuf> {
+    let learned = ensure_managed_learned_dir(project_root)?;
+    let raw = learned.join("_raw");
+    ensure_real_child_dir(&learned, &raw).then_some(raw)
+}
+
+fn existing_raw_lessons_dir(project_root: &Path) -> Option<PathBuf> {
+    let learned = existing_managed_learned_dir(project_root)?;
+    let raw = learned.join("_raw");
+    real_dir_no_follow(&raw).then_some(raw)
+}
+
+/// Validate the HOME-owned components that quarantine may traverse.
+fn global_learned_tree_is_real(root: &Path) -> bool {
+    let Some(umadev_root) = root.parent() else {
+        return false;
+    };
+    let Some(home) = umadev_root.parent() else {
+        return false;
+    };
+    real_dir_no_follow(home) && real_dir_no_follow(umadev_root) && real_dir_no_follow(root)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_HOME_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Set the lessons-only, thread-local home used by unit tests.
+#[cfg(test)]
+pub(crate) fn set_test_home_override(path: Option<PathBuf>) {
+    TEST_HOME_OVERRIDE.with(|slot| *slot.borrow_mut() = path);
 }
 
 /// Cross-platform home directory: `HOME` then `USERPROFILE` (Windows).
 fn home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = TEST_HOME_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return Some(path);
+    }
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
@@ -1737,6 +3072,19 @@ const RECONCILE_FILES: &[&str] = &[
     "tech-debt.jsonl",
 ];
 
+fn read_reconcilable_lessons_for_recall(project_root: &Path) -> Vec<Lesson> {
+    let mut lessons = Vec::new();
+    for file in RECONCILE_FILES {
+        let Some(store) = raw_lesson_store(file) else {
+            continue;
+        };
+        if project_recall_enabled(project_root, store) {
+            lessons.extend(read_raw_lessons(project_root, file));
+        }
+    }
+    lessons
+}
+
 // =====================================================================
 // Belief layer (①): fold N similar raw lessons into one denser rule.
 //
@@ -1821,8 +3169,8 @@ fn stable_str_hash(s: &str) -> u64 {
 
 /// Fold the current raw lessons into the belief ledger: cluster similar
 /// non-pitfall, non-invalidated lessons (deterministic connected components over
-/// [`lesson_similarity`] ≥ [`BELIEF_FOLD_THRESHOLD`]) and, for every cluster of
-/// at least [`BELIEF_MIN_CLUSTER`], ADD a fresh belief or UPDATE the existing one
+/// the internal lesson-similarity threshold) and, for every sufficiently large
+/// cluster, ADD a fresh belief or UPDATE the existing one
 /// that already covers those lessons.
 ///
 /// Reuses the ADD/UPDATE posture of the reconcile machinery: a cluster whose
@@ -1834,6 +3182,12 @@ fn stable_str_hash(s: &str) -> u64 {
 /// from the sediment path; recall then prefers these beliefs over their raw
 /// evidence.
 pub fn fold_beliefs(project_root: &Path) -> usize {
+    if !project_capture_enabled(project_root, MemoryStore::Beliefs) {
+        return 0;
+    }
+    let Some(_belief_guard) = acquire_raw_store_lock(project_root, BELIEFS_FILE) else {
+        return 0;
+    };
     let raw = read_all_raw_lessons(project_root);
     // Cluster only the curatable, still-valid, non-pitfall lessons: pitfalls have
     // their own dedup/efficacy loop, and folding them would fight it.
@@ -1886,8 +3240,12 @@ pub fn fold_beliefs(project_root: &Path) -> usize {
                 .iter()
                 .map(|&i| beliefs[i].trust)
                 .fold(folded.trust, f32::max);
+            let carried_invalidation = matching
+                .iter()
+                .any(|&i| beliefs[i].pitfall_status() == PitfallStatus::Invalidated);
             beliefs[keep] = folded;
             beliefs[keep].trust = carried_trust;
+            beliefs[keep].invalidated = carried_invalidation;
             // Drop every OTHER overlapping belief (high index → low so the earlier
             // removals don't shift the indices we still need to remove).
             for &idx in matching.iter().skip(1).rev() {
@@ -1903,8 +3261,11 @@ pub fn fold_beliefs(project_root: &Path) -> usize {
         return 0;
     }
     prune_beliefs(&mut beliefs);
-    write_raw_lessons(project_root, BELIEFS_FILE, &beliefs);
-    touched
+    if write_raw_lessons_unlocked(project_root, BELIEFS_FILE, &beliefs) {
+        touched
+    } else {
+        0
+    }
 }
 
 /// Build ONE belief lesson from a cluster of raw lessons. The belief's body is a
@@ -1955,9 +3316,10 @@ fn fold_one_cluster(
         format!("Belief: {topic} ({} lessons)", members.len())
     };
     let body = format!(
-        "A recurring rule distilled from {n} similar prior lessons in the \
-         `{domain}` domain. The pattern below held across all of them, so treat \
-         it as a confirmed rule, not a one-off:\n\n{rep_root}\n\nKeywords: {kw}",
+        "A candidate rule grouped from {n} similar prior lessons in the \
+         `{domain}` domain. Similarity is only a clustering signal: consult the \
+         typed evidence lifecycle before treating this hypothesis as corroborated \
+         or validated.\n\n{rep_root}\n\nKeywords: {kw}",
         n = members.len(),
         kw = keywords.join(", "),
     );
@@ -1966,6 +3328,17 @@ fn fold_one_cluster(
         .map(|l| l.source_requirement.clone())
         .find(|s| !s.is_empty())
         .unwrap_or_default();
+    let mut lifecycle = PitfallEfficacy::default();
+    for evidence in members.iter().flat_map(|lesson| {
+        lesson
+            .efficacy
+            .as_ref()
+            .into_iter()
+            .flat_map(|efficacy| efficacy.recent_observations.iter())
+    }) {
+        let _ = remember_observation(&mut lifecycle, evidence.clone());
+    }
+    let efficacy = (!lifecycle.recent_observations.is_empty()).then_some(lifecycle);
     Lesson {
         kind: LessonKind::Belief,
         domain,
@@ -1979,7 +3352,7 @@ fn fold_one_cluster(
         signature: String::new(),
         occurrences: u32::try_from(members.len()).unwrap_or(u32::MAX),
         context: Vec::new(),
-        efficacy: None,
+        efficacy,
         invalidated: false,
         trust: NEUTRAL_TRUST,
         evidence_count: u32::try_from(members.len()).unwrap_or(u32::MAX),
@@ -2104,8 +3477,8 @@ const CONTRA_MIN_ADVICE_TOKENS: usize = 4;
 /// the scan demand evidence of DISAGREEMENT, not merely different phrasing — the
 /// fix for "two lessons that agree but word it differently get mis-invalidated".
 /// Each entry is `(positive, negative)`; the check is symmetric (either lesson may
-/// hold either pole). Lowercased ASCII tokens (the advice is tokenised the same
-/// way), so this is language-light but covers the common engineering-advice verbs.
+/// hold either pole). Advice uses lowercased ASCII words plus CJK bigrams, so the
+/// fixed pairs cover common English and Chinese engineering-advice verbs.
 const CONTRA_ANTONYMS: &[(&str, &str)] = &[
     ("add", "remove"),
     ("add", "drop"),
@@ -2127,6 +3500,20 @@ const CONTRA_ANTONYMS: &[(&str, &str)] = &[
     ("required", "optional"),
     ("sync", "async"),
     ("synchronous", "asynchronous"),
+    ("添加", "删除"),
+    ("启用", "禁用"),
+    ("总是", "从不"),
+    ("使用", "避免"),
+    ("允许", "拒绝"),
+    ("允许", "阻止"),
+    ("包含", "排除"),
+    ("显示", "隐藏"),
+    ("增加", "减少"),
+    ("保留", "删除"),
+    ("创建", "删除"),
+    ("开启", "关闭"),
+    ("必需", "可选"),
+    ("同步", "异步"),
 ];
 
 /// Whether two lessons' advice carries OPPOSING verbs from [`CONTRA_ANTONYMS`] —
@@ -2205,8 +3592,8 @@ fn genuine_contradiction(
 
 /// Scan the raw ledgers for same-topic lesson pairs that GENUINELY contradict —
 /// high topic overlap, low advice-text overlap, AND an explicit antonym conflict
-/// ([`genuine_contradiction`]) — and route each hit through the INVALIDATE path,
-/// marking the LOSER ([`contradiction_loser`]: the lower-efficacy side, or the
+/// (using the internal genuine-contradiction classifier) — and route each hit through
+/// the INVALIDATE path, marking the lower-efficacy side (or the
 /// OLDER one on a tie) invalid. Returns how many lessons were invalidated. Bounded
 /// O(n²); deterministic; pure-local; fail-open.
 ///
@@ -2302,20 +3689,28 @@ fn apply_invalidations(
 ) -> usize {
     let mut marked = 0usize;
     for file in RECONCILE_FILES {
+        if raw_lesson_store(file).is_some_and(|store| !project_capture_enabled(project_root, store))
+        {
+            continue;
+        }
+        let Some(_store_guard) = acquire_raw_store_lock(project_root, file) else {
+            continue;
+        };
         let mut rows = read_raw_lessons(project_root, file);
         if rows.is_empty() {
             continue;
         }
         let mut file_changed = false;
+        let mut file_marked = 0usize;
         for row in &mut rows {
             if !row.invalidated && to_invalidate.contains(&lesson_identity(row)) {
                 row.invalidated = true;
                 file_changed = true;
-                marked += 1;
+                file_marked += 1;
             }
         }
-        if file_changed {
-            write_raw_lessons(project_root, file, &rows);
+        if file_changed && write_raw_lessons_unlocked(project_root, file, &rows) {
+            marked = marked.saturating_add(file_marked);
         }
     }
     marked
@@ -2328,15 +3723,15 @@ fn apply_invalidations(
 /// The efficacy-aware sibling of [`scan_contradictions`], scoped to the just-
 /// captured lessons (only pairs where at least ONE side is new are judged, so this
 /// is targeted and cheap, not a full re-scan). A conflict must clear the SAME
-/// triple gate ([`genuine_contradiction`]: high topic overlap, low advice overlap,
+/// triple gate (the internal genuine-contradiction classifier: high topic overlap, low advice overlap,
 /// and an explicit antonym), so two lessons that merely share a tech but AGREE are
-/// left alone. On a real conflict the [`contradiction_loser`] (the lower
+/// left alone. On a real conflict the lower-standing side (the lower
 /// helpful/harmful + trust side, or the older one on a tie) is marked `invalidated`
 /// (non-destructive; the row stays on disk for provenance, out of recall). Pitfalls
 /// (`DevError`) and beliefs govern themselves and never participate, matching
 /// `scan_contradictions`.
 ///
-/// Bounded (pool capped at [`BELIEF_SCAN_LIMIT`]), deterministic, pure-local, and
+/// Bounded by the internal belief-scan limit, deterministic, pure-local, and
 /// fail-open: an empty input, a `< 2` pool, or any store error marks nothing (`0`)
 /// and never panics. Returns how many lessons were invalidated.
 pub fn resolve_new_lesson_conflicts(project_root: &Path, new_lessons: &[Lesson]) -> usize {
@@ -2402,7 +3797,9 @@ pub fn resolve_new_lesson_conflicts(project_root: &Path, new_lessons: &[Lesson])
 /// neighbours to reconcile.
 #[must_use]
 pub fn reconcile_candidates(project_root: &Path) -> Vec<(Lesson, Vec<Lesson>)> {
-    let all = read_all_raw_lessons(project_root);
+    // Candidate pairs are rendered into a base prompt by both runner paths, so
+    // this is a real recall/injection boundary rather than a reporting read.
+    let all = read_reconcilable_lessons_for_recall(project_root);
     // Newest-first so a fresher lesson is judged against its older neighbours.
     let mut pool: Vec<&Lesson> = all
         .iter()
@@ -2500,6 +3897,13 @@ fn reconcile_lessons(project_root: &Path, all: &[Lesson], judge: Option<Reconcil
     // reconcile path). Fail-open per file.
     let mut changed = false;
     for file in RECONCILE_FILES {
+        if raw_lesson_store(file).is_some_and(|store| !project_capture_enabled(project_root, store))
+        {
+            continue;
+        }
+        let Some(_store_guard) = acquire_raw_store_lock(project_root, file) else {
+            continue;
+        };
         let mut rows = read_raw_lessons(project_root, file);
         if rows.is_empty() {
             continue;
@@ -2511,8 +3915,7 @@ fn reconcile_lessons(project_root: &Path, all: &[Lesson], judge: Option<Reconcil
                 file_changed = true;
             }
         }
-        if file_changed {
-            write_raw_lessons(project_root, file, &rows);
+        if file_changed && write_raw_lessons_unlocked(project_root, file, &rows) {
             changed = true;
         }
     }
@@ -2535,7 +3938,7 @@ pub fn sediment_lessons(project_root: &Path) -> usize {
 /// historical [`sediment_lessons`] (NOOP for every lesson → pure append).
 ///
 /// Reconcile flow (only when a judge is supplied):
-/// 1. For each fresh lesson, find the top-[`RECONCILE_TOP_S`] similar PRIOR
+/// 1. For each fresh lesson, find a bounded set of the most similar PRIOR
 ///    lessons and ask the judge for ADD/UPDATE/INVALIDATE/NOOP.
 /// 2. UPDATE / INVALIDATE → mark the most-similar conflicting prior lesson
 ///    `invalidated` in the raw ledger (never a physical delete).
@@ -2552,8 +3955,11 @@ pub fn sediment_lessons_with_judge(project_root: &Path, judge: Option<ReconcileJ
 
     // Reconcile (base-judged) — may mark some prior lessons invalid in the raw
     // ledger. Re-read afterwards so the sediment set reflects the marks.
-    if judge.is_some() && reconcile_lessons(project_root, &lessons, judge) {
-        lessons = read_all_raw_lessons(project_root);
+    if judge.is_some() {
+        let recallable = read_reconcilable_lessons_for_recall(project_root);
+        if reconcile_lessons(project_root, &recallable, judge) {
+            lessons = read_all_raw_lessons(project_root);
+        }
     }
 
     // Memory hygiene (②) + belief fold (①) — both deterministic + pure-local, so
@@ -2573,15 +3979,16 @@ pub fn sediment_lessons_with_judge(project_root: &Path, judge: Option<ReconcileJ
     // so the sediment-clean pass below still wipes a domain whose ONLY lesson was just
     // invalidated (it is about to vanish from `lessons`/`by_key`, but its stale `lesson-*.md`
     // must still be removed or it keeps being retrieved - the ghost-sediment bug).
-    let touched_domains: std::collections::HashSet<String> =
-        lessons.iter().map(|l| l.domain.clone()).collect();
+    let touched_domains: std::collections::HashSet<String> = lessons
+        .iter()
+        .filter_map(|lesson| safe_domain_segment(&lesson.domain).map(str::to_string))
+        .collect();
     // Drop invalidated lessons from the sediment candidate set (they stay on
     // disk for provenance but never become retrievable markdown). No-op for the
     // no-base path, where nothing is ever marked invalid.
-    lessons.retain(|l| !l.invalidated);
-    if lessons.is_empty() {
-        return 0;
-    }
+    lessons.retain(|l| {
+        !l.invalidated && l.is_actionable_pitfall() && safe_domain_segment(&l.domain).is_some()
+    });
 
     // Decay pass: an ancient, never-reinforced NON-pitfall lesson whose recency
     // weight has fallen below the floor drops out of the sediment top-k (it
@@ -2594,9 +4001,38 @@ pub fn sediment_lessons_with_judge(project_root: &Path, judge: Option<ReconcileJ
             l.kind == LessonKind::DevError
                 || recency_weight(&l.first_seen, now) >= RECONCILE_DECAY_FLOOR
         });
-        if lessons.is_empty() {
-            return 0;
+    }
+
+    // Sediment is a derived capture surface, not the authoritative audit ledger.
+    // Keep reconciliation/contradiction invalidation above this gate so disabling
+    // the derived Markdown view cannot freeze stale raw advice. The independent
+    // global projection retains its own leaf-store gate inside `promote_to_global`.
+    if !project_capture_enabled(project_root, MemoryStore::LessonSediment) {
+        if promote_to_global(project_root, &lessons) > 0 {
+            umadev_knowledge::invalidate_cache(project_root);
         }
+        return 0;
+    }
+
+    // Clean prior auto-sediment BEFORE the empty return. This is what removes
+    // already-materialised generic/invalidated advice while retaining its raw
+    // audit row. The previous early return left ghost markdown retrievable.
+    let _ = global_learned_dir();
+    let Some(learned_root) = ensure_managed_learned_dir(project_root) else {
+        // An existing managed-component link is an untrusted boundary. Keep the
+        // raw audit rows, but never clean or materialise through that link.
+        umadev_knowledge::invalidate_cache(project_root);
+        return 0;
+    };
+    for domain in &touched_domains {
+        let domain_dir = learned_root.join(domain);
+        if ensure_real_child_dir(&learned_root, &domain_dir) {
+            clear_auto_sediment_files(&domain_dir);
+        }
+    }
+    if lessons.is_empty() {
+        umadev_knowledge::invalidate_cache(project_root);
+        return 0;
     }
 
     // Dedupe by (domain, title) — keep the latest first_seen. On a
@@ -2618,8 +4054,6 @@ pub fn sediment_lessons_with_judge(project_root: &Path, judge: Option<ReconcileJ
         }
     }
 
-    let learned_root = project_root.join(LEARNED_DIR);
-    let _ = fs::create_dir_all(&learned_root);
     let mut written = 0usize;
 
     // Clear stale `lesson-*.md` orphans in every domain dir this run touches
@@ -2637,28 +4071,26 @@ pub fn sediment_lessons_with_judge(project_root: &Path, judge: Option<ReconcileJ
     // left that domain stale lesson-*.md on disk, and it kept being RETRIEVED (the ghost). The
     // re-write below recreates files only for the SURVIVING lessons, so an all-invalidated
     // domain ends up correctly empty.
-    for domain in &touched_domains {
-        let domain_dir = learned_root.join(domain);
-        let _ = fs::create_dir_all(&domain_dir);
-        clear_auto_sediment_files(&domain_dir);
-    }
-
     for (key, lesson) in &by_key {
         let domain_dir = learned_root.join(&lesson.domain);
-        let _ = fs::create_dir_all(&domain_dir);
+        if !ensure_real_child_dir(&learned_root, &domain_dir) {
+            continue;
+        }
         let path = domain_dir.join(format!(
             "lesson-{domain}-{:016x}.md",
             stable_str_hash(key),
             domain = lesson.domain
         ));
         let body = render_lesson_markdown(lesson);
-        if fs::write(&path, body).is_ok() {
+        // The no-follow atomic writer rejects a hostile final-component link;
+        // the verified real domain directory confines its temporary file.
+        if write_atomic(&path, &body).is_ok() {
             written += 1;
         }
     }
 
     // Promote frequently-occurring lessons to the global dir.
-    let _ = promote_to_global(project_root, &lessons);
+    let promoted = promote_to_global(project_root, &lessons);
 
     // Close the timing race: we just wrote new `.umadev/learned/*.md`, but the
     // BM25 index is content-hash cached, so a retrieval later in THIS SAME run
@@ -2666,7 +4098,7 @@ pub fn sediment_lessons_with_judge(project_root: &Path, judge: Option<ReconcileJ
     // learned. Invalidating the cache forces the next retrieval to re-scan the
     // now-larger corpus, making this run's lessons retrievable this run.
     // Fail-open (a no-op when nothing was written / no cache exists).
-    if written > 0 {
+    if written > 0 || promoted > 0 {
         umadev_knowledge::invalidate_cache(project_root);
     }
 
@@ -2689,9 +4121,14 @@ fn render_lesson_markdown(lesson: &Lesson) -> String {
         LessonKind::DevError => "[pitfall] Dev error",
         LessonKind::Belief => "[belief] Folded rule",
     };
+    let pitfall_safety = if lesson.kind == LessonKind::DevError && lesson.is_recognized() {
+        "pitfall_safety: classifier-derived-v2\n"
+    } else {
+        ""
+    };
     let keywords_inline = lesson.keywords.join(", ");
     format!(
-        "---\nid: lesson-{domain}\ntitle: {title}\ndomain: {domain}\ncategory: learned\ntags: [{tags}]\nmaintainer: auto-sediment\nlast_updated: {date}\n---\n\
+        "---\nid: lesson-{domain}\ntitle: {title}\ndomain: {domain}\ncategory: learned\ntags: [{tags}]\nmaintainer: auto-sediment\n{pitfall_safety}last_updated: {date}\n---\n\
 # {kind_label}: {title}\n\n\
 ## Symptom\n\n{body}\n\n\
 Keywords: {keywords_inline}\n\n\
@@ -2700,6 +4137,7 @@ Keywords: {keywords_inline}\n\n\
         domain = lesson.domain,
         title = lesson.title,
         tags = lesson.keywords.join(", "),
+        pitfall_safety = pitfall_safety,
         date = date,
         kind_label = kind_label,
         body = lesson.body,
@@ -2709,38 +4147,102 @@ Keywords: {keywords_inline}\n\n\
     )
 }
 
-/// Whether a lesson group is general enough to share across ALL projects.
+/// Whether a lesson group has enough evidence to cross a project boundary.
 ///
-/// Two routes to "global-worthy":
-/// - the same `(domain, title)` recurred across ≥2 distinct requirements
-///   (the original signal — a pattern, not a one-off), OR
-/// - it's a **recognised development error** (a `DevError` whose signature is
-///   not the generic `general/error/...` fallback). A classified technical
-///   pitfall — `cannot find module`, a CORS block, a type mismatch — is
-///   inherently cross-project knowledge, so it promotes on first sight. This is
-///   what makes "next time, first try" work even in a brand-new project.
-fn group_is_global_worthy(group: &[&Lesson], distinct_reqs: usize) -> bool {
-    if distinct_reqs >= 2 {
-        return true;
-    }
-    group.iter().any(|l| {
-        l.kind == LessonKind::DevError
-            && !l.signature.is_empty()
-            && !l.signature.starts_with("general/")
+/// Only precisely classified development errors may be shared globally, and
+/// only after exact mechanical validation. Independent recurrence may
+/// corroborate a project-local hypothesis, but never authorises promotion.
+/// Other lesson kinds can contain requirements, review prose, or customer
+/// entities and therefore remain project-local until they have a separately
+/// designed, typed redaction schema.
+fn group_is_global_worthy(group: &[&Lesson]) -> bool {
+    group.iter().any(|lesson| {
+        lesson.kind == LessonKind::DevError
+            && lesson.is_recognized()
+            && lesson.pitfall_status() == PitfallStatus::Validated
     })
 }
 
-/// Promote lessons that appear across multiple distinct requirements to the
-/// global `~/.umadev/learned/` dir, so all projects benefit. A lesson is
-/// "global-worthy" if its domain+title appears with ≥2 different source
-/// requirements (indicating it's a general pattern, not project-specific), or
-/// if it's a recognised development error (see [`group_is_global_worthy`]).
-fn promote_to_global(_project_root: &Path, lessons: &[Lesson]) -> usize {
+/// Classifier families whose first two signature segments are product-owned
+/// constants. Any discriminator after them may be a private package, symbol,
+/// path-derived token, or evidence hash and must never cross projects.
+const GLOBAL_SAFE_DEV_ERROR_FAMILIES: &[&str] = &[
+    "windows/powershell-execution-policy",
+    "dependency/test-deps-missing",
+    "dependency/module-not-found",
+    "dependency/package-manager",
+    "runtime/permission",
+    "type/type-mismatch",
+    "runtime/undefined-access",
+    "runtime/panic",
+    "runtime/port-in-use",
+    "network/cors",
+    "network/connection-refused",
+    "api/http-error",
+    "config/env-missing",
+    "build/syntax",
+    "test/assertion",
+    "build/build-failed",
+];
+
+fn global_safe_dev_error_lesson(lesson: &Lesson) -> Option<Lesson> {
+    if lesson.kind != LessonKind::DevError || !lesson.is_recognized() {
+        return None;
+    }
+    let mut parts = lesson.signature.split('/');
+    let family = format!("{}/{}", parts.next()?, parts.next()?);
+    if !GLOBAL_SAFE_DEV_ERROR_FAMILIES.contains(&family.as_str()) {
+        return None;
+    }
+    let (safe_root_cause, safe_fix) = crate::error_kb::classifier_owned_family_guidance(&family)?;
+
+    let domain = family.split('/').next()?;
+    let keywords = family
+        .split(['/', '-'])
+        .filter(|token| token.len() >= 3)
+        .map(ToString::to_string)
+        .collect();
+    Some(Lesson {
+        kind: LessonKind::DevError,
+        domain: domain.to_string(),
+        title: format!("Reusable development-error rule: {family}"),
+        body: format!(
+            "A recurring development-error family matched `{family}`. Project-local \
+             identifiers, evidence, requirements, and signature discriminators were \
+             intentionally omitted from global memory."
+        ),
+        fix: safe_fix,
+        root_cause: safe_root_cause,
+        keywords,
+        source_requirement: String::new(),
+        first_seen: utc_now_iso(),
+        signature: family,
+        occurrences: lesson.hits(),
+        context: Vec::new(),
+        efficacy: None,
+        invalidated: false,
+        trust: NEUTRAL_TRUST,
+        evidence_count: 0,
+        evidence: Vec::new(),
+    })
+}
+
+/// Promote recurrent or exactly validated classifier families to the global
+/// `~/.umadev/learned/` dir. The global representation is rebuilt from a
+/// classifier allowlist and drops every project-specific discriminator.
+fn promote_to_global(project_root: &Path, lessons: &[Lesson]) -> usize {
+    if !capture_enabled(
+        project_root,
+        MemoryScope::Global,
+        MemoryStore::GlobalLessonProjection,
+    ) {
+        return 0;
+    }
     let Some(global_dir) = global_learned_dir() else {
         return 0; // HOME unset or dir doesn't exist yet — skip.
     };
 
-    // Group by (domain, title) and count distinct requirements.
+    // Group exact project-local incidents before reducing each to a safe family.
     let mut groups: std::collections::HashMap<String, Vec<&Lesson>> =
         std::collections::HashMap::new();
     for lesson in lessons {
@@ -2749,13 +4251,9 @@ fn promote_to_global(_project_root: &Path, lessons: &[Lesson]) -> usize {
     }
 
     let mut promoted = 0usize;
-    for (key, group) in &groups {
-        let distinct_reqs: std::collections::HashSet<&str> = group
-            .iter()
-            .map(|l| l.source_requirement.as_str())
-            .collect();
-        if !group_is_global_worthy(group, distinct_reqs.len()) {
-            continue; // one-off, project-specific — not general enough.
+    for group in groups.values() {
+        if !group_is_global_worthy(group) {
+            continue;
         }
         // Promote the latest lesson in this group. Use the deterministic
         // total-order from lesson_precedes (first_seen → fix length → title)
@@ -2765,34 +4263,21 @@ fn promote_to_global(_project_root: &Path, lessons: &[Lesson]) -> usize {
             .iter()
             .copied()
             .reduce(|acc, l| if lesson_precedes(acc, l) { l } else { acc });
-        if let Some(lesson) = latest {
+        if let Some(lesson) = latest.and_then(global_safe_dev_error_lesson) {
             let dir = global_dir.join(&lesson.domain);
-            let _ = fs::create_dir_all(&dir);
-            // Disambiguate the filename with a stable hash of the FULL
-            // `domain::title` key. Slugifying alone is lossy — two genuinely
-            // different titles (different punctuation, different long tails that
-            // get clipped) can collapse to the same slug and silently OVERWRITE
-            // each other's global lesson. Appending the key hash keeps distinct
-            // lessons in distinct files, while a re-promotion of the SAME lesson
-            // (identical key) hashes the same → it updates in place, never
-            // duplicates. The hash is deterministic across processes (fixed-key
-            // SipHash), so cross-run promotions stay stable.
-            // Slugify to a SINGLE safe filename component: the key embeds a DevError
-            // SIGNATURE like `dependency/module-not-found/react-router-dom` (with `/`) and a
-            // user-controlled Revision title, so `/`, backslash, `:` and `..` must ALL be
-            // neutralized. The old `.replace("::","-").replace(' ',"-")` left `/` intact, so
-            // `dir.join(slug)` became a MULTI-component path into never-created subdirs ->
-            // write_atomic failed -> the pitfall NEVER promoted (the whole cross-project
-            // learning feature was silently DEAD), and a `..` title could escape the learned
-            // dir. Map every non-alphanumeric char to `-`; the -{hash} suffix keeps distinct
-            // keys in distinct files despite the coarser slug.
-            let slug: String = key
+            if !ensure_real_child_dir(&global_dir, &dir) {
+                continue;
+            }
+            // Derive both filename and hash only from the allowlisted family.
+            // This also makes repeated promotion idempotent and path-safe.
+            let safe_key = format!("{}::{}", lesson.domain, lesson.title);
+            let slug: String = safe_key
                 .chars()
                 .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
                 .collect();
             let slug = truncate(&slug, 80);
-            let path = dir.join(format!("{slug}-{:016x}.md", stable_str_hash(key)));
-            let body = render_lesson_markdown(lesson);
+            let path = dir.join(format!("{slug}-{:016x}.md", stable_str_hash(&safe_key)));
+            let body = render_global_lesson_markdown(&lesson);
             // The global learned dir is SHARED across every project + run on this
             // machine, so a plain `fs::write` (truncate-then-write) could be
             // observed torn if two processes promote the same lesson at once.
@@ -2807,12 +4292,20 @@ fn promote_to_global(_project_root: &Path, lessons: &[Lesson]) -> usize {
     promoted
 }
 
+/// Render an already-sanitised classifier-family lesson for the cross-project
+/// corpus. Callers must construct it with [`global_safe_dev_error_lesson`].
+fn render_global_lesson_markdown(lesson: &Lesson) -> String {
+    render_lesson_markdown(lesson).replace(
+        "maintainer: auto-sediment\n",
+        "maintainer: auto-sediment\nglobal_safety: classifier-family-v2\n",
+    )
+}
+
 /// List all sedimented lesson files (project + global), for reporting.
 #[must_use]
 pub fn list_sedimented_lessons(project_root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let project_learned = project_root.join(LEARNED_DIR);
-    if project_learned.is_dir() {
+    if let Some(project_learned) = existing_managed_learned_dir(project_root) {
         collect_md_files(&project_learned, &mut files, 0);
     }
     if let Some(global) = global_learned_dir() {
@@ -2828,12 +4321,18 @@ pub fn list_sedimented_lessons(project_root: &Path) -> Vec<PathBuf> {
 /// the learned tree is left untouched. Non-recursive (operates on one domain
 /// dir). Fail-open: a read/remove error is ignored.
 fn clear_auto_sediment_files(domain_dir: &Path) {
+    if !real_dir_no_follow(domain_dir) {
+        return;
+    }
     let Ok(rd) = fs::read_dir(domain_dir) else {
         return;
     };
     for entry in rd.flatten() {
+        if !real_dir_no_follow(domain_dir) {
+            return;
+        }
         let p = entry.path();
-        if !p.is_file() {
+        if !matches!(classify_no_follow(&p), EntryKind::File) {
             continue;
         }
         let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
@@ -2841,6 +4340,135 @@ fn clear_auto_sediment_files(domain_dir: &Path) {
         if is_md && name.starts_with("lesson-") {
             let _ = fs::remove_file(&p);
         }
+    }
+}
+
+/// Move unsafe legacy auto-generated global markdown out of the retrieval tree.
+/// Hand-authored files are preserved; current generated files carry the v2
+/// classifier-family marker. The quarantined copy keeps local audit evidence
+/// while its non-markdown extension prevents either BM25 or vector indexing.
+fn quarantine_unsafe_global_sediments_at(root: &Path) {
+    quarantine_unsafe_global_sediments_with(root, |_| {});
+}
+
+fn quarantine_unsafe_global_sediments_with(root: &Path, mut before_commit: impl FnMut(&Path)) {
+    if !global_learned_tree_is_real(root) {
+        return;
+    }
+    let Ok(domains) = fs::read_dir(root) else {
+        return;
+    };
+    for domain in domains.flatten() {
+        if !global_learned_tree_is_real(root) {
+            return;
+        }
+        let domain_path = domain.path();
+        if !matches!(classify_no_follow(&domain_path), EntryKind::Dir) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&domain_path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !global_learned_tree_is_real(root)
+                || !matches!(classify_no_follow(&domain_path), EntryKind::Dir)
+            {
+                return;
+            }
+            let path = entry.path();
+            if !matches!(classify_no_follow(&path), EntryKind::File)
+                || path.extension().and_then(|s| s.to_str()) != Some("md")
+            {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if !is_unsafe_global_sediment(&text) {
+                continue;
+            }
+
+            // Atomically detach this exact directory entry before inspecting it
+            // again. A concurrent writer may create a new file at `path`, but we
+            // only move the detached staging entry and never delete `path`.
+            let staged = quarantine_staging_path(&path);
+            if fs::rename(&path, &staged).is_err()
+                || !matches!(classify_no_follow(&staged), EntryKind::File)
+            {
+                continue;
+            }
+            let Ok(staged_text) = fs::read_to_string(&staged) else {
+                restore_staged_file_no_replace(&staged, &path);
+                continue;
+            };
+            if !is_unsafe_global_sediment(&staged_text) {
+                restore_staged_file_no_replace(&staged, &path);
+                continue;
+            }
+
+            let Some(umadev_root) = root.parent() else {
+                continue;
+            };
+            let quarantine_root = umadev_root.join("quarantine");
+            let quarantine = quarantine_root.join("learned");
+            if !ensure_real_child_dir(umadev_root, &quarantine_root)
+                || !ensure_real_child_dir(&quarantine_root, &quarantine)
+            {
+                continue;
+            }
+            let destination = quarantine.join(format!(
+                "legacy-{:016x}.md.quarantined",
+                stable_str_hash(&staged_text)
+            ));
+            before_commit(&path);
+            if global_learned_tree_is_real(root)
+                && matches!(classify_no_follow(&domain_path), EntryKind::Dir)
+                && real_dir_no_follow(&quarantine_root)
+                && real_dir_no_follow(&quarantine)
+            {
+                // Source and destination are below the same `.umadev` root, so
+                // rename is atomic on the normal layout. On any failure the
+                // non-markdown staging file remains as recoverable audit data.
+                let _ = fs::rename(&staged, destination);
+            }
+        }
+    }
+}
+
+fn is_unsafe_global_sediment(text: &str) -> bool {
+    let auto_generated = umadev_knowledge::front_matter_field(text, "maintainer")
+        == umadev_knowledge::FrontMatterField::Value("auto-sediment");
+    let current_safe = umadev_knowledge::front_matter_field(text, "global_safety")
+        == umadev_knowledge::FrontMatterField::Value("classifier-family-v2");
+    auto_generated && !current_safe
+}
+
+fn quarantine_staging_path(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("lesson.md");
+    path.with_file_name(format!(
+        ".{name}.{}.{}.{}.quarantine-pending",
+        std::process::id(),
+        stamp,
+        sequence
+    ))
+}
+
+/// Restore a raced non-legacy file without ever replacing a newer `original`.
+fn restore_staged_file_no_replace(staged: &Path, original: &Path) {
+    if matches!(classify_no_follow(staged), EntryKind::File) {
+        // `hard_link` is an atomic create-new operation: it fails when another
+        // writer already recreated `original`. The staging link is retained as
+        // recovery evidence, avoiding another check-then-delete race.
+        let _ = fs::hard_link(staged, original);
     }
 }
 
@@ -2852,6 +4480,9 @@ const MAX_LESSON_DEPTH: usize = 12;
 
 fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     if depth > MAX_LESSON_DEPTH {
+        return;
+    }
+    if !matches!(classify_no_follow(dir), EntryKind::Dir) {
         return;
     }
     let Ok(rd) = fs::read_dir(dir) else {
@@ -2914,6 +4545,12 @@ fn lesson_trigger_score(l: &Lesson, query: &std::collections::HashSet<String>) -
                 score += 6;
             }
         }
+        // Recognition, recurrence and frequency describe IMPORTANCE, not
+        // relevance. Without a requirement/stack overlap they must never turn an
+        // unrelated pitfall into prompt context.
+        if score == 0 {
+            return 0;
+        }
         if l.is_recognized() {
             score += 1;
         }
@@ -2922,9 +4559,10 @@ fn lesson_trigger_score(l: &Lesson, query: &std::collections::HashSet<String>) -
         // is proven (validated) is damped so it stops crowding the prompt once
         // it's reliably handled.
         match l.pitfall_status() {
-            PitfallStatus::Recurring => score += 8,
+            PitfallStatus::Invalidated => return 0,
+            PitfallStatus::Corroborated => score += 2,
             PitfallStatus::Validated => score -= 4,
-            PitfallStatus::Active => {}
+            PitfallStatus::Hypothesis => {}
         }
     }
     if score > 0 {
@@ -2955,9 +4593,9 @@ fn recency_weight(first_seen: &str, now: chrono::DateTime<Utc>) -> f64 {
 /// capture site writes). Returns `None` for legacy/hand-edited rows that don't
 /// match — callers treat that as "now" so the lesson isn't penalised.
 fn parse_iso_utc(s: &str) -> Option<chrono::DateTime<Utc>> {
-    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ")
+    chrono::DateTime::parse_from_rfc3339(s)
         .ok()
-        .map(|naive| naive.and_utc())
+        .map(|at| at.with_timezone(&Utc))
 }
 
 /// Intrinsic importance in `[0, 1]` — how much this lesson *matters* regardless
@@ -2980,9 +4618,10 @@ fn lesson_importance(l: &Lesson) -> f64 {
     // Frequency: saturating contribution so a 50-hit pitfall isn't 50× a 1-hit.
     imp += (f64::from(l.hits().min(8)) / 8.0) * 0.3;
     match l.pitfall_status() {
-        PitfallStatus::Recurring => imp += 0.4, // fix is failing — keep it loud
-        PitfallStatus::Validated => imp -= 0.3, // handled — let it fade
-        PitfallStatus::Active => {}
+        PitfallStatus::Invalidated => imp -= 0.35,
+        PitfallStatus::Corroborated => imp += 0.2,
+        PitfallStatus::Validated => imp -= 0.3,
+        PitfallStatus::Hypothesis => {}
     }
     imp.clamp(0.05, 1.0)
 }
@@ -3027,10 +4666,10 @@ fn efficacy_weight(l: &Lesson) -> f64 {
 /// - **importance** is [`lesson_importance`] (intrinsic poignancy).
 /// - **recency** is [`recency_weight`] (exponential age decay).
 ///
-/// A zero-relevance lesson keeps a small floor so the universal-fallback tier
-/// (recent pitfalls regardless of overlap) can still be ordered by recency ×
-/// importance — that's what makes pruning/eviction graceful rather than a hard
-/// LRU. Higher = keep / surface first.
+/// A zero-relevance lesson keeps a small floor so retention and reconciliation
+/// can still order stored evidence by recency × importance. Recall itself
+/// abstains on zero relevance in [`select_relevant_lessons`]. Higher = keep /
+/// surface first.
 fn lesson_decay_score(
     l: &Lesson,
     query: &std::collections::HashSet<String>,
@@ -3053,8 +4692,13 @@ fn lesson_decay_score(
     // passed / recalled-then-failed tally, so a lesson that has PROVEN helpful by
     // outcome outranks an equally-relevant one that has proven unhelpful. Neutral
     // (1.0) until observed, so an un-sampled lesson is unaffected.
+    let recency_at = if l.kind == LessonKind::DevError {
+        l.last_observed_at()
+    } else {
+        l.last_reinforced_at().unwrap_or(l.first_seen.as_str())
+    };
     rel * lesson_importance(l)
-        * recency_weight(&l.first_seen, now)
+        * recency_weight(recency_at, now)
         * f64::from(l.trust())
         * efficacy_weight(l)
 }
@@ -3072,15 +4716,25 @@ fn lesson_decay_score(
 /// or no match returns `None`.
 #[must_use]
 pub fn recurring_pitfall_for_error(project_root: &Path, failure_detail: &str) -> Option<Lesson> {
+    if !project_recall_enabled(project_root, MemoryStore::Pitfalls)
+        || !project_capture_enabled(project_root, MemoryStore::Pitfalls)
+        || !project_capture_enabled(project_root, MemoryStore::PitfallReflections)
+    {
+        return None;
+    }
     let insight = crate::error_kb::classify_error(failure_detail);
     if !insight.recognized {
         return None;
     }
-    let sig = normalize_signature(&insight.signature);
-    let family: String = sig.splitn(3, '/').take(2).collect::<Vec<_>>().join("/");
-    let mut hits: Vec<Lesson> = read_raw_lessons(project_root, DEV_ERRORS_FILE)
+    let sig = precise_actionable_signature(&insight.signature, failure_detail);
+    let mut hits: Vec<Lesson> = read_canonical_pitfalls(project_root)
         .into_iter()
-        .filter(|l| l.signature == sig || (!family.is_empty() && l.signature.starts_with(&family)))
+        .filter(|l| {
+            if !l.is_live_actionable_pitfall() {
+                return false;
+            }
+            normalize_signature(&l.signature) == sig
+        })
         .collect();
     // Efficacy PRUNE (step 3): a demoted (poison) pitfall is out of the loop — it
     // must not drive a reflection consult either. Sample-gated, so a genuine
@@ -3095,9 +4749,16 @@ pub fn recurring_pitfall_for_error(project_root: &Path, failure_detail: &str) ->
             .cmp(&recurring(a))
             .then(b.hits().cmp(&a.hits()))
     });
-    hits.into_iter()
+    let mut lesson = hits
+        .into_iter()
         .next()
-        .filter(|l| l.pitfall_status() == PitfallStatus::Recurring)
+        .filter(|l| l.pitfall_status() == PitfallStatus::Recurring)?;
+    if !project_recall_enabled(project_root, MemoryStore::PitfallReflections) {
+        if let Some(efficacy) = &mut lesson.efficacy {
+            efficacy.next_strategy.clear();
+        }
+    }
+    Some(lesson)
 }
 
 /// Retrieve prior lessons whose error signature matches `failure_detail` — the
@@ -3117,6 +4778,9 @@ pub fn recurring_pitfall_for_error(project_root: &Path, failure_detail: &str) ->
 /// a misleading prior fix.
 #[must_use]
 pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
+    if !project_recall_enabled(project_root, MemoryStore::Pitfalls) {
+        return String::new();
+    }
     let insight = crate::error_kb::classify_error(failure_detail);
     // Abstain on the generic fallback — its signature is too coarse to match a
     // specific prior root cause precisely.
@@ -3126,13 +4790,19 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
     // Normalise to the SAME stable key the store dedups under, so a recurring
     // failure whose offending path/version differs run-to-run still matches the
     // recorded lesson (otherwise the lookup would miss the very pitfall it hit).
-    let sig = normalize_signature(&insight.signature);
-    // Match the full signature, or the same family (first two path segments,
-    // e.g. `dependency/module-not-found`).
-    let family: String = sig.splitn(3, '/').take(2).collect::<Vec<_>>().join("/");
-    let mut hits: Vec<Lesson> = read_raw_lessons(project_root, DEV_ERRORS_FILE)
+    let sig = precise_actionable_signature(&insight.signature, failure_detail);
+    // Stored advice can contain discriminator-specific commands (for example a
+    // package name). Match the complete normalised signature only; a family
+    // neighbour's fix is unsafe to inject. The caller already has the incoming
+    // classifier's generic family guidance when no exact history exists.
+    let mut hits: Vec<Lesson> = read_canonical_pitfalls(project_root)
         .into_iter()
-        .filter(|l| l.signature == sig || (!family.is_empty() && l.signature.starts_with(&family)))
+        .filter(|l| {
+            if !l.is_live_actionable_pitfall() {
+                return false;
+            }
+            normalize_signature(&l.signature) == sig
+        })
         .collect();
     // Efficacy PRUNE (step 3): drop well-sampled poison pitfalls before ranking, so
     // a fix that has proven to hurt more than help stops being re-injected. If that
@@ -3160,20 +4830,7 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
             .then(b.hits().cmp(&a.hits()))
     });
     let top = &hits[0];
-    let top_sig = top.signature.clone();
     let recurring = top.pitfall_status() == PitfallStatus::Recurring;
-    // Is `top` the SAME root cause as the error we are explaining, or merely a
-    // family neighbour? `lessons_for_error` matches by full signature OR family
-    // (`category/family` prefix), so the chosen `top` can be a DIFFERENT
-    // discriminator within the same family — e.g. the error is
-    // `dependency/module-not-found/lodash` but the highest-ranked recurring hit
-    // is `…/react-router-dom`. The generic root_cause/fix below are templated
-    // per family and stay useful across discriminators, but the
-    // discriminator-SPECIFIC fields — the base-reflected `next_strategy` and the
-    // `failed_fixes` ledger — belong to THAT pitfall's exact root cause. Surfacing
-    // them for a different module is the "knowledge → noise" mis-injection. So we
-    // only emit those when `top` is an exact-signature match.
-    let exact_root_cause = top.signature == sig;
     let mut out = String::from("\n\n## 历史踩坑（同类错误你之前遇到过）\n");
     out.push_str(&format!(
         "- 已累计 {} 次；签名 `{}`\n  根因：{}\n  上次修法：{}\n",
@@ -3198,7 +4855,7 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
         // failed-fix ledger) when `top` is the exact same signature, never across
         // a mere family match. A family-only match falls back to the generic
         // template line so a different root cause never inherits another's fix.
-        let strategy = if exact_root_cause {
+        let strategy = if project_recall_enabled(project_root, MemoryStore::PitfallReflections) {
             top.efficacy
                 .as_ref()
                 .map(|e| e.next_strategy.trim())
@@ -3221,22 +4878,11 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
         // harder". This is the structured "失败修法 + 换思路" guidance — but only
         // for an exact-signature match, since a family neighbour's failed fixes
         // targeted a different root cause.
-        if exact_root_cause {
-            out.push_str(&render_failed_fixes(top));
-        }
+        out.push_str(&render_failed_fixes(top));
     }
-    // Snapshot the hit count NOW so that, if this exact pitfall recurs after the
-    // fix attempt, `capture_dev_errors` can flag `recurred_after_warning` — the
-    // efficacy half of the closed loop. This is the AT-FAILURE path. We only count
-    // it as a genuine fresh fix attempt (which RESETS the escalation flag) when
-    // `top` is the exact same root cause; a family-neighbour match surfaced only
-    // the generic summary, so it must not reset THAT different pitfall's "already
-    // warned, still recurring" flag.
-    record_pitfall_injections(
-        project_root,
-        std::slice::from_ref(&top_sig),
-        exact_root_cause,
-    );
+    // Deliberately PURE: selecting/rendering guidance is not proof that it was
+    // sent to a base. The runner/director commits the attempt through
+    // `commit_pitfall_fix_attempt` only after the host accepted/ran the turn.
     out
 }
 
@@ -3262,10 +4908,9 @@ fn render_failed_fixes(l: &Lesson) -> String {
 /// COUNT side of the bound (the byte side is [`MEMORY_PLAYBOOK_BUDGET`]). A
 /// delta-playbook is, by definition, a SMALL curated set: a handful of
 /// high-signal "next time do X instead of Y" rules, not the ledger. Three is
-/// enough to cover the top on-stack match(es) plus the most chronic recent
-/// pitfall while staying compact. [`select_relevant_lessons`] fills at most this
-/// many slots (the top positively-matched first, then recent pitfalls as the
-/// universal fallback).
+/// enough to cover the top on-stack matches while staying compact.
+/// [`select_relevant_lessons`] fills at most this many slots from positively
+/// matched memories only.
 const MEMORY_PLAYBOOK_MAX_DELTAS: usize = 3;
 
 /// Hard character budget for the injected delta-playbook block (the rendered
@@ -3291,8 +4936,8 @@ const MEMORY_PLAYBOOK_BUDGET: usize = 3_000;
 /// first-ever runs).
 ///
 /// Triggering matches the pitfall against the project's real tech-stack
-/// fingerprint (see [`lesson_trigger_score`]), not just the requirement prose,
-/// then ranks by the composite [`lesson_decay_score`]
+/// fingerprint (using the internal lesson-trigger score), not just the requirement prose,
+/// then ranks by the composite lesson-decay score
 /// (`recency · importance · relevance`) so a fresh, important, on-stack lesson
 /// outranks an old high-frequency one. We don't call BM25 here to avoid a
 /// circular dependency between the agent and knowledge crates at prompt-assembly
@@ -3300,9 +4945,9 @@ const MEMORY_PLAYBOOK_BUDGET: usize = 3_000;
 /// `phase_knowledge_digest`.
 ///
 /// **Bounded by construction (count AND bytes):** the selection is count-capped
-/// to [`MEMORY_PLAYBOOK_MAX_DELTAS`] ranked deltas (near-duplicates already
+/// to the internal maximum-delta limit (near-duplicates already
 /// merged into beliefs upstream, see [`fold_beliefs`]), and the assembled block
-/// is capped to [`MEMORY_PLAYBOOK_BUDGET`] characters here — a lower-rank delta
+/// is capped to the internal memory-playbook character budget here — a lower-rank delta
 /// that would overflow is dropped, and the single top delta is head-truncated as
 /// a hard backstop so the block can never exceed the budget. Fail-open: an empty
 /// or unreadable store yields an empty string, never a panic.
@@ -3346,17 +4991,6 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
         }
     }
 
-    // Efficacy bookkeeping: mark the dev-error pitfalls we just surfaced as
-    // "injected" so a later capture can tell whether the warning actually
-    // prevented recurrence. Fail-open — purely advisory state. PASSIVE recall
-    // (`active_fix_attempt = false`): it must NOT clear an existing
-    // `recurred_after_warning` escalation flag (read-only on that bit).
-    record_pitfall_injections(project_root, &surfaced_signatures(&selected), false);
-    // Snapshot the surfaced NON-pitfall / belief identities so the runner's next
-    // verify pass/fail can feed THEIR trust (parity with the ranked API, since
-    // the runner's `with_context` injects via THIS String path). Fail-open.
-    record_surfaced_identities(project_root, &surfaced_identities(&selected));
-
     out
 }
 
@@ -3367,9 +5001,8 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
 /// can fuse the fingerprint-decay channel with the BM25 knowledge channel by
 /// RANK without re-deriving the selection.
 ///
-/// Performs the same efficacy "injected" bookkeeping as the String API, because
-/// returning these pairs to the caller means they ARE being surfaced into a
-/// prompt. Empty for first-ever runs.
+/// Pure read: returning candidates does not prove they survived prompt budgeting
+/// or reached a host turn, so it performs no outcome/injection bookkeeping.
 #[must_use]
 pub fn relevant_lessons_for_prompt_ranked(
     project_root: &Path,
@@ -3379,76 +5012,15 @@ pub fn relevant_lessons_for_prompt_ranked(
     if selected.is_empty() {
         return Vec::new();
     }
-    // PASSIVE recall (`active_fix_attempt = false`): preserve any existing
-    // `recurred_after_warning` escalation flag — surfacing for ranking is not a
-    // fresh fix attempt.
-    record_pitfall_injections(project_root, &surfaced_signatures(&selected), false);
-    // Snapshot the NON-pitfall / belief identities too, so the runner can feed
-    // the verify pass/fail back into THEIR trust (the dev-error path already
-    // rides the signature reflux above). Fail-open: a write error is swallowed.
-    record_surfaced_identities(project_root, &surfaced_identities(&selected));
     selected.into_iter().enumerate().collect()
-}
-
-/// The dev-error signatures among `selected`, for efficacy "injected" bookkeeping.
-fn surfaced_signatures(selected: &[Lesson]) -> Vec<String> {
-    selected
-        .iter()
-        .filter(|l| l.kind == LessonKind::DevError && !l.signature.is_empty())
-        .map(|l| l.signature.clone())
-        .collect()
-}
-
-/// The `(domain, title, first_seen)` identities of every NON-pitfall lesson among
-/// `selected` — failures, revisions, validated patterns, and beliefs. Dev-error
-/// pitfalls are deliberately excluded: their trust is driven by the signature
-/// reflux (`apply_dev_error_trust`), not by identity. These identities are what
-/// [`apply_trust_for_identities`] adjusts, so capturing them at injection time is
-/// what lets a belief / non-pitfall lesson's trust actually move with the gate
-/// outcome (the previously-dead feedback path).
-fn surfaced_identities(selected: &[Lesson]) -> Vec<(String, String, String)> {
-    selected
-        .iter()
-        .filter(|l| l.kind != LessonKind::DevError)
-        .map(lesson_identity)
-        .collect()
-}
-
-/// Snapshot the surfaced non-pitfall identities to [`SURFACED_IDENTITIES_FILE`]
-/// so the runner can read them back at the next verify pass/fail and feed
-/// [`apply_trust_for_identities`]. Overwrites (not appends): only the MOST RECENT
-/// surfacing is the one a verify outcome can attribute to. Fail-open: an empty
-/// list clears the snapshot; any IO/serialize error is swallowed.
-fn record_surfaced_identities(project_root: &Path, identities: &[(String, String, String)]) {
-    let raw_dir = project_root.join(RAW_DIR);
-    let _ = fs::create_dir_all(&raw_dir);
-    let path = raw_dir.join(SURFACED_IDENTITIES_FILE);
-    if let Ok(json) = serde_json::to_string(identities) {
-        let _ = fs::write(&path, json);
-    }
-}
-
-/// Read the most recently surfaced non-pitfall identities (written by
-/// [`relevant_lessons_for_prompt_ranked`]). The runner consults this at a verify
-/// pass/fail to know WHICH belief / non-pitfall lessons were in front of the
-/// worker, then calls [`apply_trust_for_identities`]. Fail-open: a
-/// missing/corrupt snapshot yields an empty vec (no feedback, never an error).
-#[must_use]
-pub fn read_surfaced_identities(project_root: &Path) -> Vec<(String, String, String)> {
-    let path = project_root.join(RAW_DIR).join(SURFACED_IDENTITIES_FILE);
-    fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
 }
 
 /// Shared selection core for both the String and structured lesson APIs: builds
 /// the trigger query (requirement words + project tech-stack fingerprint), scores
-/// every lesson on the (relevance, composite-decay) axes, and applies the same
-/// two-tier pick (≤2 positively-matched, then top up to 3 with recent dev-errors
-/// then quality failures). Returns the chosen lessons in final rank order. Pure
-/// read — efficacy bookkeeping is the caller's responsibility so it happens
-/// exactly once per surfacing.
+/// every lesson on the (relevance, composite-decay) axes, and returns at most
+/// three positively matched deltas. Zero-overlap memory abstains instead of
+/// injecting a merely recent or frequent experience. Pure read; production does
+/// not attribute later outcomes without exact sent IDs.
 fn select_relevant_lessons(project_root: &Path, requirement: &str) -> Vec<Lesson> {
     // Candidates = raw lessons PLUS the folded beliefs. Beliefs are denser
     // summaries of clusters of raw lessons; the demotion step below hides the
@@ -3471,11 +5043,13 @@ fn select_relevant_lessons(project_root: &Path, requirement: &str) -> Vec<Lesson
     // the prose — is what makes triggering precise: a `react-router-dom`
     // pitfall fires exactly when this project depends on react-router-dom,
     // regardless of how the requirement is worded.
-    let req_lower = requirement.to_ascii_lowercase();
-    let mut query: std::collections::HashSet<String> = req_lower
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() >= 3)
-        .map(str::to_string)
+    let expanded = umadev_knowledge::expand_bilingual_query(requirement);
+    let mut query: std::collections::HashSet<String> = umadev_knowledge::tokenize(&expanded)
+        .into_iter()
+        // Single CJK characters are useful to BM25 as a weak frequency signal,
+        // but too broad to authorize durable-memory recall. Require a bigram or
+        // an ASCII identifier here so zero-overlap abstention stays precise.
+        .filter(|word| word.chars().count() >= 2)
         .collect();
     for tok in project_context_tokens(project_root) {
         query.insert(tok);
@@ -3498,9 +5072,8 @@ fn select_relevant_lessons(project_root: &Path, requirement: &str) -> Vec<Lesson
     }
 
     // Score each lesson on TWO axes:
-    // - `rel` (raw relevance i64) gates the Tier-1 (`> 0`) vs Tier-2 (`== 0`)
-    //   split below — a lesson only counts as "matched right now" when its
-    //   situation actually intersects the query/stack.
+    // - `rel` (raw relevance i64) is an abstention gate: a lesson only counts as
+    //   "matched right now" when its situation intersects the query/stack.
     // - `decay` is the composite (`recency · importance ·
     //   relevance`) that ORDERS lessons within each tier, so a newer + more
     //   important + more relevant lesson sorts first instead of a pure
@@ -3521,40 +5094,26 @@ fn select_relevant_lessons(project_root: &Path, requirement: &str) -> Vec<Lesson
     scored.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.2.first_seen.cmp(&a.2.first_seen))
+            .then_with(|| b.2.last_observed_at().cmp(a.2.last_observed_at()))
     });
 
-    // Tier 1: positively-matched (the current situation hit a recorded one).
-    // `s` is the raw relevance; `> 0` means the query/stack actually intersected
-    // this lesson. They're already ordered by the composite decay score above.
-    // Reserve one slot for the universal-fallback pitfall tier below, so a strong
-    // match never fully crowds out the most chronic recent pitfall.
-    let tier1_cap = MEMORY_PLAYBOOK_MAX_DELTAS.saturating_sub(1);
-    let mut top_idx: Vec<usize> = scored
+    // Positively matched only. A chronic but unrelated pitfall is not a useful
+    // reminder; exact failure-time recall remains available through
+    // `lessons_for_error` when its signature actually recurs.
+    let mut selected: Vec<Lesson> = scored
         .iter()
-        .enumerate()
-        .filter(|(_, (s, _, _))| *s > 0)
-        .take(tier1_cap)
-        .map(|(i, _)| i)
+        .filter(|(score, _, _)| *score > 0)
+        .take(MEMORY_PLAYBOOK_MAX_DELTAS)
+        .map(|(_, _, lesson)| (**lesson).clone())
         .collect();
-    // Tier 2: universal fallback — recent pitfalls apply regardless of overlap.
-    // Dev errors (real "踩坑") are the highest-value avoid-next-time signal, so
-    // they fill the remaining slots FIRST, then quality failures. The total is
-    // hard-capped at MEMORY_PLAYBOOK_MAX_DELTAS so the playbook stays compact.
-    for want_kind in [LessonKind::DevError, LessonKind::Failure] {
-        if top_idx.len() >= MEMORY_PLAYBOOK_MAX_DELTAS {
-            break;
-        }
-        for (i, (s, _, l)) in scored.iter().enumerate() {
-            if top_idx.len() >= MEMORY_PLAYBOOK_MAX_DELTAS {
-                break;
-            }
-            if *s == 0 && l.kind == want_kind && !top_idx.contains(&i) {
-                top_idx.push(i);
+    if !project_recall_enabled(project_root, MemoryStore::PitfallReflections) {
+        for lesson in &mut selected {
+            if let Some(efficacy) = &mut lesson.efficacy {
+                efficacy.next_strategy.clear();
             }
         }
     }
-    top_idx.iter().map(|&i| scored[i].2.clone()).collect()
+    selected
 }
 
 /// Render ONE lesson into its prompt fragment — the public entry point used by
@@ -3599,11 +5158,11 @@ fn render_one_lesson(lesson: &Lesson) -> String {
                 .filter(|s| !s.is_empty());
             let lead = if let Some(strategy) = strategy {
                 format!(
-                    "\n   ⚠ 上次已警示但仍复发 —— 改用这个不同的高层做法：\n   {}",
+                    "\n   [warn] 上次已警示但仍复发 —— 改用这个不同的高层做法：\n   {}",
                     truncate(strategy, 600)
                 )
             } else {
-                "\n   ⚠ 上次已警示但仍复发 —— 之前的修法不够,这次必须换更彻底的方案并验证。"
+                "\n   [warn] 上次已警示但仍复发 —— 之前的修法不够,这次必须换更彻底的方案并验证。"
                     .to_string()
             };
             format!("{lead}\n{}", render_failed_fixes(lesson))
@@ -3640,100 +5199,265 @@ fn render_one_lesson(lesson: &Lesson) -> String {
     }
 }
 
-/// Mark dev-error pitfalls as surfaced-to-the-worker, snapshotting their hit
-/// count so a later [`capture_dev_errors`] can detect "recurred despite being
-/// warned". Fail-open.
-///
-/// `active_fix_attempt` distinguishes the two surfacing modes, which matters for
-/// the `recurred_after_warning` escalation flag:
-/// - `true` — the AT-FAILURE injection from [`lessons_for_error`]: the worker is
-///   about to make a genuine fresh fix attempt, so resetting the flag gives the
-///   (possibly re-derived) fix a clean chance to prove itself (self-healing).
-/// - `false` — a PASSIVE prompt-assembly recall (`relevant_lessons_for_prompt`):
-///   the pitfall is merely shown as context, NOT re-attempted. Clearing the flag
-///   here would silently erase the "already warned, still recurring → escalate"
-///   signal just because the lesson scrolled past in a later prompt. So passive
-///   surfacing snapshots the baseline (bump `injected`, re-baseline
-///   `occ_at_injection` so a subsequent recurrence is still detected) but LEAVES
-///   `recurred_after_warning` untouched — read-only on the escalation bit.
-fn record_pitfall_injections(project_root: &Path, signatures: &[String], active_fix_attempt: bool) {
-    if signatures.is_empty() {
-        return;
+/// Commit a genuine failure-time fix attempt after the host has accepted/run the
+/// turn. Selection/rendering APIs stay pure because a firmware block can be
+/// truncated, prewarmed, or assembled more than once without ever reaching the
+/// base. Returns an opaque attempt token for exact-once settlement. Fail-open.
+#[must_use]
+pub fn commit_pitfall_fix_attempt(project_root: &Path, failure_detail: &str) -> Option<String> {
+    // Issuing a new attribution token is automatic capture. Recall may remain
+    // enabled independently, in which case advice is still injected but no new
+    // efficacy state is written. Settlement below deliberately remains allowed
+    // for a token committed before capture was disabled.
+    if !project_capture_enabled(project_root, MemoryStore::Pitfalls) {
+        return None;
     }
-    // Shared dev-errors lock: this read-modify-write must not race the capture /
-    // strategy / resolve / trust paths and lose their concurrent update.
-    let _kb_guard = lock_dev_errors();
+    let insight = crate::error_kb::classify_error(failure_detail);
+    if !insight.recognized {
+        return None;
+    }
+    let sig = precise_actionable_signature(&insight.signature, failure_detail);
+    let attempt_id = format!("fix-{}", next_capture_episode_id(&utc_now_iso()));
+    let _kb_guard = acquire_raw_store_lock(project_root, DEV_ERRORS_FILE)?;
     let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
-    if store.is_empty() {
-        return;
-    }
-    let want: std::collections::HashSet<&str> = signatures.iter().map(String::as_str).collect();
-    let mut changed = false;
-    for l in &mut store {
-        if l.kind == LessonKind::DevError && want.contains(l.signature.as_str()) {
-            let occ = l.hits();
-            let eff = l.efficacy.get_or_insert(PitfallEfficacy {
-                injected: 0,
-                occ_at_injection: occ,
-                recurred_after_warning: false,
-                proven_fix: false,
-                failed_fixes: Vec::new(),
-                next_strategy: String::new(),
-                helpful: 0,
-                harmful: 0,
-            });
-            eff.injected = eff.injected.saturating_add(1);
-            eff.occ_at_injection = occ;
-            // Only a genuine fresh fix attempt clears the escalation flag; a
-            // passive recall must not reset "already warned, still recurring".
-            if active_fix_attempt {
-                eff.recurred_after_warning = false;
-            }
-            changed = true;
+    // Recall's canonical projection takes advice from the highest-hit raw row
+    // (first row on a tie). Select that same source row here so the outcome is
+    // attributed to the advice actually rendered, never to a legacy shadow.
+    let mut source_index: Option<usize> = None;
+    for (index, lesson) in store.iter().enumerate() {
+        if lesson.is_live_actionable_pitfall()
+            && normalize_signature(&lesson.signature) == sig
+            && source_index.is_none_or(|current| lesson.hits() > store[current].hits())
+        {
+            source_index = Some(index);
         }
     }
-    if changed {
-        write_raw_lessons(project_root, DEV_ERRORS_FILE, &store);
+    let committed = if let Some(source_index) = source_index {
+        let lesson = &mut store[source_index];
+        let hits = lesson.hits();
+        let efficacy = lesson.efficacy.get_or_insert(PitfallEfficacy {
+            occ_at_injection: hits,
+            ..PitfallEfficacy::default()
+        });
+        efficacy.injected = efficacy.injected.saturating_add(1);
+        efficacy.occ_at_injection = hits;
+        // Committing a turn records only that advice reached the host. Preserve
+        // the last settled lifecycle verdict until this exact token is settled;
+        // a crash/abandoned turn must not downgrade NeedsRevision to Active.
+        efficacy.pending_fix_attempts.push(attempt_id.clone());
+        // A single session cannot legitimately have an unbounded number of
+        // unsettled repair turns. Bound corrupt/abandoned tokens fail-open.
+        if efficacy.pending_fix_attempts.len() > 4 {
+            efficacy.pending_fix_attempts.remove(0);
+        }
+        true
+    } else {
+        false
+    };
+    if committed && write_raw_lessons_unlocked(project_root, DEV_ERRORS_FILE, &store) {
+        Some(attempt_id)
+    } else {
+        None
     }
 }
 
-/// Mark the pitfall(s) matching `raw_errors` as having a proven fix — called
-/// when an in-run auto-repair made the build/test pass again. This is the
-/// strongest efficacy signal: we directly observed the recorded fix work, so
-/// the pitfall is validated immediately rather than after several quiet runs.
-/// Fail-open. Returns how many records were marked.
+/// Settle one previously committed repair attempt exactly once.
+///
+/// A mechanical pass validates the attempted fix. A failed overall gate only
+/// penalises it when the gate's actual evidence still contains this token's
+/// exact normalised signature; a different new error, skip, unavailable check,
+/// or missing evidence consumes the token as [`PitfallFixSettlement::Inconclusive`]
+/// without changing trust/lifecycle. This prevents "fixed the original module
+/// error, then hit a new lint error" from poisoning the original advice.
+#[must_use]
+pub fn settle_pitfall_fix_attempt(
+    project_root: &Path,
+    attempt_id: &str,
+    result: PitfallFixAttemptResult,
+) -> PitfallFixSettlement {
+    if attempt_id.trim().is_empty() {
+        return PitfallFixSettlement::NotFound;
+    }
+    let Some(_kb_guard) = acquire_raw_store_lock(project_root, DEV_ERRORS_FILE) else {
+        return PitfallFixSettlement::Inconclusive;
+    };
+    let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
+    let now = utc_now_iso();
+    for lesson in &mut store {
+        if !lesson.is_live_actionable_pitfall() {
+            continue;
+        }
+        let pending_pos = lesson.efficacy.as_ref().and_then(|efficacy| {
+            efficacy
+                .pending_fix_attempts
+                .iter()
+                .position(|id| id == attempt_id)
+        });
+        let Some(pending_pos) = pending_pos else {
+            continue;
+        };
+        let same_signature_failed = match &result {
+            PitfallFixAttemptResult::VerificationFailed(detail) => {
+                evidence_matches_attempt(detail, &lesson.signature)
+            }
+            _ => false,
+        };
+        let fix = lesson.fix.clone();
+        if let Some(efficacy) = lesson.efficacy.as_mut() {
+            efficacy.pending_fix_attempts.remove(pending_pos);
+        }
+        let settlement = match result {
+            PitfallFixAttemptResult::Passed => {
+                lesson.apply_exact_trust_feedback(true);
+                let hits = lesson.hits();
+                let signature = lesson.signature.clone();
+                let efficacy = lesson.efficacy.get_or_insert_with(PitfallEfficacy::default);
+                efficacy.occ_at_injection = hits;
+                efficacy.proven_fix = true;
+                efficacy.recurred_after_warning = false;
+                efficacy.last_verified_at.clone_from(&now);
+                efficacy.exact_last_verified_at.clone_from(&now);
+                let _ = remember_observation(
+                    efficacy,
+                    repair_outcome_evidence(
+                        project_root,
+                        attempt_id,
+                        &signature,
+                        &now,
+                        KnowledgeEvidenceOutcome::FixSucceeded,
+                    ),
+                );
+                PitfallFixSettlement::Passed
+            }
+            PitfallFixAttemptResult::VerificationFailed(detail) if same_signature_failed => {
+                drop(detail);
+                lesson.apply_exact_trust_feedback(false);
+                let hits = lesson.hits();
+                let signature = lesson.signature.clone();
+                let efficacy = lesson.efficacy.get_or_insert_with(PitfallEfficacy::default);
+                efficacy.occ_at_injection = hits;
+                efficacy.recurred_after_warning = true;
+                efficacy.proven_fix = false;
+                efficacy.last_recurred_at.clone_from(&now);
+                efficacy.last_fix_failed_at.clone_from(&now);
+                efficacy.exact_last_fix_failed_at.clone_from(&now);
+                remember_failed_fix(efficacy, &fix);
+                let _ = remember_observation(
+                    efficacy,
+                    repair_outcome_evidence(
+                        project_root,
+                        attempt_id,
+                        &signature,
+                        &now,
+                        KnowledgeEvidenceOutcome::FixFailed,
+                    ),
+                );
+                PitfallFixSettlement::SameSignatureFailed
+            }
+            PitfallFixAttemptResult::VerificationFailed(detail) => {
+                drop(detail);
+                PitfallFixSettlement::Inconclusive
+            }
+            PitfallFixAttemptResult::Unknown => PitfallFixSettlement::Inconclusive,
+        };
+        // Even an inconclusive result consumes the token: later unrelated
+        // failures must never settle this completed/abandoned turn retroactively.
+        return if write_raw_lessons_unlocked(project_root, DEV_ERRORS_FILE, &store) {
+            settlement
+        } else {
+            // The in-memory result was never committed. In particular, never
+            // let callers emit "fix confirmed" over a locked/failed rename.
+            PitfallFixSettlement::Inconclusive
+        };
+    }
+    PitfallFixSettlement::NotFound
+}
+
+fn repair_outcome_evidence(
+    project_root: &Path,
+    attempt_id: &str,
+    signature: &str,
+    observed_at: &str,
+    outcome: KnowledgeEvidenceOutcome,
+) -> PitfallObservation {
+    let outcome_id = match outcome {
+        KnowledgeEvidenceOutcome::FixSucceeded => "success",
+        KnowledgeEvidenceOutcome::FixFailed => "failure",
+        KnowledgeEvidenceOutcome::Observed | KnowledgeEvidenceOutcome::Conflict => "other",
+    };
+    PitfallObservation {
+        observed_at: observed_at.to_string(),
+        episode_id: privacy_fingerprint("umadev:repair-outcome-evidence-id:v1", attempt_id),
+        evidence_hash: privacy_fingerprint(
+            "umadev:repair-outcome-evidence:v1",
+            &format!("{signature}\0{outcome_id}"),
+        ),
+        source: "exact-mechanical-repair-verification".to_string(),
+        base: "umadev-mechanical-verifier".to_string(),
+        base_version: env!("CARGO_PKG_VERSION").to_string(),
+        workspace_scope: project_workspace_scope(project_root),
+        outcome,
+        causal_attempt_id: attempt_id.to_string(),
+    }
+}
+
+fn evidence_matches_attempt(evidence: &str, expected_signature: &str) -> bool {
+    let expected = normalize_signature(expected_signature);
+    if expected.is_empty()
+        || expected
+            .rsplit('/')
+            .next()
+            .is_some_and(|discriminator| discriminator.starts_with("u-"))
+    {
+        return false;
+    }
+    std::iter::once(evidence)
+        .chain(evidence.lines())
+        .any(|part| {
+            let insight = crate::error_kb::classify_error(part);
+            insight.recognized && precise_actionable_signature(&insight.signature, part) == expected
+        })
+}
+
+/// Legacy compatibility helper that updates pre-v1 audit fields by signature.
+/// It does not validate a rule; production repair settlement requires an exact
+/// [`commit_pitfall_fix_attempt`] token consumed by
+/// [`settle_pitfall_fix_attempt`].
 pub fn mark_pitfalls_resolved(project_root: &Path, raw_errors: &[String]) -> usize {
     let want: std::collections::HashSet<String> = raw_errors
         .iter()
         .filter(|e| crate::error_kb::looks_like_error(e))
-        .map(|e| normalize_signature(&crate::error_kb::classify_error(e).signature))
+        .filter_map(|e| {
+            let insight = crate::error_kb::classify_error(e);
+            insight
+                .recognized
+                .then(|| precise_actionable_signature(&insight.signature, e))
+        })
         .collect();
     if want.is_empty() {
         return 0;
     }
     // Shared dev-errors lock: keep this read-modify-write atomic against the
     // other mutators so a concurrent capture/strategy update isn't clobbered.
-    let _kb_guard = lock_dev_errors();
+    let Some(_kb_guard) = acquire_raw_store_lock(project_root, DEV_ERRORS_FILE) else {
+        return 0;
+    };
     let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
     if store.is_empty() {
         return 0;
     }
     let mut marked = 0;
+    let verified_at = utc_now_iso();
     for l in &mut store {
-        if l.kind == LessonKind::DevError && want.contains(&l.signature) {
+        if l.is_live_actionable_pitfall() && want.contains(&normalize_signature(&l.signature)) {
             let occ = l.hits();
             let eff = l.efficacy.get_or_insert(PitfallEfficacy {
-                injected: 0,
                 occ_at_injection: occ,
-                recurred_after_warning: false,
-                proven_fix: false,
-                failed_fixes: Vec::new(),
-                next_strategy: String::new(),
-                helpful: 0,
-                harmful: 0,
+                ..PitfallEfficacy::default()
             });
             eff.proven_fix = true;
             eff.recurred_after_warning = false;
+            eff.last_verified_at.clone_from(&verified_at);
             // Re-baseline the occurrence counter to NOW so a later recurrence
             // (occurrences > occ_at_injection) is detected and flips
             // `recurred_after_warning`, demoting this from "Validated".
@@ -3741,76 +5465,64 @@ pub fn mark_pitfalls_resolved(project_root: &Path, raw_errors: &[String]) -> usi
             marked += 1;
         }
     }
-    if marked > 0 {
-        write_raw_lessons(project_root, DEV_ERRORS_FILE, &store);
+    if marked > 0 && !write_raw_lessons_unlocked(project_root, DEV_ERRORS_FILE, &store) {
+        return 0;
     }
     marked
 }
 
 // =====================================================================
-// Trust feedback (③): asymmetric pass/fail signal on injected lessons.
+// Explicit compatibility trust feedback.
 //
-// The efficacy loop already answers "did this pitfall recur?". Trust answers
-// the broader, value-weighted question "when this lesson was put in front of
-// the worker, did the gate then PASS or FAIL?". A pass nudges the lesson's
-// trust up a little; a fail pushes it down harder (asymmetric). Trust folds
-// into `lesson_decay_score`, so a lesson that keeps coinciding with failures
-// quietly sinks in recall while a reliably-helpful one floats up — upgrading
-// "was it reused?" to "did reusing it actually help?".
-//
-// WIRING POINTS (where the runner feeds verify results back):
-//   - PASS  → `reward_trust_for_signatures(root, &surfaced_sigs)` after a
-//             verify/quality gate passes, OR `reward_injected_lessons(root,
-//             &injected_ids)` for non-pitfall lessons.
-//   - FAIL  → `penalize_trust_for_signatures(root, &surfaced_sigs)` after the
-//             gate fails with those lessons in the prompt.
-// The dev-error reflux can ride the EXISTING `mark_pitfalls_resolved` /
-// `apply_dev_error_trust` seam (see `apply_dev_error_trust`), which the runner
-// already calls at the verify-pass site (runner.rs ~L1135) and could call with
-// `passed=false` at the failure site (runner.rs ~L1057). Both are fail-open and
-// only ever adjust the trust float — they never gate the loop.
+// These identity/signature mutators remain available for tests and callers that
+// already own a causal identity. UmaDev's production prompt assembly does NOT
+// call them: candidate selection cannot prove which memories survived budgeting
+// and reached one host turn. The production pitfall repair loop instead uses
+// commit_pitfall_fix_attempt → settle_pitfall_fix_attempt exactly once.
 // =====================================================================
 
-/// Apply a trust pass/fail step to every DEV-ERROR pitfall whose signature
-/// matches one of `raw_errors`, using the SAME signature normalisation the
-/// capture/resolve paths use. This is the dev-error reflux seam: the runner
-/// already classifies the failing error and (on a successful auto-fix) calls
-/// [`mark_pitfalls_resolved`]; pairing that call with `passed=true` here rewards
-/// the pitfall whose fix just worked, and a `passed=false` call at the failure
-/// site penalises a pitfall whose injected fix did NOT hold. Returns how many
-/// records were adjusted. Fail-open: unrecognised errors / empty store → 0.
+/// Explicit compatibility trust update by exact classified signature. Not used
+/// by production passive recall; the attempt-token API is the authoritative
+/// repair settlement path. Fail-open: unrecognised errors / empty store → 0.
 pub fn apply_dev_error_trust(project_root: &Path, raw_errors: &[String], passed: bool) -> usize {
     let want: std::collections::HashSet<String> = raw_errors
         .iter()
         .filter(|e| crate::error_kb::looks_like_error(e))
-        .map(|e| normalize_signature(&crate::error_kb::classify_error(e).signature))
+        .filter_map(|e| {
+            let insight = crate::error_kb::classify_error(e);
+            insight
+                .recognized
+                .then(|| precise_actionable_signature(&insight.signature, e))
+        })
         .collect();
     if want.is_empty() {
         return 0;
     }
     // Shared dev-errors lock: keep this read-modify-write atomic against the
     // other mutators so a concurrent capture/strategy update isn't clobbered.
-    let _kb_guard = lock_dev_errors();
+    let Some(_kb_guard) = acquire_raw_store_lock(project_root, DEV_ERRORS_FILE) else {
+        return 0;
+    };
     let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
     if store.is_empty() {
         return 0;
     }
     let mut adjusted = 0usize;
     for l in &mut store {
-        if l.kind == LessonKind::DevError && want.contains(&l.signature) {
+        if l.is_live_actionable_pitfall() && want.contains(&normalize_signature(&l.signature)) {
             l.apply_trust_feedback(passed);
             adjusted += 1;
         }
     }
-    if adjusted > 0 {
-        write_raw_lessons(project_root, DEV_ERRORS_FILE, &store);
+    if adjusted > 0 && !write_raw_lessons_unlocked(project_root, DEV_ERRORS_FILE, &store) {
+        return 0;
     }
     adjusted
 }
 
 /// Apply a trust pass/fail step to the dev-error pitfalls whose normalised
-/// signature is in `signatures` (the signatures a recall surfaced into the
-/// prompt — see [`surfaced_signatures`]). Use this when the gate outcome is
+/// signature is in `signatures` (the signatures a caller confirmed were sent
+/// in a prompt). Use this when the gate outcome is
 /// known but the raw error strings aren't on hand: pass the signatures captured
 /// at injection time. Returns how many records were adjusted. Fail-open.
 pub fn apply_trust_for_signatures(
@@ -3825,26 +5537,28 @@ pub fn apply_trust_for_signatures(
     }
     // Shared dev-errors lock: keep this read-modify-write atomic against the
     // other mutators so a concurrent capture/strategy update isn't clobbered.
-    let _kb_guard = lock_dev_errors();
+    let Some(_kb_guard) = acquire_raw_store_lock(project_root, DEV_ERRORS_FILE) else {
+        return 0;
+    };
     let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
     if store.is_empty() {
         return 0;
     }
     let mut adjusted = 0usize;
     for l in &mut store {
-        if l.kind == LessonKind::DevError && want.contains(&normalize_signature(&l.signature)) {
+        if l.is_live_actionable_pitfall() && want.contains(&normalize_signature(&l.signature)) {
             l.apply_trust_feedback(passed);
             adjusted += 1;
         }
     }
-    if adjusted > 0 {
-        write_raw_lessons(project_root, DEV_ERRORS_FILE, &store);
+    if adjusted > 0 && !write_raw_lessons_unlocked(project_root, DEV_ERRORS_FILE, &store) {
+        return 0;
     }
     adjusted
 }
 
 /// Apply a trust pass/fail step to NON-pitfall lessons (failures / revisions /
-/// validated patterns / beliefs) identified by their [`lesson_identity`] triple
+/// validated patterns / beliefs) identified by their internal lesson-identity triple
 /// — the identities a recall surfaced into the prompt. Operates per
 /// reconcilable file PLUS the belief ledger so a surfaced belief's trust is
 /// updated too. Returns how many records were adjusted. Fail-open.
@@ -3861,20 +5575,25 @@ pub fn apply_trust_for_identities(
     let mut files: Vec<&str> = RECONCILE_FILES.to_vec();
     files.push(BELIEFS_FILE);
     for file in files {
+        let Some(_store_guard) = acquire_raw_store_lock(project_root, file) else {
+            continue;
+        };
         let mut rows = read_raw_lessons(project_root, file);
         if rows.is_empty() {
             continue;
         }
         let mut file_changed = false;
+        let mut file_adjusted = 0usize;
         for row in &mut rows {
             if want.contains(&lesson_identity(row)) {
                 row.apply_trust_feedback(passed);
                 file_changed = true;
+                file_adjusted = file_adjusted.saturating_add(1);
                 adjusted += 1;
             }
         }
-        if file_changed {
-            write_raw_lessons(project_root, file, &rows);
+        if file_changed && !write_raw_lessons_unlocked(project_root, file, &rows) {
+            adjusted = adjusted.saturating_sub(file_adjusted);
         }
     }
     adjusted
@@ -3883,7 +5602,7 @@ pub fn apply_trust_for_identities(
 /// Summary of the pitfall KB's self-verification state, for reporting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PitfallEfficacySummary {
-    /// Distinct dev-error pitfalls recorded.
+    /// Distinct actionable dev-error pitfalls recorded.
     pub total: usize,
     /// Pitfalls whose fix is proven (warned, no recurrence since).
     pub validated: usize,
@@ -3891,46 +5610,88 @@ pub struct PitfallEfficacySummary {
     pub recurring: usize,
     /// Pitfalls not yet surfaced / unproven.
     pub active: usize,
+    /// One-evidence/provenance-incomplete hypotheses.
+    pub hypothesis: usize,
+    /// Rules supported by at least two distinct evidence ids.
+    pub corroborated: usize,
+    /// Rules revoked by explicit conflict or a newer causal repair failure.
+    pub invalidated: usize,
+    /// Low-information generic rows retained only in raw JSONL for audit.
+    pub quarantined_records: usize,
+    /// Historical hit total stored on quarantined rows. This is explicitly not
+    /// an actionable pitfall count (old versions could inflate it per log line).
+    pub quarantined_hits: u64,
+    /// Privacy-safe unknown fingerprints awaiting a precise classifier.
+    pub unclassified_candidates: usize,
+    /// Independent episodes accumulated across those candidate fingerprints.
+    pub unclassified_candidate_hits: u64,
 }
 
 /// Render a human-readable overview of the pitfall KB — its self-verification
-/// summary plus each recorded pitfall, sorted worst-first (recurring →
-/// most-hit → recent). Used by the TUI `/pitfalls` overlay and any CLI view.
+/// summary plus each recorded pitfall, sorted worst-first (invalidated →
+/// corroborated → hypothesis → validated). Used by the TUI `/pitfalls` overlay
+/// and any CLI view.
 #[must_use]
 pub fn pitfall_overview(project_root: &Path) -> String {
-    let mut pits: Vec<Lesson> = read_raw_lessons(project_root, DEV_ERRORS_FILE)
-        .into_iter()
-        .filter(|l| l.kind == LessonKind::DevError)
-        .collect();
-    if pits.is_empty() {
-        return "踩坑知识库还是空的。\n\n开发过程中一旦遇到编译/类型/依赖/运行时等报错,\
-                UmaDev 会自动识别、记录,并在下次遇到同类问题前提醒规避。"
-            .to_string();
+    let summary = pitfall_efficacy_summary(project_root);
+    let mut pits = read_canonical_pitfalls(project_root);
+    let candidates = read_unclassified_candidate_lessons(project_root, 2);
+    if pits.is_empty() && candidates.is_empty() {
+        let quarantined = if summary.quarantined_records > 0 {
+            format!(
+                "\n\n已隔离 {} 条历史 generic 记录(旧计数 {} 次,不作为有效踩坑;原始 JSONL 仍保留供审计)。",
+                summary.quarantined_records, summary.quarantined_hits
+            )
+        } else {
+            String::new()
+        };
+        let awaiting = if summary.unclassified_candidates > 0 {
+            format!(
+                "\n\n另有 {} 条待分类候选(累计 {} 次);达到 2 次独立复现后会在此显示时间证据,但分类前绝不生成修法。",
+                summary.unclassified_candidates, summary.unclassified_candidate_hits
+            )
+        } else {
+            String::new()
+        };
+        return format!(
+            "踩坑知识库还是空的。\n\n开发过程中一旦遇到编译/类型/依赖/运行时等可定位报错,\
+             UmaDev 会按失败回合去重记录,并在下次遇到同类问题前提醒规避。{quarantined}{awaiting}"
+        );
     }
 
-    // Worst first: recurring fixes, then most-frequently-hit, then recent.
+    // Worst first: invalidated advice, independently corroborated risks,
+    // hypotheses, then causally validated repairs.
     let rank = |l: &Lesson| match l.pitfall_status() {
-        PitfallStatus::Recurring => 0,
-        PitfallStatus::Active => 1,
-        PitfallStatus::Validated => 2,
+        PitfallStatus::Invalidated => 0,
+        PitfallStatus::Corroborated => 1,
+        PitfallStatus::Hypothesis => 2,
+        PitfallStatus::Validated => 3,
     };
     pits.sort_by(|a, b| {
         rank(a)
             .cmp(&rank(b))
             .then_with(|| b.hits().cmp(&a.hits()))
-            .then_with(|| b.first_seen.cmp(&a.first_seen))
+            .then_with(|| b.last_observed_at().cmp(a.last_observed_at()))
     });
 
-    let s = pitfall_efficacy_summary(project_root);
     let mut out = format!(
-        "踩坑知识库 — 共 {} 条\n  [ok] 已验证(修复有效) {} · [warn] 仍复发(需加强) {} · 待验证 {}\n\n",
-        s.total, s.validated, s.recurring, s.active
+        "踩坑知识库 — 可行动 {} 条\n  hypothesis {} · corroborated {} · validated {} · invalidated {}\n  [candidate] 待分类 {} 条/历史命中 {} 次 · [quarantine] 历史 generic {} 条/旧计数 {} 次\n\n",
+        summary.total,
+        summary.hypothesis,
+        summary.corroborated,
+        summary.validated,
+        summary.invalidated,
+        summary.unclassified_candidates,
+        summary.unclassified_candidate_hits,
+        summary.quarantined_records,
+        summary.quarantined_hits,
     );
     for l in &pits {
         let (icon, tag) = match l.pitfall_status() {
-            PitfallStatus::Validated => ("[ok]", "已验证"),
-            PitfallStatus::Recurring => ("[warn]", "仍复发"),
-            PitfallStatus::Active => ("[pitfall]", "待验证"),
+            PitfallStatus::Hypothesis => ("[pitfall]", "hypothesis"),
+            PitfallStatus::Corroborated => ("[evidence]", "corroborated"),
+            PitfallStatus::Validated => ("[ok]", "validated"),
+            PitfallStatus::Invalidated => ("[warn]", "invalidated"),
         };
         let ctx = if l.context.is_empty() {
             String::new()
@@ -3938,13 +5699,33 @@ pub fn pitfall_overview(project_root: &Path) -> String {
             format!("  栈: {}", l.context.join(", "))
         };
         out.push_str(&format!(
-            "{icon} {} (已踩 {} 次 · {tag})\n  签名: {}{ctx}\n  原因: {}\n  规避: {}\n\n",
+            "{icon} {} (历史命中 {} 次 · 可审计证据 {} 条 · {tag})\n  签名: {}{ctx}\n  时间(UTC):\n    首次: {}\n    最近观察: {}\n    最近验证: {}\n  完整时间线: {}\n  原因: {}\n  规避: {}\n\n",
             l.title,
             l.hits(),
+            l.knowledge_evidence_count(),
             l.signature,
+            l.audited_first_observed_at(),
+            l.audited_last_observed_at()
+                .unwrap_or("—(旧数据无逐次时间)"),
+            l.last_verified_at().unwrap_or("—"),
+            if l.timeline_complete() { "是" } else { "否" },
             truncate(&l.root_cause, 160),
             truncate(&l.fix, 240),
         ));
+    }
+    if !candidates.is_empty() {
+        out.push_str("待分类候选（仅隐私指纹与时间证据，不生成/注入修法）\n");
+        for candidate in &candidates {
+            out.push_str(&format!(
+                "[candidate] {} (历史命中 {} 次 · 可审计证据 {} 条 · 需分类审核)\n  指纹: {}\n  时间(UTC):\n    首次: {}\n    最近观察: {}\n\n",
+                candidate.title,
+                candidate.hits(),
+                candidate.knowledge_evidence_count(),
+                candidate.signature,
+                candidate.audited_first_observed_at(),
+                candidate.last_recurred_at().unwrap_or("—"),
+            ));
+        }
     }
     out
 }
@@ -3962,11 +5743,48 @@ pub struct PitfallEntry {
     pub status: PitfallStatus,
     /// The recorded avoid-next-time fix.
     pub fix: String,
+    /// Grounded cause recorded for this concrete incident.
+    pub root_cause: String,
     /// Tech-stack fingerprint present when it was hit (its trigger context).
     pub context: Vec<String>,
     /// Fixes already tried that still let it recur — what UmaDev now steers AWAY
     /// from. Empty unless the pitfall recurred after a warning.
     pub failed_fixes: Vec<String>,
+    /// Immutable first observation time.
+    pub first_observed_at: String,
+    /// Latest observation time (first observation for a one-off).
+    pub last_observed_at: Option<String>,
+    /// Latest true recurrence, absent for a one-off/legacy row.
+    pub last_recurred_at: Option<String>,
+    /// Latest mechanically verified post-fix pass.
+    pub last_verified_at: Option<String>,
+    /// Number of bounded provenance records currently retained.
+    pub recent_evidence_count: usize,
+    /// Whether every lifetime hit has a retained episode record.
+    pub timeline_complete: bool,
+    /// Bounded provenance tail (timestamp + episode id + evidence hash).
+    pub recent_observations: Vec<PitfallObservation>,
+}
+
+/// Privacy-safe unknown error fingerprint. It carries only count/time/hash
+/// evidence and can never be recalled as advice until a classifier identifies
+/// a precise actionable root cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnclassifiedCandidateEntry {
+    /// Opaque `general/candidate/<hash>` identity (not raw error text).
+    pub fingerprint: String,
+    /// Independent failure episodes observed.
+    pub hits: u32,
+    /// First candidate observation.
+    pub first_observed_at: String,
+    /// Most recent repeated observation.
+    pub last_observed_at: Option<String>,
+    /// Bounded audit evidence currently retained.
+    pub recent_evidence_count: usize,
+    /// Whether the bounded timeline covers every lifetime hit.
+    pub timeline_complete: bool,
+    /// Bounded privacy-safe observation tail; raw error text is never exposed.
+    pub recent_observations: Vec<PitfallObservation>,
 }
 
 /// One pattern that passed the quality gate — a proven, reusable success.
@@ -3978,17 +5796,77 @@ pub struct ValidatedEntry {
     pub summary: String,
 }
 
+/// Lifecycle of a reusable, curated rule shown by `/lessons` (distinct from the
+/// concrete incident lifecycle shown by `/pitfalls`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CuratedLessonStatus {
+    /// One observation or provenance-incomplete legacy aggregate.
+    Hypothesis,
+    /// Two or more distinct evidence ids support the candidate rule.
+    Corroborated,
+    /// A complete causal repair success supports the rule.
+    Validated,
+    /// Contradictory evidence or a newer exact repair failure revoked the rule.
+    Invalidated,
+}
+
+impl CuratedLessonStatus {
+    /// Compatibility alias for the former two-state pending model.
+    #[allow(non_upper_case_globals)]
+    pub const Pending: Self = Self::Hypothesis;
+    /// Compatibility alias for the former repair-revision state.
+    #[allow(non_upper_case_globals)]
+    pub const NeedsRevision: Self = Self::Invalidated;
+}
+
+/// One reusable rule distilled from repeated incidents or the belief ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CuratedLessonEntry {
+    /// Human-readable rule title.
+    pub title: String,
+    /// Actionable recommendation.
+    pub rule: String,
+    /// Grounded explanation behind the rule.
+    pub root_cause: String,
+    /// Number of incidents/lessons supporting it.
+    pub evidence_count: u32,
+    /// Current confidence/lifecycle.
+    pub status: CuratedLessonStatus,
+    /// `pitfall`, `belief`, or `validated_pattern`.
+    pub source_kind: String,
+    /// Source pitfall signatures (empty for non-pitfall beliefs/patterns).
+    pub source_signatures: Vec<String>,
+    /// First evidence time available for this rule.
+    pub first_observed_at: String,
+    /// Most recent evidence/confirmation time.
+    pub last_observed_at: Option<String>,
+    /// Latest mechanical verification time, when any.
+    pub last_verified_at: Option<String>,
+    /// Whether the displayed source times cover every supporting observation.
+    /// `false` identifies legacy aggregate rows whose historical per-episode
+    /// timestamps were never recorded, so the UI must not present them as a
+    /// complete timeline.
+    pub timeline_complete: bool,
+}
+
 /// A structured, language-neutral view of "what UmaDev has learned" — its
 /// self-evolution made visible. Pure read; the CLI / TUI add i18n chrome.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LessonsReport {
     /// Pitfall self-verification counters (total / validated / recurring / active).
     pub efficacy: PitfallEfficacySummary,
+    /// Complete concrete incident ledger, ordered worst-first.
+    pub incidents: Vec<PitfallEntry>,
+    /// Reusable rules distilled from repeated pitfalls + folded experience.
+    /// This is the primary `/lessons` payload; incidents remain `/pitfalls`.
+    pub curated_lessons: Vec<CuratedLessonEntry>,
     /// High-frequency / noteworthy pitfalls, worst-first (recurring → most-hit).
     pub top_pitfalls: Vec<PitfallEntry>,
     /// Currently-avoided failing fixes — pitfalls whose recorded fix proved
     /// insufficient, so the base is now steered toward a different approach.
     pub recurring: Vec<PitfallEntry>,
+    /// Repeated unknown fingerprints shown for classification/audit only.
+    pub unclassified_candidates: Vec<UnclassifiedCandidateEntry>,
     /// Validated success patterns (passed the quality gate, reusable).
     pub validated_patterns: Vec<ValidatedEntry>,
 }
@@ -3997,7 +5875,20 @@ impl LessonsReport {
     /// `true` when nothing has been learned yet (drives the empty state).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.top_pitfalls.is_empty() && self.validated_patterns.is_empty()
+        self.curated_lessons.is_empty()
+    }
+
+    /// Whether concrete actionable incidents exist in the separate pitfall
+    /// ledger. `/lessons` can truthfully be empty while `/pitfalls` is not.
+    #[must_use]
+    pub fn has_incidents(&self) -> bool {
+        self.efficacy.total > 0
+    }
+
+    /// Whether repeated unknown errors have inspectable candidate evidence.
+    #[must_use]
+    pub fn has_unclassified_candidates(&self) -> bool {
+        self.efficacy.unclassified_candidates > 0
     }
 }
 
@@ -4016,22 +5907,21 @@ const LESSONS_TOP_N: usize = 12;
 pub fn lessons_report(project_root: &Path) -> LessonsReport {
     let efficacy = pitfall_efficacy_summary(project_root);
 
-    let mut pits: Vec<Lesson> = read_raw_lessons(project_root, DEV_ERRORS_FILE)
-        .into_iter()
-        .filter(|l| l.kind == LessonKind::DevError)
-        .collect();
-    // Worst first: recurring fixes, then most-frequently-hit, then recent —
-    // the same ordering the `/pitfalls` overlay uses.
+    let mut pits = read_canonical_pitfalls(project_root);
+    // Worst first: invalidated advice, independently corroborated risks,
+    // hypotheses, then causally validated repairs — the same ordering the
+    // `/pitfalls` overlay uses.
     let rank = |l: &Lesson| match l.pitfall_status() {
-        PitfallStatus::Recurring => 0,
-        PitfallStatus::Active => 1,
-        PitfallStatus::Validated => 2,
+        PitfallStatus::Invalidated => 0,
+        PitfallStatus::Corroborated => 1,
+        PitfallStatus::Hypothesis => 2,
+        PitfallStatus::Validated => 3,
     };
     pits.sort_by(|a, b| {
         rank(a)
             .cmp(&rank(b))
             .then_with(|| b.hits().cmp(&a.hits()))
-            .then_with(|| b.first_seen.cmp(&a.first_seen))
+            .then_with(|| b.last_observed_at().cmp(a.last_observed_at()))
     });
 
     let to_entry = |l: &Lesson| PitfallEntry {
@@ -4040,38 +5930,240 @@ pub fn lessons_report(project_root: &Path) -> LessonsReport {
         hits: l.hits(),
         status: l.pitfall_status(),
         fix: l.fix.clone(),
+        root_cause: l.root_cause.clone(),
         context: l.context.clone(),
         failed_fixes: l
             .efficacy
             .as_ref()
+            .filter(|e| e.outcome_attribution_version == 1)
             .map(|e| e.failed_fixes.clone())
+            .unwrap_or_default(),
+        first_observed_at: l.audited_first_observed_at().to_string(),
+        last_observed_at: l.audited_last_observed_at().map(str::to_string),
+        last_recurred_at: l.last_recurred_at().map(str::to_string),
+        last_verified_at: l.last_verified_at().map(str::to_string),
+        recent_evidence_count: l.knowledge_evidence_count(),
+        timeline_complete: l.timeline_complete(),
+        recent_observations: l
+            .efficacy
+            .as_ref()
+            .map(|e| e.recent_observations.clone())
             .unwrap_or_default(),
     };
 
-    let recurring: Vec<PitfallEntry> = pits
+    let incidents: Vec<PitfallEntry> = pits.iter().map(to_entry).collect();
+    let recurring: Vec<PitfallEntry> = incidents
         .iter()
-        .filter(|l| l.pitfall_status() == PitfallStatus::Recurring)
-        .map(to_entry)
+        .filter(|incident| incident.status == PitfallStatus::Invalidated)
+        .cloned()
         .collect();
-    let top_pitfalls: Vec<PitfallEntry> = pits.iter().take(LESSONS_TOP_N).map(to_entry).collect();
-
-    // Validated patterns: positive experience that cleared the quality gate.
-    let mut validated_patterns: Vec<ValidatedEntry> =
-        read_raw_lessons(project_root, "validated-decisions.jsonl")
+    let top_pitfalls: Vec<PitfallEntry> = incidents.iter().take(LESSONS_TOP_N).cloned().collect();
+    let unclassified_candidates: Vec<UnclassifiedCandidateEntry> =
+        read_unclassified_candidate_lessons(project_root, 2)
             .into_iter()
-            .filter(|l| l.kind == LessonKind::ValidatedPattern)
-            .map(|l| ValidatedEntry {
-                title: l.title,
-                summary: truncate(l.body.lines().next().unwrap_or("").trim(), 160),
+            .map(|candidate| UnclassifiedCandidateEntry {
+                fingerprint: candidate.signature.clone(),
+                hits: candidate.hits(),
+                first_observed_at: candidate.audited_first_observed_at().to_string(),
+                last_observed_at: candidate.audited_last_observed_at().map(str::to_string),
+                recent_evidence_count: candidate.knowledge_evidence_count(),
+                timeline_complete: candidate.timeline_complete(),
+                recent_observations: candidate
+                    .efficacy
+                    .as_ref()
+                    .map(|efficacy| efficacy.recent_observations.clone())
+                    .unwrap_or_default(),
             })
             .collect();
+
+    // `/lessons` is the reusable-rule view, not another incident ledger. A
+    // Every precise pitfall is visible with its explicit lifecycle. Aggregate
+    // hit counts never become evidence counts and never validate a rule.
+    let mut curated_lessons: Vec<CuratedLessonEntry> = pits
+        .iter()
+        .map(|l| CuratedLessonEntry {
+            // Keep the structured report language-neutral. CLI/TUI surfaces add
+            // the translated presentation prefix for generated pitfall rules.
+            title: l.signature.clone(),
+            rule: l.fix.clone(),
+            root_cause: l.root_cause.clone(),
+            evidence_count: u32::try_from(l.knowledge_evidence_count()).unwrap_or(u32::MAX),
+            status: match l.pitfall_status() {
+                PitfallStatus::Hypothesis => CuratedLessonStatus::Hypothesis,
+                PitfallStatus::Corroborated => CuratedLessonStatus::Corroborated,
+                PitfallStatus::Validated => CuratedLessonStatus::Validated,
+                PitfallStatus::Invalidated => CuratedLessonStatus::Invalidated,
+            },
+            source_kind: "pitfall".to_string(),
+            source_signatures: vec![l.signature.clone()],
+            first_observed_at: l.audited_first_observed_at().to_string(),
+            last_observed_at: l.audited_last_observed_at().map(str::to_string),
+            last_verified_at: l.last_verified_at().map(str::to_string),
+            timeline_complete: l.timeline_complete(),
+        })
+        .collect();
+
+    // Merge deterministic folded beliefs. Similarity only groups the candidate;
+    // lifecycle and counts come exclusively from retained typed evidence.
+    let belief_rows: Vec<Lesson> = read_raw_lessons(project_root, BELIEFS_FILE)
+        .into_iter()
+        .filter(|l| l.kind == LessonKind::Belief)
+        .collect();
+    let covered_evidence: std::collections::HashSet<String> = belief_rows
+        .iter()
+        .filter(|belief| !belief.invalidated)
+        .flat_map(|belief| belief.evidence.iter().cloned())
+        .collect();
+    curated_lessons.extend(belief_rows.into_iter().map(|l| {
+        let evidence_count = u32::try_from(l.knowledge_evidence_count()).unwrap_or(u32::MAX);
+        let status = match l.pitfall_status() {
+            PitfallStatus::Hypothesis => CuratedLessonStatus::Hypothesis,
+            PitfallStatus::Corroborated => CuratedLessonStatus::Corroborated,
+            PitfallStatus::Validated => CuratedLessonStatus::Validated,
+            PitfallStatus::Invalidated => CuratedLessonStatus::Invalidated,
+        };
+        let first_observed_at = l.audited_first_observed_at().to_string();
+        let last_observed_at = l.audited_last_observed_at().map(str::to_string);
+        let last_verified_at = l.last_verified_at().map(str::to_string);
+        let timeline_complete = l.timeline_complete();
+        CuratedLessonEntry {
+            title: l.title,
+            rule: l.fix,
+            root_cause: l.root_cause,
+            evidence_count,
+            status,
+            source_kind: "belief".to_string(),
+            source_signatures: Vec::new(),
+            // A belief's `first_seen` field historically means latest
+            // confirmation, not the first evidence in its cluster. Do
+            // not relabel it as a precise first-observation timestamp.
+            first_observed_at,
+            last_observed_at,
+            last_verified_at,
+            timeline_complete,
+        }
+    }));
+
+    // Source-verified patterns remain hypotheses until a causally attributable
+    // repair success exists; a green build alone is not proof of this advice.
+    let validated_rows: Vec<Lesson> = read_raw_lessons(project_root, "validated-decisions.jsonl")
+        .into_iter()
+        .filter(|l| l.kind == LessonKind::ValidatedPattern)
+        .filter(|l| {
+            let legacy_key = format!("{}\u{0}{}", l.domain, l.title);
+            !covered_evidence.contains(&evidence_key(l)) && !covered_evidence.contains(&legacy_key)
+        })
+        .collect();
+    for l in &validated_rows {
+        curated_lessons.push(CuratedLessonEntry {
+            title: l.title.clone(),
+            rule: l.fix.clone(),
+            root_cause: l.root_cause.clone(),
+            evidence_count: u32::try_from(l.knowledge_evidence_count()).unwrap_or(u32::MAX),
+            status: match l.pitfall_status() {
+                PitfallStatus::Hypothesis => CuratedLessonStatus::Hypothesis,
+                PitfallStatus::Corroborated => CuratedLessonStatus::Corroborated,
+                PitfallStatus::Validated => CuratedLessonStatus::Validated,
+                PitfallStatus::Invalidated => CuratedLessonStatus::Invalidated,
+            },
+            source_kind: "validated_pattern".to_string(),
+            source_signatures: Vec::new(),
+            first_observed_at: l.audited_first_observed_at().to_string(),
+            last_observed_at: l.audited_last_observed_at().map(str::to_string),
+            last_verified_at: l.last_verified_at().map(str::to_string),
+            timeline_complete: l.timeline_complete(),
+        });
+    }
+    let mut validated_patterns: Vec<ValidatedEntry> = validated_rows
+        .into_iter()
+        .filter(|lesson| lesson.pitfall_status() == PitfallStatus::Validated)
+        .map(|l| ValidatedEntry {
+            title: l.title,
+            summary: truncate(l.body.lines().next().unwrap_or("").trim(), 160),
+        })
+        .collect();
+    validated_patterns.sort_by(|a, b| a.title.cmp(&b.title).then(a.summary.cmp(&b.summary)));
+    validated_patterns.dedup();
     validated_patterns.truncate(LESSONS_TOP_N);
+
+    curated_lessons = canonicalize_curated_lessons(curated_lessons);
+
+    let curated_rank = |status: CuratedLessonStatus| match status {
+        CuratedLessonStatus::Invalidated => 0,
+        CuratedLessonStatus::Validated => 1,
+        CuratedLessonStatus::Corroborated => 2,
+        CuratedLessonStatus::Hypothesis => 3,
+    };
+    curated_lessons.sort_by(|a, b| {
+        curated_rank(a.status)
+            .cmp(&curated_rank(b.status))
+            .then_with(|| b.evidence_count.cmp(&a.evidence_count))
+            .then_with(|| b.last_observed_at.cmp(&a.last_observed_at))
+    });
 
     LessonsReport {
         efficacy,
+        incidents,
+        curated_lessons,
         top_pitfalls,
         recurring,
+        unclassified_candidates,
         validated_patterns,
+    }
+}
+
+fn canonicalize_curated_lessons(entries: Vec<CuratedLessonEntry>) -> Vec<CuratedLessonEntry> {
+    let mut canonical = Vec::<CuratedLessonEntry>::new();
+    let mut index = std::collections::HashMap::<(String, String, String, String), usize>::new();
+    for entry in entries {
+        let key = (
+            entry.source_kind.clone(),
+            entry.title.clone(),
+            entry.rule.clone(),
+            entry.root_cause.clone(),
+        );
+        if let Some(&position) = index.get(&key) {
+            let dst = &mut canonical[position];
+            dst.evidence_count = dst.evidence_count.saturating_add(entry.evidence_count);
+            if dst.first_observed_at.is_empty()
+                || (!entry.first_observed_at.is_empty()
+                    && entry.first_observed_at < dst.first_observed_at)
+            {
+                dst.first_observed_at = entry.first_observed_at;
+            }
+            dst.last_observed_at =
+                latest_optional_time(dst.last_observed_at.take(), entry.last_observed_at);
+            dst.last_verified_at =
+                latest_optional_time(dst.last_verified_at.take(), entry.last_verified_at);
+            dst.timeline_complete &= entry.timeline_complete;
+            merge_tokens(&mut dst.source_signatures, &entry.source_signatures, 32);
+            dst.status = stronger_curated_status(dst.status, entry.status);
+        } else {
+            index.insert(key, canonical.len());
+            canonical.push(entry);
+        }
+    }
+    canonical
+}
+
+fn latest_optional_time(left: Option<String>, right: Option<String>) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn stronger_curated_status(
+    left: CuratedLessonStatus,
+    right: CuratedLessonStatus,
+) -> CuratedLessonStatus {
+    use CuratedLessonStatus::{Corroborated, Hypothesis, Invalidated, Validated};
+    match (left, right) {
+        (Invalidated, _) | (_, Invalidated) => Invalidated,
+        (Validated, _) | (_, Validated) => Validated,
+        (Corroborated, _) | (_, Corroborated) => Corroborated,
+        (Hypothesis, Hypothesis) => Hypothesis,
     }
 }
 
@@ -4080,14 +6172,37 @@ pub fn lessons_report(project_root: &Path) -> LessonsReport {
 pub fn pitfall_efficacy_summary(project_root: &Path) -> PitfallEfficacySummary {
     let mut s = PitfallEfficacySummary::default();
     for l in read_raw_lessons(project_root, DEV_ERRORS_FILE) {
-        if l.kind != LessonKind::DevError {
+        if l.kind != LessonKind::DevError || l.invalidated {
             continue;
         }
+        if !l.is_recognized() {
+            if l.signature.starts_with("general/candidate/") {
+                s.unclassified_candidates += 1;
+                s.unclassified_candidate_hits = s
+                    .unclassified_candidate_hits
+                    .saturating_add(u64::from(l.hits()));
+            } else {
+                s.quarantined_records += 1;
+                s.quarantined_hits = s.quarantined_hits.saturating_add(u64::from(l.hits()));
+            }
+        }
+    }
+    for l in read_canonical_pitfalls(project_root) {
         s.total += 1;
         match l.pitfall_status() {
             PitfallStatus::Validated => s.validated += 1,
-            PitfallStatus::Recurring => s.recurring += 1,
-            PitfallStatus::Active => s.active += 1,
+            PitfallStatus::Invalidated => {
+                s.invalidated += 1;
+                s.recurring += 1;
+            }
+            PitfallStatus::Corroborated => {
+                s.corroborated += 1;
+                s.active += 1;
+            }
+            PitfallStatus::Hypothesis => {
+                s.hypothesis += 1;
+                s.active += 1;
+            }
         }
     }
     s
@@ -4106,7 +6221,7 @@ mod tests {
     /// guard's `Drop` would restore the real `HOME` underneath a `NoBundledCorpus` holder
     /// and leak the developer's staged `~/.umadev/knowledge` into tests that assert no
     /// corpus is reachable. Both now serialise on the single shared lock.
-    use crate::test_support::TempHome;
+    use crate::test_support::{NoBundledCorpus, TempHome};
 
     use crate::phases::QualityCheck;
     use tempfile::TempDir;
@@ -4120,6 +6235,29 @@ mod tests {
             score,
             details: format!("details for {name}"),
             weight: 2.0,
+        }
+    }
+
+    fn test_evidence(
+        id: &str,
+        observed_at: &str,
+        outcome: KnowledgeEvidenceOutcome,
+    ) -> PitfallObservation {
+        PitfallObservation {
+            observed_at: observed_at.to_string(),
+            episode_id: id.to_string(),
+            evidence_hash: format!("hash-{id}"),
+            source: "test-mechanical-verifier".to_string(),
+            base: "test-base".to_string(),
+            base_version: "1.2.3".to_string(),
+            workspace_scope: "project:test".to_string(),
+            outcome,
+            causal_attempt_id: matches!(
+                outcome,
+                KnowledgeEvidenceOutcome::FixSucceeded | KnowledgeEvidenceOutcome::FixFailed
+            )
+            .then(|| format!("attempt-{id}"))
+            .unwrap_or_default(),
         }
     }
 
@@ -4196,6 +6334,186 @@ mod tests {
     }
 
     #[test]
+    fn lesson_recall_policy_never_blocks_settlement_trust_or_reports() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        assert_eq!(
+            capture_dev_errors(
+                tmp.path(),
+                std::slice::from_ref(&error),
+                "demo",
+                "dependency lodash"
+            ),
+            1
+        );
+        let token = commit_pitfall_fix_attempt(tmp.path(), &error).unwrap();
+        crate::memory_control::update_recall(
+            tmp.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::Pitfalls),
+            false,
+        )
+        .unwrap();
+        assert!(lessons_for_error(tmp.path(), &error).is_empty());
+        assert!(recurring_pitfall_for_error(tmp.path(), &error).is_none());
+
+        assert_eq!(
+            settle_pitfall_fix_attempt(tmp.path(), &token, PitfallFixAttemptResult::Passed),
+            PitfallFixSettlement::Passed,
+            "a receipt sent before recall-off still settles"
+        );
+        assert_eq!(
+            apply_dev_error_trust(tmp.path(), std::slice::from_ref(&error), true),
+            1,
+            "trust bookkeeping is not prompt recall"
+        );
+        assert_eq!(lessons_report(tmp.path()).efficacy.total, 1);
+
+        let older = mk_db_lesson(
+            "indexing add",
+            "always add a btree index on every filtered column for speed",
+            "missing indexes slowed reads across the board significantly",
+            "2026-06-01T00:00:00Z",
+        );
+        let newer = mk_db_lesson(
+            "indexing drop",
+            "avoid over indexing and drop redundant indexes to keep writes fast",
+            "too many indexes bloated writes and storage badly here",
+            "2026-06-20T00:00:00Z",
+        );
+        write_raw_lessons(tmp.path(), "quality-failures.jsonl", &[older, newer]);
+        std::fs::write(
+            tmp.path().join(".umadev/memory/policy.toml"),
+            "invalid = [toml",
+        )
+        .unwrap();
+        assert_eq!(
+            scan_contradictions(tmp.path()),
+            0,
+            "a malformed policy is privacy-conservative and authorises no leaf rewrite"
+        );
+        assert!(relevant_lessons_for_prompt(tmp.path(), "database index").is_empty());
+        let report = lessons_report(tmp.path());
+        assert!(
+            !report.is_empty(),
+            "corrupt policy hides no report/inventory data"
+        );
+        assert_eq!(
+            capture_dev_errors(
+                tmp.path(),
+                std::slice::from_ref(&error),
+                "demo",
+                "dependency lodash"
+            ),
+            0,
+            "malformed policy disables new capture"
+        );
+    }
+
+    #[test]
+    fn lesson_prompt_recall_is_leaf_scoped_including_reflected_strategies() {
+        let quality = TempDir::new().unwrap();
+        capture_quality_failures(
+            quality.path(),
+            &[check("OpenAPI contract", "failed", 20)],
+            "demo",
+            "api contract openapi",
+        );
+        assert!(!relevant_lessons_for_prompt(quality.path(), "api contract openapi").is_empty());
+        crate::memory_control::update_recall(
+            quality.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::QualityFailures),
+            false,
+        )
+        .unwrap();
+        assert!(relevant_lessons_for_prompt(quality.path(), "api contract openapi").is_empty());
+        assert_eq!(read_all_raw_lessons(quality.path()).len(), 1);
+        crate::memory_control::update_recall(
+            quality.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::QualityFailures),
+            true,
+        )
+        .unwrap();
+        assert!(!relevant_lessons_for_prompt(quality.path(), "api contract openapi").is_empty());
+
+        let pitfalls = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        capture_dev_errors(
+            pitfalls.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "dependency lodash",
+        );
+        let attempt = commit_pitfall_fix_attempt(pitfalls.path(), &error).unwrap();
+        capture_dev_errors(
+            pitfalls.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "dependency lodash",
+        );
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                pitfalls.path(),
+                &attempt,
+                PitfallFixAttemptResult::VerificationFailed(error.clone()),
+            ),
+            PitfallFixSettlement::SameSignatureFailed,
+        );
+        let strategy = "pin lodash and regenerate the lockfile from a clean install";
+        assert!(record_pitfall_strategy(
+            pitfalls.path(),
+            "dependency/module-not-found/lodash",
+            strategy,
+        ));
+        assert!(lessons_for_error(pitfalls.path(), &error).contains(strategy));
+        crate::memory_control::update_capture(
+            pitfalls.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::PitfallReflections),
+            false,
+        )
+        .unwrap();
+        assert!(
+            recurring_pitfall_for_error(pitfalls.path(), &error).is_none(),
+            "capture-off prevents the optional reflection base consult",
+        );
+        assert!(
+            lessons_for_error(pitfalls.path(), &error).contains(strategy),
+            "capture and recall are independent",
+        );
+        crate::memory_control::update_capture(
+            pitfalls.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::PitfallReflections),
+            true,
+        )
+        .unwrap();
+        crate::memory_control::update_recall(
+            pitfalls.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::PitfallReflections),
+            false,
+        )
+        .unwrap();
+        let without_reflection = lessons_for_error(pitfalls.path(), &error);
+        assert!(
+            !without_reflection.is_empty(),
+            "pitfall recall remains enabled"
+        );
+        assert!(!without_reflection.contains(strategy));
+        crate::memory_control::update_recall(
+            pitfalls.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::PitfallReflections),
+            true,
+        )
+        .unwrap();
+        assert!(lessons_for_error(pitfalls.path(), &error).contains(strategy));
+    }
+
+    #[test]
     fn capture_dev_errors_distills_dedups_and_recalls() {
         let tmp = TempDir::new().unwrap();
         let errors = vec![
@@ -4231,9 +6549,8 @@ mod tests {
             .expect("react-router pitfall present");
         assert_eq!(rr.hits(), 2, "recurrence incremented occurrences");
 
-        // Dev-error pitfalls surface in the recalled prompt block even when the
-        // requirement shares no keywords with the error text.
-        let recall = relevant_lessons_for_prompt(tmp.path(), "完全无关的需求文本");
+        assert!(relevant_lessons_for_prompt(tmp.path(), "完全无关的需求文本").is_empty());
+        let recall = relevant_lessons_for_prompt(tmp.path(), "修复 react-router-dom 路由");
         assert!(
             recall.contains("[pitfall]"),
             "recall must surface pitfalls: {recall}"
@@ -4249,8 +6566,8 @@ mod tests {
         // DIFFERENT record, then rewrite the WHOLE store. Run concurrently
         // WITHOUT a shared lock, the later writer's stale snapshot clobbers the
         // earlier writer's record -> a silently dropped pitfall / strategy. The
-        // single DEV_ERRORS_LOCK around every read-modify-write must make the two
-        // functions mutually exclude so BOTH mutations survive in the final file.
+        // cross-process pitfalls-store lock around every read-modify-write must
+        // make the two functions mutually exclude so BOTH mutations survive.
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
 
@@ -4332,6 +6649,221 @@ mod tests {
     }
 
     #[test]
+    fn cross_process_lesson_writer_child() {
+        let Some(root) = std::env::var_os("UMADEV_LESSONS_MP_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let index = std::env::var("UMADEV_LESSONS_MP_INDEX").unwrap();
+        fs::write(root.join(format!("ready-{index}")), b"").unwrap();
+        let started = std::time::Instant::now();
+        while !root.join("start").exists() && started.elapsed() < std::time::Duration::from_secs(10)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            root.join("start").exists(),
+            "parent did not release writer gate"
+        );
+
+        match std::env::var("UMADEV_LESSONS_MP_MODE").as_deref() {
+            Ok("capture") => {
+                let name = std::env::var("UMADEV_LESSONS_MP_NAME").unwrap();
+                let error = format!("Error: Cannot find module 'umadev-cross-{name}'");
+                let outcome = capture_dev_errors_detailed(&root, &[error], "mp", "mp");
+                fs::write(
+                    root.join(format!("result-{index}")),
+                    outcome.observations.to_string(),
+                )
+                .unwrap();
+            }
+            Ok("same-evidence") => {
+                let error = "Error: Cannot find module 'umadev-shared-evidence'".to_string();
+                let outcome = capture_dev_errors_detailed_with_evidence_id(
+                    &root,
+                    &[error],
+                    "mp",
+                    "mp",
+                    "shared-cross-process-evidence",
+                );
+                fs::write(
+                    root.join(format!("result-{index}")),
+                    outcome.observations.to_string(),
+                )
+                .unwrap();
+            }
+            Ok("settle") => {
+                let token = std::env::var("UMADEV_LESSONS_MP_TOKEN").unwrap();
+                let settlement =
+                    settle_pitfall_fix_attempt(&root, &token, PitfallFixAttemptResult::Passed);
+                fs::write(
+                    root.join(format!("result-{index}")),
+                    format!("{settlement:?}"),
+                )
+                .unwrap();
+            }
+            mode => panic!("unexpected child mode: {mode:?}"),
+        }
+    }
+
+    fn spawn_lesson_children(
+        root: &Path,
+        mode: &str,
+        token: Option<&str>,
+    ) -> Vec<std::process::Child> {
+        const NAMES: [&str; 8] = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ];
+        let exe = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for (index, name) in NAMES.iter().enumerate() {
+            let mut command = std::process::Command::new(&exe);
+            command
+                .args([
+                    "--exact",
+                    "lessons::tests::cross_process_lesson_writer_child",
+                    "--nocapture",
+                ])
+                .env("UMADEV_LESSONS_MP_ROOT", root)
+                .env("UMADEV_LESSONS_MP_MODE", mode)
+                .env("UMADEV_LESSONS_MP_INDEX", index.to_string())
+                .env("UMADEV_LESSONS_MP_NAME", name);
+            if let Some(token) = token {
+                command.env("UMADEV_LESSONS_MP_TOKEN", token);
+            }
+            children.push(command.spawn().unwrap());
+        }
+        let started = std::time::Instant::now();
+        loop {
+            let ready = (0..NAMES.len())
+                .filter(|index| root.join(format!("ready-{index}")).exists())
+                .count();
+            if ready == NAMES.len() || started.elapsed() >= std::time::Duration::from_secs(10) {
+                fs::write(root.join("start"), b"").unwrap();
+                assert_eq!(
+                    ready,
+                    NAMES.len(),
+                    "not every writer reached the start gate"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        children
+    }
+
+    #[test]
+    fn eight_process_captures_have_zero_lost_updates() {
+        let temp = TempDir::new().unwrap();
+        let children = spawn_lesson_children(temp.path(), "capture", None);
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        for index in 0..8 {
+            assert_eq!(
+                fs::read_to_string(temp.path().join(format!("result-{index}"))).unwrap(),
+                "1"
+            );
+        }
+        let rows = read_raw_lessons(temp.path(), DEV_ERRORS_FILE);
+        let signatures: std::collections::HashSet<_> = rows
+            .iter()
+            .filter(|row| {
+                row.signature
+                    .starts_with("dependency/module-not-found/umadev-cross-")
+            })
+            .map(|row| row.signature.as_str())
+            .collect();
+        assert_eq!(signatures.len(), 8, "one or more process updates were lost");
+    }
+
+    #[test]
+    fn eight_process_replay_of_one_evidence_id_is_exactly_once() {
+        let temp = TempDir::new().unwrap();
+        let children = spawn_lesson_children(temp.path(), "same-evidence", None);
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        let committed: usize = (0..8)
+            .map(|index| {
+                fs::read_to_string(temp.path().join(format!("result-{index}")))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(
+            committed, 1,
+            "a replayed evidence id committed more than once"
+        );
+        let row = read_raw_lessons(temp.path(), DEV_ERRORS_FILE).remove(0);
+        assert_eq!(row.hits(), 1);
+        assert_eq!(row.knowledge_evidence_count(), 1);
+        assert_eq!(row.pitfall_status(), PitfallStatus::Hypothesis);
+    }
+
+    #[test]
+    fn eight_process_settlement_is_exactly_once() {
+        let temp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'";
+        assert_eq!(
+            capture_dev_errors(temp.path(), &[error.to_string()], "mp", "mp"),
+            1
+        );
+        let token = commit_pitfall_fix_attempt(temp.path(), error).unwrap();
+        let children = spawn_lesson_children(temp.path(), "settle", Some(&token));
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        let results: Vec<String> = (0..8)
+            .map(|index| fs::read_to_string(temp.path().join(format!("result-{index}"))).unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|result| *result == "Passed").count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| *result == "NotFound")
+                .count(),
+            7
+        );
+        let row = read_raw_lessons(temp.path(), DEV_ERRORS_FILE).remove(0);
+        let efficacy = row.efficacy.unwrap();
+        assert!(efficacy.pending_fix_attempts.is_empty());
+        assert_eq!(efficacy.exact_helpful, 1);
+    }
+
+    #[test]
+    fn hostile_raw_ledgers_are_bounded_and_never_overwritten() {
+        let cases = [
+            vec![b'x'; MAX_RAW_LINE_BYTES + 1],
+            "{}\n".repeat(MAX_RAW_LEDGER_LINES + 1).into_bytes(),
+            vec![b'x'; usize::try_from(MAX_RAW_LEDGER_BYTES).unwrap() + 1],
+        ];
+        for bytes in cases {
+            let temp = TempDir::new().unwrap();
+            let raw = ensure_raw_lessons_dir(temp.path()).unwrap();
+            let path = raw.join(DEV_ERRORS_FILE);
+            fs::write(&path, &bytes).unwrap();
+            assert!(read_raw_lessons(temp.path(), DEV_ERRORS_FILE).is_empty());
+            let outcome = capture_dev_errors_detailed(
+                temp.path(),
+                &["Error: Cannot find module 'bounded-ledger'".to_string()],
+                "bounds",
+                "bounds",
+            );
+            assert_eq!(outcome, PitfallCaptureOutcome::default());
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "hostile input was replaced"
+            );
+        }
+    }
+
+    #[test]
     fn efficacy_loop_escalates_recurrence_and_validates_fixes() {
         let tmp = TempDir::new().unwrap();
         let sig = "dependency/module-not-found/lodash";
@@ -4347,24 +6879,53 @@ mod tests {
         capture_dev_errors(tmp.path(), &err, "demo", "需求");
         assert_eq!(status(tmp.path()), Some(PitfallStatus::Active));
 
-        // 2. Warn the worker once — a single optimistic warning is not yet proof.
+        // 2. Passive prompt assembly is pure: it is not proof the warning was
+        // sent, so it cannot mutate lifecycle state.
         let _ = relevant_lessons_for_prompt(tmp.path(), "无关需求一");
         assert_eq!(status(tmp.path()), Some(PitfallStatus::Active));
 
-        // 3. It recurs DESPITE the warning → escalated to Recurring.
+        // 3. A second independent episode corroborates, but cannot validate.
         capture_dev_errors(tmp.path(), &err, "demo", "需求");
+        assert_eq!(status(tmp.path()), Some(PitfallStatus::Corroborated));
+
+        // 4. Failure-time retrieval is pure too; only an actually run repair
+        // turn commits the attempt. The next independent episode then proves
+        // the warning/fix did not hold.
+        assert!(!lessons_for_error(tmp.path(), &err[0]).is_empty());
+        let failed_attempt = commit_pitfall_fix_attempt(tmp.path(), &err[0]).unwrap();
+        capture_dev_errors(tmp.path(), &err, "demo", "需求");
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                tmp.path(),
+                &failed_attempt,
+                PitfallFixAttemptResult::VerificationFailed(err[0].clone())
+            ),
+            PitfallFixSettlement::SameSignatureFailed
+        );
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                tmp.path(),
+                &failed_attempt,
+                PitfallFixAttemptResult::VerificationFailed(err[0].clone())
+            ),
+            PitfallFixSettlement::NotFound
+        );
         assert_eq!(status(tmp.path()), Some(PitfallStatus::Recurring));
         assert_eq!(pitfall_efficacy_summary(tmp.path()).recurring, 1);
 
-        // 4. A PASSIVE recall surfaces it LOUDLY (escalation annotation) but must
-        //    NOT clear the escalation flag — merely showing a pitfall as prompt
-        //    context is not a fresh fix attempt, so "already warned, still
-        //    recurring" survives the surfacing (the item-#2 fix). It stays
-        //    Recurring, not silently demoted to Validated.
-        let recall = relevant_lessons_for_prompt(tmp.path(), "无关需求二");
+        // 5. A failed repair invalidates the old advice. Broad, fuzzy recall must
+        //    therefore abstain instead of reinjecting a known-bad fix. Exact
+        //    failure-time recall may still surface the failure as negative evidence
+        //    so the next repair can deliberately choose a different strategy.
+        let recall = relevant_lessons_for_prompt(tmp.path(), "修复 lodash 依赖");
         assert!(
-            recall.contains("⚠ 上次已警示"),
-            "recurrence must escalate: {recall}"
+            recall.is_empty(),
+            "invalidated advice leaked into broad recall"
+        );
+        let exact_recall = lessons_for_error(tmp.path(), &err[0]);
+        assert!(
+            exact_recall.contains("上次已警示但仍复发"),
+            "exact negative evidence must remain auditable: {exact_recall}"
         );
         assert_eq!(
             status(tmp.path()),
@@ -4372,15 +6933,24 @@ mod tests {
             "a passive recall must NOT reset the escalation flag"
         );
 
-        // 5. Self-healing routes through a GENUINE fix attempt: the at-failure
-        //    recall (`lessons_for_error`) gives the (re-derived) fix a clean
-        //    chance by resetting the escalation flag. Having now been warned and
-        //    NOT recurred since, the fix reads as Validated and is damped.
+        // 6. Retrieval and commit preserve the last settled verdict. ONLY a
+        // mechanical pass for this exact token marks Validated.
         let _ = lessons_for_error(tmp.path(), &err[0]);
+        assert_eq!(status(tmp.path()), Some(PitfallStatus::Recurring));
+        let passed_attempt = commit_pitfall_fix_attempt(tmp.path(), &err[0]).unwrap();
+        assert_eq!(status(tmp.path()), Some(PitfallStatus::Recurring));
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                tmp.path(),
+                &passed_attempt,
+                PitfallFixAttemptResult::Passed
+            ),
+            PitfallFixSettlement::Passed
+        );
         assert_eq!(
             status(tmp.path()),
             Some(PitfallStatus::Validated),
-            "an active fix attempt that doesn't recur validates the fix"
+            "only a mechanically passing post-fix check validates the fix"
         );
         let s = pitfall_efficacy_summary(tmp.path());
         assert_eq!(s.total, 1);
@@ -4417,6 +6987,7 @@ mod tests {
                 next_strategy: String::new(),
                 helpful: 0,
                 harmful: 0,
+                ..PitfallEfficacy::default()
             }),
             invalidated: false,
             trust: NEUTRAL_TRUST,
@@ -4437,20 +7008,16 @@ mod tests {
             after.recurred_after_warning,
             "passive recall must NOT clear the escalation flag"
         );
-        // But the baseline IS re-snapshotted so a later capture still detects a
-        // fresh recurrence (injected bumped, occ re-baselined to current hits).
-        assert!(
-            after.injected >= 3,
-            "passive recall still records the injection"
+        assert_eq!(
+            after.injected, 2,
+            "passive recall has no efficacy side effect"
         );
     }
 
     #[test]
     fn family_match_does_not_inject_other_root_causes_strategy() {
-        // Item #1: `lessons_for_error` matches by signature OR family prefix. A
-        // reflected `next_strategy` is root-cause-specific, so a family-neighbour
-        // (same `dependency/module-not-found` family, DIFFERENT module) must not
-        // leak its strategy / failed-fix ledger into a different module's error.
+        // Stored advice is discriminator-specific. A family neighbour must not
+        // leak any root/fix/strategy into a different module's error.
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         let neighbour = Lesson {
@@ -4476,6 +7043,7 @@ mod tests {
                     .into(),
                 helpful: 0,
                 harmful: 0,
+                ..PitfallEfficacy::default()
             }),
             invalidated: false,
             trust: NEUTRAL_TRUST,
@@ -4486,16 +7054,9 @@ mod tests {
 
         // A DIFFERENT module's error in the SAME family.
         let recall = lessons_for_error(root, "Error: Cannot find module 'lodash'");
-        // The generic family summary (root cause / last fix) is still useful and
-        // surfaced — but the neighbour's module-specific strategy + failed-fix
-        // ledger must NOT appear (that would be cross-root-cause mis-injection).
         assert!(
-            !recall.contains("Pin react-router-dom"),
-            "a family match must not inject another module's reflected strategy: {recall}"
-        );
-        assert!(
-            !recall.contains("delete node_modules and reinstall"),
-            "a family match must not inject another module's failed-fix ledger: {recall}"
+            recall.is_empty(),
+            "a family neighbour must abstain from all stored advice: {recall}"
         );
 
         // Sanity: an EXACT-signature match DOES surface its own strategy.
@@ -4510,14 +7071,22 @@ mod tests {
                 signature: "dependency/module-not-found/lodash".into(),
                 context: vec!["lodash".into()],
                 efficacy: Some(PitfallEfficacy {
+                    outcome_attribution_version: 1,
                     injected: 2,
                     occ_at_injection: 2,
                     recurred_after_warning: true,
+                    exact_last_fix_failed_at: "2026-06-22T00:00:00Z".into(),
                     proven_fix: false,
                     failed_fixes: vec![],
                     next_strategy: "Add lodash to package.json and run a clean install.".into(),
                     helpful: 0,
                     harmful: 0,
+                    recent_observations: vec![test_evidence(
+                        "lodash-failed",
+                        "2026-06-22T00:00:00Z",
+                        KnowledgeEvidenceOutcome::FixFailed,
+                    )],
+                    ..PitfallEfficacy::default()
                 }),
                 ..neighbour.clone()
             }),
@@ -4530,27 +7099,38 @@ mod tests {
     }
 
     #[test]
-    fn global_promote_filename_disambiguates_colliding_slugs() {
-        // Item #4: two lessons whose `domain::title` slugify to the SAME string
-        // must NOT overwrite each other's promoted global file. The stable
-        // key-hash suffix keeps them distinct.
-        let a = "general::Build failed (case A)!!!";
-        let b = "general::Build failed (case A)???";
-        let slug_a = a.replace("::", "-").replace(' ', "-");
-        let slug_b = b.replace("::", "-").replace(' ', "-");
-        // The lossy slugs would collide were the hash not appended.
-        let name_a = format!("{}-{:016x}.md", truncate(&slug_a, 80), stable_str_hash(a));
-        let name_b = format!("{}-{:016x}.md", truncate(&slug_b, 80), stable_str_hash(b));
-        assert_ne!(
-            name_a, name_b,
-            "distinct keys must yield distinct filenames"
+    fn global_projection_collapses_private_discriminators_to_one_safe_family() {
+        let mut a = mk_pitfall(
+            "dependency/module-not-found/acme-private-a",
+            "install dependency",
+            "dependency missing",
+            "2026-01-01T00:00:00Z",
+            2,
         );
-        // And the SAME key is stable across calls (idempotent re-promotion).
-        assert_eq!(
-            stable_str_hash(a),
-            stable_str_hash(a),
-            "the key hash is deterministic"
+        a.root_cause = "customer-secret-root-cause".into();
+        a.fix = "run private-internal-fix-command".into();
+        a.domain = "../../customer-secret-domain".into();
+        a.first_seen = "customer-secret-date".into();
+        let b = mk_pitfall(
+            "dependency/module-not-found/customer-secret-b",
+            "install dependency",
+            "dependency missing",
+            "2026-01-02T00:00:00Z",
+            2,
         );
+        let safe_a = global_safe_dev_error_lesson(&a).unwrap();
+        let safe_b = global_safe_dev_error_lesson(&b).unwrap();
+        assert_eq!(safe_a.signature, "dependency/module-not-found");
+        assert_eq!(safe_a.title, safe_b.title);
+        assert!(!safe_a.body.contains("acme"));
+        assert!(!safe_b.body.contains("customer"));
+        assert!(!safe_a.root_cause.contains("customer-secret"));
+        assert!(!safe_a.fix.contains("private-internal"));
+        assert_eq!(safe_a.domain, "dependency");
+        assert!(!safe_a.first_seen.contains("customer-secret"));
+        let key_a = format!("{}::{}", safe_a.domain, safe_a.title);
+        let key_b = format!("{}::{}", safe_b.domain, safe_b.title);
+        assert_eq!(stable_str_hash(&key_a), stable_str_hash(&key_b));
     }
 
     #[test]
@@ -4610,9 +7190,10 @@ mod tests {
                 .unwrap_or_default()
         };
 
-        // 1. First sighting + warn the worker.
+        // 1. First sighting + pure retrieval, then a confirmed repair turn.
         capture_dev_errors(tmp.path(), &err, "demo", "需求");
-        let _ = relevant_lessons_for_prompt(tmp.path(), "无关一");
+        let _ = lessons_for_error(tmp.path(), &err[0]);
+        let attempt = commit_pitfall_fix_attempt(tmp.path(), &err[0]).unwrap();
         assert!(
             failed_fix(tmp.path()).is_empty(),
             "no failed fix recorded yet"
@@ -4621,6 +7202,14 @@ mod tests {
         // 2. It recurs DESPITE the warning → the recorded fix is logged as a
         //    tried-and-failed approach in the failed-fix ledger.
         capture_dev_errors(tmp.path(), &err, "demo", "需求");
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                tmp.path(),
+                &attempt,
+                PitfallFixAttemptResult::VerificationFailed(err[0].clone()),
+            ),
+            PitfallFixSettlement::SameSignatureFailed
+        );
         let ff = failed_fix(tmp.path());
         assert_eq!(ff.len(), 1, "the failed fix must be remembered: {ff:?}");
         assert!(
@@ -4642,7 +7231,7 @@ mod tests {
     }
 
     #[test]
-    fn in_run_fix_proves_pitfall_immediately() {
+    fn legacy_broad_resolution_is_audit_only_after_attribution_upgrade() {
         let tmp = TempDir::new().unwrap();
         let err = vec!["Error: Cannot find module 'lodash'".to_string()];
         capture_dev_errors(tmp.path(), &err, "demo", "需求");
@@ -4655,15 +7244,39 @@ mod tests {
         };
         assert_eq!(st(tmp.path()), Some(PitfallStatus::Active));
 
-        // An in-run auto-fix made the build pass → mark proven directly.
+        // The pre-v1 broad signature helper still records its historical audit
+        // fields, but it cannot prove which rendered advice reached which repair
+        // turn. It therefore stays behaviorally neutral after the attribution
+        // upgrade; production uses the committed attempt-token path instead.
+        let raw_path = tmp.path().join(RAW_DIR).join(DEV_ERRORS_FILE);
+        let before_failed_write = fs::read_to_string(&raw_path).unwrap();
+        let failed_write =
+            with_forced_atomic_write_failure(|| mark_pitfalls_resolved(tmp.path(), &err));
+        assert_eq!(
+            failed_write, 0,
+            "a failed audit write cannot report success"
+        );
+        assert_eq!(
+            fs::read_to_string(raw_path).unwrap(),
+            before_failed_write,
+            "a failed atomic write must leave the complete pre-existing timeline unchanged"
+        );
+
         let n = mark_pitfalls_resolved(tmp.path(), &err);
         assert_eq!(n, 1);
         assert_eq!(
             st(tmp.path()),
-            Some(PitfallStatus::Validated),
-            "a proven in-run fix validates the pitfall immediately"
+            Some(PitfallStatus::Active),
+            "legacy broad resolution must not validate a pitfall"
         );
-        assert_eq!(pitfall_efficacy_summary(tmp.path()).validated, 1);
+        assert_eq!(pitfall_efficacy_summary(tmp.path()).validated, 0);
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        let audit = row.efficacy.unwrap();
+        assert!(
+            audit.proven_fix,
+            "legacy audit evidence remains inspectable"
+        );
+        assert_eq!(audit.outcome_attribution_version, 0);
     }
 
     #[test]
@@ -4736,6 +7349,17 @@ mod tests {
             s_with > s_without,
             "in-stack pitfall must outrank out-of-stack: {s_with} vs {s_without}"
         );
+        assert_eq!(s_without, 0, "an out-of-stack pitfall must abstain");
+        let mut recurring = lesson;
+        recurring.efficacy = Some(PitfallEfficacy {
+            recurred_after_warning: true,
+            ..PitfallEfficacy::default()
+        });
+        assert_eq!(
+            lesson_trigger_score(&recurring, &without),
+            0,
+            "recurrence raises importance but cannot fabricate relevance"
+        );
     }
 
     #[test]
@@ -4806,7 +7430,7 @@ mod tests {
     }
 
     #[test]
-    fn importance_rewards_recurring_and_damps_validated() {
+    fn importance_damps_invalidated_advice_below_validated_history() {
         let mk = |eff: Option<PitfallEfficacy>| Lesson {
             kind: LessonKind::DevError,
             domain: "dependency".into(),
@@ -4827,28 +7451,44 @@ mod tests {
             evidence: Vec::new(),
         };
         let recurring = mk(Some(PitfallEfficacy {
+            outcome_attribution_version: 1,
             injected: 1,
             occ_at_injection: 1,
             recurred_after_warning: true,
+            exact_last_fix_failed_at: "2026-06-22T00:00:00Z".into(),
             proven_fix: false,
             failed_fixes: Vec::new(),
             next_strategy: String::new(),
             helpful: 0,
             harmful: 0,
+            recent_observations: vec![test_evidence(
+                "importance-failed",
+                "2026-06-22T00:00:00Z",
+                KnowledgeEvidenceOutcome::FixFailed,
+            )],
+            ..PitfallEfficacy::default()
         }));
         let validated = mk(Some(PitfallEfficacy {
+            outcome_attribution_version: 1,
             injected: 2,
             occ_at_injection: 3,
             recurred_after_warning: false,
             proven_fix: true,
+            exact_last_verified_at: "2026-06-22T00:00:00Z".into(),
             failed_fixes: Vec::new(),
             next_strategy: String::new(),
             helpful: 0,
             harmful: 0,
+            recent_observations: vec![test_evidence(
+                "importance-success",
+                "2026-06-22T00:00:00Z",
+                KnowledgeEvidenceOutcome::FixSucceeded,
+            )],
+            ..PitfallEfficacy::default()
         }));
         assert!(
-            lesson_importance(&recurring) > lesson_importance(&validated),
-            "a failing (recurring) fix must outweigh a handled (validated) one"
+            lesson_importance(&recurring) < lesson_importance(&validated),
+            "known-bad repair advice must not outrank causally validated history"
         );
     }
 
@@ -4873,14 +7513,22 @@ mod tests {
             occurrences: 4,
             context: vec!["lodash".into()],
             efficacy: Some(PitfallEfficacy {
+                outcome_attribution_version: 1,
                 injected: 1,
                 occ_at_injection: 1,
                 recurred_after_warning: true, // ← already warned, still recurred
+                exact_last_fix_failed_at: "2026-06-22T00:00:00Z".into(),
                 proven_fix: false,
                 failed_fixes: vec!["npm install lodash".into()],
                 next_strategy: String::new(),
                 helpful: 0,
                 harmful: 0,
+                recent_observations: vec![test_evidence(
+                    "reflection-failed",
+                    "2026-06-22T00:00:00Z",
+                    KnowledgeEvidenceOutcome::FixFailed,
+                )],
+                ..PitfallEfficacy::default()
             }),
             invalidated: false,
             trust: NEUTRAL_TRUST,
@@ -4901,6 +7549,7 @@ mod tests {
                 next_strategy: String::new(),
                 helpful: 0,
                 harmful: 0,
+                ..PitfallEfficacy::default()
             }),
             ..recurring.clone()
         };
@@ -4996,14 +7645,17 @@ mod tests {
             occurrences: 5,
             context: vec![],
             efficacy: Some(PitfallEfficacy {
+                outcome_attribution_version: 1,
                 injected: 1,
                 occ_at_injection: 1,
                 recurred_after_warning: true,
+                exact_last_fix_failed_at: "2026-06-22T00:00:00Z".into(),
                 proven_fix: false,
                 failed_fixes: Vec::new(),
                 next_strategy: String::new(),
                 helpful: 0,
                 harmful: 0,
+                ..PitfallEfficacy::default()
             }),
             invalidated: false,
             trust: NEUTRAL_TRUST,
@@ -5026,14 +7678,17 @@ mod tests {
                 occurrences: 1,
                 context: vec![],
                 efficacy: Some(PitfallEfficacy {
+                    outcome_attribution_version: 1,
                     injected: 2,
                     occ_at_injection: 1,
                     recurred_after_warning: false,
                     proven_fix: true,
+                    exact_last_verified_at: "2026-06-22T00:00:00Z".into(),
                     failed_fixes: Vec::new(),
                     next_strategy: String::new(),
                     helpful: 0,
                     harmful: 0,
+                    ..PitfallEfficacy::default()
                 }),
                 invalidated: false,
                 trust: NEUTRAL_TRUST,
@@ -5050,9 +7705,7 @@ mod tests {
     }
 
     #[test]
-    fn recognized_dev_error_is_global_worthy_on_first_sight() {
-        // A classified pitfall seen in ONE project is still cross-project
-        // knowledge → promotes from a single requirement.
+    fn only_causally_validated_dev_errors_are_global_worthy() {
         let dev = Lesson {
             kind: LessonKind::DevError,
             domain: "dependency".into(),
@@ -5072,23 +7725,45 @@ mod tests {
             evidence_count: 0,
             evidence: Vec::new(),
         };
-        assert!(group_is_global_worthy(&[&dev], 1));
+        assert!(!group_is_global_worthy(&[&dev]));
+
+        let recurrent = Lesson {
+            occurrences: 2,
+            ..dev.clone()
+        };
+        assert!(!group_is_global_worthy(&[&recurrent]));
+
+        let validated = Lesson {
+            efficacy: Some(PitfallEfficacy {
+                outcome_attribution_version: 1,
+                proven_fix: true,
+                exact_last_verified_at: "2026-01-02T00:00:00Z".into(),
+                recent_observations: vec![test_evidence(
+                    "global-success",
+                    "2026-01-02T00:00:00Z",
+                    KnowledgeEvidenceOutcome::FixSucceeded,
+                )],
+                ..PitfallEfficacy::default()
+            }),
+            ..dev.clone()
+        };
+        assert!(group_is_global_worthy(&[&validated]));
 
         // A generic-fallback dev error is NOT promoted on first sight (too noisy).
         let generic = Lesson {
             signature: "general/error/something".into(),
             ..dev.clone()
         };
-        assert!(!group_is_global_worthy(&[&generic], 1));
+        assert!(!group_is_global_worthy(&[&generic]));
 
-        // A quality failure still needs ≥2 distinct requirements to promote.
+        // Non-dev lessons stay local even when repeated across requirements.
         let qual = Lesson {
             kind: LessonKind::Failure,
             signature: String::new(),
+            occurrences: 2,
             ..dev.clone()
         };
-        assert!(!group_is_global_worthy(&[&qual], 1));
-        assert!(group_is_global_worthy(&[&qual], 2));
+        assert!(!group_is_global_worthy(&[&qual]));
     }
 
     #[test]
@@ -5106,6 +7781,316 @@ mod tests {
         assert_eq!(raw[0].kind, LessonKind::Failure);
         assert!(raw[0].title.contains("API URL consistency"));
         assert!(raw[1].title.contains("placeholder"));
+    }
+
+    #[test]
+    fn lesson_capture_policy_is_leaf_scoped_and_reversible() {
+        let quality = TempDir::new().unwrap();
+        crate::memory_control::update_capture(
+            quality.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::QualityFailures),
+            false,
+        )
+        .unwrap();
+        capture_quality_failures(
+            quality.path(),
+            &[check("API contract", "failed", 20)],
+            "demo",
+            "api contract",
+        );
+        assert!(read_raw_lessons(quality.path(), "quality-failures.jsonl").is_empty());
+        crate::memory_control::update_capture(
+            quality.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::QualityFailures),
+            true,
+        )
+        .unwrap();
+        capture_quality_failures(
+            quality.path(),
+            &[check("API contract", "failed", 20)],
+            "demo",
+            "api contract",
+        );
+        assert_eq!(
+            read_raw_lessons(quality.path(), "quality-failures.jsonl").len(),
+            1
+        );
+
+        let revision = TempDir::new().unwrap();
+        crate::memory_control::update_capture(
+            revision.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::GateRevisions),
+            false,
+        )
+        .unwrap();
+        let adr = capture_gate_revision(revision.path(), "docs_confirm", "add detail", "r");
+        assert!(
+            adr.is_file(),
+            "the independent gate-adrs leaf remains enabled"
+        );
+        assert!(read_raw_lessons(revision.path(), "gate-revisions.jsonl").is_empty());
+        crate::memory_control::update_capture(
+            revision.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::GateAdrs),
+            false,
+        )
+        .unwrap();
+        let disabled_adr =
+            capture_gate_revision(revision.path(), "quality_confirm", "keep moving", "r");
+        assert!(!disabled_adr.exists());
+        crate::memory_control::update_capture(
+            revision.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::GateRevisions),
+            true,
+        )
+        .unwrap();
+        let raw_only = capture_gate_revision(revision.path(), "delivery_confirm", "raw only", "r");
+        assert!(!raw_only.exists());
+        assert_eq!(
+            read_raw_lessons(revision.path(), "gate-revisions.jsonl").len(),
+            1,
+            "gate-revisions capture remains independent from gate-adrs"
+        );
+
+        let validated = TempDir::new().unwrap();
+        let spec = umadev_contract::parse_architecture(
+            "| Method | Path | Request | Response | Auth | Description |\n|---|---|---|---|---|---|\n| GET | /api/posts | - | - | none | List |\n",
+            "demo",
+        );
+        crate::memory_control::update_capture(
+            validated.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::ValidatedPatterns),
+            false,
+        )
+        .unwrap();
+        capture_validated_patterns(validated.path(), "demo", "posts", &spec, &[], true);
+        assert!(read_raw_lessons(validated.path(), "validated-decisions.jsonl").is_empty());
+
+        use crate::tech_debt::{DebtItem, DebtKind, DebtStatus};
+        let debt = TempDir::new().unwrap();
+        crate::memory_control::update_capture(
+            debt.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::TechDebt),
+            false,
+        )
+        .unwrap();
+        let items = [DebtItem {
+            file: "output/prd.md".into(),
+            line: 3,
+            kind: DebtKind::FillerText,
+            snippet: "Lorem ipsum".into(),
+            first_seen: "2026-07-16T00:00:00Z".into(),
+            status: DebtStatus::Open,
+            resolved_at: String::new(),
+        }];
+        assert_eq!(capture_tech_debt(debt.path(), &items, "r"), 0);
+        assert!(read_raw_lessons(debt.path(), "tech-debt.jsonl").is_empty());
+
+        let pitfalls = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        crate::memory_control::update_capture(
+            pitfalls.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::Pitfalls),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            capture_dev_errors(pitfalls.path(), std::slice::from_ref(&error), "demo", "r"),
+            0
+        );
+        assert!(read_raw_lessons(pitfalls.path(), DEV_ERRORS_FILE).is_empty());
+        crate::memory_control::update_capture(
+            pitfalls.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::Pitfalls),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            capture_dev_errors(pitfalls.path(), std::slice::from_ref(&error), "demo", "r"),
+            1
+        );
+        crate::memory_control::update_capture(
+            pitfalls.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::PitfallReflections),
+            false,
+        )
+        .unwrap();
+        assert!(!record_pitfall_strategy(
+            pitfalls.path(),
+            "dependency/module-not-found/lodash",
+            "pin and clean-install"
+        ));
+
+        let beliefs = TempDir::new().unwrap();
+        seed_cluster(
+            beliefs.path(),
+            BELIEF_MIN_CLUSTER,
+            &["color", "token", "frontend"],
+            "frontend",
+        );
+        crate::memory_control::update_capture(
+            beliefs.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::Beliefs),
+            false,
+        )
+        .unwrap();
+        assert_eq!(fold_beliefs(beliefs.path()), 0);
+        assert!(read_raw_lessons(beliefs.path(), BELIEFS_FILE).is_empty());
+        crate::memory_control::update_capture(
+            beliefs.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::Beliefs),
+            true,
+        )
+        .unwrap();
+        assert!(fold_beliefs(beliefs.path()) > 0);
+
+        let sediment = TempDir::new().unwrap();
+        capture_quality_failures(
+            sediment.path(),
+            &[check("API contract", "failed", 20)],
+            "demo",
+            "api contract",
+        );
+        crate::memory_control::update_capture(
+            sediment.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::LessonSediment),
+            false,
+        )
+        .unwrap();
+        assert_eq!(sediment_lessons(sediment.path()), 0);
+        assert!(list_sedimented_lessons(sediment.path()).is_empty());
+        assert_eq!(
+            read_all_raw_lessons(sediment.path()).len(),
+            1,
+            "derived-capture off leaves the authoritative ledger visible",
+        );
+        crate::memory_control::update_capture(
+            sediment.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::LessonSediment),
+            true,
+        )
+        .unwrap();
+        assert_eq!(sediment_lessons(sediment.path()), 1);
+    }
+
+    #[test]
+    fn pitfall_capture_off_allows_recall_but_issues_no_new_attempt() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        assert_eq!(
+            capture_dev_errors(
+                tmp.path(),
+                std::slice::from_ref(&error),
+                "demo",
+                "dependency lodash"
+            ),
+            1
+        );
+        crate::memory_control::update_capture(
+            tmp.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::Pitfalls),
+            false,
+        )
+        .unwrap();
+        let before = std::fs::read(tmp.path().join(RAW_DIR).join(DEV_ERRORS_FILE)).unwrap();
+        assert!(!lessons_for_error(tmp.path(), &error).is_empty());
+        assert!(commit_pitfall_fix_attempt(tmp.path(), &error).is_none());
+        assert_eq!(
+            std::fs::read(tmp.path().join(RAW_DIR).join(DEV_ERRORS_FILE)).unwrap(),
+            before,
+            "recall with capture disabled must not update efficacy counters"
+        );
+    }
+
+    #[test]
+    fn automatic_invalidation_never_rewrites_a_capture_disabled_leaf() {
+        let tmp = TempDir::new().unwrap();
+        let older = mk_db_lesson(
+            "indexing add",
+            "always add a btree index on every filtered column for speed",
+            "missing indexes slowed reads across the board significantly",
+            "2026-06-01T00:00:00Z",
+        );
+        let newer = mk_db_lesson(
+            "indexing drop",
+            "avoid over indexing and drop redundant indexes to keep writes fast",
+            "too many indexes bloated writes and storage badly here",
+            "2026-06-20T00:00:00Z",
+        );
+        assert!(write_raw_lessons(
+            tmp.path(),
+            "quality-failures.jsonl",
+            &[older, newer]
+        ));
+        crate::memory_control::update_capture(
+            tmp.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::QualityFailures),
+            false,
+        )
+        .unwrap();
+        let path = tmp.path().join(RAW_DIR).join("quality-failures.jsonl");
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(scan_contradictions(tmp.path()), 0);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn reconcile_base_prompt_respects_each_leaf_recall_policy() {
+        let tmp = TempDir::new().unwrap();
+        let first = mk_db_lesson(
+            "indexing one",
+            "add a targeted btree index for frequently filtered columns",
+            "targeted indexes prevent repeated sequential scans",
+            "2026-06-01T00:00:00Z",
+        );
+        let second = mk_db_lesson(
+            "indexing two",
+            "add a targeted btree index for frequently filtered fields",
+            "targeted indexes prevent repeated table scans",
+            "2026-06-20T00:00:00Z",
+        );
+        assert!(write_raw_lessons(
+            tmp.path(),
+            "quality-failures.jsonl",
+            &[first, second]
+        ));
+        assert!(!reconcile_candidates(tmp.path()).is_empty());
+        crate::memory_control::update_recall(
+            tmp.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::QualityFailures),
+            false,
+        )
+        .unwrap();
+        assert!(reconcile_candidates(tmp.path()).is_empty());
+
+        let calls = std::cell::Cell::new(0usize);
+        let judge = |_: &Lesson, _: &[Lesson]| {
+            calls.set(calls.get().saturating_add(1));
+            ReconcileDecision::Noop
+        };
+        let _ = sediment_lessons_with_judge(tmp.path(), Some(&judge));
+        assert_eq!(
+            calls.get(),
+            0,
+            "recall-off lesson text must never be rendered into the base judge prompt"
+        );
     }
 
     #[test]
@@ -5265,9 +8250,8 @@ mod tests {
     }
 
     #[test]
-    fn capture_validated_patterns_gate_not_passed_omits_passed_claim() {
-        // #3: when the quality gate did NOT pass, the lesson records the
-        // implemented decomposition but never asserts "passed the quality gate".
+    fn capture_validated_patterns_gate_not_passed_writes_no_validated_claim() {
+        // A failed gate cannot mint a ValidatedPattern under softer wording.
         let tmp = TempDir::new().unwrap();
         let spec = umadev_contract::parse_architecture(
             "| Method | Path | Request | Response | Auth | Description |\n|---|---|---|---|---|---|\n| GET | /api/articles | - | - | none | List |\n",
@@ -5275,13 +8259,12 @@ mod tests {
         );
         capture_validated_patterns(tmp.path(), "demo", "博客系统", &spec, &[], false);
         let lessons = read_raw_lessons(tmp.path(), "validated-decisions.jsonl");
-        assert_eq!(lessons.len(), 1);
-        assert!(
-            !lessons[0].body.contains("passed the quality gate"),
-            "must not claim the gate passed when it did not: {}",
-            lessons[0].body
-        );
-        assert!(lessons[0].body.contains("quality gate did NOT pass"));
+        assert!(lessons.is_empty());
+        assert!(lessons_report(tmp.path()).validated_patterns.is_empty());
+        assert!(lessons_report(tmp.path())
+            .curated_lessons
+            .iter()
+            .all(|entry| entry.status != CuratedLessonStatus::Validated));
     }
 
     #[test]
@@ -5327,6 +8310,29 @@ mod tests {
         capture_quality_failures(tmp.path(), &checks2, "demo", "req");
         let raw = read_raw_lessons(tmp.path(), "quality-failures.jsonl");
         assert_eq!(raw.len(), 2);
+    }
+
+    #[test]
+    fn parallel_raw_appends_do_not_lose_either_capture() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for name in ["Parallel A", "Parallel B"] {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                capture_quality_failures(&root, &[check(name, "failed", 10)], "demo", "req");
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let raw = read_raw_lessons(&root, "quality-failures.jsonl");
+        assert_eq!(raw.len(), 2, "atomic replacement must retain both appends");
     }
 
     #[test]
@@ -5498,8 +8504,17 @@ mod tests {
         capture_validated_patterns(tmp.path(), "blog", "做一个博客", &spec, &[], true);
         let r = lessons_report(tmp.path());
         assert!(!r.is_empty());
-        assert_eq!(r.validated_patterns.len(), 1);
-        assert!(r.validated_patterns[0].title.contains("blog"));
+        assert!(
+            r.validated_patterns.is_empty(),
+            "a green build is observation evidence, not causal repair validation"
+        );
+        let candidate = r
+            .curated_lessons
+            .iter()
+            .find(|entry| entry.title.contains("blog"))
+            .expect("source-verified pattern remains visible as a candidate");
+        assert_eq!(candidate.status, CuratedLessonStatus::Hypothesis);
+        assert_eq!(candidate.evidence_count, 1);
     }
 
     // ---- Memory reconcile (Task 2) ------------------------------------------
@@ -5749,6 +8764,8 @@ mod tests {
         assert_eq!(b.evidence.len(), 4, "evidence keys recorded for demotion");
         // Freshness = the most recent member's timestamp (last_confirmed).
         assert_eq!(b.first_seen, "2026-06-13T00:00:00Z");
+        assert_eq!(b.knowledge_evidence_count(), 0);
+        assert_eq!(b.pitfall_status(), PitfallStatus::Hypothesis);
     }
 
     #[test]
@@ -5846,8 +8863,7 @@ mod tests {
             .collect();
         write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &rows);
 
-        // A requirement that shares no keyword with any pitfall → Tier-2 fallback.
-        let block = relevant_lessons_for_prompt(tmp.path(), "完全无关的需求文本占位");
+        let block = relevant_lessons_for_prompt(tmp.path(), "zzznomatch");
         let deltas = block.matches("[pitfall]").count();
         assert!(
             deltas >= 1,
@@ -5885,7 +8901,7 @@ mod tests {
             .collect();
         write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &rows);
 
-        let block = relevant_lessons_for_prompt(tmp.path(), "完全无关的需求文本占位");
+        let block = relevant_lessons_for_prompt(tmp.path(), "zzznomatch");
         assert!(
             block.chars().count() <= MEMORY_PLAYBOOK_BUDGET,
             "injected playbook stays within the byte budget even with fat deltas: {} > {MEMORY_PLAYBOOK_BUDGET}",
@@ -5926,7 +8942,7 @@ mod tests {
         // an older / rarer one (frequency × recency), so the compact set keeps the
         // deltas that matter most.
         let now = Utc::now();
-        let q = std::collections::HashSet::new(); // no query match → pure freq×recency floor
+        let q = std::collections::HashSet::new(); // retention still orders unmatched evidence
 
         let recent = mk_pitfall("d/x/recent", "f", "r", &iso(now), 1);
         let old = mk_pitfall(
@@ -5972,7 +8988,7 @@ mod tests {
             ),
         ];
         write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &rows);
-        let block = relevant_lessons_for_prompt(tmp.path(), "完全无关的需求文本占位");
+        let block = relevant_lessons_for_prompt(tmp.path(), "zzznomatch");
         let hot_at = block.find("hot").expect("hot delta present");
         let cold_at = block.find("cold").expect("cold delta present");
         assert!(
@@ -6145,81 +9161,6 @@ mod tests {
         assert_eq!(
             beliefs[0].evidence_count, 5,
             "the merged belief folds all five lessons"
-        );
-    }
-
-    // ---- ③ non-pitfall / belief trust reflux (P1-C) --------------------
-
-    /// A surfaced NON-pitfall lesson's identity is snapshotted at recall time and
-    /// its trust then moves with a verify pass/fail through
-    /// `apply_trust_for_identities` — the feedback path that was dead because only
-    /// the dev-error signatures were ever collected/wired.
-    #[test]
-    fn surfaced_identity_snapshot_drives_non_pitfall_trust() {
-        let tmp = TempDir::new().unwrap();
-        // One quality-failure (non-pitfall) lesson whose keywords match the
-        // requirement so the recall selects it.
-        seed_cluster(tmp.path(), 1, &["dashboard", "tokens"], "frontend");
-
-        // Surfacing snapshots the non-pitfall identity (excludes dev-errors).
-        let ranked =
-            relevant_lessons_for_prompt_ranked(tmp.path(), "build a dashboard with tokens");
-        assert!(
-            ranked.iter().any(|(_, l)| l.kind == LessonKind::Failure),
-            "the non-pitfall lesson must be surfaced"
-        );
-        let snapshot = read_surfaced_identities(tmp.path());
-        assert!(
-            !snapshot.is_empty(),
-            "surfacing must snapshot the non-pitfall identity for later trust"
-        );
-
-        // A FAIL step penalises the surfaced lesson's trust (asymmetric, larger).
-        let before = read_raw_lessons(tmp.path(), "quality-failures.jsonl")[0].trust();
-        let adjusted = apply_trust_for_identities(tmp.path(), &snapshot, false);
-        assert!(adjusted >= 1, "at least the surfaced lesson is adjusted");
-        let after_fail = read_raw_lessons(tmp.path(), "quality-failures.jsonl")[0].trust();
-        assert!(
-            after_fail < before,
-            "fail must lower trust: {before} -> {after_fail}"
-        );
-
-        // A PASS step then nudges it back up (reward < penalty, but still moves).
-        let adjusted_pass = apply_trust_for_identities(tmp.path(), &snapshot, true);
-        assert!(adjusted_pass >= 1);
-        let after_pass = read_raw_lessons(tmp.path(), "quality-failures.jsonl")[0].trust();
-        assert!(
-            after_pass > after_fail,
-            "pass must raise trust: {after_fail} -> {after_pass}"
-        );
-    }
-
-    /// Dev-error pitfalls are NOT included in the identity snapshot (they ride the
-    /// separate signature reflux), and the snapshot is fail-open: a missing file
-    /// reads as empty.
-    #[test]
-    fn surfaced_identities_exclude_pitfalls_and_failopen_empty() {
-        let tmp = TempDir::new().unwrap();
-        // Nothing written yet → empty, never an error.
-        assert!(read_surfaced_identities(tmp.path()).is_empty());
-
-        let selected = vec![
-            Lesson {
-                kind: LessonKind::DevError,
-                signature: "ts/2307/module-not-found".into(),
-                ..seed_cluster_one_lesson()
-            },
-            Lesson {
-                kind: LessonKind::Failure,
-                title: "a non-pitfall lesson".into(),
-                ..seed_cluster_one_lesson()
-            },
-        ];
-        let ids = surfaced_identities(&selected);
-        assert_eq!(
-            ids.len(),
-            1,
-            "only the non-pitfall lesson contributes an id"
         );
     }
 
@@ -6455,8 +9396,8 @@ mod tests {
         );
         proven.trust = 0.9;
         proven.efficacy = Some(PitfallEfficacy {
-            helpful: 8,
-            harmful: 0,
+            outcome_attribution_version: 1,
+            exact_helpful: 8,
             ..Default::default()
         });
         let unproven = mk_db_lesson(
@@ -6585,26 +9526,18 @@ mod tests {
     }
 
     #[test]
-    fn helpful_feedback_refreshes_recency_basis_failure_does_not() {
+    fn trust_feedback_never_rewrites_first_observed_time() {
         let tmp = TempDir::new().unwrap();
         let mut l = seed_cluster_one(tmp.path());
         // Backdate so a refresh is observable.
         l.first_seen = "2020-01-01T00:00:00Z".to_string();
         let stale = l.first_seen.clone();
-        // A FAILED gate must NOT buy freshness — only success keeps a lesson alive.
-        l.apply_trust_feedback(false);
-        assert_eq!(
-            l.first_seen, stale,
-            "a failed gate must not refresh recency"
-        );
-        // A HELPFUL pass refreshes the recency basis (usage-driven decay): a lesson
-        // that keeps earning its place resists clock-age eviction.
-        l.apply_trust_feedback(true);
-        assert!(
-            l.first_seen > stale,
-            "a helpful pass refreshes recency to now: {} !> {stale}",
-            l.first_seen
-        );
+        // Neither outcome may rewrite the immutable first-observed audit time.
+        l.apply_exact_trust_feedback(false);
+        assert_eq!(l.first_seen, stale);
+        l.apply_exact_trust_feedback(true);
+        assert_eq!(l.first_seen, stale);
+        assert!(l.last_reinforced_at().is_some());
     }
 
     #[test]
@@ -6613,9 +9546,17 @@ mod tests {
         let _ = tmp;
         let base = seed_cluster_one_lesson();
         let mut trusted = base.clone();
-        trusted.trust = 1.0;
+        trusted.efficacy = Some(PitfallEfficacy {
+            outcome_attribution_version: 1,
+            exact_helpful: 10,
+            ..PitfallEfficacy::default()
+        });
         let mut distrusted = base.clone();
-        distrusted.trust = TRUST_FLOOR;
+        distrusted.efficacy = Some(PitfallEfficacy {
+            outcome_attribution_version: 1,
+            exact_harmful: 10,
+            ..PitfallEfficacy::default()
+        });
         let q: std::collections::HashSet<String> = ["color", "token"]
             .iter()
             .map(|s| (*s).to_string())
@@ -6627,17 +9568,175 @@ mod tests {
             st > sd,
             "a trusted lesson must outscore a distrusted one: {st} vs {sd}"
         );
-        // The ratio tracks the trust ratio (multiplicative folding).
+        // Both exact-token axes are intentionally multiplicative: smoothed
+        // trust and the discrete helpful ratio. Verify the composed factor
+        // rather than pretending the same exact counters affect only trust.
         let ratio = st / sd;
-        let expected = 1.0_f64 / f64::from(TRUST_FLOOR);
+        let expected = (f64::from(trusted.trust()) / f64::from(distrusted.trust()))
+            * (efficacy_weight(&trusted) / efficacy_weight(&distrusted));
         assert!(
             (ratio - expected).abs() < 1e-3,
-            "decay scales linearly with trust: ratio {ratio} ~ {expected}"
+            "decay composes trust and exact efficacy multiplicatively: ratio {ratio} ~ {expected}"
         );
     }
 
     #[test]
-    fn apply_dev_error_trust_rewards_and_penalises() {
+    fn explicit_evidence_replay_is_idempotent_and_never_corroborates() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        let first = capture_dev_errors_detailed_with_evidence_id(
+            tmp.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "requirement",
+            "host-turn-42",
+        );
+        let replay = capture_dev_errors_detailed_with_evidence_id(
+            tmp.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "requirement",
+            "host-turn-42",
+        );
+        assert_eq!(first.observations, 1);
+        assert_eq!(replay, PitfallCaptureOutcome::default());
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        assert_eq!(row.hits(), 1);
+        assert_eq!(row.knowledge_evidence_count(), 1);
+        assert_eq!(row.pitfall_status(), PitfallStatus::Hypothesis);
+    }
+
+    #[test]
+    fn independent_observations_corroborate_but_cannot_validate() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        for evidence_id in ["host-turn-a", "host-turn-b"] {
+            let outcome = capture_dev_errors_detailed_with_evidence_id(
+                tmp.path(),
+                std::slice::from_ref(&error),
+                "demo",
+                "requirement",
+                evidence_id,
+            );
+            assert_eq!(outcome.observations, 1);
+        }
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        assert_eq!(row.hits(), 2);
+        assert_eq!(row.knowledge_evidence_count(), 2);
+        assert_eq!(row.pitfall_status(), PitfallStatus::Corroborated);
+        assert_eq!(row.last_verified_at(), None);
+    }
+
+    #[test]
+    fn conflicting_payload_for_one_evidence_id_invalidates_without_inflation() {
+        let tmp = TempDir::new().unwrap();
+        let first = "Error: Cannot find module 'lodash'\nrequired from module-a".to_string();
+        let conflicting = "Error: Cannot find module 'lodash'\nrequired from module-b".to_string();
+        let _ = capture_dev_errors_detailed_with_evidence_id(
+            tmp.path(),
+            &[first],
+            "demo",
+            "requirement",
+            "reused-evidence-id",
+        );
+        let second = capture_dev_errors_detailed_with_evidence_id(
+            tmp.path(),
+            &[conflicting],
+            "demo",
+            "requirement",
+            "reused-evidence-id",
+        );
+        assert_eq!(second, PitfallCaptureOutcome::default());
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        assert_eq!(row.hits(), 1);
+        assert_eq!(row.knowledge_evidence_count(), 1);
+        assert_eq!(row.corroborating_evidence_count(), 0);
+        assert_eq!(row.pitfall_status(), PitfallStatus::Invalidated);
+        assert_eq!(
+            row.efficacy.unwrap().recent_observations[0].outcome,
+            KnowledgeEvidenceOutcome::Conflict
+        );
+    }
+
+    #[test]
+    fn legacy_aggregate_hits_are_history_not_independent_validation() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = mk_pitfall(
+            "dependency/module-not-found/lodash",
+            "install lodash",
+            "dependency missing",
+            "2025-01-01T00:00:00Z",
+            226,
+        );
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[legacy]);
+        let report = lessons_report(tmp.path());
+        assert_eq!(report.incidents[0].hits, 226);
+        assert_eq!(report.incidents[0].recent_evidence_count, 0);
+        assert_eq!(report.incidents[0].status, PitfallStatus::Hypothesis);
+        assert!(!report.incidents[0].timeline_complete);
+        let overview = pitfall_overview(tmp.path());
+        assert!(overview.contains("历史命中 226 次"));
+        assert!(overview.contains("可审计证据 0 条"));
+        assert!(!overview.contains("226 次 · 可审计证据 226"));
+    }
+
+    #[test]
+    fn causal_success_validates_and_newer_causal_failure_revokes() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'";
+        let _ = capture_dev_errors_detailed_with_evidence_id(
+            tmp.path(),
+            &[error.to_string()],
+            "demo",
+            "requirement",
+            "failure-before-repair",
+        );
+        let passed = commit_pitfall_fix_attempt(tmp.path(), error).unwrap();
+        assert_eq!(
+            settle_pitfall_fix_attempt(tmp.path(), &passed, PitfallFixAttemptResult::Passed),
+            PitfallFixSettlement::Passed
+        );
+        let validated = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        assert_eq!(validated.pitfall_status(), PitfallStatus::Validated);
+        let success = validated
+            .efficacy
+            .as_ref()
+            .unwrap()
+            .recent_observations
+            .iter()
+            .find(|evidence| evidence.outcome == KnowledgeEvidenceOutcome::FixSucceeded)
+            .unwrap();
+        assert!(evidence_has_complete_causal_provenance(success));
+        assert_eq!(success.causal_attempt_id, passed);
+        assert!(success.workspace_scope.starts_with("project:"));
+
+        let failed = commit_pitfall_fix_attempt(tmp.path(), error).unwrap();
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                tmp.path(),
+                &failed,
+                PitfallFixAttemptResult::VerificationFailed(error.to_string()),
+            ),
+            PitfallFixSettlement::SameSignatureFailed
+        );
+        assert_eq!(
+            read_raw_lessons(tmp.path(), DEV_ERRORS_FILE)[0].pitfall_status(),
+            PitfallStatus::Invalidated
+        );
+
+        let recovered = commit_pitfall_fix_attempt(tmp.path(), error).unwrap();
+        assert_eq!(
+            settle_pitfall_fix_attempt(tmp.path(), &recovered, PitfallFixAttemptResult::Passed),
+            PitfallFixSettlement::Passed
+        );
+        assert_eq!(
+            read_raw_lessons(tmp.path(), DEV_ERRORS_FILE)[0].pitfall_status(),
+            PitfallStatus::Validated
+        );
+    }
+
+    #[test]
+    fn legacy_signature_feedback_is_retained_but_behaviorally_neutral() {
         let tmp = TempDir::new().unwrap();
         let err = vec!["Error: Cannot find module 'lodash'".to_string()];
         capture_dev_errors(tmp.path(), &err, "demo", "需求");
@@ -6649,21 +9748,144 @@ mod tests {
                 .map(|l| l.trust())
         };
         let start = trust_of(tmp.path()).unwrap();
-        // Gate passed with this pitfall's fix in play → reward.
+        // Historical broad signature APIs still preserve their audit counters,
+        // but cannot affect behavior without exact attempt attribution v1.
         assert_eq!(apply_dev_error_trust(tmp.path(), &err, true), 1);
-        assert!(trust_of(tmp.path()).unwrap() > start, "pass rewards trust");
-        // Gate failed with it in play → penalty (drops below the start).
         apply_dev_error_trust(tmp.path(), &err, false);
         apply_dev_error_trust(tmp.path(), &err, false);
-        assert!(
-            trust_of(tmp.path()).unwrap() < start,
-            "repeated fails sink trust below neutral"
-        );
+        assert!((trust_of(tmp.path()).unwrap() - start).abs() < f32::EPSILON);
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        let efficacy = row.efficacy.unwrap();
+        assert_eq!(efficacy.outcome_attribution_version, 0);
+        assert_eq!((efficacy.helpful, efficacy.harmful), (1, 2));
         // Unrecognised error → no-op.
         assert_eq!(
             apply_dev_error_trust(tmp.path(), &["vague noise".to_string()], true),
             0
         );
+    }
+
+    #[test]
+    fn legacy_broad_outcomes_are_behaviorally_neutral() {
+        let mut lesson = seed_cluster_one_lesson();
+        lesson.trust = TRUST_FLOOR;
+        lesson.efficacy = Some(PitfallEfficacy {
+            injected: 99,
+            occ_at_injection: 1,
+            recurred_after_warning: true,
+            proven_fix: true,
+            failed_fixes: vec!["legacy broad fix".into()],
+            next_strategy: "legacy broad strategy".into(),
+            helpful: 1,
+            harmful: 9,
+            last_fix_failed_at: "2026-01-03T00:00:00Z".into(),
+            last_verified_at: "2026-01-04T00:00:00Z".into(),
+            last_reinforced_at: "2026-01-04T00:00:00Z".into(),
+            ..PitfallEfficacy::default()
+        });
+
+        assert!((lesson.trust() - NEUTRAL_TRUST).abs() < f32::EPSILON);
+        assert_eq!(lesson.efficacy_samples(), 0);
+        assert_eq!(lesson.helpful_ratio(), None);
+        assert!(!is_efficacy_poison(&lesson));
+        assert_eq!(lesson.pitfall_status(), PitfallStatus::Active);
+        assert_eq!(lesson.last_verified_at(), None);
+        assert_eq!(lesson.last_reinforced_at(), None);
+    }
+
+    #[test]
+    fn first_exact_settlement_starts_a_clean_outcome_lineage() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'";
+        let mut legacy = mk_pitfall(
+            "dependency/module-not-found/lodash",
+            "install lodash",
+            "missing dependency",
+            "2026-01-01T00:00:00Z",
+            2,
+        );
+        legacy.trust = TRUST_FLOOR;
+        legacy.efficacy = Some(PitfallEfficacy {
+            recurred_after_warning: true,
+            proven_fix: true,
+            failed_fixes: vec!["legacy broad fix".into()],
+            next_strategy: "legacy broad strategy".into(),
+            helpful: 3,
+            harmful: 12,
+            last_fix_failed_at: "2026-01-03T00:00:00Z".into(),
+            last_verified_at: "2026-01-04T00:00:00Z".into(),
+            last_reinforced_at: "2026-01-04T00:00:00Z".into(),
+            ..PitfallEfficacy::default()
+        });
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[legacy]);
+
+        let token = commit_pitfall_fix_attempt(tmp.path(), error).unwrap();
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                tmp.path(),
+                &token,
+                PitfallFixAttemptResult::VerificationFailed(error.into()),
+            ),
+            PitfallFixSettlement::SameSignatureFailed
+        );
+
+        let lesson = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        let efficacy = lesson.efficacy.as_ref().unwrap();
+        assert_eq!(efficacy.outcome_attribution_version, 1);
+        assert_eq!((efficacy.exact_helpful, efficacy.exact_harmful), (0, 1));
+        assert_eq!(lesson.efficacy_samples(), 1);
+        assert!((lesson.trust() - (NEUTRAL_TRUST - TRUST_PENALTY)).abs() < f32::EPSILON);
+        assert_eq!(lesson.pitfall_status(), PitfallStatus::Recurring);
+        assert_eq!(efficacy.failed_fixes, vec!["install lodash"]);
+        assert!(efficacy.next_strategy.is_empty());
+        // Compatibility fields remain an audit trail but did not seed v1.
+        assert_eq!((efficacy.helpful, efficacy.harmful), (3, 12));
+    }
+
+    #[test]
+    fn canonical_merge_does_not_mix_legacy_outcomes_into_exact_behavior() {
+        let tmp = TempDir::new().unwrap();
+        let sig = "dependency/module-not-found/lodash";
+        let mut legacy = mk_pitfall(sig, "legacy fix", "root", "2026-01-01Z", 9);
+        legacy.trust = TRUST_FLOOR;
+        legacy.efficacy = Some(PitfallEfficacy {
+            recurred_after_warning: true,
+            proven_fix: true,
+            failed_fixes: vec!["legacy failed fix".into()],
+            next_strategy: "legacy strategy".into(),
+            helpful: 50,
+            harmful: 50,
+            last_fix_failed_at: "2099-01-01T00:00:00Z".into(),
+            last_verified_at: "2099-01-02T00:00:00Z".into(),
+            last_reinforced_at: "2099-01-02T00:00:00Z".into(),
+            ..PitfallEfficacy::default()
+        });
+        let mut exact = mk_pitfall(sig, "exact fix", "root", "2026-01-02Z", 2);
+        exact.efficacy = Some(PitfallEfficacy {
+            outcome_attribution_version: 1,
+            exact_helpful: 2,
+            exact_harmful: 1,
+            exact_last_verified_at: "2026-01-03T00:00:00Z".into(),
+            exact_last_reinforced_at: "2026-01-03T00:00:00Z".into(),
+            failed_fixes: vec!["exact failed fix".into()],
+            recent_observations: vec![test_evidence(
+                "exact-success",
+                "2026-01-03T00:00:00Z",
+                KnowledgeEvidenceOutcome::FixSucceeded,
+            )],
+            ..PitfallEfficacy::default()
+        });
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[legacy, exact]);
+
+        let merged = read_canonical_pitfalls(tmp.path()).remove(0);
+        let efficacy = merged.efficacy.as_ref().unwrap();
+        assert_eq!(efficacy.outcome_attribution_version, 1);
+        assert_eq!((efficacy.exact_helpful, efficacy.exact_harmful), (2, 1));
+        assert_eq!(merged.efficacy_samples(), 3);
+        assert_eq!(merged.pitfall_status(), PitfallStatus::Validated);
+        assert_eq!(merged.last_verified_at(), Some("2026-01-03T00:00:00Z"));
+        assert_eq!(efficacy.failed_fixes, vec!["exact failed fix"]);
+        assert!(efficacy.next_strategy.is_empty());
     }
 
     /// One persisted Failure lesson, returned by value for in-memory trust tests.
@@ -6717,8 +9939,9 @@ mod tests {
             occurrences: 1,
             context: Vec::new(),
             efficacy: Some(PitfallEfficacy {
-                helpful,
-                harmful,
+                outcome_attribution_version: 1,
+                exact_helpful: helpful,
+                exact_harmful: harmful,
                 ..PitfallEfficacy::default()
             }),
             invalidated: false,
@@ -6730,9 +9953,7 @@ mod tests {
 
     #[test]
     fn recall_outcome_moves_the_helpful_harmful_tally() {
-        // Step 1: a lesson RECALLED then PASSED gains helpful; recalled then still
-        // FAILED (recurs despite the injection) gains harmful — the outcome signal
-        // that closes the loop. Rides the SAME wired seam (`apply_dev_error_trust`).
+        // Only a committed repair turn can move outcome efficacy.
         let tmp = TempDir::new().unwrap();
         let err = vec!["Error: Cannot find module 'lodash'".to_string()];
         capture_dev_errors(tmp.path(), &err, "demo", "需求");
@@ -6743,28 +9964,52 @@ mod tests {
                 .find(|l| l.signature == sig)
                 .and_then(|l| l.efficacy)
         };
-        apply_dev_error_trust(tmp.path(), &err, true);
+        let passed_attempt = commit_pitfall_fix_attempt(tmp.path(), &err[0]).unwrap();
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                tmp.path(),
+                &passed_attempt,
+                PitfallFixAttemptResult::Passed
+            ),
+            PitfallFixSettlement::Passed
+        );
         let e = eff_of(tmp.path()).unwrap();
-        assert_eq!((e.helpful, e.harmful), (1, 0), "a pass increments helpful");
-        apply_dev_error_trust(tmp.path(), &err, false);
+        assert_eq!(e.outcome_attribution_version, 1);
+        assert_eq!(
+            (e.exact_helpful, e.exact_harmful),
+            (1, 0),
+            "a token-settled pass increments exact helpful"
+        );
+        let failed_attempt = commit_pitfall_fix_attempt(tmp.path(), &err[0]).unwrap();
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                tmp.path(),
+                &failed_attempt,
+                PitfallFixAttemptResult::VerificationFailed(err[0].clone())
+            ),
+            PitfallFixSettlement::SameSignatureFailed
+        );
         let e = eff_of(tmp.path()).unwrap();
         assert_eq!(
-            (e.helpful, e.harmful),
+            (e.exact_helpful, e.exact_harmful),
             (1, 1),
-            "a recurrence-despite-injection increments harmful"
+            "a same-signature token failure increments exact harmful"
         );
     }
 
     #[test]
-    fn nonpitfall_recall_outcome_moves_the_tally_via_identity() {
-        // The non-pitfall (Failure / belief) reflux also feeds the tally: a surfaced
-        // identity whose step then passes gains helpful.
+    fn explicitly_committed_nonpitfall_identity_moves_the_tally() {
+        // The low-level identity seam remains available to a caller that can prove
+        // which exact non-pitfall row reached a real turn. Passive recall itself
+        // deliberately writes no global "last surfaced" snapshot.
         let tmp = TempDir::new().unwrap();
         let req = "做一个登录系统";
         capture_quality_failures(tmp.path(), &[check("coverage", "failed", 20)], "demo", req);
-        let _ = relevant_lessons_for_prompt(tmp.path(), req); // snapshot surfaced ids
-        let ids = read_surfaced_identities(tmp.path());
-        assert!(!ids.is_empty(), "the failure lesson was surfaced");
+        let row = read_raw_lessons(tmp.path(), "quality-failures.jsonl")
+            .into_iter()
+            .next()
+            .unwrap();
+        let ids = vec![lesson_identity(&row)];
         apply_trust_for_identities(tmp.path(), &ids, true);
         let eff = read_raw_lessons(tmp.path(), "quality-failures.jsonl")
             .into_iter()
@@ -6788,14 +10033,15 @@ mod tests {
         let now = Utc::now();
         let mut high = base.clone();
         high.efficacy = Some(PitfallEfficacy {
-            helpful: 4,
-            harmful: 0,
+            outcome_attribution_version: 1,
+            exact_helpful: 4,
             ..PitfallEfficacy::default()
         });
         let mut low = base.clone();
         low.efficacy = Some(PitfallEfficacy {
-            helpful: 1,
-            harmful: 2, // ratio 0.33, samples 3 < floor → ranked low but NOT pruned
+            outcome_attribution_version: 1,
+            exact_helpful: 1,
+            exact_harmful: 2, // ratio 0.33, samples 3 < floor → ranked low but NOT pruned
             ..PitfallEfficacy::default()
         });
         let sh = lesson_decay_score(&high, &q, now);
@@ -6876,7 +10122,8 @@ mod tests {
             2,
         );
         thin.efficacy = Some(PitfallEfficacy {
-            harmful: 1,
+            outcome_attribution_version: 1,
+            exact_harmful: 1,
             ..PitfallEfficacy::default()
         });
         write_raw_lessons(root, DEV_ERRORS_FILE, std::slice::from_ref(&thin));
@@ -6886,7 +10133,8 @@ mod tests {
         );
         let mut poison = thin.clone();
         poison.efficacy = Some(PitfallEfficacy {
-            harmful: 5,
+            outcome_attribution_version: 1,
+            exact_harmful: 5,
             ..PitfallEfficacy::default()
         });
         write_raw_lessons(root, DEV_ERRORS_FILE, std::slice::from_ref(&poison));
@@ -6907,5 +10155,1366 @@ mod tests {
         assert!(relevant_lessons_for_prompt(tmp.path(), "anything").is_empty());
         assert!(relevant_lessons_for_prompt_ranked(tmp.path(), "anything").is_empty());
         assert!(lessons_for_error(tmp.path(), "Error: Cannot find module 'lodash'").is_empty());
+    }
+
+    #[test]
+    fn capture_counts_independent_events_but_dedupes_one_event_and_announces_rule() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+
+        // One failed event may repeat stderr/summary text. It is still one
+        // observation and one newly-created incident.
+        let first = capture_dev_errors_detailed(
+            tmp.path(),
+            &[error.clone(), error.clone()],
+            "demo",
+            "requirement",
+        );
+        assert_eq!(
+            first,
+            PitfallCaptureOutcome {
+                new_incidents: 1,
+                recurrent_incidents: 0,
+                newly_curated_rules: 0,
+                new_unclassified_candidates: 0,
+                recurrent_unclassified_candidates: 0,
+                observations: 1,
+            }
+        );
+
+        // A second independently-executed event is a recurrence and crosses the
+        // two-evidence threshold into a visible corroborated reusable rule.
+        let second = capture_dev_errors_detailed(
+            tmp.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "requirement",
+        );
+        assert_eq!(second.recurrent_incidents, 1);
+        assert_eq!(second.newly_curated_rules, 1);
+        assert!(second
+            .progress_notes()
+            .iter()
+            .any(|note| note.contains("形成已印证经验规则")));
+
+        let pitfall = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(pitfall.hits(), 2);
+        let observations = &pitfall.efficacy.as_ref().unwrap().recent_observations;
+        assert_eq!(observations.len(), 2);
+        assert_ne!(
+            observations[0].episode_id, observations[1].episode_id,
+            "two independently captured failures need distinct episode ids"
+        );
+        let report = lessons_report(tmp.path());
+        assert_eq!(report.curated_lessons.len(), 1);
+        assert_eq!(report.curated_lessons[0].evidence_count, 2);
+        assert_eq!(
+            report.curated_lessons[0].status,
+            CuratedLessonStatus::Corroborated
+        );
+        assert!(report.curated_lessons[0].timeline_complete);
+    }
+
+    #[test]
+    fn capture_does_not_announce_learning_when_atomic_commit_cannot_start() {
+        let tmp = TempDir::new().unwrap();
+        let root_is_file = tmp.path().join("not-a-directory");
+        std::fs::write(&root_is_file, "blocks .umadev directory creation").unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+
+        let outcome = capture_dev_errors_detailed(&root_is_file, &[error], "demo", "requirement");
+        assert_eq!(outcome, PitfallCaptureOutcome::default());
+        assert!(outcome.progress_notes().is_empty());
+        assert!(read_raw_lessons(&root_is_file, DEV_ERRORS_FILE).is_empty());
+    }
+
+    #[test]
+    fn observation_tail_is_bounded_without_losing_lifetime_hits() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        for _ in 0..(MAX_RECENT_OBSERVATIONS + 3) {
+            let _ = capture_dev_errors_detailed(
+                tmp.path(),
+                std::slice::from_ref(&error),
+                "demo",
+                "requirement",
+            );
+        }
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        assert_eq!(row.hits() as usize, MAX_RECENT_OBSERVATIONS + 3);
+        assert_eq!(
+            row.efficacy.unwrap().recent_observations.len(),
+            MAX_RECENT_OBSERVATIONS
+        );
+        assert!(!lessons_report(tmp.path()).top_pitfalls[0].timeline_complete);
+    }
+
+    #[test]
+    fn legacy_generic_226_is_quarantined_not_actionable() {
+        let _home = TempHome::new();
+        let tmp = TempDir::new().unwrap();
+        let mut generic = mk_pitfall(
+            "general/error/failed",
+            "read the log",
+            "unknown",
+            "2026-01-01T00:00:00Z",
+            226,
+        );
+        generic.domain = "general".into();
+        generic.title = "开发错误: failed".into();
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[generic]);
+
+        let summary = pitfall_efficacy_summary(tmp.path());
+        assert_eq!(summary.total, 0);
+        assert_eq!(summary.quarantined_records, 1);
+        assert_eq!(summary.quarantined_hits, 226);
+        let report = lessons_report(tmp.path());
+        assert!(report.is_empty());
+        assert!(!report.has_incidents());
+        assert!(report.top_pitfalls.is_empty());
+        assert!(relevant_lessons_for_prompt(tmp.path(), "failed").is_empty());
+        assert!(lessons_for_error(tmp.path(), "failed").is_empty());
+        let overview = pitfall_overview(tmp.path());
+        assert!(overview.contains("旧计数 226 次"));
+        assert!(!overview.contains("开发错误: failed"));
+
+        // A legacy auto-generated generic/unsafe global chunk is removed on the
+        // first sediment pass, while the raw audit row remains intact.
+        let global = global_learned_dir().unwrap().join("general");
+        fs::create_dir_all(&global).unwrap();
+        let unsafe_md = global.join("legacy.md");
+        fs::write(
+            &unsafe_md,
+            "---\nmaintainer: auto-sediment\n---\n# [pitfall] Dev error: x\ngeneral/error/failed\n",
+        )
+        .unwrap();
+        assert_eq!(sediment_lessons(tmp.path()), 0);
+        assert!(!unsafe_md.exists());
+        assert_eq!(read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).len(), 1);
+    }
+
+    #[test]
+    fn repeated_unknown_error_becomes_visible_safe_candidate_not_advice() {
+        let _home = TempHome::new();
+        let tmp = TempDir::new().unwrap();
+        let unknown =
+            "frobnicator failed while applying quux protocol at /private/acme/42".to_string();
+        let first = capture_dev_errors_detailed(
+            tmp.path(),
+            std::slice::from_ref(&unknown),
+            "secret-slug",
+            "secret requirement",
+        );
+        assert_eq!(first.new_unclassified_candidates, 1);
+        let second = capture_dev_errors_detailed(
+            tmp.path(),
+            std::slice::from_ref(&unknown),
+            "secret-slug",
+            "secret requirement",
+        );
+        assert_eq!(second.recurrent_unclassified_candidates, 1);
+        assert!(second
+            .progress_notes()
+            .iter()
+            .any(|note| note.contains("仍需分类")));
+
+        let summary = pitfall_efficacy_summary(tmp.path());
+        assert_eq!(summary.total, 0);
+        assert_eq!(summary.quarantined_records, 0);
+        assert_eq!(summary.unclassified_candidates, 1);
+        assert_eq!(summary.unclassified_candidate_hits, 2);
+        let report = lessons_report(tmp.path());
+        assert!(report.is_empty());
+        assert!(!report.has_incidents());
+        assert!(report.has_unclassified_candidates());
+        assert_eq!(report.unclassified_candidates.len(), 1);
+        let candidate = &report.unclassified_candidates[0];
+        assert_eq!(candidate.hits, 2);
+        assert!(candidate.last_observed_at.is_some());
+        assert!(candidate.timeline_complete);
+        assert_eq!(candidate.recent_observations.len(), 2);
+        assert!(candidate
+            .recent_observations
+            .iter()
+            .all(|observation| !observation.observed_at.is_empty()));
+        assert!(report.top_pitfalls.is_empty());
+        assert!(lessons_for_error(tmp.path(), &unknown).is_empty());
+        assert!(relevant_lessons_for_prompt(tmp.path(), &unknown).is_empty());
+        assert!(pitfall_overview(tmp.path()).contains("需分类审核"));
+        assert_eq!(sediment_lessons(tmp.path()), 0);
+
+        let raw = fs::read_to_string(tmp.path().join(RAW_DIR).join(DEV_ERRORS_FILE)).unwrap();
+        assert!(!raw.contains("/private/acme"));
+        assert!(!raw.contains("secret requirement"));
+        assert!(!raw.contains("frobnicator failed"));
+        // `list_sedimented_lessons` intentionally merges project and global rules.
+        // This candidate must create no project-local advice; unrelated global rules
+        // are outside the assertion and may be populated by parallel tests.
+        let mut project_files = Vec::new();
+        collect_md_files(&tmp.path().join(LEARNED_DIR), &mut project_files, 0);
+        assert!(project_files.is_empty());
+    }
+
+    #[test]
+    fn unknown_candidate_keeps_distinct_paths_without_persisting_them() {
+        let tmp = TempDir::new().unwrap();
+        let foo_42 = "frobnicator failed on GET /private/acme/foo/42".to_string();
+        let foo_99 = "frobnicator failed on GET /private/acme/foo/99".to_string();
+        let bar_42 = "frobnicator failed on GET /private/acme/bar/42".to_string();
+
+        let _ = capture_dev_errors_detailed(
+            tmp.path(),
+            std::slice::from_ref(&foo_42),
+            "demo",
+            "requirement",
+        );
+        let foo_again = capture_dev_errors_detailed(
+            tmp.path(),
+            std::slice::from_ref(&foo_99),
+            "demo",
+            "requirement",
+        );
+        let different_path = capture_dev_errors_detailed(
+            tmp.path(),
+            std::slice::from_ref(&bar_42),
+            "demo",
+            "requirement",
+        );
+
+        assert_eq!(foo_again.recurrent_unclassified_candidates, 1);
+        assert_eq!(different_path.new_unclassified_candidates, 1);
+        let summary = pitfall_efficacy_summary(tmp.path());
+        assert_eq!(summary.unclassified_candidates, 2);
+        assert_eq!(summary.unclassified_candidate_hits, 3);
+        let raw = fs::read_to_string(tmp.path().join(RAW_DIR).join(DEV_ERRORS_FILE)).unwrap();
+        assert!(!raw.contains("/private/acme/foo"));
+        assert!(!raw.contains("/private/acme/bar"));
+    }
+
+    #[test]
+    fn newly_recognized_error_migrates_matching_candidate_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'";
+        let candidate_signature = unclassified_candidate_signature(error);
+        let mut candidate = mk_pitfall(&candidate_signature, "", "", "2026-01-01T00:00:00.000Z", 2);
+        candidate.domain = "general".into();
+        candidate.efficacy = Some(PitfallEfficacy {
+            last_recurred_at: "2026-01-02T00:00:00.000Z".into(),
+            recent_observations: vec![
+                PitfallObservation {
+                    observed_at: "2026-01-01T00:00:00.000Z".into(),
+                    episode_id: "candidate-1".into(),
+                    evidence_hash: "hash-1".into(),
+                    ..PitfallObservation::default()
+                },
+                PitfallObservation {
+                    observed_at: "2026-01-02T00:00:00.000Z".into(),
+                    episode_id: "candidate-2".into(),
+                    evidence_hash: "hash-2".into(),
+                    ..PitfallObservation::default()
+                },
+            ],
+            ..PitfallEfficacy::default()
+        });
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[candidate]);
+
+        let outcome = capture_dev_errors_detailed(tmp.path(), &[error.into()], "demo", "r");
+        assert_eq!(outcome.new_incidents, 1);
+        assert_eq!(outcome.newly_curated_rules, 1);
+        let rows = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE);
+        assert!(rows
+            .iter()
+            .any(|row| row.signature == candidate_signature && row.invalidated));
+        let precise = rows
+            .iter()
+            .find(|row| row.signature == "dependency/module-not-found/lodash")
+            .unwrap();
+        assert_eq!(precise.hits(), 3);
+        assert_eq!(precise.first_seen, "2026-01-01T00:00:00.000Z");
+        let entry = lessons_report(tmp.path()).top_pitfalls.remove(0);
+        assert_eq!(entry.hits, 3);
+        assert!(entry.last_observed_at.is_some());
+        assert!(entry.timeline_complete);
+    }
+
+    #[test]
+    fn unclassified_candidate_store_is_bounded_without_deleting_legacy_generic_audit() {
+        let mut rows: Vec<Lesson> = (0..(MAX_UNCLASSIFIED_CANDIDATES + 9))
+            .map(|index| {
+                mk_pitfall(
+                    &format!("general/candidate/{index:020x}"),
+                    "",
+                    "",
+                    "2026-01-01T00:00:00Z",
+                    1,
+                )
+            })
+            .collect();
+        rows.push(mk_pitfall(
+            "general/error/failed",
+            "",
+            "",
+            "2025-01-01T00:00:00Z",
+            226,
+        ));
+        prune_pitfalls(&mut rows);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.signature.starts_with("general/candidate/"))
+                .count(),
+            MAX_UNCLASSIFIED_CANDIDATES
+        );
+        assert!(rows
+            .iter()
+            .any(|row| row.signature == "general/error/failed" && row.hits() == 226));
+    }
+
+    #[test]
+    fn legacy_json_defaults_new_timeline_and_attempt_fields() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(RAW_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(DEV_ERRORS_FILE),
+            r#"{"kind":"dev_error","domain":"dependency","title":"old","body":"b","fix":"f","root_cause":"r","keywords":[],"source_requirement":"q","first_seen":"2025-01-01T00:00:00Z"}
+"#,
+        )
+        .unwrap();
+        let rows = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hits(), 1);
+        assert!(rows[0].efficacy.is_none());
+        assert!(!rows[0].invalidated);
+    }
+
+    #[test]
+    fn corrupt_raw_lines_survive_unrelated_read_modify_write() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(RAW_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DEV_ERRORS_FILE);
+        fs::write(&path, "{legacy-corrupt-audit-line\n").unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        capture_dev_errors(tmp.path(), &[error], "demo", "requirement");
+        let raw = fs::read_to_string(path).unwrap();
+        assert!(raw.contains("{legacy-corrupt-audit-line"));
+        assert_eq!(read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_learned_dir_supports_a_symlinked_home_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let _home = TempHome::new();
+        let real_home = home_dir().unwrap();
+        let link_parent = TempDir::new().unwrap();
+        let linked_home = link_parent.path().join("linked-home");
+        symlink(&real_home, &linked_home).unwrap();
+        set_test_home_override(Some(linked_home.clone()));
+
+        let learned = global_learned_dir().unwrap();
+        assert_eq!(
+            learned,
+            fs::canonicalize(real_home)
+                .unwrap()
+                .join(GLOBAL_LEARNED_DIRNAME)
+        );
+        assert!(real_dir_no_follow(&learned));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_learned_dir_rejects_symlinked_managed_components() {
+        use std::os::unix::fs::symlink;
+
+        let _home = TempHome::new();
+        let home = home_dir().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_umadev = outside.path().join("external-umadev");
+        let outside_learned = outside_umadev.join("learned/general");
+        fs::create_dir_all(&outside_learned).unwrap();
+        let legacy = outside_learned.join("legacy.md");
+        fs::write(
+            &legacy,
+            "---\nmaintainer: auto-sediment\n---\n# private legacy\n",
+        )
+        .unwrap();
+
+        // Reject a symlinked `.umadev` ancestor without traversing or cleaning it.
+        symlink(&outside_umadev, home.join(".umadev")).unwrap();
+        assert!(global_learned_dir().is_none());
+        assert!(legacy.exists());
+        fs::remove_file(home.join(".umadev")).unwrap();
+
+        // The final `learned` component is equally untrusted.
+        fs::create_dir(home.join(".umadev")).unwrap();
+        symlink(outside_umadev.join("learned"), home.join(".umadev/learned")).unwrap();
+        assert!(global_learned_dir().is_none());
+        assert!(legacy.exists());
+        assert!(!home.join(".umadev/quarantine").exists());
+    }
+
+    #[test]
+    fn quarantine_commit_never_removes_a_concurrent_replacement() {
+        let _home = TempHome::new();
+        let home = home_dir().unwrap();
+        let root = home.join(GLOBAL_LEARNED_DIRNAME);
+        let domain = root.join("general");
+        fs::create_dir_all(&domain).unwrap();
+        let source = domain.join("legacy.md");
+        let legacy = "---\nmaintainer: auto-sediment\n---\n# legacy private body\n";
+        let replacement = "---\nmaintainer: auto-sediment\nglobal_safety: classifier-family-v2\n---\n# current safe body\n";
+        fs::write(&source, legacy).unwrap();
+
+        let mut hook_calls = 0usize;
+        quarantine_unsafe_global_sediments_with(&root, |original| {
+            hook_calls += 1;
+            assert_eq!(original, source);
+            fs::write(original, replacement).unwrap();
+        });
+
+        assert_eq!(hook_calls, 1);
+        assert_eq!(fs::read_to_string(&source).unwrap(), replacement);
+        let quarantine = home.join(".umadev/quarantine/learned");
+        let quarantined = fs::read_dir(quarantine)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(fs::read_to_string(&quarantined[0]).unwrap(), legacy);
+        assert!(fs::read_dir(domain).unwrap().flatten().all(|entry| !entry
+            .file_name()
+            .to_string_lossy()
+            .contains("quarantine-pending")));
+    }
+
+    #[test]
+    fn global_lesson_projection_honors_off_on_and_corrupt_policy() {
+        let home = NoBundledCorpus::new();
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        capture_dev_errors(
+            tmp.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "dependency lodash",
+        );
+        let attempt = commit_pitfall_fix_attempt(tmp.path(), &error).unwrap();
+        assert_eq!(
+            settle_pitfall_fix_attempt(tmp.path(), &attempt, PitfallFixAttemptResult::Passed),
+            PitfallFixSettlement::Passed
+        );
+        capture_dev_errors(
+            tmp.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "dependency lodash",
+        );
+
+        crate::memory_control::update_capture(
+            tmp.path(),
+            MemoryScope::Global,
+            Some(MemoryStore::GlobalLessonProjection),
+            false,
+        )
+        .unwrap();
+        assert!(
+            sediment_lessons(tmp.path()) > 0,
+            "project sediment is independent"
+        );
+        let global_root = home.home().join(GLOBAL_LEARNED_DIRNAME);
+        let mut global_files = Vec::new();
+        collect_md_files(&global_root, &mut global_files, 0);
+        assert!(global_files.is_empty());
+
+        crate::memory_control::update_capture(
+            tmp.path(),
+            MemoryScope::Global,
+            Some(MemoryStore::GlobalLessonProjection),
+            true,
+        )
+        .unwrap();
+        assert!(sediment_lessons(tmp.path()) > 0);
+        collect_md_files(&global_root, &mut global_files, 0);
+        assert!(!global_files.is_empty());
+
+        for file in global_files.drain(..) {
+            std::fs::remove_file(file).unwrap();
+        }
+        std::fs::write(
+            home.home().join(".umadev/memory/policy.toml"),
+            "invalid = [toml",
+        )
+        .unwrap();
+        assert!(
+            sediment_lessons(tmp.path()) > 0,
+            "project capture still proceeds"
+        );
+        collect_md_files(&global_root, &mut global_files, 0);
+        assert!(
+            global_files.is_empty(),
+            "corrupt global policy disables projection"
+        );
+        assert!(!lessons_report(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn global_promotion_omits_private_module_and_legacy_global_content() {
+        let _home = TempHome::new();
+        let tmp = TempDir::new().unwrap();
+        let secret = "TOP_SECRET_TOKEN_123";
+        let private_module = "@acme/private-payment-engine";
+        let private_slug = "acme-private-payment-engine";
+        let error = format!(
+            "Error: Cannot find module '{private_module}' from /Users/alice/private/project ({secret})"
+        );
+        capture_dev_errors(
+            tmp.path(),
+            std::slice::from_ref(&error),
+            "private-slug",
+            "customer ACME secret",
+        );
+        capture_dev_errors(
+            tmp.path(),
+            std::slice::from_ref(&error),
+            "private-slug",
+            "customer ACME secret",
+        );
+        let raw_path = tmp.path().join(RAW_DIR).join(DEV_ERRORS_FILE);
+        let raw = fs::read_to_string(raw_path).unwrap();
+        assert!(!raw.contains(secret));
+        assert!(!raw.contains("/Users/alice/private"));
+        assert!(!raw.contains("customer ACME secret"));
+        assert!(
+            raw.contains(private_slug),
+            "project-local identity is retained"
+        );
+
+        let global = global_learned_dir().unwrap();
+        let legacy = global.join("dependency/legacy-v1.md");
+        let hand_authored = global.join("notes/hand-authored.md");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::create_dir_all(hand_authored.parent().unwrap()).unwrap();
+        fs::write(
+            &legacy,
+            format!(
+                "---\nmaintainer: auto-sediment\nglobal_safety: classifier-only-v1\n---\n# Legacy\n\n{private_module}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &hand_authored,
+            "# Human note\n\nThe body literally discusses `maintainer: auto-sediment` and must survive.",
+        )
+        .unwrap();
+
+        assert!(sediment_lessons(tmp.path()) > 0);
+        assert!(!legacy.exists(), "unsafe v1 global files are quarantined");
+        assert!(
+            hand_authored.exists(),
+            "body text must never make a hand-authored note look generated"
+        );
+        let quarantine = global.parent().unwrap().join("quarantine/learned");
+        let quarantined = fs::read_dir(quarantine)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(quarantined.len(), 1);
+        assert!(fs::read_to_string(&quarantined[0])
+            .unwrap()
+            .contains(private_module));
+        let mut global_files = Vec::new();
+        collect_md_files(&global, &mut global_files, 0);
+        assert!(!global_files.is_empty());
+        for path in global_files {
+            let body = fs::read_to_string(&path).unwrap();
+            if path == hand_authored {
+                continue;
+            }
+            assert!(!body.contains(secret));
+            assert!(!body.contains("/Users/alice/private"));
+            assert!(!body.contains("customer ACME secret"));
+            assert!(!body.contains(private_module));
+            assert!(!body.contains(private_slug));
+            assert!(body.contains("global_safety: classifier-family-v2"));
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert!(!name.contains("acme"));
+            assert!(!name.contains("payment"));
+        }
+    }
+
+    #[test]
+    fn malformed_raw_domain_cannot_escape_the_project_learned_directory() {
+        let _home = TempHome::new();
+        let tmp = TempDir::new().unwrap();
+        let mut lesson = mk_pitfall(
+            "dependency/module-not-found/private",
+            "install dependency",
+            "dependency missing",
+            "2026-01-01T00:00:00Z",
+            2,
+        );
+        lesson.domain = "../../escaped".into();
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[lesson]);
+
+        assert_eq!(sediment_lessons(tmp.path()), 0);
+        assert!(!tmp.path().join("escaped").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sediment_never_follows_project_or_global_domain_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let _home = TempHome::new();
+        let project = TempDir::new().unwrap();
+        let lesson = mk_pitfall(
+            "dependency/module-not-found/private",
+            "install dependency",
+            "dependency missing",
+            "2026-01-01T00:00:00Z",
+            2,
+        );
+        write_raw_lessons(project.path(), DEV_ERRORS_FILE, &[lesson]);
+
+        let project_external = TempDir::new().unwrap();
+        let project_victim = project_external.path().join("lesson-victim.md");
+        fs::write(&project_victim, "project victim must survive").unwrap();
+        let project_domain = project.path().join(LEARNED_DIR).join("dependency");
+        symlink(project_external.path(), &project_domain).unwrap();
+
+        let global_root = global_learned_dir().unwrap();
+        let global_external = TempDir::new().unwrap();
+        let global_victim = global_external.path().join("lesson-victim.md");
+        fs::write(&global_victim, "global victim must survive").unwrap();
+        let global_domain = global_root.join("dependency");
+        symlink(global_external.path(), &global_domain).unwrap();
+
+        assert_eq!(sediment_lessons(project.path()), 0);
+        assert_eq!(
+            fs::read_to_string(&project_victim).unwrap(),
+            "project victim must survive"
+        );
+        assert_eq!(
+            fs::read_to_string(&global_victim).unwrap(),
+            "global victim must survive"
+        );
+        assert_eq!(
+            fs::read_dir(project_external.path())
+                .unwrap()
+                .flatten()
+                .count(),
+            1,
+            "local sediment must not create files through a domain symlink"
+        );
+        assert_eq!(
+            fs::read_dir(global_external.path())
+                .unwrap()
+                .flatten()
+                .count(),
+            1,
+            "global promotion must not create files through a domain symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_capture_never_follows_a_managed_learned_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let _home = TempHome::new();
+        let project = TempDir::new().unwrap();
+        fs::create_dir(project.path().join(".umadev")).unwrap();
+        let external = TempDir::new().unwrap();
+        let victim = external.path().join("dev-errors.jsonl");
+        fs::write(&victim, "external victim must survive").unwrap();
+        symlink(
+            external.path(),
+            project.path().join(".umadev").join("learned"),
+        )
+        .unwrap();
+
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        let outcome = capture_dev_errors_detailed(
+            project.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "private requirement",
+        );
+
+        assert_eq!(outcome.observations, 0, "a rejected write is not announced");
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "external victim must survive"
+        );
+        assert_eq!(
+            fs::read_dir(external.path()).unwrap().flatten().count(),
+            1,
+            "raw capture must not write through the managed learned symlink"
+        );
+    }
+
+    #[test]
+    fn invalidated_pitfall_is_inert_until_fresh_episode_reactivates_it() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        capture_dev_errors(tmp.path(), std::slice::from_ref(&error), "demo", "r");
+        let mut rows = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE);
+        rows[0].invalidated = true;
+        rows[0].trust = 0.9;
+        rows[0].efficacy.get_or_insert_default().proven_fix = true;
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &rows);
+
+        let invalidated = pitfall_efficacy_summary(tmp.path());
+        assert_eq!(invalidated.total, 1);
+        assert_eq!(invalidated.invalidated, 1);
+        assert_eq!(
+            lessons_report(tmp.path()).top_pitfalls[0].status,
+            PitfallStatus::Invalidated
+        );
+        assert!(lessons_for_error(tmp.path(), &error).is_empty());
+        assert!(recurring_pitfall_for_error(tmp.path(), &error).is_none());
+        assert!(commit_pitfall_fix_attempt(tmp.path(), &error).is_none());
+        assert!(!record_pitfall_strategy(
+            tmp.path(),
+            "dependency/module-not-found/lodash",
+            "new strategy"
+        ));
+
+        let outcome =
+            capture_dev_errors_detailed(tmp.path(), std::slice::from_ref(&error), "demo", "r");
+        assert_eq!(outcome.recurrent_incidents, 1);
+        let revived = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        assert!(!revived.invalidated);
+        assert!((revived.trust() - NEUTRAL_TRUST).abs() < f32::EPSILON);
+        assert_eq!(revived.pitfall_status(), PitfallStatus::Corroborated);
+        assert!(!lessons_for_error(tmp.path(), &error).is_empty());
+    }
+
+    #[test]
+    fn attempt_settlement_is_exact_once_and_targets_rendered_shadow_advice() {
+        let tmp = TempDir::new().unwrap();
+        let sig = "dependency/module-not-found/lodash";
+        let low = mk_pitfall(sig, "wrong low-hit fix", "low", "2026-01-01T00:00:00Z", 1);
+        let high = mk_pitfall(
+            sig,
+            "install lodash exactly",
+            "high",
+            "2026-02-01T00:00:00Z",
+            3,
+        );
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[low, high]);
+        let error = "Error: Cannot find module 'lodash'";
+        let rendered = lessons_for_error(tmp.path(), error);
+        assert!(rendered.contains("install lodash exactly"));
+        assert!(!rendered.contains("wrong low-hit fix"));
+
+        let token = commit_pitfall_fix_attempt(tmp.path(), error).unwrap();
+        let rows = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE);
+        assert!(!rows[0]
+            .efficacy
+            .as_ref()
+            .is_some_and(|e| e.pending_fix_attempts.contains(&token)));
+        assert!(rows[1]
+            .efficacy
+            .as_ref()
+            .is_some_and(|e| e.pending_fix_attempts.contains(&token)));
+
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                tmp.path(),
+                &token,
+                PitfallFixAttemptResult::VerificationFailed(error.to_string()),
+            ),
+            PitfallFixSettlement::SameSignatureFailed
+        );
+        assert_eq!(
+            settle_pitfall_fix_attempt(tmp.path(), &token, PitfallFixAttemptResult::Passed),
+            PitfallFixSettlement::NotFound
+        );
+        assert_eq!(
+            settle_pitfall_fix_attempt(tmp.path(), "unknown", PitfallFixAttemptResult::Passed),
+            PitfallFixSettlement::NotFound
+        );
+        let rows = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE);
+        let high = &rows[1];
+        let efficacy = high.efficacy.as_ref().unwrap();
+        assert!(efficacy.pending_fix_attempts.is_empty());
+        assert!(efficacy.recurred_after_warning);
+        assert!(!efficacy.proven_fix);
+        assert!(efficacy
+            .failed_fixes
+            .iter()
+            .any(|fix| fix == "install lodash exactly"));
+    }
+
+    #[test]
+    fn exact_learning_apis_never_confirm_an_uncommitted_atomic_write() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'";
+        let row = mk_pitfall(
+            "dependency/module-not-found/lodash",
+            "install lodash",
+            "missing dependency",
+            "2026-01-01T00:00:00Z",
+            2,
+        );
+        assert!(write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[row]));
+
+        let uncommitted =
+            with_forced_atomic_write_failure(|| commit_pitfall_fix_attempt(tmp.path(), error));
+        assert!(
+            uncommitted.is_none(),
+            "a failed commit cannot issue a token"
+        );
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        assert!(row
+            .efficacy
+            .as_ref()
+            .is_none_or(|efficacy| efficacy.pending_fix_attempts.is_empty()));
+
+        let token = commit_pitfall_fix_attempt(tmp.path(), error).unwrap();
+        let settlement = with_forced_atomic_write_failure(|| {
+            settle_pitfall_fix_attempt(tmp.path(), &token, PitfallFixAttemptResult::Passed)
+        });
+        assert_eq!(settlement, PitfallFixSettlement::Inconclusive);
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        assert_eq!(row.pitfall_status(), PitfallStatus::Active);
+        assert!(row
+            .efficacy
+            .as_ref()
+            .unwrap()
+            .pending_fix_attempts
+            .contains(&token));
+
+        let strategy_written = with_forced_atomic_write_failure(|| {
+            record_pitfall_strategy(
+                tmp.path(),
+                "dependency/module-not-found/lodash",
+                "try a different resolver",
+            )
+        });
+        assert!(!strategy_written);
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        assert!(row.efficacy.unwrap().next_strategy.is_empty());
+        assert!(!tmp.path().join(REFLECTIONS_DIR).exists());
+    }
+
+    #[test]
+    fn new_verification_error_consumes_token_without_poisoning_original_fix() {
+        let tmp = TempDir::new().unwrap();
+        let original = "Error: Cannot find module 'lodash'";
+        let row = mk_pitfall(
+            "dependency/module-not-found/lodash",
+            "install lodash",
+            "missing dependency",
+            "2026-01-01T00:00:00Z",
+            2,
+        );
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[row]);
+        let token = commit_pitfall_fix_attempt(tmp.path(), original).unwrap();
+
+        // The module error was fixed, but a different package now fails. The
+        // overall gate is red; this is not evidence that the lodash advice failed.
+        let settlement = settle_pitfall_fix_attempt(
+            tmp.path(),
+            &token,
+            PitfallFixAttemptResult::VerificationFailed("Error: Cannot find module 'react'".into()),
+        );
+        assert_eq!(settlement, PitfallFixSettlement::Inconclusive);
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        let efficacy = row.efficacy.unwrap();
+        assert!(efficacy.pending_fix_attempts.is_empty());
+        assert!(!efficacy.proven_fix);
+        assert!(!efficacy.recurred_after_warning);
+        assert!(efficacy.last_fix_failed_at.is_empty());
+        assert!(efficacy.failed_fixes.is_empty());
+        assert_eq!((efficacy.helpful, efficacy.harmful), (0, 0));
+
+        // The consumed token cannot later be retroactively settled by lodash.
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                tmp.path(),
+                &token,
+                PitfallFixAttemptResult::VerificationFailed(original.into()),
+            ),
+            PitfallFixSettlement::NotFound
+        );
+
+        let skipped = commit_pitfall_fix_attempt(tmp.path(), original).unwrap();
+        assert_eq!(
+            settle_pitfall_fix_attempt(tmp.path(), &skipped, PitfallFixAttemptResult::Unknown,),
+            PitfallFixSettlement::Inconclusive
+        );
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        let efficacy = row.efficacy.unwrap();
+        assert!(efficacy.pending_fix_attempts.is_empty());
+        assert_eq!((efficacy.helpful, efficacy.harmful), (0, 0));
+    }
+
+    #[test]
+    fn failed_evidence_matches_original_signature_even_after_another_error() {
+        let tmp = TempDir::new().unwrap();
+        let original = "Error: Cannot find module 'lodash'";
+        let row = mk_pitfall(
+            "dependency/module-not-found/lodash",
+            "install lodash",
+            "missing dependency",
+            "2026-01-01T00:00:00Z",
+            2,
+        );
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[row]);
+        let token = commit_pitfall_fix_attempt(tmp.path(), original).unwrap();
+        let evidence = "Error: Cannot find module 'react'\nError: Cannot find module 'lodash'";
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                tmp.path(),
+                &token,
+                PitfallFixAttemptResult::VerificationFailed(evidence.into()),
+            ),
+            PitfallFixSettlement::SameSignatureFailed
+        );
+    }
+
+    #[test]
+    fn coarse_family_attempts_require_the_same_private_evidence_fingerprint() {
+        for (family, original, different) in [
+            (
+                "test/assertion",
+                "test login_redirects assertion failed: left `/login`, right `/home`",
+                "test deletes_account assertion failed: left 500, right 204",
+            ),
+            (
+                "type/type-mismatch",
+                "error[E0308]: mismatched types: expected UserId, found String in create_user",
+                "error[E0308]: mismatched types: expected Vec<Post>, found Option<Post> in list_posts",
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let original = original.to_string();
+            for _ in 0..2 {
+                let _ = capture_dev_errors_detailed(
+                    tmp.path(),
+                    std::slice::from_ref(&original),
+                    "demo",
+                    "requirement",
+                );
+            }
+            let stored = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE);
+            assert_eq!(stored.len(), 1);
+            assert!(stored[0].signature.starts_with(&format!("{family}/e-")));
+            let original_signature = stored[0].signature.clone();
+            let different = different.to_string();
+            let _ = capture_dev_errors_detailed(
+                tmp.path(),
+                std::slice::from_ref(&different),
+                "demo",
+                "requirement",
+            );
+            let stored = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE);
+            assert_eq!(stored.len(), 2, "different coarse errors stay separate");
+            assert!(stored.iter().any(|row| {
+                row.signature == original_signature && row.hits() == 2
+            }));
+            let token = commit_pitfall_fix_attempt(tmp.path(), &original).unwrap();
+            assert_eq!(
+                settle_pitfall_fix_attempt(
+                    tmp.path(),
+                    &token,
+                    PitfallFixAttemptResult::VerificationFailed(different),
+                ),
+                PitfallFixSettlement::Inconclusive,
+                "a different assertion/type error in the same family must not poison the old fix"
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let original = "assertion failed".to_string();
+        for _ in 0..2 {
+            let _ = capture_dev_errors_detailed(
+                tmp.path(),
+                std::slice::from_ref(&original),
+                "demo",
+                "requirement",
+            );
+        }
+        let stored = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE);
+        assert!(stored[0].signature.starts_with("test/assertion/u-"));
+        let token = commit_pitfall_fix_attempt(tmp.path(), &original).unwrap();
+        assert_eq!(
+            settle_pitfall_fix_attempt(
+                tmp.path(),
+                &token,
+                PitfallFixAttemptResult::VerificationFailed(original),
+            ),
+            PitfallFixSettlement::Inconclusive,
+            "under-specified family evidence always abstains"
+        );
+    }
+
+    #[test]
+    fn pending_attempt_never_downgrades_last_settled_recurring_verdict() {
+        let tmp = TempDir::new().unwrap();
+        let sig = "dependency/module-not-found/lodash";
+        let mut recurring = mk_pitfall(sig, "install lodash", "missing", "2026-01-01Z", 2);
+        recurring.efficacy = Some(PitfallEfficacy {
+            outcome_attribution_version: 1,
+            recurred_after_warning: true,
+            last_fix_failed_at: "2026-01-02T00:00:00Z".into(),
+            exact_last_fix_failed_at: "2026-01-02T00:00:00Z".into(),
+            recent_observations: vec![test_evidence(
+                "pending-prior-failure",
+                "2026-01-02T00:00:00Z",
+                KnowledgeEvidenceOutcome::FixFailed,
+            )],
+            ..PitfallEfficacy::default()
+        });
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[recurring]);
+        let token =
+            commit_pitfall_fix_attempt(tmp.path(), "Error: Cannot find module 'lodash'").unwrap();
+        let reloaded = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        assert_eq!(reloaded.pitfall_status(), PitfallStatus::Recurring);
+        assert!(reloaded
+            .efficacy
+            .as_ref()
+            .unwrap()
+            .pending_fix_attempts
+            .contains(&token));
+        assert_eq!(
+            lessons_report(tmp.path()).top_pitfalls[0].status,
+            PitfallStatus::Recurring
+        );
+    }
+
+    #[test]
+    fn ordinary_recurrence_cannot_settle_a_stale_or_pending_attempt() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        let mut stale_injected = mk_pitfall(
+            "dependency/module-not-found/lodash",
+            "install lodash",
+            "missing",
+            "2026-01-01T00:00:00Z",
+            1,
+        );
+        stale_injected.efficacy = Some(PitfallEfficacy {
+            injected: 9,
+            occ_at_injection: 1,
+            ..PitfallEfficacy::default()
+        });
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[stale_injected]);
+        let _ = capture_dev_errors_detailed(
+            tmp.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "requirement",
+        );
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        let efficacy = row.efficacy.as_ref().unwrap();
+        assert!(!efficacy.recurred_after_warning);
+        assert!(efficacy.last_fix_failed_at.is_empty());
+
+        // A verified fix may later regress, but a currently pending exact
+        // attempt must be settled by its token rather than by generic capture.
+        let mut pending = row;
+        let baseline = pending.hits();
+        pending.efficacy = Some(PitfallEfficacy {
+            proven_fix: true,
+            occ_at_injection: baseline,
+            pending_fix_attempts: vec!["fix-pending".into()],
+            ..PitfallEfficacy::default()
+        });
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[pending]);
+        let _ = capture_dev_errors_detailed(
+            tmp.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "requirement",
+        );
+        let pending_row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        let pending_efficacy = pending_row.efficacy.unwrap();
+        assert!(pending_efficacy.proven_fix);
+        assert!(!pending_efficacy.recurred_after_warning);
+        assert!(pending_efficacy.last_fix_failed_at.is_empty());
+    }
+
+    #[test]
+    fn later_exact_recurrence_does_not_infer_a_repair_outcome() {
+        let tmp = TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'lodash'".to_string();
+        let validated = mk_pitfall(
+            "dependency/module-not-found/lodash",
+            "install lodash",
+            "missing",
+            "2026-01-01T00:00:00Z",
+            2,
+        );
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &[validated]);
+        let token = commit_pitfall_fix_attempt(tmp.path(), &error).unwrap();
+        assert_eq!(
+            settle_pitfall_fix_attempt(tmp.path(), &token, PitfallFixAttemptResult::Passed),
+            PitfallFixSettlement::Passed
+        );
+
+        let _ = capture_dev_errors_detailed(
+            tmp.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "requirement",
+        );
+        let row = read_raw_lessons(tmp.path(), DEV_ERRORS_FILE).remove(0);
+        let efficacy = row.efficacy.unwrap();
+        assert!(!efficacy.recurred_after_warning);
+        assert!(efficacy.proven_fix);
+        assert!(efficacy.last_fix_failed_at.is_empty());
+        assert!(efficacy.failed_fixes.is_empty());
+        assert!(!efficacy.last_recurred_at.is_empty());
+    }
+
+    #[test]
+    fn canonical_duplicate_lifecycle_uses_settled_event_chronology() {
+        let tmp = TempDir::new().unwrap();
+        let sig = "dependency/module-not-found/lodash";
+        let mut ordinary_repeat = mk_pitfall(sig, "fix", "root", "2026-01-01Z", 2);
+        ordinary_repeat.efficacy = Some(PitfallEfficacy {
+            last_recurred_at: "2026-01-02T00:00:00Z".into(),
+            ..PitfallEfficacy::default()
+        });
+        let active_shadow = mk_pitfall(sig, "fix", "root", "2026-01-03Z", 1);
+        write_raw_lessons(
+            tmp.path(),
+            DEV_ERRORS_FILE,
+            &[ordinary_repeat.clone(), active_shadow],
+        );
+        assert_eq!(
+            lessons_report(tmp.path()).top_pitfalls[0].status,
+            PitfallStatus::Active,
+            "an observation timestamp alone is not a failed-advice verdict"
+        );
+
+        ordinary_repeat.efficacy = Some(PitfallEfficacy {
+            outcome_attribution_version: 1,
+            recurred_after_warning: true,
+            last_fix_failed_at: "2026-01-02T00:00:00Z".into(),
+            exact_last_fix_failed_at: "2026-01-02T00:00:00Z".into(),
+            recent_observations: vec![test_evidence(
+                "failed-first",
+                "2026-01-02T00:00:00Z",
+                KnowledgeEvidenceOutcome::FixFailed,
+            )],
+            ..PitfallEfficacy::default()
+        });
+        let mut later_verified = mk_pitfall(sig, "fix", "root", "2026-01-03Z", 1);
+        later_verified.efficacy = Some(PitfallEfficacy {
+            outcome_attribution_version: 1,
+            proven_fix: true,
+            last_verified_at: "2026-01-04T00:00:00Z".into(),
+            exact_last_verified_at: "2026-01-04T00:00:00Z".into(),
+            recent_observations: vec![test_evidence(
+                "success-later",
+                "2026-01-04T00:00:00Z",
+                KnowledgeEvidenceOutcome::FixSucceeded,
+            )],
+            ..PitfallEfficacy::default()
+        });
+        write_raw_lessons(
+            tmp.path(),
+            DEV_ERRORS_FILE,
+            &[ordinary_repeat.clone(), later_verified.clone()],
+        );
+        assert_eq!(
+            lessons_report(tmp.path()).top_pitfalls[0].status,
+            PitfallStatus::Validated
+        );
+
+        let efficacy = ordinary_repeat.efficacy.as_mut().unwrap();
+        efficacy.last_fix_failed_at = "2026-01-05T00:00:00Z".into();
+        efficacy.exact_last_fix_failed_at = "2026-01-05T00:00:00Z".into();
+        efficacy.recent_observations.push(test_evidence(
+            "failed-later",
+            "2026-01-05T00:00:00Z",
+            KnowledgeEvidenceOutcome::FixFailed,
+        ));
+        write_raw_lessons(
+            tmp.path(),
+            DEV_ERRORS_FILE,
+            &[ordinary_repeat, later_verified],
+        );
+        assert_eq!(
+            lessons_report(tmp.path()).top_pitfalls[0].status,
+            PitfallStatus::Recurring
+        );
+    }
+
+    #[test]
+    fn curated_report_is_untruncated_and_canonicalizes_reusable_rules() {
+        let tmp = TempDir::new().unwrap();
+        let rows: Vec<Lesson> = (0..13)
+            .map(|index| {
+                let discriminator = char::from(b'a' + u8::try_from(index).unwrap());
+                mk_pitfall(
+                    &format!("dependency/module-not-found/pkg{discriminator}"),
+                    &format!("install pkg{discriminator}"),
+                    "missing dependency",
+                    &format!("2026-01-{:02}T00:00:00Z", index + 1),
+                    2,
+                )
+            })
+            .collect();
+        // Two legacy duplicate rows become one canonical rule. Their historical
+        // aggregate rows carry no independent evidence IDs, so canonicalization
+        // must not manufacture two votes from duplicated storage.
+        let mut validated = seed_cluster_one_lesson();
+        validated.kind = LessonKind::ValidatedPattern;
+        validated.domain = "api".into();
+        validated.title = "Reusable validated contract".into();
+        validated.fix = "reuse the contract".into();
+        validated.root_cause = "mechanical gate passed".into();
+        let mut validated_later = validated.clone();
+        validated_later.first_seen = "2026-07-01T00:00:00Z".into();
+        write_raw_lessons(
+            tmp.path(),
+            "validated-decisions.jsonl",
+            &[validated, validated_later],
+        );
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &rows);
+
+        let report = lessons_report(tmp.path());
+        assert!(report.curated_lessons.len() >= 14);
+        assert!(report
+            .curated_lessons
+            .iter()
+            .any(|entry| entry.title.contains("pkgm")));
+        let validated_rule = report
+            .curated_lessons
+            .iter()
+            .find(|entry| entry.title == "Reusable validated contract")
+            .unwrap();
+        assert_eq!(validated_rule.evidence_count, 0);
+        assert_eq!(validated_rule.status, CuratedLessonStatus::Hypothesis);
+        assert_eq!(
+            report
+                .curated_lessons
+                .iter()
+                .filter(|entry| entry.title == "Reusable validated contract")
+                .count(),
+            1
+        );
+
+        // A folded belief covering that raw rule replaces it rather than showing
+        // belief + raw evidence as two reusable cards.
+        let raw_validated = read_raw_lessons(tmp.path(), "validated-decisions.jsonl").remove(0);
+        let mut belief = seed_cluster_one_lesson();
+        belief.kind = LessonKind::Belief;
+        belief.title = "Folded validated contract".into();
+        belief.fix = "reuse the contract".into();
+        belief.root_cause = "mechanical gate passed".into();
+        belief.evidence_count = 2;
+        belief.evidence = vec![evidence_key(&raw_validated)];
+        // Legacy aggregate outcome counters have no exact sent-memory/turn
+        // identity, so they must not upgrade a belief to Validated.
+        belief.efficacy = Some(PitfallEfficacy {
+            helpful: 10,
+            ..PitfallEfficacy::default()
+        });
+        write_raw_lessons(tmp.path(), BELIEFS_FILE, &[belief]);
+        let report = lessons_report(tmp.path());
+        let folded = report
+            .curated_lessons
+            .iter()
+            .find(|entry| entry.title == "Folded validated contract")
+            .unwrap();
+        assert_eq!(folded.status, CuratedLessonStatus::Pending);
+        assert!(!report
+            .curated_lessons
+            .iter()
+            .any(|entry| entry.title == "Reusable validated contract"));
+    }
+
+    #[test]
+    fn lesson_recall_matches_bilingual_synonyms_without_losing_abstention() {
+        let _home = TempHome::new();
+        let tmp = TempDir::new().unwrap();
+        let mut lesson = mk_failure_eff("rotate auth credentials", 0, 0);
+        lesson.fix = "rotate authentication credentials before expiry".into();
+        lesson.keywords = vec![
+            "authentication".into(),
+            "credential".into(),
+            "rotation".into(),
+        ];
+        write_raw_lessons(tmp.path(), "quality-failures.jsonl", &[lesson]);
+
+        let recalled = relevant_lessons_for_prompt(tmp.path(), "登录凭证轮换");
+        assert!(
+            recalled.contains("rotate authentication credentials before expiry"),
+            "Chinese synonyms must recall the English lesson: {recalled}"
+        );
+        assert!(
+            relevant_lessons_for_prompt(tmp.path(), "绘制紫色三角形").is_empty(),
+            "an unrelated CJK query must still abstain"
+        );
+    }
+
+    #[test]
+    fn invalidated_conflicting_memory_never_reenters_prompt_recall() {
+        let _home = TempHome::new();
+        let tmp = TempDir::new().unwrap();
+        let older = mk_db_lesson(
+            "indexing add",
+            "always add a btree index on every filtered column for speed",
+            "missing indexes slowed reads across the board significantly",
+            "2026-06-01T00:00:00Z",
+        );
+        let newer = mk_db_lesson(
+            "indexing drop",
+            "avoid over indexing and drop redundant indexes to keep writes fast",
+            "too many indexes bloated writes and storage badly here",
+            "2026-06-20T00:00:00Z",
+        );
+        write_raw_lessons(tmp.path(), "quality-failures.jsonl", &[older, newer]);
+        assert_eq!(scan_contradictions(tmp.path()), 1);
+
+        let recalled = relevant_lessons_for_prompt(tmp.path(), "database index postgres query");
+        assert!(recalled.contains("drop redundant indexes"), "{recalled}");
+        assert!(
+            !recalled.contains("always add a btree index"),
+            "the invalidated conflicting rule must stay out of behavior: {recalled}"
+        );
+    }
+
+    #[test]
+    fn chinese_conflicting_memory_is_invalidated_and_abstains_from_recall() {
+        let _home = TempHome::new();
+        let tmp = TempDir::new().unwrap();
+        let mut older = mk_db_lesson(
+            "旧索引规则",
+            "总是为每个查询字段添加索引以提升读取性能",
+            "缺少索引导致数据库查询变慢",
+            "2026-06-01T00:00:00Z",
+        );
+        let mut newer = mk_db_lesson(
+            "新索引规则",
+            "避免过度索引并删除冗余索引以保持写入稳定",
+            "索引过多导致数据库写入延迟",
+            "2026-06-20T00:00:00Z",
+        );
+        let topic = vec!["数据库".into(), "索引".into(), "查询".into(), "性能".into()];
+        older.keywords.clone_from(&topic);
+        newer.keywords = topic;
+        write_raw_lessons(tmp.path(), "quality-failures.jsonl", &[older, newer]);
+
+        assert_eq!(scan_contradictions(tmp.path()), 1);
+        let recalled = relevant_lessons_for_prompt(tmp.path(), "优化数据库索引查询性能");
+        assert!(recalled.contains("删除冗余索引"), "{recalled}");
+        assert!(
+            !recalled.contains("每个查询字段添加索引"),
+            "失效的中文冲突记忆不能重新进入提示词：{recalled}"
+        );
     }
 }

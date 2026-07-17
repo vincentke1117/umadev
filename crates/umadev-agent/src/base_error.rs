@@ -291,6 +291,7 @@ fn auth_key(backend: &str) -> &'static str {
         "claude-code" | "claude" => "base.fail.auth.claude",
         "codex" => "base.fail.auth.codex",
         "opencode" => "base.fail.auth.opencode",
+        "kimi-code" | "kimi" => "base.fail.auth.kimi",
         _ => "base.fail.auth.generic",
     }
 }

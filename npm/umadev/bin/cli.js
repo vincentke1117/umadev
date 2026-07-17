@@ -8,7 +8,7 @@
 //
 // The shim is deliberately minimal:
 //   - no dependencies (zero install-time cost beyond node itself)
-//   - no parsing of argv (every flag goes straight to the binary)
+//   - only `update` is intercepted; every other flag goes straight to the binary
 //   - stdio is inherited so the ratatui TUI gets a real TTY
 
 'use strict';
@@ -18,6 +18,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const https = require('node:https');
 const os = require('node:os');
+const crypto = require('node:crypto');
 
 // Node platform/arch → our sub-package name.
 const PLATFORM_PACKAGES = {
@@ -179,8 +180,9 @@ function findKnowledgeDir() {
 
 // ── Local embedding model — ensure it's on disk, else download it (with a
 // progress bar) from THIS version's GitHub Release. Checked on EVERY launch
-// (a cheap integrity check — size + JSON parse + safetensors header, not just
-// existence, so a corrupt cache re-downloads); the ~224MB fp16 model is too large
+// (a cheap structural check — size + JSON parse + safetensors header, not just
+// existence, so a corrupt cache re-downloads). Every newly downloaded file is
+// also authenticated against its release SHA-256 sidecar. The ~224MB fp16 model is too large
 // for npm, so it's a one-time fetch into ~/.umadev/embed-model. Fail-open: any failure launches
 // anyway and the binary degrades to BM25 lexical retrieval, retrying next time.
 function homeDir() {
@@ -283,7 +285,12 @@ function modelPresent(dir) {
 // atomic rename overwrites anyway); never throws.
 function clearModelFiles(dir) {
   for (const f of MODEL_FILES) {
-    for (const p of [path.join(dir, f), path.join(dir, f + '.part')]) {
+    for (const p of [
+      path.join(dir, f),
+      path.join(dir, f + '.part'),
+      path.join(dir, f + '.sha256.download'),
+      path.join(dir, f + '.sha256.download.part'),
+    ]) {
       try {
         fs.unlinkSync(p);
       } catch (_) {
@@ -319,17 +326,53 @@ function drawBar(label, got, total, startTime) {
 // bar keeps ticking while bytes flow. The old 120s made a single dead source
 // block for two minutes, times several bases and files.
 const DOWNLOAD_IDLE_TIMEOUT_MS = 20000;
+const OFFICIAL_GITHUB_ASSET_HOSTS = new Set([
+  'release-assets.githubusercontent.com',
+  'objects.githubusercontent.com',
+  'github-releases.githubusercontent.com',
+]);
+
+function isOfficialModelUrl(raw) {
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== 'https:' || url.username || url.password) return false;
+    if (url.hostname === 'github.com') {
+      return url.pathname.startsWith('/umacloud/umadev/releases/download/');
+    }
+    return OFFICIAL_GITHUB_ASSET_HOSTS.has(url.hostname);
+  } catch (_) {
+    return false;
+  }
+}
+
+function isAllowedCustomModelUrl(raw, origin) {
+  try {
+    const url = new URL(raw);
+    return url.protocol === 'https:' && !url.username && !url.password && url.origin === origin;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Download one URL to `dest`, following redirects (GitHub → CDN), drawing a
 // progress bar when `withBar`. Resolves on success, rejects on any error.
-function downloadTo(url, dest, withBar, label) {
+function downloadTo(url, dest, withBar, label, customOrigin = null) {
   return new Promise((resolve, reject) => {
+    const allowed = customOrigin
+      ? isAllowedCustomModelUrl(url, customOrigin)
+      : isOfficialModelUrl(url);
+    if (!allowed) {
+      reject(new Error('refusing model download outside the trusted HTTPS source'));
+      return;
+    }
     const req = https.get(
       url,
       { headers: { 'User-Agent': 'umadev-cli', Accept: 'application/octet-stream' } },
       (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume();
-          downloadTo(res.headers.location, dest, withBar, label).then(resolve, reject);
+          const next = new URL(res.headers.location, url).href;
+          downloadTo(next, dest, withBar, label, customOrigin).then(resolve, reject);
           return;
         }
         if (res.statusCode !== 200) {
@@ -386,54 +429,80 @@ function downloadTo(url, dest, withBar, label) {
     );
   });
 }
-// Ordered list of base URLs to try for the model files. An explicit override
-// (UMADEV_MODEL_BASE_URL) wins; otherwise EVERYONE pulls the SAME upstream f32 from
-// HuggingFace (international) / hf-mirror.com (China), region-ordered, with the
-// GitHub fp16 release as a last-resort fallback — so the download is consistent in
-// size everywhere and the model is always reachable.
+// The default model source is the SAME versioned official GitHub Release as the
+// executable. Each file has a SHA-256 sidecar and is rejected on mismatch. An
+// explicit HTTPS override remains available for an administrator-controlled
+// mirror, but redirects are then confined to that mirror's own origin.
 function releaseBases(version) {
   if (process.env.UMADEV_MODEL_BASE_URL) {
     return [process.env.UMADEV_MODEL_BASE_URL.replace(/\/+$/, '')];
   }
-  // GitHub Release ships the quantized fp16 model (~224MB, smaller). HuggingFace
-  // and its China mirror hf-mirror.com serve the upstream f32 model (~448MB —
-  // bigger, but the candle loader handles either). hf-mirror is the FAST + reliable
-  // source inside mainland China, where github.com's release CDN is slow and the
-  // community GitHub proxies are flaky for release-asset URLs.
-  const gh = 'https://github.com/umacloud/umadev/releases/download/v' + version;
-  const ghProxies = ['https://ghproxy.net/' + gh, 'https://ghfast.top/' + gh];
-  const hf = 'https://huggingface.co/intfloat/multilingual-e5-small/resolve/main';
-  const hfMirror = 'https://hf-mirror.com/intfloat/multilingual-e5-small/resolve/main';
-  let cn = false;
-  try {
-    const opts = Intl.DateTimeFormat().resolvedOptions();
-    const tz = opts.timeZone || '';
-    const loc = (process.env.LANG || process.env.LC_ALL || '') + ' ' + (opts.locale || '');
-    cn =
-      /Shanghai|Chongqing|Urumqi|Harbin|Hong_Kong|Macau/.test(tz) ||
-      /zh[_-]?(CN|Hans)/i.test(loc);
-  } catch (_) {
-    /* default to international order */
-  }
-  // Unified on the upstream f32 model from HuggingFace (international) + its China
-  // mirror hf-mirror.com, so BOTH regions download the SAME ~448MB f32 — consistent
-  // everywhere (no more "some get 200MB, some 400MB"). China: hf-mirror first (fast
-  // in CN); international: huggingface.co first. The GitHub Release fp16 (~224MB) +
-  // proxies stay only as a LAST-RESORT fallback if both HF endpoints are down (the
-  // candle loader casts either precision to f32, so a fallback still loads).
-  return cn ? [hfMirror, hf, gh, ...ghProxies] : [hf, hfMirror, gh, ...ghProxies];
+  return ['https://github.com/umacloud/umadev/releases/download/v' + version];
 }
-// Try each base for `name` in order; resolve on first success, throw the last
-// error if all fail. A China mirror can cover a blocked github.com (or vice
-// versa) with zero user configuration.
+
+function sha256File(filePath) {
+  const hash = crypto.createHash('sha256');
+  const fd = fs.openSync(filePath, 'r');
+  const chunk = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    for (;;) {
+      const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+      if (read === 0) break;
+      hash.update(read === chunk.length ? chunk : chunk.subarray(0, read));
+    }
+    return hash.digest('hex');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function parseSha256Sidecar(body, name) {
+  for (const line of body.split(/\r?\n/)) {
+    const fields = line.trim().split(/\s+/);
+    if (fields.length < 2) continue;
+    const hash = fields[0].toLowerCase();
+    const file = fields[1].replace(/^\*/, '');
+    if (file !== name) continue;
+    if (/^[0-9a-f]{64}$/.test(hash)) return hash;
+    throw new Error('invalid SHA-256 sidecar for ' + name);
+  }
+  throw new Error('SHA-256 sidecar has no entry for ' + name);
+}
+
+// Try each base for `name` in order. Both the sidecar and the file must arrive
+// from an allowed source, and the file is accepted only when its SHA-256 matches.
 async function downloadFile(bases, name, dest, withBar, label) {
   let lastErr;
+  const customSource = Boolean(process.env.UMADEV_MODEL_BASE_URL);
   for (const base of bases) {
+    const checksumPath = dest + '.sha256.download';
     try {
-      await downloadTo(base + '/' + name, dest, withBar, label);
+      const customOrigin = customSource ? new URL(base).origin : null;
+      await downloadTo(
+        base + '/' + name + '.sha256',
+        checksumPath,
+        false,
+        '',
+        customOrigin,
+      );
+      const expected = parseSha256Sidecar(fs.readFileSync(checksumPath, 'utf8'), name);
+      await downloadTo(base + '/' + name, dest, withBar, label, customOrigin);
+      const actual = sha256File(dest);
+      if (actual !== expected) {
+        throw new Error(`SHA-256 mismatch for ${name} (expected ${expected}, got ${actual})`);
+      }
+      try { fs.unlinkSync(checksumPath); } catch (_) { /* best-effort cleanup */ }
       return;
     } catch (e) {
       lastErr = e;
+      for (const rejected of [
+        checksumPath,
+        checksumPath + '.part',
+        dest,
+        dest + '.part',
+      ]) {
+        try { fs.unlinkSync(rejected); } catch (_) { /* best-effort cleanup */ }
+      }
     }
   }
   throw lastErr || new Error('no source reachable');
@@ -455,7 +524,7 @@ async function ensureModel() {
     // a corrupt download instead of being shadowed by it (P3).
     clearModelFiles(dir);
     process.stderr.write(
-      '\n  本地向量检索模型缺失,正在下载 multilingual-e5-small(国内自动走镜像)…\n',
+      '\n  本地向量检索模型缺失，正在从当前版本的官方发布下载 multilingual-e5-small…\n',
     );
     process.stderr.write(
       '  一次性下载;之后完全本地、运行时无需联网。失败不影响使用(降级为 BM25)。\n',
@@ -623,6 +692,18 @@ const UPGRADE_COMMANDS = {
   npm: 'npm install -g umadev@latest',
 };
 
+// A normal upgrade is allowed to reuse an already-installed optional package.
+// That is desirable on a healthy install, but it cannot repair the reported
+// split where `umadev/package.json` is current while the platform executable is
+// still old. In that state the owning manager must re-materialize the package
+// tree instead of deciding the same version is already satisfied.
+const REPAIR_COMMANDS = {
+  pnpm: 'pnpm add -g umadev@latest --force',
+  yarn: 'yarn global add umadev@latest --force',
+  bun: 'bun add -g umadev@latest --force',
+  npm: 'npm install -g umadev@latest --force',
+};
+
 function detectPackageManager(pkgRoot, env = process.env) {
   const p = path.resolve(pkgRoot);
   // Compare on a normalized, lowercased path: Windows mixes separators and cases
@@ -653,7 +734,19 @@ function detectPackageManager(pkgRoot, env = process.env) {
 // `.cmd` / `.ps1` shims npm-family tools install themselves as.
 function managerRunnable(mgr) {
   try {
-    const r = spawnSync(mgr + ' --version', { stdio: 'ignore', shell: true });
+    const versionCommand = {
+      npm: 'npm --version',
+      pnpm: 'pnpm --version',
+      yarn: 'yarn --version',
+      bun: 'bun --version',
+    }[mgr];
+    if (!versionCommand) return false;
+    const r = spawnSync(versionCommand, {
+      stdio: 'ignore',
+      shell: true,
+      timeout: 10000,
+      windowsHide: true,
+    });
     return !r.error && r.status === 0;
   } catch (_) {
     return false;
@@ -844,6 +937,19 @@ function rootOwnedRefusal(pkgDir, mgr) {
   ];
 }
 
+// Actionable recovery for a split/locked Windows install. Kept as a pure
+// formatter so the exact EPERM guidance is contract-tested on every CI OS.
+function windowsLockRecoveryMessage(command) {
+  return (
+    '        Windows EPERM usually means the executable is still open. Close VS Code,\n' +
+    '        Zcode, Codex, and any PowerShell/cmd terminal still running UmaDev,\n' +
+    '        then repair with\n' +
+    '        the package manager that owns this installation:\n' +
+    `          ${command}\n` +
+    '        If `where umadev` prints multiple paths, remove the stale install.'
+  );
+}
+
 // `umadev update`. Returns true if it handled the command (the caller must then
 // exit without launching the binary), false to fall through to the binary — a
 // dev/cargo build is nobody's package install, and the binary self-updates from the
@@ -852,7 +958,6 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
   if (!isPackageManaged(pkgRoot)) return false;
 
   const mgr = detectPackageManager(pkgRoot);
-  const command = UPGRADE_COMMANDS[mgr];
 
   // BEFORE anything else — no registry call, no manager, no prompt.
   const refusal = rootOwnedRefusal(pkgRoot, mgr);
@@ -864,8 +969,9 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
 
   const before = installedVersionState(pkgRoot);
   const current = before.main || 'unknown';
+  const splitBefore = Boolean(before.main && !versionStateMatches(before, before.main));
   console.log(`UmaDev ${current} is installed (via ${mgr}).`);
-  if (before.main && !versionStateMatches(before, before.main)) {
+  if (splitBefore) {
     console.warn(`Version split detected: ${describeVersionState(before)}.`);
     console.warn('The platform package or executable will be repaired even if the main package is current.');
   }
@@ -881,29 +987,32 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
     if (latest) console.log(`Latest published version: ${latest}.`);
   }
 
-  // Upgrade with the manager that OWNS this install. If its binary is somehow not
-  // runnable (uninstalled since, or not on this PATH), npm is the universal
-  // fallback; if npm is missing too, we cannot do it for them — print the exact
-  // command and fail loudly rather than silently installing a shadow copy.
-  let useCommand = command;
+  // `--force` is not merely a request to skip the registry short-circuit: pass
+  // it through to the owner manager. A detected split also starts directly on
+  // this repair path, because a same-version ordinary install may legitimately
+  // reuse the stale optional platform package.
+  let repairAttempted = force || splitBefore;
+  const command = repairAttempted ? REPAIR_COMMANDS[mgr] : UPGRADE_COMMANDS[mgr];
+
+  // Upgrade only with the manager that OWNS this install. Falling back to npm for
+  // a pnpm/yarn/bun-owned tree does not replace that tree; it creates a second
+  // global install and PATH may keep launching this stale copy. Refuse instead and
+  // give the exact owner-manager command so success can never mean "shadow copy".
   if (!managerRunnable(mgr)) {
-    if (mgr !== 'npm' && managerRunnable('npm')) {
-      console.log(`\`${mgr}\` is not runnable here — falling back to npm.`);
-      useCommand = UPGRADE_COMMANDS.npm;
-    } else {
-      console.error(
-        `\numadev: \`${mgr}\` owns this install but is not runnable, and npm is not\n` +
-          'available either. Upgrade it yourself with:\n' +
-          `    ${command}\n`,
-      );
-      process.exitCode = 1;
-      return true;
-    }
+    console.error(
+      `\numadev: \`${mgr}\` owns this install but is not runnable from this terminal.\n` +
+        '        Refusing to use another manager because that would create a second,\n' +
+        '        shadowed UmaDev install instead of upgrading the copy you launched.\n' +
+        `        Restore \`${mgr}\` to PATH, then run:\n` +
+        `          ${command}\n`,
+    );
+    process.exitCode = 1;
+    return true;
   }
 
   const yes = args.includes('-y') || args.includes('--yes');
   if (!yes) {
-    process.stdout.write(`Upgrade now via \`${useCommand}\`? [y/N] `);
+    process.stdout.write(`Upgrade now via \`${command}\`? [y/N] `);
     const reply = readLineSync().trim().toLowerCase();
     if (reply !== 'y' && reply !== 'yes') {
       console.log('Aborted.');
@@ -914,12 +1023,15 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
   sweepAbandonedStagingDirs(pkgRoot);
 
   // A constant command string — nothing from argv reaches the shell.
-  const r = spawnSync(useCommand, { stdio: 'inherit', shell: true });
+  const r = spawnSync(command, { stdio: 'inherit', shell: true });
   if (r.error || r.status !== 0) {
     console.error(
       '\numadev: the upgrade did not complete. Run it yourself to see why:\n' +
-        `    ${useCommand}\n`,
+        `    ${command}\n`,
     );
+    if (process.platform === 'win32') {
+      console.error(windowsLockRecoveryMessage(command));
+    }
     process.exitCode = 1;
     return true;
   }
@@ -927,21 +1039,67 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
   // The manager's own cleanup normally succeeds now that the binary was never
   // launched; sweep once more in case an unrelated process held something open.
   sweepAbandonedStagingDirs(pkgRoot);
-  const after = installedVersionState(pkgRoot);
-  const expected = latest || after.main;
-  if (!versionStateMatches(after, expected)) {
-    console.error(`\numadev: upgrade verification failed (${describeVersionState(after)}).`);
-    if (expected) console.error(`        Expected all three artifacts to be ${expected}.`);
-    console.error(
-      '        On Windows, close VS Code/Zcode/Codex and any terminal still running UmaDev,\n' +
-        '        then repair the optional platform package with:\n' +
-        '          npm install -g umadev@latest --force\n' +
-        '        If `where umadev` prints multiple paths, remove the stale install.',
+  let after = installedVersionState(pkgRoot);
+  const stateReachedLatest = () =>
+    Boolean(
+      after.main &&
+        versionStateMatches(after, after.main) &&
+        (!latest || versionAtLeast(after.main, latest)),
     );
+
+  // npm treats platform packages as optional: it may return status 0 after the
+  // main manifest changed even though the native package did not. Verify the
+  // actual executable, then make one forced repair attempt before asking the
+  // user to intervene. This also covers a registry/cache race where an ordinary
+  // install reports success but leaves the previous complete version in place.
+  if (!stateReachedLatest() && !repairAttempted) {
+    const repairCommand = REPAIR_COMMANDS[mgr];
+    console.warn(
+      `The first upgrade left inconsistent artifacts (${describeVersionState(after)}).`,
+    );
+    console.warn(`Retrying once via \`${repairCommand}\`.`);
+    repairAttempted = true;
+    const repair = spawnSync(repairCommand, { stdio: 'inherit', shell: true });
+    if (repair.error || repair.status !== 0) {
+      if (process.platform === 'win32') {
+        console.error('\numadev: the forced repair did not complete.');
+        console.error(windowsLockRecoveryMessage(repairCommand));
+      } else {
+        console.error(
+          '\numadev: the forced repair did not complete. Run it yourself after closing\n' +
+            '        programs that may still be using UmaDev:\n' +
+            `          ${repairCommand}\n`,
+        );
+      }
+      process.exitCode = 1;
+      return true;
+    }
+    sweepAbandonedStagingDirs(pkgRoot);
+    after = installedVersionState(pkgRoot);
+  }
+
+  if (!stateReachedLatest()) {
+    console.error(`\numadev: upgrade verification failed (${describeVersionState(after)}).`);
+    if (latest) console.error(`        Expected a complete installation at ${latest} or newer.`);
+    else console.error('        Expected the package and executable versions to agree.');
+    console.error(windowsLockRecoveryMessage(REPAIR_COMMANDS[mgr]));
     process.exitCode = 1;
     return true;
   }
-  console.log(`[ok] UmaDev ${expected} upgraded and verified (${path.basename(after.binaryPath)}).`);
+
+  const installed = after.main;
+  if (repairAttempted) {
+    console.log(`[ok] UmaDev ${installed} repaired and verified (${path.basename(after.binaryPath)}).`);
+  } else if (before.main !== installed) {
+    console.log(`[ok] UmaDev ${installed} upgraded and verified (${path.basename(after.binaryPath)}).`);
+  } else if (latest) {
+    console.log(`[ok] UmaDev ${installed} verified (${path.basename(after.binaryPath)}).`);
+  } else {
+    console.log(
+      `[ok] UmaDev ${installed} package and executable agree (${path.basename(after.binaryPath)}).`,
+    );
+    console.warn('The registry latest version could not be confirmed, so no upgrade claim was made.');
+  }
   return true;
 }
 
@@ -1022,10 +1180,17 @@ module.exports = {
   isPackageManaged,
   isRootOwned,
   rootOwnedRefusal,
+  windowsLockRecoveryMessage,
   runSelfUpdate,
   installedVersionState,
   versionStateMatches,
   resolveInstalledBinary,
+  releaseBases,
+  isOfficialModelUrl,
+  isAllowedCustomModelUrl,
+  parseSha256Sidecar,
+  sha256File,
   versionAtLeast,
   UPGRADE_COMMANDS,
+  REPAIR_COMMANDS,
 };

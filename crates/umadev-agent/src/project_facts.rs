@@ -10,7 +10,7 @@
 //! own context window, and [`crate::lessons`] only persists *pitfalls*, never
 //! plain *facts*. There was nowhere durable for a project fact to live.
 //!
-//! This module is that place: a small, append-friendly, per-project store of
+//! This module is that place: a small, UmaDev-managed per-project store of
 //! durable facts the team should never lose — resolved tool/binary locations,
 //! build/run/test commands, environment constraints (required versions, ports),
 //! architecture decisions, user preferences. It is the *fact* sibling of the
@@ -18,11 +18,9 @@
 //!
 //! ## The loop
 //!
-//! - **RECORD** — [`record_fact`] / [`record_facts`] persist a fact via an
-//!   atomic temp+rename write, deduping by key and enforcing the bounds. The
-//!   base can ALSO record on its own: the on-disk shape ([`FACTS_REL_PATH`]) is
-//!   one self-contained JSON object per line, so the base appends a fact with
-//!   its normal file tools (the firmware block documents the exact shape).
+//! - **RECORD** — [`record_fact`] / [`record_facts`] persist facts accepted by
+//!   UmaDev's controlled extractor via an atomic temp+rename write, rejecting
+//!   credentials, deduping by key, and enforcing the bounds.
 //! - **RECALL** — [`facts_firmware_block`] renders the stored facts as a
 //!   compact, token-budgeted block that [`crate::context::compose_firmware`]
 //!   injects into the **always-on work-class head** on EVERY work turn, so the
@@ -31,25 +29,27 @@
 //!
 //! ## Bounded + fail-open by contract
 //!
-//! The store is capped at [`MAX_FACTS`] entries (oldest evicted) with each
-//! field truncated ([`MAX_KEY_CHARS`] / [`MAX_VALUE_CHARS`] / [`MAX_CATEGORY_CHARS`]),
+//! The store is capped at the internal fact limit (oldest evicted) with each
+//! field bounded by internal key/value/category limits,
 //! and the firmware block is capped at [`FACTS_FIRMWARE_BUDGET`] characters — so
 //! the prompt can never bloat. Every path is fail-open: a missing dir, an
 //! unreadable file, a corrupt/garbage line, or a failed write degrades to "no
 //! facts" and behaves exactly as before — this module NEVER panics and NEVER
 //! returns an error that could block the base.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use umadev_governance::redaction::{redact_json, redact_text};
+
+use crate::memory_control::{capture_enabled, recall_enabled, MemoryScope, MemoryStore};
 
 /// Repo-relative directory holding the durable per-project memory.
 pub const MEMORY_DIR: &str = ".umadev/memory";
 
-/// Repo-relative path of the durable fact store — an append-friendly JSONL file
-/// (one self-contained JSON fact per line) the base can append to with its own
-/// file tools. Kept as one constant so the recorder, the recall block, and the
-/// tests all name the same file.
+/// Repo-relative path of the UmaDev-managed durable fact store. Kept as one
+/// constant so the recorder, recall block, and diagnostics name the same file.
 pub const FACTS_REL_PATH: &str = ".umadev/memory/facts.jsonl";
 
 /// Hard cap on distinct facts retained on disk so a long-lived project's store
@@ -77,9 +77,7 @@ pub const FACTS_FIRMWARE_BUDGET: usize = 1_200;
 /// One durable project fact — a short key, its value, and an optional category.
 ///
 /// The on-disk form is one of these serialized to a single JSON line, e.g.
-/// `{"key":"JDK17","value":"/usr/lib/jvm/jdk-17","category":"path"}`. The shape
-/// is intentionally tiny + stable so the base can append a fact with its own
-/// file tools (see the module docs).
+/// `{"key":"JDK17","value":"/usr/lib/jvm/jdk-17","category":"path"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fact {
     /// Short, stable name of the fact ("JDK17", "build", "api_port").
@@ -100,8 +98,7 @@ pub struct Fact {
     /// lesson. It is cleared automatically when the key is re-recorded with a fresh
     /// value ([`record_facts`] replaces the row). `#[serde(default)]` keeps every
     /// pre-existing JSONL row readable, and `skip_serializing_if` keeps a LIVE
-    /// fact's on-disk shape byte-for-byte as before (no `stale` key emitted), so
-    /// the documented base-append contract is unchanged.
+    /// fact's on-disk shape byte-for-byte as before (no `stale` key emitted).
     #[serde(default, skip_serializing_if = "is_false")]
     pub stale: bool,
 }
@@ -136,9 +133,75 @@ impl Fact {
 /// this fail-open path. Shared by [`record_facts`] and [`mark_stale_facts`].
 static FACTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Absolute path of the fact store for a given project root.
-fn facts_path(root: &Path) -> PathBuf {
-    root.join(FACTS_REL_PATH)
+fn real_dir_no_follow(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+}
+
+fn ensure_real_child_dir(parent: &Path, child: &Path, create: bool) -> bool {
+    if !real_dir_no_follow(parent) {
+        return false;
+    }
+    match std::fs::symlink_metadata(child) {
+        Ok(meta) => meta.file_type().is_dir(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            std::fs::create_dir(child).is_ok()
+                && real_dir_no_follow(parent)
+                && real_dir_no_follow(child)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Resolve only UmaDev-owned path components and never follow a link in them.
+fn managed_facts_path(root: &Path, create_parent: bool) -> Option<PathBuf> {
+    let root = std::fs::canonicalize(root).ok()?;
+    if !real_dir_no_follow(&root) {
+        return None;
+    }
+    let umadev = root.join(".umadev");
+    if !ensure_real_child_dir(&root, &umadev, create_parent) {
+        return None;
+    }
+    let memory = umadev.join("memory");
+    if !ensure_real_child_dir(&umadev, &memory, create_parent) {
+        return None;
+    }
+    let path = memory.join("facts.jsonl");
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => Some(path),
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(path),
+        Err(_) => None,
+    }
+}
+
+fn read_managed_facts(root: &Path) -> Option<String> {
+    let path = managed_facts_path(root, false)?;
+    if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
+        return None;
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    let mut file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
 }
 
 /// Load the durable, RECALLABLE facts for `root`, newest LAST — the LIVE facts
@@ -147,10 +210,10 @@ fn facts_path(root: &Path) -> PathBuf {
 /// Fail-open + forgiving: a missing file yields an empty vec; a corrupt/garbage
 /// line is skipped (a single bad append never loses the rest of the store). The
 /// result is deduped by key (case-insensitive, last occurrence wins so a re-record
-/// supersedes the older value) and capped at [`MAX_FACTS`] (oldest dropped), so a
-/// store grown by raw base appends is always normalised on read. Stale
+/// supersedes the older value) and capped at the internal fact limit (oldest
+/// dropped), so legacy or externally modified stores are normalised on read. Stale
 /// (tombstoned) facts are filtered LAST — they stay on disk for provenance (see
-/// [`load_facts_raw`]) but are demoted below recall.
+/// the internal raw loader) but are demoted below recall.
 #[must_use]
 pub fn load_facts(root: &Path) -> Vec<Fact> {
     load_facts_raw(root)
@@ -168,13 +231,14 @@ pub fn load_facts(root: &Path) -> Vec<Fact> {
 /// fail-open + dedup + cap normalisation as [`load_facts`].
 #[must_use]
 fn load_facts_raw(root: &Path) -> Vec<Fact> {
-    let Ok(text) = std::fs::read_to_string(facts_path(root)) else {
+    let Some(text) = read_managed_facts(root) else {
         return Vec::new();
     };
     let parsed: Vec<Fact> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<Fact>(l).ok())
+        .filter(fact_is_safe)
         .map(normalize)
         .filter(|f| !f.key.is_empty() && !f.value.is_empty())
         .collect();
@@ -189,16 +253,18 @@ pub fn record_fact(root: &Path, fact: Fact) -> bool {
 
 /// Record durable facts into the store via an atomic read-modify-write.
 ///
-/// Each incoming fact is trimmed + field-truncated; empty (no key or no value)
-/// facts are dropped. Recording an existing key UPDATES it (and moves it to
-/// newest), so the store holds one entry per key. After merging, the store is
-/// capped at [`MAX_FACTS`] (oldest evicted) and written atomically (temp+rename),
-/// which ALSO compacts any extra lines the base appended directly. Returns how
-/// many valid facts were applied.
+/// Each incoming fact is credential-checked, trimmed, and field-truncated; empty
+/// or sensitive facts are dropped. Recording an existing key updates it (and
+/// moves it to newest), so the store holds one entry per key. After merging, the
+/// store is capped at the internal fact limit and written atomically. Returns how
+/// many valid facts were committed.
 ///
 /// Fail-open: invalid-only input is a no-op (`0`); a write error is swallowed —
 /// recording a fact must never block the team.
 pub fn record_facts(root: &Path, incoming: &[Fact]) -> usize {
+    if !capture_enabled(root, MemoryScope::Project, MemoryStore::Facts) {
+        return 0;
+    }
     // Serialize the read-modify-write so concurrent callers (a forked critic, a
     // parallel step, the staleness sweep) can't clobber each other. Recover from
     // poison so a panic elsewhere never blocks this fail-open path.
@@ -208,6 +274,7 @@ pub fn record_facts(root: &Path, incoming: &[Fact]) -> usize {
 
     let valid: Vec<Fact> = incoming
         .iter()
+        .filter(|fact| fact_is_safe(fact))
         .cloned()
         .map(normalize)
         .filter(|f| !f.key.is_empty() && !f.value.is_empty())
@@ -230,12 +297,10 @@ pub fn record_facts(root: &Path, incoming: &[Fact]) -> usize {
         store.drain(0..len - MAX_FACTS);
     }
 
-    let path = facts_path(root);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = write_atomic(&path, &render_jsonl(&store));
-    valid.len()
+    let Some(path) = managed_facts_path(root, true) else {
+        return 0;
+    };
+    write_atomic(&path, &render_jsonl(&store)).map_or(0, |()| valid.len())
 }
 
 /// STALENESS SWEEP — tombstone stored LIVE facts a run OBSERVED to be contradicted
@@ -258,7 +323,7 @@ pub fn record_facts(root: &Path, incoming: &[Fact]) -> usize {
 ///   with arguments/globs/`~`/`$`, and any I/O error (`Err`) are all left ALONE —
 ///   we demote only on unambiguous non-existence.
 ///
-/// Bounded (one pass over the ≤ [`MAX_FACTS`] store, one `try_exists` per path
+/// Bounded (one pass over the bounded fact store, one `try_exists` per path
 /// fact), deterministic, and fail-open at every step: an empty/unreadable store,
 /// no observations, or a failed write all yield `0` and never panic. Returns how
 /// many LIVE facts were newly tombstoned.
@@ -278,6 +343,7 @@ pub fn mark_stale_facts(root: &Path, observed: &[Fact]) -> usize {
     // keys/values are dropped so a blank observation never contradicts anything.
     let observed_values: std::collections::HashMap<String, String> = observed
         .iter()
+        .filter(|f| fact_is_safe(f))
         .filter(|f| !f.key.trim().is_empty() && !f.value.trim().is_empty())
         .map(|f| (f.key.trim().to_lowercase(), norm_value(&f.value)))
         .collect();
@@ -296,12 +362,10 @@ pub fn mark_stale_facts(root: &Path, observed: &[Fact]) -> usize {
         return 0; // nothing clearly contradicted → no rewrite (byte-for-byte stable)
     }
 
-    let path = facts_path(root);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = write_atomic(&path, &render_jsonl(&store));
-    marked
+    let Some(path) = managed_facts_path(root, true) else {
+        return 0;
+    };
+    write_atomic(&path, &render_jsonl(&store)).map_or(0, |()| marked)
 }
 
 /// Whether a stored LIVE fact is CLEARLY contradicted by the run's observations —
@@ -374,19 +438,20 @@ fn path_is_dead(value: &str) -> bool {
     matches!(p.try_exists(), Ok(false))
 }
 
-/// The firmware **recall** block: the stored facts as a compact, token-budgeted
-/// block to inject over the base's system-prompt face, PLUS the record-guidance
-/// that tells the base how to persist a new durable fact.
+/// The firmware **recall** block: stored facts as a compact, token-budgeted block
+/// to inject over the base's system-prompt face.
 ///
 /// Empty string when the store has no facts (fail-open / first-ever turn) — the
 /// firmware then behaves exactly as before. When facts exist, the block leads
 /// with a recall list ("use these directly; do NOT re-derive / re-search") and
-/// closes with the append shape for [`FACTS_REL_PATH`]. The whole block is
-/// bounded by `budget_chars` (typically [`FACTS_FIRMWARE_BUDGET`]): the fact list
-/// is filled until the budget is reached, so a huge store can never bloat the
-/// prompt. Deterministic (no timestamps / no I/O beyond the one store read).
+/// The whole block is bounded by `budget_chars` (typically
+/// [`FACTS_FIRMWARE_BUDGET`]), so a huge store can never bloat the prompt.
+/// Deterministic (no timestamps / no I/O beyond the one store read).
 #[must_use]
 pub fn facts_firmware_block(root: &Path, budget_chars: usize) -> String {
+    if !recall_enabled(root, MemoryScope::Project, MemoryStore::Facts) {
+        return String::new();
+    }
     let facts = load_facts(root);
     if facts.is_empty() {
         return String::new();
@@ -396,19 +461,7 @@ pub fn facts_firmware_block(root: &Path, budget_chars: usize) -> String {
         "## KNOWN PROJECT FACTS (已知项目事实 — use directly; do NOT re-derive or re-search)\n\n\
          These facts were already resolved on THIS project and persist across turns. Use them \
          as-is — do NOT re-search, re-detect, or re-derive a fact listed here:\n";
-    let footer = format!(
-        "\nTo REMEMBER a new durable fact you resolve (a tool/binary path, a required version, a \
-         port, a build/run/test command, an architecture decision, a user preference), append ONE \
-         JSON line to `{FACTS_REL_PATH}` with your file tools:\n\
-         {{\"key\":\"<short name>\",\"value\":\"<value>\",\"category\":\"<path|version|port|command|decision|preference>\"}}\n\
-         Record only STABLE, reusable facts — never transient state. Recorded facts are recalled \
-         here on every later turn, so the team never loses them."
-    );
-
-    // Reserve room for the header + footer so the fact list never crowds out the
-    // record-guidance; fill the list with the remaining budget.
-    let reserve = header.chars().count() + footer.chars().count() + 8;
-    let list_budget = budget_chars.saturating_sub(reserve);
+    let list_budget = budget_chars.saturating_sub(header.chars().count());
     let mut list = String::new();
     // Newest facts are most relevant — render them first.
     for f in facts.iter().rev() {
@@ -426,9 +479,7 @@ pub fn facts_firmware_block(root: &Path, budget_chars: usize) -> String {
         }
     }
 
-    // header + list (≤ list_budget) + footer ≤ budget by construction; the final
-    // excerpt is a hard backstop for a pathologically small budget.
-    crate::experts::excerpt(&format!("{header}{list}{footer}"), budget_chars)
+    crate::experts::excerpt(&format!("{header}{list}"), budget_chars)
 }
 
 /// Render one fact as a recall bullet: `- key [category] → value` (the category
@@ -438,6 +489,43 @@ fn render_fact_line(f: &Fact) -> String {
         Some(c) => format!("- {} [{}] → {}\n", f.key, c, f.value),
         None => format!("- {} → {}\n", f.key, f.value),
     }
+}
+
+fn fact_is_safe(f: &Fact) -> bool {
+    let key = f.key.trim();
+    let value = f.value.trim();
+    !key.is_empty()
+        && !value.is_empty()
+        && !sensitive_key(key)
+        && !contains_redaction_marker(value)
+        && redact_text(value) == value
+        && f.category.as_deref().is_none_or(|category| {
+            !sensitive_key(category)
+                && !contains_redaction_marker(category)
+                && redact_text(category) == category
+        })
+}
+
+fn sensitive_key(key: &str) -> bool {
+    if redact_text(key) != key {
+        return true;
+    }
+    const PROBE: &str = "umadev-fact-key-probe";
+    let mut object = serde_json::Map::new();
+    object.insert(
+        key.to_string(),
+        serde_json::Value::String(PROBE.to_string()),
+    );
+    match redact_json(serde_json::Value::Object(object)) {
+        serde_json::Value::Object(redacted) => {
+            redacted.get(key).and_then(serde_json::Value::as_str) != Some(PROBE)
+        }
+        _ => true,
+    }
+}
+
+fn contains_redaction_marker(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("[redacted")
 }
 
 /// Trim + field-truncate a fact to the per-fact bounds; normalise a blank
@@ -490,7 +578,18 @@ fn render_jsonl(facts: &[Fact]) -> String {
 /// temp name carries the pid + a high-resolution timestamp so two writers don't
 /// collide on the temp itself. Best-effort cleanup of the temp on rename failure.
 fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let Some(dir) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "fact store has no parent",
+        ));
+    };
+    if !real_dir_no_follow(dir) || !safe_final_file_or_absent(path)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsafe fact store path",
+        ));
+    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -501,13 +600,40 @@ fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
         std::process::id(),
         stamp,
     ));
-    std::fs::write(&tmp, body)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    if let Err(error) = file
+        .write_all(body.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    drop(file);
+    if !real_dir_no_follow(dir) || !safe_final_file_or_absent(path)? {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "fact store path changed during write",
+        ));
+    }
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
+    }
+}
+
+fn safe_final_file_or_absent(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(meta.file_type().is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
     }
 }
 
@@ -529,8 +655,69 @@ mod tests {
         assert_eq!(facts[0].key, "JDK17");
         assert_eq!(facts[0].value, "/usr/lib/jvm/jdk-17");
         assert_eq!(facts[0].category.as_deref(), Some("path"));
-        // The store lives at the documented append-friendly path.
+        // The store lives at the managed path.
         assert!(tmp.path().join(FACTS_REL_PATH).exists());
+    }
+
+    #[test]
+    fn facts_policy_controls_capture_and_prompt_recall_but_not_inventory_reads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(record_fact(
+            tmp.path(),
+            Fact::new("build", "cargo build", Some("command")),
+        ));
+
+        crate::memory_control::update_capture(
+            tmp.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::Facts),
+            false,
+        )
+        .unwrap();
+        assert!(!record_fact(
+            tmp.path(),
+            Fact::new("test", "cargo test", Some("command")),
+        ));
+        assert_eq!(
+            load_facts(tmp.path()).len(),
+            1,
+            "raw reporting stays visible"
+        );
+
+        crate::memory_control::update_recall(
+            tmp.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::Facts),
+            false,
+        )
+        .unwrap();
+        assert!(facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET).is_empty());
+        assert_eq!(load_facts(tmp.path()).len(), 1, "recall is not deletion");
+
+        crate::memory_control::update_recall(
+            tmp.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::Facts),
+            true,
+        )
+        .unwrap();
+        assert!(facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET).contains("cargo build"));
+
+        std::fs::write(
+            tmp.path().join(".umadev/memory/policy.toml"),
+            "invalid = [toml",
+        )
+        .unwrap();
+        assert!(!record_fact(
+            tmp.path(),
+            Fact::new("lint", "cargo clippy", Some("command")),
+        ));
+        assert!(facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET).is_empty());
+        assert_eq!(
+            load_facts(tmp.path()).len(),
+            1,
+            "corrupt policy hides no audit data"
+        );
     }
 
     #[test]
@@ -605,8 +792,7 @@ mod tests {
 
     #[test]
     fn load_is_forgiving_of_corrupt_lines() {
-        // A garbage line is skipped; a valid line on either side survives — a single
-        // bad base append never loses the rest of the store.
+        // A garbage line is skipped; a valid line on either side survives.
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join(FACTS_REL_PATH);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -638,13 +824,83 @@ mod tests {
     }
 
     #[test]
+    fn credentials_are_rejected_instead_of_persisting_redaction_markers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let count = record_facts(
+            tmp.path(),
+            &[
+                Fact::new("build", "cargo test --workspace", Some("command")),
+                Fact::new("api_key", "not-safe-memory", None::<String>),
+                Fact::new("remote_auth", "Bearer abcdefghijklmnop", None::<String>),
+                Fact::new(
+                    "signing_material",
+                    "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----",
+                    None::<String>,
+                ),
+                Fact::new("repo_hint", "ghp_1234567890abcdef", None::<String>),
+                Fact::new("masked", "[redacted]", None::<String>),
+                Fact::new("category_leak", "safe", Some("password")),
+            ],
+        );
+        assert_eq!(count, 1, "only the non-sensitive fact is committed");
+        let facts = load_facts(tmp.path());
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].key, "build");
+        let disk = std::fs::read_to_string(tmp.path().join(FACTS_REL_PATH)).unwrap();
+        assert!(!disk.contains("Bearer"));
+        assert!(!disk.contains("PRIVATE KEY"));
+        assert!(!disk.contains("ghp_"));
+        assert!(!disk.to_ascii_lowercase().contains("[redacted"));
+    }
+
+    #[test]
+    fn legacy_sensitive_rows_are_never_loaded_or_reinjected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join(FACTS_REL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = render_jsonl(&[
+            Fact::new("build", "cargo build", Some("command")),
+            Fact::new("password", "old-memory-value", None::<String>),
+            Fact::new("auth", "Bearer abcdefghijklmnop", None::<String>),
+            Fact::new("token_hint", "xai-123456789abcdef", None::<String>),
+            Fact::new(
+                "signing",
+                "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----",
+                None::<String>,
+            ),
+            Fact::new("category_leak", "safe", Some("Bearer abcdefghijklmnop")),
+        ]);
+        std::fs::write(&path, body).unwrap();
+
+        let facts = load_facts(tmp.path());
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].key, "build");
+        let firmware = facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET);
+        assert!(firmware.contains("cargo build"));
+        assert!(!firmware.contains("old-memory-value"));
+        assert!(!firmware.contains("Bearer"));
+        assert!(!firmware.contains("PRIVATE KEY"));
+        assert!(!firmware.contains("xai-"));
+
+        assert!(record_fact(
+            tmp.path(),
+            Fact::new("test", "cargo test", Some("command")),
+        ));
+        let compacted = std::fs::read_to_string(path).unwrap();
+        assert!(!compacted.contains("old-memory-value"));
+        assert!(!compacted.contains("Bearer"));
+        assert!(!compacted.contains("PRIVATE KEY"));
+        assert!(!compacted.contains("xai-"));
+    }
+
+    #[test]
     fn firmware_block_is_empty_without_facts() {
         let tmp = tempfile::TempDir::new().unwrap();
         assert!(facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET).is_empty());
     }
 
     #[test]
-    fn firmware_block_recalls_facts_and_carries_record_guidance() {
+    fn firmware_block_recalls_facts_without_direct_write_guidance() {
         let tmp = tempfile::TempDir::new().unwrap();
         record_fact(
             tmp.path(),
@@ -669,14 +925,9 @@ mod tests {
             block.contains("do NOT re-"),
             "tells the base not to re-search: {block}"
         );
-        // RECORD: the append shape + path is documented so the base can persist more.
         assert!(
-            block.contains(FACTS_REL_PATH),
-            "documents the store path: {block}"
-        );
-        assert!(
-            block.contains("\"key\""),
-            "documents the JSON shape: {block}"
+            !block.contains(FACTS_REL_PATH) && !block.contains("append ONE JSON"),
+            "the base is never asked to write durable facts directly: {block}"
         );
     }
 
@@ -696,11 +947,7 @@ mod tests {
             "block must stay within budget ({} > {FACTS_FIRMWARE_BUDGET})",
             block.chars().count()
         );
-        // …and still carry the record-guidance (footer survives the budgeting).
-        assert!(
-            block.contains(FACTS_REL_PATH),
-            "record-guidance survives: {block}"
-        );
+        assert!(block.contains("KNOWN PROJECT FACTS"));
     }
 
     #[test]
@@ -715,14 +962,61 @@ mod tests {
         let blocker = tmp.path().join("not-a-dir");
         std::fs::write(&blocker, b"x").unwrap();
         let unwritable = blocker.join("umadev/facts/unwritable/xyz");
-        // Returns the applied count but the write silently fails (fail-open).
-        let _ = record_fact(&unwritable, Fact::new("k", "v", None::<String>));
+        assert!(
+            !record_fact(&unwritable, Fact::new("k", "v", None::<String>)),
+            "a failed write must not report a committed fact"
+        );
         assert!(load_facts(&unwritable).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn base_style_append_is_compacted_on_next_record() {
-        // Simulate the base appending raw lines (its own file tools), incl. a dup.
+    fn managed_symlinks_are_never_followed_or_replaced() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join(FACTS_REL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let outside = tmp.path().join("outside.jsonl");
+        let outside_body = "{\"key\":\"outside\",\"value\":\"must-not-load\"}\n";
+        std::fs::write(&outside, outside_body).unwrap();
+        symlink(&outside, &path).unwrap();
+
+        assert!(load_facts(tmp.path()).is_empty());
+        assert!(facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET).is_empty());
+        assert!(!record_fact(
+            tmp.path(),
+            Fact::new("build", "cargo build", Some("command")),
+        ));
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), outside_body);
+        assert!(std::fs::symlink_metadata(path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_parent_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tmp.path().join("outside-memory");
+        std::fs::create_dir(&outside).unwrap();
+        let umadev = tmp.path().join(".umadev");
+        std::fs::create_dir(&umadev).unwrap();
+        symlink(&outside, umadev.join("memory")).unwrap();
+
+        assert!(!record_fact(
+            tmp.path(),
+            Fact::new("build", "cargo build", Some("command")),
+        ));
+        assert!(!outside.join("facts.jsonl").exists());
+    }
+
+    #[test]
+    fn legacy_direct_rows_are_compacted_on_next_record() {
+        // Old versions and external writers may have left duplicate rows.
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join(FACTS_REL_PATH);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -884,5 +1178,36 @@ mod tests {
         assert!(!tmp.path().join(FACTS_REL_PATH).exists());
         let missing = Path::new("/nonexistent/umadev/facts/root/xyz");
         assert_eq!(mark_stale_facts(missing, &[]), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mark_stale_does_not_report_success_when_commit_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(record_fact(
+            tmp.path(),
+            Fact::new("build", "npm run build", Some("command")),
+        ));
+        let memory = tmp.path().join(MEMORY_DIR);
+        let original = std::fs::metadata(&memory).unwrap().permissions();
+        std::fs::set_permissions(&memory, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = memory.join("write-probe");
+        if std::fs::write(&probe, b"probe").is_ok() {
+            let _ = std::fs::remove_file(probe);
+            std::fs::set_permissions(&memory, original).unwrap();
+            return;
+        }
+
+        let marked = mark_stale_facts(
+            tmp.path(),
+            &[Fact::new("build", "vite build", None::<String>)],
+        );
+        std::fs::set_permissions(&memory, original).unwrap();
+        assert_eq!(marked, 0, "failed persistence cannot report a tombstone");
+        assert!(load_facts(tmp.path())
+            .iter()
+            .any(|fact| fact.key == "build" && fact.value == "npm run build"));
     }
 }

@@ -3,14 +3,10 @@
 //!
 //! ## Why this exists (the recording side was unreliable)
 //!
-//! [`crate::project_facts`] RECALLS durable facts into the firmware on every work
-//! turn (so the team never re-searches a fact it already resolved), and the
-//! firmware fact block ALSO instructs the base to append new facts to
-//! [`crate::project_facts::FACTS_REL_PATH`] with its own file tools. But that
-//! RECORDING side depended on the base VOLUNTARILY writing the file — and the base
-//! often didn't. So `.umadev/memory/facts.jsonl` never appeared, the store stayed
-//! empty, and recall had nothing to surface: the user expected the file and it was
-//! absent. Instructing-only is not a guarantee.
+//! [`crate::project_facts`] recalls durable facts into work-turn firmware. Earlier
+//! versions also asked the base to append the store directly, which was unreliable
+//! and bypassed validation. The store is now written only through this controlled
+//! extraction path.
 //!
 //! ## What this module does
 //!
@@ -21,17 +17,16 @@
 //! list the durable facts the turn established as concise `key: value` lines (or
 //! `none`). It then parses those lines and writes them via
 //! [`crate::project_facts::record_facts`] (which dedups by key + enforces the
-//! bounds), so the store reliably populates WITHOUT depending on the base writing
-//! it. The firmware's record-guidance stays in place — the base CAN still append
-//! directly; this is the active backstop that GUARANTEES the file gets populated.
+//! bounds and credential checks), so the store reliably populates without allowing
+//! the base to write durable memory directly.
 //!
 //! ## Bounded + fail-open by contract
 //!
 //! - **Work-class only.** Pure [`RouteClass::Chat`] / [`RouteClass::Explain`]
 //!   establish nothing durable, so they never fork and never spend a token (see
-//!   [`route_warrants_extraction`]) — exactly the firmware's work-class gate.
+//!   the internal route-extraction classifier) — exactly the firmware's work-class gate.
 //! - **Throttled.** Even on a long multi-step build the extraction runs only on a
-//!   bounded subset of work turns ([`should_extract`]) — once early so a one-step
+//!   bounded subset of work turns (via the internal extraction guard) — once early so a one-step
 //!   build still populates the file, then every Nth turn — never once per step.
 //! - **Fail-open.** A failed/wedged fork, an offline brain, a timeout, an empty /
 //!   `none` reply, an unparseable reply, or an unwritable store all degrade to
@@ -44,6 +39,7 @@ use std::sync::Arc;
 use umadev_runtime::BaseSession;
 
 use crate::events::{EngineEvent, EventSink};
+use crate::memory_control::{capture_enabled, MemoryScope, MemoryStore};
 use crate::project_facts::{self, Fact};
 use crate::router::{RouteClass, RoutePlan};
 
@@ -98,7 +94,8 @@ fn extraction_directive() -> String {
      project facts this turn ESTABLISHED — the things a teammate joining later \
      must not have to re-discover. Include ONLY stable, reusable facts: resolved \
      tool/binary paths, the exact build / run / test commands, environment \
-     constraints (required language/runtime versions, ports, env vars), and key \
+     constraints (required language/runtime versions, ports, environment variable \
+     NAMES only), and key \
      architecture or product decisions that are now settled.\n\n\
      Output ONE fact per line as `key: value` — a short stable key, a colon, then \
      the value. For example:\n\
@@ -106,6 +103,8 @@ fn extraction_directive() -> String {
      test: pnpm -w test\n\
      api_port: 8787\n\
      jdk: /usr/lib/jvm/jdk-17\n\n\
+     NEVER include a secret, token, password, API key, credential, cookie, private \
+     key, or any environment-variable VALUE. Environment-variable NAMES are allowed. \
      Do NOT include transient state, this turn's narration, todo items, or anything \
      you are not confident is stable and reusable. If this turn established no new \
      durable fact, reply with exactly: none"
@@ -201,6 +200,13 @@ pub(crate) async fn maybe_extract_facts(
     work_turn_count: usize,
     events: &Arc<dyn EventSink>,
 ) -> usize {
+    // The user's leaf-store policy is checked before every deterministic gate and,
+    // critically, before opening a read-only base fork. Disabling capture therefore
+    // means both "write nothing" and "spend no model call"; a malformed policy is
+    // privacy-conservatively treated the same way by `capture_enabled`.
+    if !capture_enabled(root, MemoryScope::Project, MemoryStore::Facts) {
+        return 0;
+    }
     // Gate 1 — work-class only: pure chat / explain never establish durable facts,
     // so they never fork (no token cost on a chat reply).
     if route.is_some_and(|r| !route_warrants_extraction(r)) {
@@ -418,6 +424,27 @@ mod tests {
     // ── Pure parser ───────────────────────────────────────────────────────────
 
     #[test]
+    fn extraction_prompt_forbids_credentials_and_environment_values() {
+        let prompt = extraction_directive().to_ascii_lowercase();
+        for forbidden in [
+            "secret",
+            "token",
+            "password",
+            "api key",
+            "credential",
+            "cookie",
+            "private key",
+            "environment-variable value",
+        ] {
+            assert!(
+                prompt.contains(forbidden),
+                "missing safety rule: {forbidden}"
+            );
+        }
+        assert!(prompt.contains("names only"));
+    }
+
+    #[test]
     fn parse_extracts_key_value_lines_tolerating_markup() {
         let reply = "Here are the durable facts:\n\
                      - build: `pnpm -w build`\n\
@@ -497,6 +524,27 @@ mod tests {
     }
 
     #[test]
+    fn record_from_reply_drops_credentials_without_storing_redactions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let n = record_from_reply(
+            tmp.path(),
+            "build: cargo build\n\
+             api_key: xai-123456789abcdef\n\
+             auth: Bearer abcdefghijklmnop\n\
+             signing: -----BEGIN PRIVATE KEY----- abcdefgh -----END PRIVATE KEY-----",
+        );
+        assert_eq!(n, 1);
+        let facts = project_facts::load_facts(tmp.path());
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].key, "build");
+        let disk = std::fs::read_to_string(tmp.path().join(project_facts::FACTS_REL_PATH)).unwrap();
+        assert!(!disk.contains("xai-"));
+        assert!(!disk.contains("Bearer"));
+        assert!(!disk.contains("PRIVATE KEY"));
+        assert!(!disk.to_ascii_lowercase().contains("[redacted"));
+    }
+
+    #[test]
     fn record_from_a_none_reply_writes_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();
         assert_eq!(record_from_reply(tmp.path(), "none"), 0);
@@ -548,6 +596,52 @@ mod tests {
         let facts = project_facts::load_facts(tmp.path());
         assert!(facts.iter().any(|f| f.key == "build"));
         assert!(facts.iter().any(|f| f.key == "api_port"));
+    }
+
+    #[tokio::test]
+    async fn facts_capture_policy_off_and_corrupt_never_fork_the_base() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let route = build_route();
+        crate::memory_control::update_capture(
+            tmp.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::Facts),
+            false,
+        )
+        .unwrap();
+
+        let mut disabled = MainFake::replying("build: cargo build");
+        let disabled_forks = disabled.forks_handle();
+        assert_eq!(
+            maybe_extract_facts(&mut disabled, tmp.path(), Some(&route), 1, &sink()).await,
+            0
+        );
+        assert_eq!(*disabled_forks.lock().unwrap(), 0);
+
+        crate::memory_control::update_capture(
+            tmp.path(),
+            MemoryScope::Project,
+            Some(MemoryStore::Facts),
+            true,
+        )
+        .unwrap();
+        let mut enabled = MainFake::replying("build: cargo build");
+        let enabled_forks = enabled.forks_handle();
+        assert_eq!(
+            maybe_extract_facts(&mut enabled, tmp.path(), Some(&route), 1, &sink()).await,
+            1
+        );
+        assert_eq!(*enabled_forks.lock().unwrap(), 1);
+
+        let policy = tmp.path().join(".umadev/memory/policy.toml");
+        std::fs::write(&policy, "this is not valid = [toml").unwrap();
+        let mut corrupt = MainFake::replying("test: cargo test");
+        let corrupt_forks = corrupt.forks_handle();
+        assert_eq!(
+            maybe_extract_facts(&mut corrupt, tmp.path(), Some(&route), 1, &sink()).await,
+            0
+        );
+        assert_eq!(*corrupt_forks.lock().unwrap(), 0);
     }
 
     #[tokio::test]

@@ -216,8 +216,8 @@ fn looks_like_path(tok: &str) -> bool {
 }
 
 /// Extract the path-shaped token under char offset `col` of `line`, if any.
-/// Expands over [`is_path_char`] in both directions, sheds trailing sentence
-/// punctuation, and keeps only tokens that pass [`looks_like_path`] and carry
+/// Expands over the internal path-character predicate in both directions, sheds
+/// trailing sentence punctuation, and keeps only path-like tokens that carry
 /// at least one alphanumeric char (a lone `/` or `..` is not a click target).
 /// The result is a CANDIDATE — [`resolve_path`] decides whether it exists.
 #[must_use]

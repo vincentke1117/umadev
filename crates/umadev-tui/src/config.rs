@@ -27,7 +27,9 @@ const DIR_NAME: &str = ".umadev";
 /// The on-disk shape of the user config.
 #[derive(Debug, Clone, Eq, PartialEq, Default, Serialize, Deserialize)]
 pub struct UserConfig {
-    /// Stable backend id (`claude-code` / `codex` / `opencode` / `offline`).
+    /// Stable backend id (`claude-code` / `codex` / `opencode` / `grok-build` /
+    /// `kimi-code`;
+    /// `offline` is an explicit internal fallback).
     /// `None` triggers the first-launch picker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -92,7 +94,16 @@ const MIGRATIONS: &[Migration] = &[
     // `None` is meant, which would wrongly skip the first-launch picker or pin an
     // unknown language. Idempotent: a `None` or non-empty value is untouched.
     migrate_empty_strings_to_none,
+    // v1 -> v2: retire base CLIs that no longer meet the product's first-class
+    // integration bar. Clearing ONLY the backend reopens the picker while keeping
+    // every other user preference; it never silently selects offline or a
+    // different base. Aliases persisted by earlier command versions are included.
+    migrate_retired_backends_to_picker,
 ];
+
+/// Target version of the retired-backend migration (v1 -> v2). Used by the
+/// startup reporter to distinguish the one upgrade launch from later launches.
+const RETIRED_BACKEND_MIGRATION_VERSION: u32 = 2;
 
 /// The version a freshly-migrated config carries — exactly the number of
 /// migrations. A config already at this version is left untouched by the runner.
@@ -112,6 +123,24 @@ fn migrate_empty_strings_to_none(cfg: &mut UserConfig) {
         if field.as_deref().is_some_and(str::is_empty) {
             *field = None;
         }
+    }
+}
+
+/// Whether a persisted id belongs to a backend retired by the v1 -> v2
+/// migration. Matching is tolerant of casing and surrounding whitespace because
+/// old configs may have been hand-edited.
+fn is_retired_backend(id: &str) -> bool {
+    matches!(
+        id.trim().to_ascii_lowercase().as_str(),
+        "cursor" | "codebuddy" | "cbc" | "droid" | "qwen" | "qwen-code"
+    )
+}
+
+/// v1 -> v2: clear retired backend ids so startup must ask the user to choose
+/// one of the five supported bases. No fallback is selected on their behalf.
+fn migrate_retired_backends_to_picker(cfg: &mut UserConfig) {
+    if cfg.backend.as_deref().is_some_and(is_retired_backend) {
+        cfg.backend = None;
     }
 }
 
@@ -283,12 +312,28 @@ pub fn load_from(path: &std::path::Path) -> UserConfig {
 /// once per upgrade without ever risking a broken startup.
 #[must_use]
 pub fn load_and_migrate(path: &std::path::Path) -> UserConfig {
+    load_and_migrate_for_startup(path).0
+}
+
+/// Startup variant that also reports which retired backend was cleared during
+/// this launch. The report is deliberately transient: it is never serialized,
+/// so the TUI can show one clear migration notice exactly on the upgrade launch.
+#[must_use]
+pub(crate) fn load_and_migrate_for_startup(path: &std::path::Path) -> (UserConfig, Option<String>) {
     let mut cfg = load_from(path);
+    // The retired-backend step is migration index 1 (target version 2). Capture
+    // the old id only while that step is pending; once v2 is persisted, a later
+    // startup cannot repeat the notice.
+    let retired_backend = (cfg.migration_version < RETIRED_BACKEND_MIGRATION_VERSION)
+        .then(|| cfg.backend.clone())
+        .flatten()
+        .filter(|id| is_retired_backend(id));
     if run_migrations(&mut cfg) {
         // Best-effort persist of the new version + any normalized fields.
         let _ = save_to(&cfg, path);
     }
-    cfg
+    let retired_backend = retired_backend.filter(|_| cfg.backend.is_none());
+    (cfg, retired_backend)
 }
 
 /// Strictly load the config, surfacing a parse error instead of the fail-soft
@@ -487,7 +532,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.migration_version, 0);
-        // First run applies the v0->v1 normalization + bumps the version.
+        // First run applies every pending step and bumps the version.
         assert!(
             run_migrations(&mut cfg),
             "a pending migration must report change"
@@ -501,6 +546,88 @@ mod tests {
             "an already-current config must not re-run"
         );
         assert_eq!(cfg.migration_version, CURRENT_MIGRATION_VERSION);
+    }
+
+    #[test]
+    fn retired_backends_and_aliases_migrate_to_picker_without_fallback() {
+        assert_eq!(
+            CURRENT_MIGRATION_VERSION, 2,
+            "retirement is the v2 migration"
+        );
+        for retired in [
+            "cursor",
+            "codebuddy",
+            "cbc",
+            "droid",
+            "qwen",
+            "qwen-code",
+            "  CBC  ",
+        ] {
+            let mut cfg = UserConfig {
+                backend: Some(retired.to_string()),
+                lang: Some("en".into()),
+                design_system: Some("kept".into()),
+                migration_version: 1,
+                ..Default::default()
+            };
+
+            assert!(
+                run_migrations(&mut cfg),
+                "{retired} has a pending migration"
+            );
+            assert_eq!(cfg.backend, None, "{retired} must reopen the picker");
+            assert_ne!(cfg.backend.as_deref(), Some("offline"));
+            assert_eq!(cfg.lang.as_deref(), Some("en"));
+            assert_eq!(cfg.design_system.as_deref(), Some("kept"));
+            assert_eq!(cfg.migration_version, CURRENT_MIGRATION_VERSION);
+            assert!(
+                !run_migrations(&mut cfg),
+                "{retired} migration is idempotent"
+            );
+            assert_eq!(cfg.backend, None);
+        }
+    }
+
+    #[test]
+    fn four_supported_backends_are_not_changed_by_retirement_migration() {
+        for supported in crate::FIRST_CLASS_BACKEND_IDS {
+            let mut cfg = UserConfig {
+                backend: Some(supported.to_string()),
+                migration_version: 1,
+                ..Default::default()
+            };
+            assert!(run_migrations(&mut cfg));
+            assert_eq!(cfg.backend.as_deref(), Some(supported));
+        }
+    }
+
+    #[test]
+    fn retired_backend_notice_is_reported_on_exactly_one_startup() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        save_to(
+            &UserConfig {
+                backend: Some("qwen-code".into()),
+                lang: Some("zh-CN".into()),
+                migration_version: 1,
+                ..Default::default()
+            },
+            &path,
+        )
+        .unwrap();
+
+        let (first, first_notice) = load_and_migrate_for_startup(&path);
+        assert_eq!(first.backend, None);
+        assert_eq!(first_notice.as_deref(), Some("qwen-code"));
+        assert_eq!(first.migration_version, CURRENT_MIGRATION_VERSION);
+
+        let (second, second_notice) = load_and_migrate_for_startup(&path);
+        assert_eq!(second.backend, None);
+        assert_eq!(second.lang.as_deref(), Some("zh-CN"));
+        assert_eq!(
+            second_notice, None,
+            "persisted v2 must not repeat the notice"
+        );
     }
 
     #[test]

@@ -5,8 +5,10 @@
 //! that toggle into a **progressive-trust ladder** so a user can pick how much
 //! autonomy to grant as their confidence in the agent grows:
 //!
-//! - [`TrustMode::Plan`]    — research + planning only; **read-only, never
-//!   executes** real code. The agent produces "here's how I'd do it" for review.
+//! - [`TrustMode::Plan`]    — **planning with read-only requested**. UmaDev
+//!   refuses every explicit run entry before locks, branches, persisted state,
+//!   artifacts, or a writer; the base's actual process boundary still requires
+//!   vendor/platform effective-state evidence.
 //! - [`TrustMode::Guarded`] — the **default**; the existing human-in-the-loop
 //!   behaviour — every gate pauses for an explicit confirmation.
 //! - [`TrustMode::Auto`]    — fully autonomous; every gate auto-approves
@@ -31,23 +33,24 @@
 //!    silently switch — that the user let that gate auto-advance. Persisted to
 //!    `.umadev/trust.json`, fully fail-open.
 //!
-//! Everything here is **deterministic**: the mode only changes the gate
-//! auto-pass policy and the reversibility classifier is a pure function of the
-//! action string. No new model endpoint, no randomness.
+//! Everything here is **deterministic**: the mode defines an execution ceiling
+//! and gate auto-pass policy, while the reversibility classifier is a pure
+//! function of the action string. No new model endpoint, no randomness.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Autonomy tier selected for a run. The mode only controls the gate
-/// auto-pass policy; it never introduces non-determinism into phase content.
+/// Autonomy tier selected for a conversation/run. The mode controls whether
+/// execution may start and, if so, the gate auto-pass policy; it never
+/// introduces non-determinism into phase content.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustMode {
-    /// Research + planning only. The pipeline runs research and the doc phase
-    /// (PRD / architecture / UIUX — "here's how I'd build it") and then **stops
-    /// at `docs_confirm` without executing** spec / frontend / backend. Nothing
-    /// real is written into the codebase: the user reviews the plan first.
+    /// Conversational planning with the base's strongest read-only profile
+    /// requested. Explicit execution entries are rejected before they acquire a
+    /// run lock, create a branch, persist state/artifacts, or drive a writer.
+    /// The requested profile is not proof that the vendor/platform applied it.
     Plan,
     /// The default. Existing human-in-the-loop behaviour — every confirmation
     /// gate pauses and waits for the user (`docs_confirm`, `preview_confirm`,
@@ -103,12 +106,60 @@ impl TrustMode {
         matches!(self, Self::Auto)
     }
 
-    /// Whether the pipeline is allowed to *execute* (write real code in the
-    /// spec / frontend / backend phases). `plan` is read-only and stops after
-    /// the planning docs; `guarded` and `auto` both execute.
+    /// Whether any mutating pipeline is allowed to start. `plan` is read-only;
+    /// `guarded` and `auto` may execute.
     #[must_use]
     pub const fn executes(self) -> bool {
         !matches!(self, Self::Plan)
+    }
+
+    /// Whether switching from `self` to `next` removes authority already held by
+    /// a live base process. Such a downgrade requires a cancel/rebuild boundary;
+    /// changing only the UI tier cannot revoke an in-flight worker's launch flags.
+    #[must_use]
+    pub const fn is_downgrade_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Auto, Self::Guarded | Self::Plan) | (Self::Guarded, Self::Plan)
+        )
+    }
+
+    /// Whether UmaDev requests unrestricted tool access for the main base.
+    ///
+    /// Compatibility name retained for callers; this is launch intent, never
+    /// proof of effective filesystem/network/local-port capability. Prefer
+    /// [`Self::base_requests_full_access`] in new code.
+    #[must_use]
+    pub const fn base_full_access(self) -> bool {
+        self.base_requests_full_access()
+    }
+
+    /// Whether UmaDev requests full development access from the base. Guarded
+    /// and Auto both request it; enterprise policy, inherited sandboxing, or a
+    /// platform downgrade may still restrict the live process.
+    #[must_use]
+    pub const fn base_requests_full_access(self) -> bool {
+        self.executes()
+    }
+
+    /// Host-session permissions derived from this trust tier.
+    #[must_use]
+    pub const fn base_permissions(self) -> umadev_runtime::BasePermissionProfile {
+        match self {
+            Self::Plan => umadev_runtime::BasePermissionProfile::Plan,
+            Self::Guarded => umadev_runtime::BasePermissionProfile::Guarded,
+            Self::Auto => umadev_runtime::BasePermissionProfile::Auto,
+        }
+    }
+
+    /// Reconstruct the trust tier persisted in workflow state.
+    #[must_use]
+    pub const fn from_base_permissions(permissions: umadev_runtime::BasePermissionProfile) -> Self {
+        match permissions {
+            umadev_runtime::BasePermissionProfile::Plan => Self::Plan,
+            umadev_runtime::BasePermissionProfile::Guarded => Self::Guarded,
+            umadev_runtime::BasePermissionProfile::Auto => Self::Auto,
+        }
     }
 
     /// i18n key for the one-line description shown when the mode is selected.
@@ -637,10 +688,10 @@ fn path_touches_vcs(s: &str) -> bool {
 ///   dev network work (a dependency install, a plain fetch/clone) run freely
 ///   and escalates only:
 ///   - a command that pipes into a shell / hides an inline payload
-///     ([`command_is_obfuscated`] — the classic `curl … | sh`);
-///   - one that touches credential material ([`network_touches_credentials`]
+///     (as detected by the internal obfuscation classifier — the classic `curl … | sh`);
+///   - one that touches credential material (as detected by the internal credential classifier
 ///     — exfiltration);
-///   - one that PUBLISHES OUTWARD ([`network_publishes_outward`] — a `git
+///   - one that PUBLISHES OUTWARD (as detected by the internal publication classifier — a `git
 ///     push`, a package publish, a deploy: consequential and often
 ///     irrevocable, so the push/PR/deploy confirms stay mode-independent).
 ///
@@ -749,14 +800,16 @@ pub fn classify_approval_reply(reply: &str) -> Option<bool> {
 ///      workspace** (an absolute system path / `~` / a `..` the checkpoint
 ///      can't rewind) is escalated; reversible in-tree edits + build/test stay
 ///      automatic.
-///    - [`TrustMode::Plan`] — read-only planning: any real **execution** (a
-///      non-read shell command) and any out-of-tree write are escalated; reads
-///      and the in-tree planning-doc writes that are plan mode's deliverable
-///      stay automatic.
+///    - [`TrustMode::Plan`] — this classifier is defense in depth only. Public
+///      run entries and the host permission profile reject the writer before a
+///      tool call exists. If a legacy caller reaches this helper anyway, a
+///      non-read shell command or out-of-tree write is escalated; an in-tree
+///      write is not turned into a confirmation loop here, but that does not
+///      grant it execution authority.
 ///
-/// The gate-pause policy (guarded / plan pausing the *whole pipeline* for the
-/// user) is a separate concern handled by the gate machinery
-/// ([`TrustMode::gates_auto_approve`]); it is not this per-tool-call decision.
+/// The gate-pause policy is a separate concern handled by the gate machinery
+/// ([`TrustMode::gates_auto_approve`]); plan mode never reaches those execution
+/// gates through a conforming public entry.
 #[must_use]
 pub fn requires_confirmation(mode: TrustMode, command: &str, target_path: &str) -> bool {
     // No workspace root at this entry → the legacy system-root heuristic for escape
@@ -845,9 +898,9 @@ fn requires_confirmation_rooted(
         return true;
     }
     // 2) The floor did not escalate. Apply the per-mode policy. A reversible
-    //    in-tree write stays automatic in every mode (else a guarded/plan run
-    //    DENY's every edit and spins); the modes differ only on the riskier
-    //    reversible actions below.
+    //    in-tree write stays automatic in this confirmation classifier (else a
+    //    legacy caller can enter a deny loop); Plan's execution-entry guard and
+    //    read-only host profile remain the authority that prevents the write.
     let cap = capability_class(command, target_path);
     let out_of_tree_write = (matches!(cap, Capability::Write)
         && target_escapes_workspace(target_path, workspace_root))
@@ -860,9 +913,9 @@ fn requires_confirmation_rooted(
         // Default: confirm a write that escapes the workspace (not
         // checkpoint-rewindable); allow reversible in-tree edits + build/test.
         TrustMode::Guarded => out_of_tree_write,
-        // Read-only planning: confirm any real execution (a non-read shell
-        // command) and any out-of-tree write; allow reads + the in-tree
-        // planning-doc writes that are plan mode's deliverable.
+        // Read-only defense in depth: confirm any real execution (a non-read
+        // shell command) and any out-of-tree write. An in-tree write is not
+        // escalated here, but Plan's entry/profile boundary still denies it.
         TrustMode::Plan => out_of_tree_write || matches!(cap, Capability::Shell),
     }
 }
@@ -1164,11 +1217,11 @@ pub fn capability_class(command: &str, target_path: &str) -> Capability {
         // A base's file-WRITE TOOL ACTION. opencode / codex / claude surface a file edit as a
         // tool NAME ("edit" / "write" / "patch" / ...), NOT a shell command, with the file in
         // `target_path`. Without recognizing these, a plain in-tree edit was read as a Shell
-        // command - so PLAN mode escalated it as "a real execution" and DENIED every write,
-        // stalling the build with zero source files (the reported opencode "edit -> pyproject
-        // .toml 按拒绝处理"). As a Write, the in-tree/out-of-tree ESCAPE check governs it: an
-        // in-tree write stays automatic in Guarded AND Plan, and an OUT-OF-tree write correctly
-        // escalates (which the Shell mis-read had actually let slip in Guarded).
+        // command - so legacy Plan callers escalated it as "a real execution" and
+        // entered a deny loop. As a Write, the in-tree/out-of-tree ESCAPE check
+        // governs this confirmation classifier: an in-tree write is automatic in
+        // Guarded, while Plan's separate entry/profile boundary prevents a writer
+        // from reaching it at all. An OUT-OF-tree write correctly escalates.
         const WRITE_ACTIONS: &[&str] = &[
             "edit",
             "write",
@@ -1597,14 +1650,14 @@ pub struct GateTrust {
 /// The whole struct is **fail-open**: a missing / corrupt file yields the empty
 /// default ([`Self::load`]), so the run behaves exactly as it would with no
 /// ledger. An irreversible-floor action is NEVER recorded here (see
-/// [`remembered_class`]).
+/// the internal remembered-action classifier).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustLedger {
     /// Per-gate counters. A `BTreeMap` keeps the on-disk JSON key order stable.
     #[serde(default)]
     pub gates: std::collections::BTreeMap<String, GateTrust>,
     /// Reversible action classes the user has explicitly approved for this
-    /// project (keys from [`remembered_class`], e.g. `write_out_of_tree` /
+    /// project (keys from the internal remembered-action classifier, e.g. `write_out_of_tree` /
     /// `shell`). NEVER contains an irreversible-floor class. A `BTreeSet` keeps
     /// the on-disk order stable. Defaulted so an older `trust.json` without this
     /// field loads cleanly (back-compat / fail-open).
@@ -1911,9 +1964,44 @@ mod tests {
         assert!(TrustMode::Guarded.executes());
         assert!(TrustMode::Auto.executes());
 
+        for (from, to, downgrade) in [
+            (TrustMode::Plan, TrustMode::Guarded, false),
+            (TrustMode::Plan, TrustMode::Auto, false),
+            (TrustMode::Guarded, TrustMode::Auto, false),
+            (TrustMode::Guarded, TrustMode::Plan, true),
+            (TrustMode::Auto, TrustMode::Guarded, true),
+            (TrustMode::Auto, TrustMode::Plan, true),
+        ] {
+            assert_eq!(from.is_downgrade_to(to), downgrade, "{from:?} → {to:?}");
+        }
+
         assert!(!TrustMode::Plan.gates_auto_approve());
         assert!(!TrustMode::Guarded.gates_auto_approve());
         assert!(TrustMode::Auto.gates_auto_approve());
+
+        // Base capability is a separate axis: Guarded pauses at UmaDev gates
+        // without starving the coding host of normal development access.
+        assert!(!TrustMode::Plan.base_full_access());
+        assert!(TrustMode::Guarded.base_full_access());
+        assert!(TrustMode::Auto.base_full_access());
+        assert_eq!(
+            TrustMode::Plan.base_permissions(),
+            umadev_runtime::BasePermissionProfile::Plan
+        );
+        assert_eq!(
+            TrustMode::Guarded.base_permissions(),
+            umadev_runtime::BasePermissionProfile::Guarded
+        );
+        assert_eq!(
+            TrustMode::Auto.base_permissions(),
+            umadev_runtime::BasePermissionProfile::Auto
+        );
+        for mode in [TrustMode::Plan, TrustMode::Guarded, TrustMode::Auto] {
+            assert_eq!(
+                TrustMode::from_base_permissions(mode.base_permissions()),
+                mode
+            );
+        }
     }
 
     #[test]
@@ -2337,7 +2425,9 @@ mod tests {
         // mid-turn confirmation, in ANY mode. The human gate is at the confirm
         // gates, not on every tool call — so a GUARDED run must still let the base
         // write files (else it would DENY every write and spin doing nothing). The
-        // SAME holds for Plan: its in-tree planning-doc writes are its deliverable.
+        // The same return value is kept for Plan only to make this legacy
+        // confirmation classifier non-wedging. It is not execution authority:
+        // Plan run entries refuse to start and its base profile denies writes.
         for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
             assert!(
                 !requires_confirmation(mode, "", "src/app.tsx"),

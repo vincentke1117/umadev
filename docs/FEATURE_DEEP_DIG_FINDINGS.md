@@ -1,7 +1,18 @@
-# UmaDev feature-by-feature deep-dig findings
+# UmaDev feature-by-feature deep-dig findings (historical audit log)
+
+> This file preserves the discovery history and the reasoning behind individual
+> fixes. It is not the current release checklist. The authoritative current
+> closure state is §7 of
+> [`ENTERPRISE_MATURITY_AUDIT_2026-07-14.md`](ENTERPRISE_MATURITY_AUDIT_2026-07-14.md).
+> Entries below that still say “Backlog” describe the state when that audit
+> round was written; later resolution notes and regression tests take precedence.
 
 ## Fix progress
-21 fixed (was 18) + verified: router F1/F2, pipeline F1/F2/F3, TUI F1, trust T1/T2/T3, review R-H2, security S-H3, D-H1, init H3.
+The initial round recorded 21 verified fixes. Subsequent rounds also closed CLI
+H1, router F3/F4, pipeline F4, TUI F2, CLI M1/M2/M6, knowledge #1-#8, DB-M1,
+DP-M2/DP-M3, deterministic capped walks, deleted-file run diffs, source-aware PR
+staging, and exact non-zero failure semantics. Each closure is locked by a
+targeted regression test and the all-features workspace suite.
 
 A 6-lane deep functional audit of every feature area. Status: FIXED = fixed this session;
 the rest are a prioritized backlog. All are code-verified, no fabrication.
@@ -135,7 +146,7 @@ correct + ledger cannot relax the floor; runtime_proof never claims Verified wit
 
 ## Re-review round 2 - agent-assisted (COMPLETE this session)
 Four parallel review agents adversarially re-audited: (a) my own 22 fixes for regressions,
-(b) knowledge crate internals, (c) the 3 host session drivers, (d) contract/spec/governance.
+(b) knowledge crate internals, (c) the 4 host session drivers, (d) contract/spec/governance.
 
 FIXED this round (14):
 - [FIXED] REGRESSION H1 (mine, F1): is_pipeline_complete matched "Advanced to delivery",

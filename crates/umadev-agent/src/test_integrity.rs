@@ -16,7 +16,7 @@
 //! state, flagging the gaming signals above. A violation means the step's passing
 //! test signal is **not trusted** — the finding is folded into the step's
 //! deterministic acceptance as a blocking signal (see
-//! [`crate::director_loop::drive_build_step`]) and drives a bounded rework round
+//! the director loop's internal build-step driver) and drives a bounded rework round
 //! with a typed, evidence-bearing directive that names the gamed file. A
 //! genuinely-passing, un-gamed suite produces no findings and is unaffected.
 //!
@@ -123,7 +123,7 @@ struct FileMetrics {
 }
 
 /// A point-in-time snapshot of the project's TEST surface — every test file's
-/// [`FileMetrics`], every harness-config file's content hash, and the
+/// the private per-file metrics, every harness-config file's content hash, and the
 /// `package.json` test command. Captured once before a build step's doer turn and
 /// compared to the after-state by [`check`].
 ///

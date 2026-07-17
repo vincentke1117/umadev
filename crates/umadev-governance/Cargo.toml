@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+umadev-contract = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = "3"
 serde = { workspace = true }

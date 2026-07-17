@@ -9,14 +9,13 @@
 //!
 //! HARD INVARIANTS (never break — these are what keep a critic team SAFE):
 //!
-//! 1. **Fail-open.** A critic that errors, can't be forked, or returns
-//!    unparseable output yields an EMPTY verdict ([`RoleVerdict::empty`]) that
-//!    `accepts` — it can NEVER block the base. Judgment is an upgrade, never a
-//!    dependency (mirrors the `consult` contract).
-//! 2. **Deterministic loop control.** A critic verdict is *advisory only*. The
-//!    surrounding revision loops stay governed by the deterministic gap-count +
-//!    stall-counter floor (coverage / contract / governance). A non-deterministic
-//!    LLM verdict must NEVER drive loop termination.
+//! 1. **Failure is explicit.** A critic that errors, can't be forked, or returns
+//!    unparseable output yields [`ReviewStatus::Unavailable`], never a fabricated
+//!    pass. The bounded driver keeps running, while completion logic can report
+//!    that the required review did not happen.
+//! 2. **Bounded loop control.** A must-fix verdict may trigger bounded rework and
+//!    prevent a false clean-completion claim, but it never chooses retry counts.
+//!    Rust-side budgets and stall guards always terminate the loop.
 //! 3. **Single-writer / read-only.** A critic NEVER writes files or mutates the
 //!    workspace. It reviews artifacts on an ISOLATED forked session (clean,
 //!    no-resume) and returns a verdict. Only the main session ever writes.
@@ -427,6 +426,30 @@ pub struct Provenance {
     pub note: String,
 }
 
+/// The operational result of one reviewer seat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStatus {
+    /// The reviewer ran and accepted the artifacts without a must-fix finding.
+    Pass,
+    /// The reviewer ran and returned one or more must-fix findings.
+    Fail,
+    /// No trustworthy verdict exists (fork/start/turn/parse/panic failure).
+    Unavailable,
+}
+
+impl ReviewStatus {
+    /// Stable value recorded in the team ledger.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// One role's structured opinion on the shared artifacts — the team layer's
 /// unit of cross-review. Aligns with the runner's existing ad-hoc verdicts
 /// (`AcceptanceVerdict` / `DocsVerdict` / `DesignVerdict`) but generalises them
@@ -434,21 +457,19 @@ pub struct Provenance {
 /// (for `blocking`) folded into the surrounding deterministic revision loop.
 ///
 /// `accepts` is the role's overall judgement; `blocking` are issues the role
-/// considers must-fix (these MAY be fed back as advisory fixes, never as loop
-/// control); `advisory` are nice-to-have notes; `evidence` are the concrete
+/// considers must-fix and may be fed into bounded rework; `advisory` are nice-to-have notes; `evidence` are the concrete
 /// observations (file/where) backing the verdict.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RoleVerdict {
     /// The reviewing role (e.g. `product-manager`, `architect`).
     #[serde(default)]
     pub role: String,
-    /// Whether the role accepts the artifacts as-is. A partial / failed parse
-    /// defaults to `false` only when the model said so; [`RoleVerdict::empty`]
-    /// (the fail-open path) sets it to `true` so an absent critic never blocks.
+    /// Whether the role accepts the artifacts as-is. This legacy JSON field is
+    /// retained for base compatibility; [`RoleVerdict::status`] is authoritative.
     #[serde(default)]
     pub accepts: bool,
-    /// Must-fix issues from this role's seat. Advisory to the loop: they MAY be
-    /// folded into the existing revision path, but never govern termination.
+    /// Must-fix issues from this role's seat. They may be folded into bounded
+    /// rework and prevent a false clean-completion claim.
     #[serde(default)]
     pub blocking: Vec<String>,
     /// A suggested one-line FIX per blocking finding — the "how to fix" the seat
@@ -486,22 +507,49 @@ pub struct RoleVerdict {
 }
 
 impl RoleVerdict {
-    /// The fail-open verdict: a named role that ACCEPTS with no findings. This is
-    /// what a critic returns when there's no brain, the fork failed, the base
-    /// errored, or the reply didn't parse — so an absent / broken critic can
-    /// never block the base (invariant 1).
+    /// A named reviewer that could not produce a trustworthy verdict.
     #[must_use]
-    pub fn empty(role: &str) -> Self {
+    pub fn unavailable(role: &str, reason: impl Into<String>) -> Self {
         Self {
             role: role.to_string(),
-            accepts: true,
+            accepts: false,
             blocking: Vec::new(),
             remediation: Vec::new(),
-            advisory: Vec::new(),
+            advisory: vec![reason.into()],
             evidence: Vec::new(),
             provenance: Vec::new(),
             cold: false,
         }
+    }
+
+    /// Backward-compatible constructor for a missing verdict. Empty no longer
+    /// means pass: absence is an explicit [`ReviewStatus::Unavailable`].
+    #[must_use]
+    pub fn empty(role: &str) -> Self {
+        Self::unavailable(role, "review produced no usable verdict")
+    }
+
+    /// Resolve the legacy `accepts` + `blocking` shape into a non-ambiguous state.
+    #[must_use]
+    pub fn status(&self) -> ReviewStatus {
+        if !self.blocking.is_empty() {
+            ReviewStatus::Fail
+        } else if self.accepts {
+            ReviewStatus::Pass
+        } else {
+            ReviewStatus::Unavailable
+        }
+    }
+
+    /// Operational diagnosis carried by an unavailable verdict.
+    #[must_use]
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        if self.status() != ReviewStatus::Unavailable {
+            return None;
+        }
+        self.advisory
+            .iter()
+            .find_map(|s| (!s.trim().is_empty()).then_some(s.trim()))
     }
 
     /// The suggested one-line fix for the blocking finding at `idx`, if the seat
@@ -543,7 +591,41 @@ impl RoleVerdict {
             .collect();
         self.advisory = clean(self.advisory);
         self.evidence = clean(self.evidence);
+        if !self.blocking.is_empty() {
+            self.accepts = false;
+        }
         self
+    }
+}
+
+/// Team-wide result without collapsing reviewer outages into a clean pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TeamReviewResult {
+    /// Semantic must-fix findings returned by reviewers that actually ran.
+    pub blocking: Vec<String>,
+    /// Reviewer seats that could not return a trustworthy verdict.
+    pub unavailable: Vec<String>,
+}
+
+impl TeamReviewResult {
+    /// Aggregate status. Any missing required seat makes the review incomplete.
+    #[must_use]
+    pub fn status(&self) -> ReviewStatus {
+        if !self.unavailable.is_empty() {
+            ReviewStatus::Unavailable
+        } else if !self.blocking.is_empty() {
+            ReviewStatus::Fail
+        } else {
+            ReviewStatus::Pass
+        }
+    }
+}
+
+impl std::ops::Deref for TeamReviewResult {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.blocking
     }
 }
 
@@ -647,11 +729,11 @@ pub trait RoleCritic: Send + Sync {
     /// frontend / backend / DevOps) stay on the read-only fork — they benefit
     /// from knowing what the team intended.
     ///
-    /// This is purely a SURFACE preference, never a hard requirement: when no
-    /// cold surface is scoped ([`cold_surface`] → `None` on a headless / unwired
+    /// This is purely a SURFACE preference: when no
+    /// cold surface is scoped (the internal `cold_surface` resolver returns `None` on a headless / unwired
     /// path) or the fresh one-shot fails, the seat falls back to the fork
-    /// (today's behaviour) — a cold seat can degrade but never disappears
-    /// (invariant 1). Defaults to `false` so every existing / custom critic is
+    /// (today's behaviour). If neither surface can produce a verdict, the seat is
+    /// explicitly unavailable (invariant 1). Defaults to `false` so every existing / custom critic is
     /// byte-for-byte unchanged.
     fn cold(&self) -> bool {
         false
@@ -660,9 +742,8 @@ pub trait RoleCritic: Send + Sync {
     /// Review the shared artifacts and return this role's verdict.
     ///
     /// `consult` runs ONE strict-JSON judge turn on a forked read-only session
-    /// and parses it into a [`RoleVerdict`]. It is fail-open: any failure yields
-    /// [`RoleVerdict::empty`], so a critic that can't reach the brain ACCEPTS
-    /// rather than blocks (invariant 1).
+    /// and parses it into a [`RoleVerdict`]. Any transport or parse failure yields
+    /// an explicit unavailable verdict rather than an invented acceptance.
     async fn review(
         &self,
         consult: &dyn CriticConsult,
@@ -681,8 +762,8 @@ pub trait RoleCritic: Send + Sync {
 pub trait CriticConsult: Send + Sync {
     /// Run a strict-JSON judge turn for `role` and parse it into a verdict.
     /// `system` pins the role + JSON shape; `user` carries the artifacts. Always
-    /// returns a verdict — the fail-open empty one when there's no brain / the
-    /// call failed / the reply didn't parse.
+    /// returns a verdict — [`ReviewStatus::Unavailable`] when there's no brain,
+    /// the call failed, or the reply didn't parse.
     async fn judge(&self, role: &str, system: &str, user: String) -> RoleVerdict;
 }
 
@@ -1187,7 +1268,7 @@ impl RoleCritic for DevOpsCritic {
 
 /// The docs-stage cross-review team, scaled to the task. A lean task gets NO
 /// critic team (the deterministic floor + the existing single judge are enough); a
-/// pure DOCUMENT task ([`TaskKind::DocsOnly`] — a PRD / spec / design doc / report)
+/// pure DOCUMENT task ([`crate::planner::TaskKind::DocsOnly`] — a PRD / spec / design doc / report)
 /// gets ONE editorial PM seat (the document wants a single "does it serve the
 /// requirement, is it coherent and complete" read, not a product-review trio); a
 /// heavyweight greenfield / full product build gets the PM + architect + designer
@@ -1353,6 +1434,7 @@ pub fn append_team_ledger(
         "phase": phase,
         "round": round,
         "role": verdict.role,
+        "status": verdict.status().as_str(),
         "accepts": verdict.accepts,
         "blocking": verdict.blocking.len(),
         "advisory": verdict.advisory.len(),
@@ -1582,14 +1664,13 @@ mod tests {
     }
 
     #[test]
-    fn role_verdict_empty_is_fail_open_accept() {
-        // The fail-open verdict must ACCEPT with no findings — an absent critic
-        // can never block (invariant 1).
+    fn role_verdict_empty_is_explicitly_unavailable() {
         let v = RoleVerdict::empty("product-manager");
-        assert!(v.accepts, "empty verdict must accept (fail-open)");
+        assert!(!v.accepts);
+        assert_eq!(v.status(), ReviewStatus::Unavailable);
         assert_eq!(v.role, "product-manager");
         assert!(v.blocking.is_empty());
-        assert!(v.advisory.is_empty());
+        assert!(v.unavailable_reason().is_some());
     }
 
     #[test]
@@ -1640,7 +1721,7 @@ mod tests {
         let aliased: RoleVerdict =
             serde_json::from_str(r#"{"blocking":["x"],"fix":["do y"]}"#).unwrap();
         assert_eq!(aliased.normalized("qa-engineer").fix_for(0), Some("do y"));
-        // The fail-open empty verdict carries no remediation.
+        // An unavailable empty verdict carries no remediation.
         assert!(RoleVerdict::empty("architect").fix_for(0).is_none());
     }
 
@@ -1660,6 +1741,7 @@ mod tests {
         let content =
             std::fs::read_to_string(tmp.path().join(".umadev/team-ledger.jsonl")).unwrap();
         assert!(content.contains("\"role\":\"product-manager\""));
+        assert!(content.contains("\"status\":\"fail\""));
         assert!(content.contains("\"blocking\":2"));
         assert!(content.contains("\"round\":1"));
         // A second append accumulates (append mode, not truncate).

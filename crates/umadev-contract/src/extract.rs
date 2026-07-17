@@ -21,7 +21,7 @@
 //! matches a contract template like `/api/users/:id` instead of being
 //! truncated to `/api/users/` (a 3-segment path that fails the 4-segment
 //! contract match — a systematic false `UndeclaredCall`). See
-//! [`normalize_template_path`].
+//! the internal `normalize_template_path` normalizer.
 
 use std::path::{Path, PathBuf};
 
@@ -86,7 +86,7 @@ pub struct FrontendCall {
     pub method: HttpVerb,
     /// The path the call targets, e.g. `/api/users/123`. Template-literal
     /// interpolation is normalised to `:param` (see
-    /// [`normalize_template_path`]).
+    /// the internal `normalize_template_path` normalizer).
     pub path: String,
     /// Whether [`Self::method`] was determined from the call shape (`fetch`
     /// options, `axios.post`, a `useMutation` write hook, …) rather than a
@@ -347,13 +347,25 @@ pub fn extract_frontend_calls(project_root: &Path) -> Vec<FrontendCall> {
             });
         calls.extend(extract_from_file(&rel, &content));
     }
-    // Dedupe across ALL files by (method, path). `Vec::dedup` only removes
-    // *consecutive* duplicates, so the old `calls.dedup()` was a no-op for
-    // the same call made in two different files (they're never adjacent).
-    // We keep the first-seen `file` so audit can still point at a source.
-    let mut seen: std::collections::HashSet<(HttpVerb, String)> = std::collections::HashSet::new();
-    calls.retain(|c| seen.insert((c.method, c.path.clone())));
-    calls
+    // Dedupe across all files by `(method, path)`, but never let an earlier
+    // guessed wrapper verb hide a later call whose verb is mechanically known.
+    // Preserve first-seen order for deterministic diagnostics; replace only the
+    // row at that stable position when stronger evidence appears.
+    let mut positions =
+        std::collections::HashMap::<(HttpVerb, String), usize>::with_capacity(calls.len());
+    let mut unique: Vec<FrontendCall> = Vec::with_capacity(calls.len());
+    for call in calls {
+        let key = (call.method, call.path.clone());
+        if let Some(index) = positions.get(&key).copied() {
+            if !unique[index].method_known && call.method_known {
+                unique[index] = call;
+            }
+        } else {
+            positions.insert(key, unique.len());
+            unique.push(call);
+        }
+    }
+    unique
 }
 
 /// Extract calls from one file's content.
@@ -509,7 +521,16 @@ const MAX_FRONTEND_FILES: usize = 800;
 const MAX_FRONTEND_FILE_BYTES: u64 = 600_000;
 
 fn collect_frontend_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > MAX_FRONTEND_DEPTH || out.len() >= MAX_FRONTEND_FILES {
+    collect_frontend_sources_bounded(dir, out, depth, MAX_FRONTEND_FILES);
+}
+
+fn collect_frontend_sources_bounded(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    depth: usize,
+    max_files: usize,
+) {
+    if depth > MAX_FRONTEND_DEPTH || out.len() >= max_files {
         // Library code must never write directly to stdout/stderr: the TUI owns
         // the terminal. A deep or wide tree is bounded silently here and
         // higher-level verification remains fail-open.
@@ -518,8 +539,10 @@ fn collect_frontend_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in rd.flatten() {
-        if out.len() >= MAX_FRONTEND_FILES {
+    let mut entries = rd.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        if out.len() >= max_files {
             return;
         }
         let p = entry.path();
@@ -539,7 +562,7 @@ fn collect_frontend_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                 continue;
             }
-            collect_frontend_sources(&p, out, depth + 1);
+            collect_frontend_sources_bounded(&p, out, depth + 1, max_files);
         } else if meta.is_file() {
             let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
             if FRONTEND_EXTS.contains(&ext) {
@@ -552,6 +575,21 @@ fn collect_frontend_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_frontend_walk_selects_stable_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for name in ["z.ts", "b.ts", "a.ts"] {
+            std::fs::write(tmp.path().join(name), "fetch('/api/x')\n").unwrap();
+        }
+        let mut files = Vec::new();
+        collect_frontend_sources_bounded(tmp.path(), &mut files, 0, 2);
+        let names = files
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["a.ts", "b.ts"]);
+    }
 
     #[test]
     fn extract_fetch_get() {
@@ -609,6 +647,17 @@ mod tests {
             "fetch('/api/users'); fetch('/api/users'); fetch('/api/users')",
         );
         assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn cross_file_dedupe_prefers_a_known_method_over_an_earlier_guess() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.ts"), "request('/api/users')\n").unwrap();
+        std::fs::write(tmp.path().join("b.ts"), "fetch('/api/users')\n").unwrap();
+        let calls = extract_frontend_calls(tmp.path());
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].method_known);
+        assert!(calls[0].file.ends_with("b.ts"));
     }
 
     #[test]

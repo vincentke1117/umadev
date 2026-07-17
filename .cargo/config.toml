@@ -1,0 +1,4 @@
+[resolver]
+# The workspace promises Rust 1.88 support. Prefer dependency releases whose
+# own rust-version fits that promise whenever Cargo resolves or updates the lock.
+incompatible-rust-versions = "fallback"

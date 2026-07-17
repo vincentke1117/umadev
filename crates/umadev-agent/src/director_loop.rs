@@ -5,8 +5,9 @@
 //!
 //! UmaDev is a smart device with its own firmware — a senior team-director
 //! identity, engineering taste, accumulated knowledge, governance, and memory —
-//! but **no compute of its own**. Plugged into a base (claude / codex / opencode)
-//! over the continuous session, it **borrows the base's intelligence and hands**
+//! but **no compute of its own**. Plugged into one of five bases (three native
+//! plus Grok Build/Kimi Code over ACP) over the continuous session, it **borrows the base's
+//! intelligence and hands**
 //! to get work done, the way a smart peripheral borrows a host computer's CPU and
 //! storage. The firmware is injected into the base (via the directive + system
 //! prompt the caller built — `experts::director_build_directive` /
@@ -58,8 +59,9 @@
 //! 3. If QC found blocking problems, fold them into ONE fix directive and feed it
 //!    back to the base over the same session (the USB channel) — and the directive
 //!    tells the base's body to **run its own build/test and fix the cause with its
-//!    own tools**. Then re-read. **Bounded** by [`MAX_QC_ROUNDS`].
-//! 4. Clean (or no code claimed — a chat/plan answer) → done; report honestly.
+//!    own tools**. Then re-read. **Bounded** by the internal QC-round limit.
+//! 4. Clean mechanical QC → done; report honestly. A quiet/tool-only reply is
+//!    never completion evidence by itself.
 //!
 //! Note on build/test: UmaDev does NOT run the build itself as its gate — the base's
 //! body runs build/test (it has the tools), and the fix directive explicitly asks it
@@ -73,41 +75,51 @@
 //!    run-lock the caller holds. UmaDev's checks are read-only: the source floor
 //!    reads disk; the QC review runs on isolated read-only forks
 //!    ([`crate::director::review`]). Nothing UmaDev does writes the workspace.
-//! 2. **Objective floor untouched.** The source-present floor is a deterministic,
-//!    read-only reality check; review verdicts stay advisory (they only seed a fix
-//!    directive the base acts on, they never themselves decide "done"). The caller's
-//!    source-present hard-gate still runs at the boundary, unchanged.
+//! 2. **Objective floor untouched.** The source-present floor remains a
+//!    deterministic, read-only check. Reviewer blockers seed bounded fixes and
+//!    must clear before a clean claim; Rust-side budgets still own termination.
 //! 3. **Governance + audit.** Every base turn (the first build and every fix pass)
 //!    drives the SAME governed/audited session; the PreToolUse hook still fires
 //!    under every write.
 //! 4. **No new endpoint.** Every QC review reads over the SAME borrowed brain + its
 //!    `fork()`; no extra model endpoint, no API key.
-//! 5. **Fail-open.** A QC read that can't run degrades to "no problem found" (a
-//!    review that can't fork accepts), never a false failure that wedges the loop. A
-//!    dead session is an honest `Failed`, never a panic.
+//! 5. **Bounded failure.** A required review that cannot run is explicitly
+//!    unavailable, never a pass. It may leave the build incomplete, but cannot
+//!    wedge the loop; a dead session is an honest `Failed`, never a panic.
 //! 6. **Reversible.** This loop is the DEFAULT `/run` path; the legacy fixed
 //!    pipeline (`UMADEV_LEGACY_PIPELINE=1`) is untouched.
 
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use umadev_runtime::{ApprovalDecision, BaseSession, SessionEvent, StreamEvent, TurnStatus, Usage};
+use umadev_runtime::{
+    ApprovalDecision, BaseSession, HostApprovalOption, HostApprovalOptionKind, HostRequest,
+    HostResponse, SessionEvent, StreamEvent, ToolActivity, TurnStatus, Usage,
+};
 
+use crate::critics::ReviewStatus;
 use crate::director::{self, ReviewResult, VerifyKind, VerifyResult};
 use crate::events::{EngineEvent, EventSink};
+use crate::knowledge_feedback::{commit_sent_memories, SentReceiptGuard, TurnOutcome};
+use crate::phases::KnowledgeDigest;
 use crate::plan_state::{self, Plan, StepStatus};
 use crate::router::RoutePlan;
 use crate::runner::RunOptions;
 use crate::trust::requires_confirmation_with_ledger;
 use umadev_spec::Phase;
 
+mod quality_evidence;
+mod resume;
+
+use quality_evidence::{has_reproduction_test, runtime_proof_blocking};
+pub use resume::{has_resumable_director_plan, has_resumable_run};
+use resume::{load_resumable_plan, record_artifact_versions};
+
 /// The hard ceiling on auto-QC feedback-fix rounds in one `/run`. One round is: the
 /// base builds (or fixes) end to end, then UmaDev runs its objective QC pass. A
 /// clean pass ends the loop immediately, so a simple goal that builds correctly the
 /// first time spends ZERO fix rounds. The cap only bounds a goal that keeps failing
-/// QC — after it, the loop ends and the caller's source-present hard-gate has the
-/// final say. Mirrors the proven bounded-rework shape (`continuous::MAX_REWORK_ROUNDS`)
+/// QC — after it, the loop terminates as [`DirectorLoopOutcome::Failed`] with the
+/// residual objective evidence. Mirrors the proven bounded-rework shape (`continuous::MAX_REWORK_ROUNDS`)
 /// at the build level: small + decisive, not an open-ended grind.
 const MAX_QC_ROUNDS: usize = 3;
 
@@ -152,7 +164,7 @@ const DEFAULT_TOOL_IDLE_TIMEOUT_SECS: u64 = 300;
 
 /// The idle watchdog window for one `next_event().await`, from
 /// `UMADEV_IDLE_TIMEOUT_SECS` (the SAME env the single-shot host watchdog reads —
-/// `umadev_host`), falling back to [`DEFAULT_IDLE_TIMEOUT_SECS`]. A non-positive /
+/// `umadev_host`), falling back to the internal default idle timeout. A non-positive /
 /// unparseable value falls back to the default (fail-open: a bad env never
 /// disables the watchdog, which would re-introduce the permanent hang). Read once
 /// per turn at the app boundary, not per wait, so a mid-turn env flip can't race.
@@ -170,10 +182,10 @@ pub fn idle_timeout() -> Duration {
 }
 
 /// The LIVENESS-POLL interval used while the base is plausibly mid-tool, from
-/// `UMADEV_TOOL_IDLE_TIMEOUT_SECS`, falling back to [`DEFAULT_TOOL_IDLE_TIMEOUT_SECS`]
+/// `UMADEV_TOOL_IDLE_TIMEOUT_SECS`, falling back to the internal default tool-idle interval
 /// (5 min). It is how OFTEN the watchdog re-checks the base is alive while a tool runs,
 /// NOT a cap on how long the tool may take — a tool of any duration with a live base
-/// keeps waiting (see [`next_event_idle`]). A non-positive / unparseable value falls
+/// keeps waiting (see the internal idle-event pump). A non-positive / unparseable value falls
 /// back to the default (fail-open: a bad env never disables the liveness re-check).
 /// Read once per turn at the pump boundary (folded into [`IdleBudget::from_env`]), not
 /// per wait, so a mid-turn env flip can't race. `pub` so the TUI chat path shares the
@@ -196,9 +208,9 @@ pub fn tool_idle_timeout() -> Duration {
 /// tool-use event, then the tool itself (a `docker build` / a compile / `npm install` /
 /// a long test / a dev server / a data job) runs SILENTLY — for minutes or hours. While
 /// such a tool is in flight the watchdog does NOT cap the silence; it polls on the
-/// [`tool`](Self::tool) interval and, each time the interval elapses with no event,
+/// internal `tool` interval and, each time the interval elapses with no event,
 /// re-checks the base is alive — a live base keeps waiting, only a DEAD base (or the
-/// overall run-budget deadline) settles (see [`next_event_idle`]). When NO tool is in
+/// overall run-budget deadline) settles (see the internal idle-event pump). When NO tool is in
 /// flight the `base` window applies, so a TRULY hung base (no tool running) STILL
 /// settles at the base window and the watchdog never becomes unbounded for a genuine
 /// hang. The caller flips the in-tool-call state with [`tool_phase_transition`] as it
@@ -260,8 +272,8 @@ impl IdleBudget {
 #[must_use]
 pub fn tool_phase_transition(ev: &SessionEvent) -> Option<bool> {
     match ev {
-        SessionEvent::ToolCall { .. } => Some(true),
-        SessionEvent::ToolResult { .. } => Some(false),
+        SessionEvent::ToolCall { .. } | SessionEvent::ToolCallCorrelated { .. } => Some(true),
+        SessionEvent::ToolResult { .. } | SessionEvent::ToolResultCorrelated { .. } => Some(false),
         _ => None,
     }
 }
@@ -547,16 +559,25 @@ pub(crate) fn enrich_idle_reason(
 /// lives in the agent crate so both the CLI and the TUI share ONE loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectorLoopOutcome {
-    /// The build finished — the base built end to end and UmaDev's auto-QC either
-    /// passed or exhausted its bounded fix budget. The caller then runs the
-    /// objective source-present hard-gate to verify reality.
+    /// The caller selected [`crate::TrustMode::Plan`], so the requested build was
+    /// deliberately **not executed**. This is neither a successful build nor a
+    /// failure: callers must render the read-only notice without showing build
+    /// completion UI or applying source-present checks.
+    Planned {
+        /// Localized explanation of the read-only boundary and how to execute.
+        reply: String,
+    },
+    /// The build finished — the base built end to end and UmaDev's auto-QC passed.
+    /// Bounded work that still has blocking evidence is [`Self::Failed`], never
+    /// disguised as a successful settle for the caller to celebrate.
     Done {
         /// The base's final assistant text — the caller reads it for a "claimed a
         /// build" check against the real source files.
         reply: String,
     },
-    /// The session died / a turn failed — an honest hard stop, never disguised as
-    /// success. Carries a machine-true reason.
+    /// The session died, a turn failed, or bounded verification settled with
+    /// residual blocking evidence — an honest hard stop, never disguised as
+    /// success. Carries a machine-true reason/evidence summary.
     Failed(String),
     /// The run PAUSED at a spec-MUST human confirmation gate (`UD-FLOW-002`
     /// `docs_confirm` / `UD-FLOW-003` `preview_confirm`) awaiting the user.
@@ -630,17 +651,17 @@ async fn persist_run_governance_context(session: &mut dyn BaseSession, options: 
 /// firmware (team identity + craft + knowledge) is already injected by the caller
 /// into `first_directive` (and, on the TUI path, the system prompt). The base builds
 /// the goal end to end with its OWN internal agentic loop; then UmaDev runs an
-/// objective QC pass ITSELF ([`run_auto_qc`]) and, if QC found blocking problems,
+/// objective QC pass ITSELF (through the internal auto-QC routine) and, if QC found blocking problems,
 /// feeds ONE fix directive back over the same session for another pass — bounded by
-/// [`MAX_QC_ROUNDS`].
+/// the internal QC-round limit.
 ///
 /// `first_directive` is the goal framing the caller already built (e.g.
 /// [`crate::experts::director_build_directive`]). The caller owns the session
 /// lifetime (and the run-lock) and `end()`s it after this returns.
 ///
 /// Floor preserved (see the module docs): single-writer, governance + audit,
-/// advisory review, objective verify, fail-open, no endpoint. The loop never blocks
-/// the host — every failure mode degrades to a graceful settle.
+/// bounded typed review, objective verify, and no endpoint. Every failure mode
+/// settles without hanging the host.
 pub async fn drive_director_loop(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -677,6 +698,22 @@ pub async fn drive_director_loop_routed(
     first_directive: String,
     route: Option<&RoutePlan>,
 ) -> DirectorLoopOutcome {
+    // Plan is a mechanical no-write ceiling, not a late approval decision. Check
+    // it before governance-context persistence (which consults the base and writes
+    // `.umadev/governance-context.json`) or any other run setup, and return a typed
+    // non-build outcome so callers cannot celebrate this as a completed build.
+    if !options.mode.executes() {
+        events.emit(EngineEvent::Note(
+            umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
+        ));
+        events.emit(EngineEvent::Note(
+            umadev_i18n::tl("mode.plan.gate").to_string(),
+        ));
+        return DirectorLoopOutcome::Planned {
+            reply: umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
+        };
+    }
+
     // 0. ONE RULE BOOK. Persist the derived governance context BEFORE anything is written.
     //    See `persist_run_governance_context` — the default `/run` path drives the base
     //    from HERE, and it used to be the one path that never wrote the context: the run
@@ -717,26 +754,6 @@ pub async fn drive_director_loop_routed(
         }
     }
 
-    // Plan (read-only) mode must NOT drive a code-writing BUILD. The continuous engine guards
-    // its executing phases with `plan_mode_skip` (continuous.rs), but director_loop had NO such
-    // guard - so a build SPAWNED in Plan drove every step while the approval floor DENIED each
-    // write (Plan escalates every non-read action), producing ZERO source files and a confusing
-    // deny-storm before aborting (the opencode "edit -> pyproject.toml 按拒绝处理" report). Stop
-    // cleanly with the actionable read-only notice: no code is written, the source-present
-    // hard-gate does NOT fire (the reply claims no build), and the user is told to switch to
-    // /mode guarded or auto to execute.
-    if !options.mode.executes() {
-        events.emit(EngineEvent::Note(
-            umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
-        ));
-        events.emit(EngineEvent::Note(
-            umadev_i18n::tl("mode.plan.gate").to_string(),
-        ));
-        return DirectorLoopOutcome::Done {
-            reply: umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
-        };
-    }
-
     // Read the idle watchdog window + the wall-clock build budget ONCE at the
     // boundary (not per-wait), so a mid-run env flip can't race the in-flight turns.
     // The deadline is a GRACEFUL ceiling — the loop winds down (final gate on what's
@@ -754,22 +771,27 @@ pub async fn drive_director_loop_routed(
     //    `None` plan (offline / no fork / unparseable) simply means no checklist —
     //    the build loop below runs exactly as it does today. Plan synthesis runs on
     //    a READ-ONLY fork (single-writer preserved); it never writes the workspace.
-    let plan = match route {
+    let posted = match route {
         Some(r) => synthesize_and_post_plan(session, options, events, r, deadline).await,
-        None => None,
+        None => PostedPlan {
+            plan: None,
+            recipe_receipt: None,
+        },
     };
 
-    drive_director_loop_with_idle(
+    let outcome = drive_director_loop_with_idle(
         session,
         options,
         events,
         first_directive,
-        plan,
+        posted.plan,
         route,
         IdleBudget::from_env(),
         deadline,
     )
-    .await
+    .await;
+    settle_recipe_for_outcome(posted.recipe_receipt.as_ref(), &outcome);
+    outcome
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -785,193 +807,13 @@ pub async fn drive_director_loop_routed(
 // plan simply yields "nothing to resume" and the caller falls back to a fresh run.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Whether `plan` still has work left to drive — at least one step that is NOT
-/// terminal (`Done` / `Blocked`). A fully `Done`/`Blocked` plan has nothing to
-/// resume.
-fn plan_has_incomplete_step(plan: &Plan) -> bool {
-    plan.steps
-        .iter()
-        .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::Active))
-}
-
-/// Reset any `Active` step back to `Pending` so a resume re-drives the step that was
-/// interrupted mid-flight. The scheduler only surfaces `Pending` steps via
-/// [`Plan::ready_steps`], so a step persisted as `Active` (the TUI closed while it
-/// ran) would otherwise be stranded — never re-driven, never finished. The old
-/// subprocess is gone; the fresh session must re-run it from a clean state. `Done`
-/// steps are left exactly as persisted (they are never re-driven), and `Blocked`
-/// steps stay an honest gap. Returns the count reset (0 = nothing was Active).
-fn reset_active_to_pending(plan: &mut Plan) -> usize {
-    let mut reset = 0;
-    for s in &mut plan.steps {
-        if s.status == StepStatus::Active {
-            s.status = StepStatus::Pending;
-            reset += 1;
-        }
-    }
-    reset
-}
-
-/// Load the persisted plan for a RESUME, returning it ONLY when it is genuinely
-/// resumable: it parses AND has at least one incomplete (`Pending`/`Active`) step.
-/// Any `Active` step is reset to `Pending` (the interrupted step must re-drive on the
-/// fresh session — see [`reset_active_to_pending`]). Fail-open: an absent / corrupt /
-/// fully-terminal plan → `None`.
-fn load_resumable_plan(root: &Path) -> Option<Plan> {
-    let mut plan = plan_state::load(root)?;
-    // Item C staleness: re-open any step whose upstream doc artifact changed since
-    // the last recorded save, BEFORE the resumability check - a changed upstream can
-    // revive an otherwise-complete plan so the director re-derives the poisoned
-    // subtree instead of trusting it.
-    invalidate_stale_steps(root, &mut plan);
-    if !plan_has_incomplete_step(&plan) {
-        return None; // every step Done/Blocked → nothing left to resume
-    }
-    reset_active_to_pending(&mut plan);
-    Some(plan)
-}
-
-// ── Artifact staleness (item C) ── record output/ doc versions on each plan save,
-//    and on resume re-open steps whose upstream doc changed. All read-only /
-//    best-effort / fail-open: an unreadable dir, an empty store, or an unmapped
-//    file is simply skipped and never blocks the run.
-
-/// Canonical artifact name for an `output/<slug>-<kind>.md` file, or `None`.
-fn artifact_name_from_filename(fname: &str) -> Option<&'static str> {
-    let stem = fname.strip_suffix(".md")?;
-    if stem.ends_with("-architecture") {
-        Some("architecture")
-    } else if stem.ends_with("-prd") {
-        Some("prd")
-    } else if stem.ends_with("-uiux") {
-        Some("uiux")
-    } else {
-        None
-    }
-}
-
-/// [`crate::critics::ArtifactKind`] for a canonical doc-artifact name.
-fn artifact_kind_from_name(name: &str) -> Option<crate::critics::ArtifactKind> {
-    use crate::critics::ArtifactKind as A;
-    match name {
-        "architecture" => Some(A::Architecture),
-        "prd" => Some(A::Prd),
-        "uiux" => Some(A::Uiux),
-        _ => None,
-    }
-}
-
-/// The current content-version of each `output/` doc artifact, keyed by canonical
-/// name. Read-only + fail-open (an unreadable dir/file is skipped).
-fn current_artifact_versions(root: &Path) -> Vec<(String, String)> {
-    let mut v = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root.join("output")) else {
-        return v;
-    };
-    for e in entries.flatten() {
-        let fname = e.file_name().to_string_lossy().into_owned();
-        let Some(name) = artifact_name_from_filename(&fname) else {
-            continue;
-        };
-        if let Ok(content) = std::fs::read_to_string(e.path()) {
-            v.push((name.to_string(), crate::critics::artifact_version(&content)));
-        }
-    }
-    v
-}
-
-/// Record the current `output/` doc versions into the staleness store - the "we
-/// built against these versions" checkpoint, called after each plan save.
-fn record_artifact_versions(root: &Path) {
-    let current = current_artifact_versions(root);
-    if current.is_empty() {
-        return;
-    }
-    let map = current.into_iter().collect();
-    crate::critics::write_artifact_versions(root, &map);
-}
-
-/// Re-open any plan step whose upstream doc artifact CHANGED since the last recorded
-/// save (via [`Plan::invalidate_stale`]). Fail-open: empty store / no change = no-op.
-fn invalidate_stale_steps(root: &Path, plan: &mut Plan) {
-    let current = current_artifact_versions(root);
-    if current.is_empty() {
-        return;
-    }
-    let stale = crate::critics::stale_artifacts(root, &current);
-    if stale.is_empty() {
-        return;
-    }
-    use crate::critics::ArtifactKind as A;
-    let mut kinds: Vec<A> = Vec::new();
-    for n in &stale {
-        let Some(k) = artifact_kind_from_name(n) else {
-            continue;
-        };
-        kinds.push(k);
-        // A stale SOURCE doc must also invalidate the steps that read its DERIVED typed
-        // contracts (mirrors CriticArtifacts::present): FrontendEngineer reads ApiContract
-        // (derived from architecture.md), NOT Architecture directly, so without expanding
-        // to the derived kinds a revised architecture.md never reopened the frontend step
-        // and it kept building against a STALE contract.
-        match k {
-            A::Architecture => {
-                kinds.push(A::ApiContract);
-                kinds.push(A::DataModel);
-            }
-            A::Uiux => kinds.push(A::DesignTokens),
-            A::Prd => kinds.push(A::Acceptance),
-            _ => {}
-        }
-    }
-    plan.invalidate_stale(&kinds);
-}
-
-/// Whether `root` holds a resumable **director-loop plan** specifically: a
-/// persisted `.umadev/plan.json` with at least one incomplete step. Strictly
-/// narrower than [`has_resumable_run`] (which also accepts a legacy workflow
-/// state parked at a gate): only the director loop writes `plan.json`, so this is
-/// the discriminator the TUI uses to route a gate approval / revision back into
-/// [`drive_director_loop_resume`] instead of the legacy gate-block machinery.
-/// Pure, read-only, fail-open (absent / corrupt / fully-terminal plan → `false`).
-#[must_use]
-pub fn has_resumable_director_plan(root: &Path) -> bool {
-    load_resumable_plan(root).is_some()
-}
-
-/// Whether `root` holds a director-loop run that can be RESUMED on a fresh session:
-/// either a persisted `.umadev/plan.json` with an incomplete step, OR a
-/// `.umadev/workflow-state.json` parked at a gate / in a non-terminal phase. Pure,
-/// read-only, fail-open — a missing/corrupt plan or state is simply "not resumable"
-/// (never a panic). The TUI uses this so `/continue` on a fresh session re-attaches
-/// to the previous run instead of telling the user to restart the whole pipeline.
-#[must_use]
-pub fn has_resumable_run(root: &Path) -> bool {
-    // A persisted plan with remaining work is the strongest resume signal.
-    if load_resumable_plan(root).is_some() {
-        return true;
-    }
-    // Else a workflow state parked at a gate, or short of the terminal `delivery`
-    // phase, is also resumable (a run that produced state but no plan — e.g. the
-    // legacy walk, or a build interrupted before the plan was synthesised).
-    if let Some(state) = crate::state::read_workflow_state(root) {
-        if !state.active_gate.trim().is_empty() {
-            return true;
-        }
-        if state.phase != Phase::Delivery.id() {
-            return true;
-        }
-    }
-    false
-}
-
 /// **Cross-session resume** — re-attach to a persisted director-loop run on a FRESH
 /// base session instead of synthesising a new plan.
 ///
 /// Loads `.umadev/plan.json`; when a RESUMABLE plan exists (≥1 incomplete step) it
 /// re-emits [`EngineEvent::IntentDecided`] + [`EngineEvent::PlanPosted`] so the TUI
 /// re-renders the checklist with the already-`Done` steps checked, then drives ONLY
-/// the remaining steps via [`drive_plan_steps`] — which walks [`Plan::ready_steps`],
+/// the remaining steps via the internal plan-step driver — which walks [`Plan::ready_steps`],
 /// so a `Done` step is never ready and is never re-run. The base session is fresh
 /// (the old subprocess is gone): the persisted plan + the on-disk artifacts ARE the
 /// continuity, exactly as a `/run` opens a new session.
@@ -987,17 +829,9 @@ pub async fn drive_director_loop_resume(
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
 ) -> Option<DirectorLoopOutcome> {
-    // ONE RULE BOOK, on the resume door too (see `persist_run_governance_context`): a
-    // `/continue` drives the remaining steps and writes real code, so it must leave the
-    // same context on disk that the PreToolUse hook and `umadev ci` will judge by. A
-    // resumed run is still a run.
-    persist_run_governance_context(session, options).await;
-
-    // MED-3: a RESUME must honor the same Plan (read-only) gate as a fresh routed run.
-    // Without this, `/continue` in Plan mode re-drove every remaining step while the
-    // approval floor denied each write (Plan escalates all non-read actions) — the same
-    // deny-storm the fresh path already guards at `drive_director_loop_routed`. Stop
-    // cleanly with the read-only notice instead of resuming into a write storm.
+    // A resume is still an executing build. Enforce Plan before refreshing the
+    // persisted governance context or touching plan/workflow state, and keep the
+    // terminal meaning distinct from a genuinely completed run.
     if !options.mode.executes() {
         events.emit(EngineEvent::Note(
             umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
@@ -1005,10 +839,16 @@ pub async fn drive_director_loop_resume(
         events.emit(EngineEvent::Note(
             umadev_i18n::tl("mode.plan.gate").to_string(),
         ));
-        return Some(DirectorLoopOutcome::Done {
+        return Some(DirectorLoopOutcome::Planned {
             reply: umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
         });
     }
+
+    // ONE RULE BOOK, on the resume door too (see `persist_run_governance_context`): a
+    // `/continue` drives the remaining steps and writes real code, so it must leave the
+    // same context on disk that the PreToolUse hook and `umadev ci` will judge by. A
+    // resumed run is still a run.
+    persist_run_governance_context(session, options).await;
 
     let mut plan = load_resumable_plan(&options.project_root)?;
 
@@ -1035,27 +875,55 @@ pub async fn drive_director_loop_resume(
     // the already-Done steps are skipped and only the Pending ones drive; it persists
     // the plan + finalizes exactly as a fresh deliberate build does. A first-step
     // drive failure returns `None` (the caller fails open to a fresh run).
-    drive_plan_steps(session, options, events, route, &mut plan, idle, deadline).await
+    let receipt = crate::recipes::project_recipes_dir(&options.project_root).and_then(|dir| {
+        crate::recipes::active_recipe_receipt_for_plan(&dir, &plan).map(|receipt| (dir, receipt))
+    });
+    let outcome =
+        drive_plan_steps(session, options, events, route, &mut plan, idle, deadline).await;
+    match outcome.as_ref() {
+        Some(outcome) => settle_recipe_for_outcome(receipt.as_ref(), outcome),
+        // The resume could not start and the caller will create a fresh run. Its
+        // prior's result is unknowable, so close it instead of leaving fake pending
+        // evidence forever.
+        None => {
+            if let Some((dir, receipt)) = &receipt {
+                let _ = crate::recipes::settle_recipe_receipt(
+                    dir,
+                    receipt,
+                    crate::recipes::RecipeOutcome::Unknown,
+                );
+            }
+        }
+    }
+    outcome
 }
 
 /// Synthesise the owned plan, persist it best-effort, and emit [`EngineEvent::PlanPosted`].
 /// Returns the plan when one was produced, else `None` (the caller then runs the
 /// existing single-turn build). Fully fail-open: synthesis / persistence failures
 /// degrade to `None` / a skipped write, never an error.
+struct PostedPlan {
+    plan: Option<Plan>,
+    recipe_receipt: Option<(std::path::PathBuf, crate::recipes::RecipeReceipt)>,
+}
+
 async fn synthesize_and_post_plan(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
     deadline: std::time::Instant,
-) -> Option<Plan> {
+) -> PostedPlan {
     // A plan is warranted whenever there's a BUILD to make visible — every Build
     // route, even a lean single-page one, gets a (proportionally short) plan so the
     // user SEES the director think, not just a deliberate/deep one. A fast chat /
     // explain / quick-edit needs no DAG (and would just pay a fork round-trip for
     // nothing).
     if !(matches!(route.class, crate::router::RouteClass::Build) || route.depth.is_deliberate()) {
-        return None;
+        return PostedPlan {
+            plan: None,
+            recipe_receipt: None,
+        };
     }
     // Tell the user the director is PLANNING before the synthesis fork. That fork
     // collects the plan SILENTLY with up to a 180s window, so a complex requirement
@@ -1066,8 +934,15 @@ async fn synthesize_and_post_plan(
     ));
     // LOW #5: bound the planning drain by the SHARED run deadline so planning is
     // attributed to the run budget (no separate fixed 180s clock).
-    let plan = plan_state::synthesize_plan(session, options, &options.requirement, route, deadline)
-        .await?;
+    let synthesis =
+        plan_state::synthesize_plan_traced(session, options, &options.requirement, route, deadline)
+            .await;
+    let Some(plan) = synthesis.plan else {
+        return PostedPlan {
+            plan: None,
+            recipe_receipt: synthesis.recipe_receipt,
+        };
+    };
     // A FRESH plan synthesis == a NEW deliberate run: rotate the previous run's
     // notes (`.umadev/run-notes.md` → `.umadev/run-notes.prev.md`) so the notes
     // file stays run-scoped. A RESUME re-attaches the persisted plan (it never
@@ -1081,7 +956,28 @@ async fn synthesize_and_post_plan(
     // build is actually planning + working. Fail-open (swallows write errors).
     sync_phase_from_plan(&plan, options);
     events.emit(EngineEvent::plan_posted(&plan));
-    Some(plan)
+    PostedPlan {
+        plan: Some(plan),
+        recipe_receipt: synthesis.recipe_receipt,
+    }
+}
+
+fn settle_recipe_for_outcome(
+    receipt: Option<&(std::path::PathBuf, crate::recipes::RecipeReceipt)>,
+    outcome: &DirectorLoopOutcome,
+) {
+    let Some((dir, receipt)) = receipt else {
+        return;
+    };
+    let outcome = match outcome {
+        DirectorLoopOutcome::Done { .. } => crate::recipes::RecipeOutcome::Pass,
+        DirectorLoopOutcome::Failed(_) => crate::recipes::RecipeOutcome::Fail,
+        DirectorLoopOutcome::Planned { .. } => crate::recipes::RecipeOutcome::Unknown,
+        // A gate pause is not terminal. The active marker carries this exact receipt
+        // into `drive_director_loop_resume`, where it will settle once.
+        DirectorLoopOutcome::PausedAtGate { .. } => return,
+    };
+    let _ = crate::recipes::settle_recipe_receipt(dir, receipt, outcome);
 }
 
 /// Internal escape hatch (Wave A safety valve): when `UMADEV_NO_SEAT_BUILD` is
@@ -1170,7 +1066,12 @@ async fn drive_director_loop_with_idle(
     }
 
     let mut next_directive = first_directive;
-    let mut last_reply = String::new();
+    // The last objective findings that a fix turn was meant to clear. They survive
+    // a wall-clock settle so the terminal outcome can name WHY the build is not done.
+    let mut residual_qc: Vec<String> = Vec::new();
+    let mut budget_reached = false;
+    let mut qc_blockers = crate::blocker::BlockerSetTracker::default();
+    let mut last_qc_snapshot: Option<SourceTreeSnapshot> = None;
     // Change 2 (single-turn twin): did this build go through blocking-item rework? A round
     // past 0 is a fix turn, so the build was reworked → the ONE integrated final report
     // supersedes report A at the settle. A clean round-0 build keeps its reply untouched.
@@ -1192,10 +1093,11 @@ async fn drive_director_loop_with_idle(
         // hard-gate the caller runs). Round 0 (the build itself) always runs.
         if round > 0 && std::time::Instant::now() >= deadline {
             events.emit(EngineEvent::Note(
-                "team · time budget reached — settling with the current build (raise \
+                "team · time budget reached — stopping incomplete with the current build (raise \
                  UMADEV_RUN_BUDGET_SECS for more fix rounds)"
                     .to_string(),
             ));
+            budget_reached = true;
             break;
         }
         // Plan visibility (Wave 1): mark the ready BUILD steps Active before this
@@ -1239,25 +1141,20 @@ async fn drive_director_loop_with_idle(
                 ))
             }
         };
-        last_reply = turn.text.clone();
+        let last_reply = turn.text.clone();
 
-        // 2. On the FIRST turn only: if the base didn't claim it built/changed code
-        //    (a chat / plan / "I read it" answer), there is nothing to QC — settle.
-        //    This keeps a simple goal the base just answered directly from being
-        //    forced through QC. A FIX turn (round >= 1) is NEVER short-circuited
-        //    here: the previous QC already proved there were blocking problems, so
-        //    the fix MUST be re-verified — a fix reply that only says "confirmed it
-        //    passes" (no change-verb) must not be mistaken for "nothing to check"
-        //    and settle with the problems still unfixed. QC is read-only + cheap.
-        if round == 0 && !crate::gates::claims_code_changes(&turn.text) {
-            // No code claimed → nothing the plan describes actually ran; leave the
-            // steps as-is (the caller decides) and settle. SIZING calibration: a route
-            // that mutated nothing is a TRIVIAL actual outcome — a route sized as a real
-            // build here OVER-sized the turn (advisory, fail-open; see `record_run_sizing`).
-            record_run_sizing(options, route, crate::sizing_calibration::SizeRank::Trivial);
-            return DirectorLoopOutcome::Done { reply: last_reply };
-        }
-
+        // 2. UmaDev ALWAYS runs its own objective QC pass — hard floor + verify +
+        //    optional fork review. Reply wording is narration, never acceptance
+        //    evidence: a tool-only turn, a terse "OK", or a base that simply omits a
+        //    change verb may still have written files, left an owned plan Active, or
+        //    skipped verification. The old first-round prose shortcut returned Done
+        //    before any of those facts were checked. Keeping every round on this one
+        //    mechanical boundary also means an uncorroborated green claim reaches the
+        //    build/test fact read (`ran_build_tool == false`) instead of bypassing it.
+        //
+        //    A true Chat/Explain request never enters the Director in the first place;
+        //    once this Build engine owns the turn, only objective QC may settle it.
+        //
         // 3. UmaDev runs its OWN objective QC pass — hard floor + verify + optional
         //    fork review. NOTHING here is the base summoning a team; it is UmaDev
         //    inspecting reality over the borrowed brain. When a route is in hand, the
@@ -1299,9 +1196,10 @@ async fn drive_director_loop_with_idle(
                     crate::sizing_calibration::SizeRank::Heavy
                 },
             );
-            // ACTIVE FACT-RECORDING BACKSTOP (single-turn path): this clean build
-            // turn changed code (it passed `claims_code_changes` on round 0), so it
-            // is a real work turn — extract its durable facts ourselves and persist
+            // ACTIVE FACT-RECORDING BACKSTOP (single-turn path): this turn passed the
+            // objective build QC, so it is a real completed work turn regardless of
+            // whether its final prose happened to use a change verb — extract its
+            // durable facts ourselves and persist
             // them to `.umadev/memory/facts.jsonl` so the store reliably populates
             // without depending on the base writing it. Once per clean single-turn
             // build (count 1 → the throttle always fires the first work turn); a
@@ -1325,15 +1223,41 @@ async fn drive_director_loop_with_idle(
             };
         }
 
-        // 5. QC found blocking problems. Out of fix budget → settle (the caller's
-        //    source-present hard-gate is the objective backstop).
+        residual_qc = qc.blocking.clone();
+        let current_qc_snapshot = source_tree_snapshot(&options.project_root);
+        let workspace_progress = last_qc_snapshot
+            .as_ref()
+            .is_some_and(|previous| previous != &current_qc_snapshot);
+        last_qc_snapshot = Some(current_qc_snapshot);
+        let assessments = qc.assess_blockers(&mut qc_blockers, workspace_progress);
+        emit_blocker_assessments(events, &assessments);
+        if let Some(stuck) = assessments
+            .iter()
+            .find(|item| item.disposition == crate::blocker::BlockerDisposition::Escalate)
+        {
+            residual_qc.push(format!(
+                "stuck detector: blocker `{}` repeated {} times without a source-tree change",
+                stuck.diagnosis.fingerprint, stuck.repeat_count
+            ));
+            persist_plan(&plan, options);
+            finalize_phase_from_plan_opt(&plan, options, false);
+            return DirectorLoopOutcome::Failed(qc_incomplete_reason(
+                "auto-QC stopped an unchanged repair loop",
+                &residual_qc,
+            ));
+        }
+
+        // 5. QC found blocking problems. Out of fix budget → terminate honestly.
+        //    The caller's source-present check is only ONE floor and cannot clear
+        //    governance/build/review findings, so returning Done here would overwrite
+        //    the real incomplete state with a completion card.
         if round + 1 >= MAX_QC_ROUNDS {
             events.emit(EngineEvent::Note(
-                "team · auto-QC reached its fix-round budget — settling (objective hard-gate decides reality)"
+                "team · auto-QC reached its fix-round budget — stopping incomplete with residual evidence"
                     .to_string(),
             ));
-            // The objective hard-gate decides reality; the plan steps stay where
-            // they are (Active), honestly reflecting that QC didn't fully clear.
+            // The plan steps stay where they are (Active), honestly reflecting that
+            // QC didn't fully clear; the terminal Failed reason carries the findings.
             // Persist the final state for resume.
             persist_plan(&plan, options);
             // Sync the 9-phase state at a NON-clean settle: never claim `delivery` —
@@ -1343,20 +1267,15 @@ async fn drive_director_loop_with_idle(
             // SIZING calibration: the cheap path burned its whole QC fix budget without
             // clearing → the work was HEAVIER than the single-turn sizing assumed.
             record_run_sizing(options, route, crate::sizing_calibration::SizeRank::Heavy);
-            // Change 2: this settle is always a reworked path (a fix round ran) — produce
-            // the ONE integrated final report; fail-open to the existing reply.
-            return DirectorLoopOutcome::Done {
-                reply: if reworked {
-                    integrated_final_report(session, options, events, last_reply, deadline).await
-                } else {
-                    last_reply
-                },
-            };
+            return DirectorLoopOutcome::Failed(qc_incomplete_reason(
+                "auto-QC fix-round budget exhausted before the blocking findings cleared",
+                &residual_qc,
+            ));
         }
 
         // 6. Fold the QC findings into ONE fix directive and feed it back over the
         //    USB channel for another build pass → re-QC.
-        next_directive = qc.fix_directive();
+        next_directive = qc.fix_directive_with_assessments("", &assessments);
     }
 
     // Loop fell through (exhausted the bounded rounds) — persist the plan's final
@@ -1367,15 +1286,12 @@ async fn drive_director_loop_with_idle(
     // SIZING calibration: exhausting the bounded rounds means the work outran the
     // single-turn sizing → HEAVY actual outcome. Advisory, fail-open.
     record_run_sizing(options, route, crate::sizing_calibration::SizeRank::Heavy);
-    // Change 2: the loop only reaches here after fix rounds ran → produce the ONE
-    // integrated final report (fail-open to the existing reply).
-    DirectorLoopOutcome::Done {
-        reply: if reworked {
-            integrated_final_report(session, options, events, last_reply, deadline).await
-        } else {
-            last_reply
-        },
-    }
+    let reason = if budget_reached {
+        "run time budget exhausted before auto-QC cleared"
+    } else {
+        "auto-QC settled without a clean verdict"
+    };
+    DirectorLoopOutcome::Failed(qc_incomplete_reason(reason, &residual_qc))
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1474,6 +1390,54 @@ async fn drive_plan_steps(
     if let Some(halt) = halt_if_workspace_in_past(options, events) {
         return Some(halt);
     }
+    // P0 EXECUTION CONTRACT — intent classification is not a write boundary. Every
+    // mutating plan step must name its create/modify surface before the first doer
+    // runs; otherwise the scope denominator is unknowable and the old scope floor
+    // silently stood down. Planning already performs one bounded repair re-ask. If
+    // it is still incomplete, fail explicitly and keep the workspace untouched —
+    // never widen to the legacy end-to-end mega-turn.
+    let contract =
+        crate::execution_contract::ExecutionContract::from_plan(route, &options.requirement, plan);
+    if let Some(violation) = contract.preflight_violations().into_iter().next() {
+        for step in plan
+            .steps
+            .iter_mut()
+            .filter(|step| step.kind == plan_state::StepKind::Build && step.files.is_empty())
+        {
+            step.status = StepStatus::Blocked;
+            events.emit(EngineEvent::plan_step_status(
+                step.id.clone(),
+                step.title.clone(),
+                StepStatus::Blocked,
+            ));
+        }
+        events.emit(EngineEvent::Note(format!(
+            "floor · {}: {}",
+            violation.code, violation.message
+        )));
+        persist_plan_ref(plan, options);
+        finalize_phase_from_plan(plan, options, false);
+        emit_plan_completion_summary(plan, events);
+        return Some(DirectorLoopOutcome::Failed(violation.message));
+    }
+    let mut task_tracker = match crate::plan_tasks::PlanTaskTracker::open(
+        &options.project_root,
+        &options.backend,
+        &options.requirement,
+        plan,
+    ) {
+        Ok(tracker) => tracker,
+        Err(error) => {
+            let reason = format!("agent task ledger unavailable: {error}");
+            events.emit(EngineEvent::Note(format!("team · {reason}")));
+            return Some(DirectorLoopOutcome::Failed(reason));
+        }
+    };
+    events.emit(EngineEvent::Note(format!(
+        "team · agent run {} · {} durable task(s)",
+        task_tracker.run_id(),
+        task_tracker.tasks().count()
+    )));
     events.emit(EngineEvent::Note(format!(
         "team · scheduling {} step(s) over the team ({} build · {} review)",
         plan.steps.len(),
@@ -1488,14 +1452,8 @@ async fn drive_plan_steps(
     )));
 
     let mut last_reply = String::new();
-    // Change 2: did the build actually go through blocking-item rework? Set true when a
-    // review step fired a fix turn OR the final gate ran a fix turn. The ONE integrated
-    // final report is produced at convergence when this is set OR when the build settled
-    // CLEAN (every step Done + a clean final gate): every per-step doer reply was
-    // wrap-up-suppressed, so a clean plan-driven build still needs its deferred final
-    // report. Only a build that ended neither clean nor reworked (blocked / stranded)
-    // keeps the last step's reply (no report turn burned on a non-delivering base).
-    let mut reworked = false;
+    // Every clean plan-driven build gets ONE integrated report: per-step doer replies
+    // are wrap-up-suppressed. A non-clean build gets no success-shaped report turn.
     let mut transitions = 0usize;
     // The running count of completed BUILD steps — the "work turn" tally that the
     // active fact-extraction backstop throttles on (see `crate::fact_extract`).
@@ -1505,6 +1463,11 @@ async fn drive_plan_steps(
     // so a build where the base keeps failing the same way STOPS with a diagnosis
     // instead of grinding to MAX_STEP_TRANSITIONS burning effort. A Done step resets it.
     let mut failure_breaker = crate::trust::ConsecutiveFailureBreaker::new();
+    // Machine-true evidence accumulated when a step settles Blocked. The plan stores
+    // the terminal status, but not each verifier's gap text; keep a bounded run-local
+    // copy so a non-clean terminal outcome can explain the failure to the caller.
+    let mut incomplete_evidence: Vec<(String, String)> = Vec::new();
+    let mut budget_reached = false;
     // SELF-EVOLUTION: run-scoped set of recurring-pitfall signatures a reflection has
     // already been attempted for, so `drive_build_step` fires the (forked, fail-open)
     // reflection consult AT MOST ONCE per signature per run. Bounded by construction.
@@ -1535,6 +1498,7 @@ async fn drive_plan_steps(
                  UMADEV_RUN_BUDGET_SECS for a longer run)"
                     .to_string(),
             ));
+            budget_reached = true;
             break;
         }
         // Blast-radius-weighted scheduling: among the currently-ready PEERS, drive the
@@ -1557,6 +1521,19 @@ async fn drive_plan_steps(
         let Some(step) = plan.steps.iter().find(|s| s.id == step_id).cloned() else {
             break;
         };
+        if let Err(error) = task_tracker.start_step(plan, &step) {
+            let reason = format!("agent task `{}` could not start: {error}", step.id);
+            plan.mark(&step_id, StepStatus::Blocked);
+            events.emit(EngineEvent::plan_step_status(
+                step_id,
+                step.title,
+                StepStatus::Blocked,
+            ));
+            events.emit(EngineEvent::Note(format!("team · {reason}")));
+            persist_plan_ref(plan, options);
+            let _ = task_tracker.finish(false, &reason, vec![reason.clone()]);
+            return Some(DirectorLoopOutcome::Failed(reason));
+        }
         plan.mark(&step_id, StepStatus::Active);
         events.emit(EngineEvent::plan_step_status(
             step_id.clone(),
@@ -1602,6 +1579,24 @@ async fn drive_plan_steps(
         // longer exists. Stop, honestly, right here: the plan is persisted, the notice is
         // raised, and the next start's heal puts the tree back before anything else runs.
         if let Some(halt) = halt_if_workspace_in_past(options, events) {
+            let reason = "workspace recovery interrupted the active agent task";
+            let blockers = vec![reason.to_string()];
+            let _ = task_tracker.settle_base_agents(
+                &step,
+                &outcome.base_agents,
+                StepStatus::Blocked,
+                false,
+                reason,
+                &blockers,
+            );
+            let _ = task_tracker.settle_step(
+                &step,
+                StepStatus::Blocked,
+                false,
+                reason,
+                blockers.clone(),
+            );
+            let _ = task_tracker.finish(false, reason, blockers);
             return Some(halt);
         }
 
@@ -1610,15 +1605,13 @@ async fn drive_plan_steps(
             reply,
             drove,
             made_progress,
+            unavailable,
+            base_agents,
             gap_evidence,
-            reworked: step_reworked,
         } = outcome;
         if !reply.is_empty() {
             last_reply = reply;
         }
-        // Change 2: a review step that fired blocking-item rework marks the whole build
-        // as reworked, so the integrated final report supersedes the (now-stale) report A.
-        reworked |= step_reworked;
 
         // MEDIUM #2 (first-step bail) — FIX: reset the just-marked Active step BEFORE
         // bailing. If the FIRST step is a Build that could not drive a single turn (a
@@ -1631,6 +1624,24 @@ async fn drive_plan_steps(
         // step that no-ops (an empty team) does NOT bail: there's simply nothing to
         // review yet, and the next (Build) step still gets its chance.
         if transitions == 1 && step.kind == plan_state::StepKind::Build && !drove {
+            let reason = "the first scheduled doer turn could not run";
+            let blockers = vec![reason.to_string()];
+            let _ = task_tracker.settle_base_agents(
+                &step,
+                &base_agents,
+                StepStatus::Blocked,
+                true,
+                reason,
+                &blockers,
+            );
+            let _ = task_tracker.settle_step(
+                &step,
+                StepStatus::Blocked,
+                true,
+                reason,
+                blockers.clone(),
+            );
+            let _ = task_tracker.finish(false, reason, blockers);
             plan.mark(&step_id, StepStatus::Pending);
             events.emit(EngineEvent::plan_step_status(
                 step_id,
@@ -1666,9 +1677,54 @@ async fn drive_plan_steps(
             // Bounded: a step that exhausted its fix budget — OR a BUILD step that cleared
             // only a neutral skip with no real work — is Blocked (honest), so it no longer
             // gates dependents but the plan records the gap. The final QC gate + the
-            // caller's hard-gate still decide overall reality.
+            // final QC gate still decides overall reality.
             StepStatus::Blocked
         };
+        let task_summary = if status == StepStatus::Done {
+            format!("step `{}` passed its deterministic acceptance", step.title)
+        } else if unavailable {
+            format!(
+                "step `{}` could not obtain a required host/review",
+                step.title
+            )
+        } else {
+            format!(
+                "step `{}` did not pass its deterministic acceptance",
+                step.title
+            )
+        };
+        let mut task_blockers = gap_evidence.clone();
+        if status == StepStatus::Blocked && task_blockers.is_empty() {
+            task_blockers.push(task_summary.clone());
+        }
+        if let Err(error) = task_tracker.settle_base_agents(
+            &step,
+            &base_agents,
+            status,
+            unavailable,
+            &task_summary,
+            &task_blockers,
+        ) {
+            let reason = format!(
+                "base-native tasks under `{}` could not settle: {error}",
+                step.id
+            );
+            events.emit(EngineEvent::Note(format!("team · {reason}")));
+            plan.mark(&step_id, StepStatus::Blocked);
+            persist_plan_ref(plan, options);
+            let _ = task_tracker.finish(false, &reason, vec![reason.clone()]);
+            return Some(DirectorLoopOutcome::Failed(reason));
+        }
+        if let Err(error) =
+            task_tracker.settle_step(&step, status, unavailable, &task_summary, task_blockers)
+        {
+            let reason = format!("agent task `{}` could not settle: {error}", step.id);
+            events.emit(EngineEvent::Note(format!("team · {reason}")));
+            plan.mark(&step_id, StepStatus::Blocked);
+            persist_plan_ref(plan, options);
+            let _ = task_tracker.finish(false, &reason, vec![reason.clone()]);
+            return Some(DirectorLoopOutcome::Failed(reason));
+        }
         plan.mark(&step_id, status);
         events.emit(EngineEvent::plan_step_status(
             step_id,
@@ -1681,6 +1737,17 @@ async fn drive_plan_steps(
         // a step that actually ticked Done moves the phase; a Blocked step leaves it.
         // Fail-open. This is what keeps `/status` honest as the build progresses.
         sync_phase_from_plan(plan, options);
+
+        if status == StepStatus::Done && made_progress {
+            let kind = match step.kind {
+                plan_state::StepKind::Build => "build",
+                plan_state::StepKind::Review => "review",
+            };
+            let _ = crate::context::record_run_note(
+                &options.project_root,
+                &format!("Verified {kind} step completed: {}", step.title.trim()),
+            );
+        }
 
         // CIRCUIT BREAKER (UD-FLOW-008). Feed this step's outcome into the
         // consecutive-same-class-failure breaker: a Done step is real progress (reset);
@@ -1723,6 +1790,20 @@ async fn drive_plan_steps(
         // sub-DAG still faces the identical acceptance floor; no gate is weakened. The
         // `replanned` flag is consumed on the single attempt so this can never loop.
         if status == StepStatus::Blocked {
+            if gap_evidence.is_empty() {
+                incomplete_evidence.push((
+                    step.id.clone(),
+                    format!(
+                        "step `{step_title}` did not satisfy acceptance or produce verifiable progress"
+                    ),
+                ));
+            } else {
+                incomplete_evidence.extend(
+                    gap_evidence
+                        .iter()
+                        .map(|gap| (step.id.clone(), format!("step `{step_title}`: {gap}"))),
+                );
+            }
             attempt_replan_blocked_subtree(
                 session,
                 options,
@@ -1770,6 +1851,12 @@ async fn drive_plan_steps(
         // re-load would lose the build on resume, so the run keeps driving instead.
         if let Some(gate) = confirm_gate_after_step(&step, status, plan, options) {
             if plan_state::save(plan, &options.project_root).is_ok() {
+                if let Err(error) = task_tracker.wait_for_user(gate.id_str()) {
+                    let reason = format!("agent task ledger could not pause at gate: {error}");
+                    events.emit(EngineEvent::Note(format!("team · {reason}")));
+                    let _ = task_tracker.finish(false, &reason, vec![reason.clone()]);
+                    return Some(DirectorLoopOutcome::Failed(reason));
+                }
                 // Checkpoint the doc versions the user is confirming, so a resume
                 // re-opens doc steps ONLY if the user actually edits a doc while
                 // the run is parked (the staleness store, same as persist_plan_ref).
@@ -1807,6 +1894,7 @@ async fn drive_plan_steps(
     // here, so the final whole-build gate's round 0 runs UmaDev's OWN build/test read
     // rather than trusting the last step's prose (a safe tightening — each step was
     // already verified; this only re-checks once). Fix rounds re-derive it per turn.
+    let no_fix_context = KnowledgeDigest::default();
     let final_gate = run_final_gate(
         session,
         options,
@@ -1814,15 +1902,12 @@ async fn drive_plan_steps(
         route,
         &last_reply,
         deadline,
-        "",
+        &no_fix_context,
         false,
     )
     .await;
     if !final_gate.reply.is_empty() {
         last_reply = final_gate.reply;
-        // Change 2: the final gate ran a fix turn → the build went through rework, so the
-        // last build step's report A is stale (it predates this fix).
-        reworked = true;
     }
 
     // HONEST clean signal (used for the report below AND finalize): every step
@@ -1835,28 +1920,57 @@ async fn drive_plan_steps(
     // incomplete build can never be disguised as a clean delivery. This makes the
     // step path's gate never weaker than the single-turn loop (which already gates
     // finalize INSIDE `qc.is_clean()`). Fail-open: a dirty gate just means "not clean".
-    let clean = plan.steps.iter().all(|s| s.status == StepStatus::Done) && final_gate.clean;
+    let mut clean = plan.steps.iter().all(|s| s.status == StepStatus::Done) && final_gate.clean;
+    let mut task_failure_reason = None;
+    let task_finish_summary = if clean {
+        "all agent tasks passed their deterministic acceptance"
+    } else {
+        "one or more agent tasks did not reach verified success"
+    };
+    match task_tracker.finish(
+        clean,
+        task_finish_summary,
+        incomplete_evidence
+            .iter()
+            .map(|(step_id, evidence)| format!("{step_id}: {evidence}"))
+            .chain(final_gate.blocking.iter().cloned())
+            .collect(),
+    ) {
+        Ok(crate::task_lifecycle::RunReadiness::Succeeded) if clean => {}
+        Ok(readiness) => {
+            clean = false;
+            task_failure_reason = Some(format!("agent task ledger settled as {readiness:?}"));
+        }
+        Err(error) => {
+            clean = false;
+            task_failure_reason = Some(format!("agent task ledger could not settle: {error}"));
+        }
+    }
 
-    // Change 2: the build has CONVERGED — drive the ONE integrated final report on the
-    // MAIN continuous session (which holds the full build + rework history) and record
-    // THAT as the reply the user sees. Two cases earn it, exactly once each:
-    //   - REWORKED (a review-step fix turn OR the final gate's fix turn ran): the base's
-    //     earlier streamed "here's what I did — ## Next steps" (report A) is stale — it
-    //     can't reflect the blocking-item fixes or the plan/dependency changes they caused.
-    //   - CLEAN plan-driven convergence: every per-step doer directive carried the
-    //     wrap-up suppression note (`summon_directive`), so the last step's reply is a
-    //     deliberately conclusion-free step narration — WITHOUT this turn a clean build
-    //     would end on a mid-run narration and the deferred wrap-up would never arrive
-    //     (the user's final report is worth the one extra bounded turn).
-    // A build that ended NEITHER clean NOR reworked (blocked/stranded steps, no fix turn
-    // ran — e.g. a dead session) keeps the honest last reply + the per-step completion
-    // summary below; no report turn is burned on a base that isn't delivering.
-    // FAIL-OPEN: a dead/empty turn degrades to the existing `last_reply` (never lost). This
-    // runs AFTER `run_final_gate` and BEFORE the structured completion artifacts below,
-    // which stay untouched (they were already emitted post-convergence).
-    if reworked || clean {
+    // Only a CLEAN plan-driven convergence earns the integrated final report. Every
+    // per-step directive suppressed its project-level wrap-up, so this bounded turn is
+    // the one user-facing conclusion. A Blocked/budget/dirty-gate settle deliberately
+    // skips it: streaming a success-shaped report before returning Failed would recreate
+    // the false completion this terminal check prevents. Fail-open on a dead report turn:
+    // `integrated_final_report` preserves the previous reply.
+    if clean {
         last_reply = integrated_final_report(session, options, events, last_reply, deadline).await;
     }
+
+    let incomplete_reason = (!clean).then(|| {
+        let mut reason = plan_incomplete_reason(
+            plan,
+            budget_reached || std::time::Instant::now() >= deadline,
+            transitions >= MAX_STEP_TRANSITIONS,
+            &incomplete_evidence,
+            &final_gate.blocking,
+        );
+        if let Some(task_reason) = task_failure_reason {
+            reason.push_str("; ");
+            reason.push_str(&task_reason);
+        }
+        reason
+    });
 
     // Persist the plan's terminal state for resume.
     persist_plan_ref(plan, options);
@@ -1884,7 +1998,7 @@ async fn drive_plan_steps(
         // SUCCESS-RECIPE CAPTURE (the WIN sibling of the pitfall pipeline): distil the
         // plan shape this CLEAN deliberate build actually executed — the ordered
         // step titles/seats that reached Done, the scaffold its evidence named, the
-        // detected stack + requirement shape — into a reusable cross-project recipe,
+        // detected stack + requirement shape — into a reusable project-private recipe,
         // so the next similar build gets it as a plan-time PRIOR. One optional
         // read-only fork enriches patterns; everything is best-effort + fail-open, so
         // a capture error NEVER affects the just-finished delivery.
@@ -1908,7 +2022,10 @@ async fn drive_plan_steps(
         route,
         run_actual_size_from_plan(plan),
     );
-    Some(DirectorLoopOutcome::Done { reply: last_reply })
+    Some(match incomplete_reason {
+        Some(reason) => DirectorLoopOutcome::Failed(reason),
+        None => DirectorLoopOutcome::Done { reply: last_reply },
+    })
 }
 
 /// The confirmation gate to OPEN after a plan step settled, or `None` (the
@@ -2042,7 +2159,13 @@ fn persist_gate_open(options: &RunOptions, gate: crate::gates::Gate) {
         last_transition_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         note: format!("Paused at {} (director loop)", gate.id_str()),
         backend: options.backend.clone(),
-        base_session_id: current_state.and_then(|s| s.base_session_id),
+        base_session_id: current_state
+            .as_ref()
+            .and_then(|s| s.base_session_id.clone()),
+        base_resume_identity: current_state
+            .as_ref()
+            .and_then(|s| s.base_resume_identity.clone()),
+        permission_profile: Some(options.mode.base_permissions()),
         spec_version: umadev_spec::SPEC_VERSION.to_string(),
     };
     let _ = crate::state::write_workflow_state(&options.project_root, &state);
@@ -2072,8 +2195,8 @@ fn run_actual_size_from_plan(plan: &Plan) -> crate::sizing_calibration::SizeRank
 /// "accepted" step that did NO real verifiable work (a dead Build turn that only
 /// cleared a neutral skip, or an empty-team ReviewClean) is accepted-but-not-progress,
 /// so the scheduler marks it Blocked rather than falsely ticking it Done.
-// The four flags are INDEPENDENT honest observations of one step's outcome (accepted /
-// drove-a-turn / made-real-progress / fired-rework), not a state machine — collapsing
+// The three flags are INDEPENDENT honest observations of one step's outcome (accepted /
+// drove-a-turn / made-real-progress), not a state machine — collapsing
 // them into an enum would lose the orthogonal signals the scheduler reads separately.
 #[allow(clippy::struct_excessive_bools)]
 struct StepOutcome {
@@ -2089,19 +2212,19 @@ struct StepOutcome {
     /// green build / a seat that actually reviewed). `false` = a neutral skip that
     /// must not count toward `Done`.
     made_progress: bool,
+    /// The required host/reviewer was unavailable, rather than returning a
+    /// semantic verification failure.
+    unavailable: bool,
+    /// Base-native child agents observed while producing this step. The plan
+    /// ledger hashes vendor ids and settles these children with the same
+    /// deterministic result as their parent step.
+    base_agents: crate::bg_agents::BaseAgentObservation,
     /// The TYPED gap evidence from the step's LAST failing acceptance check (the
     /// diagnosed "declared X but Y" lines the deterministic floor produced) — carried
     /// out so a BOUNDED RE-PLAN of a blocked subtree can feed the brain WHY the step
     /// blocked, not just that it did. Empty on an accepted step or a neutral skip that
     /// produced no verifiable failure.
     gap_evidence: Vec<String>,
-    /// Whether this step actually FIRED blocking-item rework — a review step that found
-    /// MUST-FIX findings and drove a fix turn on the main session (Change 2). It is the
-    /// signal the scheduler folds into the run-level `reworked` flag so the ONE integrated
-    /// final report is produced only when the build truly went through rework (a clean
-    /// build keeps the last build step's reply as its final word). A Build step never sets
-    /// this: its own fix rounds are already reflected in its final reply.
-    reworked: bool,
 }
 
 /// The overall-goal preamble prepended to every plan-step directive — the directive
@@ -2167,14 +2290,14 @@ fn integrated_final_report_directive(options: &RunOptions) -> String {
         format!("## The product being delivered\n{req}\n\n")
     };
     format!(
-        "{goal}The build has now converged: the team reviewed the work and every \
-         blocking item raised in review has been worked through. Write the SINGLE, \
+        "{goal}The build has now reached a clean convergence: no unresolved review \
+         blocker or unavailable required reviewer remains. Write the SINGLE, \
          integrated final report for this build now — this is the wrap-up you deferred \
          while the steps were still running. Ground it entirely in what actually \
          happened in this session (you hold the full history). Do NOT open new work or \
          edit files — just report, concisely:\n\
          - What was ultimately delivered, and its real, current state.\n\
-         - Which blocking / must-fix items the review surfaced, and HOW each was resolved.\n\
+         - Which blocking / must-fix items the review actually surfaced and how each was resolved; if none were raised, say none.\n\
          - Any changes to the plan or task dependencies those fixes caused.\n\
          - Anything the user should know or do next.\n\
          Write the report in the same language you have been working in this session."
@@ -2255,6 +2378,22 @@ fn plan_progress_recitation(plan: &Plan, current_step_id: &str) -> String {
     )
 }
 
+fn render_project_learned_reference(
+    kind: umadev_knowledge::PromptReferenceKind,
+    source: &str,
+    section: &str,
+    content: &str,
+) -> String {
+    umadev_knowledge::render_prompt_reference(umadev_knowledge::PromptReference {
+        kind,
+        corpus_origin: umadev_knowledge::CorpusOrigin::ProjectLearned,
+        corpus_scope: umadev_knowledge::CorpusScope::Project,
+        source,
+        section: Some(section),
+        content,
+    })
+}
+
 /// Drive ONE Build step: `summon` the step's seat serially on the main session with
 /// a focused directive (recalled pitfalls injected), then verify against the step's
 /// `acceptance` on the deterministic floor. A failing acceptance folds its evidence
@@ -2318,9 +2457,8 @@ async fn drive_build_step(
         instruction.push_str("\n\n");
         instruction.push_str(plan_progress.trim());
     }
-    // RUN-NOTES RECALL (B1#6, bounded): the base's OWN persisted working notes
-    // from earlier in this run (`.umadev/run-notes.md` — the firmware told it to
-    // append decisions / discoveries / blockers there). Re-injected as a bounded
+    // RUN-NOTES RECALL (B1#6, bounded): UmaDev's persisted verified work notes
+    // from earlier in this run (`.umadev/run-notes.md`). Re-injected as a bounded
     // tail at each step so the working memory SURVIVES session resets, compaction,
     // and cross-session resumes on a fresh brain. Fail-open: an absent / empty /
     // unreadable file injects nothing (directive unchanged).
@@ -2334,7 +2472,12 @@ async fn drive_build_step(
     }
     if !pitfalls.trim().is_empty() {
         instruction.push_str("\n\n## Known pitfalls to avoid (from past runs)\n");
-        instruction.push_str(pitfalls.trim());
+        instruction.push_str(&render_project_learned_reference(
+            umadev_knowledge::PromptReferenceKind::Lesson,
+            ".umadev/learned/_raw",
+            "requirement_recall",
+            pitfalls.trim(),
+        ));
     }
     // MID-RUN USER STEERING (A2#4/#5): drain the hosting UI's queued directives
     // (`/plan skip|veto|add`, text typed while the build ran, a gate revision) at
@@ -2378,6 +2521,15 @@ async fn drive_build_step(
             instruction.push_str(&format!("- `{p}`\n"));
         }
     }
+    // EXECUTION CONTRACT (model-facing belt). The deterministic post-condition
+    // checks the run diff, but the doer should know the boundary before it reaches
+    // for a tool: only this step's declared files, its concrete deliverables, and a
+    // proportional change budget. The plan preflight above guarantees this block is
+    // never the "no surface" form on a writer step.
+    let step_contract =
+        crate::execution_contract::ExecutionContract::from_step(route, &options.requirement, step);
+    instruction.push_str("\n\n");
+    instruction.push_str(&step_contract.prompt_block());
 
     // TEST-INTEGRITY BASELINE (UD-QA-001). Snapshot the project's TEST surface
     // BEFORE this step's doer turn(s) so the deterministic floor can detect
@@ -2437,12 +2589,17 @@ async fn drive_build_step(
 
     let mut drove = false;
     let mut last_reply = String::new();
-    // SELF-EVOLUTION accounting across this step's fix rounds (a SIDE EFFECT of the
-    // deterministic acceptance verdict, never a driver of it). Carries the previous
-    // round's FAILING evidence so a pass that RECOVERS from it can reward + mark
-    // resolved the pitfall whose recorded fix just held. Empty on a clean first pass.
-    let mut prior_fail_errors: Vec<String> = Vec::new();
+    let mut last_fail_errors: Vec<String> = Vec::new();
+    let mut base_agents = crate::bg_agents::BaseAgentObservation::default();
+    // Failure whose recalled fix is embedded in the NEXT re-drive. It is
+    // committed only after that directive was actually accepted by the host.
+    let mut pending_fix_error: Option<String> = None;
+    let mut pending_fix_verifiers: Vec<String> = Vec::new();
+    let mut blocker_detector = crate::blocker::StuckDetector::default();
+    let mut last_failure_snapshot: Option<SourceTreeSnapshot> = None;
     for round in 0..=max_fix_rounds {
+        let mut committed_attempt: Option<String> = None;
+        let mut committed_attempt_verifiers: Vec<String> = Vec::new();
         // Wall-clock ceiling (graceful): an EXTRA fix round past the budget is
         // abandoned — round 0 (the actual work) always runs, only the re-drives are
         // skipped, so a build can't keep grinding minute-long summon turns past its
@@ -2477,6 +2634,7 @@ async fn drive_build_step(
             ),
         )
         .await;
+        base_agents.merge(summoned.base_agents.clone());
         if summoned.done {
             drove = true;
         }
@@ -2499,21 +2657,29 @@ async fn drive_build_step(
                 reply: last_reply,
                 drove,
                 made_progress: false,
+                unavailable: true,
+                base_agents,
                 gap_evidence: vec![
                     "base session unreachable — the step's doer directive could not be \
                      sent, so no turn ever ran for this step"
                         .to_string(),
                 ],
-                reworked: false,
             };
+        }
+        // The exact knowledge receipt exists only when the doer directive really
+        // reached the host. Keep it armed across every mechanical verifier and
+        // floor amendment below; cancellation/error before settlement drops it as
+        // Unknown rather than guessing reward or penalty.
+        let memory_receipt = summoned.memory_receipt;
+        let skill_receipt = summoned.skill_receipt;
+        if let Some(failure) = pending_fix_error.take() {
+            committed_attempt_verifiers = std::mem::take(&mut pending_fix_verifiers);
+            committed_attempt =
+                crate::lessons::commit_pitfall_fix_attempt(&options.project_root, &failure);
         }
         if !summoned.text.trim().is_empty() {
             last_reply = summoned.text.clone();
         }
-        // Wave 2 deliverable 4: distil this turn's failed-tool pitfalls into the
-        // lessons KB on the DEFAULT loop (audit recording already happened inside
-        // summon's governed pump). Fail-open: capture never affects the schedule.
-        capture_turn_pitfalls(options, events, &summoned.pitfalls);
         // Verify against THIS step's acceptance on the deterministic floor.
         let mut verdict = verify_step_acceptance(
             session,
@@ -2548,8 +2714,9 @@ async fn drive_build_step(
         // (UD-CODE-006b) are BLOCKING — folded into the verdict so the SAME
         // bounded re-drive that handles any failing acceptance fixes the cause
         // (split the file / invert the dependency). Duplicated added code
-        // (UD-CODE-006c) and comment narration (UD-CODE-006d) are ADVISORY — the floor has no advisory channel,
-        // so it surfaces as a Note and never touches the verdict. Deterministic
+        // (UD-CODE-006c) and comment narration (UD-CODE-006d) are ADVISORY —
+        // the floor has no advisory channel, so they surface as Notes and never
+        // touch the verdict. Deterministic
         // + fail-open (no arch doc / huge repo / unreadable tree → no findings);
         // bounded by the same `max_fix_rounds` as every other step finding.
         if let Some(arch_before) = arch_baseline.as_ref() {
@@ -2567,6 +2734,33 @@ async fn drive_build_step(
                     events.emit(EngineEvent::Note(format!("advisory · {}", f.message)));
                 }
             }
+        }
+        // Preserve observable event boundaries: every failed tool execution and
+        // every deterministic acceptance finding is an independent episode.
+        // `capture_turn_pitfalls` feeds them one by one; duplicate lines inside a
+        // single event are still collapsed by the capture layer. Positive
+        // evidence is not a pitfall feed.
+        let mut round_pitfalls = summoned.pitfalls.clone();
+        if !verdict.accepted {
+            if let Some(raw_log) = verdict
+                .raw_log
+                .as_ref()
+                .filter(|log| !log.trim().is_empty())
+            {
+                // `evidence` is often only "test: FAILED (exit 101)", too thin
+                // to classify. The bounded raw log carries the compiler/test root
+                // cause and represents this one deterministic verification event.
+                round_pitfalls.push(raw_log.clone());
+            } else {
+                round_pitfalls.extend(verdict.evidence.iter().cloned());
+            }
+        }
+        capture_turn_pitfalls(options, events, &round_pitfalls);
+        if let Some(receipt) = memory_receipt {
+            let _ = receipt.settle(memory_outcome_for_step_verdict(&verdict));
+        }
+        if let Some(receipt) = skill_receipt {
+            let _ = receipt.settle(skill_outcome_for_step_verdict(&verdict));
         }
         // MEDIUM #3 — a dead/hung summon turn that never actually ran (`!drove`) must
         // not "complete" a Build step on a NEUTRAL-SKIP acceptance (an unavailable
@@ -2588,7 +2782,13 @@ async fn drive_build_step(
             // in front of the doer and the step PASSED — reward their trust. If this
             // pass RECOVERED from a recorded failing round, that IS proof the pitfall's
             // recorded fix held: reward its dev-error trust and mark it resolved.
-            crate::self_evolve::reward_on_pass(&options.project_root, &prior_fail_errors);
+            if let Some(attempt) = committed_attempt.as_deref() {
+                let _ = crate::lessons::settle_pitfall_fix_attempt(
+                    &options.project_root,
+                    attempt,
+                    repair_attempt_result_for_verdict(&verdict, &committed_attempt_verifiers),
+                );
+            }
             // FIRST-PASS ACCEPTANCE signal (advisory self-evolution, fail-open):
             // this proposal PASSED verification — record whether it did so on the
             // FIRST attempt (round 0, no rework) or only after one or more fix
@@ -2602,10 +2802,9 @@ async fn drive_build_step(
                 // floor positively confirmed real work — exactly the (drove ||
                 // has_positive_evidence) condition that let it accept here.
                 made_progress: true,
+                unavailable: false,
+                base_agents,
                 gap_evidence: Vec::new(), // accepted → no gap to re-plan around
-                // A Build step's own fix rounds are already reflected in its final reply;
-                // only review/final-gate rework triggers the integrated final report.
-                reworked: false,
             };
         }
         // SELF-EVOLUTION (a SIDE EFFECT of this FAILING verdict — never a driver of
@@ -2616,19 +2815,50 @@ async fn drive_build_step(
         // run) for a higher-level corrective strategy. All best-effort: a store or
         // consult error NEVER fails the step.
         let evidence_line = verdict.evidence_line();
-        let fail_errors = verdict.evidence.clone();
-        crate::self_evolve::penalise_on_fail(&options.project_root, &fail_errors);
+        let failure_detail = verdict.failure_detail();
+        last_fail_errors = verdict.evidence.clone();
+        let current_failure_snapshot = source_tree_snapshot(&options.project_root);
+        let workspace_progress = last_failure_snapshot
+            .as_ref()
+            .is_some_and(|previous| previous != &current_failure_snapshot);
+        last_failure_snapshot = Some(current_failure_snapshot);
+        let assessment = blocker_detector.assess(
+            &failure_detail,
+            &step.criterion_label(),
+            true,
+            workspace_progress,
+        );
+        events.emit(EngineEvent::Note(format!(
+            "team · blocker {}/{} · {} · unchanged repeat {}",
+            assessment.diagnosis.class.as_str(),
+            assessment.diagnosis.fingerprint,
+            assessment.disposition.as_str(),
+            assessment.repeat_count,
+        )));
+        if let Some(attempt) = committed_attempt.as_deref() {
+            let _ = crate::lessons::settle_pitfall_fix_attempt(
+                &options.project_root,
+                attempt,
+                repair_attempt_result_for_verdict(&verdict, &committed_attempt_verifiers),
+            );
+        }
         crate::self_evolve::reflect_on_recurring_failure(
             session,
             &options.project_root,
             events,
-            &evidence_line,
+            &failure_detail,
             reflected,
         )
         .await;
+        if assessment.disposition == crate::blocker::BlockerDisposition::Escalate {
+            last_fail_errors.push(format!(
+                "stuck detector: blocker `{}` repeated {} times without a source-tree change",
+                assessment.diagnosis.fingerprint, assessment.repeat_count
+            ));
+            break;
+        }
         // Remember this round's failing evidence so a recovery on a LATER round can
         // reward + mark-resolved the pitfall whose recorded fix then holds.
-        prior_fail_errors = fail_errors;
         // Out of fix budget → leave the step unaccepted (the caller marks it Blocked
         // and the final gate still has the last word). Bounded — never an open grind.
         if round >= max_fix_rounds {
@@ -2638,19 +2868,36 @@ async fn drive_build_step(
         // signature ("you hit this N times before; here's what worked; it keeps
         // recurring") + any base-reflected strategy. Fingerprint-gated + abstaining, so
         // an unclassifiable failure injects nothing. Fail-open (empty string on a miss).
-        let prior = crate::lessons::lessons_for_error(&options.project_root, &evidence_line);
+        let prior = crate::lessons::lessons_for_error(&options.project_root, &failure_detail);
+        pending_fix_error = (!prior.is_empty()).then(|| failure_detail.clone());
+        pending_fix_verifiers = if prior.is_empty() {
+            Vec::new()
+        } else {
+            verdict.mechanical_build_test_failed_steps.clone()
+        };
         // Fold this step's failing acceptance into the NEXT re-drive's directive so
         // the same seat fixes the cause with raw evidence, in the same session. The
         // overall-goal frame is re-prepended so a fix turn keeps the product context.
+        let prior_reference = if prior.is_empty() {
+            String::new()
+        } else {
+            render_project_learned_reference(
+                umadev_knowledge::PromptReferenceKind::Pitfall,
+                ".umadev/learned/_raw/dev-errors.jsonl",
+                "exact_error_match",
+                &prior,
+            )
+        };
         instruction = format!(
-            "{}{} — {}\n\n## This step did not pass its acceptance check yet — fix the cause\n{}{prior}\n\
+            "{}{} — {}\n\n## This step did not pass its acceptance check yet — fix the cause\n{}\n\n{}{prior_reference}\n\
              Edit the real files, run any build/test you need, and make this step's \
              acceptance ({}) actually pass.",
             step_goal_frame(options),
             step.title,
             route_focus_line(route),
+            assessment.prompt_block(),
             evidence_line,
-            step_criterion_label(step),
+            step.criterion_label(),
         );
         // B1#2: thread the failing build/test output's BOUNDED verbatim tail into the
         // rework directive when the floor captured one — the brain adapts from the raw
@@ -2681,10 +2928,11 @@ async fn drive_build_step(
         reply: last_reply,
         drove,
         made_progress: false,
+        unavailable: false,
+        base_agents,
         // The last failing round's typed evidence — WHY this step could not pass its
         // acceptance — so a bounded re-plan can route around the diagnosed blocker.
-        gap_evidence: prior_fail_errors,
-        reworked: false, // a Build step never fires the run-level integrated-report rework
+        gap_evidence: last_fail_errors,
     }
 }
 
@@ -2741,7 +2989,7 @@ fn record_run_sizing(
 }
 
 /// Drive ONE Review step: fork the cross-review team (read-only) over the current
-/// blackboard. A review step is "accepted" when no seat raises a blocking finding;
+/// blackboard. A review step is clean only when every convened seat returns pass;
 /// blocking findings fold into ONE bounded fix turn on the MAIN session (the doer
 /// repairs), then we re-read. Returns a [`StepOutcome`].
 ///
@@ -2768,7 +3016,28 @@ async fn drive_review_step(
     // the router already chose for this turn), not from a re-derived requirement
     // classification. An empty route team → no cross-review (the floor stands).
     let review = director::review_with_seats(session, options, events, &route.team).await;
-    if !review.has_blocking() {
+    if review.status() == ReviewStatus::Unavailable {
+        let mut gaps = review.blocking;
+        gaps.extend(
+            review
+                .unavailable
+                .iter()
+                .map(|item| format!("review unavailable: {item}")),
+        );
+        events.emit(EngineEvent::Note(
+            "team · required review unavailable — the step cannot be marked clean".to_string(),
+        ));
+        return StepOutcome {
+            accepted: true,
+            reply: String::new(),
+            drove: review.seats > 0,
+            made_progress: false,
+            unavailable: true,
+            base_agents: crate::bg_agents::BaseAgentObservation::default(),
+            gap_evidence: gaps,
+        };
+    }
+    if review.status() == ReviewStatus::Pass {
         // A team actually convened (seats > 0) ⇒ real review progress; an empty team
         // (seats == 0) is a neutral skip that must NOT advance the done count.
         let reviewed = review.seats > 0;
@@ -2777,15 +3046,14 @@ async fn drive_review_step(
             reply: String::new(),
             drove: reviewed,
             made_progress: reviewed,
+            unavailable: false,
+            base_agents: crate::bg_agents::BaseAgentObservation::default(),
             gap_evidence: Vec::new(), // review accepted → no gap
-            reworked: false,          // no blocking finding → no fix turn fired
         };
     }
-    // Wall-clock ceiling: the team found blocking issues, but the budget is already
-    // spent — skip the (minute-level) fix turn and surface the findings honestly. A
-    // review step is advisory, so we still "accept" it (the final gate / hard-gate
-    // own reality); we just don't grind another doer turn past the deadline. A team
-    // DID convene + raised findings (seats > 0), so this is real review progress.
+    // The team found blockers after the fix budget ended. Preserve those blockers
+    // on the step instead of accepting an empty result and hoping a later pass finds
+    // them again.
     if std::time::Instant::now() >= deadline {
         events.emit(EngineEvent::Note(
             "team · time budget reached — review findings left for the final gate \
@@ -2795,15 +3063,15 @@ async fn drive_review_step(
         return StepOutcome {
             accepted: true,
             reply: String::new(),
-            drove: false,
-            made_progress: true,
-            gap_evidence: Vec::new(), // advisory review deferred to the final gate
-            reworked: false,          // budget spent before any fix turn ran
+            drove: review.seats > 0,
+            made_progress: false,
+            unavailable: false,
+            base_agents: crate::bg_agents::BaseAgentObservation::default(),
+            gap_evidence: review.blocking,
         };
     }
     // The team found blocking issues — fold them into ONE bounded fix turn on the
-    // main session (the doer repairs), then accept (advisory: the deterministic
-    // floor in the final gate is the real stop, never a critic verdict — invariant).
+    // main session, then require a clean re-review before marking the step clean.
     let mut body = String::new();
     for b in &review.blocking {
         body.push_str("- ");
@@ -2813,67 +3081,53 @@ async fn drive_review_step(
     let directive = format!(
         "The review team flagged MUST-FIX issues in what was built so far. Fix EVERY one \
          now by editing the files directly — do not narrate, just apply the fixes and \
-         re-run any build/test you already ran. Issues:\n{body}\nWhen all are fixed, end \
-         your turn."
+         re-run any build/test you already ran. Issues:\n{body}\n{}\nWhen all are fixed, end \
+         your turn.",
+        diagnosed_blockers_for_prompt(&review.blocking, "team review")
     );
-    let drove =
-        crate::continuous::drive_rework_turn(session, options, events, directive, deadline).await;
-    // LOW #1 — re-VERIFY the repair instead of blindly accepting it: re-run the
-    // (read-only, cheap) cross-review once after the fix turn. A review step stays
-    // advisory (the final QC gate + hard-gate own termination, never an LLM verdict),
-    // so we always "accept" to keep the schedule moving — but we now report HONESTLY
-    // whether the fix actually cleared the findings rather than silently assuming it
-    // did. Fail-open: if the re-review can't fork it returns no-blocking (accept).
+    let rework = crate::continuous::drive_rework_turn_capturing(
+        session, options, events, directive, deadline,
+    )
+    .await;
+    let drove = rework.done;
+    let base_agents = rework.base_agents;
+    // Re-run the same required review after the fix. A failed review transport is
+    // unavailable, and a residual semantic blocker remains a blocker; neither may
+    // be rewritten into a clean pass.
     let recheck = director::review_with_seats(session, options, events, &route.team).await;
-    if recheck.has_blocking() {
-        // FLOOR-INTEGRITY (a corroborated residual must not silently pass). A residual
-        // blocking finding after the fix turn is, on its own, a critic OPINION —
-        // ADVISORY by invariant 2, never a hard-fail. But before letting the step tick
-        // Done as FULLY CLEAN, corroborate that residual against UmaDev's OWN
-        // deterministic floor: a content-governance hit, a failed
-        // contract/coverage/acceptance/runtime check, or a failed source verify (the
-        // SAME objective signals the final QC folds in). Deterministic + read-only +
-        // fail-open: an uncomputable / neutral floor yields NO corroboration and today's
-        // advisory behaviour stands (a Note, the step proceeds).
-        let corroboration = review_residual_floor_corroboration(options, events, route).await;
-        if !corroboration.is_empty() {
-            events.emit(EngineEvent::Note(format!(
-                "team · review step's residual finding(s) are CORROBORATED by the \
-                 deterministic floor ({}) — marking the step not-clean so the final gate \
-                 can't drop it (the FLOOR fails it; critics stay advisory)",
-                corroboration.join("; ")
-            )));
-            // Honest status via the EXISTING machinery: `made_progress = false` marks
-            // this step Blocked (NOT Done-clean) at the scheduler, which folds into the
-            // final `clean` computation (`all steps Done && final_gate.clean`) so the
-            // corroborated residual can't vanish. `accepted` STAYS true so the circuit
-            // breaker (`drove && !accepted`) is UNTOUCHED — a floor-corroborated residual
-            // is not a driven-verify failure, and a critic never trips loop control
-            // (invariant 2 / the deterministic floor governs). The team convened + a
-            // repair turn ran, so this is real (if not-clean) review work.
-            return StepOutcome {
-                accepted: true,
-                reply: String::new(),
-                drove,
-                made_progress: false,
-                // The corroborating floor lines — WHY this review step is not clean — so
-                // a bounded re-plan (only if it strands dependents) can route around it.
-                gap_evidence: corroboration,
-                // A blocking-item fix turn DID run on the main session (repair above), so
-                // the build went through rework → the integrated final report supersedes
-                // the (now-stale) report A.
-                reworked: true,
-            };
-        }
-        // NOT corroborated — a bare critic opinion only. Invariant 2 holds: advisory,
-        // surface the honest Note and let the step proceed exactly as before (a critic's
-        // opinion never hard-fails a step; the objective hard-gate still owns reality).
+    if recheck.status() == ReviewStatus::Unavailable {
+        let mut gaps = review.blocking;
+        gaps.extend(recheck.blocking);
+        gaps.extend(
+            recheck
+                .unavailable
+                .into_iter()
+                .map(|item| format!("review unavailable after rework: {item}")),
+        );
+        return StepOutcome {
+            accepted: true,
+            reply: String::new(),
+            drove,
+            made_progress: false,
+            unavailable: true,
+            base_agents,
+            gap_evidence: gaps,
+        };
+    }
+    if recheck.status() == ReviewStatus::Fail {
         events.emit(EngineEvent::Note(format!(
-            "team · review step repaired but {} finding(s) remain after the fix turn — \
-             NOT corroborated by the deterministic floor, so advisory-only (left for the \
-             final gate; the objective hard-gate owns reality)",
+            "team · review step still has {} must-fix finding(s) after rework — preserving them as blockers",
             recheck.blocking.len()
         )));
+        return StepOutcome {
+            accepted: true,
+            reply: String::new(),
+            drove,
+            made_progress: false,
+            unavailable: false,
+            base_agents,
+            gap_evidence: recheck.blocking,
+        };
     }
     // A team convened, raised findings, and a repair turn ran — real review progress
     // regardless of whether the repair turn fully settled (`drove`).
@@ -2882,68 +3136,10 @@ async fn drive_review_step(
         reply: String::new(),
         drove,
         made_progress: true,
-        gap_evidence: Vec::new(), // review accepted (advisory) → no gap to re-plan
-        // A blocking-item fix turn ran on the main session (the repair above), so the
-        // build went through rework → trigger the integrated final report at convergence.
-        reworked: true,
+        unavailable: false,
+        base_agents,
+        gap_evidence: Vec::new(),
     }
-}
-
-/// DETERMINISTIC floor corroboration for a review step's RESIDUAL blocking finding
-/// (the floor-integrity tightening). After a review step's bounded fix turn the
-/// cross-review team may STILL raise a blocking finding; on its own that is a critic
-/// OPINION — ADVISORY by invariant 2, and a bare opinion must NEVER hard-fail a step.
-/// So before a residual can hold the step back it must be CORROBORATED by UmaDev's OWN
-/// deterministic floor. This runs the SAME read-only, deterministic checks the final QC
-/// gate folds in and returns the corroborating lines:
-///
-/// 1. **content-governance scan** (`continuous::governance_scan`) — emoji-as-icon /
-///    hardcoded color / AI-slop / swallowed-error hits in what the base wrote,
-/// 2. **required acceptance floor** (`acceptance_floor_blocking`) — a coverage gap /
-///    an unimplemented planned endpoint / frontend↔backend contract drift / an
-///    unverified `runtime-proof.json`,
-/// 3. **source-present verify** (`director::verify` / [`VerifyKind::SourcePresent`]) —
-///    a claimed-done build with ZERO real source on disk is an objective floor failure.
-///
-/// An EMPTY result means NOT corroborated → the caller keeps today's advisory behaviour
-/// (a Note, the step proceeds). Read-only + fail-open + CHEAP by construction (disk
-/// reads only — no second full build, no fork): a build failure is already re-found
-/// INDEPENDENTLY by the final gate, so this closes the gap only for findings that could
-/// otherwise VANISH (governance / contract / coverage / runtime / source) without paying
-/// for a duplicate build. Every contributor degrades to a neutral skip when it can't run,
-/// so an uncomputable corroboration yields an empty result — never a spurious fail, never
-/// a crash. This does NOT change the advisory nature of critics: it only lets an
-/// independently-observed FLOOR signal — not the critic's opinion — mark the step honest.
-async fn review_residual_floor_corroboration(
-    options: &RunOptions,
-    events: &Arc<dyn EventSink>,
-    route: &RoutePlan,
-) -> Vec<String> {
-    let mut corroborating: Vec<String> = Vec::new();
-    // 1. Content-governance scan (deterministic, read-only) — the same craft/quality
-    //    floor `run_auto_qc` folds in. A hit here is an objective, base-agnostic signal.
-    for v in crate::continuous::governance_scan(options) {
-        corroborating.push(format!("[governance] {v}"));
-    }
-    // 2. Required acceptance floor (coverage / acceptance / contract / runtime-proof) —
-    //    the SAME deterministic contract/acceptance checks the final QC folds in. Called
-    //    unconditionally: it is fail-open (no PRD / architecture / runtime-proof → empty),
-    //    so it can only ever add a REAL, machine-checked gap, never a fabricated one.
-    for line in acceptance_floor_blocking(options, Some(route)) {
-        corroborating.push(line);
-    }
-    // 3. Source-present verify (a failed verify) — a claimed-done build with no real
-    //    source on disk. Cheap: a disk read, never a build. A failing BUILD is left to
-    //    the final gate, which re-runs it independently (so it can't vanish anyway); we
-    //    corroborate here only with the signals that COULD otherwise be dropped.
-    let src = director::verify(options, events, VerifyKind::SourcePresent).await;
-    if src.available && !src.passed {
-        corroborating.push(format!(
-            "source-present: FAILED — {}",
-            src.evidence.first().cloned().unwrap_or_default()
-        ));
-    }
-    corroborating
 }
 
 /// A bounded snapshot of the project's source tree — path → (byte size, mtime) —
@@ -3016,6 +3212,15 @@ struct StepVerdict {
     /// checkable), but a dead/hung session that produced no turn must not "complete"
     /// a step on a free pass.
     has_positive_evidence: bool,
+    /// IDs of project build/test/lint commands that actually ran and passed.
+    /// Source/file/review proof and unavailable/skipped commands never appear.
+    /// Repair settlement compares this set with the original failed-step set.
+    mechanical_build_test_passed_steps: Vec<String>,
+    /// Mechanical verifier step IDs that ran and failed in this round. When a
+    /// recalled repair is re-driven, these IDs are carried to the next round;
+    /// a green aggregate only validates the repair if every original failed
+    /// step exists and passes again (deleting/renaming the script is Unknown).
+    mechanical_build_test_failed_steps: Vec<String>,
     /// Concrete evidence lines from the check (failed-step names / drift / count).
     evidence: Vec<String>,
     /// B1#2 — a BOUNDED verbatim tail of the failing build/test output (last ~60
@@ -3036,6 +3241,96 @@ impl StepVerdict {
             self.evidence.join("; ")
         }
     }
+
+    /// Highest-fidelity failure evidence for classification and exact repair
+    /// attribution. The one-line acceptance summary is useful for display, but
+    /// it often omits the compiler/test identity; the bounded raw log owns that
+    /// identity whenever present.
+    fn failure_detail(&self) -> String {
+        self.raw_log
+            .as_ref()
+            .filter(|raw| !raw.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| self.evidence.join("\n"))
+    }
+}
+
+/// Causal memory outcome for one sent doer directive. A neutral/skipped
+/// acceptance is not evidence that retrieved knowledge helped, and a rejection
+/// without concrete mechanical evidence is not evidence that it hurt.
+fn memory_outcome_for_step_verdict(verdict: &StepVerdict) -> TurnOutcome {
+    if verdict.accepted && verdict.has_positive_evidence {
+        TurnOutcome::Pass
+    } else if !verdict.accepted
+        && (!verdict.evidence.is_empty()
+            || verdict
+                .raw_log
+                .as_deref()
+                .is_some_and(|raw| !raw.trim().is_empty()))
+    {
+        TurnOutcome::Fail
+    } else {
+        TurnOutcome::Unknown
+    }
+}
+
+fn skill_outcome_for_step_verdict(verdict: &StepVerdict) -> crate::skills::SkillUseOutcome {
+    match memory_outcome_for_step_verdict(verdict) {
+        TurnOutcome::Pass => crate::skills::SkillUseOutcome::Pass,
+        TurnOutcome::Fail => crate::skills::SkillUseOutcome::Fail,
+        TurnOutcome::Unknown => crate::skills::SkillUseOutcome::Unknown,
+    }
+}
+
+fn repair_attempt_result_for_verdict(
+    verdict: &StepVerdict,
+    expected_verifiers: &[String],
+) -> crate::lessons::PitfallFixAttemptResult {
+    let same_verifiers_passed = !expected_verifiers.is_empty()
+        && expected_verifiers.iter().all(|expected| {
+            verdict
+                .mechanical_build_test_passed_steps
+                .iter()
+                .any(|actual| actual == expected)
+        });
+    if verdict.accepted && same_verifiers_passed {
+        crate::lessons::PitfallFixAttemptResult::Passed
+    } else if verdict.accepted {
+        // SourcePresent/FileExists/FileContains/TurnSettled/review acceptance,
+        // plus an unavailable or all-skipped build, cannot causally prove that
+        // the attempted repair fixed its original mechanical failure.
+        crate::lessons::PitfallFixAttemptResult::Unknown
+    } else {
+        let detail = verdict.failure_detail();
+        if detail.trim().is_empty() {
+            crate::lessons::PitfallFixAttemptResult::Unknown
+        } else {
+            crate::lessons::PitfallFixAttemptResult::VerificationFailed(detail)
+        }
+    }
+}
+
+fn build_test_passed_steps(result: &VerifyResult) -> Vec<String> {
+    if !result.available || !result.passed {
+        return Vec::new();
+    }
+    result
+        .evidence
+        .iter()
+        // `verify_build_test_raw` emits one `step: ok` line per command that
+        // really ran and omits skipped commands.
+        .filter_map(|line| line.strip_suffix(": ok"))
+        .map(str::to_string)
+        .collect()
+}
+
+fn build_test_failed_steps(result: &VerifyResult) -> Vec<String> {
+    result
+        .evidence
+        .iter()
+        .filter_map(|line| line.split_once(": FAILED").map(|(step, _)| step))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Verify one step against its `acceptance` on the DETERMINISTIC floor — the SAME
@@ -3093,6 +3388,8 @@ async fn verify_step_acceptance(
         A::SourcePresent if is_build && is_doc_seat => StepVerdict {
             accepted: true,
             has_positive_evidence: false,
+            mechanical_build_test_passed_steps: Vec::new(),
+            mechanical_build_test_failed_steps: Vec::new(),
             evidence: Vec::new(),
             raw_log: None,
         },
@@ -3140,7 +3437,11 @@ async fn verify_step_acceptance(
             // directive. Same check, same events; a pass/skip yields no raw log.
             events.emit(EngineEvent::Note("team · verify build-test".to_string()));
             let (bt, raw) = director::verify_build_test_raw(options).await;
+            let mechanical_build_test_passed_steps = build_test_passed_steps(&bt);
+            let mechanical_build_test_failed_steps = build_test_failed_steps(&bt);
             let mut v = with_source_evidence(acceptance_from_verify(bt), src_positive);
+            v.mechanical_build_test_passed_steps = mechanical_build_test_passed_steps;
+            v.mechanical_build_test_failed_steps = mechanical_build_test_failed_steps;
             if !v.accepted {
                 v.raw_log = raw;
             }
@@ -3183,6 +3484,8 @@ async fn verify_step_acceptance(
                 // passed. An EMPTY-team ReviewClean (0 seats) is a NEUTRAL SKIP — it
                 // must not count as real progress that marks a step Done over no work.
                 has_positive_evidence: src_positive || (review.seats > 0 && !review.has_blocking()),
+                mechanical_build_test_passed_steps: Vec::new(),
+                mechanical_build_test_failed_steps: Vec::new(),
                 evidence: review.blocking.clone(),
                 raw_log: None,
             }
@@ -3202,6 +3505,8 @@ async fn verify_step_acceptance(
             StepVerdict {
                 accepted: true,
                 has_positive_evidence: false,
+                mechanical_build_test_passed_steps: Vec::new(),
+                mechanical_build_test_failed_steps: Vec::new(),
                 evidence: Vec::new(),
                 raw_log: None,
             }
@@ -3228,6 +3533,8 @@ fn acceptance_from_verify(r: VerifyResult) -> StepVerdict {
     StepVerdict {
         accepted: !r.available || r.passed,
         has_positive_evidence: r.available && r.passed,
+        mechanical_build_test_passed_steps: Vec::new(),
+        mechanical_build_test_failed_steps: Vec::new(),
         evidence: if r.available && !r.passed {
             r.evidence
         } else {
@@ -3390,6 +3697,14 @@ async fn verify_step_evidence(
     }
 
     let accepted = gaps.is_empty();
+    let mechanical_build_test_passed_steps = build
+        .as_ref()
+        .map(build_test_passed_steps)
+        .unwrap_or_default();
+    let mechanical_build_test_failed_steps = build
+        .as_ref()
+        .map(build_test_failed_steps)
+        .unwrap_or_default();
     StepVerdict {
         // Accept iff NO declared contract is unsatisfied. (A neutral-skip-only step on
         // a Build path still has the honesty floor's positive source evidence; a
@@ -3397,6 +3712,8 @@ async fn verify_step_evidence(
         // path's fail-open posture.)
         accepted,
         has_positive_evidence: any_positive,
+        mechanical_build_test_passed_steps,
+        mechanical_build_test_failed_steps,
         evidence: gaps,
         // The raw build/test tail rides only a REJECTING verdict (a failed build that
         // produced gaps); a clean/neutral verdict carries no log.
@@ -3840,7 +4157,8 @@ fn source_mentions(root: &std::path::Path, needle: &str) -> bool {
 /// so the build is ALWAYS held to the objective floor even at the budget; only the
 /// minute-level FIX TURN it would trigger is skipped once the deadline is spent (the
 /// doc'd "hard ceiling" — the build could otherwise run several fix turns over budget
-/// here). The objective hard-gate the caller runs still owns reality.
+/// here). A residual finding is returned as a dirty outcome and becomes an honest
+/// director failure; it is never delegated to a narrower source-only caller check.
 /// The outcome of [`run_final_gate`]: the final fix-turn reply PLUS whether the gate
 /// settled CLEAN. H1: the step-driven caller must AND `clean` into its finalize
 /// decision — a build whose steps all ticked Done but whose final cross-cutting gate
@@ -3854,6 +4172,9 @@ struct FinalGateOutcome {
     /// `false` when the gate settled with residual blocking findings (budget /
     /// deadline / dead session).
     clean: bool,
+    /// The last objective blocking findings. Empty on a clean gate; retained on
+    /// every dirty settle so the director's terminal failure carries evidence.
+    blocking: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3864,11 +4185,10 @@ async fn run_final_gate(
     route: &RoutePlan,
     seed_reply: &str,
     deadline: std::time::Instant,
-    // Optional CONTEXT prefix front-loaded onto every fix directive (the chat-build
-    // post-QC entry passes the recalled knowledge digest + prior pitfalls so a fix
-    // turn carries the team's standards + memory). `""` = the byte-for-byte original
-    // directive (the `/run` step-driver passes this), so existing callers are unchanged.
-    fix_prefix: &str,
+    // Optional structured CONTEXT front-loaded onto every fix directive. The
+    // chat-build entry passes recalled knowledge text + exact memory identities;
+    // `/run` passes an empty digest and creates no receipt.
+    fix_context: &KnowledgeDigest,
     // OBSERVED-tool corroboration for the SEED reply: did a real build/test/lint runner
     // run producing `seed_reply`? Callers that can't observe it pass `false` (conservative
     // — round 0 then runs UmaDev's own read rather than trusting the seed's prose). Each
@@ -3876,6 +4196,7 @@ async fn run_final_gate(
     seed_ran_build_tool: bool,
 ) -> FinalGateOutcome {
     let mut last_reply = String::new();
+    let mut last_blocking = Vec::new();
     // The incremental-verify signal seeds from the LAST step's reply (the steps just
     // ran the build/test); each fix round below then carries its own turn's reply.
     let mut verify_signal = seed_reply.to_string();
@@ -3883,6 +4204,11 @@ async fn run_final_gate(
     // then tracks each fix turn's OWN observed run — so a fix turn's green claim can only
     // skip the read when THAT turn actually ran a runner.
     let mut verify_ran_build_tool = seed_ran_build_tool;
+    // A fix turn's knowledge can be judged only by the NEXT QC read. Holding the
+    // guard here makes cancellation, panic, or an absent next read settle Unknown.
+    let mut pending_memory_receipt: Option<SentReceiptGuard> = None;
+    let mut qc_blockers = crate::blocker::BlockerSetTracker::default();
+    let mut last_qc_snapshot: Option<SourceTreeSnapshot> = None;
     for round in 0..MAX_QC_ROUNDS {
         // The QC read ALWAYS runs (it is read-only + cheap), so the build is held to
         // the objective floor every iteration — even at the budget. The final gate
@@ -3897,51 +4223,90 @@ async fn run_final_gate(
             verify_ran_build_tool,
         )
         .await;
+        if let Some(receipt) = pending_memory_receipt.take() {
+            let outcome = if qc.is_clean() {
+                TurnOutcome::Pass
+            } else {
+                TurnOutcome::Fail
+            };
+            let _ = receipt.settle(outcome);
+        }
         if qc.is_clean() {
             return FinalGateOutcome {
                 reply: last_reply,
                 clean: true,
+                blocking: Vec::new(),
+            };
+        }
+        last_blocking = qc.blocking.clone();
+        let current_qc_snapshot = source_tree_snapshot(&options.project_root);
+        let workspace_progress = last_qc_snapshot
+            .as_ref()
+            .is_some_and(|previous| previous != &current_qc_snapshot);
+        last_qc_snapshot = Some(current_qc_snapshot);
+        let assessments = qc.assess_blockers(&mut qc_blockers, workspace_progress);
+        emit_blocker_assessments(events, &assessments);
+        if let Some(stuck) = assessments
+            .iter()
+            .find(|item| item.disposition == crate::blocker::BlockerDisposition::Escalate)
+        {
+            last_blocking.push(format!(
+                "stuck detector: blocker `{}` repeated {} times without a source-tree change",
+                stuck.diagnosis.fingerprint, stuck.repeat_count
+            ));
+            events.emit(EngineEvent::Note(
+                "team · final QC stopped an unchanged repair loop and retained the evidence"
+                    .to_string(),
+            ));
+            return FinalGateOutcome {
+                reply: last_reply,
+                clean: false,
+                blocking: last_blocking,
             };
         }
         if round + 1 >= MAX_QC_ROUNDS {
             events.emit(EngineEvent::Note(
-                "team · final QC reached its fix-round budget — settling (objective hard-gate decides reality)"
+                "team · final QC reached its fix-round budget — stopping incomplete with residual evidence"
                     .to_string(),
             ));
             return FinalGateOutcome {
                 reply: last_reply,
                 clean: false,
+                blocking: last_blocking,
             };
         }
         // Wall-clock ceiling (graceful): the QC READ above ran (the floor still bites),
         // but the minute-level FIX TURN it would trigger is skipped once the budget is
-        // spent — the residual findings are surfaced honestly and left for the
-        // objective hard-gate rather than driving more over-budget fix turns. This is
+        // spent — the residual findings are retained in the dirty outcome rather than
+        // driving more over-budget fix turns. This is
         // the doc'd "hard ceiling": the build can't keep grinding fix turns past it.
         if std::time::Instant::now() >= deadline {
             events.emit(EngineEvent::Note(
-                "team · time budget reached — final QC findings left for the objective \
-                 hard-gate (raise UMADEV_RUN_BUDGET_SECS for more fix rounds)"
+                "team · time budget reached — final QC findings retained as incomplete \
+                 evidence (raise UMADEV_RUN_BUDGET_SECS for more fix rounds)"
                     .to_string(),
             ));
             return FinalGateOutcome {
                 reply: last_reply,
                 clean: false,
+                blocking: last_blocking,
             };
         }
         // Fold the residual findings into ONE fix turn on the main session — with the
         // optional context prefix (knowledge + pitfalls) front-loaded for a chat-build.
-        match drive_one_turn(
+        match drive_one_turn_with_memories(
             session,
             options,
             events,
-            qc.fix_directive_with_context(fix_prefix),
+            qc.fix_directive_with_assessments(&fix_context.text, &assessments),
+            fix_context.memories.clone(),
             IdleBudget::from_env(),
             deadline,
         )
         .await
         {
             Ok(t) => {
+                pending_memory_receipt = t.memory_receipt;
                 verify_signal = t.text.clone();
                 verify_ran_build_tool = t.ran_build_tool;
                 last_reply = t.text;
@@ -3952,6 +4317,7 @@ async fn run_final_gate(
                 return FinalGateOutcome {
                     reply: last_reply,
                     clean: false,
+                    blocking: last_blocking,
                 }
             }
         }
@@ -3959,6 +4325,7 @@ async fn run_final_gate(
     FinalGateOutcome {
         reply: last_reply,
         clean: false,
+        blocking: last_blocking,
     }
 }
 
@@ -3974,21 +4341,21 @@ async fn run_final_gate(
 /// 2. **critic team review** (`run_auto_qc` → `review_with_seats` sized from
 ///    `route.team`, fork-based read-only critics),
 /// 3. **bounded evidence-bearing rework** — blocking findings fold into ONE fix
-///    directive per round, bounded by [`MAX_QC_ROUNDS`] + the wall-clock deadline,
+///    directive per round, bounded by the internal QC-round limit + the wall-clock deadline,
 ///    fed back over the SAME continuous session (single-writer preserved), with the
 ///    recalled **knowledge digest + prior pitfalls** front-loaded (`post_build_rework_context`)
 ///    so the fix carries the team's commercial standards + memory,
-/// 4. **usage + lessons capture** — every fix turn runs through [`drive_one_turn`],
+/// 4. **usage + lessons capture** — every fix turn runs through the internal turn pump,
 ///    which records the token estimate (`/usage`) and distils failed-tool pitfalls
 ///    into the lessons KB (`/lessons`), so the chat build self-evolves like a `/run`.
 ///
-/// Delegates the actual gate to [`run_final_gate`] (the exact same bounded pass the
+/// Delegates the actual gate to the internal final-gate routine (the exact same bounded pass the
 /// `/run` step-driver ends on) with the route's seats + the knowledge/lessons prefix,
 /// so a chat build is held to the IDENTICAL floor as `/run` — not a re-implementation
 /// that could drift. Returns the final fix-turn reply (empty when QC was already
 /// clean). **Fail-open throughout**: a scan / fork / rework that can't run contributes
 /// nothing and the build settles (a chat turn is never wedged by QC). The wall-clock
-/// budget ([`run_budget`]) bounds the extra fix turns exactly like `/run`.
+/// budget bounds the extra fix turns exactly like `/run`.
 ///
 /// `seed_reply` is the build turn's own reply (so the incremental build/test read can
 /// trust a green result the base already reported). Pure chat (no `became_build`) must
@@ -4010,14 +4377,14 @@ pub async fn run_post_build_qc(
     // ONCE, to front-load onto every fix directive (deliverable 3). The chat session
     // opened firmware-light (no JIT knowledge), so this is where a chat-build's fix gets
     // the standards + memory. Fail-open: empty recall = the byte-for-byte plain directive.
-    let prefix = post_build_rework_context(options);
+    let context = post_build_rework_context(options);
     // The chat-build surface only needs the fix-turn reply; its caller does not gate a
     // finalize on the gate's clean-ness (the `/run` step path does — see H1). Seed
     // corroboration `false`: this entry has only the seed REPLY text, not an observed
     // run, so round 0 runs UmaDev's own build/test read rather than trusting the seed's
     // prose "it's green" — narration alone must not skip. Fix rounds re-derive per turn.
     run_final_gate(
-        session, options, events, route, seed_reply, deadline, &prefix, false,
+        session, options, events, route, seed_reply, deadline, &context, false,
     )
     .await
     .reply
@@ -4031,32 +4398,34 @@ pub async fn run_post_build_qc(
 /// the one point it matters (fixing real findings), without paying the full firmware
 /// cost on every chat message. Pure + fully fail-open: each contributor swallows its
 /// own errors into an empty string (the plain directive), never a panic or a block.
-fn post_build_rework_context(options: &RunOptions) -> String {
-    let mut out = String::new();
+fn post_build_rework_context(options: &RunOptions) -> KnowledgeDigest {
     // Knowledge digest — small budget (3 chunks), matching the agentic light-turn size.
-    // `record_feedback = true`: this prefix front-loads a chat-BUILD's post-QC fix
-    // directives (only reached once a turn is a real build), and that fix loop runs
-    // the same `self_evolve` reward/penalise seam as `/run` — so the surfaced chunks
-    // are snapshotted here for that outcome to attribute.
-    let digest = crate::phases::agentic_knowledge_digest(
+    // Keep retrieval pure while carrying exact identities through prompt
+    // assembly. Receipt commit still happens only after a real host send.
+    let mut digest = crate::phases::agentic_knowledge_digest_with_memories(
         &options.project_root,
         &options.requirement,
         3,
-        true,
+        false,
     );
-    if !digest.trim().is_empty() {
-        out.push_str(digest.trim());
+    if !digest.text.trim().is_empty() {
+        digest.text = digest.text.trim().to_string();
     }
     // Prior pitfalls on this project (recalled lessons) — what already bit us before.
     let lessons =
         crate::lessons::relevant_lessons_for_prompt(&options.project_root, &options.requirement);
     if !lessons.trim().is_empty() {
-        if !out.is_empty() {
-            out.push_str("\n\n");
+        if !digest.text.is_empty() {
+            digest.text.push_str("\n\n");
         }
-        out.push_str(lessons.trim());
+        digest.text.push_str(&render_project_learned_reference(
+            umadev_knowledge::PromptReferenceKind::Lesson,
+            ".umadev/learned/_raw",
+            "post_build_rework",
+            lessons.trim(),
+        ));
     }
-    out
+    digest
 }
 
 /// Distil a turn's failed-tool summaries into the lessons KB on the DEFAULT loop —
@@ -4067,53 +4436,22 @@ fn capture_turn_pitfalls(options: &RunOptions, events: &Arc<dyn EventSink>, pitf
     if pitfalls.is_empty() {
         return;
     }
-    let n = crate::lessons::capture_dev_errors(
-        &options.project_root,
-        pitfalls,
-        &options.effective_slug(),
-        &options.requirement,
-    );
-    if n > 0 {
-        events.emit(EngineEvent::Note(format!(
-            "[learned] 识别并记录了 {n} 条开发踩坑,已写入知识库 — 下次遇到同类问题会提前规避。"
-        )));
+    // Each item is one failed ToolResult (or one deterministic acceptance
+    // finding), hence one independent episode. Do not flatten the whole turn
+    // into one capture batch: two separate failed executions of the same test
+    // are two observations. `capture_dev_errors` still dedupes repeated lines
+    // inside each individual event.
+    let mut outcome = crate::lessons::PitfallCaptureOutcome::default();
+    for pitfall in pitfalls {
+        outcome.absorb(crate::lessons::capture_dev_errors_detailed(
+            &options.project_root,
+            std::slice::from_ref(pitfall),
+            &options.effective_slug(),
+            &options.requirement,
+        ));
     }
-}
-
-/// A human label for a step's acceptance criterion, used in the fix directive so
-/// the doer knows exactly what mechanical bar this step must clear.
-fn acceptance_label(spec: &plan_state::AcceptanceSpec) -> &'static str {
-    use plan_state::AcceptanceSpec as A;
-    match spec {
-        A::SourcePresent => "real source files exist on disk",
-        A::BuildTest => "the project's build/test passes",
-        A::Contract => "the frontend↔backend API contract holds",
-        A::DesignTokensPresent => "the design-tokens.{json,css} design system exists on disk",
-        A::DesignTokensConform => {
-            "the design system CONFORMS: >=6 color roles each with a paired `on-` foreground, a \
-             >=4-step type scale, a 4pt spacing scale, a radius scale, motion tokens; every \
-             (surface, on-surface) pair measured against WCAG; the UI drawing from the tokens; \
-             no AI-purple brand hue"
-        }
-        A::ReviewClean => "the review team raises no blocking issue",
-        A::TurnSettled => "the work turn completes",
-    }
-}
-
-/// The mechanical bar a step must clear, for the fix directive — the TYPED EVIDENCE
-/// CONTRACT summary when the step declares one (so the doer is told exactly which
-/// specific files/tests/routes must check out), else the generic
-/// [`acceptance_label`]. Keeps the directive truthful about what UmaDev will actually
-/// verify before it ticks the step done.
-fn step_criterion_label(step: &plan_state::PlanStep) -> String {
-    if step.evidence.is_empty() {
-        acceptance_label(&step.acceptance).to_string()
-    } else {
-        step.evidence
-            .iter()
-            .map(plan_state::EvidenceContract::label)
-            .collect::<Vec<_>>()
-            .join(", ")
+    for note in outcome.progress_notes() {
+        events.emit(EngineEvent::Note(note));
     }
 }
 
@@ -4456,6 +4794,81 @@ fn emit_plan_completion_summary(plan: &Plan, events: &Arc<dyn EventSink>) {
     events.emit(EngineEvent::Note(lines.join("\n")));
 }
 
+/// Explain why a step-driven build cannot claim `Done`. Status counts come from
+/// the persisted plan; verifier and final-QC details are bounded by
+/// [`qc_incomplete_reason`]. Evidence from a step that a successful re-plan removed
+/// is filtered out, so the terminal message only names residual blockers.
+fn plan_incomplete_reason(
+    plan: &Plan,
+    budget_reached: bool,
+    transition_limit_reached: bool,
+    step_evidence: &[(String, String)],
+    final_qc: &[String],
+) -> String {
+    let blocked = plan
+        .steps
+        .iter()
+        .filter(|step| step.status == StepStatus::Blocked)
+        .count();
+    let unfinished = plan
+        .steps
+        .iter()
+        .filter(|step| matches!(step.status, StepStatus::Active | StepStatus::Pending))
+        .count();
+
+    let mut reasons = Vec::new();
+    if budget_reached {
+        reasons.push("run time budget exhausted".to_string());
+    }
+    if transition_limit_reached {
+        reasons.push(format!(
+            "plan transition limit ({MAX_STEP_TRANSITIONS}) reached"
+        ));
+    }
+    if blocked > 0 {
+        reasons.push(format!("{blocked} plan step(s) blocked"));
+    }
+    if unfinished > 0 {
+        reasons.push(format!("{unfinished} plan step(s) unfinished"));
+    }
+    if !final_qc.is_empty() {
+        reasons.push("final QC retained blocking findings".to_string());
+    }
+    if reasons.is_empty() {
+        reasons.push("the clean-delivery invariant was not satisfied".to_string());
+    }
+
+    let blocked_ids: std::collections::HashSet<&str> = plan
+        .steps
+        .iter()
+        .filter(|step| step.status == StepStatus::Blocked)
+        .map(|step| step.id.as_str())
+        .collect();
+    let mut evidence: Vec<String> = step_evidence
+        .iter()
+        .filter(|(step_id, _)| blocked_ids.contains(step_id.as_str()))
+        .map(|(_, detail)| detail.clone())
+        .collect();
+    // A stranded dependent has no verifier gap of its own. Its persisted status +
+    // title is still concrete evidence that the plan did not finish.
+    for step in plan.steps.iter().filter(|step| {
+        step.status == StepStatus::Blocked
+            && !step_evidence.iter().any(|(step_id, _)| step_id == &step.id)
+    }) {
+        evidence.push(format!("step `{}` remains Blocked", step.title));
+    }
+    for step in plan
+        .steps
+        .iter()
+        .filter(|step| matches!(step.status, StepStatus::Active | StepStatus::Pending))
+    {
+        evidence.push(format!("step `{}` remains {:?}", step.title, step.status));
+    }
+    evidence.extend(final_qc.iter().cloned());
+
+    qc_incomplete_reason(&reasons.join("; "), &evidence)
+}
+
 /// On a clean settle: tick any non-Done step to `Done`, emit a status event for
 /// each transition, and persist the completed plan. No-op without a plan.
 fn complete_plan(plan: &mut Option<Plan>, options: &RunOptions, events: &Arc<dyn EventSink>) {
@@ -4651,7 +5064,13 @@ fn persist_phase_impl(options: &RunOptions, phase: Phase, note_override: Option<
         ),
         backend: options.backend.clone(),
         // Preserve the resume pointer across every phase transition of THIS run.
-        base_session_id: current_state.and_then(|s| s.base_session_id),
+        base_session_id: current_state
+            .as_ref()
+            .and_then(|s| s.base_session_id.clone()),
+        base_resume_identity: current_state
+            .as_ref()
+            .and_then(|s| s.base_resume_identity.clone()),
+        permission_profile: Some(options.mode.base_permissions()),
         spec_version: umadev_spec::SPEC_VERSION.to_string(),
     };
     let _ = crate::state::write_workflow_state(&options.project_root, &state);
@@ -4713,6 +5132,10 @@ struct TurnResult {
     /// enough to SKIP UmaDev's own build/test read — narration alone (a green claim with
     /// NO runner ever invoked) leaves this `false`, so UmaDev runs its own read instead.
     ran_build_tool: bool,
+    /// Receipt armed after the exact initial directive was accepted. Callers
+    /// settle it only from the next deterministic verification pass; errors or
+    /// cancellation before that point consume it as Unknown on drop.
+    memory_receipt: Option<SentReceiptGuard>,
 }
 
 /// The outcome of [`resolve_approval`]: the decision plus whether it was made
@@ -4789,6 +5212,139 @@ pub(crate) async fn resolve_approval(
     }
 }
 
+fn approval_option_id(
+    options: &[HostApprovalOption],
+    decision: ApprovalDecision,
+) -> Option<String> {
+    let preferred = match decision {
+        ApprovalDecision::Allow => [
+            HostApprovalOptionKind::AllowOnce,
+            HostApprovalOptionKind::AllowAlways,
+        ],
+        ApprovalDecision::Deny => [
+            HostApprovalOptionKind::RejectOnce,
+            HostApprovalOptionKind::RejectAlways,
+        ],
+    };
+    preferred
+        .iter()
+        .find_map(|kind| options.iter().find(|option| &option.kind == kind))
+        .map(|option| option.id.clone())
+}
+
+/// Resolve a typed base-to-host request without coercing questions or MCP
+/// elicitation into binary approval. A hosted TUI gets the exact request;
+/// headless and unknown paths return the request's protocol-shaped safe denial.
+pub(crate) async fn resolve_host_request(
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    req_id: &str,
+    request: &HostRequest,
+) -> HostResponse {
+    match request {
+        HostRequest::Approval {
+            action,
+            target,
+            options: approval_options,
+            ..
+        } => {
+            let resolved = resolve_approval(options, events, action, target).await;
+            HostResponse::Approval {
+                decision: resolved.decision,
+                selected_option_id: approval_option_id(approval_options, resolved.decision),
+                message: matches!(resolved.decision, ApprovalDecision::Deny)
+                    .then(|| "denied by UmaDev trust policy or user".to_string()),
+            }
+        }
+        HostRequest::PermissionExpansion {
+            permissions,
+            reason,
+            ..
+        } => {
+            let target = permissions
+                .iter()
+                .map(|permission| {
+                    permission.target.as_ref().map_or_else(
+                        || permission.kind.clone(),
+                        |target| format!("{}:{target}", permission.kind),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            events.emit(EngineEvent::Note(format!(
+                "[permission] {}{}",
+                reason
+                    .as_deref()
+                    .unwrap_or("the base requested additional access"),
+                if target.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{target}")
+                }
+            )));
+            let resolved = resolve_approval(options, events, "permission-expansion", &target).await;
+            HostResponse::PermissionExpansion {
+                decision: resolved.decision,
+                granted: matches!(resolved.decision, ApprovalDecision::Allow)
+                    .then(|| permissions.clone())
+                    .unwrap_or_default(),
+                message: reason.clone(),
+            }
+        }
+        HostRequest::PlanConfirmation { plan, message, .. } => {
+            events.emit(EngineEvent::Note(format!(
+                "[plan] {}\n{}",
+                message
+                    .as_deref()
+                    .unwrap_or("the base requests confirmation"),
+                plan.chars().take(12_000).collect::<String>()
+            )));
+            let target = plan
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("plan");
+            let resolved = resolve_approval(options, events, "plan-confirmation", target).await;
+            HostResponse::PlanConfirmation {
+                decision: resolved.decision,
+                feedback: matches!(resolved.decision, ApprovalDecision::Deny)
+                    .then(|| "plan execution was not approved".to_string()),
+            }
+        }
+        HostRequest::FolderTrust {
+            cwd,
+            workspace,
+            config_kinds,
+        } => {
+            events.emit(EngineEvent::Note(format!(
+                "[folder-trust] kept gated: cwd={} workspace={} config={}",
+                cwd.display(),
+                workspace.display(),
+                config_kinds.join(", ")
+            )));
+            request
+                .safe_rejection("Folder Trust requires the dedicated live human decision surface")
+        }
+        HostRequest::Unknown { method, .. } => {
+            events.emit(EngineEvent::Note(format!(
+                "base requested unsupported host method `{method}`; safely rejected"
+            )));
+            request.safe_rejection("unsupported host request")
+        }
+        HostRequest::UserInput { .. } | HostRequest::McpElicitation { .. } => {
+            if let Some(response) = crate::interaction::request_host_response(req_id, request).await
+            {
+                response
+            } else {
+                events.emit(EngineEvent::Note(
+                    "base requested interactive input, but no live response surface was available"
+                        .to_string(),
+                ));
+                request.safe_rejection("interactive response unavailable")
+            }
+        }
+    }
+}
+
 /// Send one directive and pump the base's event stream to its `TurnDone`, forwarding
 /// tool calls + text to the live sink (the SAME `WorkerStream` render path the
 /// pipeline uses), answering approvals via the always-on irreversible floor, and
@@ -4831,6 +5387,33 @@ async fn drive_one_turn(
     .await
 }
 
+/// [`drive_one_turn`] with exact retrieved-memory identities carried through the
+/// final send boundary. This is intentionally used only by chat-originated
+/// post-build QC fixes; planning, reports, critics, and background wait turns do
+/// not create knowledge receipts.
+async fn drive_one_turn_with_memories(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    directive: String,
+    memories: Vec<umadev_knowledge::MemoryRef>,
+    idle: IdleBudget,
+    deadline: std::time::Instant,
+) -> Result<TurnResult, String> {
+    drive_one_turn_with_backoff_and_memories(
+        session,
+        options,
+        events,
+        directive,
+        memories,
+        idle,
+        deadline,
+        TRANSIENT_BACKOFF_BASE,
+        TRANSIENT_BACKOFF_CAP,
+    )
+    .await
+}
+
 /// [`drive_one_turn`] with the transient-backoff schedule injected (so the test drives
 /// a tiny, deterministic window). See [`drive_one_turn`] for the two self-heals.
 #[allow(clippy::too_many_arguments)]
@@ -4844,9 +5427,36 @@ async fn drive_one_turn_with_backoff(
     backoff_base: Duration,
     backoff_cap: Duration,
 ) -> Result<TurnResult, String> {
+    drive_one_turn_with_backoff_and_memories(
+        session,
+        options,
+        events,
+        directive,
+        Vec::new(),
+        idle,
+        deadline,
+        backoff_base,
+        backoff_cap,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_one_turn_with_backoff_and_memories(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    directive: String,
+    memories: Vec<umadev_knowledge::MemoryRef>,
+    idle: IdleBudget,
+    deadline: std::time::Instant,
+    backoff_base: Duration,
+    backoff_cap: Duration,
+) -> Result<TurnResult, String> {
     // Estimate the directive's token cost up front (the session stream carries no
     // usage on `TurnDone`, unlike the single-shot path), so `/usage` is real on the
-    // default loop for ALL three bases — not just claude in the legacy runner.
+    // default loop for all five bases (three native plus Grok Build/Kimi Code), not just
+    // Claude in the legacy runner.
     let mut est_tokens: u64 = approx_tokens(&directive);
     // Keep the directive OWNED (clone for the send) so a transient backoff-retry or a
     // silent-hang watchdog re-drive can re-send the SAME directive on this session.
@@ -4861,6 +5471,8 @@ async fn drive_one_turn_with_backoff(
     if let Err(e) = session.send_turn(directive.clone()).await {
         return Err(format!("session send: {e}"));
     }
+    let memory_receipt = commit_sent_memories(&options.project_root, &directive, &memories)
+        .map(|receipt| SentReceiptGuard::new(&options.project_root, receipt));
     let mut text = String::new();
     let mut pitfalls: Vec<String> = Vec::new();
     // Bounded counters for the two self-heals (see the fn docs): how many transient
@@ -4873,6 +5485,7 @@ async fn drive_one_turn_with_backoff(
     // compile / npm install / a long test), so the next wait uses the extended tool
     // window; otherwise the base default — so a truly hung base still settles.
     let mut in_tool_call = false;
+    let mut tool_activity = ToolActivity::default();
     // Did the base ACTUALLY run a build/test/lint runner this turn? Set from the OBSERVED
     // tool-call stream below (not the reply prose), it is the corroboration the auto-QC
     // requires before a green CLAIM is trusted to skip UmaDev's own build/test read. Reset
@@ -4883,8 +5496,8 @@ async fn drive_one_turn_with_backoff(
     // BackgroundTask frames + the "Async agent launched" tool_result fallback). A
     // `Completed` settle with agents outstanding is converted into a bounded "wait
     // for your agents, collect their results, THEN report" re-drive — at most
-    // `bg_agents::MAX_BG_REDRIVES` per turn, then an honest note. Fail-open: a base
-    // that surfaces no background signal keeps a zero count → today's behavior.
+    // `bg_agents::MAX_BG_REDRIVES` per turn, then an incomplete failure. Fail-open:
+    // a base that surfaces no background signal keeps a zero count → today's behavior.
     let mut bg = crate::bg_agents::BgAgentTracker::new();
     loop {
         // Wall-clock budget reached DURING a turn (not just between steps/rounds). A
@@ -4914,6 +5527,7 @@ async fn drive_one_turn_with_backoff(
             return Ok(TurnResult {
                 text,
                 ran_build_tool,
+                memory_receipt,
             });
         }
         // Idle watchdog (P0-3 / P1-11): a base that HANGS (stops emitting stdout
@@ -4974,6 +5588,7 @@ async fn drive_one_turn_with_backoff(
                     return Ok(TurnResult {
                         text,
                         ran_build_tool,
+                        memory_receipt,
                     });
                 }
                 // Watchdog re-drive (bounded SINGLE retry): a NON-tool silent hang on a
@@ -5003,6 +5618,7 @@ async fn drive_one_turn_with_backoff(
                     text.clear();
                     pitfalls.clear();
                     in_tool_call = false;
+                    tool_activity.clear();
                     // The re-drive is a fresh attempt — the corroboration must reflect
                     // ONLY tools the FINAL attempt actually runs, never the abandoned
                     // (hung) attempt's runner: a stale `true` here would let the
@@ -5031,11 +5647,10 @@ async fn drive_one_turn_with_backoff(
         };
         // Update the mid-tool state from this event BEFORE handling it: a tool-use
         // arms the extended grace for the next wait, a tool-result disarms it.
-        if let Some(t) = tool_phase_transition(&ev) {
-            in_tool_call = t;
-        }
+        in_tool_call = tool_activity.observe(&ev);
         // Feed the outstanding-background-agents guard (cheap, fail-open).
         bg.observe(&ev);
+        let event_tool_call_id = ev.tool_call_id().map(str::to_owned);
         match ev {
             SessionEvent::TextDelta(delta) => {
                 est_tokens = est_tokens.saturating_add(approx_tokens(&delta));
@@ -5058,7 +5673,14 @@ async fn drive_one_turn_with_backoff(
                 // guess. Purely informational; drives no loop control or acceptance.
                 events.emit(EngineEvent::BaseModel { id });
             }
-            SessionEvent::ToolCall { name, input } => {
+            SessionEvent::StateUpdate(update) => {
+                events.emit(EngineEvent::BaseSessionState {
+                    backend_id: options.backend.clone(),
+                    update,
+                });
+            }
+            SessionEvent::ToolCall { name, input }
+            | SessionEvent::ToolCallCorrelated { name, input, .. } => {
                 // OBSERVED-tool corroboration (honesty floor): if THIS tool call is a real
                 // build/test/lint runner, record it — the auto-QC will require this signal
                 // before trusting the reply's prose "it's green" enough to skip UmaDev's
@@ -5105,8 +5727,45 @@ async fn drive_one_turn_with_backoff(
                 // "no real-time feedback when writing code"). Fail-open: a
                 // non-edit tool / unreadable input → None → the plain tool row.
                 let edit = umadev_runtime::ToolEdit::from_claude_tool_input(&name, &input);
+                let stream_event = match event_tool_call_id {
+                    None => StreamEvent::ToolUse { name, detail, edit },
+                    Some(call_id) => StreamEvent::ToolUseCorrelated {
+                        call_id,
+                        name,
+                        detail,
+                        edit,
+                    },
+                };
                 events.emit(EngineEvent::WorkerStream {
-                    event: StreamEvent::ToolUse { name, detail, edit },
+                    event: stream_event,
+                });
+            }
+            SessionEvent::ToolProgressCorrelated { call_id, title } => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolProgressCorrelated { call_id, title },
+                });
+            }
+            SessionEvent::ToolOutputDelta(delta) => {
+                // Process output is a non-terminal progress frame. Forward it
+                // for visibility without disarming the tool grace or treating
+                // verification as complete.
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolOutputDelta { delta },
+                });
+            }
+            SessionEvent::ToolOutputDeltaCorrelated { call_id, delta } => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolOutputDeltaCorrelated { call_id, delta },
+                });
+            }
+            SessionEvent::ToolOutputSnapshot(output) => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolOutputSnapshot { output },
+                });
+            }
+            SessionEvent::ToolOutputSnapshotCorrelated { call_id, output } => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolOutputSnapshotCorrelated { call_id, output },
                 });
             }
             SessionEvent::ToolResult { ok, summary } => {
@@ -5117,6 +5776,22 @@ async fn drive_one_turn_with_backoff(
                 }
                 events.emit(EngineEvent::WorkerStream {
                     event: StreamEvent::ToolResult { ok, summary },
+                });
+            }
+            SessionEvent::ToolResultCorrelated {
+                call_id,
+                ok,
+                summary,
+            } => {
+                if !ok {
+                    pitfalls.push(summary.clone());
+                }
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolResultCorrelated {
+                        call_id,
+                        ok,
+                        summary,
+                    },
                 });
             }
             SessionEvent::NeedApproval {
@@ -5151,8 +5826,24 @@ async fn drive_one_turn_with_backoff(
                     return Err(format!("session respond: {e}"));
                 }
             }
+            SessionEvent::HostRequest { req_id, request } => {
+                let response = resolve_host_request(options, events, &req_id, &request).await;
+                if let Err(error) = session.respond_host(&req_id, response).await {
+                    record_turn_usage(options, events, None, est_tokens);
+                    return Err(format!("session host response: {error}"));
+                }
+            }
             SessionEvent::BackgroundTask(_) => {
                 // Already folded into the tracker above; carries no render row.
+            }
+            SessionEvent::BackgroundProcess(_) => {
+                // A base-owned shell/monitor process has an independent
+                // lifecycle. It is observable in the resident UI, but it must
+                // not enter the sub-agent completion guard or block TurnDone.
+            }
+            SessionEvent::PromptQueueChanged(_) => {
+                // The native queue belongs to the interactive resident session;
+                // a headless director turn never materializes it as output.
             }
             SessionEvent::TurnDone { status, usage } => match status {
                 // Completed / Truncated → accept the turn (the deterministic floor
@@ -5167,6 +5858,7 @@ async fn drive_one_turn_with_backoff(
                     // your agents" re-drive (at most `MAX_BG_REDRIVES`, and never
                     // past the run deadline). Truncated is NOT re-driven — the base
                     // hit a turn/budget ceiling, spending more would fight the cap.
+                    // Exhausting the bound is an incomplete turn, never success.
                     if matches!(status, TurnStatus::Completed)
                         && std::time::Instant::now() < deadline
                         && bg.begin_redrive()
@@ -5186,27 +5878,33 @@ async fn drive_one_turn_with_backoff(
                             // appends the REAL final report) and keep
                             // `ran_build_tool` (tools genuinely ran this turn).
                             in_tool_call = false;
+                            tool_activity.clear();
                             continue;
                         }
                         // A send failure means the session is going away — fall
                         // through and settle honestly on what landed (fail-open).
-                    }
-                    if bg.outstanding() > 0 {
-                        // Bound exhausted (or the deadline/send blocked the
-                        // re-drive) — settle, but say so honestly.
-                        events.emit(EngineEvent::Note(umadev_i18n::tlf(
-                            "bg.outstanding_note",
-                            &[&bg.outstanding().to_string()],
-                        )));
                     }
                     // Wave 2 deliverable 4: record usage + distil pitfalls on the
                     // DEFAULT loop, for every base. Both fail-open. F3: prefer the
                     // base's REAL reported usage, fall back to the chars/4 estimate.
                     record_turn_usage(options, events, usage, est_tokens);
                     capture_turn_pitfalls(options, events, &pitfalls);
+                    if bg.outstanding() > 0 {
+                        // The base gave us positive lifecycle evidence that work is
+                        // still live. A warning followed by `Ok` still lets the outer
+                        // plan mark the step complete, so fail the logical turn after
+                        // the bounded recovery attempts instead.
+                        let incomplete = umadev_i18n::tlf(
+                            "bg.outstanding_note",
+                            &[&bg.outstanding().to_string()],
+                        );
+                        events.emit(EngineEvent::Note(incomplete.clone()));
+                        return Err(incomplete);
+                    }
                     return Ok(TurnResult {
                         text,
                         ran_build_tool,
+                        memory_receipt,
                     });
                 }
                 // LOW #2: an Interrupted/Failed turn still consumed tokens — record the
@@ -5254,6 +5952,7 @@ async fn drive_one_turn_with_backoff(
                         text.clear();
                         pitfalls.clear();
                         in_tool_call = false;
+                        tool_activity.clear();
                         // The re-drive is a fresh attempt — the corroboration must reflect
                         // ONLY tools the FINAL attempt actually runs, never a prior try's.
                         ran_build_tool = false;
@@ -5282,11 +5981,7 @@ pub(crate) fn record_estimated_usage(backend: &str, est_tokens: u64) {
     if est_tokens == 0 {
         return;
     }
-    crate::runner::record_usage(
-        backend,
-        umadev_spec::Phase::Frontend,
-        u32::try_from(est_tokens).unwrap_or(u32::MAX),
-    );
+    crate::runner::record_usage(backend, umadev_spec::Phase::Frontend, est_tokens);
 }
 
 /// The token count to record for one turn: the base's REAL usage when its live
@@ -5299,16 +5994,21 @@ pub(crate) fn record_estimated_usage(backend: &str, est_tokens: u64) {
 /// estimate; the real path can never make `/usage` read lower than honest.
 pub(crate) fn real_or_estimated_tokens(usage: Option<Usage>, est_tokens: u64) -> u64 {
     match usage {
-        Some(u) => u64::from(u.input_tokens) + u64::from(u.output_tokens),
+        // An incomplete empty report is explicitly "unknown/lower bound 0",
+        // not proof that the turn was free. Preserve any non-zero lower bound;
+        // otherwise use the deterministic estimate for the legacy flat ledger.
+        Some(u) if u.usage_incomplete && u.has_empty_lower_bound() => est_tokens,
+        Some(u) => u.total_tokens,
         None => est_tokens,
     }
 }
 
 /// Record one director turn's token usage to `~/.umadev/usage.jsonl` so `/usage`
-/// is real on the default loop for all three bases — preferring the base's REAL
+/// is real on the default loop for all five bases (three native plus Grok Build/Kimi Code) —
+/// preferring the base's REAL
 /// reported usage and falling back to the `chars/4` estimate (F3). Fail-open: a
 /// zero count / a write error is a no-op. Mirrors [`crate::runner::record_usage`].
-fn record_turn_usage(
+pub(crate) fn record_turn_usage(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     usage: Option<Usage>,
@@ -5318,12 +6018,7 @@ fn record_turn_usage(
     // the real path (an estimate is not the base's own number, so we don't inflate
     // the live count with it). The ledger row below still records the estimate
     // fallback so `/usage` stays honest.
-    if let Some(u) = &usage {
-        events.emit(EngineEvent::TurnUsage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-        });
-    }
+    events.emit(EngineEvent::TurnUsage { usage });
     record_estimated_usage(
         &options.backend,
         real_or_estimated_tokens(usage, est_tokens),
@@ -5449,6 +6144,47 @@ struct QcReport {
     raw_failure_log: Option<String>,
 }
 
+/// Build a bounded, machine-true terminal diagnosis from residual QC findings.
+/// The outcome text is rendered directly by CLI/TUI failure surfaces, so it must
+/// carry useful evidence without dumping an unbounded governance/build log.
+fn qc_incomplete_reason(reason: &str, blocking: &[String]) -> String {
+    const MAX_ITEMS: usize = 8;
+    const MAX_ITEM_CHARS: usize = 320;
+
+    let mut evidence: Vec<String> = blocking
+        .iter()
+        .filter_map(|item| {
+            let item = item.trim();
+            (!item.is_empty()).then(|| item.chars().take(MAX_ITEM_CHARS).collect())
+        })
+        .take(MAX_ITEMS)
+        .collect();
+    if blocking
+        .iter()
+        .filter(|item| !item.trim().is_empty())
+        .count()
+        > evidence.len()
+    {
+        evidence.push(format!(
+            "... {} additional blocking finding(s)",
+            blocking
+                .iter()
+                .filter(|item| !item.trim().is_empty())
+                .count()
+                .saturating_sub(evidence.len())
+        ));
+    }
+
+    if evidence.is_empty() {
+        format!("director build incomplete: {reason}")
+    } else {
+        format!(
+            "director build incomplete: {reason}. Residual evidence: {}",
+            evidence.join(" | ")
+        )
+    }
+}
+
 impl QcReport {
     /// Whether the build passed QC clean (no blocking problem found).
     fn is_clean(&self) -> bool {
@@ -5460,6 +6196,7 @@ impl QcReport {
     /// own tools — UmaDev only hands it the facts and asks it to act. Lean +
     /// command-style so the base fixes rather than narrates; it already holds the
     /// full build context in this one continuous session, so no role re-priming.
+    #[cfg(test)]
     fn fix_directive(&self) -> String {
         self.fix_directive_with_context("")
     }
@@ -5470,7 +6207,38 @@ impl QcReport {
     /// (`post_build_rework_context`) so the fix turn fixes WITH the team's standards
     /// and memory, not blind. An empty prefix yields the byte-for-byte original
     /// directive, so the `/run` callers are unchanged. Fail-open by construction.
+    #[cfg(test)]
     fn fix_directive_with_context(&self, prefix: &str) -> String {
+        let mut tracker = crate::blocker::BlockerSetTracker::default();
+        let assessments = self.assess_blockers(&mut tracker, false);
+        self.fix_directive_with_assessments(prefix, &assessments)
+    }
+
+    /// Diagnose the current set with classifier-owned playbooks while preserving
+    /// recurrence state in `tracker` across QC rounds.
+    fn assess_blockers(
+        &self,
+        tracker: &mut crate::blocker::BlockerSetTracker,
+        workspace_progress: bool,
+    ) -> Vec<crate::blocker::BlockerAssessment> {
+        let mut evidence = self.blocking.clone();
+        if let Some(raw) = self
+            .raw_failure_log
+            .as_ref()
+            .filter(|raw| !raw.trim().is_empty())
+        {
+            evidence.push(raw.clone());
+        }
+        tracker.assess_all(&evidence, "objective QC", true, workspace_progress)
+    }
+
+    /// Render a directive from assessments already computed by the run-local
+    /// tracker, so the prompt and the visible loop decision cannot disagree.
+    fn fix_directive_with_assessments(
+        &self,
+        prefix: &str,
+        assessments: &[crate::blocker::BlockerAssessment],
+    ) -> String {
         let mut body = String::new();
         for b in &self.blocking {
             body.push_str("- ");
@@ -5492,14 +6260,46 @@ impl QcReport {
             }
             _ => String::new(),
         };
+        let diagnosis = assessments
+            .iter()
+            .take(8)
+            .map(crate::blocker::BlockerAssessment::prompt_block)
+            .collect::<Vec<_>>()
+            .join("\n\n");
         format!(
             "{lead}An objective check of what you just built surfaced problems that must be \
              fixed (these are real facts read from disk / review, not your memory):\n\
-             {body}\nFix the cause of each one yourself with your tools — edit/create \
+             {body}\n{diagnosis}\n\nFix the cause of each one yourself with your tools — edit/create \
              the real files — then RUN the project's own build and tests to confirm \
              they pass. When it is genuinely clean, end your turn and report honestly \
              what you fixed.{raw}"
         )
+    }
+}
+
+fn diagnosed_blockers_for_prompt(findings: &[String], criterion: &str) -> String {
+    let mut tracker = crate::blocker::BlockerSetTracker::default();
+    tracker
+        .assess_all(findings, criterion, true, false)
+        .iter()
+        .take(8)
+        .map(crate::blocker::BlockerAssessment::prompt_block)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn emit_blocker_assessments(
+    events: &Arc<dyn EventSink>,
+    assessments: &[crate::blocker::BlockerAssessment],
+) {
+    for item in assessments.iter().take(8) {
+        events.emit(EngineEvent::Note(format!(
+            "team · blocker {}/{} · {} · unchanged repeat {}",
+            item.diagnosis.class.as_str(),
+            item.diagnosis.fingerprint,
+            item.disposition.as_str(),
+            item.repeat_count,
+        )));
     }
 }
 
@@ -5702,12 +6502,8 @@ async fn run_auto_qc(
     //     artifact / unreadable doc yields no gap, never a false alarm), so a check
     //     that genuinely can't run is a NEUTRAL skip, not a fabricated failure.
     if route.map(|r| r.depth.is_deliberate()).unwrap_or(false) {
-        // ONE scope-creep computation for BOTH halves of its answer. It stages the whole
-        // work-tree, reads the run diff, and extracts every backend route in the repo —
-        // and the floor (new unclaimed surfaces) and the notes (unclaimed edits) are two
-        // views of that ONE set, not two questions. Computing it twice paid for all of
-        // it twice, and left the two views able to disagree if a file landed between the
-        // calls. Fail-open exactly as before: no plan → no set → both halves silent.
+        // Compute scope drift once. New surfaces and edits to existing files are both
+        // execution-contract violations; a missing diff remains a silent fail-open.
         let scope: Vec<crate::scope_creep::ScopeFinding> =
             crate::plan_state::load(&options.project_root)
                 .map(|plan| crate::scope_creep::unclaimed_changes(&options.project_root, &plan))
@@ -5715,10 +6511,6 @@ async fn run_auto_qc(
         for line in acceptance_floor_blocking_with(options, route, Some(&scope)) {
             blocking.push(line);
         }
-        // The ADVISORY half of the SAME set (an unclaimed edit inside code that already
-        // existed): worth seeing, not worth blocking. Bounded + fail-open — silent
-        // whenever the check itself is silent.
-        emit_scope_advisories(events, &scope);
     }
 
     // 3. Optional fork review (UmaDev's read-only QC over read-only forks). The team
@@ -5757,19 +6549,18 @@ async fn run_auto_qc(
 /// unparseable doc yields no gap (a neutral skip), so a check that genuinely
 /// cannot run never fabricates a failure. Returns the blocking lines (empty =
 /// the floor is clean OR nothing could be checked).
+#[cfg(test)]
 fn acceptance_floor_blocking(options: &RunOptions, route: Option<&RoutePlan>) -> Vec<String> {
     acceptance_floor_blocking_with(options, route, None)
 }
 
-/// [`acceptance_floor_blocking`], reusing a scope-creep result the caller ALREADY
+/// The acceptance-floor core, optionally reusing scope drift the caller already
 /// computed.
 ///
 /// `unclaimed_changes` is not cheap: it stages the whole work-tree into the shadow index
 /// (`git add -A --force`), reads a full run diff, and runs a repo-wide backend-route
-/// extraction. A QC pass needs BOTH halves of its answer — the blocking new-surface
-/// findings for the floor, and the advisory edits for the notes — and computing it twice
-/// pays all of that twice for one set of facts (and can even disagree with itself if a
-/// file lands between the two calls). Compute once, partition by severity.
+/// extraction. A QC pass reuses that one snapshot so every scope finding is judged
+/// against the same workspace state.
 ///
 /// `scope: None` keeps the standalone behaviour (compute it here) for callers that have
 /// no precomputed set.
@@ -5821,7 +6612,7 @@ fn acceptance_floor_blocking_with(
     // half of the anti-spaghetti floor — the architecture doc's declared
     // layer-dependency rules (`## Layering` order / `LAYER-RULE: a !-> b`),
     // verified against the repo-map's resolved import edges. The touched-file
-    // rules (god-file / added-code clones) run at the STEP level in
+    // rules (god-file / added-code clones / comment hygiene) run at the STEP level in
     // `drive_build_step`, where the changed-file set is known from the pre-step
     // baseline; here the empty touched set makes them a silent no-op by
     // construction. Fail-open: no doc / no declaration / no resolved edges →
@@ -5836,11 +6627,9 @@ fn acceptance_floor_blocking_with(
     // requirement has no step?" (UNDER-building). This asks the opposite: "which CHANGE
     // belongs to no step?" (OVER-building) — an unplanned dependency, an unplanned
     // source file, an unplanned public route: work nobody sized, nobody asked for, and
-    // nobody reviewed. Only the NEW-SURFACE findings block; an unclaimed edit inside
-    // existing code is advisory (surfaced as a note by the caller). Fail-open and
-    // SILENT when no step declared a file surface, when there is no run baseline to diff
-    // against, or when the diff can't be read — an absent declaration is not a claim
-    // that nothing will change, so it can never manufacture a finding.
+    // nobody reviewed. New surfaces and edits to existing files both violate the
+    // execution contract. A missing run baseline or unreadable diff remains fail-open;
+    // malformed/missing step file declarations are rejected by plan preflight.
     // See [`crate::scope_creep`]. Reuse the caller's set when it already paid for one.
     match scope {
         Some(findings) => out.extend(
@@ -5920,114 +6709,6 @@ fn acceptance_floor_blocking_with(
     out
 }
 
-/// Read a written `runtime-proof.json` and, if it recorded a real (non-skipped)
-/// FAILURE to boot/answer, return a blocking line. A missing file → `None` (the
-/// runtime check simply wasn't run this loop — neutral, never a fabricated fail).
-/// A written-but-not-verified proof whose reason is a SKIP (no dev server / no
-/// curl) is also neutral; only a proof that ran and failed blocks. Fail-open: an
-/// unreadable / unparseable file → `None`.
-///
-/// FRESHNESS: a proof whose source fingerprint no longer matches the tree is STALE
-/// and is not read at all — in EITHER direction. A stale FAILURE must not block code
-/// that has since been fixed, and (more importantly) a stale PASS must not be mistaken
-/// for evidence about the code we are shipping. A proof produced before the last change
-/// to the code it describes is not a proof; the check has to be re-run for real, which
-/// is exactly what the floor does on its own path. Fail-open: an unstamped proof (an
-/// older artifact) has no fingerprint to contradict, so it is read as before.
-fn runtime_proof_blocking(root: &std::path::Path) -> Option<String> {
-    let path = root.join(crate::runtime_proof::runtime_proof_rel_path());
-    let body = std::fs::read_to_string(path).ok()?;
-    let proof: crate::runtime_proof::RuntimeProof = serde_json::from_str(&body).ok()?;
-    if proof.is_stale(root) {
-        return None; // describes a tree that no longer exists → says nothing about this one
-    }
-    if proof.status.is_verified() {
-        return None; // booted + answered → no problem
-    }
-    // Not verified. Distinguish a real failure from a neutral skip: a skip reason
-    // names an absent precondition (no dev server / curl / not detected). Only a
-    // genuine boot/route failure is blocking.
-    let reason = proof.summary_line().to_ascii_lowercase();
-    let is_skip = reason.contains("not found")
-        || reason.contains("no dev server")
-        || reason.contains("not detected")
-        || reason.contains("skipped");
-    if is_skip {
-        return None;
-    }
-    Some(format!(
-        "runtime-proof: the app did not boot + answer its routes — {} (fix the cause so it \
-         actually runs, then re-verify)",
-        proof.summary_line()
-    ))
-}
-
-/// Heuristic: does the project carry at least one real test file? Used only for the
-/// Bugfix reproduction-test floor. Looks for the universal test-file conventions
-/// (`*.test.*` / `*.spec.*` / a `tests/` or `__tests__` dir / a `test_*.py` /
-/// `*_test.go` / a Rust `#[test]`). Pure + fail-open (bounded by `source_files`):
-/// an empty tree → `false`. Conservative — a false "has a test" only DROPS a
-/// blocking floor (never fabricates one), so we require a reasonably strong signal.
-fn has_reproduction_test(root: &std::path::Path) -> bool {
-    for f in crate::acceptance::source_files(root) {
-        let name = f
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let path_str = f.to_string_lossy().to_ascii_lowercase();
-        let by_name = name.contains(".test.")
-            || name.contains(".spec.")
-            || name.starts_with("test_")
-            || name.ends_with("_test.go")
-            || name.ends_with("_test.py")
-            || name.ends_with(".test.rs");
-        let by_dir = path_str.contains("/tests/")
-            || path_str.contains("/__tests__/")
-            || path_str.contains("/test/")
-            || path_str.contains("/spec/");
-        if by_name || by_dir {
-            return true;
-        }
-        // A Rust file carrying `#[test]` / `#[tokio::test]` is a real test too.
-        if name.to_ascii_lowercase().ends_with(".rs") {
-            if let Ok(content) = std::fs::read_to_string(&f) {
-                if content.contains("#[test]") || content.contains("#[tokio::test]") {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Surface the ADVISORY half of the scope check as notes — an unclaimed edit inside a
-/// file that already existed. Ordinary drift most of the time; occasionally the first
-/// visible sign that the run is building something nobody planned. Advisory by design:
-/// it informs, it never blocks (only a NEW unclaimed surface — file / dependency /
-/// route — does that, via [`acceptance_floor_blocking`]).
-///
-/// Bounded (at most [`MAX_SCOPE_ADVISORIES`] notes) and fail-open: silent when no step
-/// declared a file surface, when there is no run baseline, or when the diff can't be
-/// read — i.e. whenever `scope` is empty, which is exactly what the check itself returns
-/// in every one of those cases.
-///
-/// Takes the ALREADY-COMPUTED set: the blocking half and this advisory half are two
-/// views of ONE `unclaimed_changes` result (which stages the tree and scans every route
-/// in the repo), so the QC pass computes it once and partitions it.
-fn emit_scope_advisories(events: &Arc<dyn EventSink>, scope: &[crate::scope_creep::ScopeFinding]) {
-    for f in scope
-        .iter()
-        .filter(|f| !f.blocking)
-        .take(MAX_SCOPE_ADVISORIES)
-    {
-        events.emit(EngineEvent::Note(format!("team · {}", f.message)));
-    }
-}
-
-/// How many scope advisories one QC pass surfaces before it stops talking.
-const MAX_SCOPE_ADVISORIES: usize = 5;
-
 /// Map a [`VerifyResult`] from a build/test check to a blocking line, or `None` when
 /// it passed / was skipped (an unavailable check is neutral — fail-open).
 fn build_test_blocking(r: &VerifyResult) -> Option<String> {
@@ -6042,7571 +6723,19 @@ fn build_test_blocking(r: &VerifyResult) -> Option<String> {
     Some(format!("verify build-test: FAILED{detail}"))
 }
 
-/// Pull the blocking findings out of a [`ReviewResult`] (already seat-tagged +
-/// deduped by the review team). Empty when the team accepted or no team convened.
+/// Pull every reason a required review is not clean. Operational unavailability is
+/// distinct in [`ReviewResult`] but blocks commercial completion just like a
+/// residual must-fix finding; it must never disappear as an empty pass.
 fn review_blocking(r: &ReviewResult) -> Vec<String> {
-    r.blocking.clone()
+    let mut findings = r.blocking.clone();
+    findings.extend(
+        r.unavailable
+            .iter()
+            .map(|item| format!("review unavailable: {item}")),
+    );
+    findings
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Serializes the tests that mutate the process-global `UMADEV_IDLE_TIMEOUT_SECS`
-    /// / `UMADEV_TOOL_IDLE_TIMEOUT_SECS` env (read by `IdleBudget::from_env`):
-    /// `set_var` / `remove_var` are process-wide, so without this lock concurrent env
-    /// tests race and flake. Poison-tolerant so one failing test can't cascade.
-    static IDLE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    use crate::events::RecordingSink;
-    use crate::trust::TrustMode;
-    use umadev_runtime::{SessionError, SessionEvent, TurnStatus};
-
-    struct EnvRestore {
-        key: &'static str,
-        prior: Option<std::ffi::OsString>,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let prior = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, prior }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let prior = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self { key, prior }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match self.prior.take() {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
-    fn opts(root: &std::path::Path) -> RunOptions {
-        RunOptions {
-            project_root: root.to_path_buf(),
-            requirement: "做一个登录系统".to_string(),
-            slug: "demo".to_string(),
-            model: String::new(),
-            backend: String::new(),
-            design_system: String::new(),
-            seed_template: String::new(),
-            mode: TrustMode::Auto,
-            strict_coverage: false,
-        }
-    }
-
-    fn sink() -> (Arc<dyn EventSink>, RecordingSink) {
-        let rec = RecordingSink::default();
-        (Arc::new(rec.clone()), rec)
-    }
-
-    #[test]
-    fn default_loop_audit_records_the_real_verdict_not_hardcoded_allow() {
-        // P2: the default director loop used to record every tool call as `allow`,
-        // inconsistent with the continuous path's real governance verdict. Now the
-        // audit computes the SAME verdict: a dangerous bash → `block`, a benign
-        // read → `allow`.
-        let tmp = tempfile::TempDir::new().expect("tmp");
-        let options = opts(tmp.path());
-
-        // Dangerous command → the verdict blocks (not a hardcoded allow).
-        let danger = serde_json::json!({ "command": "rm -rf /" });
-        let d = tool_call_governance_verdict(&options, "Bash", &danger);
-        assert!(d.block, "a root-wipe must produce a blocking verdict");
-
-        // A benign read → pass.
-        let benign = serde_json::json!({ "file_path": "src/main.rs" });
-        let r = tool_call_governance_verdict(&options, "Read", &benign);
-        assert!(!r.block, "an observe-only read passes");
-
-        // The audit record carries the REAL decision word, not `allow`.
-        record_tool_call_audit(&options, "Bash", "rm -rf /", &danger);
-        let log = tmp
-            .path()
-            .join(".umadev")
-            .join("audit")
-            .join("tool-calls.jsonl");
-        let recorded = std::fs::read_to_string(&log).unwrap_or_default();
-        assert!(
-            recorded.contains("\"decision\":\"block\""),
-            "the audit trail records the real `block` verdict, not a hardcoded allow: {recorded}"
-        );
-    }
-
-    #[test]
-    fn default_loop_floor_blocks_env_write_even_when_clauses_disabled() {
-        // P2: the default loop's verdict must apply the bypass-immune floor. Even
-        // with the secret/path clauses disabled in `.umadev/rules.toml`, a write to
-        // `.env` (no source extension → a content scan alone would miss it) is
-        // blocked by the floor's path guard (UD-SEC-001) — the same un-closable
-        // floor `continuous::evaluate_tool_call` and the Claude hook apply.
-        let tmp = tempfile::TempDir::new().expect("tmp");
-        let udir = tmp.path().join(".umadev");
-        std::fs::create_dir_all(&udir).unwrap();
-        std::fs::write(
-            udir.join("rules.toml"),
-            "[disabled]\nclauses = [\"UD-SEC-001\", \"UD-SEC-003\", \"UD-SEC-018\", \"UD-SEC-026\"]\n",
-        )
-        .unwrap();
-        let options = opts(tmp.path());
-
-        let env_write = serde_json::json!({ "file_path": ".env", "content": "PORT=3000" });
-        let d = tool_call_governance_verdict(&options, "Write", &env_write);
-        assert!(
-            d.block,
-            "the floor must block a .env write despite the disabled clauses"
-        );
-        assert_eq!(d.clause, "UD-SEC-001");
-    }
-
-    // ── A scripted fake BaseSession: each `send_turn` loads the next scripted
-    // batch of events (a turn). Forks emit a fixed JSON verdict so a QC review gets
-    // a verdict. `next_event` drains the current batch. ──
-    #[derive(Clone)]
-    struct FakeSession {
-        /// One event-batch per upcoming MAIN turn, consumed front-to-back.
-        turns: std::collections::VecDeque<Vec<SessionEvent>>,
-        /// The currently-draining batch.
-        current: std::collections::VecDeque<SessionEvent>,
-        /// Directives the MAIN session received, in order (asserted by tests).
-        sent: Arc<std::sync::Mutex<Vec<String>>>,
-        /// Whether `fork()` succeeds.
-        can_fork: bool,
-        /// JSON a forked judge turn emits.
-        fork_reply: String,
-        /// `true` once this is a forked (read-only) session.
-        is_fork: bool,
-    }
-
-    impl FakeSession {
-        fn new(turns: Vec<Vec<SessionEvent>>, can_fork: bool, fork_reply: &str) -> Self {
-            Self {
-                turns: turns.into_iter().collect(),
-                current: std::collections::VecDeque::new(),
-                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
-                can_fork,
-                fork_reply: fork_reply.to_string(),
-                is_fork: false,
-            }
-        }
-        fn sent_handle(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
-            Arc::clone(&self.sent)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl BaseSession for FakeSession {
-        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-            if !self.can_fork {
-                return Err(SessionError::ForkUnsupported("test".into()));
-            }
-            let mut f = self.clone();
-            f.is_fork = true;
-            f.current.clear();
-            f.turns.clear();
-            Ok(Box::new(f))
-        }
-        async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
-            if self.is_fork {
-                // A forked judge turn emits its JSON verdict then ends.
-                self.current = [
-                    SessionEvent::TextDelta(self.fork_reply.clone()),
-                    SessionEvent::TurnDone {
-                        status: TurnStatus::Completed,
-                        usage: None,
-                    },
-                ]
-                .into_iter()
-                .collect();
-                return Ok(());
-            }
-            self.sent.lock().unwrap().push(directive);
-            self.current = self
-                .turns
-                .pop_front()
-                .unwrap_or_else(|| {
-                    vec![SessionEvent::TurnDone {
-                        status: TurnStatus::Completed,
-                        usage: None,
-                    }]
-                })
-                .into_iter()
-                .collect();
-            Ok(())
-        }
-        async fn next_event(&mut self) -> Option<SessionEvent> {
-            self.current.pop_front()
-        }
-        async fn respond(
-            &mut self,
-            _req_id: &str,
-            _decision: ApprovalDecision,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn interrupt(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn end(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
-    fn text_turn(s: &str) -> Vec<SessionEvent> {
-        vec![
-            SessionEvent::TextDelta(s.to_string()),
-            SessionEvent::TurnDone {
-                status: TurnStatus::Completed,
-                usage: None,
-            },
-        ]
-    }
-
-    /// A turn that ends with REAL reported usage (F3) — for asserting the
-    /// consumer prefers the base's reported usage over the chars/4 estimate.
-    fn text_turn_with_usage(s: &str, input: u32, output: u32) -> Vec<SessionEvent> {
-        vec![
-            SessionEvent::TextDelta(s.to_string()),
-            SessionEvent::TurnDone {
-                status: TurnStatus::Completed,
-                usage: Some(Usage {
-                    input_tokens: input,
-                    output_tokens: output,
-                }),
-            },
-        ]
-    }
-
-    /// Write a minimal real source file so the source-present floor passes and QC
-    /// moves on to build/test + review (instead of stopping at the hard floor).
-    fn seed_source(root: &std::path::Path) {
-        std::fs::write(root.join("app.ts"), "export const x = 1;").unwrap();
-    }
-
-    /// Seed the three core-doc deliverables the doc-first skeleton requires, so a
-    /// deliberate step-driven build's prepended PM/architect/UIUX doc steps pass their
-    /// FileContains/FileExists acceptance and the plan proceeds to the code steps.
-    /// Also seeds an execution plan citing the PRD's `FR-001` so the requirement-
-    /// coverage floor is satisfied — otherwise the PRD's declared `FR-001` reads as an
-    /// uncovered requirement, failing the contract floor a backend step verifies against
-    /// (`ContractMatches`) and stalling the build at the frontend phase.
-    ///
-    /// Also seeds the TWO code-phase-prep deliverables the skeleton now guarantees
-    /// structurally: an authored test file under `tests/` (the QA test-authoring
-    /// step's FileExists evidence — authored tests exist, NOT a green suite) and a
-    /// real `design-tokens.json` on the blackboard (the designer tokens step's
-    /// DesignTokensPresent acceptance), so those inserted steps accept and the
-    /// driving tests keep exercising the SAME doc→code flow as before.
-    fn seed_core_docs(root: &std::path::Path) {
-        let out = root.join("output");
-        std::fs::create_dir_all(&out).unwrap();
-        std::fs::write(out.join("demo-prd.md"), "# PRD\n\nFR-001 login\n").unwrap();
-        std::fs::write(
-            out.join("demo-architecture.md"),
-            "# Architecture\n\n## API\nGET /api/x\n",
-        )
-        .unwrap();
-        // The UIUX doc carries the `## Visual direction` the designer's DIRECTION step
-        // (UD-CODE-007f) is bound to — a design read naming the REGISTER, the three
-        // forced decisions (color commitment level; the theme forced by a physical
-        // scene; named anchors each bound to a dimension), and anti-goals.
-        std::fs::write(
-            out.join("demo-uiux.md"),
-            "# UI/UX\n\n\
-             ## Visual direction\n\n\
-             Design read: an internal task console for support agents — register: product — \
-             calm, dense, unremarkable — family: tech-utility.\n\n\
-             - Color commitment: restrained. Color is a status signal, never decoration.\n\
-             - Theme: agents sit in a windowless floor lit by overhead fluorescents for an \
-             8-hour shift and glance between two monitors; the constant flat light and long \
-             dwell force a light theme with strong contrast.\n\
-             - Anchors:\n\
-               - density: from a flight-status board — many true rows, one line each.\n\
-               - type: from a transit signage system — one neutral face, tabular figures.\n\
-               - whitespace: from a spreadsheet — tight rows, generous column gutters.\n\n\
-             Anti-goals: not a consumer dashboard, not a marketing surface, no illustration, \
-             no page-load animation.\n\n\
-             ## Tokens\n\ndesign tokens + component states\n",
-        )
-        .unwrap();
-        std::fs::write(
-            out.join("demo-execution-plan.md"),
-            "# Execution plan\n\n- FR-001 login covered by the auth task\n",
-        )
-        .unwrap();
-        // QA test-authoring evidence: the authored acceptance tests exist on disk.
-        let tests = root.join("tests");
-        std::fs::create_dir_all(&tests).unwrap();
-        std::fs::write(
-            tests.join("acceptance.test.ts"),
-            "test('FR-001 login', () => { expect(1).toBe(1); });\n",
-        )
-        .unwrap();
-        // Designer design-tokens evidence: a REAL, CONFORMANT tokens file on the
-        // blackboard (UD-CODE-007). The old fixture (`{"color":{"primary":"#0f62fe"}}`)
-        // was exactly the theatre the conformance floor now rejects: a file, not a
-        // system. This one declares >= 6 color roles each with a paired `on-`
-        // foreground (all clearing WCAG), a >= 4-step type scale at ratio >= 1.125, a
-        // 4pt spacing scale, a radius scale, and motion tokens.
-        std::fs::write(
-            out.join("design-tokens.css"),
-            ":root {\n\
-             --color-bg: #fafafa; --color-on-bg: #18181b;\n\
-             --color-surface: #ffffff; --color-on-surface: #18181b;\n\
-             --color-card: #ffffff; --color-on-card: #3f3f46;\n\
-             --color-muted: #f4f4f5; --color-on-muted: #52525b;\n\
-             --color-primary: #1d4ed8; --color-on-primary: #ffffff;\n\
-             --color-accent: #0f766e; --color-on-accent: #ffffff;\n\
-             --color-border: #e4e4e7;\n\
-             --text-xs: 0.75rem; --text-sm: 0.875rem; --text-base: 1rem; --text-lg: 1.125rem;\n\
-             --space-1: 4px; --space-2: 8px; --space-4: 16px; --space-6: 24px;\n\
-             --radius-sm: 6px; --radius-md: 8px;\n\
-             --duration-fast: 120ms; --duration-normal: 180ms;\n\
-             --ease-standard: cubic-bezier(0.2, 0, 0.2, 1);\n\
-             }\n",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn real_usage_is_preferred_over_the_estimate() {
-        // F3: when the base reports REAL per-turn usage on `TurnDone`, the consumer
-        // records input+output, NOT the chars/4 estimate. When it doesn't (None,
-        // e.g. opencode), it falls back to the estimate — so `/usage` stays honest.
-        let real = Some(Usage {
-            input_tokens: 1500,
-            output_tokens: 450,
-        });
-        // Estimate (99) is ignored when real usage is present.
-        assert_eq!(real_or_estimated_tokens(real, 99), 1950);
-        // No reported usage → the estimate stands (opencode path / failed parse).
-        assert_eq!(real_or_estimated_tokens(None, 99), 99);
-        // A reported zero-usage turn records zero (honest), not the estimate.
-        assert_eq!(real_or_estimated_tokens(Some(Usage::default()), 99), 0);
-    }
-
-    #[tokio::test]
-    async fn turn_done_real_usage_flows_through_drive_one_turn() {
-        // F3 end-to-end on the DEFAULT loop: a turn whose `TurnDone` carries real
-        // usage drives cleanly to completion (the real-usage path must not change
-        // loop control, only what `/usage` records). The recorded number lands in
-        // ~/.umadev (HOME) so we assert the turn SUCCEEDS rather than the file.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let turns = vec![text_turn_with_usage("done, real usage attached", 1200, 300)];
-        let mut sess = FakeSession::new(turns, false, "");
-        let out = drive_one_turn(
-            &mut sess,
-            &opts(tmp.path()),
-            &events,
-            "build it".to_string(),
-            IdleBudget::new(
-                std::time::Duration::from_secs(5),
-                std::time::Duration::from_secs(5),
-            ),
-            std::time::Instant::now() + std::time::Duration::from_secs(3600),
-        )
-        .await;
-        match out {
-            Ok(r) => assert_eq!(r.text, "done, real usage attached"),
-            Err(e) => panic!("a turn with real usage must complete cleanly: {e}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn outstanding_bg_agents_convert_the_settle_into_a_bounded_redrive() {
-        // Report-1 fix: the base dispatches background sub-agents, writes a premature
-        // "final report" and ends the turn. The pump must NOT settle — it re-drives the
-        // base with a "wait for your agents, collect their results" directive; once the
-        // agents resolve (turn 2 here), the turn settles cleanly with no honesty note.
-        use umadev_runtime::BackgroundTaskSignal;
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, rec) = sink();
-        let turns = vec![
-            vec![
-                SessionEvent::BackgroundTask(BackgroundTaskSignal::Started {
-                    id: "a1".to_string(),
-                }),
-                SessionEvent::BackgroundTask(BackgroundTaskSignal::Started {
-                    id: "a2".to_string(),
-                }),
-                SessionEvent::TextDelta("dispatched 2 agents; final report: done".to_string()),
-                SessionEvent::TurnDone {
-                    status: TurnStatus::Completed,
-                    usage: None,
-                },
-            ],
-            vec![
-                SessionEvent::BackgroundTask(BackgroundTaskSignal::Finished {
-                    id: "a1".to_string(),
-                }),
-                SessionEvent::BackgroundTask(BackgroundTaskSignal::Live { agent_ids: vec![] }),
-                SessionEvent::TextDelta(" — collected; real final report".to_string()),
-                SessionEvent::TurnDone {
-                    status: TurnStatus::Completed,
-                    usage: None,
-                },
-            ],
-        ];
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
-        let out = drive_one_turn(
-            &mut sess,
-            &opts(tmp.path()),
-            &events,
-            "build it".to_string(),
-            IdleBudget::new(
-                std::time::Duration::from_secs(5),
-                std::time::Duration::from_secs(5),
-            ),
-            std::time::Instant::now() + std::time::Duration::from_secs(3600),
-        )
-        .await
-        .expect("the re-driven turn settles cleanly");
-        // The re-drive happened: two directives were sent, the second being the
-        // bounded "wait for your background agents" corrective.
-        let sent = sent.lock().unwrap().clone();
-        assert_eq!(sent.len(), 2, "one build directive + one bg re-drive");
-        assert!(
-            sent[1].contains("background") && sent[1].contains("2"),
-            "the re-drive names the outstanding count: {}",
-            sent[1]
-        );
-        // Nothing outstanding at the final settle → NO honest-incomplete note.
-        assert_eq!(
-            rec.count(|e| matches!(e, EngineEvent::Note(n) if n.contains("[warn]")
-                && n.contains("git status"))),
-            0,
-            "no outstanding-work note once the agents resolved"
-        );
-        // The text keeps BOTH turns' output (the premature report + the real one).
-        assert!(out.text.contains("real final report"));
-    }
-
-    #[tokio::test]
-    async fn bg_redrive_is_bounded_then_settles_with_an_honest_note() {
-        // The bound: agents that NEVER resolve earn at most MAX_BG_REDRIVES re-drives,
-        // then the turn settles (terminating!) with the honest incomplete-work note.
-        use umadev_runtime::BackgroundTaskSignal;
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, rec) = sink();
-        let stuck = |report: &str| {
-            vec![
-                SessionEvent::BackgroundTask(BackgroundTaskSignal::Started {
-                    id: "a1".to_string(),
-                }),
-                SessionEvent::TextDelta(report.to_string()),
-                SessionEvent::TurnDone {
-                    status: TurnStatus::Completed,
-                    usage: None,
-                },
-            ]
-        };
-        let turns = vec![stuck("report 1"), stuck("report 2"), stuck("report 3")];
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
-        let out = drive_one_turn(
-            &mut sess,
-            &opts(tmp.path()),
-            &events,
-            "build it".to_string(),
-            IdleBudget::new(
-                std::time::Duration::from_secs(5),
-                std::time::Duration::from_secs(5),
-            ),
-            std::time::Instant::now() + std::time::Duration::from_secs(3600),
-        )
-        .await
-        .expect("the bounded settle still completes the turn");
-        assert!(out.text.contains("report 3"));
-        assert_eq!(
-            sent.lock().unwrap().len(),
-            1 + usize::from(crate::bg_agents::MAX_BG_REDRIVES),
-            "exactly MAX_BG_REDRIVES re-drives, then settle"
-        );
-        // The settle is honest: the outstanding-work note was emitted.
-        assert!(
-            rec.count(|e| matches!(e, EngineEvent::Note(n) if n.contains("git status"))) >= 1,
-            "settling with outstanding agents must say so"
-        );
-    }
-
-    /// A turn that RUNS a shell command (a `ToolCall`) before finishing, for asserting
-    /// the observed-tool corroboration (`ran_build_tool`) the auto-QC honesty floor reads.
-    fn tool_then_text_turn(command: &str, s: &str) -> Vec<SessionEvent> {
-        vec![
-            SessionEvent::ToolCall {
-                name: "Bash".to_string(),
-                input: serde_json::json!({ "command": command }),
-            },
-            SessionEvent::TextDelta(s.to_string()),
-            SessionEvent::TurnDone {
-                status: TurnStatus::Completed,
-                usage: None,
-            },
-        ]
-    }
-
-    #[tokio::test]
-    async fn drive_one_turn_records_an_observed_build_runner() {
-        // The observed-tool corroboration is set from the ACTUAL tool-call stream: a turn
-        // that runs `cargo test` marks `ran_build_tool = true`; a turn that only runs a
-        // non-runner (`cat package.json`) leaves it `false` even when the reply CLAIMS a
-        // green build — so narration alone can never corroborate.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let idle = IdleBudget::new(
-            std::time::Duration::from_secs(5),
-            std::time::Duration::from_secs(5),
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
-
-        let mut ran = FakeSession::new(
-            vec![tool_then_text_turn(
-                "cargo test --workspace",
-                "All tests pass.",
-            )],
-            false,
-            "",
-        );
-        let out = drive_one_turn(
-            &mut ran,
-            &opts(tmp.path()),
-            &events,
-            "build it".to_string(),
-            idle,
-            deadline,
-        )
-        .await
-        .expect("turn completes");
-        assert!(
-            out.ran_build_tool,
-            "an observed `cargo test` runner must set ran_build_tool"
-        );
-
-        let mut narrated = FakeSession::new(
-            vec![tool_then_text_turn(
-                "cat package.json",
-                "Ran cargo test — all tests pass (exit code 0).",
-            )],
-            false,
-            "",
-        );
-        let out2 = drive_one_turn(
-            &mut narrated,
-            &opts(tmp.path()),
-            &events,
-            "build it".to_string(),
-            idle,
-            deadline,
-        )
-        .await
-        .expect("turn completes");
-        assert!(
-            !out2.ran_build_tool,
-            "a non-runner tool + a NARRATED green claim must NOT set ran_build_tool"
-        );
-    }
-
-    /// Attempt 1 OBSERVES a real test runner (`cargo test` ToolCall + result) then
-    /// HANGS silently (no TurnDone, base still alive) → the silent-hang watchdog
-    /// re-drives once; attempt 2 only NARRATES a green result — no tool call at all.
-    struct HangsAfterRunnerThenNarrates {
-        sends: usize,
-        current: std::collections::VecDeque<SessionEvent>,
-    }
-
-    #[async_trait::async_trait]
-    impl BaseSession for HangsAfterRunnerThenNarrates {
-        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-            Err(SessionError::ForkUnsupported("test".into()))
-        }
-        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
-            self.sends += 1;
-            self.current = if self.sends == 1 {
-                // A REAL runner ran (observed), its result landed… then the stream
-                // goes silent with the turn still open (a dropped stream).
-                vec![
-                    SessionEvent::ToolCall {
-                        name: "Bash".to_string(),
-                        input: serde_json::json!({ "command": "cargo test --workspace" }),
-                    },
-                    SessionEvent::ToolResult {
-                        ok: true,
-                        summary: "test result: ok".to_string(),
-                    },
-                ]
-            } else {
-                // The re-driven attempt: a bare green CLAIM, no runner invoked.
-                vec![
-                    SessionEvent::TextDelta("Ran the suite again — all green, exit 0.".to_string()),
-                    SessionEvent::TurnDone {
-                        status: TurnStatus::Completed,
-                        usage: None,
-                    },
-                ]
-            }
-            .into();
-            Ok(())
-        }
-        async fn next_event(&mut self) -> Option<SessionEvent> {
-            if let Some(ev) = self.current.pop_front() {
-                return Some(ev);
-            }
-            // Queue drained with the turn still open: hang (alive), never EOF.
-            std::future::pending::<()>().await;
-            None
-        }
-        async fn respond(
-            &mut self,
-            _req_id: &str,
-            _decision: ApprovalDecision,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn interrupt(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn end(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn watchdog_redrive_resets_stale_ran_build_tool() {
-        // Bug 4: attempt 1 really ran `cargo test` (an OBSERVED ToolCall) then hung;
-        // the silent-hang watchdog re-drove the SAME directive. Attempt 2 only
-        // NARRATED a green result. The corroboration must reflect ONLY the FINAL
-        // attempt — a stale `ran_build_tool = true` inherited from the abandoned
-        // attempt would let attempt 2's bare green claim skip UmaDev's own
-        // build/test read (the transient-retry path already resets it; the watchdog
-        // re-drive must mirror it).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let mut sess = HangsAfterRunnerThenNarrates {
-            sends: 0,
-            current: std::collections::VecDeque::new(),
-        };
-        let budget = IdleBudget::new(Duration::from_millis(20), Duration::from_millis(20));
-        let out = tokio::time::timeout(
-            Duration::from_secs(5),
-            drive_one_turn(
-                &mut sess,
-                &opts(tmp.path()),
-                &events,
-                "build it".to_string(),
-                budget,
-                std::time::Instant::now() + Duration::from_secs(3_600),
-            ),
-        )
-        .await
-        .expect("the watchdog re-drive settles, never hangs forever")
-        .expect("the re-driven attempt completes");
-        assert_eq!(sess.sends, 2, "the watchdog re-drove exactly once");
-        assert_eq!(out.text, "Ran the suite again — all green, exit 0.");
-        assert!(
-            !out.ran_build_tool,
-            "a watchdog re-drive must NOT inherit the abandoned attempt's runner corroboration"
-        );
-    }
-
-    // ── The USB-model loop: base builds end to end → UmaDev auto-QC → bounded fix ──
-
-    #[tokio::test]
-    async fn clean_build_passes_qc_with_no_markers_and_finishes() {
-        // The base builds end to end and ends WITHOUT any scheduling marker (the
-        // whole point: the team lives in the base's head). With real source on disk
-        // and no fork (no review team), auto-QC is clean → done in one base turn.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, _rec) = sink();
-        let turns = vec![text_turn(
-            "I created the login form, the route, and the tests — implemented it end \
-             to end. All done.",
-        )];
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
-        let o = opts(tmp.path());
-
-        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
-        match outcome {
-            DirectorLoopOutcome::Done { reply } => assert!(reply.contains("created the login")),
-            other => panic!("expected Done, got {other:?}"),
-        }
-        let sent = sent.lock().unwrap();
-        // Exactly ONE main directive: the opening build. Clean QC → no fix pass.
-        assert_eq!(sent.len(), 1, "clean QC → no feedback-fix turn: {sent:?}");
-        assert!(sent[0].contains("GO"), "opening directive sent");
-    }
-
-    #[tokio::test]
-    async fn lean_clean_build_finishes_in_one_turn_without_review() {
-        // The headline speed case: a simple page that the base builds correctly the
-        // first time spends ZERO fix rounds AND skips the fork review entirely.
-        // Even though the session CAN fork and would raise a blocking verdict, the
-        // lean tier never convenes the review, so the loop settles in ONE base turn.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, _rec) = sink();
-        let reply = r#"{"accepts": false, "blocking": ["MUST NOT trigger a fix round"]}"#;
-        let turns = vec![text_turn(
-            "Created the single-page todo app — index.html, styles, the add/delete \
-             logic. Implemented it end to end. Done.",
-        )];
-        let mut sess = FakeSession::new(turns, true, reply);
-        let sent = sess.sent_handle();
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
-
-        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        // EXACTLY one main directive — the opening build. The lean QC is clean (no
-        // review), so no fix directive is ever fed back.
-        assert_eq!(
-            sent.lock().unwrap().len(),
-            1,
-            "a lean clean build finishes in one turn — no review-driven fix pass"
-        );
-    }
-
-    #[tokio::test]
-    async fn qc_finds_no_source_and_feeds_a_fix_directive_back() {
-        // The base CLAIMS a build but writes no source. UmaDev's hard-floor QC
-        // catches it and feeds a fix directive back over the USB channel; the next
-        // base turn writes real source → re-QC clean → done.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        // Turn 1 CLAIMS a build (a change verb) but writes no source → the hard-floor
-        // QC FAILS and a fix directive is fed back. Turn 2 claims done again (the
-        // tree stays empty in this scripted fake, but we only assert the fix
-        // directive was injected, which proves the feedback path fired).
-        let turns = vec![
-            text_turn("Implemented it. (but the fake wrote nothing to disk)"),
-            text_turn("Now created app.ts and the tests. Done."),
-        ];
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
-        let o = opts(tmp.path());
-
-        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        let sent = sent.lock().unwrap();
-        // The opening build, then a fix directive carrying the source-present finding.
-        assert!(
-            sent.iter()
-                .any(|d| d.contains("source-present") && d.contains("must be fixed")),
-            "the QC finding was fed back as a fix directive: {sent:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn qc_review_blocking_is_fed_back_as_a_fix_directive() {
-        // Real source exists, build/test is skipped (no manifest), but a forked
-        // review seat raises a blocking finding → UmaDev folds it into a fix
-        // directive over the same session.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, _rec) = sink();
-        let reply = r#"{"accepts": false, "blocking": ["登录失败路径无测试"]}"#;
-        let turns = vec![
-            text_turn("Created the login form and route. Done."),
-            text_turn("Added the failure-path tests. Done."),
-        ];
-        let mut sess = FakeSession::new(turns, true, reply);
-        let sent = sess.sent_handle();
-        let o = opts(tmp.path());
-
-        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        let sent = sent.lock().unwrap();
-        assert!(
-            sent.iter()
-                .any(|d| d.contains("登录失败路径无测试") && d.contains("must be fixed")),
-            "the review blocking finding was fed back as a fix directive: {sent:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_chat_answer_with_no_code_claim_skips_qc_entirely() {
-        // A goal the base just answers in prose (no claim of code changes) → no QC,
-        // settle after one turn. Keeps a simple ask from being forced through QC.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let turns = vec![text_turn(
-            "Here is how I would approach this conceptually, before any code — let me \
-             walk through the trade-offs first.",
-        )];
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
-        let o = opts(tmp.path());
-
-        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        assert_eq!(
-            sent.lock().unwrap().len(),
-            1,
-            "a non-code answer skips QC → one turn, no re-injection"
-        );
-    }
-
-    #[tokio::test]
-    async fn fix_loop_is_bounded_by_max_qc_rounds() {
-        // The base keeps claiming a build but never writes source — QC keeps failing.
-        // The loop must STOP at MAX_QC_ROUNDS, never spin forever (bounded), and end
-        // gracefully (the caller's hard-gate decides reality).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        // Every turn claims a build (a change verb) but the tree stays empty → the
-        // hard-floor QC fails every round, so the loop keeps feeding fix directives
-        // until it hits MAX_QC_ROUNDS.
-        let turns: Vec<Vec<SessionEvent>> = (0..MAX_QC_ROUNDS + 3)
-            .map(|_| text_turn("Implemented it (but still wrote nothing)."))
-            .collect();
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
-        let o = opts(tmp.path());
-
-        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        // Exactly MAX_QC_ROUNDS base build/fix turns were driven — the fix loop is
-        // BOUNDED, never an open-ended grind — PLUS the ONE integrated final-report turn
-        // (Change 2) at convergence, because this settle went through rework (fix rounds
-        // ran). The +1 is a single, bounded convergence turn, not another fix round.
-        assert_eq!(
-            sent.lock().unwrap().len(),
-            MAX_QC_ROUNDS + 1,
-            "the fix loop is bounded by MAX_QC_ROUNDS, then one integrated final report closes it"
-        );
-    }
-
-    #[tokio::test]
-    async fn dead_session_is_a_failed_outcome_not_a_panic() {
-        // A session that ends mid-turn (next_event → None with no TurnDone) is an
-        // honest Failed outcome — fail-open, never a panic.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        // A turn whose batch has a text delta but NO TurnDone → next_event drains
-        // to None mid-turn.
-        let turns = vec![vec![SessionEvent::TextDelta("partial".to_string())]];
-        let mut sess = FakeSession::new(turns, false, "");
-        let o = opts(tmp.path());
-
-        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
-        assert!(
-            matches!(outcome, DirectorLoopOutcome::Failed(_)),
-            "a dead session is a Failed outcome: {outcome:?}"
-        );
-    }
-
-    /// A session that HANGS: `send_turn` succeeds, but `next_event` never resolves
-    /// (it returns a future that stays `Pending` forever) — the real "base wrote
-    /// nothing and never exits" hang the idle watchdog must catch.
-    struct HangingSession;
-
-    #[async_trait::async_trait]
-    impl BaseSession for HangingSession {
-        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-            Err(SessionError::ForkUnsupported("hang".into()))
-        }
-        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn next_event(&mut self) -> Option<SessionEvent> {
-            // Never resolves — simulate a base that hangs holding the pipe open.
-            std::future::pending::<()>().await;
-            None
-        }
-        async fn respond(
-            &mut self,
-            _req_id: &str,
-            _decision: ApprovalDecision,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn interrupt(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn end(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn idle_watchdog_settles_a_hung_base_as_failed() {
-        // P1-2: a base that hangs (no output, never exits) must NOT block the
-        // director loop forever — the idle watchdog settles it as a Failed outcome.
-        // Drive the deterministic core directly with a tiny window (no process-env
-        // mutation, so nothing to race), keeping the real wait at ~100ms.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let mut sess = HangingSession;
-        let o = opts(tmp.path());
-        let outcome = drive_director_loop_with_idle(
-            &mut sess,
-            &o,
-            &events,
-            "GO".to_string(),
-            None,
-            None,
-            IdleBudget::new(Duration::from_millis(100), Duration::from_millis(100)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        if let DirectorLoopOutcome::Failed(reason) = outcome {
-            assert!(
-                reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
-                "a hung base settles as an idle Failed: {reason}"
-            );
-        } else {
-            panic!("expected a Failed (idle) outcome, got {outcome:?}");
-        }
-    }
-
-    /// A hung session that ALSO exposes a stderr tail — the broken-base case where
-    /// the real cause (a bad model id / "not logged in") was written to STDERR and
-    /// never stdout, so the bare idle reason gave no diagnosis. Used to prove the
-    /// run path now folds that stderr into the user-visible Failed reason (parity
-    /// with the chat path's `enrich_base_failure`).
-    struct HangingSessionWithStderr;
-
-    #[async_trait::async_trait]
-    impl BaseSession for HangingSessionWithStderr {
-        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-            Err(SessionError::ForkUnsupported("hang".into()))
-        }
-        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn next_event(&mut self) -> Option<SessionEvent> {
-            std::future::pending::<()>().await;
-            None
-        }
-        async fn respond(
-            &mut self,
-            _req_id: &str,
-            _decision: ApprovalDecision,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn interrupt(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn end(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-        fn stderr_tail(&self) -> Option<String> {
-            Some("error: model X not available".to_string())
-        }
-    }
-
-    #[tokio::test]
-    async fn idle_settle_folds_in_the_base_stderr_tail() {
-        // The gap this fix closes: on the run / director-loop path a hung build used
-        // to settle with a bare "base went idle — …" and NO cause. Now the watchdog
-        // captures the base's own `stderr_tail()` at the settle and folds it into the
-        // Failed reason, so the user sees WHY — exactly as the chat path does.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let mut sess = HangingSessionWithStderr;
-        let o = opts(tmp.path());
-        let outcome = drive_director_loop_with_idle(
-            &mut sess,
-            &o,
-            &events,
-            "GO".to_string(),
-            None,
-            None,
-            IdleBudget::new(Duration::from_millis(100), Duration::from_millis(100)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        if let DirectorLoopOutcome::Failed(reason) = outcome {
-            assert!(
-                reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
-                "still settles as an idle Failed: {reason}"
-            );
-            assert!(
-                reason.contains("error: model X not available"),
-                "the run-path idle reason must now CONTAIN the base's stderr tail: {reason}"
-            );
-            assert!(
-                reason.contains("base stderr"),
-                "the stderr tail is labelled like the chat path: {reason}"
-            );
-        } else {
-            panic!("expected a Failed (idle) outcome, got {outcome:?}");
-        }
-    }
-
-    #[test]
-    fn enrich_idle_reason_is_fail_open_and_bounded() {
-        // No exit, no tail, an opaque idle reason → no family matches → today's
-        // bare reason, unchanged (fail-open: Unknown prepends nothing).
-        let base = idle_reason(Duration::from_secs(7));
-        assert_eq!(enrich_idle_reason(&base, None, None, "claude-code"), base);
-        // A present tail is folded in, last 3 non-empty lines, joined (a 4th-from-end
-        // line and blank lines are dropped). The tail is still appended verbatim
-        // even when the classifier also fires.
-        let enriched = enrich_idle_reason(
-            "base session ended mid-turn",
-            None,
-            Some("DROPPED\n\nmodel not found\nlogin required\nfinal line\n".to_string()),
-            "claude-code",
-        );
-        assert!(enriched.contains("base stderr: model not found | login required | final line"));
-        assert!(
-            !enriched.contains("DROPPED"),
-            "only the last 3 lines: {enriched}"
-        );
-        // A long tail is bounded to ≤280 chars of snippet (never unbounded).
-        let long = "x".repeat(1_000);
-        let enriched = enrich_idle_reason("r", None, Some(long), "claude-code");
-        let tail = enriched.split("base stderr: ").nth(1).unwrap();
-        assert!(tail.chars().count() <= 280, "stderr tail is bounded");
-    }
-
-    #[test]
-    fn enrich_idle_reason_prepends_actionable_line_for_a_known_stderr() {
-        // D1: a known stderr (here an auth error) now classifies and PREPENDS the
-        // per-base actionable diagnosis, while still appending the raw stderr tail
-        // as the technical detail — so a hung claude with a bad key reads e.g.
-        // "底座未登录 — 运行 claude auth login … — base stderr: error: invalid x-api-key"
-        // instead of a blind "base session idle".
-        let enriched = enrich_idle_reason(
-            "base session idle",
-            None,
-            Some("error: invalid x-api-key".to_string()),
-            "claude-code",
-        );
-        // The actionable line is prepended (auth → claude-code key)…
-        assert!(
-            enriched.starts_with(&crate::base_error::actionable_message(
-                &crate::base_error::BaseFailure::Auth,
-                "claude-code"
-            )),
-            "actionable line is prepended: {enriched}"
-        );
-        // …and the raw stderr tail is still appended for power users.
-        assert!(enriched.contains("base stderr: error: invalid x-api-key"));
-    }
-
-    #[test]
-    fn idle_timeout_reads_env_and_falls_back_safely() {
-        let _env = IDLE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = EnvRestore::set("UMADEV_IDLE_TIMEOUT_SECS", "42");
-        // A valid positive value is honoured.
-        assert_eq!(idle_timeout(), Duration::from_secs(42));
-        // A non-positive / garbage value falls back to the default (fail-open: a
-        // bad env never DISABLES the watchdog, which would re-open the hang).
-        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "0");
-        assert_eq!(
-            idle_timeout(),
-            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
-        );
-        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "nonsense");
-        assert_eq!(
-            idle_timeout(),
-            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
-        );
-        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
-        assert_eq!(
-            idle_timeout(),
-            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
-        );
-    }
-
-    #[test]
-    fn tool_idle_timeout_reads_env_and_falls_back_safely() {
-        let _env = IDLE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The EXTENDED tool-grace window honours its own env knob and is fail-open:
-        // a non-positive / unparseable value falls back to the default (a bad env
-        // never DISABLES the grace, and because the default is finite it can never
-        // make the watchdog unbounded).
-        let _restore = EnvRestore::set("UMADEV_TOOL_IDLE_TIMEOUT_SECS", "2400");
-        assert_eq!(tool_idle_timeout(), Duration::from_secs(2400));
-        std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", "0");
-        assert_eq!(
-            tool_idle_timeout(),
-            Duration::from_secs(DEFAULT_TOOL_IDLE_TIMEOUT_SECS)
-        );
-        std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", "garbage");
-        assert_eq!(
-            tool_idle_timeout(),
-            Duration::from_secs(DEFAULT_TOOL_IDLE_TIMEOUT_SECS)
-        );
-        std::env::remove_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS");
-        assert_eq!(
-            tool_idle_timeout(),
-            Duration::from_secs(DEFAULT_TOOL_IDLE_TIMEOUT_SECS)
-        );
-    }
-
-    #[test]
-    fn idle_defaults_dont_kill_ordinary_builds() {
-        // The base default is 1200s so an ordinary slow non-tool turn - or a base pointed at
-        // a rate-limited third-party model doing its OWN internal retry backoff - is not
-        // mis-killed before its retry can land. The tool default is a 300s LIVENESS-POLL
-        // interval (a re-check cadence, NOT a grace cap), so a tool of any duration with a
-        // live base is never killed on silence — only the run budget bounds it.
-        assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 1200);
-        assert_eq!(DEFAULT_TOOL_IDLE_TIMEOUT_SECS, 300);
-        // Compile-time invariant: the poll interval is a positive, finite cadence (a
-        // poll of 0 would busy-spin). A `const` block keeps the check at build time (and
-        // satisfies clippy's `assertions_on_constants`, which forbids a runtime assert
-        // over constants).
-        const {
-            assert!(
-                DEFAULT_TOOL_IDLE_TIMEOUT_SECS > 0,
-                "the liveness-poll interval must be a positive cadence"
-            );
-        }
-    }
-
-    #[test]
-    fn tool_phase_transition_maps_tool_start_and_finish() {
-        // A tool-use arms the liveness poll; a tool-result disarms it; everything
-        // else leaves the flag unchanged (so text streaming never resets it).
-        assert_eq!(
-            tool_phase_transition(&SessionEvent::ToolCall {
-                name: "Bash".into(),
-                input: serde_json::json!({"command": "docker build ."}),
-            }),
-            Some(true)
-        );
-        assert_eq!(
-            tool_phase_transition(&SessionEvent::ToolResult {
-                ok: true,
-                summary: "built".into(),
-            }),
-            Some(false)
-        );
-        assert_eq!(
-            tool_phase_transition(&SessionEvent::TextDelta("…".into())),
-            None
-        );
-        assert_eq!(
-            tool_phase_transition(&SessionEvent::TurnDone {
-                status: TurnStatus::Completed,
-                usage: None,
-            }),
-            None
-        );
-    }
-
-    #[test]
-    fn idle_budget_picks_the_poll_window_only_while_in_a_tool_call() {
-        let _env = IDLE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // `window` picks the `tool` liveness-POLL interval while a tool is mid-flight,
-        // and the `base` window otherwise (so a truly hung base — no tool running —
-        // settles at the base window). Note the poll interval is no longer a "longer"
-        // grace cap: with the defaults it is SHORTER than the base window (300s vs
-        // 600s), because it is a re-check cadence, not a deadline.
-        let budget = IdleBudget::new(Duration::from_secs(600), Duration::from_secs(300));
-        assert_eq!(budget.window(false), Duration::from_secs(600));
-        assert_eq!(budget.window(true), Duration::from_secs(300));
-        // `from_env` wires the two env knobs (defaults here, no override set).
-        let _base_env = EnvRestore::remove("UMADEV_IDLE_TIMEOUT_SECS");
-        let _tool_env = EnvRestore::remove("UMADEV_TOOL_IDLE_TIMEOUT_SECS");
-        let env_budget = IdleBudget::from_env();
-        assert_eq!(
-            env_budget.window(false),
-            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
-        );
-        assert_eq!(
-            env_budget.window(true),
-            Duration::from_secs(DEFAULT_TOOL_IDLE_TIMEOUT_SECS)
-        );
-    }
-
-    #[test]
-    fn idle_reason_names_the_long_task_case_not_a_login_problem() {
-        // The misleading "check your login/model config" framing is gone: an idle
-        // settle now leads with the long-task case (build/compile/install/test) and
-        // points at the env knob — and carries the stable, locale-independent marker
-        // the pumps/tests key off.
-        let reason = idle_reason(Duration::from_secs(600));
-        assert!(
-            reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
-            "names the env knob to raise: {reason}"
-        );
-        assert!(
-            reason.contains("600"),
-            "reports the elapsed window: {reason}"
-        );
-        // Not a login/auth scare line (the old chat-path framing).
-        assert!(
-            !reason.contains("登录") && !reason.to_lowercase().contains("log in"),
-            "must not frame a silent build as a login problem: {reason}"
-        );
-    }
-
-    /// A session that emits ONE tool-use event then HANGS forever while staying ALIVE
-    /// (`try_exit_status` is the default `None`) — the legitimate-long-tool case (a
-    /// `docker build` kicks off, then runs silently for minutes or hours). Used to prove
-    /// the liveness watchdog keeps such a base alive INDEFINITELY past the base idle
-    /// window: each poll re-checks the (live) base and keeps waiting, never settling on
-    /// silence alone.
-    struct ToolThenHangSession {
-        emitted: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl BaseSession for ToolThenHangSession {
-        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-            Err(SessionError::ForkUnsupported("hang".into()))
-        }
-        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn next_event(&mut self) -> Option<SessionEvent> {
-            if self.emitted {
-                // The tool is running silently — never resolves.
-                std::future::pending::<()>().await;
-                None
-            } else {
-                self.emitted = true;
-                Some(SessionEvent::ToolCall {
-                    name: "Bash".into(),
-                    input: serde_json::json!({"command": "docker build ."}),
-                })
-            }
-        }
-        async fn respond(
-            &mut self,
-            _req_id: &str,
-            _decision: ApprovalDecision,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn interrupt(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn end(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn mid_tool_silence_survives_the_base_window_but_a_bare_hang_settles() {
-        // The regression this fixes: a base that fires a tool then goes silent for the
-        // tool's whole duration must NOT be killed. With a TINY base window (50ms) and a
-        // tiny tool POLL interval (20ms), the liveness watchdog re-checks the (live)
-        // ToolCall-then-hang base every 20ms and keeps waiting — so it is still draining
-        // well past the base window (we cancel at 300ms to keep the test fast), proof
-        // the silence was never capped while the base stayed alive.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let mut sess = ToolThenHangSession { emitted: false };
-        let o = opts(tmp.path());
-        let budget = IdleBudget::new(Duration::from_millis(50), Duration::from_millis(20));
-        let pumped = tokio::time::timeout(
-            Duration::from_millis(300),
-            drive_one_turn(
-                &mut sess,
-                &o,
-                &events,
-                "build it".to_string(),
-                budget,
-                std::time::Instant::now() + Duration::from_secs(3_600),
-            ),
-        )
-        .await;
-        assert!(
-            pumped.is_err(),
-            "a base mid-tool must NOT settle on silence — the liveness poll keeps the \
-             live base alive (so the outer 300ms cancel fires instead)"
-        );
-
-        // Control: the SAME tiny windows, but a base that hangs with NO tool in flight
-        // settles promptly at the base window (the watchdog still catches a true hang —
-        // the liveness model did not make the non-tool case unbounded).
-        let mut hung = HangingSession;
-        let bare = tokio::time::timeout(
-            Duration::from_secs(2),
-            drive_one_turn(
-                &mut hung,
-                &o,
-                &events,
-                "build it".to_string(),
-                budget,
-                std::time::Instant::now() + Duration::from_secs(3_600),
-            ),
-        )
-        .await
-        .expect("a bare hang (no tool running) must settle at the base window");
-        match bare {
-            Err(reason) => assert!(
-                reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
-                "a true hang still settles as an idle reason: {reason}"
-            ),
-            Ok(_) => panic!("a hung base must settle as an Err, not Ok"),
-        }
-    }
-
-    #[tokio::test]
-    async fn run_budget_reached_mid_tool_settles_gracefully_not_failed() {
-        // MEDIUM M5: when the wall-clock run budget expires DURING a silent tool turn,
-        // the turn must settle GRACEFULLY so the run still reaches run_auto_qc +
-        // finalize — exactly like a budget reached mid-STREAM. Before the fix the
-        // in-tool `IdleTimedOut` returned Err → the run was Failed and SKIPPED QC +
-        // delivery, purely because the deadline happened to land mid-tool rather than
-        // mid-stream. A near-future deadline + a base that fires a tool then hangs
-        // exercises that exact path; the loop must end as Done, not Failed.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let mut sess = ToolThenHangSession { emitted: false };
-        let o = opts(tmp.path());
-        let outcome = drive_director_loop_with_idle(
-            &mut sess,
-            &o,
-            &events,
-            "GO".to_string(),
-            None,
-            None,
-            IdleBudget::new(Duration::from_millis(40), Duration::from_millis(40)),
-            std::time::Instant::now() + Duration::from_millis(140),
-        )
-        .await;
-        assert!(
-            matches!(outcome, DirectorLoopOutcome::Done { .. }),
-            "a budget reached mid-tool settles gracefully (Done), not Failed: {outcome:?}"
-        );
-    }
-
-    /// A real, already-exited `ExitStatus` for the "base died mid-tool" fixtures —
-    /// constructed by running a trivial process, so no platform-specific / unsafe
-    /// `from_raw`. Deterministic on every Unix-like CI / dev box.
-    fn a_real_exit_status() -> std::process::ExitStatus {
-        std::process::Command::new("true")
-            .status()
-            .expect("spawn `true` to obtain a real ExitStatus")
-    }
-
-    /// A base whose `next_event` never resolves (a tool runs silently) with a
-    /// configurable `try_exit_status` (alive = `None`, dead = `Some`) and an interrupt
-    /// counter — the fixture for the liveness watchdog's three in-tool / non-tool settle
-    /// paths. `next_event_idle` is driven directly so the four behaviours are asserted
-    /// without going through a whole turn.
-    struct ProbeSession {
-        exit: Option<std::process::ExitStatus>,
-        interrupts: Arc<std::sync::Mutex<u32>>,
-    }
-
-    impl ProbeSession {
-        fn new(exit: Option<std::process::ExitStatus>) -> Self {
-            Self {
-                exit,
-                interrupts: Arc::new(std::sync::Mutex::new(0)),
-            }
-        }
-        fn interrupts(&self) -> Arc<std::sync::Mutex<u32>> {
-            Arc::clone(&self.interrupts)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl BaseSession for ProbeSession {
-        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-            Err(SessionError::ForkUnsupported("probe".into()))
-        }
-        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn next_event(&mut self) -> Option<SessionEvent> {
-            // A silently-running tool: never resolves.
-            std::future::pending::<()>().await;
-            None
-        }
-        async fn respond(
-            &mut self,
-            _req_id: &str,
-            _decision: ApprovalDecision,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn interrupt(&mut self) -> Result<(), SessionError> {
-            *self.interrupts.lock().unwrap() += 1;
-            Ok(())
-        }
-        async fn end(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-        fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
-            self.exit
-        }
-    }
-
-    #[tokio::test]
-    async fn next_event_idle_in_tool_with_a_live_base_keeps_waiting_past_the_poll_window() {
-        // (a) The crux of the liveness refinement: a tool in flight + a LIVE base
-        // (try_exit_status None) must NOT settle just because the poll window elapsed —
-        // it keeps re-checking and waiting. With a 20ms poll and a far-future deadline,
-        // `next_event_idle` should still be running well past several poll windows (we
-        // cancel at 250ms), i.e. it did NOT return an IdleTimedOut on silence alone.
-        let mut sess = ProbeSession::new(None);
-        let budget = IdleBudget::new(Duration::from_millis(50), Duration::from_millis(20));
-        let out = tokio::time::timeout(
-            Duration::from_millis(250),
-            next_event_idle(
-                &mut sess,
-                budget,
-                true,
-                Some(std::time::Instant::now() + Duration::from_secs(3_600)),
-            ),
-        )
-        .await;
-        assert!(
-            out.is_err(),
-            "an in-tool LIVE base must keep waiting past the poll window, never settle on \
-             silence (the outer 250ms cancel must fire instead)"
-        );
-        assert_eq!(
-            *sess.interrupts().lock().unwrap(),
-            0,
-            "a live in-tool base is never interrupted by the watchdog"
-        );
-    }
-
-    #[tokio::test]
-    async fn next_event_idle_in_tool_with_a_dead_base_settles_as_session_ended() {
-        // (b) A base that died mid-tool (try_exit_status Some, no event) is caught by
-        // the liveness poll within ONE poll window and settles as SessionEnded — NOT an
-        // unbounded wait, and NOT a misleading idle-hang.
-        let mut sess = ProbeSession::new(Some(a_real_exit_status()));
-        let budget = IdleBudget::new(Duration::from_millis(50), Duration::from_millis(20));
-        let ev = tokio::time::timeout(
-            Duration::from_secs(2),
-            next_event_idle(
-                &mut sess,
-                budget,
-                true,
-                Some(std::time::Instant::now() + Duration::from_secs(3_600)),
-            ),
-        )
-        .await
-        .expect("a dead in-tool base must settle within one poll window, not hang");
-        match ev {
-            IdleEvent::SessionEnded { exit, .. } => {
-                assert!(
-                    exit.is_some(),
-                    "the base's exit status is surfaced: {exit:?}"
-                );
-            }
-            other => panic!("expected SessionEnded for a dead in-tool base, got {other:?}"),
-        }
-        assert_eq!(
-            *sess.interrupts().lock().unwrap(),
-            0,
-            "an already-dead base is not interrupted (it has already exited)"
-        );
-    }
-
-    #[tokio::test]
-    async fn next_event_idle_non_tool_hang_settles_at_the_base_window_with_a_bounded_interrupt() {
-        // (c) A genuinely hung base that is NOT in a tool still settles at the base
-        // window (the non-tool case is never made unbounded), and the watchdog issues
-        // its ONE best-effort bounded interrupt before settling.
-        let mut sess = ProbeSession::new(None);
-        let budget = IdleBudget::new(Duration::from_millis(20), Duration::from_millis(20));
-        let ev = tokio::time::timeout(
-            Duration::from_secs(2),
-            next_event_idle(&mut sess, budget, false, None),
-        )
-        .await
-        .expect("a non-tool hang must settle at the base window, not run forever");
-        assert!(
-            matches!(ev, IdleEvent::IdleTimedOut { .. }),
-            "a non-tool hang settles as IdleTimedOut: {ev:?}"
-        );
-        assert_eq!(
-            *sess.interrupts().lock().unwrap(),
-            1,
-            "the non-tool hang path issues exactly one best-effort interrupt"
-        );
-    }
-
-    #[tokio::test]
-    async fn next_event_idle_in_tool_live_base_settles_when_the_run_budget_is_exhausted() {
-        // (d) The outer backstop: a LIVE base mid-tool keeps waiting, but only until the
-        // overall run-budget deadline. A deadline already in the PAST settles the very
-        // first poll as IdleTimedOut — the run budget is the single bound on the
-        // otherwise-indefinite in-tool wait. No interrupt here (the run finalization /
-        // session.end() owns releasing the still-live base).
-        let mut sess = ProbeSession::new(None);
-        let budget = IdleBudget::new(Duration::from_millis(50), Duration::from_millis(20));
-        let past = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap();
-        let ev = tokio::time::timeout(
-            Duration::from_secs(2),
-            next_event_idle(&mut sess, budget, true, Some(past)),
-        )
-        .await
-        .expect("an in-tool live base past its run budget must settle promptly");
-        assert!(
-            matches!(ev, IdleEvent::IdleTimedOut { .. }),
-            "the run-budget deadline settles an in-tool live base as IdleTimedOut: {ev:?}"
-        );
-        assert_eq!(
-            *sess.interrupts().lock().unwrap(),
-            0,
-            "the in-tool budget backstop does not interrupt (the run finalization does)"
-        );
-    }
-
-    // ── Visible retry + silent-hang watchdog re-drive ──────────────────────
-
-    /// A failed-turn batch carrying the base's OWN error text (the transient/hard
-    /// failure the `TurnStatus::Failed` retry path classifies).
-    fn fail_turn(reason: &str) -> Vec<SessionEvent> {
-        vec![SessionEvent::TurnDone {
-            status: TurnStatus::Failed(reason.to_string()),
-            usage: None,
-        }]
-    }
-
-    /// A base whose every turn is a NON-tool silent hang (`next_event` never resolves)
-    /// while it stays ALIVE (`try_exit_status` defaults to `None`), counting each
-    /// `send_turn` — the fixture for the silent-hang WATCHDOG RE-DRIVE (a live base that
-    /// may have dropped its stream is re-driven once before failing).
-    struct CountingHangSession {
-        sends: Arc<std::sync::Mutex<u32>>,
-    }
-
-    #[async_trait::async_trait]
-    impl BaseSession for CountingHangSession {
-        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-            Err(SessionError::ForkUnsupported("hang".into()))
-        }
-        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
-            *self.sends.lock().unwrap() += 1;
-            Ok(())
-        }
-        async fn next_event(&mut self) -> Option<SessionEvent> {
-            std::future::pending::<()>().await;
-            None
-        }
-        async fn respond(
-            &mut self,
-            _req_id: &str,
-            _decision: ApprovalDecision,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn interrupt(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn end(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
-    /// A base that emits ONE `ToolCall` per turn then hangs silently while staying ALIVE
-    /// — the IN-TOOL case the watchdog must NOT re-drive (a long-running tool is
-    /// legitimately silent). Counts each `send_turn` so a spurious re-drive is caught.
-    struct CountingToolHangSession {
-        sends: Arc<std::sync::Mutex<u32>>,
-        emitted_tool: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl BaseSession for CountingToolHangSession {
-        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-            Err(SessionError::ForkUnsupported("hang".into()))
-        }
-        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
-            *self.sends.lock().unwrap() += 1;
-            self.emitted_tool = false;
-            Ok(())
-        }
-        async fn next_event(&mut self) -> Option<SessionEvent> {
-            if self.emitted_tool {
-                std::future::pending::<()>().await;
-                None
-            } else {
-                self.emitted_tool = true;
-                Some(SessionEvent::ToolCall {
-                    name: "Bash".into(),
-                    input: serde_json::json!({"command": "docker build ."}),
-                })
-            }
-        }
-        async fn respond(
-            &mut self,
-            _req_id: &str,
-            _decision: ApprovalDecision,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn interrupt(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn end(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn transient_backoff_is_exponential_capped_and_bounded() {
-        // Exponential off the base, capped — deterministic + never unbounded.
-        let base = Duration::from_secs(2);
-        let cap = Duration::from_secs(30);
-        assert_eq!(transient_backoff_wait(base, cap, 1), Duration::from_secs(2));
-        assert_eq!(transient_backoff_wait(base, cap, 2), Duration::from_secs(4));
-        assert_eq!(transient_backoff_wait(base, cap, 3), Duration::from_secs(8));
-        // A large attempt saturates at the cap, never overflows.
-        assert_eq!(transient_backoff_wait(base, cap, 50), cap);
-        // attempt 0 is total (yields the base), never a panic.
-        assert_eq!(transient_backoff_wait(base, cap, 0), base);
-    }
-
-    #[tokio::test]
-    async fn a_transient_failure_emits_a_countdown_note_then_recovers() {
-        // Part 1: a base turn-failure the classifier reads as TRANSIENT (a 429) is backed
-        // off and re-driven, and the wait is VISIBLE — a countdown Note is emitted BEFORE
-        // the backoff. The second turn completes, so the turn recovers.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, rec) = sink();
-        let turns = vec![
-            fail_turn("API Error: Request rejected (429) — rate limit"),
-            text_turn("recovered"),
-        ];
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
-        let out = drive_one_turn_with_backoff(
-            &mut sess,
-            &opts(tmp.path()),
-            &events,
-            "build it".to_string(),
-            IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-            // Tiny, fast backoff window so the test never really waits seconds.
-            Duration::from_millis(2),
-            Duration::from_millis(20),
-        )
-        .await;
-        match out {
-            Ok(r) => assert_eq!(r.text, "recovered", "the turn recovered after one backoff"),
-            Err(e) => panic!("a transient 429 must be retried to recovery: {e}"),
-        }
-        // Re-driven once: the initial directive + one retry = 2 sends.
-        assert_eq!(
-            sent.lock().unwrap().len(),
-            2,
-            "the transient failure is re-driven once"
-        );
-        // The backoff is VISIBLE — a countdown Note with the stable, locale-independent
-        // "(attempt 1/3)" marker was surfaced before recovery.
-        assert!(
-            rec.events()
-                .iter()
-                .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("1/3"))),
-            "a countdown Note is surfaced before the backoff wait"
-        );
-    }
-
-    #[tokio::test]
-    async fn transient_retries_are_bounded_and_fail_open() {
-        // Part 1 boundedness: a base that ALWAYS fails transiently is retried only a
-        // bounded number of times, then fails honestly with the raw reason intact
-        // (fail-open) — never an infinite retry loop.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, rec) = sink();
-        let turns = vec![fail_turn("429 too many requests"); 6];
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
-        let out = drive_one_turn_with_backoff(
-            &mut sess,
-            &opts(tmp.path()),
-            &events,
-            "build it".to_string(),
-            IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-            Duration::from_millis(1),
-            Duration::from_millis(10),
-        )
-        .await;
-        match out {
-            Err(reason) => assert!(
-                reason.contains("429"),
-                "the base's raw error survives the bounded retry: {reason}"
-            ),
-            Ok(_) => {
-                panic!("a base that always fails transiently must still fail, not loop forever")
-            }
-        }
-        // Bounded: the initial send + EXACTLY `MAX_TRANSIENT_RETRIES` retries.
-        assert_eq!(
-            sent.lock().unwrap().len(),
-            (MAX_TRANSIENT_RETRIES + 1) as usize,
-            "transient retries are bounded by MAX_TRANSIENT_RETRIES"
-        );
-        // One visible countdown per retry (the "/3" max is locale-independent).
-        let countdowns = rec
-            .events()
-            .iter()
-            .filter(|e| matches!(e, EngineEvent::Note(n) if n.contains("/3")))
-            .count();
-        assert_eq!(
-            countdowns, MAX_TRANSIENT_RETRIES as usize,
-            "one visible countdown Note per bounded retry"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_hard_failure_is_not_retried() {
-        // A HARD failure (auth) is returned at once — retrying it is futile, so NO
-        // backoff, NO countdown, exactly ONE send.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, rec) = sink();
-        let turns = vec![fail_turn("401 Unauthorized — not logged in")];
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
-        let out = drive_one_turn_with_backoff(
-            &mut sess,
-            &opts(tmp.path()),
-            &events,
-            "build it".to_string(),
-            IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-            Duration::from_millis(1),
-            Duration::from_millis(10),
-        )
-        .await;
-        assert!(out.is_err(), "an auth failure fails honestly");
-        assert_eq!(
-            sent.lock().unwrap().len(),
-            1,
-            "a hard (auth) failure is never retried"
-        );
-        assert_eq!(
-            rec.count(|e| matches!(e, EngineEvent::Note(n) if n.contains("/3"))),
-            0,
-            "a hard failure emits no countdown Note"
-        );
-    }
-
-    #[tokio::test]
-    async fn non_tool_silent_hang_on_a_live_base_redrives_once_then_fails() {
-        // Part 2: a NON-tool silent hang on a STILL-ALIVE base (it may have dropped its
-        // stream) is re-driven EXACTLY once before failing — a bounded single retry, not
-        // an infinite re-drive.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, rec) = sink();
-        let sends = Arc::new(std::sync::Mutex::new(0u32));
-        let mut sess = CountingHangSession {
-            sends: Arc::clone(&sends),
-        };
-        // Tiny base window so the non-tool hang settles fast.
-        let budget = IdleBudget::new(Duration::from_millis(20), Duration::from_millis(20));
-        let out = tokio::time::timeout(
-            Duration::from_secs(2),
-            drive_one_turn(
-                &mut sess,
-                &opts(tmp.path()),
-                &events,
-                "build it".to_string(),
-                budget,
-                std::time::Instant::now() + Duration::from_secs(3_600),
-            ),
-        )
-        .await
-        .expect("the bounded re-drive must settle, never hang forever");
-        match out {
-            Err(reason) => assert!(
-                reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
-                "a second hang fails honestly as an idle settle: {reason}"
-            ),
-            Ok(_) => panic!("a base that only ever hangs must fail, not succeed"),
-        }
-        // Re-driven EXACTLY once: the initial send + one watchdog re-drive = 2 sends.
-        assert_eq!(
-            *sends.lock().unwrap(),
-            2,
-            "the silent-hang watchdog re-drives exactly once (bounded)"
-        );
-        // The re-drive is VISIBLE.
-        let redrive = umadev_i18n::tl("tui.retry.silent_redrive");
-        assert!(
-            rec.events()
-                .iter()
-                .any(|e| matches!(e, EngineEvent::Note(n) if n == redrive)),
-            "the silent-hang re-drive emits a visible Note"
-        );
-    }
-
-    #[tokio::test]
-    async fn in_tool_silent_hang_on_a_live_base_never_redrives() {
-        // Part 2 guard: an IN-TOOL live base (a long `docker build`) goes silent but must
-        // NOT be re-driven — the liveness watchdog keeps waiting, so the only base call is
-        // the original send. Proves the re-drive never fights the legitimate long-tool
-        // wait (no spurious retry).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let sends = Arc::new(std::sync::Mutex::new(0u32));
-        let mut sess = CountingToolHangSession {
-            sends: Arc::clone(&sends),
-            emitted_tool: false,
-        };
-        let budget = IdleBudget::new(Duration::from_millis(20), Duration::from_millis(20));
-        let pumped = tokio::time::timeout(
-            Duration::from_millis(300),
-            drive_one_turn(
-                &mut sess,
-                &opts(tmp.path()),
-                &events,
-                "build it".to_string(),
-                budget,
-                std::time::Instant::now() + Duration::from_secs(3_600),
-            ),
-        )
-        .await;
-        assert!(
-            pumped.is_err(),
-            "an in-tool live base keeps waiting (no settle, no re-drive — the outer cancel fires)"
-        );
-        // Driven exactly ONCE — the in-tool wait never re-drives (no spurious retry).
-        assert_eq!(
-            *sends.lock().unwrap(),
-            1,
-            "an in-tool live hang is never re-driven"
-        );
-    }
-
-    // ── Auto-QC units ─────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn auto_qc_clean_when_source_present_and_no_review_team() {
-        // Real source on disk, no manifest (build/test skipped → neutral), no fork
-        // (no review) → QC clean.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
-        assert!(qc.is_clean(), "source present + nothing to fail → clean QC");
-    }
-
-    /// A codex-tier `RunOptions` — a non-claude backend (no real-time governance
-    /// hook), so the director auto-QC must run the content-governance catch-up.
-    fn codex_opts(root: &std::path::Path) -> RunOptions {
-        let mut o = opts(root);
-        o.backend = "codex".to_string();
-        o
-    }
-
-    #[tokio::test]
-    async fn auto_qc_governs_codex_writes_and_blocks_on_emoji_icon() {
-        // P1-1: codex / opencode have NO real-time hook, so the director QC pass is
-        // their ONLY content-governance gate. A file the base wrote using an emoji
-        // as a functional icon must surface as a `[governance]` blocking finding,
-        // which the loop folds into a fix directive.
-        let tmp = tempfile::TempDir::new().unwrap();
-        // A clean source so the source-present floor passes, plus a button that uses
-        // an emoji as its icon (a universal-floor violation, context-independent).
-        std::fs::write(
-            tmp.path().join("button.tsx"),
-            "export const Btn = () => <button>\u{1F680} Launch</button>;",
-        )
-        .unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = codex_opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
-        assert!(
-            !qc.is_clean(),
-            "an emoji-as-icon write by codex must be governed: {:?}",
-            qc.blocking
-        );
-        assert!(
-            qc.blocking.iter().any(|b| b.starts_with("[governance]")),
-            "the finding is tagged [governance]: {:?}",
-            qc.blocking
-        );
-    }
-
-    #[tokio::test]
-    async fn auto_qc_governs_craft_for_claude_too() {
-        // The claude real-time hook no longer screens CRAFT (it now refuses only the
-        // irreversible-if-written floor — secrets/paths — so it never pins the
-        // base's hands for a fixable nit). So the QC content-governance scan is the
-        // craft moat for EVERY backend, claude included: the same emoji-as-icon file
-        // that codex's QC flags must be flagged here too, then repaired by the
-        // feedback loop.
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join("button.tsx"),
-            "export const Btn = () => <button>\u{1F680} Launch</button>;",
-        )
-        .unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let mut o = opts(tmp.path());
-        o.backend = "claude-code".to_string();
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
-        assert!(
-            !qc.is_clean(),
-            "an emoji-as-icon write must be governed by QC even on claude: {:?}",
-            qc.blocking
-        );
-        assert!(
-            qc.blocking.iter().any(|b| b.starts_with("[governance]")),
-            "the finding is tagged [governance]: {:?}",
-            qc.blocking
-        );
-    }
-
-    #[tokio::test]
-    async fn auto_qc_governance_does_not_falsely_flag_a_clean_static_page() {
-        // Context-aware: a clean static frontend page (codex backend) must NOT be
-        // flagged for a missing server-surface rule (CSP / HSTS / structured log) —
-        // it serves none. A benign HTML page → clean QC even on the governed path.
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join("index.html"),
-            "<!doctype html><html><body><h1>Hello</h1><p>A static page.</p></body></html>",
-        )
-        .unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let mut o = codex_opts(tmp.path());
-        o.requirement = "做一个简单的静态介绍页,纯前端".to_string();
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
-        assert!(
-            qc.is_clean(),
-            "a clean static page must not be falsely flagged: {:?}",
-            qc.blocking
-        );
-    }
-
-    #[tokio::test]
-    async fn auto_qc_blocks_when_no_source_present() {
-        // No source on disk after a claimed build → the hard floor is the decisive
-        // blocking finding (and QC returns early without running build/review).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
-        assert!(!qc.is_clean(), "no source → blocking");
-        assert!(
-            qc.blocking.iter().any(|b| b.contains("source-present")),
-            "the hard-floor finding is present: {:?}",
-            qc.blocking
-        );
-    }
-
-    /// A lean-tier `RunOptions` — a clearly-small requirement that
-    /// `planner::is_lean_build` classifies as lean (Light), so QC takes the
-    /// stripped-down path (source floor only, no duplicate build / fork review).
-    fn lean_opts(root: &std::path::Path) -> RunOptions {
-        let mut o = opts(root);
-        o.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
-        o
-    }
-
-    #[tokio::test]
-    async fn lean_goal_qc_stops_at_source_floor_and_skips_review() {
-        // A lean goal with real source on disk → QC is clean WITHOUT convening the
-        // fork review. The session here CAN fork and would return a BLOCKING verdict
-        // if the review ran; the lean tier must short-circuit BEFORE that, so the
-        // blocking finding never appears → clean.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, _rec) = sink();
-        let reply = r#"{"accepts": false, "blocking": ["a review nit that must NOT surface"]}"#;
-        let mut sess = FakeSession::new(vec![], true, reply);
-        let o = lean_opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
-        assert!(
-            qc.is_clean(),
-            "a lean goal with source present is clean — the fork review is skipped: {:?}",
-            qc.blocking
-        );
-    }
-
-    #[tokio::test]
-    async fn lean_goal_qc_still_enforces_the_source_present_hard_floor() {
-        // The lean tier must NEVER drop the honesty hard floor: a lean goal that
-        // CLAIMED a build but wrote zero source is STILL caught (the one invariant
-        // the fast path keeps). Empty tree → the source-present blocking finding.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = lean_opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
-        assert!(!qc.is_clean(), "a lean goal with no source still blocks");
-        assert!(
-            qc.blocking.iter().any(|b| b.contains("source-present")),
-            "the hard-floor finding fires on the lean tier too: {:?}",
-            qc.blocking
-        );
-    }
-
-    /// Did the sink record a Note whose text contains `needle`?
-    fn note_seen(rec: &RecordingSink, needle: &str) -> bool {
-        rec.events().iter().any(|e| match e {
-            EngineEvent::Note(n) => n.contains(needle),
-            _ => false,
-        })
-    }
-
-    #[test]
-    fn plan_completion_summary_lists_every_step_by_terminal_status() {
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let (events, rec) = sink();
-        let mk = |id: &str, seat, status| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.to_string(),
-            title: format!("do {id}"),
-            seat,
-            kind: StepKind::Build,
-            depends_on: vec![],
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status,
-        };
-        let plan = Plan {
-            steps: vec![
-                mk("a", crate::critics::Seat::ProductManager, StepStatus::Done),
-                mk("b", crate::critics::Seat::UiuxDesigner, StepStatus::Pending),
-                mk(
-                    "c",
-                    crate::critics::Seat::BackendEngineer,
-                    StepStatus::Active,
-                ),
-                mk("d", crate::critics::Seat::QaEngineer, StepStatus::Blocked),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        emit_plan_completion_summary(&plan, &events);
-        // Header carries the 1/1/1/1 counts (done / active / blocked / pending), locale-neutral.
-        assert!(note_seen(
-            &rec,
-            &umadev_i18n::tlf("plan.summary.header", &["1", "1", "1", "1"])
-        ));
-        // Every step appears, marked by its terminal status.
-        assert!(note_seen(&rec, "[√] do a (product-manager)"), "done step");
-        assert!(note_seen(&rec, "[ ] do b (uiux-designer)"), "pending step");
-        assert!(
-            note_seen(&rec, "[~] do c (backend-engineer)"),
-            "active step"
-        );
-        assert!(note_seen(&rec, "[✗] do d (qa-engineer)"), "blocked step");
-
-        // An empty plan emits no summary at all.
-        let (events2, rec2) = sink();
-        emit_plan_completion_summary(
-            &Plan {
-                steps: vec![],
-                risks: vec![],
-                open_questions: vec![],
-            },
-            &events2,
-        );
-        assert!(!note_seen(&rec2, "["), "empty plan emits nothing");
-    }
-
-    #[tokio::test]
-    async fn incremental_verify_skips_the_duplicate_build_when_base_ran_it_green() {
-        // Wave 3 incremental verify (honesty-tightened fast path): a base reply that
-        // reports a PASSED build/test AND is CORROBORATED by an OBSERVED build/test runner
-        // this turn (`ran_build_tool = true`) skips UmaDev's OWN duplicate read — it emits
-        // the "trusting its result" note and NOT the "verify build-test" note. This is the
-        // honest run's fast path, preserved. The source-present floor + governance still
-        // ran (clean here), so QC is clean.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path()); // "做一个登录系统" — non-lean, so it reaches the build read
-        let reply = "Implemented the login system end to end. Ran `npm test` and `npm run build` — all tests pass and the build succeeded (exit code 0).";
-        // ran_build_tool = true: a real runner WAS observed on the tool-call stream.
-        let qc = run_auto_qc(&mut sess, &o, &events, None, Some(reply), true).await;
-        assert!(
-            qc.is_clean(),
-            "clean source + corroborated build → clean: {:?}",
-            qc.blocking
-        );
-        assert!(
-            note_seen(&rec, "base already ran build/test green"),
-            "the incremental-verify skip note must be emitted"
-        );
-        assert!(
-            !note_seen(&rec, "verify build-test"),
-            "the duplicate build/test read must be skipped (no verify note)"
-        );
-    }
-
-    #[tokio::test]
-    async fn incremental_verify_does_not_skip_a_green_claim_with_no_observed_run() {
-        // HONESTY TIGHTENING (the hole closed): the base CLAIMS a green build with all the
-        // machine-evidence words a text scan would trust ("ran npm test", "exit code 0"),
-        // but NO build/test runner was observed on the tool-call stream this turn
-        // (`ran_build_tool = false`) — it narrated the run without running it. UmaDev must
-        // NOT skip its own read: it does NOT emit the "trusting its result" note and DOES
-        // run its own build/test read. A re-verify, never a false FAIL — with no manifest
-        // the read is neutral, so QC is still clean (a genuinely clean build re-passes).
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let reply = "Implemented the login system end to end. Ran `npm test` and `npm run build` — all tests pass and the build succeeded (exit code 0).";
-        // ran_build_tool = false: the base narrated a run it never actually performed.
-        let qc = run_auto_qc(&mut sess, &o, &events, None, Some(reply), false).await;
-        assert!(
-            qc.is_clean(),
-            "no manifest → neutral re-verify, still clean (no false FAIL): {:?}",
-            qc.blocking
-        );
-        assert!(
-            !note_seen(&rec, "base already ran build/test green"),
-            "an un-corroborated green claim must NOT trigger the skip"
-        );
-        assert!(
-            note_seen(&rec, "verify build-test"),
-            "UmaDev runs its OWN read when a green claim is not corroborated by a real run"
-        );
-    }
-
-    #[tokio::test]
-    async fn incremental_verify_runs_our_own_read_when_reply_is_ambiguous() {
-        // No reply / an ambiguous reply (no explicit passed-run) → UmaDev falls back to
-        // running its OWN build/test read (prior behaviour, no regression). With no
-        // manifest the read returns unavailable (neutral) fast, but the verify note
-        // proves UmaDev did NOT trust an unproven build.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        // Ambiguous "done" — no "tests pass"/"build succeeded" → must NOT skip.
-        let qc = run_auto_qc(
-            &mut sess,
-            &o,
-            &events,
-            None,
-            Some("Done — implemented it."),
-            false,
-        )
-        .await;
-        assert!(
-            qc.is_clean(),
-            "no manifest → neutral build read, still clean"
-        );
-        assert!(
-            !note_seen(&rec, "base already ran build/test green"),
-            "an ambiguous reply must NOT trigger the skip"
-        );
-        assert!(
-            note_seen(&rec, "verify build-test"),
-            "UmaDev runs its own build/test read when the base's result is unproven"
-        );
-    }
-
-    #[test]
-    fn build_test_blocking_is_none_when_skipped_or_passed() {
-        // An unavailable (skipped) check is neutral, not a false failure (fail-open).
-        let skipped = VerifyResult {
-            available: false,
-            passed: true,
-            evidence: vec![],
-        };
-        assert!(build_test_blocking(&skipped).is_none());
-        // A passing check is not blocking.
-        let ok = VerifyResult {
-            available: true,
-            passed: true,
-            evidence: vec!["build: ok".into()],
-        };
-        assert!(build_test_blocking(&ok).is_none());
-        // A real failure is blocking, carrying the evidence.
-        let bad = VerifyResult {
-            available: true,
-            passed: false,
-            evidence: vec!["build: FAILED (exit 1)".into()],
-        };
-        let line = build_test_blocking(&bad).expect("a failed step blocks");
-        assert!(line.contains("FAILED") && line.contains("exit 1"));
-    }
-
-    #[test]
-    fn fix_directive_lists_every_blocking_finding() {
-        let qc = QcReport {
-            blocking: vec![
-                "verify build-test: FAILED — build: FAILED (exit 1)".into(),
-                "[security] no input validation".into(),
-            ],
-            raw_failure_log: None,
-        };
-        let d = qc.fix_directive();
-        assert!(d.contains("must be fixed"));
-        assert!(d.contains("build: FAILED"));
-        assert!(d.contains("no input validation"));
-        // B1#2 — no raw log captured → the directive skips the excerpt cleanly.
-        assert!(
-            !d.contains("Raw failing build/test output"),
-            "no raw section without a captured log: {d}"
-        );
-    }
-
-    #[test]
-    fn fix_directive_carries_the_bounded_raw_failure_log_when_captured() {
-        // B1#2: a captured failing build/test tail rides the fix directive VERBATIM
-        // (fenced), after the distilled findings — raw evidence the brain adapts from.
-        let qc = QcReport {
-            blocking: vec!["verify build-test: FAILED — test: FAILED (exit 101)".into()],
-            raw_failure_log: Some(
-                "$ cargo test   (step `test`, exit 101)\nassertion `left == right` failed\n  left: 2\n right: 3"
-                    .to_string(),
-            ),
-        };
-        let d = qc.fix_directive();
-        assert!(d.contains("## Raw failing build/test output (verbatim tail)"));
-        assert!(
-            d.contains("assertion `left == right` failed"),
-            "the raw excerpt is carried verbatim: {d}"
-        );
-        // The distilled finding is still there — the raw log supplements, never replaces.
-        assert!(d.contains("test: FAILED (exit 101)"));
-    }
-
-    // ── Wave 4: required acceptance floor (deliberate only; bugfix repro test) ──
-
-    /// Write a PRD declaring FR-001 + FR-002 and a tasks list covering only FR-001,
-    /// so `uncovered_requirements` reports FR-002 as a coverage gap.
-    fn seed_coverage_gap(root: &std::path::Path) {
-        std::fs::create_dir_all(root.join("output")).unwrap();
-        std::fs::write(
-            root.join("output").join("demo-prd.md"),
-            "| FR-001 | login |\n| FR-002 | logout |",
-        )
-        .unwrap();
-        let cdir = root.join(".umadev").join("changes").join("demo-1");
-        std::fs::create_dir_all(&cdir).unwrap();
-        std::fs::write(cdir.join("tasks.md"), "- [ ] login _(FR-001)_").unwrap();
-    }
-
-    /// A Bugfix route (Standard depth) for the reproduction-test floor test.
-    fn bugfix_route() -> crate::router::RoutePlan {
-        let mut r = build_route();
-        r.kind = crate::planner::TaskKind::Bugfix;
-        r
-    }
-
-    #[test]
-    fn a_backend_only_run_is_not_blocked_by_a_leftover_uiux_doc() {
-        // HIGH: the visual-direction floor used to gate on a FILE (`output/<slug>-uiux.md`
-        // exists). A brownfield repo — or simply a SECOND run in a workspace where an
-        // earlier UI build left the doc behind — hands a pure BACKEND task a blocking
-        // design finding it can neither act on nor escape. The gate belongs on the
-        // ROUTE's own judgement about whether this turn builds UI.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let out = tmp.path().join("output");
-        std::fs::create_dir_all(&out).unwrap();
-        // The leftover: a UIUX doc with NO `## Visual direction` section at all — the one
-        // condition that still blocks a UI run.
-        std::fs::write(out.join("demo-uiux.md"), "# UIUX\n\n## Tokens\n\n:root{}\n").unwrap();
-        let o = opts(tmp.path());
-
-        let mut backend = build_route();
-        backend.kind = crate::planner::TaskKind::BackendOnly;
-        assert!(!backend.needs_ui());
-        let blocking = acceptance_floor_blocking(&o, Some(&backend));
-        assert!(
-            !blocking.iter().any(|b| b.contains("Visual direction")),
-            "a backend-only run inherits no design gate from a file it did not write: \
-             {blocking:?}"
-        );
-
-        // The SAME tree, on a UI-bearing run → the floor still binds.
-        let ui = build_route(); // Greenfield
-        assert!(ui.needs_ui());
-        assert!(
-            acceptance_floor_blocking(&o, Some(&ui))
-                .iter()
-                .any(|b| b.contains("Visual direction")),
-            "a UI run that skipped the direction step is still held to it"
-        );
-    }
-
-    #[test]
-    fn acceptance_floor_blocks_a_deliberate_build_with_a_coverage_gap() {
-        // A deliberate build with a declared-but-unimplemented requirement must
-        // surface a coverage gap as a blocking finding (the required floor).
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_coverage_gap(tmp.path());
-        let o = opts(tmp.path());
-        let route = build_route();
-        let blocking = acceptance_floor_blocking(&o, Some(&route));
-        assert!(
-            blocking
-                .iter()
-                .any(|b| b.contains("coverage gap") && b.contains("FR-002")),
-            "the uncovered requirement is a blocking finding: {blocking:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn deliberate_qc_enforces_the_acceptance_floor_lean_skips_it() {
-        // The acceptance floor is REQUIRED on the deliberate path but NOT on lean.
-        // Same project (a coverage gap) → blocks on a deliberate route, clean on a
-        // lean requirement (which returns before the floor — speed preserved).
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        seed_coverage_gap(tmp.path());
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-
-        // Deliberate route → the floor runs → the coverage gap blocks.
-        let mut deliberate = opts(tmp.path());
-        deliberate.requirement = "做一个完整的任务管理产品".to_string();
-        let route = build_route();
-        let qc = run_auto_qc(&mut sess, &deliberate, &events, Some(&route), None, false).await;
-        assert!(
-            qc.blocking.iter().any(|b| b.contains("coverage gap")),
-            "deliberate QC enforces the acceptance floor: {:?}",
-            qc.blocking
-        );
-
-        // Lean requirement → QC returns at the lean short-circuit, BEFORE the floor.
-        let mut lean = opts(tmp.path());
-        lean.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
-        let qc2 = run_auto_qc(&mut sess, &lean, &events, None, None, false).await;
-        assert!(
-            !qc2.blocking.iter().any(|b| b.contains("coverage gap")),
-            "a lean goal does NOT pay the acceptance floor (speed): {:?}",
-            qc2.blocking
-        );
-    }
-
-    #[tokio::test]
-    async fn deliberate_route_with_lean_reading_requirement_still_runs_full_gate() {
-        // M2 regression: the lean short-circuit must key off the ROUTE's brain-decided
-        // depth, NOT a re-derived keyword classify(requirement). A DELIBERATE route whose
-        // requirement happens to READ lean ("做一个简单的待办单页") must still run the
-        // FULL gate (the acceptance floor), not settle after source-present + governance.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        seed_coverage_gap(tmp.path());
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let mut o = opts(tmp.path());
-        // A requirement the keyword classifier would call LEAN…
-        o.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
-        assert!(
-            crate::planner::is_lean_build(&o.requirement),
-            "precondition: the requirement reads lean by the keyword classifier"
-        );
-        // …but the ROUTE is deliberate (Standard depth) → the full gate must run.
-        let route = build_route();
-        let qc = run_auto_qc(&mut sess, &o, &events, Some(&route), None, false).await;
-        assert!(
-            qc.blocking.iter().any(|b| b.contains("coverage gap")),
-            "a deliberate route runs the full gate even when the requirement reads lean: {:?}",
-            qc.blocking
-        );
-    }
-
-    #[test]
-    fn bugfix_without_a_reproduction_test_blocks_and_a_test_clears_it() {
-        // A Bugfix with source but NO test → the reproduction-test floor blocks.
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("fix.ts"), "export const x = 1;").unwrap();
-        let o = opts(tmp.path());
-        let route = bugfix_route();
-        let blocking = acceptance_floor_blocking(&o, Some(&route));
-        assert!(
-            blocking.iter().any(|b| b.contains("reproduction test")),
-            "a bugfix with no test must demand a reproduction test: {blocking:?}"
-        );
-
-        // Add a real reproduction test → the floor clears (red→green is now possible).
-        std::fs::write(
-            tmp.path().join("fix.test.ts"),
-            "test('reproduces the bug', () => { expect(fixed()).toBe(true); });",
-        )
-        .unwrap();
-        let blocking2 = acceptance_floor_blocking(&o, Some(&route));
-        assert!(
-            !blocking2.iter().any(|b| b.contains("reproduction test")),
-            "a reproduction test clears the bugfix floor: {blocking2:?}"
-        );
-    }
-
-    #[test]
-    fn acceptance_floor_is_fail_open_when_artifacts_are_missing() {
-        // No PRD / no architecture / no source → every contributor reads empty →
-        // the floor is clean (a neutral skip, never a fabricated failure).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let o = opts(tmp.path());
-        let route = build_route();
-        assert!(
-            acceptance_floor_blocking(&o, Some(&route)).is_empty(),
-            "an empty project yields no fabricated acceptance failures"
-        );
-    }
-
-    #[test]
-    fn acceptance_floor_blocks_a_layer_violation_declared_in_the_architecture_doc() {
-        // UD-CODE-006b (spec §3.6): the architecture doc declares a
-        // one-way layering order; an import edge AGAINST it (repository →
-        // controller) is a blocking finding on the deterministic floor, naming
-        // both files. Without a declaration the check silently no-ops.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        let write = |rel: &str, body: &str| {
-            let p = root.join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, body).unwrap();
-        };
-        write(
-            "src/controller/user.ts",
-            "export function userController() {}\n",
-        );
-        write(
-            "src/repository/user.ts",
-            "import { userController } from '../controller/user';\nexport function userRepo() {}\n",
-        );
-        let o = opts(root);
-        let route = build_route();
-        // No layering declaration yet → the floor stays clean (fail-open no-op).
-        write(
-            "output/demo-architecture.md",
-            "# Architecture\n\nprose only\n",
-        );
-        assert!(
-            !acceptance_floor_blocking(&o, Some(&route))
-                .iter()
-                .any(|b| b.contains("layer violation")),
-            "no declaration → no layer findings"
-        );
-        // Declare the layering contract → the violating edge blocks.
-        write(
-            "output/demo-architecture.md",
-            "# Architecture\n\n## Layering\n\n\
-             | dir | layer |\n| --- | --- |\n\
-             | src/controller | controller |\n\
-             | src/repository | repository |\n\n\
-             Order: controller -> repository\n",
-        );
-        let blocking = acceptance_floor_blocking(&o, Some(&route));
-        assert!(
-            blocking.iter().any(|b| b.contains("layer violation")
-                && b.contains("src/repository/user.ts")
-                && b.contains("src/controller/user.ts")),
-            "the floor blocks the against-the-order import, naming both files: {blocking:?}"
-        );
-    }
-
-    #[test]
-    fn runtime_proof_blocking_distinguishes_failure_from_skip() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let dir = tmp
-            .path()
-            .join(crate::runtime_proof::runtime_proof_rel_path());
-        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
-        // A SKIP (no dev server) → neutral, no block.
-        std::fs::write(
-            &dir,
-            r#"{"timestamp":"t","status":{"kind":"not_verified","reason":"no dev server detected"},"dev_server":null,"command":null,"base_url":null,"ready_ms":null,"routes":[],"e2e":null}"#,
-        )
-        .unwrap();
-        assert!(
-            runtime_proof_blocking(tmp.path()).is_none(),
-            "a runtime SKIP is neutral, not a block"
-        );
-        // A real boot FAILURE → blocking.
-        std::fs::write(
-            &dir,
-            r#"{"timestamp":"t","status":{"kind":"not_verified","reason":"server did not become ready within 60s"},"dev_server":"vite","command":"npm run dev","base_url":"http://localhost:5173","ready_ms":null,"routes":[],"e2e":null}"#,
-        )
-        .unwrap();
-        let line = runtime_proof_blocking(tmp.path()).expect("a real boot failure blocks");
-        assert!(line.contains("runtime-proof"));
-    }
-
-    // ── Wave 1: routed entry — visible intent + owned plan, fully fail-open ──
-
-    /// A deliberate Build route for the wiring tests.
-    fn build_route() -> crate::router::RoutePlan {
-        crate::router::RoutePlan {
-            class: crate::router::RouteClass::Build,
-            kind: crate::planner::TaskKind::Greenfield,
-            depth: crate::router::Depth::Standard,
-            team: vec![crate::critics::Seat::FrontendEngineer],
-            scope: vec![],
-            needs_clarify: None,
-            est_budget: crate::router::Budget::for_route(
-                crate::router::RouteClass::Build,
-                crate::router::Depth::Standard,
-            ),
-            confidence: 0.7,
-        }
-    }
-
-    #[test]
-    fn run_budget_reads_env_and_falls_back_safely() {
-        let _env = EnvRestore::set("UMADEV_RUN_BUDGET_SECS", "120");
-        assert_eq!(run_budget(), Duration::from_secs(120));
-        std::env::set_var("UMADEV_RUN_BUDGET_SECS", "0"); // non-positive → default
-        assert_eq!(run_budget(), Duration::from_secs(DEFAULT_RUN_BUDGET_SECS));
-        std::env::set_var("UMADEV_RUN_BUDGET_SECS", "nonsense");
-        assert_eq!(run_budget(), Duration::from_secs(DEFAULT_RUN_BUDGET_SECS));
-        std::env::remove_var("UMADEV_RUN_BUDGET_SECS");
-        assert_eq!(run_budget(), Duration::from_secs(DEFAULT_RUN_BUDGET_SECS));
-    }
-
-    #[test]
-    fn seat_driven_decision_is_router_driven_with_an_escape_hatch() {
-        // Wave A: the build-path decision is AUTOMATIC from the route (no user flag,
-        // no new classifier — it reuses the router's own `depth` signal). A DELIBERATE
-        // full build (Greenfield → Standard) builds SEAT-BY-SEAT; a lean/Fast build
-        // stays the single end-to-end turn so token cost stays proportional.
-        let deliberate = build_route(); // Greenfield / Standard (deliberate)
-        let lean = fast_build_route(); // Light / Fast (not deliberate)
-        assert!(
-            seat_driven_build_warranted(&deliberate, false),
-            "a deliberate full build warrants seat-by-seat building"
-        );
-        assert!(
-            !seat_driven_build_warranted(&lean, false),
-            "a lean/Fast build stays single-turn (no per-step scheduling)"
-        );
-        // The escape hatch can only DISABLE seat-driving (force the cheaper single
-        // turn); it can NEVER force seat-driving on, and it leaves the lean default
-        // exactly where it was — the default remains router-driven.
-        assert!(
-            !seat_driven_build_warranted(&deliberate, true),
-            "the escape hatch forces even a deliberate build back to a single turn"
-        );
-        assert!(
-            !seat_driven_build_warranted(&lean, true),
-            "the escape hatch never turns a lean build into a seat-driven one"
-        );
-    }
-
-    #[tokio::test]
-    async fn deliberate_build_winds_down_gracefully_at_the_time_budget() {
-        // A deliberate build whose wall-clock budget is ALREADY spent drives its
-        // first step, then stops scheduling new steps and settles via the final gate
-        // (graceful — never a mid-write abort, never unbounded). The honest budget
-        // note fires.
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let mk = |id: &str| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.to_string(),
-            title: format!("step {id}"),
-            seat: crate::critics::Seat::FrontendEngineer,
-            kind: StepKind::Build,
-            depends_on: vec![],
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status: StepStatus::Pending,
-        };
-        let plan = Plan {
-            steps: vec![mk("a"), mk("b"), mk("c")],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        let turns = vec![
-            text_turn("step a done"),
-            text_turn("step b done"),
-            text_turn("step c done"),
-            text_turn("final gate ok"),
-        ];
-        let mut sess = FakeSession::new(turns, true, "");
-        let o = opts(tmp.path());
-        let route = build_route(); // deliberate Standard
-                                   // An already-spent budget (deadline in the past). `checked_sub` avoids the
-                                   // unchecked-Instant-subtraction lint; fall back to "now" (still ≤ now).
-        let already_past = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now);
-        let outcome = drive_director_loop_with_idle(
-            &mut sess,
-            &o,
-            &events,
-            "GO".into(),
-            Some(plan),
-            Some(&route),
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            already_past,
-        )
-        .await;
-        assert!(
-            matches!(outcome, DirectorLoopOutcome::Done { .. }),
-            "the build settles cleanly (never hangs) at the budget: {outcome:?}"
-        );
-        assert!(
-            rec.events().iter().any(|e| matches!(
-                e,
-                EngineEvent::Note(n) if n.contains("time budget reached")
-            )),
-            "the graceful budget wind-down note fires: {:?}",
-            rec.events()
-        );
-    }
-
-    #[tokio::test]
-    async fn routed_loop_in_plan_mode_stops_read_only_without_driving_writes() {
-        // A director BUILD spawned in Plan (read-only) mode must STOP cleanly with the
-        // read-only notice, NOT drive the plan and deny-storm every write (the reported
-        // opencode "edit -> pyproject.toml 按拒绝处理 -> 0 source files" storm). The guard
-        // returns BEFORE any turn is driven, so an empty FakeSession is never touched.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let mut o = opts(tmp.path());
-        o.mode = TrustMode::Plan;
-        let route = build_route();
-        let outcome =
-            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        assert!(
-            matches!(outcome, DirectorLoopOutcome::Done { .. }),
-            "plan mode settles cleanly (Done, not a deny-storm): {outcome:?}"
-        );
-        assert!(
-            rec.events().iter().any(|e| matches!(
-                e,
-                EngineEvent::Note(n) if n.contains("计划模式") || n.contains("plan")
-            )),
-            "the read-only plan-mode notice fires: {:?}",
-            rec.events()
-        );
-    }
-
-    #[tokio::test]
-    async fn routed_loop_emits_intent_decided() {
-        // The routed entry surfaces the routing decision BEFORE any work, so the
-        // user sees "I'll BUILD this …". A non-forking session means no plan, which
-        // is fine — IntentDecided must still fire.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let turns = vec![text_turn("Built it end to end. Done.")];
-        let mut sess = FakeSession::new(turns, false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-
-        let outcome =
-            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        assert!(
-            rec.count(
-                |e| matches!(e, EngineEvent::IntentDecided { class, .. } if class == "build")
-            ) == 1,
-            "exactly one IntentDecided(build) is emitted"
-        );
-    }
-
-    #[tokio::test]
-    async fn routed_loop_synthesizes_and_posts_a_plan_when_the_brain_replies() {
-        // The planning turn runs on the MAIN session (its first turn) and replies
-        // with a valid plan JSON → the loop synthesises the plan, persists
-        // `.umadev/plan.json`, posts it, and ticks a step active. Because the route
-        // is DELIBERATE (Standard), Wave 2 then DRIVES the plan step-by-step via
-        // `summon` (the second scripted turn is the first step's doer turn), so the
-        // doer's reply text threads back through `SummonResult.text`.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        seed_core_docs(tmp.path()); // the skeleton prepends 3 doc + QA-test + tokens steps
-        let (events, rec) = sink();
-        let plan_json = r#"{"steps":[
-            {"id":"scaffold","title":"Scaffold","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
-            {"id":"ui","title":"Build the UI","seat":"frontend-engineer","kind":"build","depends_on":["scaffold"],"acceptance":"source-present"}
-        ],"risks":["state mgmt"],"open_questions":[]}"#;
-        // Turn 1 = the JSON plan (main-session planning turn); turn 2 = the build.
-        // Extra doc/build steps beyond these default-complete on the FakeSession.
-        let turns = vec![
-            text_turn(plan_json),
-            text_turn("Built the whole app end to end. Done."),
-        ];
-        let mut sess = FakeSession::new(turns, true, plan_json);
-        let mut o = opts(tmp.path());
-        // A lean requirement would skip the heavy review but the plan path keys off
-        // the ROUTE's deliberate depth, not the requirement — keep it a real build.
-        o.requirement = "做一个完整的任务管理产品".to_string();
-        let route = build_route();
-
-        let outcome =
-            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-
-        // The plan was posted with all 8 steps (3 doc-first + the QA test-authoring +
-        // the designer VISUAL-DIRECTION step (UD-CODE-007f — direction before tokens) +
-        // the design-tokens skeleton step + the 2 brain build steps).
-        assert!(
-            rec.count(|e| matches!(e, EngineEvent::PlanPosted { total, .. } if *total == 8)) == 1,
-            "an 8-step plan (3 doc + test-plan + direction + tokens + 2 brain) was posted: {:?}",
-            rec.events()
-        );
-        // At least one step was surfaced as active (the ready PRD doc step).
-        assert!(
-            rec.count(
-                |e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "active")
-            ) >= 1,
-            "a ready step ticked active"
-        );
-        // It was persisted to disk and is loadable, and OPENS with the PRD doc step.
-        let loaded = crate::plan_state::load(tmp.path()).expect("plan persisted");
-        assert_eq!(loaded.steps.len(), 8);
-        assert_eq!(
-            loaded.steps[0].id, "umadev-phase-prd",
-            "the doc-first skeleton opens the plan with the PRD step"
-        );
-        // The step-driven loop drove the doer turn and threaded its reply back.
-        match outcome {
-            DirectorLoopOutcome::Done { reply } => assert!(reply.contains("Built the whole app")),
-            other => panic!("expected Done, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn fresh_plan_synthesis_rotates_the_previous_runs_notes() {
-        // B1#6 run-scoping: a NEW deliberate run (fresh plan synthesis) rotates the
-        // previous run's `.umadev/run-notes.md` to `.umadev/run-notes.prev.md`, so
-        // the notes file always belongs to ONE run. (A RESUME keeps the live file —
-        // covered by `resume_step_directive_recalls_the_persisted_run_notes`.)
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        seed_core_docs(tmp.path());
-        let dir = tmp.path().join(".umadev");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("run-notes.md"),
-            "- [t0] STALE_NOTE from the previous run\n",
-        )
-        .unwrap();
-        let (events, _rec) = sink();
-        let plan_json = r#"{"steps":[
-            {"id":"scaffold","title":"Scaffold","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"}
-        ],"risks":[],"open_questions":[]}"#;
-        let turns = vec![text_turn(plan_json), text_turn("Built. Done.")];
-        let mut sess = FakeSession::new(turns, true, plan_json);
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的任务管理产品".to_string();
-        let route = build_route();
-        let _ = drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        assert!(
-            !dir.join("run-notes.md").exists(),
-            "a fresh run starts with a clean notes sheet"
-        );
-        let prev = std::fs::read_to_string(dir.join("run-notes.prev.md"))
-            .expect("previous run's notes preserved");
-        assert!(
-            prev.contains("STALE_NOTE"),
-            "the previous run's notes rotate one generation back: {prev}"
-        );
-    }
-
-    #[tokio::test]
-    async fn routed_loop_fails_open_to_single_turn_when_plan_unparseable() {
-        // The fork replies with garbage (no JSON object) → synthesize_plan returns
-        // None → the loop behaves EXACTLY like today's single-turn build. No
-        // PlanPosted, but the build still completes.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let turns = vec![text_turn("Built it. Done.")];
-        let mut sess = FakeSession::new(turns, true, "not json at all, sorry");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-
-        let outcome =
-            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        // No plan could be parsed → none posted (fail-open to single-turn behaviour).
-        assert_eq!(
-            rec.count(|e| matches!(e, EngineEvent::PlanPosted { .. })),
-            0,
-            "an unparseable plan posts nothing — single-turn fallback"
-        );
-        // IntentDecided still fired (it never depends on the plan).
-        assert_eq!(
-            rec.count(|e| matches!(e, EngineEvent::IntentDecided { .. })),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn non_routed_entry_is_unchanged_no_intent_or_plan() {
-        // The legacy entry (drive_director_loop) passes route = None → no
-        // IntentDecided, no plan, exactly today's behaviour. This guards the
-        // backward-compatible contract the TUI/CLI callers rely on.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let turns = vec![text_turn("Built it. Done.")];
-        let mut sess = FakeSession::new(turns, true, r#"{"steps":[]}"#);
-        let o = opts(tmp.path());
-
-        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".into()).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        assert_eq!(
-            rec.count(|e| matches!(e, EngineEvent::IntentDecided { .. })),
-            0
-        );
-        assert_eq!(
-            rec.count(|e| matches!(e, EngineEvent::PlanPosted { .. })),
-            0
-        );
-    }
-
-    // ── Wave 2: drive the plan step-by-step (deliberate) vs single-turn (lean) ──
-
-    /// A FAST (lean) Build route — proportional, convenes no team, NOT deliberate.
-    fn fast_build_route() -> crate::router::RoutePlan {
-        crate::router::RoutePlan {
-            class: crate::router::RouteClass::Build,
-            kind: crate::planner::TaskKind::Light,
-            depth: crate::router::Depth::Fast,
-            team: vec![],
-            scope: vec![],
-            needs_clarify: None,
-            est_budget: crate::router::Budget::for_route(
-                crate::router::RouteClass::Build,
-                crate::router::Depth::Fast,
-            ),
-            confidence: 0.6,
-        }
-    }
-
-    #[tokio::test]
-    async fn deliberate_build_drives_each_step_via_summon_and_ticks_done() {
-        // The headline Wave 2 behaviour: a DELIBERATE build with a 2-step plan drives
-        // EACH step on its own summon turn (so the main session receives the plan
-        // turn + one doer directive PER step), verifies each against source-present,
-        // and ticks each step Done on the checklist.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path()); // source present → each step's acceptance passes
-        seed_core_docs(tmp.path()); // the doc-first skeleton prepends 3 doc steps
-        let (events, rec) = sink();
-        let plan_json = r#"{"steps":[
-            {"id":"scaffold","title":"Scaffold","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
-            {"id":"ui","title":"Build the UI","seat":"frontend-engineer","kind":"build","depends_on":["scaffold"],"acceptance":"source-present"}
-        ],"risks":[],"open_questions":[]}"#;
-        // Turn 1 = plan JSON; the deliberate route prepends the skeleton steps (PRD /
-        // architecture / UIUX docs, then the QA test-authoring + designer tokens
-        // code-phase prep), each consuming a doer turn BEFORE scaffold + ui. The
-        // FakeSession default-completes any further turns (the final QC gate).
-        let turns = vec![
-            text_turn(plan_json),
-            text_turn("Wrote the PRD. Done."),
-            text_turn("Wrote the architecture. Done."),
-            text_turn("Wrote the UI/UX doc. Done."),
-            text_turn("Authored the acceptance tests. Done."),
-            text_turn("Decided the visual direction. Done."),
-            text_turn("Wrote the design tokens. Done."),
-            text_turn("Scaffolded the app skeleton. Done."),
-            text_turn("Built the UI. Done."),
-        ];
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的任务管理产品".to_string();
-        let route = build_route();
-
-        let outcome =
-            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-
-        // BOTH steps ticked Done (the real "checklist ticks off" outcome).
-        let done = rec
-            .count(|e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "done"));
-        assert!(done >= 2, "both build steps ticked done: {done}");
-
-        // The main session received the plan turn AND a separate focused directive
-        // per step — proof the plan was DRIVEN step-by-step, not in one mega-turn.
-        let sent = sent.lock().unwrap();
-        assert!(
-            sent.iter().any(|d| d.contains("Scaffold")),
-            "the scaffold step got its own focused directive: {sent:?}"
-        );
-        assert!(
-            sent.iter().any(|d| d.contains("Build the UI")),
-            "the ui step got its own focused directive: {sent:?}"
-        );
-        // Change 2 (Bug-2 fix): a CLEAN multi-step deliberate build DOES drive the ONE
-        // integrated final-report turn at convergence — every per-step doer directive
-        // carried the wrap-up suppression note, so without this turn the build's final
-        // reply would be the last step's deliberately conclusion-free narration (the
-        // deferred wrap-up would never arrive). Exactly ONCE — never a double report.
-        assert_eq!(
-            sent.iter()
-                .filter(|d| d.contains("integrated final report for this build"))
-                .count(),
-            1,
-            "a clean multi-step build drives exactly ONE integrated final-report turn: {sent:?}"
-        );
-        // FIX #6: each per-step directive HARD-scopes the base to ONE step (the root
-        // fix for "the base builds the whole project in step 1's turn"). The focused
-        // directive must carry the single-step constraint phrasing.
-        assert!(
-            sent.iter().any(|d| d.contains("ONE step of a larger build")
-                && d.contains("Do NOT implement any other part of the project")),
-            "the per-step directive hard-scopes the base to ONE step: {sent:?}"
-        );
-        // Persisted terminal plan is all-Done.
-        let loaded = crate::plan_state::load(tmp.path()).expect("plan persisted");
-        assert!(loaded
-            .steps
-            .iter()
-            .all(|s| s.status == crate::plan_state::StepStatus::Done));
-    }
-
-    // ── workflow-state.json phase sync — the state-sync bug fix. The director-loop
-    //    path must keep `.umadev/workflow-state.json` (the 9-phase machine `/status`
-    //    reads) in step with REAL progress; before the fix it stayed frozen at
-    //    `research` / all-pending while the build moved on. ──
-
-    /// Read the persisted workflow phase id from `.umadev/workflow-state.json`, or
-    /// `None` when no state was written.
-    fn persisted_phase_id(root: &std::path::Path) -> Option<String> {
-        crate::state::read_workflow_state(root).map(|s| s.phase)
-    }
-
-    #[tokio::test]
-    async fn director_loop_advances_workflow_state_off_research() {
-        // THE BUG: a `/run` over the director-loop / plan path never wrote
-        // workflow-state.json, so `/status` showed `phase=research` / all-pending even
-        // after real code landed. Now a deliberate step-driven build (a frontend +
-        // backend plan) must leave a workflow-state.json whose phase is PAST research
-        // and reflects the completed steps (backend completed → `backend`/`delivery`).
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path()); // source present → each step's acceptance passes
-        seed_core_docs(tmp.path()); // the doc-first skeleton prepends 3 doc steps
-        let (events, _rec) = sink();
-        let plan_json = r#"{"steps":[
-            {"id":"fe","title":"Build the frontend","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
-            {"id":"be","title":"Build the backend","seat":"backend-engineer","kind":"build","depends_on":["fe"],"acceptance":"source-present"}
-        ],"risks":[],"open_questions":[]}"#;
-        // The deliberate Greenfield route prepends the skeleton steps (3 docs + the
-        // QA test-authoring + designer tokens prep), each consuming a doer turn
-        // BEFORE the fe + be code steps.
-        let turns = vec![
-            text_turn(plan_json),
-            text_turn("Wrote the PRD. Done."),
-            text_turn("Wrote the architecture. Done."),
-            text_turn("Wrote the UI/UX doc. Done."),
-            text_turn("Authored the acceptance tests. Done."),
-            text_turn("Decided the visual direction. Done."),
-            text_turn("Wrote the design tokens. Done."),
-            text_turn("Built the frontend. Done."),
-            text_turn("Built the backend. Done."),
-        ];
-        let mut sess = FakeSession::new(turns, false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的任务管理产品".to_string();
-        let route = build_route();
-
-        // Before the run there is NO state file (this is the frozen-at-research case).
-        assert!(persisted_phase_id(tmp.path()).is_none());
-
-        let outcome =
-            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-
-        // A state file now exists and its phase is NOT the initial `research`.
-        let phase = persisted_phase_id(tmp.path()).expect("workflow-state.json was written");
-        assert_ne!(
-            phase, "research",
-            "the director loop advanced the phase off the initial research value"
-        );
-        // Both steps reached Done (a clean finish over a backend seat) → the terminal
-        // phase is the deepest the build honestly reached. A clean finalize claims
-        // `delivery`; it must at MINIMUM be past the frontend phase the backend follows.
-        let rank = |id: &str| {
-            umadev_spec::PHASE_CHAIN
-                .iter()
-                .position(|p| p.id() == id)
-                .unwrap_or(0)
-        };
-        assert!(
-            rank(&phase) >= rank("backend"),
-            "a build whose backend step completed reaches at least `backend` (got {phase})"
-        );
-    }
-
-    #[test]
-    fn phase_for_seat_maps_each_seat_honestly() {
-        use crate::critics::Seat;
-        assert_eq!(phase_for_seat(Seat::ProductManager), Phase::Docs);
-        assert_eq!(phase_for_seat(Seat::Architect), Phase::Spec);
-        assert_eq!(phase_for_seat(Seat::UiuxDesigner), Phase::Frontend);
-        assert_eq!(phase_for_seat(Seat::FrontendEngineer), Phase::Frontend);
-        assert_eq!(phase_for_seat(Seat::BackendEngineer), Phase::Backend);
-        assert_eq!(phase_for_seat(Seat::QaEngineer), Phase::Quality);
-        assert_eq!(phase_for_seat(Seat::SecurityEngineer), Phase::Quality);
-        assert_eq!(phase_for_seat(Seat::DevopsEngineer), Phase::Delivery);
-        // The gate phases are never the anchor for a step (they are human pauses).
-        for seat in [
-            Seat::ProductManager,
-            Seat::Architect,
-            Seat::UiuxDesigner,
-            Seat::FrontendEngineer,
-            Seat::BackendEngineer,
-            Seat::QaEngineer,
-            Seat::SecurityEngineer,
-            Seat::DevopsEngineer,
-        ] {
-            assert!(
-                !phase_for_seat(seat).is_gate(),
-                "a step never anchors to a gate phase"
-            );
-        }
-    }
-
-    #[test]
-    fn phase_for_step_anchors_qa_test_authoring_to_spec_not_quality() {
-        // A QA BUILD step is TEST-AUTHORING (test-first: the doc-first skeleton
-        // schedules it right after the docs, before any code) — it anchors to `spec`,
-        // NOT `quality`, so /status doesn't jump to quality while no code exists and
-        // a non-clean finalize can't claim a quality-era finish off spec-era prep. A
-        // QA REVIEW step keeps the seat's quality anchor (it reads delivered code).
-        use crate::critics::Seat;
-        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
-        let mk = |seat: Seat, kind: StepKind| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: "s".into(),
-            title: "s".into(),
-            seat,
-            kind,
-            depends_on: vec![],
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status: StepStatus::Pending,
-        };
-        assert_eq!(
-            phase_for_step(&mk(Seat::QaEngineer, StepKind::Build)),
-            Phase::Spec,
-            "test-authoring is spec-era prep"
-        );
-        assert_eq!(
-            phase_for_step(&mk(Seat::QaEngineer, StepKind::Review)),
-            Phase::Quality,
-            "a QA review keeps the seat's quality anchor"
-        );
-        // Every other seat still anchors exactly by seat.
-        assert_eq!(
-            phase_for_step(&mk(Seat::BackendEngineer, StepKind::Build)),
-            Phase::Backend
-        );
-        assert_eq!(
-            phase_for_step(&mk(Seat::UiuxDesigner, StepKind::Build)),
-            Phase::Frontend
-        );
-    }
-
-    #[test]
-    fn persisted_phase_never_regresses_across_writes() {
-        // The monotonic clamp: once the state reached a deeper phase, a later write of
-        // an EARLIER phase is ignored (a backend step finishing after a frontend step
-        // must not pull the phase back to `frontend`). This is the "never move
-        // BACKWARD" invariant the fix promises.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let o = opts(tmp.path());
-        // Advance frontend → backend → (try to regress) frontend.
-        persist_phase(&o, Phase::Frontend);
-        assert_eq!(persisted_phase_id(tmp.path()).as_deref(), Some("frontend"));
-        persist_phase(&o, Phase::Backend);
-        assert_eq!(persisted_phase_id(tmp.path()).as_deref(), Some("backend"));
-        // A regressing write is clamped — the phase stays at the deeper `backend`.
-        persist_phase(&o, Phase::Frontend);
-        assert_eq!(
-            persisted_phase_id(tmp.path()).as_deref(),
-            Some("backend"),
-            "a write of an earlier phase is clamped to the deepest reached (no regress)"
-        );
-    }
-
-    #[tokio::test]
-    async fn step_completions_advance_phase_monotonically_never_backward() {
-        // End-to-end monotonicity across the step driver: a plan whose steps complete
-        // in seat order frontend → backend ticks the phase forward and NEVER backward,
-        // even though the backend step's seat maps to a LATER phase than the frontend's.
-        // (A regression would surface if a later-finishing earlier-phase step pulled it
-        // back; here the clamp guarantees a non-decreasing phase rank at every Done.)
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        seed_core_docs(tmp.path()); // the doc-first skeleton prepends 3 doc steps
-        let (events, _rec) = sink();
-        // backend (later phase) is the FIRST code step; frontend (earlier phase) depends
-        // on it — so the EARLIER-phase step finishes LAST. The clamp must keep the phase
-        // at `backend` after the trailing frontend step, never regress to `frontend`.
-        let plan_json = r#"{"steps":[
-            {"id":"be","title":"Build the backend","seat":"backend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
-            {"id":"fe","title":"Polish the frontend","seat":"frontend-engineer","kind":"build","depends_on":["be"],"acceptance":"source-present"}
-        ],"risks":[],"open_questions":[]}"#;
-        // The deliberate Greenfield route prepends the skeleton steps (3 docs + the
-        // QA test-authoring + designer tokens prep), each consuming a doer turn
-        // BEFORE the be + fe code steps.
-        let turns = vec![
-            text_turn(plan_json),
-            text_turn("Wrote the PRD. Done."),
-            text_turn("Wrote the architecture. Done."),
-            text_turn("Wrote the UI/UX doc. Done."),
-            text_turn("Authored the acceptance tests. Done."),
-            text_turn("Decided the visual direction. Done."),
-            text_turn("Wrote the design tokens. Done."),
-            text_turn("Built the backend. Done."),
-            text_turn("Polished the frontend. Done."),
-        ];
-        let mut sess = FakeSession::new(turns, false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-
-        let outcome =
-            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-
-        // After the EARLIER-phase frontend step finished LAST, the phase must still be
-        // at least `backend` — it never regressed to `frontend`.
-        let phase = persisted_phase_id(tmp.path()).expect("state written");
-        let rank = |id: &str| {
-            umadev_spec::PHASE_CHAIN
-                .iter()
-                .position(|p| p.id() == id)
-                .unwrap_or(0)
-        };
-        assert!(
-            rank(&phase) >= rank("backend"),
-            "the phase never regressed below the deepest step reached (got {phase})"
-        );
-    }
-
-    #[test]
-    fn finalize_phase_is_honest_clean_vs_unclean() {
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let mk = |id: &str, seat: crate::critics::Seat, status: StepStatus| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: format!("step {id}"),
-            seat,
-            kind: StepKind::Build,
-            depends_on: vec![],
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status,
-        };
-
-        // CLEAN finish (every step Done) over a QA-deepest plan → the build claims the
-        // terminal `delivery` phase.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let o = opts(tmp.path());
-        let clean_plan = Plan {
-            steps: vec![
-                mk(
-                    "fe",
-                    crate::critics::Seat::FrontendEngineer,
-                    StepStatus::Done,
-                ),
-                mk("qa", crate::critics::Seat::QaEngineer, StepStatus::Done),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        finalize_phase_from_plan(&clean_plan, &o, true);
-        assert_eq!(
-            persisted_phase_id(tmp.path()).as_deref(),
-            Some("delivery"),
-            "a genuinely clean finish reaches delivery"
-        );
-
-        // NON-clean finish (backend step Blocked, frontend Done) → the state must NOT
-        // claim delivery; it reflects only the furthest phase that actually completed
-        // (frontend), so `/status` stays honest about where the build stopped.
-        let tmp2 = tempfile::TempDir::new().unwrap();
-        let o2 = opts(tmp2.path());
-        let unclean_plan = Plan {
-            steps: vec![
-                mk(
-                    "fe",
-                    crate::critics::Seat::FrontendEngineer,
-                    StepStatus::Done,
-                ),
-                mk(
-                    "be",
-                    crate::critics::Seat::BackendEngineer,
-                    StepStatus::Blocked,
-                ),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        finalize_phase_from_plan(&unclean_plan, &o2, false);
-        assert_eq!(
-            persisted_phase_id(tmp2.path()).as_deref(),
-            Some("frontend"),
-            "a non-clean finish never optimistically claims delivery"
-        );
-    }
-
-    #[tokio::test]
-    async fn lean_fast_build_stays_single_turn_no_step_scheduling() {
-        // A LEAN/Fast Build route must NOT take the step-driven path — it stays ONE
-        // end-to-end build turn (the Wave 1 speed invariant). A Fast Build still gets
-        // a short VISIBLE plan (the planning turn), but the step-driver only fires on
-        // DELIBERATE depth, so the build itself is a single fast turn: the planning
-        // turn + exactly ONE build directive, never decomposed into per-step summons.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, _rec) = sink();
-        let plan_json = r#"{"steps":[
-            {"id":"a","title":"Page","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"}
-        ],"risks":[],"open_questions":[]}"#;
-        // Turn 1 = the (short) plan; turn 2 = the single end-to-end build.
-        let turns = vec![
-            text_turn(plan_json),
-            text_turn("Built the single page end to end. Done."),
-        ];
-        let mut sess = FakeSession::new(turns, true, plan_json);
-        let sent = sess.sent_handle();
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
-        let route = fast_build_route();
-
-        let outcome =
-            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        // The planning turn + EXACTLY ONE build directive — the lean build is a single
-        // fast turn, never decomposed into per-step summon turns (the speed invariant).
-        let sent = sent.lock().unwrap();
-        assert_eq!(
-            sent.len(),
-            2,
-            "a lean/Fast build is the plan turn + ONE build turn (no step scheduling): {sent:?}"
-        );
-        // The single build directive is the caller's "GO" framing, NOT a per-step
-        // focused directive (which would carry the HARD-scoped "ONE step of a larger
-        // build" phrasing from `route_focus_line`).
-        assert!(
-            sent.iter().any(|d| d.contains("GO")),
-            "the build ran the caller's single directive: {sent:?}"
-        );
-        assert!(
-            !sent
-                .iter()
-                .any(|d| d.contains("ONE step of a larger build")),
-            "no per-step summon directive on a lean/Fast build: {sent:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn step_scheduling_fails_open_to_single_turn_when_first_step_cannot_drive() {
-        // Fail-open: if the FIRST step can't drive at all (a dead session on the very
-        // first doer turn), the step path returns None and the loop falls back to the
-        // single end-to-end turn — the build is never lost to a scheduling failure.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        // Seed the core docs so the doc-first skeleton's FIRST step (the PRD doc) has its
-        // deliverable on disk — it then accepts on round 0 WITHOUT driving a turn
-        // (drove=false), which is exactly the first-step "couldn't drive" bail path this
-        // test exercises. The partial (no-TurnDone) turn is that PRD step's round-0 summon.
-        seed_core_docs(tmp.path());
-        let (events, rec) = sink();
-        let plan_json = r#"{"steps":[
-            {"id":"a","title":"Step A","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"}
-        ],"risks":[],"open_questions":[]}"#;
-        // Turn 1 = plan JSON. Turn 2 (the first doc step's doer) has NO TurnDone → the
-        // session drains to None mid-turn → summon's pump returns done=false with no
-        // text, so the first step "didn't drive" → fall back to the single turn.
-        let turns = vec![
-            text_turn(plan_json),
-            vec![SessionEvent::TextDelta("partial, no TurnDone".into())],
-            text_turn("Fallback single-turn build. Done."),
-        ];
-        let mut sess = FakeSession::new(turns, false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-
-        let outcome =
-            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        // The build still completes (via the single-turn fallback), never a panic.
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        // The fallback note was emitted.
-        assert!(
-            rec.events().iter().any(|e| matches!(
-                e,
-                EngineEvent::Note(n) if n.contains("step scheduling unavailable")
-            )),
-            "a first-step drive failure falls back to the single turn"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failing_step_acceptance_is_bounded_and_marks_blocked() {
-        // A step whose acceptance NEVER passes (claims a build but the tree stays
-        // empty so source-present fails every round) must be BOUNDED by the per-step
-        // fix budget, then marked Blocked (honest) — never an infinite re-drive.
-        let tmp = tempfile::TempDir::new().unwrap();
-        // NO source seeded → the source-present acceptance fails every round.
-        let (events, rec) = sink();
-        let plan_json = r#"{"steps":[
-            {"id":"a","title":"Step A","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"}
-        ],"risks":[],"open_questions":[]}"#;
-        // Every doer turn claims done but writes nothing → acceptance fails; the
-        // FakeSession default-completes once the scripted turns run out.
-        let turns = vec![
-            text_turn(plan_json),
-            text_turn("Worked on it. Done."),
-            text_turn("Tried again. Done."),
-            text_turn("Once more. Done."),
-        ];
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-
-        let outcome =
-            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        // The step was driven a BOUNDED number of times (1 plan turn + at most
-        // MAX_STEP_FIX_ROUNDS+1 doer turns + the final-gate fix turns) — never a spin.
-        let n = sent.lock().unwrap().len();
-        assert!(
-            n <= 1 + (MAX_STEP_FIX_ROUNDS + 1) + MAX_QC_ROUNDS,
-            "the failing step is bounded, not an infinite re-drive: {n} turns"
-        );
-        // The step ended Blocked (its acceptance never passed) — honest, not Done.
-        assert!(
-            rec.count(
-                |e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "blocked")
-            ) >= 1,
-            "an unacceptable step is marked Blocked"
-        );
-    }
-
-    // ── Blast-radius-weighted verification ordering: among ready peers the highest-
-    //    blast-radius (most-depended-on, expensive-to-unwind) step is scheduled +
-    //    reworked FIRST; a dependency still never runs before its prerequisite; a
-    //    high-blast-radius step earns one extra rigor fix round. ──
-
-    /// The ordered ids of the `active` PlanStepStatus events the run emitted — the
-    /// drive order the scheduler actually chose.
-    fn active_order(rec: &RecordingSink) -> Vec<String> {
-        rec.events()
-            .iter()
-            .filter_map(|e| match e {
-                EngineEvent::PlanStepStatus { id, status, .. } if status == "active" => {
-                    Some(id.clone())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// A 4-step plan: an independent low-impact peer (`config`, blast radius 0) listed
-    /// FIRST in plan order, an upstream `schema` (blast radius 2: `api` + `ui` depend on
-    /// it), and its two dependents. `config` and `schema` are both ready initially; the
-    /// blast-radius scheduler must drive `schema` first despite `config`'s earlier plan
-    /// position. `api`/`ui` can only run AFTER `schema` is Done (DAG order).
-    fn upstream_peer_plan() -> crate::plan_state::Plan {
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let mk = |id: &str, deps: &[&str]| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: format!("Build the {id}"),
-            seat: crate::critics::Seat::FrontendEngineer,
-            kind: StepKind::Build,
-            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status: StepStatus::Pending,
-        };
-        Plan {
-            steps: vec![
-                mk("config", &[]),      // radius 0, first in plan order
-                mk("schema", &[]),      // radius 2 (api + ui)
-                mk("api", &["schema"]), // gated by schema
-                mk("ui", &["schema"]),  // gated by schema
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        }
-    }
-
-    #[tokio::test]
-    async fn the_director_path_writes_the_governance_context_before_it_writes_code() {
-        // HIGH 1. `.umadev/governance-context.json` was written ONLY by the legacy gated walk
-        // and the single-shot runner. The DEFAULT path — this one — never wrote it. So a user
-        // asked for a purple brand landing page, the run honoured it in-process, and then
-        // their `git commit` fired `.git/hooks/pre-commit` → `umadev ci` → no context →
-        // `ProjectContext::unknown()` → BLOCK UD-CODE-002 on the exact color they had asked
-        // for, exit 1, with nothing they could edit to converge. The run and the gate have to
-        // read one rule book, and the run is the one that has to write it.
-        //
-        // And the COLOUR PERMISSION in that rule book is the BRAIN's verdict, asked once at
-        // this door (`color_permission::consult_color_permission`) — never a reading of the
-        // requirement's words, which is a question a word list cannot answer.
-        let requirement = "做一个品牌落地页,主色用紫色渐变";
-
-        // (a) A brain that GRANTS. The door asks it, and persists what it says.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let ctx_file = tmp.path().join(".umadev").join("governance-context.json");
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(
-            vec![],
-            true,
-            "{\"purple_allowed\":true,\"reason\":\"the user chose violet as the brand\"}",
-        );
-        let mut o = opts(tmp.path());
-        o.requirement = requirement.to_string();
-        let route = build_route();
-
-        assert!(!ctx_file.exists(), "precondition: no context yet");
-        let _ = drive_director_loop_routed(&mut sess, &o, &events, "GO".to_string(), Some(&route))
-            .await;
-
-        let ctx: umadev_governance::ProjectContext =
-            serde_json::from_str(&std::fs::read_to_string(&ctx_file).expect("context persisted"))
-                .expect("valid context json");
-        assert!(
-            ctx.purple_allowed,
-            "the brain judged the requirement to authorize the hue — every surface must be \
-             able to read that"
-        );
-        // And it is STAMPED, or the readers (which cannot see this run) would refuse to
-        // honour it: a permission with no provenance belongs to nobody.
-        assert_eq!(
-            ctx.requirement_hash,
-            umadev_governance::requirement_fingerprint(&o.requirement)
-        );
-        assert!(ctx.derived_at > 0);
-
-        // (b) NO BRAIN (`can_fork: false`) — the STRICT floor. The SAME requirement, and the
-        // permission is WITHHELD: a decision we could not establish is not a permission. This
-        // is the direction that makes the whole design safe. A leak writes AI-slop into the
-        // customer's repo irreversibly; a false block is one recoverable rework.
-        let tmp2 = tempfile::TempDir::new().unwrap();
-        let ctx_file2 = tmp2.path().join(".umadev").join("governance-context.json");
-        let (events2, _rec2) = sink();
-        let mut blind = FakeSession::new(vec![], false, "");
-        let mut o2 = opts(tmp2.path());
-        o2.requirement = requirement.to_string();
-        let _ =
-            drive_director_loop_routed(&mut blind, &o2, &events2, "GO".to_string(), Some(&route))
-                .await;
-        let ctx2: umadev_governance::ProjectContext =
-            serde_json::from_str(&std::fs::read_to_string(&ctx_file2).expect("context persisted"))
-                .expect("valid context json");
-        assert!(
-            !ctx2.purple_allowed,
-            "no brain ⇒ no permission: the anti-slop rule stays ARMED"
-        );
-        // The context is still written and stamped — the OTHER decisions in it (the static
-        // frontend signal) are unaffected, and the readers still need a rule book.
-        assert!(ctx2.derived_at > 0);
-    }
-
-    #[tokio::test]
-    async fn a_workspace_stuck_in_the_past_stops_the_schedule_instead_of_writing_on_it() {
-        // MED. A step's red→green evidence check rewinds the tree to an earlier checkpoint to
-        // replay a test, then puts it back. When that restore FAILED, the old code emitted a
-        // `tracing::warn!` — a line in a log FILE under the TUI — and the scheduler drove
-        // right on, writing new code on top of the user's source reverted to an earlier state,
-        // on a base reading a codebase that no longer exists. The module's own invariant says
-        // "a workspace stuck in the past is never a silent condition"; the driver has to obey
-        // it too.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path()); // every source-present step would otherwise pass
-        let (events, rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        let mut plan = upstream_peer_plan();
-
-        // The condition a failed `TempRewind::restore` / `Drop` leaves behind.
-        crate::checkpoint::mark_workspace_in_past(
-            tmp.path(),
-            crate::checkpoint::InPastReason::Retryable,
-        );
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        crate::checkpoint::clear_workspace_in_past(tmp.path());
-
-        // The run STOPS — it does not fall through to the final gate / finalize, both of
-        // which write.
-        assert!(
-            matches!(outcome, Some(DirectorLoopOutcome::Failed(_))),
-            "a tree in the past must end the run, not merely log: {outcome:?}"
-        );
-        // NOT ONE step is driven. The flag was already up when the schedule was entered —
-        // which is exactly how a process STARTS when the workspace heal stood down — and the
-        // check used to run only AFTER a step had driven, so a full step's worth of writes
-        // landed on the in-past tree before anything noticed. The first swing counts.
-        assert_eq!(
-            active_order(&rec).len(),
-            0,
-            "no step may be scheduled onto a tree that is already in the past"
-        );
-        // And it is LOUD on the surface the user is watching, plus the notice queue the next
-        // start drains.
-        let halt = umadev_i18n::tl("checkpoint.workspace_in_past_halt");
-        assert!(
-            rec.events()
-                .iter()
-                .any(|e| matches!(e, EngineEvent::Note(n) if n == halt)),
-            "the user must SEE it, not find it in a log file"
-        );
-        assert!(
-            crate::checkpoint::take_workspace_notices()
-                .iter()
-                .any(|n| n == halt),
-            "…and the workspace-integrity queue carries it too"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_single_turn_build_path_also_refuses_a_workspace_in_the_past() {
-        // The lean / Fast build path (no plan, or a route that isn't deliberate) runs the
-        // single end-to-end turn + bounded QC fix rounds — and it had NO halt check at all.
-        // A workspace known to be stranded at an earlier checkpoint (the flag the workspace
-        // heal raises at process start when it stood down) was still handed the build turn,
-        // and then a fix turn, and then another: every one of them writing new code on top
-        // of files that are not the user's. Not one turn may be driven.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let mut sess = FakeSession::new(vec![text_turn("built the whole thing")], false, "");
-        let sent = sess.sent_handle();
-        let o = opts(tmp.path());
-
-        crate::checkpoint::mark_workspace_in_past(
-            tmp.path(),
-            crate::checkpoint::InPastReason::Retryable,
-        );
-        let outcome = drive_director_loop_with_idle(
-            &mut sess,
-            &o,
-            &events,
-            "build it".to_string(),
-            None, // no plan → the single-turn loop, not the step scheduler
-            None,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        crate::checkpoint::clear_workspace_in_past(tmp.path());
-
-        assert!(
-            matches!(outcome, DirectorLoopOutcome::Failed(_)),
-            "the single-turn path must STOP, not build onto a tree in the past: {outcome:?}"
-        );
-        assert!(
-            sent.lock().unwrap().is_empty(),
-            "not one turn may be driven onto a workspace that is in the past"
-        );
-        let halt = umadev_i18n::tl("checkpoint.workspace_in_past_halt");
-        assert!(
-            rec.events()
-                .iter()
-                .any(|e| matches!(e, EngineEvent::Note(n) if n == halt)),
-            "…and the user must SEE why the build stopped"
-        );
-        let _ = crate::checkpoint::take_workspace_notices();
-    }
-
-    #[tokio::test]
-    async fn a_healthy_workspace_is_never_halted() {
-        // The guard is keyed by ROOT: a stranded tree in ANOTHER workspace must not stop a
-        // run in this one (a process legitimately touches several via --project-root).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let other = tempfile::TempDir::new().unwrap();
-        crate::checkpoint::mark_workspace_in_past(
-            other.path(),
-            crate::checkpoint::InPastReason::Retryable,
-        );
-        let (events, _rec) = sink();
-        let o = opts(tmp.path());
-        let halted = halt_if_workspace_in_past(&o, &events);
-        crate::checkpoint::clear_workspace_in_past(other.path());
-        assert!(
-            halted.is_none(),
-            "another workspace's stranded tree is not this run's problem"
-        );
-    }
-
-    #[tokio::test]
-    async fn scheduler_drives_ready_peers_in_plan_order_keeping_dag() {
-        // Source seeded → every source-present step PASSES in one turn, so the schedule
-        // walks cleanly and we can read the pure DRIVE order. Ready peers run in PLAN ORDER,
-        // so `config` (first in the plan) is driven BEFORE `schema` — what runs matches what
-        // the checklist shows (no "skipped task 3, jumped to task 4"). And `api`/`ui` (which
-        // depend on `schema`) must run AFTER `schema`, never before (DAG order intact).
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        let mut plan = upstream_peer_plan();
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
-
-        let order = active_order(&rec);
-        let pos = |id: &str| order.iter().position(|x| x == id).expect("step ran");
-        // Order among the initial ready PEERS is PLAN ORDER: config (first) before schema.
-        assert!(
-            pos("config") < pos("schema"),
-            "ready peers run in plan order (config before schema): {order:?}"
-        );
-        // DAG order preserved: a dependent never runs before its prerequisite.
-        assert!(
-            pos("schema") < pos("api") && pos("schema") < pos("ui"),
-            "a dependency (schema) runs before its dependents (api, ui): {order:?}"
-        );
-        // Every step completed cleanly (source present → all accepted).
-        assert!(
-            plan.steps
-                .iter()
-                .all(|s| s.status == crate::plan_state::StepStatus::Done),
-            "the whole DAG drained Done: {:?}",
-            plan.steps
-                .iter()
-                .map(|s| (s.id.clone(), s.status))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[tokio::test]
-    async fn rework_drives_ready_peers_in_plan_order() {
-        // NO source → both ready peers (config, schema) FAIL their source-present
-        // acceptance and are reworked, then marked Blocked. The scheduler drives ready peers
-        // in PLAN ORDER, so `config` (first in the plan) is reworked FIRST. (schema's block
-        // then strands api/ui, which are pruned.)
-        let tmp = tempfile::TempDir::new().unwrap();
-        // NO source seeded.
-        let (events, rec) = sink();
-        // Plenty of default-completing turns; a FUTURE deadline so the full per-step fix
-        // budget runs (isolates the rework ORDER from the wall-clock ceiling).
-        let mut sess = FakeSession::new(vec![], false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        let mut plan = upstream_peer_plan();
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
-
-        // config is reworked before schema: config becomes Active first.
-        let order = active_order(&rec);
-        let pos = |id: &str| order.iter().position(|x| x == id);
-        assert!(
-            pos("schema").is_some() && pos("config").is_some(),
-            "both failing peers were driven: {order:?}"
-        );
-        assert!(
-            pos("config") < pos("schema"),
-            "the plan-order-first peer (config) is reworked first: {order:?}"
-        );
-        // (`active_order` above is the authoritative drive-order signal — one PlanStepStatus
-        // `active` event per step as it's picked. A per-directive text check is unreliable
-        // here because every step directive RECITES the whole plan, so a pending peer's title
-        // appears in the active peer's directives too.)
-        // schema ended Blocked; its dependents api/ui were stranded (pruned), not
-        // reworked — the upstream block obviated the downstream rework.
-        use crate::plan_state::StepStatus;
-        let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
-        assert_eq!(by("schema"), StepStatus::Blocked);
-        assert_eq!(by("config"), StepStatus::Blocked);
-        assert_eq!(by("api"), StepStatus::Blocked, "stranded behind schema");
-        assert_eq!(by("ui"), StepStatus::Blocked, "stranded behind schema");
-        assert!(
-            !order.contains(&"api".to_string()) && !order.contains(&"ui".to_string()),
-            "stranded dependents were never driven (rework obviated): {order:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn reworked_step_build_drives_one_integrated_final_report() {
-        // Change 2 (step path): when the build actually goes through blocking-item
-        // rework — a review step finds MUST-FIX findings and drives a fix turn — the
-        // base's premature "## Next steps" report A is stale, so at convergence the
-        // scheduler drives ONE integrated final-report turn on the MAIN session and
-        // records THAT as the reply. Proven by the integrated-report DIRECTIVE being
-        // sent EXACTLY once (the clean counterpart above asserts its own exactly-once
-        // — a clean convergence earns the report too now, but never a double).
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path()); // the build step's source-present acceptance passes
-        let (events, _rec) = sink();
-        // can_fork=true + a blocking verdict → the review team raises a MUST-FIX finding,
-        // which folds into a fix turn on the main session (the rework this test needs).
-        let turns: Vec<Vec<SessionEvent>> = std::iter::once(text_turn(
-            "Built the feature end to end. ## Next steps: ship it.",
-        ))
-        .chain((0..8).map(|_| text_turn("Reworked and re-verified.")))
-        .collect();
-        let mut sess = FakeSession::new(
-            turns,
-            true,
-            r#"{"accepts": false, "blocking": ["登录失败路径缺测试"]}"#,
-        );
-        let sent = sess.sent_handle();
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的登录产品".to_string();
-        let route = build_route(); // team = [FrontendEngineer] → a seat actually reviews
-        let mut plan = Plan {
-            steps: vec![
-                PlanStep {
-                    files: plan_state::StepFiles::default(),
-                    id: "impl".into(),
-                    title: "Implement the login".into(),
-                    seat: crate::critics::Seat::FrontendEngineer,
-                    kind: StepKind::Build,
-                    depends_on: vec![],
-                    acceptance: AcceptanceSpec::SourcePresent,
-                    evidence: Vec::new(),
-                    status: StepStatus::Pending,
-                },
-                PlanStep {
-                    files: plan_state::StepFiles::default(),
-                    id: "review".into(),
-                    title: "Cross-review".into(),
-                    seat: crate::critics::Seat::QaEngineer,
-                    kind: StepKind::Review,
-                    depends_on: vec!["impl".into()],
-                    acceptance: AcceptanceSpec::ReviewClean,
-                    evidence: Vec::new(),
-                    status: StepStatus::Pending,
-                },
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
-
-        let sent = sent.lock().unwrap();
-        // The ONE integrated final-report turn fired at convergence (its distinctive
-        // directive was sent) — and EXACTLY once: a reworked build must never
-        // double-report now that a clean convergence also drives the report turn.
-        assert_eq!(
-            sent.iter()
-                .filter(|d| d.contains("integrated final report for this build"))
-                .count(),
-            1,
-            "a reworked build drives exactly ONE integrated final-report turn: {sent:?}"
-        );
-        // And the final reply is NOT the premature report A (it was superseded).
-        match outcome {
-            Some(DirectorLoopOutcome::Done { reply }) => assert!(
-                !reply.contains("## Next steps"),
-                "report A was superseded by the integrated final report: {reply:?}"
-            ),
-            other => panic!("expected Done, got {other:?}"),
-        }
-    }
-
-    // ── Dead-summon guard (Bug 1, empirically reproduced): after an early step
-    //    wrote real source and the base process DIED, the remaining steps' summons
-    //    can't run — but the workspace-global source-present positive (step 1's
-    //    files) used to fake-tick them Done, converging into a fake clean delivery.
-    //    Now: a definite send failure blocks the step for ANY step (not just the
-    //    first), and a `!drove` step needs STEP-ATTRIBUTABLE evidence (its own
-    //    declared file paths / a source-tree delta since the step start). ──
-
-    /// A main session that is ALIVE for its first `alive_turns` sends, then DIES.
-    /// `send_fails_after_death = true` → every later `send_turn` errors (the base
-    /// process exited — the DEFINITE no-turn signal; mirrors the dead-session probe);
-    /// `false` → later sends still "succeed" but the event stream is instant EOF
-    /// (a silent death with no send error — the belt+suspenders shape).
-    struct DyingSession {
-        alive_turns: usize,
-        turns_sent: usize,
-        send_fails_after_death: bool,
-        current: std::collections::VecDeque<SessionEvent>,
-    }
-
-    impl DyingSession {
-        fn new(alive_turns: usize, send_fails_after_death: bool) -> Self {
-            Self {
-                alive_turns,
-                turns_sent: 0,
-                send_fails_after_death,
-                current: std::collections::VecDeque::new(),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl BaseSession for DyingSession {
-        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-            Err(SessionError::ForkUnsupported("dead".into()))
-        }
-        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
-            self.turns_sent += 1;
-            if self.turns_sent > self.alive_turns {
-                if self.send_fails_after_death {
-                    return Err(SessionError::Send("base process exited".into()));
-                }
-                // Silent death: the send "lands" but the stream just ends (EOF).
-                self.current.clear();
-                return Ok(());
-            }
-            self.current = vec![
-                SessionEvent::TextDelta("Scaffolded the app skeleton.".to_string()),
-                SessionEvent::TurnDone {
-                    status: TurnStatus::Completed,
-                    usage: None,
-                },
-            ]
-            .into();
-            Ok(())
-        }
-        async fn next_event(&mut self) -> Option<SessionEvent> {
-            self.current.pop_front()
-        }
-        async fn respond(
-            &mut self,
-            _req_id: &str,
-            _decision: ApprovalDecision,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn interrupt(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn end(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
-    /// The probe's 3-step chain: scaffold → feature-a → feature-b, all
-    /// source-present Build steps (the acceptance shape that fake-ticked).
-    fn dead_session_plan() -> crate::plan_state::Plan {
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let mk = |id: &str, deps: &[&str]| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: format!("step {id}"),
-            seat: crate::critics::Seat::FrontendEngineer,
-            kind: StepKind::Build,
-            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status: StepStatus::Pending,
-        };
-        Plan {
-            steps: vec![
-                mk("scaffold", &[]),
-                mk("feature-a", &["scaffold"]),
-                mk("feature-b", &["feature-a"]),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        }
-    }
-
-    /// Drive the dead-session scenario and assert the honest outcome shared by both
-    /// death shapes: step 1 (which really ran) is Done, steps 2..N end BLOCKED (not
-    /// fake-Done off step 1's source), and the run does not finalize as `delivery`.
-    async fn assert_dead_session_blocks_remaining_steps(send_fails: bool) {
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path()); // step 1's real source — the old GLOBAL evidence trap
-        let (events, _rec) = sink();
-        let mut sess = DyingSession::new(1, send_fails);
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的任务管理产品".to_string();
-        let route = build_route();
-        let mut plan = dead_session_plan();
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        // Step 1 really drove → no first-step bail; the schedule settles honestly.
-        assert!(
-            matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
-            "the schedule settles (never wedges) over a dead session: {outcome:?}"
-        );
-        use crate::plan_state::StepStatus;
-        let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
-        assert_eq!(
-            by("scaffold"),
-            StepStatus::Done,
-            "the real turn's step is Done"
-        );
-        assert_eq!(
-            by("feature-a"),
-            StepStatus::Blocked,
-            "a step whose turn never ran must NOT tick Done off step 1's source"
-        );
-        assert_eq!(
-            by("feature-b"),
-            StepStatus::Blocked,
-            "the stranded dependent is honestly Blocked, not fake-Done"
-        );
-        // NOT a clean delivery: the 9-phase state must not claim `delivery`.
-        assert_ne!(
-            persisted_phase_id(tmp.path()).as_deref(),
-            Some("delivery"),
-            "a dead-session build must not finalize as a clean delivery"
-        );
-    }
-
-    #[tokio::test]
-    async fn dead_session_send_failure_blocks_remaining_steps_not_fake_done() {
-        // The probe shape (scratchpad replan-probe/deadsession): sends FAIL after
-        // step 1 — the DEFINITE no-turn signal marks every later step Blocked.
-        assert_dead_session_blocks_remaining_steps(true).await;
-    }
-
-    #[tokio::test]
-    async fn silently_dead_session_blocks_remaining_steps_without_step_evidence() {
-        // Belt+suspenders: the sends still "succeed" but no turn ever produces an
-        // event (EOF) — `!drove` with NO step-attributable evidence (no declared
-        // file paths, no source-tree delta) must leave the step Blocked even though
-        // the workspace-global source-present positive (step 1's files) holds.
-        assert_dead_session_blocks_remaining_steps(false).await;
-    }
-
-    #[tokio::test]
-    async fn dead_turn_with_step_attributable_delta_still_completes_the_step() {
-        // The HONEST counter-case: a turn that died mid-way (`!drove`) but whose
-        // work REALLY landed — the step's own declared FileExists path appears on
-        // disk during the step — still ticks Done (hung-but-productive is honoured;
-        // the guard rejects only evidence that cannot be attributed to the step).
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, _rec) = sink();
-        // The step's deliverable ALREADY exists when its (dead) turn is verified —
-        // declared FileExists evidence is step-attributable by construction.
-        std::fs::write(tmp.path().join("feature.ts"), "export const f = 1;").unwrap();
-        let mut sess = DyingSession::new(0, false); // dead from the very first send
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的任务管理产品".to_string();
-        let route = build_route();
-        let step = crate::plan_state::PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: "feature".into(),
-            title: "Build the feature".into(),
-            seat: crate::critics::Seat::FrontendEngineer,
-            kind: crate::plan_state::StepKind::Build,
-            depends_on: vec![],
-            acceptance: crate::plan_state::AcceptanceSpec::SourcePresent,
-            evidence: vec![crate::plan_state::EvidenceContract::FileExists {
-                path: "feature.ts".into(),
-            }],
-            status: crate::plan_state::StepStatus::Pending,
-        };
-        let mut reflected = std::collections::HashSet::new();
-        let out = drive_build_step(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &step,
-            "",
-            0,
-            std::time::Instant::now() + Duration::from_secs(3_600),
-            &mut reflected,
-        )
-        .await;
-        assert!(
-            out.accepted && out.made_progress,
-            "declared step-attributable evidence completes the step even when the turn died"
-        );
-    }
-
-    // ── First-pass acceptance signal: the measured engineering-doctrine telemetry
-    //    (advisory, fail-open). A step that PASSES on the first acceptance check
-    //    (no rework) is recorded first_pass+attempts; a step that needed rework /
-    //    never passed is recorded attempts-only — keyed by BOTH the doer-seat kind
-    //    and the route-class kind. It never changes a step's outcome. ──
-
-    #[tokio::test]
-    async fn first_pass_signal_records_clean_steps_as_first_pass() {
-        // Source seeded → every source-present step PASSES on round 0 (zero rework).
-        // Each of the 4 FrontendEngineer Build steps on a Build route is therefore a
-        // FIRST-PASS, recorded under both the seat kind and the class kind. The run
-        // still completes Done — the signal is pure telemetry.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route(); // class = Build
-        let mut plan = upstream_peer_plan(); // 4 Build steps, all FrontendEngineer
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
-        // Advisory invariant: the signal did NOT change the build outcome.
-        assert!(
-            plan.steps
-                .iter()
-                .all(|s| s.status == crate::plan_state::StepStatus::Done),
-            "all steps still drained Done (advisory only): {:?}",
-            plan.steps
-                .iter()
-                .map(|s| (s.id.clone(), s.status))
-                .collect::<Vec<_>>()
-        );
-        // The recorded aggregate: 4 first-pass attempts under each dimension.
-        let stats = crate::first_pass::load(tmp.path());
-        let class = crate::first_pass::class_kind("build");
-        let seat = crate::first_pass::seat_kind("frontend-engineer");
-        let cs = stats.kinds.get(&class).copied().expect("class recorded");
-        let ss = stats.kinds.get(&seat).copied().expect("seat recorded");
-        assert_eq!(
-            (cs.attempts, cs.first_pass),
-            (4, 4),
-            "class:build all first-pass"
-        );
-        assert_eq!((ss.attempts, ss.first_pass), (4, 4), "seat all first-pass");
-    }
-
-    #[tokio::test]
-    async fn first_pass_signal_records_reworked_steps_as_attempts_only() {
-        // NO source → the two ready peers (schema, config) FAIL their source-present
-        // acceptance through every fix round and are marked Blocked (api/ui are
-        // stranded, never driven). Each driven step is recorded attempts+1 /
-        // first_pass+0. The Blocked outcome is unchanged — the signal is advisory.
-        let tmp = tempfile::TempDir::new().unwrap();
-        // NO source seeded.
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        let mut plan = upstream_peer_plan();
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
-        // Advisory invariant: schema + config still ended Blocked (signal changed
-        // nothing about loop termination / the deterministic floor).
-        use crate::plan_state::StepStatus;
-        let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
-        assert_eq!(by("schema"), StepStatus::Blocked);
-        assert_eq!(by("config"), StepStatus::Blocked);
-        // Only schema + config were driven (api/ui stranded) → 2 attempts, 0 first-pass.
-        let stats = crate::first_pass::load(tmp.path());
-        let class = crate::first_pass::class_kind("build");
-        let cs = stats.kinds.get(&class).copied().expect("class recorded");
-        assert_eq!(
-            (cs.attempts, cs.first_pass),
-            (2, 0),
-            "reworked/failed steps bump attempts only"
-        );
-        // The signal is correctly NOT first-pass; the rate is 0% but below the min
-        // sample so it stays untrusted (None) — no false confidence on 2 samples.
-        assert_eq!(crate::first_pass::first_pass_rate(tmp.path(), &class), None);
-    }
-
-    #[tokio::test]
-    async fn routed_loop_surfaces_a_low_confidence_nudge_advisory() {
-        // Pre-seed a trustworthy-LOW first-pass history for the build class, then run
-        // the routed entry: it surfaces the IntentDecided card AND an advisory nudge
-        // toward more consult / lower autonomy — without changing the build outcome.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let class = crate::first_pass::class_kind("build");
-        for _ in 0..6 {
-            crate::first_pass::record(tmp.path(), &class, false); // 0/6 → low
-        }
-        let (events, rec) = sink();
-        let turns = vec![text_turn("Built it end to end. Done.")];
-        let mut sess = FakeSession::new(turns, false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-
-        let outcome =
-            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        // The advisory nudge fired (it never blocks the run).
-        assert!(
-            rec.events().iter().any(|e| matches!(
-                e,
-                EngineEvent::Note(n) if n.contains("一次过验收率偏低")
-            )),
-            "a low-confidence advisory nudge is surfaced: {:?}",
-            rec.events()
-        );
-        // IntentDecided still fired exactly once (the nudge is additive, not a swap).
-        assert_eq!(
-            rec.count(|e| matches!(e, EngineEvent::IntentDecided { .. })),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn routed_loop_emits_no_nudge_without_a_signal() {
-        // A FRESH project (no stats file) → the consult finds no signal → NO nudge is
-        // emitted and behaviour is byte-for-byte the pre-signal path. Guards fail-open.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let turns = vec![text_turn("Built it. Done.")];
-        let mut sess = FakeSession::new(turns, false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-
-        let outcome =
-            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        assert!(
-            !rec.events().iter().any(|e| matches!(
-                e,
-                EngineEvent::Note(n) if n.contains("一次过验收率偏低")
-            )),
-            "no signal → no nudge (fail-open, unchanged behaviour)"
-        );
-    }
-
-    #[tokio::test]
-    async fn high_blast_radius_step_earns_an_extra_fix_round() {
-        // Rigor weighted by blast radius: a HIGH-blast-radius failing step (schema,
-        // radius 2 ≥ HIGH_BLAST_RADIUS) is re-driven one MORE bounded round than a
-        // radius-0 leaf. With no source, schema fails every round; count the directives
-        // that carry ITS title (the final-gate fix turns don't) → MAX_STEP_FIX_ROUNDS+1
-        // base rounds + 1 rigor bonus.
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let sent = sess.sent_handle();
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        // schema (radius 2: api + ui depend on it) is the only initially-ready step.
-        let mk = |id: &str, deps: &[&str]| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: format!("Build the {id}"),
-            seat: crate::critics::Seat::FrontendEngineer,
-            kind: StepKind::Build,
-            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status: StepStatus::Pending,
-        };
-        let mut plan = Plan {
-            steps: vec![
-                mk("schema", &[]),
-                mk("api", &["schema"]),
-                mk("ui", &["schema"]),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        assert_eq!(
-            plan.blast_radius("schema"),
-            2,
-            "schema is high-blast-radius"
-        );
-
-        let _ = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        let schema_directives = sent
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|d| d.contains("Build the schema"))
-            .count();
-        // Base budget (MAX_STEP_FIX_ROUNDS + 1 = 3) + the rigor bonus (1) = 4 doer turns.
-        assert_eq!(
-            schema_directives,
-            MAX_STEP_FIX_ROUNDS + 1 + 1,
-            "a high-blast-radius step earns one extra fix round"
-        );
-    }
-
-    // ── HIGH #1: the wall-clock deadline binds the step-internal + final-gate fix
-    //    rounds (round 0 always runs; extra fix rounds past budget are skipped). ──
-
-    /// A 1-step Build plan whose acceptance NEVER passes (no source on disk). The
-    /// `id` lets the caller assert the step.
-    fn one_failing_build_plan() -> crate::plan_state::Plan {
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        Plan {
-            steps: vec![PlanStep {
-                files: plan_state::StepFiles::default(),
-                id: "a".into(),
-                title: "Step A".into(),
-                seat: crate::critics::Seat::FrontendEngineer,
-                kind: StepKind::Build,
-                depends_on: vec![],
-                acceptance: AcceptanceSpec::SourcePresent,
-                evidence: Vec::new(),
-                status: StepStatus::Pending,
-            }],
-            risks: vec![],
-            open_questions: vec![],
-        }
-    }
-
-    /// A deadline already in the past (the budget is fully spent before the call).
-    fn spent_deadline() -> std::time::Instant {
-        std::time::Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now)
-    }
-
-    #[tokio::test]
-    async fn budget_skips_step_internal_fix_rounds_round0_still_runs() {
-        // HIGH #1: a Build step whose acceptance fails would normally re-drive
-        // MAX_STEP_FIX_ROUNDS extra summon turns. With the wall-clock budget ALREADY
-        // spent, round 0 (the real work) STILL runs once, but every EXTRA fix round is
-        // skipped — so the step drives exactly ONE doer turn, not three. The honest
-        // "skipping further fix rounds" note fires. (Compare
-        // a_failing_step_acceptance_is_bounded_and_marks_blocked, which lets the full
-        // fix budget run under a future deadline.)
-        let tmp = tempfile::TempDir::new().unwrap();
-        // NO source → the source-present acceptance fails every round.
-        let (events, rec) = sink();
-        let mut sess = FakeSession::new(
-            vec![
-                text_turn("Worked on it. Done."),
-                text_turn("Tried again. Done."),
-                text_turn("Once more. Done."),
-            ],
-            false,
-            "",
-        );
-        let sent = sess.sent_handle();
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        let mut plan = one_failing_build_plan();
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            spent_deadline(),
-        )
-        .await;
-        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
-        // EXACTLY ONE doer turn drove the step (round 0) — the extra fix rounds were
-        // skipped by the budget. The final gate also adds NO fix turn (its own round-0
-        // QC read found the gap but the budget skipped the fix turn), so the main
-        // session received exactly one directive total.
-        let n = sent.lock().unwrap().len();
-        assert_eq!(
-            n, 1,
-            "round 0 runs but extra fix rounds + final-gate fix turns are skipped: {n}"
-        );
-        assert!(
-            note_seen(&rec, "skipping further fix rounds on this step"),
-            "the step-internal budget note fires"
-        );
-        // The step still ended Blocked (round 0's acceptance failed) — honest.
-        assert_eq!(plan.steps[0].status, crate::plan_state::StepStatus::Blocked);
-    }
-
-    #[tokio::test]
-    async fn budget_skips_final_gate_fix_turns_round0_qc_still_runs() {
-        // HIGH #1: the final whole-build QC gate's round 0 (the read-only QC read)
-        // always runs so the build is held to the floor; but its minute-level FIX
-        // turns past the budget are skipped. With source present but a governance
-        // violation (an emoji-as-icon write on codex), round-0 QC flags a finding —
-        // and with the budget spent NO fix turn is driven for it.
-        let tmp = tempfile::TempDir::new().unwrap();
-        // Source present (so the step's acceptance passes + the step ticks Done), plus
-        // a governance violation the FINAL gate's QC will flag.
-        std::fs::write(
-            tmp.path().join("button.tsx"),
-            "export const Btn = () => <button>\u{1F680} Launch</button>;",
-        )
-        .unwrap();
-        let (events, rec) = sink();
-        let mut sess = FakeSession::new(vec![text_turn("Built step a. Done.")], false, "");
-        let sent = sess.sent_handle();
-        let mut o = codex_opts(tmp.path()); // codex → the QC governance scan is its gate
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        let mut plan = one_failing_build_plan(); // acceptance is source-present → passes here
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            spent_deadline(),
-        )
-        .await;
-        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
-        // The step drove ONCE (its acceptance passed → Done). The final gate's round-0
-        // QC flagged the governance violation, but the budget skipped its fix turn —
-        // so the main session saw exactly ONE directive (the step), no final-gate fix.
-        let n = sent.lock().unwrap().len();
-        assert_eq!(
-            n, 1,
-            "the step ran; the final-gate fix turn was skipped past budget: {n}"
-        );
-        assert!(
-            note_seen(&rec, "final QC findings left for the objective"),
-            "the final-gate budget note fires"
-        );
-        assert_eq!(plan.steps[0].status, crate::plan_state::StepStatus::Done);
-    }
-
-    // ── MEDIUM #2: a Pending step stranded behind a Blocked dependency is honestly
-    //    re-marked Blocked + a Note fires (no silent scope loss). ──
-
-    #[test]
-    fn unreachable_pending_behind_a_blocked_dep_is_marked_blocked() {
-        // The pure helper: a → (Blocked); b depends on a (Pending); c depends on b
-        // (Pending); d is independent (Pending). a's block transitively strands b AND
-        // c, but NOT the independent d. Marks b + c Blocked, leaves d Pending.
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let (events, rec) = sink();
-        let mk = |id: &str, deps: &[&str], status: StepStatus| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: format!("step {id}"),
-            seat: crate::critics::Seat::FrontendEngineer,
-            kind: StepKind::Build,
-            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status,
-        };
-        let mut plan = Plan {
-            steps: vec![
-                mk("a", &[], StepStatus::Blocked),
-                mk("b", &["a"], StepStatus::Pending),
-                mk("c", &["b"], StepStatus::Pending),
-                mk("d", &[], StepStatus::Pending),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        let n = mark_unreachable_pending_blocked(&mut plan, &events);
-        assert_eq!(n, 2, "b and c are transitively stranded → 2 newly Blocked");
-        let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
-        assert_eq!(by("b"), StepStatus::Blocked);
-        assert_eq!(by("c"), StepStatus::Blocked);
-        assert_eq!(
-            by("d"),
-            StepStatus::Pending,
-            "the independent step is untouched"
-        );
-        // A Blocked status event was emitted for each stranded step.
-        assert_eq!(
-            rec.count(
-                |e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "blocked")
-            ),
-            2
-        );
-        // A clean plan (nothing Blocked) strands nothing.
-        let mut clean = Plan {
-            steps: vec![
-                mk("x", &[], StepStatus::Done),
-                mk("y", &["x"], StepStatus::Pending),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        let (e2, _r2) = sink();
-        assert_eq!(mark_unreachable_pending_blocked(&mut clean, &e2), 0);
-    }
-
-    #[tokio::test]
-    async fn blocked_step_strands_its_dependent_which_is_honestly_marked_and_noted() {
-        // End-to-end MEDIUM #2: a 2-step plan where step a (no source → acceptance
-        // fails, bounded) ends Blocked, and step b depends on a. b never becomes ready
-        // (its dep a is not Done), so the scheduler leaves it Pending — the silent
-        // scope loss. The post-schedule honesty pass marks b Blocked + emits the
-        // "因前置被阻塞而跳过" Note, so the checklist and the conclusion are honest.
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        // NO source → step a's source-present acceptance fails every round → Blocked.
-        let (events, rec) = sink();
-        let mk = |id: &str, deps: &[&str]| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: format!("step {id}"),
-            seat: crate::critics::Seat::FrontendEngineer,
-            kind: StepKind::Build,
-            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status: StepStatus::Pending,
-        };
-        let mut plan = Plan {
-            steps: vec![mk("a", &[]), mk("b", &["a"])],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        // Plenty of default-completing turns; a future deadline so the FULL fix budget
-        // runs (this isolates MEDIUM #2 from HIGH #1 — the strand, not the budget).
-        let turns: Vec<Vec<SessionEvent>> =
-            (0..6).map(|_| text_turn("Worked on it. Done.")).collect();
-        let mut sess = FakeSession::new(turns, false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
-        // BOTH a (drove + failed) and b (stranded) ended Blocked — no Pending leftover.
-        let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
-        assert_eq!(by("a"), StepStatus::Blocked, "step a failed its acceptance");
-        assert_eq!(
-            by("b"),
-            StepStatus::Blocked,
-            "step b is honestly marked Blocked (stranded), not silently left Pending"
-        );
-        // The honest skip Note fired so the conclusion isn't silently incomplete.
-        assert!(
-            note_seen(&rec, "因前置被阻塞而跳过"),
-            "the stranded-scope Note is surfaced"
-        );
-    }
-
-    #[tokio::test]
-    async fn circuit_breaker_stops_a_flailing_plan_early_with_a_diagnosis() {
-        // UD-FLOW-008 circuit breaker: a plan of INDEPENDENT build steps that each
-        // fail their acceptance (no source on disk → source-present rejects every step)
-        // is a same-class flail. After CONSECUTIVE_FAILURE_THRESHOLD consecutive
-        // build-verify failures the breaker trips: the schedule STOPS early (later steps
-        // are never driven) and a typed diagnosis Note is surfaced — instead of looping
-        // through all MAX_STEP_TRANSITIONS burning the base's effort. The run still
-        // settles cleanly (Done, honestly NOT clean), never a wedge.
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        // NO source seeded → every source-present Build step fails its acceptance.
-        let (events, rec) = sink();
-        // More INDEPENDENT steps than the threshold, so the breaker (not exhaustion)
-        // is what stops the loop — proving an EARLY, diagnosed stop.
-        let n_steps = (crate::trust::CONSECUTIVE_FAILURE_THRESHOLD as usize) + 2;
-        let mk = |id: &str| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: format!("step {id}"),
-            seat: crate::critics::Seat::FrontendEngineer,
-            kind: StepKind::Build,
-            depends_on: vec![], // all independent → all ready, all driven in turn
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status: StepStatus::Pending,
-        };
-        let mut plan = Plan {
-            steps: (0..n_steps).map(|i| mk(&format!("s{i}"))).collect(),
-            risks: vec![],
-            open_questions: vec![],
-        };
-        // Plenty of default-completing turns; a future deadline so the breaker (not the
-        // wall-clock budget) is what stops the schedule.
-        let turns: Vec<Vec<SessionEvent>> =
-            (0..40).map(|_| text_turn("Worked on it. Done.")).collect();
-        let mut sess = FakeSession::new(turns, false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string(); // a build (not a document task)
-        let route = build_route();
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        // Settles cleanly (never hangs / never disguises the failures as success).
-        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
-        // EARLY stop: exactly threshold steps were ever driven (went Active); the rest
-        // were never scheduled because the breaker tripped.
-        let driven = active_order(&rec).len();
-        assert_eq!(
-            driven,
-            crate::trust::CONSECUTIVE_FAILURE_THRESHOLD as usize,
-            "the breaker stops the schedule after N consecutive failures, before exhausting \
-             all {n_steps} steps (drove {driven})"
-        );
-        // A typed diagnosis was surfaced naming WHAT kept failing.
-        assert!(
-            note_seen(&rec, "circuit breaker tripped")
-                && note_seen(&rec, "build-verify")
-                && note_seen(&rec, "stopping the schedule early"),
-            "a typed circuit-breaker diagnosis is surfaced: {:?}",
-            rec.events()
-        );
-    }
-
-    // ── HIGH #1 / MEDIUM #3: a step can no longer be marked Done over ZERO real work
-    //    (an empty-team ReviewClean, or a Build step over a dead summon turn). ──
-
-    /// A 1-step plan whose single Build step declares `ReviewClean` acceptance — the
-    /// weak criterion that, pre-fix, accepted over an empty team (no source check).
-    fn one_review_clean_build_plan() -> crate::plan_state::Plan {
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        Plan {
-            steps: vec![PlanStep {
-                files: plan_state::StepFiles::default(),
-                id: "a".into(),
-                title: "Build with a weak review-clean acceptance".into(),
-                seat: crate::critics::Seat::FrontendEngineer,
-                kind: StepKind::Build,
-                depends_on: vec![],
-                acceptance: AcceptanceSpec::ReviewClean,
-                evidence: Vec::new(),
-                status: StepStatus::Pending,
-            }],
-            risks: vec![],
-            open_questions: vec![],
-        }
-    }
-
-    #[tokio::test]
-    async fn turn_settled_build_step_with_no_source_is_not_done() {
-        // HIGH #1: a Build step that declares the WEAKEST acceptance (TurnSettled)
-        // must STILL honour the source-present honesty floor — a turn that settled but
-        // wrote ZERO source must NOT mark the step Done. Verify the floor directly.
-        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        // NO source seeded → the honesty floor must reject.
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-        let step = PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: "a".into(),
-            title: "claimed done, wrote nothing".into(),
-            seat: crate::critics::Seat::FrontendEngineer,
-            kind: StepKind::Build,
-            depends_on: vec![],
-            acceptance: AcceptanceSpec::TurnSettled,
-            evidence: Vec::new(),
-            status: StepStatus::Active,
-        };
-        let verdict = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
-        assert!(
-            !verdict.accepted,
-            "a TurnSettled Build over an empty tree must NOT pass the honesty floor"
-        );
-    }
-
-    // ── Evidence-contract-per-step: deterministic verify wiring ──────────────
-
-    /// A Build step carrying a typed evidence contract (for the verify tests).
-    fn evidence_step(evidence: Vec<crate::plan_state::EvidenceContract>) -> plan_state::PlanStep {
-        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
-        PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: "a".into(),
-            title: "deliver the thing".into(),
-            seat: crate::critics::Seat::FrontendEngineer,
-            kind: StepKind::Build,
-            depends_on: vec![],
-            // Acceptance is the FALLBACK; the typed evidence is what's actually checked.
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence,
-            status: StepStatus::Active,
-        }
-    }
-
-    #[tokio::test]
-    async fn evidence_file_exists_satisfied_marks_the_step_accepted() {
-        use crate::plan_state::EvidenceContract as E;
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(
-            tmp.path().join("src/App.tsx"),
-            "export const App = () => null;",
-        )
-        .unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-        let step = evidence_step(vec![E::FileExists {
-            path: "src/App.tsx".into(),
-        }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
-        assert!(v.accepted, "the declared file exists → the step is done");
-        assert!(v.has_positive_evidence);
-        assert!(v.evidence.is_empty(), "no gap: {:?}", v.evidence);
-    }
-
-    #[tokio::test]
-    async fn evidence_malformed_is_an_unmet_gap_even_with_real_source() {
-        use crate::plan_state::EvidenceContract as E;
-        // M6 regression: a step whose ONLY declared evidence is an under-specified
-        // (Malformed) contract must NOT be accepted just because some source exists —
-        // it is held to a falsifiable bar (an explicit gap), never silently degraded to
-        // the coarse "any source exists" default.
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(tmp.path().join("src/other.tsx"), "export const X = 1;").unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-        let step = evidence_step(vec![E::Malformed {
-            detail: "file-exists: missing a non-empty `path`".into(),
-        }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
-        assert!(
-            !v.accepted,
-            "an under-specified evidence contract must leave the step NOT done despite source"
-        );
-        assert!(
-            v.evidence_line().contains("under-specified"),
-            "the gap names the under-specification: {}",
-            v.evidence_line()
-        );
-    }
-
-    #[tokio::test]
-    async fn evidence_file_exists_absent_stays_not_done_with_a_typed_gap() {
-        use crate::plan_state::EvidenceContract as E;
-        let tmp = tempfile::TempDir::new().unwrap();
-        // Real source present (so the honesty floor passes) but NOT the declared file.
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(tmp.path().join("src/other.tsx"), "export const X = 1;").unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-        let step = evidence_step(vec![E::FileExists {
-            path: "src/App.tsx".into(),
-        }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
-        assert!(
-            !v.accepted,
-            "the declared file is absent → the step is NOT done"
-        );
-        let line = v.evidence_line();
-        assert!(
-            line.contains("file-exists `src/App.tsx`") && line.contains("absent"),
-            "a typed evidence-gap directive is surfaced: {line}"
-        );
-    }
-
-    #[tokio::test]
-    async fn evidence_file_contains_checks_the_specific_substring() {
-        use crate::plan_state::EvidenceContract as E;
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(tmp.path().join("src/api.ts"), "export const base = '/api';").unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-        // The file exists but does NOT contain the declared needle → a typed gap.
-        let miss = evidence_step(vec![E::FileContains {
-            path: "src/api.ts".into(),
-            needle: "/api/login".into(),
-        }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &miss, None).await;
-        assert!(!v.accepted);
-        assert!(
-            v.evidence_line().contains("does not contain"),
-            "{}",
-            v.evidence_line()
-        );
-        // Now it contains the needle → satisfied.
-        std::fs::write(
-            tmp.path().join("src/api.ts"),
-            "fetch('/api/login', { method: 'POST' });",
-        )
-        .unwrap();
-        let hit = evidence_step(vec![E::FileContains {
-            path: "src/api.ts".into(),
-            needle: "/api/login".into(),
-        }]);
-        let v2 = verify_step_acceptance(&mut sess, &o, &events, &route, &hit, None).await;
-        assert!(v2.accepted && v2.has_positive_evidence);
-    }
-
-    #[tokio::test]
-    async fn step_with_no_evidence_falls_back_to_the_current_acceptance() {
-        // Fail-open: an empty evidence contract uses the step's AcceptanceSpec EXACTLY as
-        // before — source present + SourcePresent acceptance accepts; an empty tree is
-        // rejected by the SAME honesty floor (the acceptance path still governs).
-        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let route = build_route();
-        let mk = |status| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: "a".into(),
-            title: "t".into(),
-            seat: crate::critics::Seat::FrontendEngineer,
-            kind: StepKind::Build,
-            depends_on: vec![],
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(), // ← no typed contract → fall back to acceptance
-            status,
-        };
-        // With real source → accepted.
-        let with_src = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(with_src.path().join("src")).unwrap();
-        std::fs::write(with_src.path().join("src/a.ts"), "export const x = 1;").unwrap();
-        let v = verify_step_acceptance(
-            &mut sess,
-            &opts(with_src.path()),
-            &events,
-            &route,
-            &mk(StepStatus::Active),
-            None,
-        )
-        .await;
-        assert!(
-            v.accepted,
-            "no-evidence step accepts via SourcePresent acceptance"
-        );
-        // Empty tree → the acceptance honesty floor rejects (unchanged behaviour).
-        let empty = tempfile::TempDir::new().unwrap();
-        let v2 = verify_step_acceptance(
-            &mut sess,
-            &opts(empty.path()),
-            &events,
-            &route,
-            &mk(StepStatus::Active),
-            None,
-        )
-        .await;
-        assert!(
-            !v2.accepted,
-            "no-evidence step over an empty tree still rejects"
-        );
-    }
-
-    #[tokio::test]
-    async fn evidence_route_responds_is_fail_open_skip_when_app_cannot_boot() {
-        use crate::plan_state::EvidenceContract as E;
-        // A Build step with real source + a RouteResponds contract, but the tmp tree has
-        // no dev server → the runtime proof degrades to NotVerified → the route check is
-        // a NEUTRAL skip (fail-open), so the step accepts on the source floor's evidence
-        // rather than being falsely blocked.
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(tmp.path().join("src/a.ts"), "export const x = 1;").unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-        let step = evidence_step(vec![E::RouteResponds {
-            method: "GET".into(),
-            path: "/api/x".into(),
-            status: Some(200),
-        }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
-        assert!(
-            v.accepted,
-            "an unbootable route check is a neutral skip, never a false block"
-        );
-        assert!(v.evidence.is_empty());
-    }
-
-    #[tokio::test]
-    async fn evidence_test_passes_flags_a_declared_but_absent_named_test() {
-        use crate::plan_state::EvidenceContract as E;
-        // Source present (so the honesty floor passes) but NO test mentions "checkout" →
-        // the named test is absent from the codebase → a typed gap, not done.
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(tmp.path().join("src/app.ts"), "export const x = 1;").unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-        let step = evidence_step(vec![E::TestPasses {
-            name: Some("checkout".into()),
-        }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
-        assert!(!v.accepted);
-        assert!(
-            v.evidence_line().contains("checkout")
-                && v.evidence_line().contains("no test by that name"),
-            "{}",
-            v.evidence_line()
-        );
-    }
-
-    #[tokio::test]
-    async fn evidence_test_passes_accepts_a_present_named_test_when_suite_unavailable() {
-        use crate::plan_state::EvidenceContract as E;
-        // A test file mentions "login"; no manifest → the suite half is a neutral skip,
-        // but the named test IS present → positive evidence, accepted.
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(
-            tmp.path().join("src/login.test.ts"),
-            "test('login flow works', () => { expect(1).toBe(1); });",
-        )
-        .unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-        let step = evidence_step(vec![E::TestPasses {
-            name: Some("login".into()),
-        }]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
-        assert!(v.accepted && v.has_positive_evidence);
-    }
-
-    #[tokio::test]
-    async fn evidence_all_contracts_must_hold_one_gap_blocks_the_step() {
-        use crate::plan_state::EvidenceContract as E;
-        // Two contracts: one satisfied (file exists), one not (a missing file). ALL must
-        // hold → the step stays not-done and the single typed gap is surfaced.
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(tmp.path().join("src/a.tsx"), "export const A = 1;").unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-        let step = evidence_step(vec![
-            E::FileExists {
-                path: "src/a.tsx".into(),
-            },
-            E::FileExists {
-                path: "src/b.tsx".into(),
-            },
-        ]);
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
-        assert!(!v.accepted, "one unmet contract blocks the whole step");
-        assert!(v.evidence_line().contains("src/b.tsx"));
-        assert!(
-            !v.evidence_line().contains("src/a.tsx"),
-            "the met one is not a gap"
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_team_review_clean_build_step_over_no_source_is_blocked_not_done() {
-        // HIGH #1 + MEDIUM #3 (combined): a Build step that declares ReviewClean but
-        // has an EMPTY route team (so 0 seats actually review) used to accept over zero
-        // work — the empty-team review found "no blocking", and there was no source
-        // floor on the ReviewClean path. Now: the source floor binds the Build step
-        // (no source → reject), AND an empty-team review is a NEUTRAL skip that is not
-        // positive progress. The step ends Blocked (honest), never Done.
-        let tmp = tempfile::TempDir::new().unwrap();
-        // NO source seeded.
-        let (events, rec) = sink();
-        // A single dead-ish doer turn (claims done, writes nothing). `fast_build_route`
-        // has an EMPTY team → the ReviewClean check convenes 0 seats (neutral skip).
-        let turns = vec![
-            text_turn("Worked on it. Done."),
-            text_turn("Tried again. Done."),
-            text_turn("Once more. Done."),
-        ];
-        let mut sess = FakeSession::new(turns, false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        // A deliberate route but with NO standing team → the review is an empty skip.
-        let mut route = build_route();
-        route.team = vec![];
-        let mut plan = one_review_clean_build_plan();
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
-        // The step must NOT be Done over zero real work — it is honestly Blocked.
-        assert_eq!(
-            plan.steps[0].status,
-            crate::plan_state::StepStatus::Blocked,
-            "an empty-team ReviewClean Build over no source is Blocked, not Done"
-        );
-        assert_eq!(
-            rec.count(
-                |e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "done")
-            ),
-            0,
-            "no step ticked Done over zero work"
-        );
-    }
-
-    #[tokio::test]
-    async fn dead_summon_does_not_complete_a_later_step_via_a_neutral_skip() {
-        // MEDIUM #3: a dead/hung summon turn that never actually ran (`!drove`) must
-        // not "complete" a Build step on a NEUTRAL-SKIP acceptance. Here a Build step
-        // with ReviewClean acceptance + an empty team would (pre-fix) accept over a
-        // dead turn; now the (drove || positive-evidence) guard refuses it. Driven via
-        // `drive_build_step` directly so the dead turn + neutral acceptance are exact.
-        let tmp = tempfile::TempDir::new().unwrap();
-        // NO source → no positive evidence; the doer turn is dead (no TurnDone).
-        let (events, _rec) = sink();
-        let turns = vec![
-            // A turn with text but NO TurnDone → summon's pump returns done=false.
-            vec![SessionEvent::TextDelta("partial, never settled".into())],
-            vec![SessionEvent::TextDelta("partial again".into())],
-            vec![SessionEvent::TextDelta("still partial".into())],
-        ];
-        let mut sess = FakeSession::new(turns, false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let mut route = build_route();
-        route.team = vec![]; // empty team → the ReviewClean check is a neutral skip
-        let step = one_review_clean_build_plan()
-            .steps
-            .into_iter()
-            .next()
-            .unwrap();
-
-        let outcome = drive_build_step(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &step,
-            "", // no plan-progress recitation in this single-step unit test
-            0,  // a leaf step (no dependents) → base fix budget, no rigor bonus
-            std::time::Instant::now() + Duration::from_secs(3_600),
-            &mut std::collections::HashSet::new(),
-        )
-        .await;
-        assert!(
-            !outcome.accepted,
-            "a dead summon + neutral-skip acceptance must NOT accept the step"
-        );
-        assert!(
-            !outcome.drove,
-            "the doer turn never actually settled (dead session)"
-        );
-        assert!(
-            !outcome.made_progress,
-            "a dead turn over a neutral skip is not real progress"
-        );
-    }
-
-    /// A doer session that GAMES the tests on every turn: it deletes a pre-existing
-    /// test file while leaving the real impl source in place (so the source-present
-    /// floor still passes). The ONLY thing that can fail the step is the
-    /// test-integrity guard — exactly what we want to prove. Records the directives
-    /// it received so the test can assert the guard's evidence was folded back in.
-    struct GamingSession {
-        root: std::path::PathBuf,
-        test_rel: String,
-        sent: Arc<std::sync::Mutex<Vec<String>>>,
-        current: std::collections::VecDeque<SessionEvent>,
-    }
-    impl GamingSession {
-        fn new(root: &std::path::Path, test_rel: &str) -> Self {
-            Self {
-                root: root.to_path_buf(),
-                test_rel: test_rel.to_string(),
-                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
-                current: std::collections::VecDeque::new(),
-            }
-        }
-        fn sent_handle(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
-            Arc::clone(&self.sent)
-        }
-    }
-    #[async_trait::async_trait]
-    impl BaseSession for GamingSession {
-        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-            Err(SessionError::ForkUnsupported("test".into()))
-        }
-        async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
-            self.sent.lock().unwrap().push(directive);
-            // Game the tests: delete the pre-existing test file (idempotent — once
-            // gone, the violation persists every round, so the step never clears).
-            let _ = std::fs::remove_file(self.root.join(&self.test_rel));
-            self.current = [
-                SessionEvent::TextDelta("Build done, all green.".into()),
-                SessionEvent::TurnDone {
-                    status: TurnStatus::Completed,
-                    usage: None,
-                },
-            ]
-            .into_iter()
-            .collect();
-            Ok(())
-        }
-        async fn next_event(&mut self) -> Option<SessionEvent> {
-            self.current.pop_front()
-        }
-        async fn respond(
-            &mut self,
-            _req_id: &str,
-            _decision: ApprovalDecision,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn interrupt(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn end(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn test_integrity_guard_blocks_a_gaming_step_and_is_bounded() {
-        // UD-QA-001: a Build step whose doer DELETES a pre-existing test to fake a
-        // pass must NOT be accepted, even though real impl source is on disk (so the
-        // source-present floor passes). The guard flips the otherwise-passing verdict
-        // to blocked, folds a file-naming finding into the re-drive directive, and is
-        // bounded by the SAME fix-round counter — never an open grind.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path()); // app.ts (impl) → source-present floor passes
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(
-            tmp.path().join("src/app.test.ts"),
-            "it('adds', () => { expect(add(1,2)).toEqual(3); });\n",
-        )
-        .unwrap();
-        let (events, _rec) = sink();
-        let mut sess = GamingSession::new(tmp.path(), "src/app.test.ts");
-        let sent = sess.sent_handle();
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        // The step's declared acceptance is SourcePresent — which WOULD pass over the
-        // remaining impl source; only the integrity guard can block it.
-        let step = one_failing_build_plan().steps.into_iter().next().unwrap();
-
-        let outcome = drive_build_step(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &step,
-            "", // no plan-progress recitation in this single-step unit test
-            0,  // leaf step → base fix budget (MAX_STEP_FIX_ROUNDS), no rigor bonus
-            std::time::Instant::now() + Duration::from_secs(3_600),
-            &mut std::collections::HashSet::new(),
-        )
-        .await;
-
-        assert!(
-            !outcome.accepted,
-            "a step that games tests must NOT be accepted even with impl source present"
-        );
-        // Bounded: round 0 + MAX_STEP_FIX_ROUNDS re-drives = 3 turns, never infinite.
-        let directives = sent.lock().unwrap().clone();
-        assert_eq!(
-            directives.len(),
-            MAX_STEP_FIX_ROUNDS + 1,
-            "the integrity-driven rework is bounded by the fix-round counter: {directives:?}"
-        );
-        // The re-drive directive carries the typed, file-naming evidence.
-        assert!(
-            directives[1].contains("test-integrity") && directives[1].contains("app.test.ts"),
-            "the fix directive names the gamed file: {:?}",
-            directives[1]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_integrity_guard_leaves_an_ungamed_step_alone() {
-        // The complement: a Build step whose doer leaves the tests intact (FakeSession
-        // never touches the fs) must pass cleanly — the guard is silent on an un-gamed
-        // suite, so a genuine build is unaffected.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(
-            tmp.path().join("src/app.test.ts"),
-            "it('adds', () => { expect(add(1,2)).toEqual(3); });\n",
-        )
-        .unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![text_turn("Implemented it. Done.")], false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        let step = one_failing_build_plan().steps.into_iter().next().unwrap();
-
-        let outcome = drive_build_step(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &step,
-            "", // no plan-progress recitation in this single-step unit test
-            0,
-            std::time::Instant::now() + Duration::from_secs(3_600),
-            &mut std::collections::HashSet::new(),
-        )
-        .await;
-        assert!(
-            outcome.accepted,
-            "an un-gamed build (tests left intact) must pass — the guard is silent"
-        );
-    }
-
-    /// A doer session that writes ONE giant NEW source file on every turn —
-    /// real source (so the source-present floor passes), no test gaming. The
-    /// ONLY thing that can fail the step is the architecture-fitness god-file
-    /// gate (`UD-CODE-006a`).
-    struct GodFileSession {
-        root: std::path::PathBuf,
-        sent: Arc<std::sync::Mutex<Vec<String>>>,
-        current: std::collections::VecDeque<SessionEvent>,
-    }
-    impl GodFileSession {
-        fn new(root: &std::path::Path) -> Self {
-            Self {
-                root: root.to_path_buf(),
-                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
-                current: std::collections::VecDeque::new(),
-            }
-        }
-        fn sent_handle(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
-            Arc::clone(&self.sent)
-        }
-    }
-    #[async_trait::async_trait]
-    impl BaseSession for GodFileSession {
-        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
-            Err(SessionError::ForkUnsupported("test".into()))
-        }
-        async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
-            self.sent.lock().unwrap().push(directive);
-            // Ship one giant new file (idempotent — the god file persists every
-            // round, so the step never clears until it is split).
-            let body: String = (0..600)
-                .map(|i| format!("export function generated_fn_{i}(x) {{ return x + {i}; }}\n"))
-                .collect();
-            std::fs::create_dir_all(self.root.join("src")).unwrap();
-            std::fs::write(self.root.join("src/huge.ts"), body).unwrap();
-            self.current = [
-                SessionEvent::TextDelta("Build done, all in one file.".into()),
-                SessionEvent::TurnDone {
-                    status: TurnStatus::Completed,
-                    usage: None,
-                },
-            ]
-            .into_iter()
-            .collect();
-            Ok(())
-        }
-        async fn next_event(&mut self) -> Option<SessionEvent> {
-            self.current.pop_front()
-        }
-        async fn respond(
-            &mut self,
-            _req_id: &str,
-            _decision: ApprovalDecision,
-        ) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn interrupt(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-        async fn end(&mut self) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn arch_fitness_floor_blocks_a_god_file_step_with_a_split_directive() {
-        // UD-CODE-006a: a deliberate Build step whose doer ships one giant NEW
-        // source file must NOT be accepted, even though real source is on disk
-        // (the source-present acceptance passes). The god-file gate flips the
-        // verdict, folds the split directive into the bounded re-drive, and is
-        // bounded by the SAME fix-round counter — never an open grind.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, _rec) = sink();
-        let mut sess = GodFileSession::new(tmp.path());
-        let sent = sess.sent_handle();
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route(); // Standard depth → deliberate → the floor arms
-        let step = one_failing_build_plan().steps.into_iter().next().unwrap();
-
-        let outcome = drive_build_step(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &step,
-            "",
-            0,
-            std::time::Instant::now() + Duration::from_secs(3_600),
-            &mut std::collections::HashSet::new(),
-        )
-        .await;
-
-        assert!(
-            !outcome.accepted,
-            "a step that ships a 600-line NEW god file must NOT be accepted"
-        );
-        // Bounded: round 0 + MAX_STEP_FIX_ROUNDS re-drives, never infinite.
-        let directives = sent.lock().unwrap().clone();
-        assert_eq!(
-            directives.len(),
-            MAX_STEP_FIX_ROUNDS + 1,
-            "the god-file rework is bounded by the fix-round counter: {directives:?}"
-        );
-        // The re-drive directive carries the split directive naming the file.
-        assert!(
-            directives[1].contains("split it by feature/domain")
-                && directives[1].contains("src/huge.ts"),
-            "the fix directive names the god file and tells the doer to split it: {:?}",
-            directives[1]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_passing_build_step_rewards_the_recalled_lesson_trust() {
-        // SELF-EVOLUTION (relocated onto the default path): a Build step whose
-        // acceptance PASSES must lift the trust of the lessons that were recalled into
-        // it — the previously-dead feedback the runner-only path used to strand. Seed
-        // one non-pitfall lesson (a quality failure), drive a step that passes on round
-        // 0 (source is present), and assert the recalled lesson's trust rose. The
-        // update is a pure SIDE EFFECT of the pass verdict — the step still accepts.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path()); // source present → SourcePresent acceptance passes
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个登录系统".to_string();
-        // Seed one recallable non-pitfall lesson at neutral trust.
-        crate::lessons::capture_quality_failures(
-            tmp.path(),
-            &[crate::phases::QualityCheck {
-                name: "coverage".to_string(),
-                category: "quality".to_string(),
-                description: "test".to_string(),
-                status: "failed".to_string(),
-                score: 20,
-                details: "coverage below the bar for the login system".to_string(),
-                weight: 2.0,
-            }],
-            "demo",
-            &o.requirement,
-        );
-        let trust_of = |t: &std::path::Path| {
-            crate::lessons::read_raw_lessons(t, "quality-failures.jsonl")
-                .into_iter()
-                .next()
-                .map(|l| l.trust())
-        };
-        let before = trust_of(tmp.path()).unwrap();
-        assert!(
-            (before - crate::lessons::NEUTRAL_TRUST).abs() < f32::EPSILON,
-            "the lesson seeds at neutral trust"
-        );
-
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(
-            vec![text_turn("Implemented the login system. Done.")],
-            false,
-            "",
-        );
-        let route = build_route();
-        let step = one_failing_build_plan().steps.into_iter().next().unwrap();
-        let outcome = drive_build_step(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &step,
-            "",
-            0,
-            std::time::Instant::now() + Duration::from_secs(3_600),
-            &mut std::collections::HashSet::new(),
-        )
-        .await;
-        assert!(outcome.accepted, "the step passes (source present)");
-        assert!(
-            trust_of(tmp.path()).unwrap() > before,
-            "a passing step lifts the recalled lesson's trust (the relocated reward)"
-        );
-    }
-
-    #[tokio::test]
-    async fn first_step_dead_summon_resets_the_step_to_pending_before_bailing() {
-        // MEDIUM #2 (strand fix): when the FIRST Build step can't drive (a dead summon
-        // on the very first doer turn), `drive_plan_steps` returns None to fall back to
-        // the single end-to-end turn. The just-marked Active step MUST be reset to
-        // Pending (not left wedged Active) so a resume reads a clean plan. Drive
-        // `drive_plan_steps` directly so we can inspect the plan after the None bail.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        // EVERY doer turn (round 0 + the bounded fix re-drives) has a text delta but
-        // NO TurnDone → the session drains to None mid-turn each time → summon keeps
-        // returning done=false (a session that STAYS dead; the dead-summon guard now
-        // re-drives a mid-turn death within the bounded fix budget before giving up,
-        // so a single dead batch followed by default-completing turns would recover).
-        let turns = vec![
-            vec![SessionEvent::TextDelta("partial, no TurnDone".into())];
-            MAX_STEP_FIX_ROUNDS + 2
-        ];
-        let mut sess = FakeSession::new(turns, false, "");
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        let mut plan = one_failing_build_plan(); // 1 Build step, id "a"
-
-        let outcome = drive_plan_steps(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &mut plan,
-            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        // The step-driver bailed (None) so the caller runs the single end-to-end turn.
-        assert!(
-            outcome.is_none(),
-            "a first-step dead summon bails to the single-turn fallback"
-        );
-        // The just-marked Active step was RESET to Pending — never left wedged Active.
-        assert_eq!(
-            plan.steps[0].status,
-            crate::plan_state::StepStatus::Pending,
-            "the stranded first step is reset to Pending for a clean resume"
-        );
-        // A Pending status event was emitted for the reset (so the TUI un-sticks it).
-        assert!(
-            rec.count(
-                |e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "pending")
-            ) >= 1,
-            "the reset-to-Pending transition is surfaced"
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_team_review_step_is_a_neutral_skip_not_progress() {
-        // HIGH #1: a standalone Review step whose route convened NO team (0 seats) did
-        // zero real reviewing — it must be a NEUTRAL skip, NOT counted as progress that
-        // ticks the step Done. `drive_review_step` returns made_progress=false for it.
-        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], true, r#"{"accepts": true, "blocking": []}"#);
-        let o = opts(tmp.path());
-        let mut route = build_route();
-        route.team = vec![]; // empty team → no seat actually reviews
-        let step = PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: "review".into(),
-            title: "Cross-review".into(),
-            seat: crate::critics::Seat::QaEngineer,
-            kind: StepKind::Review,
-            depends_on: vec![],
-            acceptance: AcceptanceSpec::ReviewClean,
-            evidence: Vec::new(),
-            status: StepStatus::Active,
-        };
-        let outcome = drive_review_step(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &step,
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(
-            outcome.accepted,
-            "an empty-team review accepts (nothing to block)"
-        );
-        assert!(
-            !outcome.made_progress,
-            "an empty-team review is a neutral skip, NOT real progress that marks Done"
-        );
-        assert!(!outcome.drove, "no review team actually convened (0 seats)");
-    }
-
-    #[tokio::test]
-    async fn review_residual_corroboration_hits_a_floor_signal_and_is_silent_when_clean() {
-        // FLOOR-INTEGRITY (the corroboration primitive): the residual-review floor check
-        // is DETERMINISTIC + fail-open. A real governance violation on disk corroborates
-        // a residual review finding; a genuinely clean floor (source present, no
-        // violation, no doc gaps) corroborates NOTHING — so a bare critic opinion is
-        // never smuggled through as if it were a floor signal.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let route = build_route();
-
-        // Clean floor: a plain source file, no governance violation, no PRD/architecture
-        // docs → every deterministic check is a neutral pass → NOT corroborated (empty).
-        seed_source(tmp.path());
-        let o = opts(tmp.path());
-        let clean = review_residual_floor_corroboration(&o, &events, &route).await;
-        assert!(
-            clean.is_empty(),
-            "a clean floor corroborates nothing — a bare opinion stays advisory: {clean:?}"
-        );
-
-        // Governance violation on disk (emoji-as-icon in a UI source file) → the content
-        // scan hits → the residual is CORROBORATED (non-empty, floor-tagged).
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(
-            tmp.path().join("src/Btn.tsx"),
-            "export const B = () => <button>🔍</button>;\n",
-        )
-        .unwrap();
-        let hit = review_residual_floor_corroboration(&o, &events, &route).await;
-        assert!(
-            hit.iter().any(|l| l.contains("[governance]")),
-            "an on-disk governance violation corroborates the residual: {hit:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn corroborated_residual_review_finding_marks_the_step_not_clean() {
-        // FLOOR-INTEGRITY: after a review step's fix turn the team STILL flags a blocking
-        // finding AND UmaDev's own deterministic floor (a governance violation on disk)
-        // independently bites → the residual is CORROBORATED. The step must NOT tick
-        // Done-clean: `made_progress=false` marks it Blocked (which folds into the final
-        // gate's `all steps Done` clean signal so it can't vanish), while `accepted`
-        // STAYS true so the circuit breaker (`drove && !accepted`) is untouched — a
-        // corroborated residual never trips loop control, and critics stay advisory.
-        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        // Source present (source-present passes) BUT it carries a governance violation, so
-        // the corroboration comes from the content scan, not an empty-tree floor.
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(
-            tmp.path().join("src/Btn.tsx"),
-            "export const B = () => <button>🔍</button>;\n",
-        )
-        .unwrap();
-        let (events, _rec) = sink();
-        // can_fork=true + a blocking verdict → the review team raises a finding on the
-        // first pass AND on the recheck after the fix turn (the residual).
-        let mut sess = FakeSession::new(
-            vec![text_turn("fixed what I could")],
-            true,
-            r#"{"accepts": false, "blocking": ["按钮缺 loading 态"]}"#,
-        );
-        let o = opts(tmp.path());
-        let route = build_route(); // team = [FrontendEngineer] → a seat actually reviews
-        let step = PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: "review".into(),
-            title: "Cross-review".into(),
-            seat: crate::critics::Seat::QaEngineer,
-            kind: StepKind::Review,
-            depends_on: vec![],
-            acceptance: AcceptanceSpec::ReviewClean,
-            evidence: Vec::new(),
-            status: StepStatus::Active,
-        };
-        let outcome = drive_review_step(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &step,
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(
-            !outcome.made_progress,
-            "a floor-corroborated residual must NOT tick Done-clean (it folds into the final gate)"
-        );
-        assert!(
-            outcome.accepted,
-            "`accepted` stays true so the circuit breaker is untouched — critics stay advisory"
-        );
-        assert!(
-            !outcome.gap_evidence.is_empty(),
-            "the corroborating floor lines are carried so they can't vanish"
-        );
-    }
-
-    #[tokio::test]
-    async fn uncorroborated_residual_review_finding_stays_advisory() {
-        // The complement (invariant 2 + fail-open): a residual blocking finding with a
-        // CLEAN deterministic floor (source present, no governance violation, no doc
-        // gaps) is a bare critic OPINION. It must NOT hard-fail the step — `made_progress`
-        // stays true (the step proceeds, today's behaviour). This also IS the fail-open
-        // case: a neutral / uncomputable floor degrades to today's behaviour, never a
-        // spurious fail.
-        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path()); // clean source → source-present passes, no violation
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(
-            vec![text_turn("fixed what I could")],
-            true,
-            r#"{"accepts": false, "blocking": ["按钮缺 loading 态"]}"#,
-        );
-        let o = opts(tmp.path());
-        let route = build_route();
-        let step = PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: "review".into(),
-            title: "Cross-review".into(),
-            seat: crate::critics::Seat::QaEngineer,
-            kind: StepKind::Review,
-            depends_on: vec![],
-            acceptance: AcceptanceSpec::ReviewClean,
-            evidence: Vec::new(),
-            status: StepStatus::Active,
-        };
-        let outcome = drive_review_step(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            &step,
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(
-            outcome.made_progress,
-            "an uncorroborated critic opinion stays advisory — the step proceeds (never hard-fails)"
-        );
-        assert!(outcome.accepted, "review steps still accept (advisory)");
-        assert!(
-            outcome.gap_evidence.is_empty(),
-            "no floor corroboration → nothing to carry"
-        );
-    }
-
-    #[tokio::test]
-    async fn step_heartbeat_passes_through_and_a_fast_turn_emits_no_note() {
-        // FIX #7: the heartbeat wrapper returns the wrapped future's value unchanged,
-        // and a sub-interval (fast) turn emits NO heartbeat (the immediate first tick
-        // is consumed) — so a quick step never spams the event stream.
-        let (events, rec) = sink();
-        let out = with_step_heartbeat(&events, "Quick step", async { 7u8 }).await;
-        assert_eq!(
-            out, 7,
-            "the wrapped future's value passes through unchanged"
-        );
-        assert!(
-            rec.count(|e| matches!(e, EngineEvent::Note(n) if n.contains("still building"))) == 0,
-            "a sub-interval step emits no heartbeat (the immediate first tick is consumed)"
-        );
-    }
-
-    #[tokio::test]
-    async fn step_heartbeat_fires_on_a_turn_that_outlives_the_interval() {
-        // FIX #7 (the positive case): a future that out-lives the heartbeat interval
-        // yields at least one "still building" note — proof the heartbeat actually
-        // fires for a genuinely long turn. Drives the explicit-interval variant with a
-        // tiny real window (10ms) so the test stays fast without a paused-clock harness.
-        let (events, rec) = sink();
-        let slow = async {
-            tokio::time::sleep(Duration::from_millis(60)).await;
-            42u8
-        };
-        let out =
-            with_step_heartbeat_every(&events, "Long step", Duration::from_millis(10), slow).await;
-        assert_eq!(out, 42);
-        assert!(
-            rec.count(
-                |e| matches!(e, EngineEvent::Note(n) if n.contains("Long step")
-                && n.contains("still building"))
-            ) >= 1,
-            "a turn that outlives the heartbeat interval emits at least one progress note"
-        );
-    }
-
-    #[tokio::test]
-    async fn default_loop_records_usage_and_audit_and_lessons() {
-        // Wave 2 deliverable 4: the DEFAULT single-turn loop records token usage,
-        // the tool-call audit trail, and distils pitfalls — for every base, not just
-        // claude in the legacy runner.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        // A turn that calls a tool (audited), a FAILED tool (a pitfall), and ends.
-        let turns = vec![vec![
-            SessionEvent::TextDelta("Implemented the feature. Done.".into()),
-            SessionEvent::ToolCall {
-                name: "Write".into(),
-                input: serde_json::json!({"file_path": "src/app.ts"}),
-            },
-            SessionEvent::ToolResult {
-                ok: false,
-                summary: "npm run build failed: TS2304 cannot find name 'Foo'".into(),
-            },
-            SessionEvent::TurnDone {
-                status: TurnStatus::Completed,
-                usage: None,
-            },
-        ]];
-        let mut sess = FakeSession::new(turns, false, "");
-        let mut o = opts(tmp.path());
-        o.backend = "codex".to_string(); // a non-claude base: audit must still record
-                                         // Usage is written to ~/.umadev (HOME), so just assert the audit + lessons
-                                         // side effects that land under the project root (deterministic, isolated).
-        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".into()).await;
-        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-
-        // Audit trail recorded the tool call (UD-EVID-002) under the project root.
-        let audit = tmp
-            .path()
-            .join(".umadev")
-            .join("audit")
-            .join("tool-calls.jsonl");
-        let trail = std::fs::read_to_string(&audit).unwrap_or_default();
-        assert!(
-            trail.contains("Write") && trail.contains("src/app.ts"),
-            "the tool call was recorded to the audit trail: {trail:?}"
-        );
-
-        // A `[learned]` note fired — the failed tool call was distilled into lessons.
-        assert!(
-            rec.events()
-                .iter()
-                .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("[learned]"))),
-            "the failed tool call was captured as a development pitfall"
-        );
-    }
-
-    // ── Architecture unification: a CHAT-build's post-build QC earns the same
-    //    flagship QC the `/run` path runs (governance/slop scan + team + bounded
-    //    rework + capture), via `run_post_build_qc`. ──
-
-    /// The behaviour-derived `Build`/`Light`/`Fast` route a chat-build carries — the
-    /// EXACT shape the TUI's `reactive_build_route()` builds when the base writes its
-    /// first file. `Light`/`Fast` means the QC takes the lean tier (source-present +
-    /// governance scan, then settle), mirroring a real chat "做个落地页".
-    fn chat_build_route() -> RoutePlan {
-        use crate::router::{Budget, Depth, RouteClass};
-        use crate::TaskKind;
-        RoutePlan {
-            class: RouteClass::Build,
-            kind: TaskKind::Light,
-            depth: Depth::Fast,
-            team: Vec::new(),
-            scope: Vec::new(),
-            needs_clarify: None,
-            est_budget: Budget::for_route(RouteClass::Build, Depth::Fast),
-            confidence: 0.6,
-        }
-    }
-
-    #[tokio::test]
-    async fn post_build_qc_folds_a_design_slop_violation_into_a_fix_turn() {
-        // A chat-build whose base wrote a UI file with emoji-as-icon (design slop)
-        // must get the SAME governance scan the `/run` path runs — folded into a
-        // bounded fix turn, exactly like a `/run` finding. This is the headline of the
-        // unification: chat "做个落地页" now auto-gets the design/slop floor.
-        let tmp = tempfile::TempDir::new().unwrap();
-        // A real UI source file with an emoji used as a functional icon (a button
-        // label) — `governance_scan` (the same emoji/slop detector) flags it.
-        std::fs::write(
-            tmp.path().join("App.tsx"),
-            "export const Btn = () => <button>🚀 Launch</button>;",
-        )
-        .unwrap();
-        let (events, _rec) = sink();
-        // Turn 1 is the build reply (the base already claimed it built); turn 2 is the
-        // fix turn (it "removes" the emoji — the scripted fake doesn't rewrite the file,
-        // but we only assert the fix directive carried the governance finding).
-        let turns = vec![text_turn(
-            "Removed the emoji icon, used a Lucide icon. Done.",
-        )];
-        let mut sess = FakeSession::new(turns, true, r#"{"accepts": true, "blocking": []}"#);
-        let sent = sess.sent_handle();
-        let o = opts(tmp.path());
-        let route = chat_build_route();
-
-        let _ = run_post_build_qc(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            "Built the landing page end to end. Done.",
-        )
-        .await;
-        let sent = sent.lock().unwrap();
-        assert!(
-            sent.iter()
-                .any(|d| d.contains("[governance]") && d.contains("must be fixed")),
-            "the design-slop (emoji) finding was fed back as a fix directive: {sent:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn post_build_qc_on_a_clean_build_drives_no_fix_turn() {
-        // A clean chat-build (real source, no governance violation, lean goal) must
-        // settle with ZERO fix turns — the QC ran but found nothing, so the chat-build
-        // is not slowed by needless rework.
-        let tmp = tempfile::TempDir::new().unwrap();
-        // A clean, slop-free, non-UI source module — `seed_source` writes exactly the
-        // file the existing clean-build tests rely on (no emoji, no hardcoded color, no
-        // root-component / ErrorBoundary rule), so the governance scan is genuinely clean.
-        seed_source(tmp.path());
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], true, r#"{"accepts": true, "blocking": []}"#);
-        let sent = sess.sent_handle();
-        let mut o = opts(tmp.path());
-        // A lean goal → the lean tier short-circuits after the governance scan (clean).
-        o.requirement = "做一个简单的纯前端落地页单页".to_string();
-        let route = chat_build_route();
-
-        let reply = run_post_build_qc(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            "Built the clean landing page. Done.",
-        )
-        .await;
-        assert!(
-            reply.trim().is_empty(),
-            "a clean post-build QC returns an empty reply (no fix turn ran): {reply:?}"
-        );
-        assert_eq!(
-            sent.lock().unwrap().len(),
-            0,
-            "a clean chat-build drives no fix turn — chat stays fast"
-        );
-    }
-
-    #[tokio::test]
-    async fn post_build_qc_with_no_source_feeds_the_honesty_floor_back() {
-        // A chat turn that claimed a build but wrote ZERO source: the source-present
-        // honesty floor (always run, every tier) catches it and folds it into a fix
-        // directive — the same decisive finding the `/run` path produces.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let turns = vec![text_turn("Now actually created the files. Done.")];
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
-        let o = opts(tmp.path());
-        let route = chat_build_route();
-
-        let _ = run_post_build_qc(
-            &mut sess,
-            &o,
-            &events,
-            &route,
-            "Built it end to end. Done. (but wrote nothing)",
-        )
-        .await;
-        assert!(
-            sent.lock()
-                .unwrap()
-                .iter()
-                .any(|d| d.contains("source-present") && d.contains("must be fixed")),
-            "the no-source honesty finding was fed back as a fix directive"
-        );
-    }
-
-    #[tokio::test]
-    async fn post_build_qc_is_fail_open_on_a_dead_session() {
-        // A session that dies on the fix turn must NOT panic — `run_post_build_qc`
-        // settles fail-open (returns the empty/partial reply), never wedging the chat.
-        let tmp = tempfile::TempDir::new().unwrap();
-        // A governance violation so QC is NOT clean → it will try a fix turn.
-        std::fs::write(
-            tmp.path().join("App.tsx"),
-            "export const Btn = () => <button>🚀 Go</button>;",
-        )
-        .unwrap();
-        let (events, _rec) = sink();
-        // The fix turn's batch has a text delta but NO TurnDone → next_event drains to
-        // None mid-turn (a dead session). `run_post_build_qc` must settle, not panic.
-        let turns = vec![vec![SessionEvent::TextDelta("partial fix".to_string())]];
-        let mut sess = FakeSession::new(turns, true, r#"{"accepts": true, "blocking": []}"#);
-        let o = opts(tmp.path());
-        let route = chat_build_route();
-
-        // Just reaching here without a panic is the assertion (fail-open). The reply is
-        // whatever landed before the session died (empty in this scripted case).
-        let _reply = run_post_build_qc(&mut sess, &o, &events, &route, "Built it. Done.").await;
-    }
-
-    #[test]
-    fn post_build_rework_context_is_fail_open_on_an_empty_project() {
-        // No knowledge dir + no lessons file → an empty prefix (never a panic). The
-        // fix directive then degrades to the byte-for-byte plain directive.
-        // Isolate HOME/UMADEV_KNOWLEDGE_DIR so a corpus staged to ~/.umadev/knowledge
-        // (the bundled-knowledge home fallback) can't make this "empty" project recall.
-        let _no_corpus = crate::test_support::NoBundledCorpus::new();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let o = opts(tmp.path());
-        let prefix = post_build_rework_context(&o);
-        assert!(
-            prefix.is_empty(),
-            "an empty project recalls no knowledge/lessons → empty prefix: {prefix:?}"
-        );
-    }
-
-    // ── Cross-session RESUME (`/continue` on a fresh session) ──
-
-    /// Build a [`crate::plan_state::PlanStep`] for the resume tests.
-    fn resume_step(
-        id: &str,
-        title: &str,
-        deps: &[&str],
-        status: crate::plan_state::StepStatus,
-    ) -> crate::plan_state::PlanStep {
-        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind};
-        PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: title.into(),
-            seat: crate::critics::Seat::FrontendEngineer,
-            kind: StepKind::Build,
-            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status,
-        }
-    }
-
-    #[test]
-    fn plan_progress_recitation_is_bounded_and_honest() {
-        // PLAN RECITATION lock test: the compact per-step "where we are in the plan"
-        // line must (a) state the honest position, (b) name only the NEXT up-to-two
-        // upcoming steps, and (c) be empty for a trivial plan — so a long step-by-step
-        // run keeps the base anchored to the whole plan without bloating the directive.
-        use crate::plan_state::{Plan, StepStatus};
-
-        let plan = Plan {
-            steps: vec![
-                resume_step("s1", "scaffold the project", &[], StepStatus::Done),
-                resume_step("s2", "build the auth route", &["s1"], StepStatus::Active),
-                resume_step("s3", "build the dashboard", &["s2"], StepStatus::Pending),
-                resume_step("s4", "wire the payments flow", &["s3"], StepStatus::Pending),
-                resume_step("s5", "add the settings page", &["s4"], StepStatus::Pending),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-
-        let recit = plan_progress_recitation(&plan, "s2");
-        // Honest position — the current (Active) step is not yet counted complete.
-        assert!(
-            recit.contains("1 of 5 plan steps complete"),
-            "recites the honest position: {recit}"
-        );
-        // Names the NEXT (up to two) upcoming steps…
-        assert!(
-            recit.contains("build the dashboard"),
-            "names the next step: {recit}"
-        );
-        assert!(
-            recit.contains("wire the payments flow"),
-            "names the 2nd next step: {recit}"
-        );
-        // …but is BOUNDED to two — the third pending step is NOT listed.
-        assert!(
-            !recit.contains("add the settings page"),
-            "recitation is bounded to two upcoming steps: {recit}"
-        );
-        // …and never re-lists the already-done step.
-        assert!(
-            !recit.contains("scaffold the project"),
-            "omits the done step: {recit}"
-        );
-
-        // The LAST step recites only its position (no upcoming) — still bounded.
-        let last = plan_progress_recitation(&plan, "s5");
-        assert!(
-            last.contains("final step"),
-            "the last step recites its position with no upcoming: {last}"
-        );
-
-        // FAIL-OPEN: a trivial single-step plan emits nothing (the goal frame suffices).
-        let solo = Plan {
-            steps: vec![resume_step("only", "do the thing", &[], StepStatus::Active)],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        assert!(
-            plan_progress_recitation(&solo, "only").is_empty(),
-            "a single-step plan needs no progress recitation"
-        );
-    }
-
-    #[tokio::test]
-    async fn resume_drives_only_the_remaining_steps_not_the_done_ones() {
-        // The resume entry loads a persisted plan with some Done + some Pending steps
-        // and drives ONLY the remaining ones — the already-Done step is never re-run.
-        use crate::plan_state::{Plan, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        // Source on disk so the remaining Build step's source-present acceptance passes
-        // (it ticks Done, not Blocked) — the resume must COMPLETE the remaining work.
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-
-        // Persist a plan: `alpha` already DONE, `beta` PENDING (depends on alpha). A
-        // resume must skip `alpha` entirely and drive only `beta`.
-        let persisted = Plan {
-            steps: vec![
-                resume_step("alpha", "ALPHA scaffold the project", &[], StepStatus::Done),
-                resume_step(
-                    "beta",
-                    "BETA build the remaining feature",
-                    &["alpha"],
-                    StepStatus::Pending,
-                ),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        plan_state::save(&persisted, tmp.path()).expect("persist the plan");
-
-        let mut sess = FakeSession::new(vec![text_turn("Built BETA. Done.")], false, "");
-        let sent = sess.sent_handle();
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-
-        let outcome = drive_director_loop_resume(&mut sess, &o, &events, &route).await;
-        assert!(
-            matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
-            "a resumable plan drives to a Done outcome"
-        );
-
-        // ONLY the remaining step drove — no directive ever mentioned the Done one.
-        let sent = sent.lock().unwrap();
-        assert!(
-            sent.iter()
-                .any(|d| d.contains("BETA build the remaining feature")),
-            "the remaining (Pending) step was driven: {sent:?}"
-        );
-        assert!(
-            !sent
-                .iter()
-                .any(|d| d.contains("ALPHA scaffold the project")),
-            "the already-Done step was NOT re-driven: {sent:?}"
-        );
-        // Piece #3: the step directive RESTATES the original requirement (the goal
-        // frame), so the base knows the overall product even on a fresh-session
-        // resume — not just the bare step title.
-        assert!(
-            sent.iter()
-                .any(|d| d.contains("做一个完整的产品") && d.contains("Overall goal")),
-            "the resumed step directive restates the original goal, not just the step \
-             title: {sent:?}"
-        );
-        // Plan recitation is threaded into the live directive: the driven step carries
-        // the compact "where we are in the plan" line (1 of 2 done — beta is last).
-        assert!(
-            sent.iter()
-                .any(|d| d.contains("Plan progress") && d.contains("1 of 2 plan steps complete")),
-            "the step directive recites the plan position so the base stays anchored: {sent:?}"
-        );
-
-        // The persisted plan now has both steps Done (alpha preserved, beta completed).
-        let after = plan_state::load(tmp.path()).expect("the plan is still on disk");
-        let by = |id: &str| after.steps.iter().find(|s| s.id == id).unwrap().status;
-        assert_eq!(
-            by("alpha"),
-            StepStatus::Done,
-            "the prior Done step stays Done"
-        );
-        assert_eq!(
-            by("beta"),
-            StepStatus::Done,
-            "the remaining step is completed"
-        );
-
-        // The checklist was re-rendered (PlanPosted) so the TUI shows the resume —
-        // and the re-post carries the PERSISTED statuses (alpha already done), so
-        // the panel renders "1/2" with alpha checked instead of resetting to
-        // all-pending / 0 done (user-reported after /continue).
-        let reposted = rec
-            .events()
-            .into_iter()
-            .find_map(|e| match e {
-                EngineEvent::PlanPosted {
-                    statuses,
-                    done,
-                    total,
-                    ..
-                } => Some((statuses, done, total)),
-                _ => None,
-            })
-            .expect("the checklist is re-rendered on resume");
-        assert_eq!(
-            reposted,
-            (vec!["done".to_string(), "pending".to_string()], 1, 2),
-            "the resume re-post carries the persisted per-step truth"
-        );
-    }
-
-    #[tokio::test]
-    async fn resume_is_none_when_no_resumable_plan_exists() {
-        // Fail-open: an absent plan → the resume entry returns None so the caller falls
-        // back to a fresh run (never a crash, never a phantom resume).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let o = opts(tmp.path());
-        let route = build_route();
-        let outcome = drive_director_loop_resume(&mut sess, &o, &events, &route).await;
-        assert!(
-            outcome.is_none(),
-            "no persisted plan → no resume (caller fails open to a fresh run)"
-        );
-    }
-
-    #[tokio::test]
-    async fn resume_step_directive_recalls_the_persisted_run_notes() {
-        // B1#6 (run-notes survive session resets): notes the base appended to
-        // `.umadev/run-notes.md` earlier in the run are re-injected — bounded tail
-        // under the persisted-notes header — into the step directive on a RESUME
-        // over a FRESH session. And a resume never rotates the file (the notes are
-        // exactly the memory it wants back).
-        use crate::plan_state::{Plan, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let notes_dir = tmp.path().join(".umadev");
-        std::fs::create_dir_all(&notes_dir).unwrap();
-        std::fs::write(
-            notes_dir.join("run-notes.md"),
-            "- [t1] NOTES_MARKER chose sqlite: zero-config for this scale\n",
-        )
-        .unwrap();
-        let (events, _rec) = sink();
-
-        let persisted = Plan {
-            steps: vec![
-                resume_step("alpha", "ALPHA scaffold the project", &[], StepStatus::Done),
-                resume_step(
-                    "beta",
-                    "BETA build the remaining feature",
-                    &["alpha"],
-                    StepStatus::Pending,
-                ),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        plan_state::save(&persisted, tmp.path()).expect("persist the plan");
-
-        let mut sess = FakeSession::new(vec![text_turn("Built BETA. Done.")], false, "");
-        let sent = sess.sent_handle();
-        let o = opts(tmp.path());
-        let route = build_route();
-        let outcome = drive_director_loop_resume(&mut sess, &o, &events, &route).await;
-        assert!(
-            matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
-            "the resumable plan drives to a Done outcome"
-        );
-
-        let sent = sent.lock().unwrap();
-        assert!(
-            sent.iter().any(
-                |d| d.contains("## Run notes (yours, persisted)") && d.contains("NOTES_MARKER")
-            ),
-            "the driven step's directive recalls the persisted run notes: {sent:?}"
-        );
-        // The resume kept the notes file in place — rotation happens ONLY on a
-        // fresh plan synthesis (a NEW run), never on a resume.
-        assert!(
-            tmp.path().join(".umadev/run-notes.md").exists(),
-            "a resume must not rotate the run notes away"
-        );
-    }
-
-    #[test]
-    fn has_resumable_run_detects_incomplete_done_and_absent() {
-        // `has_resumable_run` is true for an incomplete persisted plan and false for a
-        // fully-Done / absent one (no workflow-state written in these temp dirs).
-        use crate::plan_state::{Plan, StepStatus};
-
-        // (a) Absent plan + absent state → not resumable.
-        let absent = tempfile::TempDir::new().unwrap();
-        assert!(
-            !has_resumable_run(absent.path()),
-            "no plan / no state → not resumable"
-        );
-
-        // (b) A persisted plan with a Pending step → resumable.
-        let incomplete = tempfile::TempDir::new().unwrap();
-        let p = Plan {
-            steps: vec![
-                resume_step("a", "a", &[], StepStatus::Done),
-                resume_step("b", "b", &["a"], StepStatus::Pending),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        plan_state::save(&p, incomplete.path()).unwrap();
-        assert!(
-            has_resumable_run(incomplete.path()),
-            "an incomplete persisted plan is resumable"
-        );
-
-        // (c) A persisted plan with EVERY step Done (+ no state) → not resumable.
-        let done = tempfile::TempDir::new().unwrap();
-        let p = Plan {
-            steps: vec![
-                resume_step("a", "a", &[], StepStatus::Done),
-                resume_step("b", "b", &["a"], StepStatus::Done),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        plan_state::save(&p, done.path()).unwrap();
-        assert!(
-            !has_resumable_run(done.path()),
-            "a fully-Done plan with no state is not resumable"
-        );
-    }
-
-    #[test]
-    fn load_resumable_plan_resets_an_interrupted_active_step_to_pending() {
-        // A step persisted as Active (the TUI closed mid-step) must be reset to Pending
-        // on load so `ready_steps` surfaces it again — otherwise the interrupted step is
-        // stranded (never re-driven). Done steps are preserved.
-        use crate::plan_state::{Plan, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let p = Plan {
-            steps: vec![
-                resume_step("a", "a", &[], StepStatus::Done),
-                resume_step("b", "b", &[], StepStatus::Active),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        plan_state::save(&p, tmp.path()).unwrap();
-        let loaded =
-            load_resumable_plan(tmp.path()).expect("an Active step makes the plan resumable");
-        let by = |id: &str| loaded.steps.iter().find(|s| s.id == id).unwrap().status;
-        assert_eq!(by("a"), StepStatus::Done, "the Done step is preserved");
-        assert_eq!(
-            by("b"),
-            StepStatus::Pending,
-            "the interrupted Active step is reset to Pending for a clean re-drive"
-        );
-        let ready: Vec<String> = loaded.ready_steps().iter().map(|s| s.id.clone()).collect();
-        assert_eq!(ready, vec!["b"], "the reset step is ready again");
-    }
-
-    #[test]
-    fn stale_upstream_doc_reopens_steps_on_resume() {
-        // Item C end-to-end: a plan built against prd v1 is fully Done; the PRD then
-        // changes; on resume the frontend step (reads Prd) + its downstream re-open so
-        // the director re-derives against the changed upstream instead of trusting a
-        // now-poisoned result.
-        use crate::plan_state::{Plan, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("output")).unwrap();
-        std::fs::write(root.join("output").join("app-prd.md"), "prd v1").unwrap();
-        record_artifact_versions(root);
-        let mut plan = Plan {
-            steps: vec![
-                resume_step("fe", "frontend", &[], StepStatus::Done),
-                resume_step("qa", "qa", &["fe"], StepStatus::Done),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        invalidate_stale_steps(root, &mut plan);
-        assert!(plan.steps.iter().all(|s| s.status == StepStatus::Done));
-        std::fs::write(root.join("output").join("app-prd.md"), "prd v2 CHANGED").unwrap();
-        invalidate_stale_steps(root, &mut plan);
-        let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
-        assert_eq!(
-            by("fe"),
-            StepStatus::Pending,
-            "frontend re-opens on a prd change"
-        );
-        assert_eq!(by("qa"), StepStatus::Pending, "its downstream re-opens too");
-    }
-
-    // ── BOUNDED RE-PLAN of a blocked subtree (attempt_replan_blocked_subtree) ──
-
-    /// scaffold(Done) → api(Blocked) → ui(Pending): a blocked step that STRANDS a
-    /// dependent (`ui`). `mk` mirrors the inline PlanStep builder the other tests use.
-    fn blocked_subtree_plan() -> Plan {
-        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind};
-        let mk = |id: &str, deps: &[&str], status: StepStatus| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: format!("Build the {id}"),
-            seat: crate::critics::Seat::BackendEngineer,
-            kind: StepKind::Build,
-            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status,
-        };
-        Plan {
-            steps: vec![
-                mk("scaffold", &[], StepStatus::Done),
-                mk("api", &["scaffold"], StepStatus::Blocked),
-                mk("ui", &["api"], StepStatus::Pending),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        }
-    }
-
-    /// A brain re-plan reply: a fresh route {api2 → ui2} around the blocked `api`.
-    const REPLAN_SUBDAG: &str = r#"{"steps":[
-        {"id":"api2","title":"alt api","seat":"backend-engineer","kind":"build",
-         "depends_on":["scaffold"],"acceptance":"source-present"},
-        {"id":"ui2","title":"alt ui","seat":"frontend-engineer","kind":"build",
-         "depends_on":["api2"],"acceptance":"source-present"}]}"#;
-
-    #[tokio::test]
-    async fn replan_triggers_once_merges_a_validated_subdag_and_is_bounded() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        // The fork's judge turn emits the replacement sub-DAG JSON.
-        let mut sess = FakeSession::new(vec![], true, REPLAN_SUBDAG);
-        let o = opts(tmp.path());
-        let mut plan = blocked_subtree_plan();
-        let mut replanned = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(3_600);
-
-        // First block WITH stranded dependents → ONE re-plan; the sub-DAG is merged
-        // (routed through normalized(): dedup / dangling strip / cycle-break / floors).
-        let merged = attempt_replan_blocked_subtree(
-            &mut sess,
-            &o,
-            &events,
-            &mut plan,
-            "api",
-            "Build the api",
-            &["source-present: no source files on disk".to_string()],
-            &mut replanned,
-            deadline,
-        )
-        .await;
-        assert!(
-            merged,
-            "a blocked step with stranded dependents re-plans once"
-        );
-        assert!(replanned, "the single-attempt budget is consumed");
-        let ids: Vec<&str> = plan.steps.iter().map(|s| s.id.as_str()).collect();
-        assert!(
-            ids.contains(&"api2") && ids.contains(&"ui2"),
-            "the fresh route is spliced in: {ids:?}"
-        );
-        assert!(
-            !ids.contains(&"api") && !ids.contains(&"ui"),
-            "the blocked subtree is replaced: {ids:?}"
-        );
-        // The surviving Done step KEEPS its status (normalized's reset was undone).
-        assert_eq!(
-            plan.steps
-                .iter()
-                .find(|s| s.id == "scaffold")
-                .unwrap()
-                .status,
-            StepStatus::Done
-        );
-
-        // BOUND: a SECOND block does NOT re-plan again (the flag is already consumed).
-        let before = plan.clone();
-        let again = attempt_replan_blocked_subtree(
-            &mut sess,
-            &o,
-            &events,
-            &mut plan,
-            "api2",
-            "alt api",
-            &[],
-            &mut replanned,
-            deadline,
-        )
-        .await;
-        assert!(!again, "at most ONE re-plan per run");
-        assert_eq!(plan, before, "a second attempt leaves the plan unchanged");
-    }
-
-    #[tokio::test]
-    async fn replan_falls_back_when_the_consult_fails() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        // can_fork == false → the consult can't open → judge_json None → fallback.
-        let mut sess = FakeSession::new(vec![], false, REPLAN_SUBDAG);
-        let o = opts(tmp.path());
-        let mut plan = blocked_subtree_plan();
-        let before = plan.clone();
-        let mut replanned = false;
-        let merged = attempt_replan_blocked_subtree(
-            &mut sess,
-            &o,
-            &events,
-            &mut plan,
-            "api",
-            "Build the api",
-            &[],
-            &mut replanned,
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(!merged, "a failed consult falls back to the honest strand");
-        assert_eq!(plan, before, "the plan is unchanged when the consult fails");
-        assert!(
-            replanned,
-            "the attempt is still consumed so a failed consult can never retry (no loop)"
-        );
-    }
-
-    #[tokio::test]
-    async fn replan_falls_back_on_an_unparseable_or_noop_subdag() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        // Unparseable fork reply → parse_brain_steps empty → fallback.
-        let mut sess = FakeSession::new(vec![], true, "not json at all");
-        let o = opts(tmp.path());
-        let mut plan = blocked_subtree_plan();
-        let before = plan.clone();
-        let mut replanned = false;
-        let merged = attempt_replan_blocked_subtree(
-            &mut sess,
-            &o,
-            &events,
-            &mut plan,
-            "api",
-            "Build the api",
-            &[],
-            &mut replanned,
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(!merged, "an unparseable sub-DAG falls back");
-        assert_eq!(plan, before);
-
-        // A no-op sub-DAG that re-emits ONLY existing ids (no new route) also falls back.
-        let mut sess2 = FakeSession::new(
-            vec![],
-            true,
-            r#"{"steps":[{"id":"ui","title":"x","seat":"frontend-engineer","kind":"build","acceptance":"source-present"}]}"#,
-        );
-        let mut plan2 = blocked_subtree_plan();
-        let before2 = plan2.clone();
-        let mut replanned2 = false;
-        let merged2 = attempt_replan_blocked_subtree(
-            &mut sess2,
-            &o,
-            &events,
-            &mut plan2,
-            "api",
-            "Build the api",
-            &[],
-            &mut replanned2,
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(
-            !merged2,
-            "a sub-DAG adding no NEW id changes nothing → fallback"
-        );
-        assert_eq!(plan2, before2);
-    }
-
-    #[tokio::test]
-    async fn replan_does_not_trigger_for_a_blocked_leaf_with_no_dependents() {
-        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, _rec) = sink();
-        // A valid sub-DAG is available on the fork, but the blocked step is a LEAF
-        // (nothing depends on it) → nothing to recover → no consult, no change.
-        let mut sess = FakeSession::new(vec![], true, REPLAN_SUBDAG);
-        let o = opts(tmp.path());
-        let mut plan = Plan {
-            steps: vec![
-                PlanStep {
-                    files: plan_state::StepFiles::default(),
-                    id: "scaffold".into(),
-                    title: "scaffold".into(),
-                    seat: crate::critics::Seat::FrontendEngineer,
-                    kind: StepKind::Build,
-                    depends_on: vec![],
-                    acceptance: AcceptanceSpec::SourcePresent,
-                    evidence: Vec::new(),
-                    status: StepStatus::Done,
-                },
-                PlanStep {
-                    files: plan_state::StepFiles::default(),
-                    id: "leaf".into(),
-                    title: "a leaf".into(),
-                    seat: crate::critics::Seat::FrontendEngineer,
-                    kind: StepKind::Build,
-                    depends_on: vec!["scaffold".into()],
-                    acceptance: AcceptanceSpec::SourcePresent,
-                    evidence: Vec::new(),
-                    status: StepStatus::Blocked,
-                },
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        let before = plan.clone();
-        let mut replanned = false;
-        let merged = attempt_replan_blocked_subtree(
-            &mut sess,
-            &o,
-            &events,
-            &mut plan,
-            "leaf",
-            "a leaf",
-            &[],
-            &mut replanned,
-            std::time::Instant::now() + Duration::from_secs(3_600),
-        )
-        .await;
-        assert!(
-            !merged,
-            "a blocked leaf has nothing to recover → no re-plan"
-        );
-        assert!(
-            !replanned,
-            "no stranded dependents → the single-attempt budget is NOT spent"
-        );
-        assert_eq!(plan, before, "the plan is unchanged for a leaf block");
-    }
-
-    // ── Spec-MUST confirmation gates on the DEFAULT path (A1-GAP1 / UD-FLOW-002 /
-    //    UD-FLOW-003): a HOSTED, guarded run pauses at docs_confirm once the core-doc
-    //    steps settle Done, and at preview_confirm once the frontend family settles;
-    //    auto / headless runs drive through exactly as today; a resume never
-    //    re-fires the gate it paused at. ──
-
-    /// A doc-first 4-step plan (PM → architect → frontend/backend) whose steps all
-    /// pass a seeded source-present acceptance, so gate positions are deterministic.
-    fn gated_plan() -> crate::plan_state::Plan {
-        use crate::critics::Seat;
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let mk = |id: &str, seat: Seat, deps: &[&str]| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: format!("do the {id} work"),
-            seat,
-            kind: StepKind::Build,
-            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status: StepStatus::Pending,
-        };
-        Plan {
-            steps: vec![
-                mk("pm", Seat::ProductManager, &[]),
-                mk("arch", Seat::Architect, &["pm"]),
-                mk("fe", Seat::FrontendEngineer, &["arch"]),
-                mk("be", Seat::BackendEngineer, &["arch"]),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        }
-    }
-
-    /// The hosted interaction a TUI provides (gates on; no steer/approval needed).
-    fn gates_hosted_interaction() -> crate::interaction::RunInteraction {
-        crate::interaction::RunInteraction {
-            steer: None,
-            approval: None,
-            confirm_gates: true,
-        }
-    }
-
-    #[tokio::test]
-    async fn hosted_guarded_build_pauses_at_docs_confirm_with_persisted_door() {
-        // The revived spec-MUST docs gate: once the PM + architect doc steps settle
-        // Done on a HOSTED guarded run, the schedule PAUSES — GateOpened emitted,
-        // plan persisted (remaining steps Pending), the open door written to
-        // workflow-state — and returns PausedAtGate instead of driving the code steps.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let mut o = opts(tmp.path());
-        o.mode = TrustMode::Guarded;
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        let mut plan = gated_plan();
-
-        let outcome = crate::interaction::hosted(gates_hosted_interaction(), async {
-            drive_plan_steps(
-                &mut sess,
-                &o,
-                &events,
-                &route,
-                &mut plan,
-                IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-                std::time::Instant::now() + Duration::from_secs(3_600),
-            )
-            .await
-        })
-        .await;
-        assert!(
-            matches!(
-                outcome,
-                Some(DirectorLoopOutcome::PausedAtGate {
-                    gate: crate::gates::Gate::DocsConfirm
-                })
-            ),
-            "a hosted guarded run pauses at docs_confirm: {outcome:?}"
-        );
-        // GateOpened rendered the gate card (the TUI's active_gate driver).
-        assert_eq!(
-            rec.count(|e| matches!(
-                e,
-                EngineEvent::GateOpened {
-                    gate: crate::gates::Gate::DocsConfirm,
-                    ..
-                }
-            )),
-            1,
-            "exactly one docs_confirm GateOpened was emitted"
-        );
-        // The persisted plan holds the pause honestly: docs Done, code Pending.
-        let loaded = plan_state::load(tmp.path()).expect("plan persisted at the pause");
-        let status_of = |id: &str| loaded.steps.iter().find(|s| s.id == id).unwrap().status;
-        assert_eq!(status_of("pm"), StepStatus::Done);
-        assert_eq!(status_of("arch"), StepStatus::Done);
-        assert_eq!(status_of("fe"), StepStatus::Pending);
-        assert_eq!(status_of("be"), StepStatus::Pending);
-        // The open door is on disk for /status + a fresh session's /continue.
-        let state = crate::state::read_workflow_state(tmp.path()).expect("state written");
-        assert_eq!(state.active_gate, "docs_confirm");
-        assert!(has_resumable_run(tmp.path()));
-        assert!(has_resumable_director_plan(tmp.path()));
-    }
-
-    #[tokio::test]
-    async fn resume_after_docs_gate_pauses_at_preview_then_completes() {
-        // The full round-trip: docs pause → approve (resume) → the docs gate never
-        // re-fires (transition-triggered: the Done doc steps are never re-driven),
-        // the frontend step completes → preview_confirm pause → approve (resume) →
-        // the backend step completes → a clean Done outcome.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let mut o = opts(tmp.path());
-        o.mode = TrustMode::Guarded;
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-
-        // 1. Fresh drive → docs pause (as covered above).
-        let mut plan = gated_plan();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let outcome = crate::interaction::hosted(gates_hosted_interaction(), async {
-            drive_plan_steps(
-                &mut sess,
-                &o,
-                &events,
-                &route,
-                &mut plan,
-                IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-                std::time::Instant::now() + Duration::from_secs(3_600),
-            )
-            .await
-        })
-        .await;
-        assert!(matches!(
-            outcome,
-            Some(DirectorLoopOutcome::PausedAtGate {
-                gate: crate::gates::Gate::DocsConfirm
-            })
-        ));
-
-        // 2. User approves → resume on a FRESH session. The docs gate must NOT
-        //    re-fire; the frontend step settles → preview_confirm pause.
-        let mut sess2 = FakeSession::new(vec![], false, "");
-        let outcome2 = crate::interaction::hosted(gates_hosted_interaction(), async {
-            drive_director_loop_resume(&mut sess2, &o, &events, &route).await
-        })
-        .await;
-        assert!(
-            matches!(
-                outcome2,
-                Some(DirectorLoopOutcome::PausedAtGate {
-                    gate: crate::gates::Gate::PreviewConfirm
-                })
-            ),
-            "the resumed run pauses next at preview_confirm (docs never re-fires): {outcome2:?}"
-        );
-        assert_eq!(
-            rec.count(|e| matches!(
-                e,
-                EngineEvent::GateOpened {
-                    gate: crate::gates::Gate::DocsConfirm,
-                    ..
-                }
-            )),
-            1,
-            "docs_confirm opened exactly ONCE across the whole run"
-        );
-        let state = crate::state::read_workflow_state(tmp.path()).expect("state");
-        assert_eq!(state.active_gate, "preview_confirm");
-
-        // 3. User approves the preview → resume completes the backend step; the
-        //    schedule finishes with a Done outcome and no further gate.
-        let mut sess3 = FakeSession::new(vec![], false, "");
-        let outcome3 = crate::interaction::hosted(gates_hosted_interaction(), async {
-            drive_director_loop_resume(&mut sess3, &o, &events, &route).await
-        })
-        .await;
-        assert!(
-            matches!(outcome3, Some(DirectorLoopOutcome::Done { .. })),
-            "the final resume completes the plan: {outcome3:?}"
-        );
-        let loaded = plan_state::load(tmp.path()).expect("plan persisted");
-        assert!(
-            loaded.steps.iter().all(|s| s.status == StepStatus::Done),
-            "every step settled Done across the gated round-trip"
-        );
-        // Phase-monotonicity core assertion (same invariant the phase tests lock):
-        // the finished build's persisted phase is at least `backend`.
-        let rank = |id: &str| {
-            umadev_spec::PHASE_CHAIN
-                .iter()
-                .position(|p| p.id() == id)
-                .unwrap()
-        };
-        let final_state = crate::state::read_workflow_state(tmp.path()).expect("state");
-        assert!(
-            rank(&final_state.phase) >= rank("backend"),
-            "the completed gated run's phase never regressed: {}",
-            final_state.phase
-        );
-        assert!(
-            final_state.active_gate.is_empty(),
-            "no stale open door after the run completes"
-        );
-    }
-
-    #[tokio::test]
-    async fn auto_mode_and_headless_runs_never_pause_at_a_gate() {
-        // Auto tier (hosted) and a headless guarded run (no interaction scope) BOTH
-        // keep today's drive-through behaviour: no GateOpened, a Done outcome, every
-        // step complete in one schedule.
-        for (mode, hosted) in [(TrustMode::Auto, true), (TrustMode::Guarded, false)] {
-            let tmp = tempfile::TempDir::new().unwrap();
-            seed_source(tmp.path());
-            let (events, rec) = sink();
-            let mut sess = FakeSession::new(vec![], false, "");
-            let mut o = opts(tmp.path());
-            o.mode = mode;
-            o.requirement = "做一个完整的产品".to_string();
-            let route = build_route();
-            let mut plan = gated_plan();
-
-            let drive = drive_plan_steps(
-                &mut sess,
-                &o,
-                &events,
-                &route,
-                &mut plan,
-                IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-                std::time::Instant::now() + Duration::from_secs(3_600),
-            );
-            let outcome = if hosted {
-                crate::interaction::hosted(gates_hosted_interaction(), drive).await
-            } else {
-                drive.await
-            };
-            assert!(
-                matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
-                "mode={mode:?} hosted={hosted}: drives through with no pause: {outcome:?}"
-            );
-            assert_eq!(
-                rec.count(|e| matches!(e, EngineEvent::GateOpened { .. })),
-                0,
-                "mode={mode:?} hosted={hosted}: no gate event on the drive-through path"
-            );
-            assert!(
-                plan.steps.iter().all(|s| s.status == StepStatus::Done),
-                "every step completed in one schedule"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn gate_never_fires_with_no_remaining_work() {
-        // A docs-only plan (PM + architect, nothing after) must NOT pause: a pause
-        // with nothing left to drive would strand the run (not resumable). The
-        // schedule finishes normally instead.
-        use crate::critics::Seat;
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let mut o = opts(tmp.path());
-        o.mode = TrustMode::Guarded;
-        o.requirement = "写两份文档".to_string();
-        let route = build_route();
-        let mk = |id: &str, seat: Seat, deps: &[&str]| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: format!("write the {id} doc"),
-            seat,
-            kind: StepKind::Build,
-            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
-            acceptance: AcceptanceSpec::SourcePresent,
-            evidence: Vec::new(),
-            status: StepStatus::Pending,
-        };
-        let mut plan = Plan {
-            steps: vec![
-                mk("pm", Seat::ProductManager, &[]),
-                mk("arch", Seat::Architect, &["pm"]),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-
-        let outcome = crate::interaction::hosted(gates_hosted_interaction(), async {
-            drive_plan_steps(
-                &mut sess,
-                &o,
-                &events,
-                &route,
-                &mut plan,
-                IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-                std::time::Instant::now() + Duration::from_secs(3_600),
-            )
-            .await
-        })
-        .await;
-        assert!(
-            matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
-            "a docs-only plan finishes instead of pausing un-resumably: {outcome:?}"
-        );
-        assert_eq!(
-            rec.count(|e| matches!(e, EngineEvent::GateOpened { .. })),
-            0,
-            "no gate fires when nothing remains to resume into"
-        );
-    }
-
-    #[tokio::test]
-    async fn design_tokens_step_never_triggers_or_holds_the_docs_gate() {
-        // The designer's design-tokens deliverable step is UIUX-SEATED but is
-        // code-phase prep, not doc authoring: (1) a still-pending tokens step must
-        // NOT hold the docs gate closed once the actual docs are Done, and (2) the
-        // tokens step settling Done AFTER the resume must NOT re-fire docs_confirm
-        // (gate-opens-once).
-        use crate::critics::Seat;
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut o = opts(tmp.path());
-        o.mode = TrustMode::Guarded;
-        let mk = |id: &str, seat: Seat, acceptance: AcceptanceSpec, status: StepStatus| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: format!("do {id}"),
-            seat,
-            kind: StepKind::Build,
-            depends_on: vec![],
-            acceptance,
-            evidence: Vec::new(),
-            status,
-        };
-        crate::interaction::hosted(gates_hosted_interaction(), async {
-            // Docs all Done, tokens still Pending, settled step = the UIUX doc: the
-            // gate opens NOW — the pending tokens step (excluded from the family)
-            // does not hold it.
-            let uiux = mk(
-                "uiux",
-                Seat::UiuxDesigner,
-                AcceptanceSpec::SourcePresent,
-                StepStatus::Done,
-            );
-            let plan = Plan {
-                steps: vec![
-                    mk(
-                        "pm",
-                        Seat::ProductManager,
-                        AcceptanceSpec::SourcePresent,
-                        StepStatus::Done,
-                    ),
-                    mk(
-                        "arch",
-                        Seat::Architect,
-                        AcceptanceSpec::SourcePresent,
-                        StepStatus::Done,
-                    ),
-                    uiux.clone(),
-                    mk(
-                        "tokens",
-                        Seat::UiuxDesigner,
-                        AcceptanceSpec::DesignTokensPresent,
-                        StepStatus::Pending,
-                    ),
-                    mk(
-                        "fe",
-                        Seat::FrontendEngineer,
-                        AcceptanceSpec::SourcePresent,
-                        StepStatus::Pending,
-                    ),
-                ],
-                risks: vec![],
-                open_questions: vec![],
-            };
-            assert_eq!(
-                confirm_gate_after_step(&uiux, StepStatus::Done, &plan, &o),
-                Some(crate::gates::Gate::DocsConfirm),
-                "a pending tokens step does not hold the docs gate closed"
-            );
-            // Post-resume: the tokens step settles Done — it must NOT re-fire the
-            // docs gate (it is not a doc-family member OR trigger).
-            let tokens_done = mk(
-                "tokens",
-                Seat::UiuxDesigner,
-                AcceptanceSpec::DesignTokensPresent,
-                StepStatus::Done,
-            );
-            let mut plan2 = plan.clone();
-            plan2.mark("tokens", StepStatus::Done);
-            assert_eq!(
-                confirm_gate_after_step(&tokens_done, StepStatus::Done, &plan2, &o),
-                None,
-                "a design-tokens step settling post-resume never re-fires docs_confirm"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn docs_gate_fires_before_code_phase_prep_and_opens_exactly_once() {
-        // End-to-end over drive_plan_steps + resume with the NEW skeleton shape: a
-        // plan carrying the QA test-authoring + designer tokens prep steps between
-        // the docs and the code. The docs gate must open when the DOCS complete
-        // (prep still pending — it is code-phase work that runs AFTER the user
-        // confirms the docs), the prep steps complete after the resume WITHOUT
-        // re-firing docs_confirm, and the frontend then pauses at preview_confirm.
-        use crate::critics::Seat;
-        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        // The prep steps' real evidence: authored tests on disk + a real tokens file.
-        std::fs::create_dir_all(tmp.path().join("tests")).unwrap();
-        std::fs::write(tmp.path().join("tests").join("probe.test.ts"), "test();").unwrap();
-        std::fs::write(
-            tmp.path().join("design-tokens.json"),
-            "{ \"color\": { \"primary\": \"#0f62fe\" } }",
-        )
-        .unwrap();
-        let (events, rec) = sink();
-        let mut o = opts(tmp.path());
-        o.mode = TrustMode::Guarded;
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        let mk = |id: &str, seat: Seat, acceptance: AcceptanceSpec, deps: &[&str]| PlanStep {
-            files: plan_state::StepFiles::default(),
-            id: id.into(),
-            title: format!("do the {id} work"),
-            seat,
-            kind: StepKind::Build,
-            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
-            acceptance,
-            evidence: Vec::new(),
-            status: StepStatus::Pending,
-        };
-        let mut qa = mk(
-            "qa-tests",
-            Seat::QaEngineer,
-            AcceptanceSpec::SourcePresent,
-            &["arch"],
-        );
-        qa.evidence = vec![crate::plan_state::EvidenceContract::FileExists {
-            path: "tests".to_string(),
-        }];
-        let mut plan = Plan {
-            steps: vec![
-                mk(
-                    "pm",
-                    Seat::ProductManager,
-                    AcceptanceSpec::SourcePresent,
-                    &[],
-                ),
-                mk(
-                    "arch",
-                    Seat::Architect,
-                    AcceptanceSpec::SourcePresent,
-                    &["pm"],
-                ),
-                qa,
-                mk(
-                    "tokens",
-                    Seat::UiuxDesigner,
-                    AcceptanceSpec::DesignTokensPresent,
-                    &["arch"],
-                ),
-                mk(
-                    "fe",
-                    Seat::FrontendEngineer,
-                    AcceptanceSpec::SourcePresent,
-                    &["qa-tests", "tokens"],
-                ),
-                mk(
-                    "be",
-                    Seat::BackendEngineer,
-                    AcceptanceSpec::SourcePresent,
-                    &["qa-tests"],
-                ),
-            ],
-            risks: vec![],
-            open_questions: vec![],
-        };
-
-        // 1. Fresh drive → pauses at docs_confirm as soon as pm + arch settle (the
-        //    prep steps are still Pending — they are NOT doc-family members).
-        let mut sess = FakeSession::new(vec![], false, "");
-        let outcome = crate::interaction::hosted(gates_hosted_interaction(), async {
-            drive_plan_steps(
-                &mut sess,
-                &o,
-                &events,
-                &route,
-                &mut plan,
-                IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-                std::time::Instant::now() + Duration::from_secs(3_600),
-            )
-            .await
-        })
-        .await;
-        assert!(
-            matches!(
-                outcome,
-                Some(DirectorLoopOutcome::PausedAtGate {
-                    gate: crate::gates::Gate::DocsConfirm
-                })
-            ),
-            "docs gate opens when the DOCS complete, before the prep steps: {outcome:?}"
-        );
-        let loaded = plan_state::load(tmp.path()).expect("plan persisted at the pause");
-        let status_of = |p: &Plan, id: &str| p.steps.iter().find(|s| s.id == id).unwrap().status;
-        assert_eq!(
-            status_of(&loaded, "qa-tests"),
-            StepStatus::Pending,
-            "test-authoring is code-phase prep — it runs AFTER the docs gate resumes"
-        );
-        assert_eq!(status_of(&loaded, "tokens"), StepStatus::Pending);
-
-        // 2. Approve → resume: the prep steps complete (no docs re-fire), the
-        //    frontend settles → preview_confirm.
-        let mut sess2 = FakeSession::new(vec![], false, "");
-        let outcome2 = crate::interaction::hosted(gates_hosted_interaction(), async {
-            drive_director_loop_resume(&mut sess2, &o, &events, &route).await
-        })
-        .await;
-        assert!(
-            matches!(
-                outcome2,
-                Some(DirectorLoopOutcome::PausedAtGate {
-                    gate: crate::gates::Gate::PreviewConfirm
-                })
-            ),
-            "after the prep steps the frontend pauses at preview_confirm: {outcome2:?}"
-        );
-        assert_eq!(
-            rec.count(|e| matches!(
-                e,
-                EngineEvent::GateOpened {
-                    gate: crate::gates::Gate::DocsConfirm,
-                    ..
-                }
-            )),
-            1,
-            "docs_confirm opened exactly ONCE — the prep steps completing never re-fired it"
-        );
-
-        // 3. Approve the preview → the backend completes and the run finishes.
-        let mut sess3 = FakeSession::new(vec![], false, "");
-        let outcome3 = crate::interaction::hosted(gates_hosted_interaction(), async {
-            drive_director_loop_resume(&mut sess3, &o, &events, &route).await
-        })
-        .await;
-        assert!(
-            matches!(outcome3, Some(DirectorLoopOutcome::Done { .. })),
-            "the final resume completes the plan: {outcome3:?}"
-        );
-        let done = plan_state::load(tmp.path()).expect("plan persisted");
-        assert!(
-            done.steps.iter().all(|s| s.status == StepStatus::Done),
-            "every step (docs, prep, code) settled Done: {:?}",
-            done.steps
-                .iter()
-                .map(|s| (s.id.clone(), s.status))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[tokio::test]
-    async fn queued_steer_folds_into_the_next_build_step_directive() {
-        // A2#4/#5: directives queued in the hosted steering intake are drained at
-        // the next STEP BOUNDARY and folded into the doer's instruction — steering
-        // applies mid-run instead of evaporating. Auto tier so no gate pause
-        // interleaves; the intake is consumed exactly once.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let (events, rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let sent = sess.sent_handle();
-        let mut o = opts(tmp.path());
-        o.requirement = "做一个完整的产品".to_string();
-        let route = build_route();
-        let mut plan = gated_plan();
-
-        let steer: crate::interaction::SteerIntake = Arc::new(std::sync::Mutex::new(vec![
-            "Plan steering: SKIP step `be` — do not perform it.".to_string(),
-        ]));
-        let interaction = crate::interaction::RunInteraction {
-            steer: Some(Arc::clone(&steer)),
-            approval: None,
-            confirm_gates: false,
-        };
-        let outcome = crate::interaction::hosted(interaction, async {
-            drive_plan_steps(
-                &mut sess,
-                &o,
-                &events,
-                &route,
-                &mut plan,
-                IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
-                std::time::Instant::now() + Duration::from_secs(3_600),
-            )
-            .await
-        })
-        .await;
-        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
-        // The FIRST doer directive carries the folded steering block…
-        let sent = sent.lock().unwrap();
-        let steered: Vec<&String> = sent
-            .iter()
-            .filter(|d| d.contains("## User steering"))
-            .collect();
-        assert!(
-            steered
-                .first()
-                .is_some_and(|d| d.contains("SKIP step `be`")),
-            "the queued directive folded into a step directive: {sent:?}"
-        );
-        // …exactly once (the intake drains on consumption, never re-applied).
-        assert_eq!(steered.len(), 1, "steering applied at ONE step boundary");
-        assert!(
-            steer.lock().unwrap().is_empty(),
-            "the intake drained on consumption"
-        );
-        // The fold was surfaced to the user (the i18n note).
-        assert!(
-            rec.count(|e| matches!(e, EngineEvent::Note(n) if n.contains("1"))) >= 1,
-            "a fold note was emitted"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_approval_headless_keeps_the_floor_and_hosted_asks_the_user() {
-        // A2#3: the interactive approval bridge. Headless (no scope): the floor's
-        // escalation degrades to DENY exactly as today. Hosted: the callback's
-        // verdict decides — an Allow also records the reversible class in the
-        // project trust ledger (like the chat drain), a Deny denies.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut o = opts(tmp.path());
-        o.mode = TrustMode::Guarded;
-        let (events, _rec) = sink();
-
-        // An out-of-tree write escalates under Guarded (root-aware policy).
-        let action = "write";
-        let target = "/etc/hosts-not-ours";
-
-        // Headless: escalate → DENY, flagged headless (the caller emits its note).
-        let headless = resolve_approval(&o, &events, action, target).await;
-        assert!(matches!(headless.decision, ApprovalDecision::Deny));
-        assert!(headless.headless);
-
-        // Hosted + user APPROVES → Allow, interactive.
-        let approve: crate::interaction::ApprovalFn =
-            Arc::new(|_a, _t| Box::pin(async { true }) as crate::interaction::ApprovalFuture);
-        let hosted_allow = crate::interaction::hosted(
-            crate::interaction::RunInteraction {
-                steer: None,
-                approval: Some(approve),
-                confirm_gates: false,
-            },
-            resolve_approval(&o, &events, action, target),
-        )
-        .await;
-        assert!(matches!(hosted_allow.decision, ApprovalDecision::Allow));
-        assert!(!hosted_allow.headless);
-        // The approved reversible class was remembered (not re-asked next time):
-        // the SAME action now passes the floor without any callback.
-        let after = resolve_approval(&o, &events, action, target).await;
-        assert!(
-            matches!(after.decision, ApprovalDecision::Allow),
-            "the remembered class skips the re-ask"
-        );
-
-        // Hosted + user DENIES an (unremembered) escalation → Deny, interactive.
-        let deny: crate::interaction::ApprovalFn =
-            Arc::new(|_a, _t| Box::pin(async { false }) as crate::interaction::ApprovalFuture);
-        let hosted_deny = crate::interaction::hosted(
-            crate::interaction::RunInteraction {
-                steer: None,
-                approval: Some(deny),
-                confirm_gates: false,
-            },
-            resolve_approval(&o, &events, "bash", "git push --force origin main"),
-        )
-        .await;
-        assert!(matches!(hosted_deny.decision, ApprovalDecision::Deny));
-        assert!(!hosted_deny.headless);
-    }
-
-    #[tokio::test]
-    async fn resolve_approval_auto_frees_installs_but_still_asks_on_disasters() {
-        // The narrowed AUTO floor on the director path: a dependency install is
-        // ordinary dev work — allowed WITHOUT consulting the user (the callback
-        // must never fire; the reported "npm install 待批准 in auto" nag). A true
-        // disaster (`rm -rf`) still escalates and — hosted — asks the live user.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut o = opts(tmp.path());
-        o.mode = TrustMode::Auto;
-        let (events, _rec) = sink();
-
-        let consulted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let consulted_probe = Arc::clone(&consulted);
-        let never: crate::interaction::ApprovalFn = Arc::new(move |_a, _t| {
-            consulted_probe.store(true, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async { false }) as crate::interaction::ApprovalFuture
-        });
-        let freed = crate::interaction::hosted(
-            crate::interaction::RunInteraction {
-                steer: None,
-                approval: Some(never),
-                confirm_gates: false,
-            },
-            resolve_approval(&o, &events, "bash", "npm install"),
-        )
-        .await;
-        assert!(
-            matches!(freed.decision, ApprovalDecision::Allow),
-            "auto allows the ordinary inbound network install without a prompt"
-        );
-        assert!(
-            !consulted.load(std::sync::atomic::Ordering::SeqCst),
-            "auto must not consult the user for npm install"
-        );
-
-        // A destructive disaster still surfaces the interactive prompt in Auto,
-        // and the user's verdict decides.
-        let approve: crate::interaction::ApprovalFn =
-            Arc::new(|_a, _t| Box::pin(async { true }) as crate::interaction::ApprovalFuture);
-        let asked = crate::interaction::hosted(
-            crate::interaction::RunInteraction {
-                steer: None,
-                approval: Some(approve),
-                confirm_gates: false,
-            },
-            resolve_approval(&o, &events, "bash", "rm -rf node_modules && rm -rf dist"),
-        )
-        .await;
-        assert!(matches!(asked.decision, ApprovalDecision::Allow));
-        assert!(
-            !asked.headless,
-            "the residual auto escalation must ask the live user, not headless-decide"
-        );
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // RED→GREEN evidence contract — "a test that never failed proves nothing"
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn red_green_verdict_passes_a_test_that_was_red_before_the_step() {
-        use crate::verify::NamedTestOutcome as T;
-        // The whole contract in one line: the named test FAILED at the pre-state and
-        // (the caller has already established) PASSES at head. That is a real test.
-        assert!(matches!(
-            red_half_verdict("login_rejects_bad_password", T::Failed),
-            Some(EvidenceOutcome::Pass)
-        ));
-    }
-
-    #[test]
-    fn red_green_verdict_fails_the_step_when_the_test_already_passed_at_baseline() {
-        // THE POINT OF THE WHOLE MECHANISM. A test that was ALREADY GREEN before the
-        // step's work existed cannot be asserting that work — it was written after (or
-        // around) the code, to match what the code already did. It has never once
-        // demonstrated that it can detect the behaviour's absence. `TestPasses` is
-        // satisfied by exactly this test; the red→green contract rejects it, by name,
-        // with the diagnosis stated plainly.
-        use crate::verify::NamedTestOutcome as T;
-        let Some(EvidenceOutcome::Gap(msg)) = red_half_verdict("adds_two_numbers", T::Passed)
-        else {
-            panic!("a test that was already green at the pre-state MUST reject the step");
-        };
-        assert!(msg.contains("ALREADY PASSED"), "{msg}");
-        assert!(msg.contains("adds_two_numbers"), "{msg}");
-    }
-
-    #[test]
-    fn red_green_verdict_is_inconclusive_when_the_pre_state_test_cannot_be_run() {
-        // FAIL-OPEN: a rewound tree we could not run the test in (a toolchain that
-        // needs dependencies the pre-state lacked, a timeout) yields NO verdict — the
-        // caller degrades to the ordinary named-test bar. We never block a step on our
-        // own inability to verify.
-        use crate::verify::NamedTestOutcome as T;
-        assert!(
-            red_half_verdict("t", T::Unavailable).is_none(),
-            "an unrunnable pre-state is inconclusive, never a finding"
-        );
-    }
-
-    #[test]
-    fn the_red_half_memo_never_caches_a_non_verdict() {
-        // N3. The memo may only hold IMMUTABLE FACTS ABOUT THE PAST: at commit `pre`,
-        // that test did (Passed) or did not (Failed) succeed. `Unavailable` is not such a
-        // fact — it is a fact about our TOOLING at one moment (a timeout, a transient
-        // runner failure). Caching it froze one flake into the answer for
-        // `(root, pre, test)` for the entire process: every later fix round of that step
-        // skipped the rewind, read the cached non-verdict, and fell open to the plain
-        // `TestPasses` bar — permanently downgrading the red→green contract because of a
-        // single transient miss.
-        use crate::verify::NamedTestOutcome as T;
-        let root = std::path::Path::new("/tmp/umadev-red-half-memo-test");
-        let pre = "cafe1234";
-        let test = "n3_regression_probe";
-
-        // A transient non-verdict is NOT remembered — the next round asks again.
-        red_half_remember(root, pre, test, T::Unavailable);
-        assert!(
-            red_half_cached(root, pre, test).is_none(),
-            "a non-verdict must never be memoized: it would downgrade the contract for the \
-             whole process on the strength of one flake"
-        );
-
-        // …and the round that DOES get an answer records it, so the (immutable) past is
-        // not re-derived by a second rewind.
-        red_half_remember(root, pre, test, T::Failed);
-        assert_eq!(
-            red_half_cached(root, pre, test),
-            Some(T::Failed),
-            "a real observation about the past IS sound to memoize"
-        );
-
-        // A later `Unavailable` must not clobber the fact we already established.
-        red_half_remember(root, pre, test, T::Unavailable);
-        assert_eq!(
-            red_half_cached(root, pre, test),
-            Some(T::Failed),
-            "a transient miss cannot erase an established fact"
-        );
-    }
-
-    #[tokio::test]
-    async fn red_green_falls_open_to_test_passes_when_no_runner_or_rewind_exists() {
-        // END-TO-END FAIL-OPEN, through the real contract path. The workspace has the
-        // named test in its source but NO recognised project manifest (so no test
-        // runner) and NO pre-state checkpoint. Both halves are unaskable → the step is
-        // held to exactly the bar we CAN check (the test exists), never blocked on a
-        // question we could not ask.
-        use crate::plan_state::EvidenceContract as E;
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(
-            tmp.path().join("src/app.test.js"),
-            "test('login_rejects_bad_password', () => { expect(1).toBe(1); });",
-        )
-        .unwrap();
-        let o = opts(tmp.path());
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let route = build_route();
-        let step = evidence_step(vec![E::TestFailsThenPasses {
-            test: "login_rejects_bad_password".into(),
-        }]);
-
-        let v = verify_step_acceptance(
-            &mut sess, &o, &events, &route, &step,
-            None, // no pre-state checkpoint → the red half is unaskable
-        )
-        .await;
-        assert!(
-            v.accepted,
-            "an unverifiable red→green degrades to the TestPasses bar: {:?}",
-            v.evidence
-        );
-    }
-
-    #[tokio::test]
-    async fn red_green_still_rejects_a_test_that_is_not_in_the_codebase_at_all() {
-        // The green half is toolchain-INDEPENDENT: a test that appears nowhere in the
-        // source cannot pass, no matter what a runner would say (and this is what stops
-        // a "filter matched nothing, exit 0" runner from faking a green).
-        use crate::plan_state::EvidenceContract as E;
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-        std::fs::write(tmp.path().join("src/app.js"), "export const a = 1;\n").unwrap();
-        let o = opts(tmp.path());
-        let (events, _rec) = sink();
-        let mut sess = FakeSession::new(vec![], false, "");
-        let route = build_route();
-        let step = evidence_step(vec![E::TestFailsThenPasses {
-            test: "a_test_nobody_ever_wrote".into(),
-        }]);
-
-        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step, None).await;
-        assert!(
-            !v.accepted,
-            "an absent test cannot satisfy a red→green claim"
-        );
-        assert!(
-            v.evidence_line().contains("a_test_nobody_ever_wrote"),
-            "the gap names the missing test: {:?}",
-            v.evidence
-        );
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // SCOPE CREEP — "which change belongs to no step?" (the dual of coverage)
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// A workspace with a run baseline + a persisted plan whose one code step claims
-    /// `claim` as its file surface. `None` when `git` is unavailable (fail-open env).
-    fn scoped_workspace(claim: &[&str]) -> Option<tempfile::TempDir> {
-        if !std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-        {
-            return None;
-        }
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        crate::checkpoint::create_run_baseline(tmp.path(), "demo")?;
-        let plan = plan_state::Plan {
-            steps: vec![plan_state::PlanStep {
-                files: crate::plan_state::StepFiles {
-                    create: claim.iter().map(|c| (*c).to_string()).collect(),
-                    modify: vec![],
-                },
-                id: "impl".into(),
-                title: "build the planned thing".into(),
-                seat: crate::critics::Seat::BackendEngineer,
-                kind: plan_state::StepKind::Build,
-                depends_on: vec![],
-                acceptance: plan_state::AcceptanceSpec::SourcePresent,
-                evidence: vec![],
-                status: plan_state::StepStatus::Pending,
-            }],
-            risks: vec![],
-            open_questions: vec![],
-        };
-        plan_state::save(&plan, tmp.path()).unwrap();
-        Some(tmp)
-    }
-
-    #[test]
-    fn acceptance_floor_blocks_an_unclaimed_new_source_file() {
-        // OVER-BUILDING is the dual of the coverage gap above. The plan said it would
-        // write `planned.ts`; the run ALSO wrote `rogue.ts` — a new place for logic to
-        // live that nobody sized, nobody asked for, and no reviewer looked at. It
-        // blocks, on the same deterministic floor as an uncovered requirement.
-        let Some(tmp) = scoped_workspace(&["planned.ts"]) else {
-            return;
-        };
-        std::fs::write(tmp.path().join("planned.ts"), "export const p = 1;\n").unwrap();
-        std::fs::write(tmp.path().join("rogue.ts"), "export const r = 1;\n").unwrap();
-
-        let o = opts(tmp.path());
-        let route = build_route();
-        let blocking = acceptance_floor_blocking(&o, Some(&route));
-        assert!(
-            blocking
-                .iter()
-                .any(|b| b.starts_with("scope:") && b.contains("rogue.ts")),
-            "an unclaimed new source file blocks: {blocking:?}"
-        );
-        assert!(
-            !blocking.iter().any(|b| b.contains("planned.ts")),
-            "the CLAIMED file is in scope and never a finding: {blocking:?}"
-        );
-    }
-
-    #[test]
-    fn acceptance_floor_is_silent_on_scope_when_the_plan_declared_no_surface() {
-        // FAIL-OPEN, and the reason the check can ship at all: a plan that never
-        // declared where it would write has made no claim to hold the tree against.
-        // The very same rogue file produces NOT ONE scope finding.
-        let Some(tmp) = scoped_workspace(&[]) else {
-            return;
-        };
-        std::fs::write(tmp.path().join("rogue.ts"), "export const r = 1;\n").unwrap();
-        let o = opts(tmp.path());
-        let route = build_route();
-        let blocking = acceptance_floor_blocking(&o, Some(&route));
-        assert!(
-            !blocking.iter().any(|b| b.starts_with("scope:")),
-            "an absent declaration is not a claim that nothing will change: {blocking:?}"
-        );
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // EVIDENCE FRESHNESS — "a proof taken before the last change is not a proof"
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn a_stale_runtime_proof_is_not_read_by_the_floor_in_either_direction() {
-        // A runtime proof describes ONE state of the source. Once the code moves, the
-        // proof is about a tree that no longer exists — so the floor must not read it,
-        // in EITHER direction: a stale FAILURE must not block code that has since been
-        // fixed, and (the dangerous one) a stale PASS must never be mistaken for
-        // evidence about the code we are shipping.
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_source(tmp.path());
-        let audit = tmp.path().join(".umadev").join("audit");
-        std::fs::create_dir_all(&audit).unwrap();
-
-        let write_failed_proof = |fingerprint: Option<String>| {
-            let proof = crate::runtime_proof::RuntimeProof {
-                timestamp: "2026-07-01T00:00:00Z".to_string(),
-                status: crate::runtime_proof::RuntimeStatus::NotVerified(
-                    "server did not become ready within 60s".to_string(),
-                ),
-                dev_server: Some("Vite dev server".to_string()),
-                command: Some("npm run dev".to_string()),
-                base_url: Some("http://localhost:5173".to_string()),
-                ready_ms: None,
-                routes: Vec::new(),
-                e2e: None,
-                source_fingerprint: fingerprint,
-            };
-            std::fs::write(
-                audit.join("runtime-proof.json"),
-                serde_json::to_string(&proof).unwrap(),
-            )
-            .unwrap();
-        };
-
-        // FRESH failure (stamped with the tree as it stands) → a real, blocking fact.
-        let now = crate::freshness::workspace_fingerprint(tmp.path())
-            .expect("a test tree is fingerprintable");
-        write_failed_proof(Some(now));
-        assert!(
-            runtime_proof_blocking(tmp.path()).is_some(),
-            "a proof that describes THIS code is read"
-        );
-
-        // The code CHANGES. The same recorded failure now describes a tree we are not
-        // shipping — it is no longer evidence about anything, so the floor drops it and
-        // the check has to be re-run for real.
-        std::fs::write(tmp.path().join("fixed.ts"), "export const fixed = true;\n").unwrap();
-        assert!(
-            runtime_proof_blocking(tmp.path()).is_none(),
-            "evidence produced before the last change to the code it describes is not evidence"
-        );
-
-        // FAIL-OPEN: an UNSTAMPED proof has no fingerprint to contradict — an unknown is
-        // never a finding, so an older artifact behaves exactly as it always did.
-        write_failed_proof(None);
-        assert!(
-            runtime_proof_blocking(tmp.path()).is_some(),
-            "an unstamped proof is read as before — we never block on our own blindness"
-        );
-    }
-}
+#[path = "director_loop_tests.rs"]
+mod director_loop_tests;

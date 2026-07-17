@@ -157,15 +157,21 @@ pub fn run_adopt(project_root: &Path) -> AdoptReport {
     };
 
     // --- Step 3: reverse-derive the API contract baseline --------------
-    let api_endpoints = if let Some((count, rels)) = adopt_api_contract(project_root) {
-        artifacts.extend(rels);
-        count
-    } else {
+    let contract = adopt_api_contract(project_root);
+    artifacts.extend(contract.written_paths);
+    if contract.discovered_calls == 0 {
         notes.push(
             "no frontend API calls found in source — adopted contract baseline is empty".into(),
         );
-        0
-    };
+    } else if contract.unresolved_methods > 0 {
+        notes.push(format!(
+            "{} frontend API call(s) had no mechanically known HTTP method and were not \
+             fabricated into the typed baseline; replace ambiguous wrappers with typed calls \
+             or document their methods before relying on the contract",
+            contract.unresolved_methods
+        ));
+    }
+    let api_endpoints = contract.endpoint_count;
 
     // --- Step 4: write the lean boundary doc ---------------------------
     let mut report = AdoptReport {
@@ -310,7 +316,7 @@ fn index_project_source(project_root: &Path) -> Result<(u32, u32, String), Strin
     Ok((file_count, chunk_count, rel))
 }
 
-/// Load the project-source BM25 index written by [`index_project_source`].
+/// Load the project-source BM25 index written by the internal source indexer.
 /// Fail-open: a missing / corrupt index returns `None`, so a caller wiring
 /// real-code retrieval into later phases degrades to "no extra context".
 #[must_use]
@@ -389,7 +395,9 @@ fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize, max_fi
     let Ok(entries) = std::fs::read_dir(dir) else {
         return; // unreadable dir → skip (fail-open)
     };
-    for entry in entries.flatten() {
+    let mut entries = entries.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
         if out.len() >= max_files {
             return;
         }
@@ -430,19 +438,23 @@ fn has_source_ext(path: &Path) -> bool {
 /// validators operate on the existing codebase, not just freshly-scaffolded
 /// code.
 ///
-/// Returns `(endpoint_count, written_relative_paths)`, or `None` when no
-/// frontend calls exist (nothing to baseline).
-fn adopt_api_contract(project_root: &Path) -> Option<(u32, Vec<String>)> {
+struct AdoptContractResult {
+    endpoint_count: u32,
+    written_paths: Vec<String>,
+    discovered_calls: usize,
+    unresolved_methods: usize,
+}
+
+/// Unknown wrapper methods are reported but never invented as GET in the typed
+/// baseline: an adopted contract becomes future enforcement, so a guess here
+/// would turn into a durable false requirement.
+fn adopt_api_contract(project_root: &Path) -> AdoptContractResult {
     let calls = umadev_contract::extract_frontend_calls(project_root);
-    if calls.is_empty() {
-        return None;
-    }
+    let discovered_calls = calls.len();
+    let unresolved_methods = calls.iter().filter(|call| !call.method_known).count();
 
     let mut endpoints: Vec<Endpoint> = Vec::new();
-    for call in &calls {
-        // Skip method-unknown guesses for the baseline path set only when an
-        // identical known endpoint already exists; otherwise keep it so the
-        // contract still reflects the call site.
+    for call in calls.iter().filter(|call| call.method_known) {
         let op = operation_id_for(call.method, &call.path);
         endpoints.push(Endpoint {
             method: call.method,
@@ -464,13 +476,18 @@ fn adopt_api_contract(project_root: &Path) -> Option<(u32, Vec<String>)> {
     };
 
     let count = u32::try_from(spec.len()).unwrap_or(u32::MAX);
-    // `write_contract` is itself best-effort; capture whatever landed.
-    let written = write_contract(project_root, &spec);
+    // Do not create an empty contract that could be mistaken for proof that the
+    // project has no API. Unknown-only input remains an explicit audit note.
+    let written = if spec.is_empty() {
+        Vec::new()
+    } else {
+        write_contract(project_root, &spec)
+    };
     // Touch render_json so a future caller can diff without re-walking (and so
     // the dependency is exercised in one place). Best-effort, ignored on error.
     let _ = render_json(&spec);
 
-    let rels: Vec<String> = written
+    let written_paths: Vec<String> = written
         .iter()
         .map(|p| {
             p.strip_prefix(project_root)
@@ -479,7 +496,12 @@ fn adopt_api_contract(project_root: &Path) -> Option<(u32, Vec<String>)> {
                 .replace(std::path::MAIN_SEPARATOR, "/")
         })
         .collect();
-    Some((count, rels))
+    AdoptContractResult {
+        endpoint_count: count,
+        written_paths,
+        discovered_calls,
+        unresolved_methods,
+    }
 }
 
 /// Build a stable, readable operationId from a method + path, e.g.
@@ -750,6 +772,25 @@ mod tests {
     }
 
     #[test]
+    fn adopt_does_not_fabricate_an_unknown_wrapper_method() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "package.json", r#"{"name":"x"}"#);
+        write(tmp.path(), "src/api.ts", "request('/api/users');\n");
+
+        let report = run_adopt(tmp.path());
+        assert_eq!(report.api_endpoints, 0);
+        assert!(
+            report.notes.iter().any(|note| note.contains("HTTP method")),
+            "the unresolved method must be visible: {:?}",
+            report.notes
+        );
+        assert!(
+            !tmp.path().join(".umadev/contracts/openapi.yaml").exists(),
+            "unknown-only calls must not produce a false GET contract"
+        );
+    }
+
+    #[test]
     fn adopt_skips_vendored_and_state_dirs() {
         let tmp = TempDir::new().unwrap();
         write(tmp.path(), "package.json", r#"{"name":"x"}"#);
@@ -810,6 +851,21 @@ mod tests {
             operation_id_for(HttpVerb::Delete, "/api/x/:id"),
             operation_id_for(HttpVerb::Delete, "/api/x/:id")
         );
+    }
+
+    #[test]
+    fn bounded_adopt_walk_selects_stable_paths() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["z.rs", "b.rs", "a.rs"] {
+            std::fs::write(tmp.path().join(name), "fn main() {}\n").unwrap();
+        }
+        let mut files = Vec::new();
+        collect_source_files(tmp.path(), &mut files, 0, 2);
+        let names = files
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["a.rs", "b.rs"]);
     }
 
     #[test]

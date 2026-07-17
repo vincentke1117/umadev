@@ -5,7 +5,7 @@
 //! layer, making them citable by the host during research/generation phases.
 //!
 //! **Markdown only.** The runtime RAG walker indexes `.md` exclusively, so
-//! `add`/`search` accept only `.md`. A `.txt` would print "[ok] Added" yet the
+//! `add`/`search` accept only `.md`. A `.txt` would print `"[ok] Added"` yet the
 //! base would never index it — so we reject non-markdown up front with a clear
 //! message instead of staging a silent non-delivery.
 //!

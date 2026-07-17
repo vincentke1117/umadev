@@ -76,41 +76,35 @@ impl Drop for NoBundledCorpus {
     }
 }
 
-/// RAII guard that isolates `$HOME` (hence `global_learned_dir()`) to a throwaway
-/// temp dir, so a real sediment/promotion can neither READ nor POLLUTE the
-/// developer's actual `~/.umadev/learned`. Restores the prior env on drop.
+/// RAII guard that isolates the lessons subsystem's home resolution to a
+/// throwaway temp dir, so a real sediment/promotion can neither READ nor POLLUTE
+/// the developer's actual `~/.umadev/learned`.
 ///
-/// Shares [`ENV_GUARD`] with [`NoBundledCorpus`] on purpose — both mutate the
-/// same process-global `HOME`, so they must be mutually exclusive.
+/// It retains [`ENV_GUARD`] compatibility with [`NoBundledCorpus`], while using
+/// a thread-local override so parallel unrelated tests cannot create files in
+/// its scratch directory.
 pub(crate) struct TempHome {
     _lock: MutexGuard<'static, ()>,
     _tmp: TempDir,
-    prev_home: Option<OsString>,
-    prev_userprofile: Option<OsString>,
 }
 
 impl TempHome {
-    /// Take the shared env lock and repoint `HOME`/`USERPROFILE` at a temp dir.
+    /// Take the shared env lock and install a lessons-only thread-local home.
+    /// Avoiding process-global HOME mutation makes parallel tests deterministic.
     pub(crate) fn new() -> Self {
         let lock = env_guard();
-        let prev_home = std::env::var_os("HOME");
-        let prev_userprofile = std::env::var_os("USERPROFILE");
         let tmp = TempDir::new().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        std::env::set_var("USERPROFILE", tmp.path());
+        crate::lessons::set_test_home_override(Some(tmp.path().to_path_buf()));
         Self {
             _lock: lock,
             _tmp: tmp,
-            prev_home,
-            prev_userprofile,
         }
     }
 }
 
 impl Drop for TempHome {
     fn drop(&mut self) {
-        restore("HOME", self.prev_home.take());
-        restore("USERPROFILE", self.prev_userprofile.take());
+        crate::lessons::set_test_home_override(None);
     }
 }
 

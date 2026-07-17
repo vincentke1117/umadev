@@ -22,18 +22,18 @@ const jetBrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000"),
-  title: "UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use",
+  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "https://umadev.goder.ai"),
+  title: "UmaDev — 一个模拟真实开发团队、驱动你的底座干活的 Agent",
   description:
-    "UmaDev is a coding agent that works like a real dev team — product manager, architect, designer, frontend, backend, QA, security, DevOps — borrowing your logged-in Claude Code / Codex / OpenCode brain to turn one idea into a shippable, commercial-grade app.",
+    "UmaDev 深度适配五个一等本机编码底座；Claude Code、Codex、OpenCode 采用厂商专属协议，Grok Build 与 Kimi Code 采用厂商官方 ACP v1 接口和隔离配置。",
   icons: {
     icon: asset("/assets/umadev-icon.png"),
     apple: asset("/assets/umadev-icon.png"),
   },
   openGraph: {
-    title: "UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use",
+    title: "UmaDev — One agent. A whole development team at work.",
     description:
-      "A coding agent that works like a real dev team — eight specialists collaborating to turn your idea into a shippable, commercial-grade app — PRD, API contract, design system, build, tests, security audit and a delivery proof pack.",
+      "Deeply integrate one of five first-class local coding bases: Claude Code, Codex, OpenCode, Grok Build, or Kimi Code.",
     type: "website",
     images: [{ url: asset("/assets/wide-1.png"), width: 1672, height: 941 }],
   },

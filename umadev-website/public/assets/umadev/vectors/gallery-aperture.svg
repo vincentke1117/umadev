@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" fill="none">
+  <defs>
+    <linearGradient id="g" x1="116" y1="672" x2="672" y2="120" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B6EA8"/>
+      <stop offset=".45" stop-color="#00D2FF"/>
+      <stop offset="1" stop-color="#FF2A85"/>
+    </linearGradient>
+  </defs>
+  <circle cx="400" cy="400" r="310" stroke="#00D2FF" stroke-opacity=".13"/>
+  <circle cx="400" cy="400" r="270" stroke="url(#g)" stroke-width="3" stroke-dasharray="160 18 34 22"/>
+  <path d="M400 132C502 132 589 188 636 270L488 299L400 132Z" fill="url(#g)" fill-opacity=".18" stroke="#00D2FF" stroke-opacity=".52"/>
+  <path d="M636 270C687 358 675 466 617 544L517 431L636 270Z" fill="url(#g)" fill-opacity=".14" stroke="#FF2A85" stroke-opacity=".46"/>
+  <path d="M617 544C558 623 457 662 360 641L405 496L617 544Z" fill="url(#g)" fill-opacity=".16" stroke="#00D2FF" stroke-opacity=".42"/>
+  <path d="M360 641C253 619 177 538 145 446L296 413L360 641Z" fill="url(#g)" fill-opacity=".12" stroke="#00D2FF" stroke-opacity=".36"/>
+  <path d="M145 446C114 350 151 247 229 187L320 310L145 446Z" fill="url(#g)" fill-opacity=".15" stroke="#FF2A85" stroke-opacity=".42"/>
+  <path d="M229 187C278 149 336 132 400 132L400 282L229 187Z" fill="url(#g)" fill-opacity=".12" stroke="#00D2FF" stroke-opacity=".38"/>
+  <circle cx="400" cy="400" r="112" stroke="#F5FCFF" stroke-opacity=".24" stroke-width="2"/>
+  <circle cx="400" cy="400" r="7" fill="#00D2FF"/>
+</svg>

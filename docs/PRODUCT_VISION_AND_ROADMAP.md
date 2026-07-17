@@ -1,20 +1,42 @@
 # UmaDev — Product Vision & Roadmap to Commercial Launch
 
-> **Status:** authoritative. This document supersedes scattered direction notes and
-> the aspirational `AGENT_WIELDS_BASE_ARCHITECTURE.md` migration-wave language.
-> It defines the target — **UmaDev: a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use**
-> (a product manager, architect, UI/UX designer, frontend, backend, QA, security, and
-> DevOps — eight specialists, coordinated by a scheduling seat) — an honest gap
-> analysis against the current code, and an executable, impact-ordered roadmap to
-> launch. The headline — a coding agent that works like a real dev team — frames this
+> **Status (reviewed 2026-07-17): historical implementation roadmap, not a live gap report.**
+> The product direction below remains valid, but the “today/current” observations and
+> Wave 1–6 checklists describe the baseline from which the director architecture was
+> built. Router, owned plan, firmware injection, step scheduling, visible events,
+> deterministic verification, delivery artifacts, persistent conversation and
+> evidence-gated memory now exist in the default path. Do not use the historical gap table
+> to infer present behavior.
+>
+> Normative behavior comes from [`UMADEV_HOST_SPEC_V1`](../spec/UMADEV_HOST_SPEC_V1.md).
+> The current crate topology is documented in [`ARCHITECTURE.md`](ARCHITECTURE.md), and
+> the dated, evidence-backed maturity snapshot is
+> [`ENTERPRISE_MATURITY_AUDIT_2026-07-14.md`](ENTERPRISE_MATURITY_AUDIT_2026-07-14.md).
+> This document preserves why the architecture was chosen and the sequence in which
+> it was implemented.
+> It is not a completion certificate. The linked audit is a dated snapshot; current
+> release readiness must be established from the present test/CI results, the manual
+> terminal/OS matrix, and unresolved architecture/security findings rather than a
+> fixed count copied into this roadmap.
+>
+> It defines the target — **UmaDev: a coding agent that works like a real dev team,
+> commanding one of five AI coding CLIs you already use**: Claude Code, Codex, and
+> OpenCode through vendor-specific transports; Grok Build and Kimi Code through
+> isolated vendor profiles on the hardened ACP v1 core.
+> The product can simulate product, architecture, UI/UX, frontend, backend, QA,
+> security, and DevOps responsibilities through bounded base sessions coordinated by
+> a scheduling seat. These are role contracts, not independent people, and the roster
+> is proportional to task depth. The remainder preserves an honest gap analysis against the code at the time
+> and the executable, impact-ordered roadmap used to reach the target. The headline
+> — a coding agent that works like a real dev team — frames this
 > whole document: the team is how it works, a coordinator seat schedules and gates it,
 > and the layered architecture below is how that team is wired.
 >
-> **The product is the team.** A solo developer or a small team
-> instantly gets a full, disciplined development team — eight role specialists that
-> plan, build, review, and sign off like a real team, with a coordinator seat that
-> routes the request, owns the visible plan, schedules the team, enforces the gates,
-> and leaves the audit trail.
+> **The product is role-based team orchestration.** A coordinator routes the request,
+> owns the visible plan, schedules single-writer work and isolated advisory reviews,
+> enforces deterministic gates, and leaves an audit trail. This can reproduce useful
+> team disciplines; it does not make probabilistic model output equivalent to human
+> sign-off or guarantee that every task reaches commercial readiness.
 >
 > **Non-negotiable identity:** UmaDev is **firmware over a borrowed brain**. It owns
 > **no model**, brokers **no endpoint**, and does **not** re-implement the base's
@@ -26,11 +48,11 @@
 
 ---
 
-## 0. The one-sentence problem
+## 0. Historical baseline that motivated the roadmap
 
-The product the README/spec **describe** (a whole development team — driven by a
+At the time this roadmap was written, the product the README/spec **described** (a whole development team — driven by a
 coordinator that routes, plans, decomposes, schedules the team, delivers a proof-pack,
-and learns) is **not the product that ships by default**. The default path (`drive_director_loop`) is *one base build turn + ≤3
+and learns) was **not the product that shipped by default**. The then-default path (`drive_director_loop`) was *one base build turn + ≤3
 rounds of read-only QC*, fed by a *static* directive, with **no routing, no visible
 plan, no team scheduling, no learned-memory injection, and no codebase-context
 engine**. All of that intelligence exists in the tree but is either stranded in the
@@ -41,14 +63,25 @@ visible event surface) — not greenfield invention.
 
 ---
 
-## 1. Target Architecture — how the development team is wired
+## 1. Target architecture that guided the implementation
 
 UmaDev is one engine with five layers — the machinery that turns the eight-role team
 into a running system, coordinated by the scheduling seat. The base brain is
 consulted at **explicit decision points** to produce **typed artifacts UmaDev owns**;
-UmaDev then drives the base body deterministically against those artifacts. Everything is **fail-open**: any
-brain consult that fails or returns garbage falls back to a deterministic floor and
-never blocks the host.
+UmaDev then drives the base body deterministically against those artifacts. Advisory
+brain consults, retrieval and governance helpers have bounded degradation; they do
+not receive authority merely because a consult failed. Authentication, transport,
+hard-gate and verification failures are surfaced as degraded, incompatible, blocked
+or failed work rather than being translated into success.
+
+“Fail-open” here describes unavailable advisory cognition and governance error
+handling; it does **not** grant authority. Brain-selected writer admission is
+fail-closed: the current typed model route must contain the exact legal
+authorization `mutating`, and missing/blank/invalid authorization becomes
+read-only. The independent deterministic fallback can recognize only an
+unmistakable, explicitly scoped current-user request on the resident lane; it
+never inherits a malformed model verdict. Plan mode is an independent read-only
+ceiling.
 
 ```
                          ┌─────────────────────────────────────────────┐
@@ -60,43 +93,48 @@ never blocks the host.
               ┌──────────────────────────┼───────────────────────────────┐
               ▼                          ▼                                ▼
    ┌───────────────┐         ┌───────────────────────┐        ┌────────────────────┐
-   │  FAST PATH    │         │  DELIBERATE PATH       │        │  CLARIFY           │
-   │  chat / 1-2   │         │  L2 PLAN → L3 DRIVE     │        │  one batched, MCQ  │
-   │  line edit    │         │  → L4 VERIFY → L5 LEARN │        │  question, then    │
-   │  (no run-lock)│         │  (run-lock, gates)      │        │  re-route          │
+   │  LIGHT PATH   │         │  DELIBERATE PATH       │        │  CLARIFY           │
+   │  chat/explain │         │  L2 PLAN → L3 DRIVE     │        │  one batched, MCQ  │
+   │  or quick edit│         │  → L4 VERIFY → L5 LEARN │        │  question, then    │
+   │  lock if write│         │  (run-lock, gates)      │        │  re-route          │
    └───────────────┘         └───────────────────────┘        └────────────────────┘
               │                          │
               └──────────┬───────────────┘
                          ▼
-        L0  FIRMWARE INJECTION (every base session, every path):
-            identity + craft/anti-slop + JIT knowledge + learned-lessons digest
-            + repo-map slice + project-action ledger  (token-budgeted, curated)
+        L0  ROUTE-PROPORTIONAL FIRMWARE:
+            stable identity; then, as warranted, craft + JIT knowledge/pitfalls
+            + repo-map + project facts/run notes  (token-budgeted, curated)
 ```
 
 ### L0 — Firmware injection (the borrowed-brain conditioning layer)
 
-The single boundary where UmaDev conditions the base session. **Today this is
-asymmetric and thin on the live path** — `session_for` injects *no* system prompt;
+The single boundary where UmaDev conditions the base session. **At roadmap
+authoring this was asymmetric and thin on the live path** — `session_for` injected *no* system prompt;
 the only firmware is a static `director_build_directive` string. Target: **one
 `umadev_agent::context::compose_firmware(root, route, requirement)`** that *every*
 path (chat, fast, deliberate) calls to build a curated, token-budgeted system prompt:
 
 - **Identity** — senior director + the seat the current step needs (`experts::agentic_team_identity`).
-- **Craft / anti-slop law** — `experts::ANTI_SLOP_LAW` + `agentic_engineering_rules` (already strong; just always-on).
-- **JIT knowledge** — `umadev_knowledge::retrieve` keyed on *requirement + stack + current step* (BM25↔vector + HyDE/RRF), returned as a small digest, **not** the whole corpus. Curated to a budget, not front-loaded.
-- **Learned-lessons digest** — `lessons::lessons_for_error` / recurring-pitfall recall keyed on the detected stack fingerprint (today this fires *only* in `runner.rs`).
-- **Repo-map slice** — a token-budgeted, intent-personalized signature outline of the user's code (new; see L1/Wave 3).
-- **Project-action ledger digest** — a compact "what I've done this session" from an owned JSONL (new), so the agent can answer "what did you just do" from ground truth, not the base's fuzzy recall.
+- **Craft / anti-slop law** — selected for mutating craft routes rather than imposed on pure Chat.
+- **JIT knowledge + pitfalls** — a bounded digest keyed on requirement, stack and step; the full knowledge/pitfall path is reserved for Full-tier work. BM25 is the lexical floor, while vectors/HyDE are conditional.
+- **Repo-map slice** — a token-budgeted, intent-personalized signature outline for work routes when source is present.
+- **Project facts** — safe, non-stale entries from `.umadev/memory/facts.jsonl`, recalled on work-class turns.
+- **Run notes** — bounded, untrusted same-run history from `.umadev/run-notes.md`, written by UmaDev only after a step made progress and passed deterministic acceptance. Failed/blocked/empty-review steps do not write, and notes never authorize work.
 
-> **Governance contract is preserved:** firmware is injected into the base's *own*
-> native system-prompt / settings surface (each of the three bases has one). UmaDev
-> declares policy; the base executes. We never own cognition.
+> **Governance contract is preserved:** firmware is delivered through the selected
+> base's supported prompt or protocol surface. Claude Code, Codex, and OpenCode keep
+> their vendor-specific transports; Grok Build uses a dedicated profile over the
+> hardened ACP v1 core. Authentication, permission
+> modes, and resume support are negotiated or handled by the base, never invented by
+> UmaDev. UmaDev declares policy; the base executes. We never own cognition.
 
-**Token economy** (the discipline that prevents "context rot"): identity + active-step
-craft + governance are always-on and *small*; knowledge and repo-map are *JIT-retrieved
-and budgeted*; prior-phase artifacts are *compacted to decisions, not transcripts*.
+**Token economy** (the discipline that prevents "context rot"): identity is always
+small; craft, governance, knowledge and repo-map are selected only after the current
+turn is routed and are budgeted in proportion to that route; prior-phase artifacts
+are compacted to decisions, not transcripts. Plain conversation therefore does not
+inherit build/governance instructions.
 
-### L1 — Intelligent Router (`umadev_agent::router`, NEW)
+### L1 — Intelligent Router (`umadev_agent::router`, shipping)
 
 The missing brain. Replaces the two current "classifiers" — `looks_like_work_request`
 (a substring toggle that only gates injection) and `planner::classify` (a keyword
@@ -115,21 +153,41 @@ pub struct RoutePlan {
 }
 ```
 
-**Two-tier, fail-open:**
-- **Tier-0 (deterministic, zero latency):** `planner::classify` + `looks_like_work_request` catch the obvious (greeting → Chat; "改个文案" → QuickEdit). This is the floor and the fallback.
-- **Tier-1 (brain-assisted):** for anything ambiguous, a cheap **structured-JSON consult on a `fork()`ed read-only session** (modeled exactly on the existing `surface_intake_plan`, which already proves the pattern works) returns `{class, kind, complexity, needs, scope, risks, confidence}`. Reconciled with the Tier-0 prior: **brain wins, but never drops below the deterministic safe floor** (it may escalate depth/team, never silently de-scope below what keywords flagged dangerous).
+**Model-first, fail-open:**
+- **Healthy path:** every ordinary natural-language turn receives one structured-JSON semantic decision on a fresh read-only child of the selected base. The decision contains `{class, authorization, kind, complexity, needs, scope, risks, confidence}` and is authoritative in both directions: terse real work may be promoted, while keyword-heavy explanation/status questions may be downgraded to read-only.
+- **Availability fallback:** deterministic parsing is used only when the selected model cannot return a valid decision. It is conservative and may execute an unmistakable scoped request on the resident lane, but it cannot launch Director, a role team, or flagship post-build QC on its own.
+- **Authorization ceiling:** a brain-selected writer route requires the exact valid typed value
+  `authorization: "mutating"`; missing, blank, or invalid authorization fails closed
+  to read-only Explain with no team. Explicit read-only wording and Plan mode can
+  narrow a verdict, and Plan can never be widened by the model. Inherited
+  conversation, plans, TODOs and project documents are context, never current-turn
+  authority. Deterministic fallback is computed independently from explicit current
+  user text and cannot reinterpret an invalid authorization field as permission.
 
 **Decision points:**
-- `class == Chat | Explain` → **Fast path**, no run-lock, light firmware.
-- `class == QuickEdit | Debug` and `depth == Fast` → fast single-writer turn + targeted verify.
-- `class == Build` or `depth >= Standard` → **Deliberate path** (L2→L5), run-lock, gates, team.
+- `class == Chat | Explain` → read-only light path, no writer run-lock.
+- `class == QuickEdit | Debug` and `depth == Fast` → fast single-writer turn;
+  after a code write, completion additionally requires an observed successful
+  targeted verification after the last code write. Mutation alone is neither
+  Director admission nor full completion.
+- every `class == Build`, plus `class == Debug` at `Standard | Deep` → **Director path** (L2→L5), owned plan, run-lock, proportional gates/team/QC.
 - `needs_clarify.is_some()` → emit **one** batched multiple-choice question via the existing `ClarifyGate`, then re-route. Hard rule injected: *never ask what you can discover by reading the code.*
 
-**The decision is surfaced** (`EngineEvent::IntentDecided`) so the user *sees* the route: "这是一个小修改，直接做" vs "这是完整产品，进入研发流程 (~20 min, will create files under src/)." Routing is legible, and the user can override (`/run` forces Deep, `/quick` forces Fast).
+**The decision is surfaced** (`EngineEvent::IntentDecided`) on the governed path so
+the user sees why a request entered the development workflow. Explicit `/run` is an
+unambiguous Build entry; ordinary conversation remains quiet and proportional.
 
-### L2 — Planning & Scheduling (`umadev_agent::plan_state`, NEW)
+**Live authority remains separated after routing.** During a writer run, only an
+explicit correction to the current task enters steer; questions and future/ambiguous
+work queue FIFO for fresh routing after settlement. At a confirmation gate, a
+question is answered through an independent read-only query without advancing the
+gate, and the gate becomes actionable only after the writer session has ended its
+current boundary. Cancellation clears the native resume/session hand-back and writes
+a conversation control boundary so the next turn cannot revive cancelled work.
 
-The keystone of "feels like a real agent." Today there is **no `Plan` data structure**;
+### L2 — Planning & Scheduling (`umadev_agent::plan_state`; introduced by this roadmap)
+
+The keystone of "feels like a real agent." At roadmap authoring there was **no `Plan` data structure**;
 the plan lives invisibly in the base's head and the 9-dot phase bar sits frozen at
 `0/9` during a director run.
 
@@ -141,7 +199,7 @@ the plan lives invisibly in the base's head and the 9-dot phase bar sits frozen 
   ```
   This is a **dependency DAG**, not a flat list — independent nodes are parallelizable, and `acceptance` makes each step's "done" mechanical, not vibes-based.
 - **Visible & steerable:** persisted to `.umadev/plan.json`; rendered live in the TUI as a checklist that ticks off (`[x] scaffold · [~] auth route · [ ] login form  3/8`). A `/plan` command lets the user **reorder / skip / add / veto** a step, folded back into the next directive over the same session. This converts gate-only intervention into step-level control.
-- **Scheduling = single-writer + map-reduce-manage** (the Devin/Anthropic doctrine, to be locked as a spec clause): **doing-roles drive the main session serially** under the run-lock (one writer — actions carry implicit decisions that conflict if parallelized); **reviewing critics run on parallel `fork()`ed read-only sessions** and return bounded `RoleVerdict`s. Decomposable doing-work (per-module, per-route) may fan out to **isolated forked sub-sessions** that return only a structured summary; writes still serialize through the one main session. The team scales with `RoutePlan.depth/team`, on **every** path — not just `/run`.
+- **Scheduling = single-writer + map-reduce-manage:** doing roles drive the main session serially under the run-lock; reviewing critics use fresh Plan-profile child sessions and return bounded `RoleVerdict`s. Critic verdicts are advisory and may be unavailable/empty without deciding success. Observable base-native child work is journaled, but vendor completion is not acceptance; the parent step must still pass the deterministic floor. The team scales with `RoutePlan.depth/team`, and Chat/Explain or narrow fast edits do not convene the full roster.
 
 ### L3 — Director Intelligence: drive, adapt, self-correct (`director_loop` rebuilt)
 
@@ -151,55 +209,66 @@ evidence-grounded**:
 1. **Drive** each ready step (deps satisfied) as a `summon(Serial)` directive — finally using the dead `director::summon` lever.
 2. **Verify against that step's `acceptance`** using the **deterministic floor only** (coverage / contract / runtime-proof / build-test). Critic verdicts stay **advisory**; the floor is the only thing that flips a step to done or forces rework. Hard rule in firmware: *an open loop that declares done without a green gate is a defect.*
 3. **Self-correct with diagnosis, not "go fix it":** tag each blocking finding with a class (build / contract / coverage / behavior / craft), attach the matching `error_kb` playbook + recalled `lessons`, and fold a **concrete** rework directive (with raw failing-test/stderr evidence) back into the session.
-4. **Adapt / escalate** with a typed blocker disposition per finding — `Investigate | FixAdjacent | NoteAndContinue | Escalate`. Only `Escalate` consumes the bounded gap/stall counter; `NoteAndContinue` records to `lessons` without burning a rework round. On a *recurring* identical finding (stuck-detector over the event log: same error/directive fingerprint N times), **change strategy** (reflect, narrow to the failing file, split the step) or exit cleanly as `BLOCKED{reason, evidence}` — never spin.
+4. **Targeted adapt / escalate:** every current blocker receives a typed disposition (`Investigate | FixAdjacent | NoteAndContinue | Escalate`). A run-local tracker counts stable error fingerprints independently and compares source-tree snapshots; the second unchanged observation changes strategy, while the third stops the ineffective repair loop with bounded evidence. Source progress resets the count. An unverified finding is never written directly into `lessons`.
 5. **Decide when to involve the user:** clarify only at L1 (intent) and at the two confirm gates; otherwise drive autonomously within the trust tier. Irreversible/out-of-scope actions always hit the floor.
 
-> **Implementation status (honest).** Steps 1–2 ship in full (`drive_plan_steps` →
-> `director::summon` per ready step, deterministic-floor acceptance per step). Step 3
-> ships the **concrete, evidence-bearing** rework directive (raw failing-test/stderr
-> folded back) + **recalled `lessons`**; the per-finding *class tag* + `error_kb`
-> *playbook lookup* are a refinement still on the bench. Step 4 ships a **bounded
-> gap/stall counter** that exits cleanly as `BLOCKED{reason, evidence}` rather than
-> spinning — the **typed `BlockerDisposition`** and the **fingerprint-based
-> stuck-detector** are the L3 target, not yet the shipped mechanism. Treat the typed
-> disposition / playbook lookup as roadmap, not a current guarantee.
+> **Implementation status (honest).** Steps 1–4 ship on the default Director path.
+> `drive_plan_steps` invokes `director::summon` per ready step and accepts only the
+> deterministic floor. Step, team-review and whole-build QC findings are classified
+> as build / contract / coverage / behavior / craft, receive classifier-owned
+> `error_kb` root-cause/playbook guidance, and carry raw failing-test/stderr evidence
+> plus recalled exact lessons where available. The run-local fingerprint tracker
+> changes strategy on the second unchanged observation and settles `Failed` on the
+> third, unless a source-tree change resets it. The same `Failed` settlement is
+> mandatory for Active/Pending/incomplete plans, dirty final QC, or residual findings
+> after the round/time budget; none may become `Done`. This diagnoses known families;
+> generic findings deliberately stay `Investigate` rather than inventing a repair.
 
 **Context survival across a long build:** a **compaction module** clears consumed
 tool outputs first, then (if still over budget) summarizes into a fixed template
 (*Primary Intent · Files & Code · Errors & Fixes · Pending Tasks · Current Work · Next
 Step*), reopening the session seeded with the summary + most-recent artifacts. Plan
-progress + a `PROGRESS.md`-style state file are re-read on every step entry, so the
-session survives compaction and process restart.
+progress from `.umadev/plan.json` plus bounded `.umadev/run-notes.md` history can be
+re-read at step boundaries. Run notes are not a complete transcript or a promise of
+exact vendor-session restoration; exact resume remains capability-specific.
 
 ### L4 — Mature functions & verification (deterministic floor, on by default)
 
 - **Acceptance gate is real and required for heavyweight kinds:** `coverage` (FR→step) + `acceptance` (task→API) + `umadev-contract` validation + `verify --runtime` (boot + route probe → `runtime-proof.json`) become **required signals on the default deliberate path**, not legacy-only. For bugfixes, require a **failing reproduction test that actually reproduces the issue**, gated on red→green plus regression staying green.
 - **Delivery artifacts restored on the default path:** `output/*-prd.md`, `-architecture.md`, `-uiux.md`, scorecard HTML, and the zipped **proof-pack** — lifted out of `phases.rs` into a `director::finalize()` that runs once QC is clean (gated by depth, so a todo page doesn't get a proof-pack).
 - **Owned baseline SAST** so `security` produces findings tool-free (extend the `rules` engine with injection / missing-auth / hardcoded-secret heuristics); gitleaks/semgrep remain optional upgrades.
-- **Git as the trust substrate:** auto-commit each accepted step on a derived `umadev/<task>` branch (attributed `umadev via <base-id>`), never the user's working/default branch, **never auto-merge**; `rollback` = real git revert; per-turn checkpoints decoupled from the user's `.git`.
+- **Git trust substrate (target, not fully shipped):** the roadmap proposed auto-committing every accepted step and implementing rollback as real `git revert`. Current isolation is narrower: a clean Git worktree can use a derived `umadev/<task>` branch; non-Git or dirty worktrees report that isolation was skipped. Checkpoints are not a claim that every accepted step is auto-committed. UmaDev never auto-merges or pushes.
 
-### L5 — Memory & learning (active on the live path)
+### L5 — Memory & learning (evidence-gated on the live path)
 
-- **Episodic vs semantic split, consolidate on a separate reflection pass** (don't summarize at write-time): keep raw, stack-fingerprinted pitfall episodes; a periodic reflection scores by recency × relevance × salience and writes **semantic rules** + **procedural skills** without deleting episodes.
-- **Correction-as-documentation, re-injected as firmware:** on a true recurrence, a `Reflection` compiles a concrete prevention rule keyed by stack fingerprint into the **next run's L0 injection** — so the same class of mistake is *prevented*, not just logged. Optionally auto-promote a durable reflection into a committed `AGENTS.md`/`.umadev/rules/` artifact (shareable, diff-reviewable).
-- **All capture sites wired into `director_loop`** (`capture_dev_errors` / `capture_validated_patterns` / `record_tool_call` / `record_usage`) so `/lessons` and `/usage` and the audit trail are real on the default path — for all three bases, not just claude.
+- **Pitfalls and lessons:** project incidents count independent episodes, not repeated stderr lines. A recurrence may produce a pending candidate; validation requires the exact repair attempt followed by the same verifier passing. Generic/unclassified incidents are quarantined rather than injected as advice.
+- **Learned skills and recipes:** both are project-local candidates. Non-trivial clean delivery is required for skill graduation; recipes require strict stack/kind/shape matching. Retrieval alone is not use evidence: an exact prompt-delivery receipt plus deterministic pass/fail/unknown outcome settles later utility, with unknown neutral.
+- **Facts:** stable project/environment facts are extracted after meaningful work by a bounded read-only pass, secret-filtered, and recalled only on work-class turns. Stale, contradictory, or missing-path facts are demoted/tombstoned.
+- **Run notes:** UmaDev writes at most one bounded note after a plan step both makes progress and passes deterministic acceptance. Failures, blocked steps and empty reviews do not write; the base cannot write the file directly. Notes are same-run untrusted history, not authorization or completion evidence.
+- **No automatic policy promotion:** the live path does not promise periodic semantic consolidation, automatic prevention, cross-project procedural learning, or auto-commits into `AGENTS.md`/rules. Those are product hypotheses requiring separate evidence and user review.
+
+Memory capture and recall are fail-soft, while exact sent-memory receipts keep outcome attribution auditable. Event richness remains transport-specific; a capability that Grok Build does not advertise is not guessed.
 
 ### Conversation as a first-class surface
 
-Chat is the everyday surface and is currently a goldfish: the `conversation` buffer
-is built, trimmed to 16, and **never sent** to the brain (memory is delegated entirely
-to the base's `--resume`); restart = amnesia; offline chat returns empty; chat and
+Chat is the everyday surface and was then a goldfish: the `conversation` buffer was
+built, trimmed to 16, and **never sent** to the brain (memory was delegated entirely
+to a native resume mechanism); restart meant amnesia; offline chat returned empty; chat and
 `/run` use **disjoint** sessions. Target:
 
-- **Send UmaDev's own bounded transcript every turn** (base `--resume` becomes belt-and-suspenders, not the only memory).
+- **Send UmaDev's own bounded transcript every turn** (native resume or negotiated ACP `session/resume` / `session/load` becomes belt-and-suspenders, not the only memory).
 - **Persist + resume chat sessions per project** (`.umadev/chat/<id>.json`), with `/sessions` and `/resume`.
 - **Unify chat ↔ `/run` memory:** hand the finished director session back to chat so "what did you just build?" continues the *same* session that did the build.
 - **Context management:** token-budgeted summarize-and-fold (a `/compact` verb) instead of FIFO-drop-at-16.
-- **Offline/external brain:** a context-aware canned reply offline; an `External`/HTTP arm so chat has a brain even with no base CLI — still never owning cognition, just refusing to return silence.
+- **Offline fallback:** context-aware deterministic templates may support demos/tests, but they are not a coding brain and must not claim completed work. The proposed `External`/HTTP model arm is retired as contrary to the product identity: UmaDev owns no model endpoint; real cognition requires one of the five authenticated bases.
 
 ---
 
-## 2. Honest Gap Analysis — current vs target
+## 2. Historical gap analysis — roadmap baseline vs target
+
+> The table in this section is intentionally retained as implementation history.
+> It is not a current defect list. Consult the dated enterprise audit for remaining
+> gaps and the code/tests for behavior.
 
 Ranked by impact on "not a real agent / not launchable."
 
@@ -227,7 +296,7 @@ team, delivery, memory) is dead code, legacy-only, or aspirational. The launch g
 
 ---
 
-## 3. Roadmap to Commercial Launch — impact-ordered Waves
+## 3. Historical implementation roadmap — impact-ordered waves
 
 Each wave is a coherent shippable increment. **TS** = table-stakes (a launch can't ship
 without it). **DIFF** = differentiating (the reason a user picks UmaDev). Every brain
@@ -259,7 +328,7 @@ base, slower" into "a director ran my project."
 live path, so the depth that already exists in the tree is on by default.
 
 **Deliverables**
-1. **`compose_firmware`** — `umadev-agent/src/context.rs` (NEW/expanded): one builder injecting identity + craft + JIT knowledge digest + lessons digest, called by **all** paths. Apply it in `host::session_for` (`host/lib.rs:1205`) by accepting a system prompt for all three bases (claude `--append-system-prompt`/settings; codex/opencode native system text). Promote the rich TUI composition (`lib.rs:1336`) to the director caller.
+1. **`compose_firmware`** — `umadev-agent/src/context.rs` (NEW/expanded): one builder for stable identity plus a route-proportional overlay. Chat stays light; work routes select craft, repo context, facts, and (at Full tier) JIT knowledge/pitfalls. The original wave applied the delivery contract to the three vendor-specific bases; the current implementation extends it to Grok Build through its negotiated ACP surface.
 2. **Drive the plan via `summon`** — wire `director::summon(Serial)` into `director_loop` for each Build step; `summon(Parallel)`/`review` for Review steps. Map-reduce-manage: decomposable steps fan to isolated forked sub-sessions returning structured summaries.
 3. **Brain-assisted team sizing** — lift `*_team_for_kind` (`critics.rs:570`) out of `/run`-only; size the roster from `RoutePlan.team`/depth on every path.
 4. **Wire learned memory + audit + usage into the default loop** — call `lessons::capture_*` / `record_tool_call` / `record_usage` from the `drive_one_turn` event pump (`director_loop.rs:365-378`); inject recalled pitfalls into the directive.
@@ -292,7 +361,7 @@ default path.
 **Deliverables**
 1. **`director::finalize()`** — lift artifact writers from `phases.rs:2129-2269`; produce PRD/architecture/uiux/scorecard/proof-pack once QC is clean, gated by depth.
 2. **Required acceptance floor for heavyweight kinds** — promote `coverage` + `acceptance` + `umadev-contract` + `verify --runtime` into the default deliberate path; for Bugfix, require a reproduction test (red→green) + green regression.
-3. **Diagnosed, escalating self-correction** — typed blocker disposition (`Investigate|FixAdjacent|NoteAndContinue|Escalate`); `error_kb` playbook + `lessons` folded into the fix directive; stuck-detector over the event log → strategy change or `BLOCKED{reason,evidence}`.
+3. **Diagnosed, escalating self-correction** — typed blocker disposition (`Investigate|FixAdjacent|NoteAndContinue|Escalate`); `error_kb` playbook + `lessons` folded into the fix directive; stuck-detector over the event log → strategy change or a public `Failed` settlement carrying bounded blocking evidence.
 4. **Owned baseline SAST** — extend `rules` with injection/missing-auth/secret heuristics so `security`/`report --review` find things tool-free.
 
 **Touches:** `umadev-agent/{director,director_loop,acceptance,coverage,security,error_kb}.rs`, `umadev-contract`, `umadev-governance/src/rules.rs`.
@@ -307,9 +376,9 @@ default path.
 **Deliverables**
 1. **Send UmaDev's transcript every turn** (`lib.rs:1352`); thread `conversation` into `AgenticTurn`. **Persist + resume per-project chat** (`.umadev/chat/<id>.json`); `/sessions`, `/resume`, `/compact` (token-budgeted summarize-and-fold replacing FIFO-16).
 2. **Unify chat ↔ `/run` memory** — don't close+clear the held session on run finish (`lib.rs:1877-1883`); hand it back to chat as the active session.
-3. **Engine unification & session-carrying `continue`** — `drive_director_loop` emits `GateOpened` + persists `workflow-state.json` (incl. `plan_steps`) at checkpoints so `continue`/`revise`/`redo` operate on the live engine; resume the **same** base session id (drivers already support `set_session_id`) instead of a cold one.
+3. **Engine unification & session-carrying `continue`** — `drive_director_loop` emits `GateOpened` + persists `workflow-state.json` (incl. `plan_steps`) at checkpoints so `continue`/`revise`/`redo` operate on the live engine; expose the gate only after the writer boundary has ended, answer gate-local questions through an independent read-only query, and resume the **same** base session id (drivers already support `set_session_id`) instead of a cold one.
 4. **Cross-session goal continuity** — on launch, if `.umadev/plan.json` has an unfinished plan, surface "resume goal X (step 3/7)?"; in `auto` tier, drive to completion.
-5. **Offline/external chat reply** — context-aware offline reply (no more empty `String::new()`); add an `External`/HTTP arm to `build_brain` for a base-less chat brain.
+5. **Offline chat reply** — context-aware deterministic fallback (no more empty `String::new()`). The once-proposed `External`/HTTP model arm was deliberately retired: it would make UmaDev a model-endpoint broker and violate the borrowed-brain identity.
 
 **Touches:** `umadev-tui/{lib,app}.rs`, `umadev-agent/{state,director_loop}.rs`, `umadev/src/main.rs`, `umadev-runtime/src/lib.rs`.
 
@@ -322,7 +391,7 @@ default path.
 
 **Deliverables**
 1. **Graduated trust + recovery UX** — decompose `TrustMode` into per-capability auto-approve (read auto / write guarded / shell confirm / network allowlist) with the always-on irreversible floor + a circuit breaker; turn aborts into action cards (`Retry / Switch base / Open log / Run doctor / Show login cmd`); adaptive stall threshold (longer during installs/builds).
-2. **Branch isolation + git substrate** — workspace-mutating runs operate on a derived `umadev/<task>` branch, never default, **never auto-merge**; per-turn checkpoints + real-git `rollback`.
+2. **Branch isolation + git substrate** — use a derived `umadev/<task>` branch when a clean Git worktree permits it; report a skip for non-Git/dirty worktrees and preserve existing changes; never auto-merge. Real-git rollback remains a separate target, not an implication of the current shadow checkpoint mechanism.
 3. **Governance parity disclosure** — run the content-governance scan after every base turn for codex/opencode; honestly surface real-time-hook parity.
 4. **Spec/docs/code reconciliation** — make the director/USB model canonical; demote the 9-phase chain to "the deep-commercial-build play the director may choose"; rewrite README "how it works / deliverables / team"; finish/close tasks #22 (delete or wire dead `summon`/`checkpoint`/`director_build` branches) and #23; retire the env-gated legacy engine or make it the director's internal "Deep" tier.
 5. **Cost/time expectation setting** + contextual discoverability nudges.
@@ -341,22 +410,22 @@ default path.
 
 ### Why a user picks UmaDev
 
-**vs the raw base CLI (claude-code / codex / opencode):** UmaDev is **firmware that makes
-the base behave like a senior delivery team** — it *routes* the request, *plans* visibly,
-*schedules a team* (serial doers + parallel reviewers), injects *curated engineering
-craft + anti-AI-slop taste + your project's knowledge + learned pitfalls*, verifies
-against a *deterministic acceptance floor* that can say no, and hands back a *proof-pack
-+ scorecard*. The bare base is a brilliant generalist with no taste floor, no plan you
-can steer, no team, no memory of your project, and no honesty gate. UmaDev keeps the
-base's brain and subscription (no second bill, no second login) and adds the **whole
-development-team layer the base lacks** (eight role specialists + a coordinator) — and
-it works across **all three** bases identically.
+**vs using a supported base CLI directly:** UmaDev adds a governance-and-delivery
+director: typed routing, a visible owned plan for deliberate work, single-writer
+execution, isolated advisory reviews, route-proportional standards/project memory,
+and a deterministic acceptance floor that can refuse completion. Some base CLIs may
+offer their own planning, subagents, memory, or safety features; the differentiator is
+UmaDev's consistent, inspectable contract over those capabilities, not a claim that a
+bare base has none. UmaDev keeps the base's brain and subscription (no UmaDev-owned
+model bill, API key, or login) and exposes that contract across **all five** first-class bases. The
+three vendor-specific transports and the isolated Grok Build/Kimi Code ACP profiles are not identical: authentication,
+permission modes, resume, and optional events remain vendor-specific and are used
+only when advertised or otherwise documented by that base.
 
-**vs Cursor:** Cursor's moat is its IDE + apply pipeline + index. UmaDev is **CLI/terminal-
-native, base-agnostic, and governance-first** — it brings the multi-seat review,
-anti-slop craft floor, proof-pack delivery, and self-evolving project memory that Cursor's
-single-model agent doesn't. UmaDev borrows whatever brain the user already pays for
-instead of locking them to one vendor's model.
+**vs using a base directly:** the selected base keeps its own model, tool loop, and
+vendor strengths. UmaDev adds a terminal-native, governance-first director layer:
+multi-seat review, an anti-slop craft floor, proof-pack delivery, and evolving project
+memory without taking over the base's account or model endpoint.
 
 **vs Devin:** Devin owns its model, VMs, and ACU economics. UmaDev is the **open,
 local-first, bring-your-own-brain** director: the same single-writer/map-reduce-manage
@@ -364,7 +433,7 @@ doctrine and plan-before-spend checkpoint, but running on the user's existing ba
 subscription, on their machine, with their data, with a transparent audit trail — no
 proprietary endpoint, no ACU meter.
 
-### What must be true for that to hold (the launch bar)
+### Original launch bar (retained for architectural review)
 
 1. **The default path must deliver the firmware** (W2) — today it barely beats the bare base. *Non-negotiable.*
 2. **Routing + a visible, steerable plan must be real** (W1) — this is the felt difference between "agent" and "wrapper."
@@ -372,9 +441,10 @@ proprietary endpoint, no ACU meter.
 4. **The acceptance gate must say no, and delivery must produce proof** (W4) — "commercial-grade" is verification + shareable artifacts, not vibes.
 5. **It must remember across turns and sessions** (W5) — a goldfish never feels like a colleague.
 6. **The first-run signal must be honest and the docs must match the product** (W1 auth probe, W6 reconciliation) — trust is lost permanently at the first lie.
-7. **All of it stays fail-open firmware over a borrowed brain** — the moat is the *deterministic director shell + taste + memory + governance*, with the base as a swappable cognition source. The day UmaDev owns a model or forks the base loop, it loses its identity and its reason to exist.
+7. **Advisory subsystems stay fail-soft over a borrowed brain** — retrieval, critics and governance bugs degrade safely, while writer authorization, irreversible actions, hard gates and completion evidence remain fail-closed or explicitly failed. The day UmaDev owns a model endpoint or forks the base loop, it loses its identity and its reason to exist.
 
 > **The bet:** the 2026 differentiator is no longer price or raw model IQ — it's *the
-> loop, the gates, the plan, the taste, the memory, and the transparency*. UmaDev's
-> assets for all six already exist in the tree. Launch is the act of wiring them onto
-> the path users actually hit, and making the director *visible*.
+> loop, the gates, the plan, the taste, the memory, and the transparency*. The tree
+> contains implementations for these areas, but commercial readiness still depends
+> on present CI, real-terminal/platform validation, evidence quality, and the honest
+> capability boundaries documented above.

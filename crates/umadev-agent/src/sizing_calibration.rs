@@ -209,7 +209,7 @@ impl SizingStats {
     }
 
     /// Record ONE scored run for `class`. A brand-new class is only inserted while under
-    /// the [`MAX_CLASSES`] cap (a runaway guard); an already-tracked class always updates.
+    /// the internal class cap (a runaway guard); an already-tracked class always updates.
     pub fn observe(&mut self, class: &str, predicted: SizeRank, actual: SizeRank) {
         if !self.classes.contains_key(class) && self.classes.len() >= MAX_CLASSES {
             return;

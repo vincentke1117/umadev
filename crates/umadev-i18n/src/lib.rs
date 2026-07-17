@@ -284,6 +284,37 @@ mod tests {
     }
 
     #[test]
+    fn retired_backends_are_not_advertised_by_the_catalog() {
+        for lang in Lang::ALL {
+            for key in [
+                "backend.cursor",
+                "backend.codebuddy",
+                "backend.droid",
+                "backend.qwen",
+                "tui.cmd.cursor",
+                "tui.cmd.codebuddy",
+                "tui.cmd.droid",
+                "tui.cmd.qwen",
+            ] {
+                assert_eq!(
+                    t(lang, key),
+                    key,
+                    "{key} must stay absent for {}",
+                    lang.code()
+                );
+            }
+            let who = t(lang, "chitchat.who");
+            for retired_name in ["Cursor", "CodeBuddy", "Droid", "Qwen"] {
+                assert!(
+                    !who.contains(retired_name),
+                    "{} who-am-I text still advertises {retired_name}: {who}",
+                    lang.code()
+                );
+            }
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // a flat registry of guarded keys; length is data, not logic.
     fn migrated_tui_keys_present_in_all_langs() {
         // Guard the keys migrated out of hard-coded TUI strings (overlay / help
@@ -294,6 +325,7 @@ mod tests {
         // while still shipping a wrong-language string; this test fails loudly
         // and tells them to add the key in all three catalogs.
         const MIGRATED: &[&str] = &[
+            "backend.migration.retired",
             "run.classified_build_memo",
             "checkpoint.phase_label",
             "checkpoint.manual_label",
@@ -402,7 +434,14 @@ mod tests {
             // Phase-2-C-P1: the persistent token/cost gauge in the meta row, and
             // the idle double-Esc rewind hint.
             "tui.gauge.tokens",
+            "tui.gauge.tokens_lower_bound",
+            "tui.gauge.usage_unknown",
             "tui.gauge.cost",
+            "tui.gauge.cost_exact",
+            "tui.gauge.cost_unknown",
+            "tui.wait.tokens",
+            "tui.wait.tokens_lower_bound",
+            "tui.wait.usage_unknown",
             // Live context-window occupancy gauge + the proactive one-shot
             // compaction nudge fired when it crosses the high threshold.
             "tui.gauge.context",
@@ -565,9 +604,10 @@ mod tests {
             "continuous.governance_clean",
             "continuous.governance_remaining",
             "continuous.governance_rework_intro",
-            // Wave 1 (director-driven `/run`): the director path's terminal report
-            // + its objective source-present hard-stop.
+            // Wave 1 (director-driven `/run`): the director path's terminal reports
+            // (done / paused) + its objective source-present hard-stop.
             "director.run_done",
+            "director.run_paused",
             "director.no_source_hardstop",
             // Wave 5 (memory + conversation): persistent chat restore, the
             // /sessions //resume //compact surfaces, cross-session goal continuity,
@@ -651,6 +691,27 @@ mod tests {
             "tasks.status.failed",
             "tasks.status.stopped",
             "tui.cmd.tasks",
+            "processes.fetching",
+            "processes.stopping",
+            "processes.session_changed",
+            "processes.not_active",
+            "processes.unsupported",
+            "processes.failed",
+            "processes.empty",
+            "processes.header",
+            "processes.kind.bash",
+            "processes.kind.monitor",
+            "processes.status.running",
+            "processes.status.completed",
+            "processes.status.exit",
+            "processes.status.signal",
+            "processes.truncated",
+            "processes.stop.killed",
+            "processes.stop.already_exited",
+            "processes.stop.not_found",
+            "processes.invalid_id",
+            "processes.usage",
+            "tui.cmd.processes",
             "tui.chip.run",
             "tui.chip.run_indeterminate",
             // Large-paste collapse: a bulky bracketed paste folds into this

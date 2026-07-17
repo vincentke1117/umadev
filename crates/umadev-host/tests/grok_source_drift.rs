@@ -1,0 +1,446 @@
+use std::path::{Path, PathBuf};
+
+use umadev_host::grok_contract::{
+    GROK_BUILD_SOURCE_ACP_SCHEMA_VERSION, GROK_BUILD_SOURCE_ACP_VERSION, GROK_BUILD_SOURCE_COMMIT,
+    GROK_BUILD_SOURCE_VERSION,
+};
+
+fn source_root() -> Option<PathBuf> {
+    std::env::var_os("UMADEV_GROK_SOURCE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn read(root: &Path, relative: &str) -> String {
+    std::fs::read_to_string(root.join(relative))
+        .unwrap_or_else(|error| panic!("read pinned Grok source {relative}: {error}"))
+}
+
+fn source_head(root: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap_or_else(|error| panic!("read pinned Grok source commit: {error}"));
+    assert!(
+        output.status.success(),
+        "git rev-parse failed for pinned Grok source: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("pinned Grok source commit is UTF-8")
+        .trim()
+        .to_string()
+}
+
+fn assert_markers(source: &str, contract: &str, markers: &[&str]) {
+    for marker in markers {
+        assert!(
+            source.contains(marker),
+            "missing audited {contract} marker {marker}"
+        );
+    }
+}
+
+#[test]
+fn pinned_grok_source_still_matches_the_audited_wire_contract() {
+    let Some(root) = source_root() else {
+        eprintln!("skipped: UMADEV_GROK_SOURCE_DIR is set by the source-contract CI job");
+        return;
+    };
+
+    assert_eq!(source_head(&root), GROK_BUILD_SOURCE_COMMIT);
+
+    let workspace = read(&root, "Cargo.toml");
+    assert!(workspace.contains(&format!(
+        "agent-client-protocol = {{ version = \"{GROK_BUILD_SOURCE_ACP_VERSION}\""
+    )));
+
+    for manifest in [
+        "crates/codegen/xai-grok-pager/Cargo.toml",
+        "crates/codegen/xai-grok-pager-bin/Cargo.toml",
+        "crates/codegen/xai-grok-shell/Cargo.toml",
+    ] {
+        assert!(
+            read(&root, manifest).contains(&format!("version = \"{GROK_BUILD_SOURCE_VERSION}\""))
+        );
+    }
+
+    let lock = read(&root, "Cargo.lock");
+    assert!(lock.contains(&format!(
+        "name = \"agent-client-protocol-schema\"\nversion = \"{GROK_BUILD_SOURCE_ACP_SCHEMA_VERSION}\""
+    )));
+
+    let auth = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/extensions/auth.rs",
+    );
+    for method in ["x.ai/auth/get_url", "x.ai/auth/submit_code"] {
+        assert!(
+            auth.contains(method),
+            "missing audited auth method {method}"
+        );
+    }
+    assert!(
+        auth.contains("let rx = agent.auth_url_rx.borrow_mut().take()"),
+        "auth URL is no longer a one-shot receiver; re-audit the bootstrap poller"
+    );
+
+    // Interactive auth is explicitly user-authorized in UmaDev because this
+    // pinned Grok build opens browsers itself. Lock both the loopback ordering
+    // (browser open before URL delivery) and device ordering (URL delivery
+    // before detached browser open); neither behavior may be guessed after a
+    // source bump.
+    let oidc_login = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/auth/oidc/login.rs",
+    );
+    let loopback_open = oidc_login
+        .find("webbrowser::open(&auth_url)")
+        .expect("missing audited loopback browser open");
+    let loopback_send = oidc_login
+        .find("if let Some(tx) = url_tx")
+        .expect("missing audited loopback URL delivery");
+    assert!(
+        loopback_open < loopback_send,
+        "loopback browser/URL order changed; re-audit interactive auth UX"
+    );
+
+    let device_login = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/auth/device_code.rs",
+    );
+    let device_send = device_login
+        .find("if let Some(tx) = channels.url_tx")
+        .expect("missing audited device URL delivery");
+    let device_open = device_login
+        .find("open_browser_detached(&display_uri).await")
+        .expect("missing audited device browser open");
+    assert!(
+        device_send < device_open,
+        "device browser/URL order changed; re-audit interactive auth UX"
+    );
+
+    let pager_effects = read(
+        &root,
+        "crates/codegen/xai-grok-pager/src/app/effects/mod.rs",
+    );
+    assert!(pager_effects.contains("for i in 0..60"));
+    assert!(pager_effects.contains("Duration::from_millis(50)"));
+
+    let folder_trust = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/agent/mvp_agent/folder_trust_prompt.rs",
+    );
+    for marker in [
+        "x.ai/folder_trust/request",
+        "x.ai/folderTrust",
+        "interactive",
+        "TRUST_PROMPT_TIMEOUT",
+    ] {
+        assert!(
+            folder_trust.contains(marker),
+            "missing audited Folder Trust marker {marker}"
+        );
+    }
+
+    let permission_prompter = read(
+        &root,
+        "crates/codegen/xai-grok-workspace/src/permission/prompter.rs",
+    );
+    for marker in [
+        "acp::PermissionOptionKind::AllowOnce",
+        "acp::PermissionOptionKind::AllowAlways",
+        "acp::PermissionOptionKind::RejectOnce",
+        "acp::PermissionOptionKind::RejectAlways",
+        "RequestPermissionOutcome::Cancelled",
+    ] {
+        assert!(
+            permission_prompter.contains(marker),
+            "missing audited permission marker {marker}"
+        );
+    }
+
+    // UmaDev deliberately does not re-authenticate an advertised cached token:
+    // initialize has already refreshed and selected it, while Grok's later
+    // cached-token fallback currently replaces the caller's meta before entering
+    // interactive grok.com auth. Keep both sides of that source dependency pinned.
+    let acp_agent = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs",
+    );
+    for marker in [
+        "let mut has_cached_token = init_has_current",
+        "self.auth_manager.auth().await.is_ok()",
+        "self.set_auth_method(default_id)",
+        "self.seed_client_config_auth_if_available()",
+    ] {
+        assert!(
+            acp_agent.contains(marker),
+            "missing audited cached-auth marker {marker}"
+        );
+    }
+    let agent_ops = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs",
+    );
+    assert!(agent_ops.contains("\"use_oauth\" : true"));
+
+    let updates = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/extensions/notification.rs",
+    );
+    for update in [
+        "TaskBackgrounded",
+        "TaskCompleted",
+        "subagent_spawned",
+        "subagent_progress",
+        "subagent_finished",
+        "TurnCompleted",
+    ] {
+        assert!(updates.contains(update), "missing audited update {update}");
+    }
+
+    let slash = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/session/slash_commands.rs",
+    );
+    assert!(slash.contains("trimmed.strip_prefix('/')"));
+    assert!(read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs"
+    )
+    .contains("slash_commands::resolve"));
+
+    let wire_tags = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/session/wire_tags.rs",
+    );
+    assert!(wire_tags.contains("available_commands_update"));
+    assert!(read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/session/acp_session_impl/updates.rs"
+    )
+    .contains("SessionUpdate::CurrentModeUpdate"));
+    assert!(read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/session/turn_completion.rs"
+    )
+    .contains("TurnCompleted"));
+}
+
+#[test]
+fn pinned_grok_source_still_matches_the_audited_subagent_contract() {
+    let Some(root) = source_root() else {
+        eprintln!("skipped: UMADEV_GROK_SOURCE_DIR is set by the source-contract CI job");
+        return;
+    };
+
+    assert_eq!(source_head(&root), GROK_BUILD_SOURCE_COMMIT);
+
+    // Lifecycle notifications are carried on the parent session while naming
+    // the child session that subsequent child-scoped traffic belongs to.
+    let notification = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/extensions/notification.rs",
+    );
+    assert_markers(
+        &notification,
+        "subagent lifecycle wire",
+        &[
+            "pub struct SessionNotification",
+            "pub session_id: acp::SessionId",
+            "SubagentSpawned {",
+            "parent_session_id: String",
+            "parent_prompt_id: Option<String>",
+            "child_session_id: String",
+            "SubagentProgress {",
+            "context_window_tokens: u64",
+            "context_usage_pct: u8",
+            "SubagentFinished {",
+            "status: String",
+            "will_wake: bool",
+        ],
+    );
+
+    // The parent-to-child route must be announced before the child can emit a
+    // prompt-side update or reverse request.
+    let subagent_request = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/agent/subagent/handle_request.rs",
+    );
+    let spawned = subagent_request
+        .find("SessionUpdate::SubagentSpawned {")
+        .expect("missing audited SubagentSpawned emission");
+    let child_prompt = subagent_request[spawned..]
+        .find(".send(SessionCommand::Prompt {")
+        .map(|offset| spawned + offset)
+        .expect("missing audited child SessionCommand::Prompt dispatch");
+    assert!(
+        spawned < child_prompt,
+        "child prompt moved before SubagentSpawned; re-audit child-session routing"
+    );
+    assert_markers(
+        &subagent_request[spawned..child_prompt],
+        "spawn-before-child-prompt",
+        &[
+            "&ctx.parent_session_id",
+            "child_session_id: child_session_id.0.to_string()",
+            "parent_session_id: ctx.parent_session_id.clone()",
+        ],
+    );
+
+    // Blocking child interactions use the child actor's own session ID. These
+    // are legitimate child-scoped requests, not foreign-session traffic.
+    let spawn = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs",
+    );
+    assert_markers(
+        &spawn,
+        "child ask-user wire",
+        &[
+            "let session_id = session.session_info.id.clone()",
+            "session_id: session_id.0.to_string()",
+            "\"x.ai/ask_user_question\"",
+        ],
+    );
+    let tool_calls = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs",
+    );
+    assert_markers(
+        &tool_calls,
+        "child exit-plan wire",
+        &[
+            "session_id: self.session_id_string()",
+            "\"x.ai/exit_plan_mode\"",
+        ],
+    );
+
+    // Durable lifecycle edges are event-ID stamped. Replay tracks both the
+    // event cursor and unpaired (subagent, child-session) spawns so restart
+    // recovery can emit the missing terminal edge without duplicating history.
+    let subagent = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/agent/subagent/mod.rs",
+    );
+    assert_markers(
+        &subagent,
+        "subagent event identity",
+        &[
+            "ensure_event_id_meta(parent_session_id, &mut meta)",
+            "acp::ExtNotification::new(\"x.ai/session_notification\"",
+        ],
+    );
+    let storage = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/session/storage/mod.rs",
+    );
+    assert_markers(
+        &storage,
+        "subagent replay",
+        &[
+            "pub(crate) const XAI_SESSION_UPDATE_METHOD: &str = \"_x.ai/session/update\"",
+            "pub max_event_seq: Option<u64>",
+            "pub unfinished_subagents: Vec<(String, String)>",
+            "fn collect_unfinished_subagents",
+            "Update::SubagentSpawned {",
+            "child_session_id",
+            "Update::SubagentFinished { subagent_id, .. }",
+            "filtered.iter().rposition(|l| line_has_event_id(l, id))",
+            "unfinished_subagents: collect_unfinished_subagents(&filtered)",
+        ],
+    );
+
+    // A completion marked will_wake is followed by one synthetic parent prompt
+    // with a stable ID. Clients must not race it with their own recovery turn.
+    assert_markers(
+        &subagent,
+        "subagent auto-wake",
+        &[
+            "fn should_auto_wake_subagent(",
+            "&& !block_waited",
+            "&& !explicitly_killed",
+            "&& parent_channel_open",
+            "let prompt_id = format!(\"subagent-completed-{subagent_id}\")",
+            "prompt_id: prompt_id.clone()",
+        ],
+    );
+    let finished = subagent_request
+        .find("SessionUpdate::SubagentFinished {")
+        .expect("missing audited SubagentFinished emission");
+    let wake = subagent_request[finished..]
+        .find("if will_wake {")
+        .map(|offset| finished + offset)
+        .expect("missing audited will_wake injection gate");
+    assert_markers(
+        &subagent_request[finished..wake],
+        "will_wake finish wire",
+        &["will_wake,", "ctx.parent_cmd_tx.as_ref()"],
+    );
+
+    // Progress is transient rather than replayed. Reconnect obtains an
+    // authoritative parent-scoped live snapshot through list_running.
+    let task_extension = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/extensions/task.rs",
+    );
+    assert_markers(
+        &task_extension,
+        "subagent list-running resync",
+        &[
+            "struct ListRunningSubagentsRequest",
+            "session_id: String",
+            "struct ListRunningSubagentsResponse",
+            "subagents: Vec<SubagentLiveSnapshotDto>",
+            "\"x.ai/subagent/list_running\"",
+            "agent.list_running_subagents(&req.session_id)",
+            "resolve_running_list(seeds).await",
+        ],
+    );
+    let updates = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/session/acp_session_impl/updates.rs",
+    );
+    let progress = updates
+        .find("XaiSessionUpdate::SubagentProgress {")
+        .expect("missing audited SubagentProgress branch");
+    let progress_return = updates[progress..]
+        .find("return;")
+        .map(|offset| progress + offset)
+        .expect("SubagentProgress no longer exits before persistence");
+    let persistence = updates[progress..]
+        .find(".persistence_tx")
+        .map(|offset| progress + offset)
+        .expect("missing audited xAI persistence send");
+    assert!(
+        progress_return < persistence,
+        "SubagentProgress is now persisted; re-audit replay/resync semantics"
+    );
+
+    // ACP cancel omits this private flag in normal clients; the pinned agent
+    // defaults it to true and forwards that value into SessionCommand::Cancel.
+    let acp_agent = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs",
+    );
+    let cancel_key = acp_agent
+        .find(".get(\"cancelSubagents\")")
+        .expect("missing audited cancelSubagents metadata key");
+    let cancel_default = acp_agent[cancel_key..]
+        .find(".unwrap_or(true)")
+        .map(|offset| cancel_key + offset)
+        .expect("cancelSubagents no longer defaults to true");
+    let cancel_send = acp_agent[cancel_default..]
+        .find("SessionCommand::Cancel {")
+        .map(|offset| cancel_default + offset)
+        .expect("missing audited SessionCommand::Cancel forwarding");
+    assert!(cancel_key < cancel_default && cancel_default < cancel_send);
+    assert_markers(
+        &acp_agent[cancel_send..],
+        "cancel-subagents forwarding",
+        &["cancel_subagents,", "kill_background_tasks: false"],
+    );
+}

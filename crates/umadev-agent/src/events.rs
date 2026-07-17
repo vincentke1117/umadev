@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use umadev_runtime::Usage;
 use umadev_spec::Phase;
 
 use crate::gates::{Gate, GateChoice};
@@ -62,7 +63,8 @@ pub enum EngineEvent {
     },
     /// A host backend was probed for availability (TUI startup).
     BackendProbed {
-        /// Stable backend id (`claude-code` / `codex` / `opencode`).
+        /// Stable id of one of five bases: three native (`claude-code`, `codex`,
+        /// `opencode`) plus Grok Build and Kimi Code over vendor-isolated ACP.
         backend_id: String,
         /// `true` when the host CLI is installed and reachable.
         ready: bool,
@@ -104,9 +106,9 @@ pub enum EngineEvent {
         /// Truncated stderr (≤ 8 KiB) for the UI to show.
         stderr: String,
     },
-    /// One chunk of output produced by the host CLI (Claude Code /
-    /// Codex). Emitted per non-empty line so a UI can render the host's
-    /// response as it scrolls past, instead of dumping the whole thing
+    /// One chunk of output produced by one of the five base CLIs (three native
+    /// plus Grok Build/Kimi Code over ACP). Emitted per non-empty line so a UI can render
+    /// the base's response as it scrolls past, instead of dumping the whole thing
     /// at the end of the phase.
     HostOutput {
         /// The phase that produced this chunk.
@@ -116,15 +118,12 @@ pub enum EngineEvent {
     },
     /// A human-readable progress note (free-form).
     Note(String),
-    /// Real per-turn token usage as REPORTED BY THE BASE (input + output), emitted
-    /// once per completed base turn (a chat reply or a build step). The UI sums
-    /// these into a live session total — true consumption, not an estimate. Zero
-    /// when the base reports nothing for the turn.
+    /// Whole-prompt usage as reported by the base, emitted exactly once per
+    /// completed base turn. `None` means unknown; an incomplete report is a
+    /// lower bound rather than an exact zero/total.
     TurnUsage {
-        /// Tokens consumed from the request this turn.
-        input_tokens: u32,
-        /// Tokens produced in the response this turn.
-        output_tokens: u32,
+        /// Typed quality-bearing whole-prompt report, or unknown.
+        usage: Option<Usage>,
     },
     /// The base reported the EXACT model it resolved for the live session (from
     /// the session `init` frame — see `umadev_runtime::SessionEvent::SessionModel`).
@@ -136,6 +135,15 @@ pub enum EngineEvent {
     BaseModel {
         /// The base-reported model id (e.g. `claude-sonnet-4-5-20250929`).
         id: String,
+    },
+    /// Dynamic state published by a live base session. Catalog updates are
+    /// complete replacements, including an empty replacement. UIs should ignore
+    /// events whose `backend_id` is not their currently selected base.
+    BaseSessionState {
+        /// Stable first-class backend id that owns this session state.
+        backend_id: String,
+        /// Typed model, mode, command, or tool-catalog update from the base.
+        update: umadev_runtime::SessionStateUpdate,
     },
     /// A **transient, in-place status line** — NOT a transcript entry. Used by
     /// the long-phase heartbeat for its periodic "still working (mm:ss)" beats:
@@ -168,10 +176,10 @@ pub enum EngineEvent {
         /// Whether the sub-task succeeded.
         ok: bool,
     },
-    /// **Real-time streaming event** from the worker (Claude Code / Codex / OpenCode).
-    /// Emitted for each JSONL line parsed from `--output-format stream-json`
-    /// (claude) or `--json` (codex). The TUI shows these live so the user
-    /// sees the worker's tool calls and text deltas as they happen — instead
+    /// **Real-time streaming event** from one of the five base CLIs (three native
+    /// plus Grok Build/Kimi Code over ACP). Emitted from native streaming frames or ACP
+    /// session events. The TUI shows these live so the user sees the worker's tool
+    /// calls and text deltas as they happen — instead
     /// of staring at a spinner for 3 minutes.
     WorkerStream {
         /// What kind of stream event this is.

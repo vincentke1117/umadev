@@ -25,10 +25,10 @@
 //!    actionable message.
 //! 3. **Different host, or identity unparseable/missing, or the boot id conflicts
 //!    with a live PID** → we can't attribute the owner, so fall back to a generous
-//!    age threshold ([`STALE_SECS`]): an ancient lock with no heartbeat is
+//!    internal age threshold: an ancient lock with no heartbeat is
 //!    reclaimed, otherwise refuse (with a "delete the file to force" hint).
 //!
-//! That verdict is [`classify_claim_owner`] — the SINGLE owner-liveness rule,
+//! That verdict comes from the internal claim-owner classifier — the SINGLE owner-liveness rule,
 //! shared with the temporary-rewind crash marker in [`crate::checkpoint`], because
 //! two files answering the same question two different ways is exactly how a live
 //! holder's lock gets reclaimed under it.

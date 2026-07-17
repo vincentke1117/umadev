@@ -190,9 +190,9 @@ fn has_ai_app(lower: &str) -> bool {
 /// The runtime model / provider the user explicitly named for the BUILT APP, as a
 /// canonical label (e.g. "运行时用千问 Max" → the Qwen/DashScope label), or `None`
 /// when the requirement names no runtime model. The first matching provider in
-/// [`PROVIDER_PATTERNS`] wins (more specific patterns are listed first).
+/// the internal provider-pattern table wins (more specific patterns are listed first).
 ///
-/// Deterministic + fail-open. ASCII matchers use [`has_word`] so a bare "gpt"/
+/// Deterministic + fail-open. ASCII matchers use whole-word matching so a bare "gpt"/
 /// "glm" matches as a token but not inside an unrelated word.
 #[must_use]
 pub fn stated_runtime_model(requirement: &str) -> Option<&'static str> {
@@ -242,18 +242,20 @@ pub fn runtime_model_directive(requirement: &str) -> String {
     };
     format!(
         "## App runtime model — USER-CONFIGURABLE, not the dev base\n\
+         {default_clause}\n\
+         Minimum implementation contract: keep model id, base URL, and API-key \
+         env-var name configurable; prefer an OpenAI-compatible client so Qwen, \
+         DeepSeek, Zhipu, Moonshot, OpenAI, and local Ollama are config changes. \
+         NEVER silently hardcode Anthropic / Claude or `ANTHROPIC_API_KEY`.\n\
          This build's app calls an LLM at RUNTIME. That runtime model is the USER'S \
          choice and is a SEPARATE concern from the base CLI this dev tool itself runs \
-         on. NEVER silently hardcode the dev base's provider (Anthropic / Claude — \
-         `ANTHROPIC_API_KEY` + the Claude API) as the app's runtime engine.\n\
+         on. Never silently substitute the dev base's provider as the app's runtime \
+         engine.\n\
          - Put the LLM call behind a thin provider-abstraction layer: read the model \
          id, base URL, and API-key env-var NAME from configuration (env vars / a config \
          file) so the model can be swapped WITHOUT editing code.\n\
-         - Prefer an OpenAI-compatible client (one `base_url` + `api_key` + `model` \
-         triple); the same client covers OpenAI, DashScope/Qwen, DeepSeek, Zhipu, \
-         Moonshot, and a local Ollama endpoint — so switching provider is a config \
-         change, not a rewrite.\n\
-         - {default_clause}"
+         - Keep provider-specific details behind that adapter instead of spreading \
+         vendor branches through product code."
     )
 }
 

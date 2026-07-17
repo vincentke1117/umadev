@@ -14,6 +14,7 @@
 
 use std::path::Path;
 
+use crate::corpus::{CorpusOrigin, CorpusScope};
 use crate::tokenizer::{cjk_trigrams_only, tokenize};
 
 /// Per-chunk metadata parsed from front-matter + path.
@@ -44,6 +45,20 @@ pub struct ChunkMeta {
     /// readable (they rebuild on the schema-version bump).
     #[serde(default)]
     pub is_learned: bool,
+    /// `true` when the COMPLETE learned source file carries a current explicit
+    /// pitfall-safety marker. The marker is stamped onto every H2 chunk at
+    /// index time, so a safe file's Fix / Root cause chunks do not get mistaken
+    /// for unsafe legacy data merely because the marker text lives in another
+    /// section. Legacy cached chunks default to `false` and stay quarantined.
+    #[serde(default)]
+    pub is_safe_learned_pitfall: bool,
+    /// Provenance of the corpus root that supplied this chunk. Stamped by the
+    /// unified corpus indexer; standalone `chunk_text` calls remain `Unknown`.
+    #[serde(default)]
+    pub corpus_origin: CorpusOrigin,
+    /// Authority boundary of the source corpus.
+    #[serde(default)]
+    pub corpus_scope: CorpusScope,
 }
 
 /// One retrievable unit: metadata + tokenised body + raw text excerpt.
@@ -259,6 +274,9 @@ pub fn chunk_text(rel_path: &str, body: &str) -> Vec<Chunk> {
                     // Default: a knowledge-corpus chunk. The index build loop overrides this
                     // to true for a file that came from a learned sediment dir.
                     is_learned: false,
+                    is_safe_learned_pitfall: false,
+                    corpus_origin: CorpusOrigin::Unknown,
+                    corpus_scope: CorpusScope::Unknown,
                 },
                 body: trimmed,
                 tokens,
@@ -269,6 +287,112 @@ pub fn chunk_text(rel_path: &str, body: &str) -> Vec<Chunk> {
         .collect()
 }
 
+/// Result of a strict lookup in the first YAML front-matter block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontMatterField<'a> {
+    /// The document has no leading YAML block; it is ordinary markdown.
+    NoHeader,
+    /// The header is unterminated, the key is invalid, or the key is duplicated.
+    Invalid,
+    /// A complete header exists but does not define this key.
+    Missing,
+    /// The header defines this key exactly once.
+    Value(&'a str),
+}
+
+/// Accept only the plain scalar form emitted by UmaDev for provenance fields.
+/// Quoted, commented, collection, alias, tag, and block-scalar forms have YAML
+/// semantics that this deliberately small parser does not implement, so callers
+/// enforcing a privacy boundary must treat them as ambiguous.
+fn is_unambiguous_plain_scalar(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['\'', '"', '[', '{', '|', '>', '&', '*', '!', '%', '@', '`'])
+        && !value.contains('#')
+        && !value.contains(": ")
+        && !value.contains(":\t")
+}
+
+fn quoted_key_matches(field: &str, key: &str) -> bool {
+    (field.starts_with('"') && field.ends_with('"')
+        || field.starts_with('\'') && field.ends_with('\''))
+        && field.get(1..field.len().saturating_sub(1)) == Some(key)
+}
+
+/// Read one exact scalar from the first complete YAML front-matter block.
+/// Body text never counts. Unlike an `Option`, the result distinguishes an
+/// ordinary hand-authored document from an ambiguous/malformed security field,
+/// so privacy boundaries can fail closed without deleting ordinary notes.
+#[must_use]
+pub fn front_matter_field<'a>(body: &'a str, key: &str) -> FrontMatterField<'a> {
+    if key.trim().is_empty() || key.contains([':', '\n', '\r']) {
+        return FrontMatterField::Invalid;
+    }
+    // A UTF-8 BOM is common in files touched by Windows editors. Treat the
+    // single document-start marker as encoding metadata, not as body text;
+    // otherwise a legacy `maintainer: auto-sediment` header becomes
+    // `NoHeader` and bypasses the global learned privacy quarantine.
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
+    let mut lines = body.lines().skip_while(|line| line.trim().is_empty());
+    let Some(first) = lines.next() else {
+        return FrontMatterField::NoHeader;
+    };
+    if first != "---" {
+        return if first.trim() == "---" {
+            FrontMatterField::Invalid
+        } else {
+            FrontMatterField::NoHeader
+        };
+    }
+    let mut found = None;
+    for line in lines {
+        if line == "---" {
+            return found.map_or(FrontMatterField::Missing, FrontMatterField::Value);
+        }
+        if line.trim() == "---" {
+            return FrontMatterField::Invalid;
+        }
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        let trimmed_field = field.trim();
+        if trimmed_field != key {
+            // A quoted spelling is equivalent YAML but outside this strict
+            // parser. Do not let it masquerade as an absent security field.
+            if quoted_key_matches(trimmed_field, key) {
+                return FrontMatterField::Invalid;
+            }
+            continue;
+        }
+        // Security markers must be top-level, column-zero keys in the canonical
+        // form. Indented/nested or whitespace-decorated equivalents are
+        // ambiguous without a complete YAML parser.
+        if field != key {
+            return FrontMatterField::Invalid;
+        }
+        // Duplicate security fields are ambiguous. Reject the complete header
+        // instead of letting the first or last value win.
+        if found.is_some() {
+            return FrontMatterField::Invalid;
+        }
+        let value = value.trim();
+        if !is_unambiguous_plain_scalar(value) {
+            return FrontMatterField::Invalid;
+        }
+        found = Some(value);
+    }
+    // An unterminated YAML block is not front matter.
+    FrontMatterField::Invalid
+}
+
+/// Convenience projection for non-security callers.
+#[must_use]
+pub fn front_matter_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    match front_matter_field(body, key) {
+        FrontMatterField::Value(value) => Some(value),
+        FrontMatterField::NoHeader | FrontMatterField::Invalid | FrontMatterField::Missing => None,
+    }
+}
+
 /// Detect + strip a leading `---\n...\n---\n` YAML block. Extracts `tags`
 /// from a `tags: [a, b, c]` line. Returns the body with the block removed.
 ///
@@ -276,6 +400,7 @@ pub fn chunk_text(rel_path: &str, body: &str) -> Vec<Chunk> {
 /// fragile (the `---` opener/closer look identical to each other and to a
 /// markdown thematic break). Scanning lines avoids that ambiguity.
 fn strip_front_matter(body: &str) -> ParsedFrontMatter {
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
     let mut lines = body.lines().peekable();
     // The first non-blank line must be exactly `---` to count as front-matter.
     let first = loop {
@@ -698,6 +823,83 @@ mod tests {
         // fall back to the full token count so old caches keep scoring.
         assert_eq!(chunk.bigram_len, 0);
         assert_eq!(chunk.bm25_len(), chunk.tokens.len());
+    }
+
+    #[test]
+    fn strict_front_matter_lookup_ignores_body_text_and_ambiguous_headers() {
+        let valid = "\n---\nmaintainer: auto-sediment\nglobal_safety: classifier-family-v2\n---\n# Body\nmaintainer: attacker";
+        assert_eq!(
+            front_matter_value(valid, "maintainer"),
+            Some("auto-sediment")
+        );
+        assert_eq!(
+            front_matter_value(valid, "global_safety"),
+            Some("classifier-family-v2")
+        );
+        assert_eq!(
+            front_matter_field("---\r\nmaintainer: auto-sediment\r\n---\r\n", "maintainer"),
+            FrontMatterField::Value("auto-sediment")
+        );
+        assert_eq!(
+            front_matter_field(
+                "\u{feff}---\r\nmaintainer: auto-sediment\r\n---\r\n",
+                "maintainer"
+            ),
+            FrontMatterField::Value("auto-sediment"),
+            "a UTF-8 BOM must not hide generated provenance on Windows"
+        );
+        assert_eq!(
+            front_matter_value("# Body\nmaintainer: auto-sediment", "maintainer"),
+            None
+        );
+        assert_eq!(
+            front_matter_value(
+                "---\nglobal_safety: classifier-family-v2\nglobal_safety: legacy\n---\n",
+                "global_safety"
+            ),
+            None
+        );
+        assert_eq!(
+            front_matter_field(
+                "---\nglobal_safety: classifier-family-v2\nglobal_safety: legacy\n---\n",
+                "global_safety"
+            ),
+            FrontMatterField::Invalid
+        );
+        assert_eq!(
+            front_matter_field("# Body\nmaintainer: auto-sediment", "maintainer"),
+            FrontMatterField::NoHeader
+        );
+        assert_eq!(
+            front_matter_value(
+                "---\nglobal_safety: classifier-family-v2\n# missing close",
+                "global_safety"
+            ),
+            None
+        );
+
+        for ambiguous in [
+            "  ---\nmaintainer: auto-sediment\n---\n",
+            "---\nmaintainer: auto-sediment\n  ---\n",
+            "---\nmaintainer: \"auto-sediment\"\n---\n",
+            "---\nmaintainer: 'auto-sediment'\n---\n",
+            "---\nmaintainer: auto-sediment # generated\n---\n",
+            "---\n\"maintainer\": auto-sediment\n---\n",
+            "---\n  maintainer: auto-sediment\n---\n",
+        ] {
+            assert_eq!(
+                front_matter_field(ambiguous, "maintainer"),
+                FrontMatterField::Invalid,
+                "ambiguous YAML must fail closed: {ambiguous:?}"
+            );
+        }
+        assert_eq!(
+            front_matter_field(
+                "---\nmaintainer: auto-sediment\nglobal_safety: \"classifier-family-v2\"\n---\n",
+                "global_safety"
+            ),
+            FrontMatterField::Invalid
+        );
     }
 
     #[test]

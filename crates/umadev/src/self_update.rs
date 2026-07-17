@@ -18,17 +18,18 @@
 //! block the Windows form), and a subprocess would make the download's progress and
 //! failure modes opaque.
 //!
-//! **Safety contract:** the download is written to a temp file *next to* the
-//! current exe (same filesystem, so the final `rename` is atomic) and fully
-//! verified — HTTP 200, non-trivial size, correct executable magic for this
-//! platform — **before** anything touches the installed binary. Any failure at any
-//! step leaves the existing binary byte-for-byte untouched and prints the exact
-//! manual command. The user can never be left with a half-written binary.
+//! **Safety contract:** executable bytes come only from the official GitHub Release
+//! and GitHub-owned asset hosts. The download is written to a temp file *next to*
+//! the current exe (same filesystem, so the final `rename` is atomic), then checked
+//! for size and executable magic before anything touches the installed binary. Any
+//! failure leaves the existing binary byte-for-byte untouched and prints an official
+//! npm fallback command.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 
 /// GitHub Releases API for the repo the release workflow publishes to
 /// (`.github/workflows/release.yml` uploads `dist/*` on every `v*` tag).
@@ -37,10 +38,18 @@ const LATEST_RELEASE_API: &str = "https://api.github.com/repos/umacloud/umadev/r
 /// The releases page, printed whenever an automatic update cannot proceed.
 const RELEASES_PAGE: &str = "https://github.com/umacloud/umadev/releases";
 
+/// Package-manager fallback when the official GitHub release cannot be reached.
+const NPM_FALLBACK: &str =
+    "npm install -g umadev@latest --force --registry=https://registry.npmjs.org";
+
 /// Smallest plausible size, in bytes, of a real `umadev` release binary. The
 /// shipped binary is tens of MB; anything under 1 MiB is a truncated download, an
 /// error page, or a redirect stub — never a usable executable.
 const MIN_BINARY_BYTES: u64 = 1_048_576;
+
+/// A checksum sidecar is one short SHA-256 line. Refuse an unexpectedly large
+/// response instead of buffering an arbitrary release asset into memory.
+const MAX_CHECKSUM_BYTES: usize = 4_096;
 
 /// Timeout for the (tiny) GitHub Releases API call.
 const API_TIMEOUT: Duration = Duration::from_secs(20);
@@ -121,6 +130,12 @@ pub fn release_asset_name(os: &str, arch: &str) -> Option<String> {
     Some(format!("umadev-{target}{ext}"))
 }
 
+/// Sidecar published beside every release binary.
+#[must_use]
+pub fn checksum_asset_name(binary_asset: &str) -> String {
+    format!("{binary_asset}.sha256")
+}
+
 /// Parse a `major.minor.patch` version, tolerating a leading `v` and ignoring any
 /// pre-release / build suffix. `None` when it is not a plain three-part version.
 fn semver_triple(v: &str) -> Option<(u64, u64, u64)> {
@@ -151,11 +166,9 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 
 /// Does the downloaded blob actually start like a native executable for `os`?
 ///
-/// The release publishes **no checksum file** (`release.yml` uploads the raw
-/// binaries and the embedding-model assets, nothing else), so this magic-byte check
-/// plus the size floor is the strongest integrity gate available without inventing
-/// a checksum the release does not produce. It reliably rejects the realistic
-/// failure: an HTML error / captive-portal page served with a 200.
+/// This format check complements (and never replaces) the required SHA-256
+/// sidecar verification. It gives a clearer error for an HTML/captive-portal
+/// response that happened to arrive before the digest comparison.
 /// Unknown platforms fail open (`true`) — we never publish for them anyway.
 pub fn looks_like_executable(os: &str, head: &[u8]) -> bool {
     match os {
@@ -322,15 +335,61 @@ pub fn parse_latest_release(body: &str) -> Result<LatestRelease> {
     Ok(LatestRelease { tag, assets })
 }
 
-/// Every URL worth trying for one release asset, in order: GitHub itself, then the
-/// community GitHub mirrors that make release assets reachable from mainland China
-/// (the same fallback chain the npm shim already uses for the embedding model).
+/// Trusted download candidates for a release asset.
+///
+/// There is deliberately one candidate. The matching SHA-256 sidecar is fetched
+/// independently from the same official release; community proxies are never an
+/// executable source.
 pub fn download_urls(browser_url: &str) -> Vec<String> {
-    vec![
-        browser_url.to_string(),
-        format!("https://ghproxy.net/{browser_url}"),
-        format!("https://ghfast.top/{browser_url}"),
-    ]
+    reqwest::Url::parse(browser_url)
+        .ok()
+        .filter(is_official_release_asset_url)
+        .map(|_| vec![browser_url.to_string()])
+        .unwrap_or_default()
+}
+
+/// The API's browser URL must be this repository's HTTPS release-download path.
+fn is_official_release_asset_url(url: &reqwest::Url) -> bool {
+    is_https_default_port(url)
+        && url.host_str() == Some("github.com")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url
+            .path()
+            .starts_with("/umacloud/umadev/releases/download/")
+}
+
+/// GitHub redirects browser download URLs to a signed URL on one of its asset
+/// hosts. No redirect to a community proxy or unrelated host is accepted.
+fn is_official_download_target(url: &reqwest::Url) -> bool {
+    if !is_https_default_port(url) || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match url.host_str() {
+        Some("github.com") => is_official_release_asset_url(url),
+        Some(
+            "release-assets.githubusercontent.com"
+            | "objects.githubusercontent.com"
+            | "github-releases.githubusercontent.com",
+        ) => true,
+        _ => false,
+    }
+}
+
+fn is_https_default_port(url: &reqwest::Url) -> bool {
+    url.scheme() == "https" && url.port_or_known_default() == Some(443)
+}
+
+fn official_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            attempt.error("too many redirects while downloading the GitHub release asset")
+        } else if is_official_download_target(attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.error("refusing a release-asset redirect outside official GitHub hosts")
+        }
+    })
 }
 
 /// Fetch + parse the latest release from the GitHub API.
@@ -413,9 +472,81 @@ async fn download_to(client: &reqwest::Client, url: &str, dest: &Path) -> Result
     Ok(got)
 }
 
-/// Size + magic-byte gate on a finished download. Runs BEFORE any rename, so a
-/// rejected file never reaches the installed path.
-fn verify_download(path: &Path, os: &str) -> Result<()> {
+/// Download and parse the checksum sidecar for `asset`. The accepted format is
+/// the conventional `64-hex  filename` line generated by the release workflow.
+async fn fetch_checksum(client: &reqwest::Client, url: &str, asset: &str) -> Result<String> {
+    if download_urls(url).is_empty() {
+        bail!("refusing a checksum URL outside the official GitHub release source");
+    }
+    let mut resp = client
+        .get(url)
+        .header("Accept", "text/plain")
+        .send()
+        .await
+        .with_context(|| format!("could not reach checksum {url}"))?;
+    if !resp.status().is_success() {
+        bail!("HTTP {} from checksum {url}", resp.status());
+    }
+    if resp
+        .content_length()
+        .is_some_and(|length| length > MAX_CHECKSUM_BYTES as u64)
+    {
+        bail!("the checksum sidecar is unexpectedly large");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("the checksum download from {url} was interrupted"))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_CHECKSUM_BYTES {
+            bail!("the checksum sidecar exceeds {MAX_CHECKSUM_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let text = std::str::from_utf8(&body).context("the checksum sidecar is not UTF-8")?;
+    parse_sha256_sidecar(text, asset)
+}
+
+fn parse_sha256_sidecar(body: &str, asset: &str) -> Result<String> {
+    for line in body.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(hash) = fields.next() else { continue };
+        let Some(name) = fields.next() else { continue };
+        let name = name.trim_start_matches('*');
+        if name != asset {
+            continue;
+        }
+        if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(hash.to_ascii_lowercase());
+        }
+        bail!("the checksum for `{asset}` is not a 64-digit SHA-256 value");
+    }
+    bail!("the checksum sidecar contains no entry for `{asset}`")
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("could not hash {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1_024].into_boxed_slice();
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("could not hash {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Checksum + size + magic-byte gate on a finished download. Runs BEFORE any
+/// rename, so a rejected file never reaches the installed path.
+fn verify_download(path: &Path, os: &str, expected_sha256: &str) -> Result<()> {
     let size = std::fs::metadata(path)
         .with_context(|| format!("the download vanished: {}", path.display()))?
         .len();
@@ -435,6 +566,12 @@ fn verify_download(path: &Path, os: &str) -> Result<()> {
     };
     if !looks_like_executable(os, &head) {
         bail!("the download does not look like a native executable for this platform");
+    }
+    let actual = sha256_file(path)?;
+    if actual != expected_sha256.to_ascii_lowercase() {
+        bail!(
+            "the downloaded binary failed SHA-256 verification (expected {expected_sha256}, got {actual})"
+        );
     }
     Ok(())
 }
@@ -456,12 +593,16 @@ fn make_executable(_path: &Path) -> Result<()> {
 }
 
 /// The manual fallback, printed on every failure path so the user is never stuck.
+fn manual_instructions() -> String {
+    format!(
+        "\nUpdate through the official npm package:\n  {NPM_FALLBACK}\n\
+         Or download this platform's binary from the official GitHub release:\n  \
+         {RELEASES_PAGE}"
+    )
+}
+
 fn print_manual_instructions() {
-    println!(
-        "\nUpdate manually:\n  \
-         cargo install --git https://github.com/umacloud/umadev umadev --force\n  \
-         or download this platform's binary from: {RELEASES_PAGE}"
-    );
+    println!("{}", manual_instructions());
 }
 
 /// `umadev update` for a [`InstallKind::Standalone`] install: resolve the latest
@@ -506,6 +647,31 @@ pub async fn run(
         print_manual_instructions();
         bail!("no asset `{asset}` in release {}", release.tag);
     };
+    if download_urls(&url).is_empty() {
+        println!("Release {} returned an untrusted asset URL.", release.tag);
+        print_manual_instructions();
+        bail!("refusing to download `{asset}` from a non-official GitHub release URL");
+    }
+    let checksum_asset = checksum_asset_name(&asset);
+    let Some(checksum_url) = release.asset_url(&checksum_asset).map(str::to_string) else {
+        println!(
+            "Release {} publishes no `{checksum_asset}` integrity sidecar.",
+            release.tag
+        );
+        print_manual_instructions();
+        bail!(
+            "no checksum asset `{checksum_asset}` in release {}",
+            release.tag
+        );
+    };
+    if download_urls(&checksum_url).is_empty() {
+        println!(
+            "Release {} returned an untrusted checksum URL.",
+            release.tag
+        );
+        print_manual_instructions();
+        bail!("refusing a non-official checksum URL for `{asset}`");
+    }
 
     if is_newer(&release.tag, current) {
         println!(
@@ -526,7 +692,7 @@ pub async fn run(
     tmp.push(format!(".new-{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
 
-    let result = install(&tmp, exe, &url, os).await;
+    let result = install(&tmp, exe, &url, &checksum_url, &asset, os).await;
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp); // never leave a partial download behind
         print_manual_instructions();
@@ -542,16 +708,29 @@ pub async fn run(
 
 /// Download → verify → swap. Split out of [`run`] so every failure funnels through
 /// one cleanup path (delete the temp file, keep the installed binary).
-async fn install(tmp: &Path, exe: &Path, url: &str, os: &str) -> Result<()> {
+async fn install(
+    tmp: &Path,
+    exe: &Path,
+    url: &str,
+    checksum_url: &str,
+    asset: &str,
+    os: &str,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent("umadev-cli")
         .timeout(DOWNLOAD_TIMEOUT)
+        .redirect(official_redirect_policy())
         .build()
         .context("could not build an HTTP client")?;
 
+    let expected_sha256 = fetch_checksum(&client, checksum_url, asset).await?;
+    let candidates = download_urls(url);
+    if candidates.is_empty() {
+        bail!("refusing a release asset URL outside the official GitHub release source");
+    }
     let mut last: Option<anyhow::Error> = None;
     let mut downloaded = false;
-    for candidate in download_urls(url) {
+    for candidate in candidates {
         match download_to(&client, &candidate, tmp).await {
             Ok(_) => {
                 downloaded = true;
@@ -564,7 +743,7 @@ async fn install(tmp: &Path, exe: &Path, url: &str, os: &str) -> Result<()> {
         return Err(last.unwrap_or_else(|| anyhow::anyhow!("no download source was reachable")));
     }
 
-    verify_download(tmp, os)?;
+    verify_download(tmp, os, &expected_sha256)?;
     make_executable(tmp)?;
     apply_swap(&swap_plan(exe, tmp, cfg!(windows)))?;
     Ok(())
@@ -598,6 +777,47 @@ mod tests {
             release_asset_name("windows", "x86_64").unwrap(),
             "umadev-x86_64-pc-windows-msvc.exe"
         );
+    }
+
+    #[test]
+    fn checksum_sidecar_name_is_derived_from_the_exact_binary_asset() {
+        assert_eq!(
+            checksum_asset_name("umadev-x86_64-pc-windows-msvc.exe"),
+            "umadev-x86_64-pc-windows-msvc.exe.sha256"
+        );
+    }
+
+    #[test]
+    fn parses_only_the_checksum_for_the_requested_asset() {
+        let wanted = "umadev-aarch64-apple-darwin";
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let body = format!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  other\n{hash}  {wanted}\n"
+        );
+        assert_eq!(parse_sha256_sidecar(&body, wanted).unwrap(), hash);
+        assert!(parse_sha256_sidecar(&body, "missing").is_err());
+        assert!(parse_sha256_sidecar("not-a-hash  wanted\n", "wanted").is_err());
+    }
+
+    #[test]
+    fn downloaded_binary_must_match_its_sha256_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("umadev");
+        let mut bytes = vec![
+            0_u8;
+            usize::try_from(MIN_BINARY_BYTES)
+                .expect("minimum binary size fits every supported target")
+        ];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        std::fs::write(&binary, &bytes).unwrap();
+        let expected = sha256_file(&binary).unwrap();
+        verify_download(&binary, "linux", &expected).unwrap();
+        assert!(verify_download(
+            &binary,
+            "linux",
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        )
+        .is_err());
     }
 
     #[test]
@@ -820,11 +1040,65 @@ mod tests {
     }
 
     #[test]
-    fn download_urls_try_github_first_then_the_mirrors() {
-        let urls = download_urls("https://github.com/umacloud/umadev/releases/download/v1/x");
-        assert_eq!(urls.len(), 3);
-        assert!(urls[0].starts_with("https://github.com/"));
-        assert!(urls[1].contains("ghproxy.net"));
-        assert!(urls[2].contains("ghfast.top"));
+    fn download_candidates_contain_only_the_official_github_release() {
+        let official = "https://github.com/umacloud/umadev/releases/download/v1/x";
+        let urls = download_urls(official);
+        assert_eq!(urls, vec![official]);
+        assert!(urls.iter().all(|url| {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            parsed.scheme() == "https" && parsed.host_str() == Some("github.com")
+        }));
+        assert!(urls
+            .iter()
+            .all(|url| !url.contains("ghproxy.net") && !url.contains("ghfast.top")));
+    }
+
+    #[test]
+    fn download_candidates_reject_third_party_http_and_lookalike_sources() {
+        for url in [
+            "https://ghproxy.net/https://github.com/umacloud/umadev/releases/download/v1/x",
+            "https://ghfast.top/https://github.com/umacloud/umadev/releases/download/v1/x",
+            "http://github.com/umacloud/umadev/releases/download/v1/x",
+            "https://github.com.evil.invalid/umacloud/umadev/releases/download/v1/x",
+            "https://github.com/another/repo/releases/download/v1/x",
+        ] {
+            assert!(
+                download_urls(url).is_empty(),
+                "accepted untrusted URL: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirects_are_limited_to_official_github_asset_hosts() {
+        for url in [
+            "https://github.com/umacloud/umadev/releases/download/v1/x",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/x",
+            "https://objects.githubusercontent.com/github-production-release-asset/x",
+        ] {
+            assert!(
+                is_official_download_target(&reqwest::Url::parse(url).unwrap()),
+                "rejected official target: {url}"
+            );
+        }
+        for url in [
+            "https://ghproxy.net/x",
+            "https://ghfast.top/x",
+            "https://example.com/x",
+            "http://release-assets.githubusercontent.com/x",
+        ] {
+            assert!(
+                !is_official_download_target(&reqwest::Url::parse(url).unwrap()),
+                "accepted untrusted redirect: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_instructions_include_the_official_npm_fallback() {
+        let instructions = manual_instructions();
+        assert!(instructions.contains("official npm package"));
+        assert!(instructions.contains(NPM_FALLBACK));
+        assert!(instructions.contains(RELEASES_PAGE));
     }
 }

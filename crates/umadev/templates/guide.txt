@@ -4,8 +4,9 @@ UmaDev — 60-second walkthrough
 WHAT IS UMADEV?
 ------------------
   UmaDev is the **project-director Agent** for AI coding. It does NOT call
-  any LLM and owns no model — it drives the base CLI you already logged into
-  (Claude Code / Codex / OpenCode), reusing that base's OWN login and model
+  any LLM and owns no model — it drives one of five base CLIs: three vendor-specific
+  (Claude Code / Codex / OpenCode) plus Grok Build and Kimi Code over ACP, reusing that
+  base's OWN login and model
   (your subscription, or whatever third-party / local model you connected to
   the base). Result: zero API key of its own, deterministic, fully audited.
 
@@ -19,8 +20,8 @@ THE PIPELINE (9 phases, 2 gates)
 YOUR ROLE
 ---------
   1. Type `umadev` to enter the chat TUI.
-  2. First time: pick the base CLI you logged into (claude-code / codex /
-       opencode). UmaDev drives it with ITS own model — nothing to configure.
+  2. First time: pick one of the five base CLIs (3 vendor transports + Grok/Kimi ACP).
+       UmaDev drives it with ITS own model — nothing to configure.
   3. Type naturally (or press Shift+Enter for multi-line). The base decides
        whether to answer as chat or start the pipeline.
   4. Watch the pipeline narrate. Worker output streams into the chat.
@@ -34,7 +35,8 @@ THE COMMAND SURFACE
 -------------------
   Inside the TUI (recommended):
     umadev                          launch the chat
-    /claude /codex /opencode           switch base CLI (each uses its OWN model)
+    /claude /codex /opencode /grok /kimi
+                                       switch base CLI (each uses its OWN model)
     /status                            show the active base + its driving model
     /model <id>                        override the base's model for this session
     /mode plan|guarded|auto            trust tier (plan = read-only, auto = autonomous)
@@ -55,17 +57,21 @@ THE COMMAND SURFACE
     /history /help /clear /quit
     type freely                        a fresh requirement, or a revision at a gate
 
-  Workers (base CLIs you already installed + logged in; no API key):
-    claude-code  Anthropic Claude Code
-    codex        OpenAI Codex
-    opencode     OpenCode
-    offline      deterministic templates (no AI; internal CI / demo fallback)
+  Workers (4 base CLIs: 3 native + Grok Build ACP; installed + logged in; no API key):
+    Native (3):
+      claude-code  Anthropic Claude Code
+      codex        OpenAI Codex
+      opencode     OpenCode
+    ACP v1 (1):
+      grok-build   Grok Build
+    Fallback (not a base):
+      offline      deterministic templates (no AI; internal CI / demo fallback)
 
   Scripted form (when you don't want a TUI):
     umadev init                     write umadev.yaml (run once per workspace)
     umadev adopt [path]             adopt an EXISTING repo (detect stack, derive contract)
-    umadev run <req>                non-interactive run, pauses at docs_confirm
-    umadev run <req> --backend X    drive real worker (claude-code / codex / opencode)
+    umadev run <req>                scripted run, pauses at docs_confirm
+    umadev run <req> --backend X    drive any of the 4 real workers (3 native + Grok ACP)
     umadev run <req> --mode plan    trust tier: plan (read-only) | guarded (default) | auto
     umadev quick <task>             lightweight fast track for a trivial change
     umadev redo <phase>             re-run one phase (e.g. umadev redo frontend)

@@ -115,7 +115,7 @@ impl FirstPassStats {
     /// Record ONE verified proposal for `kind`: always `attempts += 1`, plus
     /// `first_pass += 1` when it passed on the first attempt. Pure mutation;
     /// persisting is the caller's job. A brand-new kind is only inserted while
-    /// under the [`MAX_KINDS`] cap — an already-tracked kind always updates, so
+    /// under the bounded kind cap — an already-tracked kind always updates, so
     /// the cap never silently freezes an existing signal.
     pub fn observe(&mut self, kind: &str, first_pass: bool) {
         if !self.kinds.contains_key(kind) && self.kinds.len() >= MAX_KINDS {

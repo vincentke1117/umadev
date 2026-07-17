@@ -21,6 +21,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use crate::chunker::Chunk;
+use crate::corpus::{corpus_from_paths, CorpusFile, CorpusOrigin, CorpusScope, CorpusSet};
 use crate::tokenizer::tokenize;
 use crate::vector;
 
@@ -34,10 +35,10 @@ const B: f64 = 0.75;
 /// the TOKENIZER / chunker / index layout: after such an upgrade the cached
 /// `bm25.bin` is silently stale until a source file happens to change. Bumping
 /// this constant invalidates every cache built by an older schema (the version
-/// is folded into [`corpus_signature`], so an old `.sig` can no longer match).
+/// is folded into [`corpus_source_signature`], so an old `.sig` can no longer match).
 /// Bump it whenever `tokenizer::tokenize`, the chunker, or the `Bm25Index`
 /// layout changes in a way that alters indexed tokens.
-const INDEX_SCHEMA_VERSION: u32 = 2;
+const INDEX_SCHEMA_VERSION: u32 = 5;
 
 /// One inverted-index entry: the term, and the chunks that contain it with
 /// per-chunk term frequency.
@@ -68,6 +69,12 @@ pub struct Bm25Index {
     /// Total number of chunks. Equal to `chunks.len()`; stored explicitly
     /// so the query function doesn't borrow `self.chunks`.
     pub doc_count: u64,
+    /// Corpus signature embedded in the same serialized object as the chunks.
+    /// The sidecar remains the cheap invalidation switch, but a cache hit must
+    /// match BOTH values; concurrent writers can therefore never pair process
+    /// A's index with process B's sidecar and serve the wrong snapshot.
+    #[serde(default)]
+    cache_signature: String,
 }
 
 impl Bm25Index {
@@ -120,6 +127,7 @@ impl Bm25Index {
             term_map,
             avg_doc_len,
             doc_count,
+            cache_signature: String::new(),
         }
     }
 
@@ -387,9 +395,165 @@ pub fn bm25_search<'a>(index: &'a Bm25Index, query: &str, top_k: usize) -> Vec<(
         .collect()
 }
 
-/// On-disk index path: `<project_root>/.umadev/kb-index/bm25.bin`.
-fn index_path(project_root: &Path) -> PathBuf {
-    project_root.join(super::KB_INDEX_DIR).join("bm25.bin")
+fn real_dir_no_follow(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+}
+
+fn real_file_no_follow(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
+fn canonical_real_boundary(boundary: &Path) -> Option<PathBuf> {
+    let boundary = std::fs::canonicalize(boundary).ok()?;
+    real_dir_no_follow(&boundary).then_some(boundary)
+}
+
+fn ensure_real_child_dir(parent: &Path, child: &Path) -> bool {
+    if !real_dir_no_follow(parent) {
+        return false;
+    }
+    match std::fs::symlink_metadata(child) {
+        Ok(meta) => meta.file_type().is_dir(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let _ = std::fs::create_dir(child);
+            real_dir_no_follow(parent) && real_dir_no_follow(child)
+        }
+        Err(_) => false,
+    }
+}
+
+fn existing_managed_umadev_dir(boundary: &Path) -> Option<PathBuf> {
+    let boundary = canonical_real_boundary(boundary)?;
+    let umadev = boundary.join(".umadev");
+    real_dir_no_follow(&umadev).then_some(umadev)
+}
+
+fn ensure_managed_umadev_dir(boundary: &Path) -> Option<PathBuf> {
+    let boundary = canonical_real_boundary(boundary)?;
+    let umadev = boundary.join(".umadev");
+    ensure_real_child_dir(&boundary, &umadev).then_some(umadev)
+}
+
+/// Resolve an existing `.umadev/learned` below a user-selected boundary.
+///
+/// The boundary itself may legitimately be a symlink (a symlinked workspace or
+/// home directory), so it is canonicalised first. The two UmaDev-managed
+/// components below that boundary are then inspected with `lstat`: neither
+/// `.umadev` nor `learned` may be a symlink/junction. Keeping this check in the
+/// knowledge crate is deliberate — retrieval must not rely on the agent crate
+/// having validated the same path before calling us.
+#[cfg(all(test, unix))]
+pub(crate) fn existing_managed_learned_dir(boundary: &Path) -> Option<PathBuf> {
+    let umadev = existing_managed_umadev_dir(boundary)?;
+    let learned = umadev.join("learned");
+    real_dir_no_follow(&learned).then_some(learned)
+}
+
+pub(crate) fn existing_managed_cache_dir(project_root: &Path) -> Option<PathBuf> {
+    let umadev = existing_managed_umadev_dir(project_root)?;
+    let cache = umadev.join("kb-index");
+    real_dir_no_follow(&cache).then_some(cache)
+}
+
+pub(crate) fn ensure_managed_cache_dir(project_root: &Path) -> Option<PathBuf> {
+    let umadev = ensure_managed_umadev_dir(project_root)?;
+    let cache = umadev.join("kb-index");
+    ensure_real_child_dir(&umadev, &cache).then_some(cache)
+}
+
+pub(crate) fn read_regular_file_no_follow(path: &Path) -> Option<Vec<u8>> {
+    real_file_no_follow(path)
+        .then(|| std::fs::read(path).ok())
+        .flatten()
+}
+
+pub(crate) fn write_atomic_in_real_dir(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cache path has no parent",
+        ));
+    };
+    if !real_dir_no_follow(parent) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cache parent is not a real directory",
+        ));
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("cache");
+    let temporary = parent.join(format!(
+        ".{name}.{}.{}.{}.tmp",
+        std::process::id(),
+        stamp,
+        sequence
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    match std::fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+/// Purge cache artifacts created under an older corpus/privacy schema before
+/// any cache-hit decision. The separate schema marker survives ordinary
+/// signature invalidation, so adding one lesson does not unnecessarily discard
+/// a current vector store; an actual version upgrade removes both lexical
+/// chunks and old vector metadata (which may contain legacy private paths).
+fn prepare_cache_schema(project_root: &Path) {
+    prepare_cache_schema_with_remove(project_root, |path| std::fs::remove_file(path));
+}
+
+fn prepare_cache_schema_with_remove(
+    project_root: &Path,
+    mut remove_file: impl FnMut(&Path) -> std::io::Result<()>,
+) {
+    let Some(cache_dir) = ensure_managed_cache_dir(project_root) else {
+        return;
+    };
+    let expected = INDEX_SCHEMA_VERSION.to_string();
+    let marker = cache_dir.join("schema");
+    if read_regular_file_no_follow(&marker)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .is_some_and(|value| value.trim() == expected)
+    {
+        return;
+    }
+    let mut removed_all = true;
+    for name in ["bm25.bin", "bm25.sig", "vectors.bin"] {
+        match remove_file(&cache_dir.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => removed_all = false,
+        }
+    }
+    // The marker is the commit record for the whole purge. If a Windows lock
+    // or any other transient failure leaves one artifact behind, retaining the
+    // old marker makes the next invocation retry the migration.
+    if removed_all {
+        let _ = write_atomic_in_real_dir(&marker, expected.as_bytes());
+    }
 }
 
 /// Force the next [`load_or_build_index_multi`] to REBUILD from source instead
@@ -405,8 +569,116 @@ fn index_path(project_root: &Path) -> PathBuf {
 /// or unremovable signature file is ignored (a stale `.sig` only costs one
 /// extra organic rebuild later, never correctness).
 pub fn invalidate_cache(project_root: &Path) {
-    let sig_path = index_path(project_root).with_extension("sig");
-    let _ = std::fs::remove_file(&sig_path);
+    if let Some(cache_dir) = existing_managed_cache_dir(project_root) {
+        let _ = std::fs::remove_file(cache_dir.join("bm25.sig"));
+    }
+}
+
+/// One corpus file as it moves through provenance review and index building.
+/// Learned sources carry their reviewed text immediately; curated files stay
+/// lazy until a cache miss requires a rebuild.
+struct CorpusSource {
+    path: PathBuf,
+    relative_path: String,
+    text: Option<String>,
+    is_learned: bool,
+    is_safe_learned_pitfall: bool,
+    origin: CorpusOrigin,
+    scope: CorpusScope,
+}
+
+fn collect_corpus_sources(files: &[CorpusFile]) -> Vec<CorpusSource> {
+    collect_corpus_sources_with_reader(files, |path| std::fs::read_to_string(path))
+}
+
+fn collect_corpus_sources_with_reader(
+    files: &[CorpusFile],
+    mut read_to_string: impl FnMut(&Path) -> std::io::Result<String>,
+) -> Vec<CorpusSource> {
+    let mut sources = Vec::with_capacity(files.len());
+    for file in files {
+        let is_learned = file.origin().is_learned();
+        let text = if is_learned {
+            let Ok(text) = read_to_string(file.path()) else {
+                continue;
+            };
+            if file.origin() == CorpusOrigin::GlobalSafeLearned
+                && is_unsafe_auto_global_lesson(&text)
+            {
+                continue;
+            }
+            Some(text)
+        } else {
+            None
+        };
+        let is_safe_learned_pitfall = text
+            .as_deref()
+            .is_some_and(source_has_current_pitfall_safety_marker);
+        sources.push(CorpusSource {
+            path: file.path().to_path_buf(),
+            relative_path: file.relative_path().to_string(),
+            text,
+            is_learned,
+            is_safe_learned_pitfall,
+            origin: file.origin(),
+            scope: file.scope(),
+        });
+    }
+    sources
+}
+
+fn materialize_corpus_sources(sources: Vec<CorpusSource>) -> Vec<CorpusSource> {
+    materialize_corpus_sources_with_reader(sources, |path| std::fs::read_to_string(path))
+}
+
+fn materialize_corpus_sources_with_reader(
+    sources: Vec<CorpusSource>,
+    mut read_to_string: impl FnMut(&Path) -> std::io::Result<String>,
+) -> Vec<CorpusSource> {
+    sources
+        .into_iter()
+        .filter_map(|mut source| {
+            if source.text.is_none() {
+                source.text = read_to_string(&source.path).ok();
+            }
+            source.text.as_ref()?;
+            Some(source)
+        })
+        .collect()
+}
+
+fn load_cached_index(project_root: &Path, signature: &str) -> Option<Bm25Index> {
+    let cache_dir = existing_managed_cache_dir(project_root)?;
+    let stored_signature =
+        String::from_utf8(read_regular_file_no_follow(&cache_dir.join("bm25.sig"))?).ok()?;
+    if stored_signature != signature {
+        return None;
+    }
+    let bytes = read_regular_file_no_follow(&cache_dir.join("bm25.bin"))?;
+    let index = serde_json::from_slice::<Bm25Index>(&bytes).ok()?;
+    (index.cache_signature == signature && index.is_consistent()).then_some(index)
+}
+
+fn build_index_from_sources(sources: &[CorpusSource]) -> Bm25Index {
+    let mut chunks = Vec::new();
+    for source in sources {
+        let Some(text) = source.text.as_deref() else {
+            continue;
+        };
+        let mut file_chunks = crate::chunker::chunk_text(&source.relative_path, text);
+        if source.is_learned {
+            for chunk in &mut file_chunks {
+                chunk.meta.is_learned = true;
+                chunk.meta.is_safe_learned_pitfall = source.is_safe_learned_pitfall;
+            }
+        }
+        for chunk in &mut file_chunks {
+            chunk.meta.corpus_origin = source.origin;
+            chunk.meta.corpus_scope = source.scope;
+        }
+        chunks.extend(file_chunks);
+    }
+    Bm25Index::from_chunks(chunks)
 }
 
 /// Build (or rebuild) the index from all `.md` files under `knowledge_dir`,
@@ -421,73 +693,55 @@ pub fn load_or_build_index(project_root: &Path, knowledge_dir: &Path) -> Bm25Ind
 /// Build/load the BM25 index over MULTIPLE source directories (e.g. the
 /// static `knowledge/`, project `.umadev/learned/`, and global
 /// `~/.umadev/learned/`). All `.md` files across all dirs are merged into
-/// one index with a combined mtime signature for cache invalidation.
+/// one index with a combined content signature for cache invalidation. Learned
+/// roots are identified by their `.umadev/learned` path shape, not list order.
 #[must_use]
 pub fn load_or_build_index_multi(project_root: &Path, knowledge_dirs: &[PathBuf]) -> Bm25Index {
-    // Collect all .md files from every dir.
-    let mut paths: Vec<PathBuf> = Vec::new();
-    for dir in knowledge_dirs {
-        if dir.is_dir() {
-            walk_md(dir, &mut paths, 0);
-        }
-    }
-    // Sort the collected paths so chunk POSITIONS are stable run-to-run: `walk_md`
-    // collects in `read_dir` order, which is unspecified and can vary between
-    // machines / after a file is added or removed. A stable position is what the
-    // vector store's positional `chunk_idx` keys on, so an unstable order would
-    // desync BM25 from the cached vector store and attribute a vector hit to the
-    // WRONG chunk (MED #4).
-    paths.sort();
-    let signature = corpus_signature(&paths, knowledge_dirs);
+    let corpus = corpus_from_paths(project_root, knowledge_dirs);
+    load_or_build_index_corpus(project_root, &corpus)
+}
 
-    // Cache check: if the signature matches the stored one, load directly.
-    let sig_path = index_path(project_root).with_extension("sig");
-    if let Ok(stored_sig) = std::fs::read_to_string(&sig_path) {
-        if stored_sig == signature {
-            let idx_path = index_path(project_root);
-            if let Ok(bytes) = std::fs::read(&idx_path) {
-                if let Ok(index) = serde_json::from_slice::<Bm25Index>(&bytes) {
-                    // Only trust a cache whose cross-references are in range — a
-                    // corrupt-but-shape-valid blob would otherwise OOB-panic in
-                    // `search`. An inconsistent cache falls through to a rebuild.
-                    if index.is_consistent() {
-                        return index;
-                    }
-                }
-            }
-        }
+/// Build/load the BM25 index over the exact provenance-aware [`CorpusSet`]
+/// shared with retrieval previews and vector construction.
+#[must_use]
+pub fn load_or_build_index_corpus(project_root: &Path, corpus: &CorpusSet) -> Bm25Index {
+    prepare_cache_schema(project_root);
+    let files = corpus.markdown_files();
+    // Learned files are read and reviewed exactly once here. The reviewed text
+    // supplies both its signature and, on a rebuild, every generated chunk.
+    // This closes the audit -> hash -> chunk path-reopen race.
+    let sources = collect_corpus_sources(&files);
+    let preliminary_signature = corpus_source_signature(&sources);
+
+    // A cache hit does not rebuild, so curated files can remain path-backed and
+    // use the metadata/hash memo. Cached chunks came from an earlier reviewed
+    // snapshot; current source bytes are not ingested on this branch.
+    if let Some(index) = load_cached_index(project_root, &preliminary_signature) {
+        return index;
     }
 
-    // Cache miss (or corrupt) — rebuild. Chunk each file using the dir it
-    // came from as the strip-prefix root (so ChunkMeta.path is relative).
-    let mut chunks: Vec<Chunk> = Vec::new();
-    for abs in &paths {
-        let root = knowledge_dirs
-            .iter()
-            .find(|d| abs.starts_with(d))
-            .cloned()
-            .unwrap_or_else(|| knowledge_dirs[0].clone());
-        // A file from any corpus dir PAST the curated knowledge dir (index 0) is learned
-        // SEDIMENT (.umadev/learned + ~/.umadev/learned from corpus_dirs). Stamp its chunks
-        // so the phase/seat filter always lets them through - including a promoted GLOBAL
-        // lesson whose slug filename lacks the `lesson-` marker (knowledge #1).
-        let is_learned = knowledge_dirs.first().is_none_or(|k| &root != k);
-        let mut file_chunks = crate::chunker::chunk_file(&root, abs);
-        if is_learned {
-            for ch in &mut file_chunks {
-                ch.meta.is_learned = true;
-            }
+    // Cache miss: take one immutable text snapshot of every remaining curated
+    // file, then recompute the exact signature and build from those same bytes.
+    // A concurrent replacement can affect a later invocation, never split this
+    // invocation's signature from its chunks.
+    let sources = materialize_corpus_sources(sources);
+    let signature = exact_corpus_source_signature(&sources);
+    if signature != preliminary_signature {
+        if let Some(index) = load_cached_index(project_root, &signature) {
+            return index;
         }
-        chunks.extend(file_chunks);
     }
-    let index = Bm25Index::from_chunks(chunks);
+
+    let mut index = build_index_from_sources(&sources);
+    index.cache_signature.clone_from(&signature);
 
     // Persist index + signature (best-effort).
-    let path = index_path(project_root);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(text) = serde_json::to_vec(&index) {
+    if let (Some(cache_dir), Ok(text)) = (
+        ensure_managed_cache_dir(project_root),
+        serde_json::to_vec(&index),
+    ) {
+        let sig_path = cache_dir.join("bm25.sig");
+        let path = cache_dir.join("bm25.bin");
         // Write the signature ONLY when the index write actually SUCCEEDED. Writing
         // the sig unconditionally after a FAILED index write (disk full, or a Windows
         // lock / transient EACCES while the previous valid index file survives) leaves
@@ -496,12 +750,112 @@ pub fn load_or_build_index_multi(project_root: &Path, knowledge_dirs: &[PathBuf]
         // corpus changes again. Gating the sig on the index write keeps the pair
         // consistent: a failed index write leaves the old sig, so the next load's
         // signature mismatch rebuilds instead of trusting a stale cache.
-        if std::fs::write(&path, text).is_ok() {
-            let _ = std::fs::write(&sig_path, &signature);
+        if write_atomic_in_real_dir(&path, &text).is_ok() {
+            let _ = write_atomic_in_real_dir(&sig_path, signature.as_bytes());
         }
     }
 
     index
+}
+
+/// Reject legacy auto-generated cross-project lessons before they enter either
+/// the BM25 cache or vector corpus. Hand-authored global notes remain valid;
+/// current generated lessons must carry the classifier-family v2 marker.
+fn is_unsafe_auto_global_lesson(text: &str) -> bool {
+    use crate::chunker::FrontMatterField as Field;
+
+    let maintainer = crate::chunker::front_matter_field(text, "maintainer");
+    let global_safety = crate::chunker::front_matter_field(text, "global_safety");
+    // Ambiguous security metadata is never indexed. Cleanup leaves the file in
+    // place for a human to repair rather than guessing its provenance.
+    if maintainer == Field::Invalid || global_safety == Field::Invalid {
+        return true;
+    }
+    match maintainer {
+        Field::Value("auto-sediment") => global_safety != Field::Value("classifier-family-v2"),
+        Field::NoHeader | Field::Missing | Field::Value(_) => false,
+        Field::Invalid => true,
+    }
+}
+
+/// Check the whole learned markdown source, before the chunker strips front
+/// matter and divides it into H2 sections. Only canonical frontmatter is an
+/// authority; body prose can describe these fields but cannot grant trust.
+fn source_has_current_pitfall_safety_marker(text: &str) -> bool {
+    use crate::chunker::FrontMatterField as Field;
+
+    crate::chunker::front_matter_field(text, "global_safety")
+        == Field::Value("classifier-family-v2")
+        || crate::chunker::front_matter_field(text, "pitfall_safety")
+            == Field::Value("classifier-derived-v2")
+}
+
+fn content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    digest.iter().take(8).fold(String::new(), |mut acc, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{byte:02x}");
+        acc
+    })
+}
+
+fn format_corpus_signature(mut entries: Vec<(String, String)>) -> String {
+    entries.sort();
+    let body = entries
+        .iter()
+        .map(|(path, hash)| format!("{path}\t{hash}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("schema=v{INDEX_SCHEMA_VERSION}\n{body}")
+}
+
+fn corpus_source_signature(sources: &[CorpusSource]) -> String {
+    match signature_memo().lock() {
+        Ok(mut memo) => compute_corpus_source_signature(sources, &mut memo),
+        Err(_) => compute_corpus_source_signature(sources, &mut HashMap::new()),
+    }
+}
+
+fn compute_corpus_source_signature(
+    sources: &[CorpusSource],
+    memo: &mut HashMap<PathBuf, CachedFileHash>,
+) -> String {
+    let mut content_reads = 0;
+    let entries = sources
+        .iter()
+        .filter_map(|source| {
+            let hash = source.text.as_ref().map_or_else(
+                || file_content_hash(&source.path, memo, &mut content_reads),
+                |text| Some(content_hash(text.as_bytes())),
+            )?;
+            Some((source_identity(source), hash))
+        })
+        .collect();
+    format_corpus_signature(entries)
+}
+
+fn exact_corpus_source_signature(sources: &[CorpusSource]) -> String {
+    let entries = sources
+        .iter()
+        .filter_map(|source| {
+            source
+                .text
+                .as_ref()
+                .map(|text| (source_identity(source), content_hash(text.as_bytes())))
+        })
+        .collect();
+    format_corpus_signature(entries)
+}
+
+fn source_identity(source: &CorpusSource) -> String {
+    format!(
+        "{}/{}/{}",
+        source.scope.id(),
+        source.origin.id(),
+        source.relative_path
+    )
 }
 
 /// Build a machine-INDEPENDENT corpus signature: one sorted line per file,
@@ -538,6 +892,7 @@ pub fn load_or_build_index_multi(project_root: &Path, knowledge_dirs: &[PathBuf]
 /// `knowledge_dirs` is the list of roots to strip (so `ChunkMeta.path`-style
 /// relative keys land in the signature). Falls back to the file name when no
 /// root matches.
+#[cfg(test)]
 fn corpus_signature(paths: &[PathBuf], knowledge_dirs: &[PathBuf]) -> String {
     // Take the process-wide per-file hash memo. Fail-open on a poisoned lock:
     // fall back to a fresh empty memo (correct, just not accelerated).
@@ -560,7 +915,7 @@ struct CachedFileHash {
 }
 
 /// The process-wide per-file content-hash memo, keyed by absolute path. Purely
-/// an in-process accelerator for [`corpus_signature`]: it never touches disk, so
+/// an in-process accelerator for [`corpus_source_signature`]: it never touches disk, so
 /// it changes nothing about the portable, content-based on-disk `.sig`. Fail-open
 /// — a poisoned lock just takes the un-memoized (still correct) path.
 fn signature_memo() -> &'static Mutex<HashMap<PathBuf, CachedFileHash>> {
@@ -589,7 +944,6 @@ fn file_content_hash(
     memo: &mut HashMap<PathBuf, CachedFileHash>,
     content_reads: &mut usize,
 ) -> Option<String> {
-    use sha2::{Digest, Sha256};
     let stat = file_stat(path);
     // Fast path: cheap `stat` matches the memoized `(mtime, size)` → reuse the
     // stored content hash, no byte read.
@@ -605,12 +959,7 @@ fn file_content_hash(
     // counts only files actually read from disk (fail-open: the file is skipped).
     let bytes = std::fs::read(path).ok()?;
     *content_reads += 1;
-    let digest = Sha256::digest(&bytes);
-    let hash_hex: String = digest.iter().take(8).fold(String::new(), |mut acc, b| {
-        use std::fmt::Write as _;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    });
+    let hash_hex = content_hash(&bytes);
     // Only cacheable when we have a `(mtime, size)` to key on; otherwise the next
     // call re-reads (fail-open, still correct).
     if let Some((mtime, size)) = stat {
@@ -632,6 +981,7 @@ fn file_content_hash(
 /// every file was served from the warm memo. Taking the memo as a parameter lets
 /// a test drive the fast/slow paths deterministically without the process-global
 /// memo.
+#[cfg(test)]
 fn compute_signature(
     paths: &[PathBuf],
     knowledge_dirs: &[PathBuf],
@@ -653,18 +1003,7 @@ fn compute_signature(
             .unwrap_or_else(|| p.to_string_lossy().replace('\\', "/"));
         entries.push((rel, hash));
     }
-    entries.sort();
-    // Fold in the schema version so a tokenizer/chunker/layout upgrade
-    // invalidates every older cache even when no source file changed.
-    let body = entries
-        .iter()
-        .map(|(p, h)| format!("{p}\t{h}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    (
-        format!("schema=v{INDEX_SCHEMA_VERSION}\n{body}"),
-        content_reads,
-    )
+    (format_corpus_signature(entries), content_reads)
 }
 
 /// Maximum number of `.md` files the index will scan. A guard against a
@@ -694,9 +1033,20 @@ fn max_md_files() -> usize {
 /// an entry whose metadata can't be read is skipped, never aborting the walk.
 /// (umadev-knowledge deliberately does not depend on umadev-agent, so this
 /// mirrors that crate's `fswalk` policy inline rather than sharing the helper.)
-fn walk_md(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+pub(crate) fn walk_md(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     let cap = max_md_files();
+    walk_md_bounded(dir, out, depth, cap);
+}
+
+fn walk_md_bounded(dir: &Path, out: &mut Vec<PathBuf>, depth: usize, cap: usize) {
     if depth > 6 {
+        return;
+    }
+    // Callers can pass a corpus root directly. Classifying only its children
+    // still follows a symlinked root through `read_dir`, which lets a managed
+    // `.umadev/learned` link escape into an arbitrary external markdown tree.
+    // Apply the same lstat/no-follow rule to every recursion root as to entries.
+    if !real_dir_no_follow(dir) {
         return;
     }
     // 0 = unlimited; otherwise this is a hard ceiling enforced PER-PUSH below
@@ -707,7 +1057,12 @@ fn walk_md(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in rd.flatten() {
+    // File-system enumeration order is unspecified. Apply the cap only after a
+    // stable per-directory ordering so identical corpora select identical files
+    // on APFS, ext4 and NTFS.
+    let mut entries = rd.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
         let p = entry.path();
         let Ok(meta) = std::fs::symlink_metadata(&p) else {
             continue;
@@ -717,7 +1072,7 @@ fn walk_md(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             continue;
         }
         if ft.is_dir() {
-            walk_md(&p, out, depth + 1);
+            walk_md_bounded(&p, out, depth + 1, cap);
         } else if ft.is_file() && p.extension().and_then(|s| s.to_str()) == Some("md") {
             if cap != 0 && out.len() >= cap {
                 warn_md_cap_once(cap);
@@ -791,6 +1146,10 @@ pub fn corpus_fingerprint(index: &Bm25Index) -> String {
     let mut hasher = Sha256::new();
     hasher.update((index.chunks.len() as u64).to_be_bytes());
     for c in &index.chunks {
+        hasher.update(c.meta.corpus_scope.id().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(c.meta.corpus_origin.id().as_bytes());
+        hasher.update([0u8]);
         hasher.update(c.meta.path.as_bytes());
         hasher.update([0u8]);
         hasher.update(c.meta.section.as_bytes());
@@ -1100,6 +1459,179 @@ mod tests {
     }
 
     #[test]
+    fn multi_corpus_rejects_unsafe_auto_global_lessons_only() {
+        use std::fs;
+
+        let project = tempfile::TempDir::new().unwrap();
+        let external = tempfile::TempDir::new().unwrap();
+        let root = project.path();
+        let curated = root.join("knowledge");
+        let project_learned = root.join(".umadev/learned");
+        let global_learned = external.path().join(".umadev/learned");
+        fs::create_dir_all(&curated).unwrap();
+        fs::create_dir_all(&project_learned).unwrap();
+        fs::create_dir_all(&global_learned).unwrap();
+
+        fs::write(
+            curated.join("curated.md"),
+            "# Curated\n\ncurated_visible_token",
+        )
+        .unwrap();
+        fs::write(
+            project_learned.join("local.md"),
+            "---\nmaintainer: auto-sediment\npitfall_safety: classifier-derived-v2\n---\n# [pitfall] Dev error: Local\n\n## Symptom\n\nproject_private_token\n\n## Fix\n\nlocal_fix_token",
+        )
+        .unwrap();
+        fs::write(
+            global_learned.join("legacy-auto.md"),
+            "---\nmaintainer: auto-sediment\nglobal_safety: classifier-only-v1\n---\n# Legacy\n\nacme_private_payment_engine",
+        )
+        .unwrap();
+        fs::write(
+            global_learned.join("legacy-auto-bom.md"),
+            "\u{feff}---\nmaintainer: auto-sediment\n---\n# Legacy BOM\n\nbom_prefixed_private_token",
+        )
+        .unwrap();
+        fs::write(
+            global_learned.join("safe-auto.md"),
+            "---\nmaintainer: auto-sediment\nglobal_safety: classifier-family-v2\n---\n# Safe\n\nsafe_classifier_family_token",
+        )
+        .unwrap();
+        fs::write(
+            global_learned.join("hand-authored.md"),
+            "# Hand-authored\n\nhand_authored_global_token discusses `maintainer: auto-sediment` and `global_safety: classifier-family-v2` in prose",
+        )
+        .unwrap();
+        fs::write(
+            global_learned.join("ambiguous-auto.md"),
+            "---\nmaintainer: auto-sediment\nmaintainer: human\nglobal_safety: classifier-family-v2\n---\n# Ambiguous\n\nambiguous_private_token",
+        )
+        .unwrap();
+        for (name, header, token) in [
+            (
+                "quoted-maintainer.md",
+                "maintainer: \"auto-sediment\"\nglobal_safety: classifier-family-v2",
+                "quoted_maintainer_private_token",
+            ),
+            (
+                "commented-maintainer.md",
+                "maintainer: auto-sediment # generated\nglobal_safety: classifier-family-v2",
+                "commented_maintainer_private_token",
+            ),
+            (
+                "quoted-safety.md",
+                "maintainer: auto-sediment\nglobal_safety: 'classifier-family-v2'",
+                "quoted_safety_private_token",
+            ),
+            (
+                "quoted-key.md",
+                "\"maintainer\": auto-sediment\nglobal_safety: classifier-family-v2",
+                "quoted_key_private_token",
+            ),
+        ] {
+            fs::write(
+                global_learned.join(name),
+                format!("---\n{header}\n---\n# Ambiguous YAML\n\n{token}"),
+            )
+            .unwrap();
+        }
+
+        // Deliberately put GLOBAL first. Security classification must not rely
+        // on the historical "curated directory is element zero" convention.
+        let index = load_or_build_index_multi(root, &[global_learned, curated, project_learned]);
+        let corpus = index
+            .chunks
+            .iter()
+            .map(|chunk| chunk.body.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(corpus.contains("curated_visible_token"));
+        assert!(
+            corpus.contains("project_private_token"),
+            "project-local sediment may retain project-private context"
+        );
+        assert!(corpus.contains("safe_classifier_family_token"));
+        assert!(corpus.contains("hand_authored_global_token"));
+        assert!(
+            !corpus.contains("bom_prefixed_private_token"),
+            "a BOM-prefixed legacy generated lesson must remain quarantined"
+        );
+        assert!(!corpus.contains("ambiguous_private_token"));
+        for token in [
+            "quoted_maintainer_private_token",
+            "commented_maintainer_private_token",
+            "quoted_safety_private_token",
+            "quoted_key_private_token",
+        ] {
+            assert!(
+                !corpus.contains(token),
+                "ambiguous YAML provenance must fail closed: {token}"
+            );
+        }
+        assert!(
+            !corpus.contains("acme_private_payment_engine"),
+            "legacy auto-generated global lessons must be excluded before indexing"
+        );
+        assert!(
+            index
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.meta.path == "safe-auto.md")
+                .all(|chunk| chunk.meta.is_safe_learned_pitfall),
+            "the file-level v2 marker must be stamped onto every safe chunk"
+        );
+        assert!(
+            index
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.meta.path == "local.md")
+                .all(|chunk| chunk.meta.is_safe_learned_pitfall),
+            "the local file-level marker must cover its separate Fix chunk"
+        );
+    }
+
+    #[test]
+    fn reviewed_learned_text_is_reused_for_signature_and_chunks() {
+        let external = tempfile::TempDir::new().unwrap();
+        let global_learned = external.path().join(".umadev/learned");
+        let path = global_learned.join("safe.md");
+        let safe = "---\nmaintainer: auto-sediment\nglobal_safety: classifier-family-v2\n---\n# Safe\n\nreviewed_safe_token";
+        let replacement = "---\nmaintainer: auto-sediment\nglobal_safety: classifier-only-v1\n---\n# Unsafe\n\nreplacement_private_token";
+        std::fs::create_dir_all(&global_learned).unwrap();
+        std::fs::write(&path, safe).unwrap();
+        let corpus = CorpusSet::from_roots([(
+            global_learned,
+            CorpusOrigin::GlobalSafeLearned,
+            CorpusScope::Global,
+        )]);
+        let files = corpus.markdown_files();
+        let mut reads = 0;
+
+        let sources = collect_corpus_sources_with_reader(&files, |_| {
+            reads += 1;
+            Ok(if reads == 1 { safe } else { replacement }.to_string())
+        });
+        assert_eq!(reads, 1, "provenance review reads the source once");
+        let preliminary = corpus_source_signature(&sources);
+        let sources = materialize_corpus_sources_with_reader(sources, |_| {
+            panic!("a reviewed learned source must not be reopened")
+        });
+        let exact = exact_corpus_source_signature(&sources);
+        let index = build_index_from_sources(&sources);
+        let corpus = index
+            .chunks
+            .iter()
+            .map(|chunk| chunk.body.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(preliminary, exact);
+        assert!(corpus.contains("reviewed_safe_token"));
+        assert!(!corpus.contains("replacement_private_token"));
+    }
+
+    #[test]
     fn load_or_build_reuses_cache_when_unchanged() {
         use std::fs;
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1130,6 +1662,163 @@ mod tests {
         .unwrap();
         let idx3 = load_or_build_index(root, &kd);
         assert!(!idx3.chunks.is_empty());
+    }
+
+    #[test]
+    fn provenance_aware_index_preserves_origin_and_scope_for_each_root() {
+        let project = tempfile::TempDir::new().unwrap();
+        let bundled = tempfile::TempDir::new().unwrap();
+        let custom = project.path().join("knowledge");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(
+            bundled.path().join("curated.md"),
+            "# Curated\n\nbundled_token",
+        )
+        .unwrap();
+        std::fs::write(custom.join("team.md"), "# Team\n\nproject_token").unwrap();
+        let corpus = CorpusSet::from_roots([
+            (
+                bundled.path().to_path_buf(),
+                CorpusOrigin::BundledCurated,
+                CorpusScope::Bundled,
+            ),
+            (custom, CorpusOrigin::ProjectCustom, CorpusScope::Project),
+        ]);
+        let index = load_or_build_index_corpus(project.path(), &corpus);
+        let curated = index
+            .chunks
+            .iter()
+            .find(|chunk| chunk.body.contains("bundled_token"))
+            .unwrap();
+        let team = index
+            .chunks
+            .iter()
+            .find(|chunk| chunk.body.contains("project_token"))
+            .unwrap();
+        assert_eq!(curated.meta.corpus_origin, CorpusOrigin::BundledCurated);
+        assert_eq!(curated.meta.corpus_scope, CorpusScope::Bundled);
+        assert_eq!(team.meta.corpus_origin, CorpusOrigin::ProjectCustom);
+        assert_eq!(team.meta.corpus_scope, CorpusScope::Project);
+    }
+
+    #[test]
+    fn schema_upgrade_purges_legacy_lexical_and_vector_cache_artifacts() {
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let knowledge = root.join("knowledge");
+        let cache = root.join(".umadev/kb-index");
+        fs::create_dir_all(&knowledge).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(knowledge.join("safe.md"), "# Safe\n\ncurrent_safe_token").unwrap();
+        fs::write(cache.join("schema"), "2").unwrap();
+        fs::write(cache.join("bm25.bin"), "legacy_private_chunk").unwrap();
+        fs::write(cache.join("bm25.sig"), "legacy-signature").unwrap();
+        fs::write(cache.join("vectors.bin"), "legacy_private_vector_path").unwrap();
+
+        let index = load_or_build_index(root, &knowledge);
+
+        assert!(index
+            .chunks
+            .iter()
+            .any(|chunk| chunk.body.contains("current_safe_token")));
+        assert_eq!(
+            fs::read_to_string(cache.join("schema")).unwrap(),
+            INDEX_SCHEMA_VERSION.to_string()
+        );
+        assert!(cache.join("bm25.bin").is_file());
+        assert!(!cache.join("vectors.bin").exists());
+        assert!(!fs::read(cache.join("bm25.bin"))
+            .unwrap()
+            .windows("legacy_private_chunk".len())
+            .any(|window| window == b"legacy_private_chunk"));
+    }
+
+    #[test]
+    fn schema_upgrade_does_not_advance_marker_when_an_artifact_is_locked() {
+        use std::fs;
+        use std::io::{Error, ErrorKind};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let cache = root.join(".umadev/kb-index");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("schema"), "2").unwrap();
+        fs::write(cache.join("bm25.bin"), "legacy-index").unwrap();
+        fs::write(cache.join("bm25.sig"), "legacy-signature").unwrap();
+        fs::write(cache.join("vectors.bin"), "legacy-private-vector").unwrap();
+        let locked = cache.join("vectors.bin");
+        let mut attempted = Vec::new();
+
+        prepare_cache_schema_with_remove(root, |path| {
+            attempted.push(path.to_path_buf());
+            if path.file_name().is_some_and(|name| name == "vectors.bin") {
+                Err(Error::new(ErrorKind::PermissionDenied, "simulated lock"))
+            } else {
+                fs::remove_file(path)
+            }
+        });
+
+        assert_eq!(attempted.len(), 3, "all artifacts should be attempted");
+        assert_eq!(fs::read_to_string(cache.join("schema")).unwrap(), "2");
+        assert!(locked.exists());
+
+        prepare_cache_schema(root);
+        assert_eq!(
+            fs::read_to_string(cache.join("schema")).unwrap(),
+            INDEX_SCHEMA_VERSION.to_string()
+        );
+        assert!(!locked.exists(), "the next invocation must retry cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_migration_never_follows_a_managed_directory_symlink() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::TempDir::new().unwrap();
+        let knowledge = project.path().join("knowledge");
+        fs::create_dir_all(&knowledge).unwrap();
+        fs::write(
+            knowledge.join("safe.md"),
+            "# Safe\n\nexternal_cache_escape_guard",
+        )
+        .unwrap();
+        fs::create_dir(project.path().join(".umadev")).unwrap();
+
+        let external = tempfile::TempDir::new().unwrap();
+        let artifacts = [
+            ("schema", "2"),
+            ("bm25.bin", "external legacy index"),
+            ("bm25.sig", "external legacy signature"),
+            ("vectors.bin", "external private vector metadata"),
+        ];
+        for (name, body) in artifacts {
+            fs::write(external.path().join(name), body).unwrap();
+        }
+        symlink(external.path(), project.path().join(".umadev/kb-index")).unwrap();
+
+        let index = load_or_build_index(project.path(), &knowledge);
+        invalidate_cache(project.path());
+
+        assert!(index
+            .chunks
+            .iter()
+            .any(|chunk| chunk.body.contains("external_cache_escape_guard")));
+        for (name, body) in artifacts {
+            assert_eq!(
+                fs::read_to_string(external.path().join(name)).unwrap(),
+                body,
+                "schema migration/cache writes must not touch the symlink target"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(external.path()).unwrap().flatten().count(),
+            artifacts.len(),
+            "no cache artifact may be created outside the managed tree"
+        );
     }
 
     #[test]
@@ -1271,6 +1960,24 @@ B: {sb}"
         );
     }
 
+    #[test]
+    fn bounded_markdown_walk_selects_a_stable_lexicographic_subset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // Reverse creation order to ensure the assertion is about the walker,
+        // not an accidental directory insertion order.
+        std::fs::write(root.join("z.md"), "# Z\n").unwrap();
+        std::fs::write(root.join("b.md"), "# B\n").unwrap();
+        std::fs::write(root.join("a.md"), "# A\n").unwrap();
+        let mut paths = Vec::new();
+        walk_md_bounded(root, &mut paths, 0, 2);
+        let names = paths
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["a.md", "b.md"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn walk_md_no_follow_symlinks_out_and_cycle_terminates() {
@@ -1301,6 +2008,66 @@ B: {sb}"
         assert!(
             !out.iter().any(|p| p.to_string_lossy().contains("escape")),
             "walk must not traverse an escaping symlink: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_learned_accepts_linked_boundary_but_rejects_managed_links() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let real_boundary = tempfile::TempDir::new().unwrap();
+        let link_parent = tempfile::TempDir::new().unwrap();
+        let linked_boundary = link_parent.path().join("linked-boundary");
+        symlink(real_boundary.path(), &linked_boundary).unwrap();
+
+        let umadev = real_boundary.path().join(".umadev");
+        let learned = umadev.join("learned");
+        fs::create_dir_all(&learned).unwrap();
+        assert_eq!(
+            existing_managed_learned_dir(&linked_boundary),
+            Some(fs::canonicalize(&learned).unwrap()),
+            "a user-selected HOME/workspace boundary may itself be a symlink"
+        );
+
+        let outside = tempfile::TempDir::new().unwrap();
+        fs::remove_dir(&learned).unwrap();
+        symlink(outside.path(), &learned).unwrap();
+        assert!(
+            existing_managed_learned_dir(&linked_boundary).is_none(),
+            "the managed learned component must never be followed"
+        );
+
+        fs::remove_file(&learned).unwrap();
+        fs::remove_dir(&umadev).unwrap();
+        symlink(outside.path(), &umadev).unwrap();
+        assert!(
+            existing_managed_learned_dir(&linked_boundary).is_none(),
+            "the managed .umadev component must never be followed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_md_rejects_a_symlinked_corpus_root() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            outside.path().join("private.md"),
+            "# private\n\nexternal_private_token",
+        )
+        .unwrap();
+        let link_parent = tempfile::TempDir::new().unwrap();
+        let linked_root = link_parent.path().join("learned");
+        symlink(outside.path(), &linked_root).unwrap();
+
+        let mut paths = Vec::new();
+        walk_md(&linked_root, &mut paths, 0);
+        assert!(
+            paths.is_empty(),
+            "a symlinked corpus root must not pull external markdown into retrieval"
         );
     }
 
@@ -1564,6 +2331,25 @@ B: {sb}"
         }
         assert!(!idx.is_consistent());
         assert!(idx.search("login", 5).is_empty(), "no panic, empty result");
+    }
+
+    #[test]
+    fn cache_loader_rejects_index_and_sidecar_from_different_writers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = ensure_managed_cache_dir(tmp.path()).unwrap();
+        let mut index_a = idx_from(&[("a.md", "# A\n\n## S\n\nprivate snapshot A")]);
+        index_a.cache_signature = "signature-A".to_string();
+        std::fs::write(
+            cache.join("bm25.bin"),
+            serde_json::to_vec(&index_a).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(cache.join("bm25.sig"), "signature-B").unwrap();
+
+        assert!(
+            load_cached_index(tmp.path(), "signature-B").is_none(),
+            "process B's sidecar must never authorize process A's index snapshot"
+        );
     }
 
     #[test]

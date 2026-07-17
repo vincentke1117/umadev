@@ -168,7 +168,7 @@ pub struct FileSymbols {
     pub rel_path: String,
     /// Symbols in source order.
     pub symbols: Vec<Symbol>,
-    /// Importance score for this file (see [`SymbolIndex::rank`]).
+    /// Importance score assigned by the internal file ranker.
     pub score: f64,
 }
 
@@ -208,14 +208,23 @@ impl SymbolIndex {
 
 /// Recursively collect code files under `dir`, bounded by [`limits`].
 fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > limits::MAX_DEPTH || out.len() >= limits::MAX_FILES {
+    collect_bounded(dir, out, depth, limits::MAX_FILES);
+}
+
+fn collect_bounded(dir: &Path, out: &mut Vec<PathBuf>, depth: usize, max_files: usize) {
+    if depth > limits::MAX_DEPTH || out.len() >= max_files {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return; // unreadable dir → skip (fail-open)
     };
-    for e in rd.flatten() {
-        if out.len() >= limits::MAX_FILES {
+    // `read_dir` order is explicitly unspecified. Sort BEFORE applying the cap,
+    // otherwise two filesystems can index different subsets of the same large
+    // repository and produce different prompts/cache signatures.
+    let mut entries = rd.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for e in entries {
+        if out.len() >= max_files {
             return;
         }
         let p = e.path();
@@ -230,7 +239,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                 continue;
             }
-            collect(&p, out, depth + 1);
+            collect_bounded(&p, out, depth + 1, max_files);
         } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
             // Extension match is case-insensitive (`.RS`, `.PY` on Windows).
             let ext_lc = ext.to_ascii_lowercase();
@@ -1386,7 +1395,8 @@ fn resolve_edges(
 
 /// Build the structured [`SymbolIndex`] for `root` — scan every code file,
 /// extract + rank symbols. Uses the on-disk mtime cache when valid (see
-/// [`load_or_scan`]). Fail-open: an empty/unreadable repo yields an empty index.
+/// the internal cache loader). Fail-open: an empty/unreadable repo yields an
+/// empty index.
 #[must_use]
 pub fn symbol_index(root: &Path) -> SymbolIndex {
     load_or_scan(root)
@@ -1596,7 +1606,7 @@ fn file_stem_lc(rel_path: &str) -> String {
 /// (so `"checkout"` matches `src/pages/checkout/Cart.tsx`); when any scope hint
 /// is supplied, files matching it are emitted first (and never truncated away
 /// before unrelated files). With an empty `scope`, the global importance order
-/// from [`rank`] is used.
+/// from the internal global ranker is used.
 ///
 /// Fail-open: an empty repo / unreadable root / `budget_chars == 0` returns an
 /// empty `String`.
@@ -2710,6 +2720,24 @@ mod tests {
             sig.starts_with(&format!("schema=v{REPOMAP_SCHEMA_VERSION}")),
             "signature must be prefixed with the schema version: {sig}"
         );
+    }
+
+    #[test]
+    fn bounded_code_walk_selects_a_stable_lexicographic_subset() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // Deliberately create in the opposite order. The file cap must be
+        // applied after stable ordering, not after filesystem enumeration.
+        write(root, "z.rs", "fn z() {}\n");
+        write(root, "b.rs", "fn b() {}\n");
+        write(root, "a.rs", "fn a() {}\n");
+        let mut files = Vec::new();
+        collect_bounded(root, &mut files, 0, 2);
+        let names = files
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["a.rs", "b.rs"]);
     }
 
     #[test]

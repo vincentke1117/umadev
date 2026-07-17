@@ -447,7 +447,7 @@ pub struct DesignIntent {
 /// the ARMED direction: a requirement that never names the hue at all — the overwhelmingly
 /// common case — needs no consult, and the rule simply stays on. `false` here means "nobody
 /// could possibly have authorized it, don't even ask"; `true` means only "ask the brain".
-/// Neither answer can grant permission, so no addition to [`PURPLE_WORDS`] can ever leak one.
+/// Neither answer can grant permission, so no addition to `PURPLE_WORDS` can ever leak one.
 ///
 /// Fail-open by shape: an unparseable literal, a proper noun, a prohibition, a quoted code
 /// fence — every one of them merely returns `true` and costs one cheap consult, which then

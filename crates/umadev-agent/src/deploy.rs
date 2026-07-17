@@ -52,6 +52,52 @@ const OUTPUT_CAP: usize = 256 * 1024;
 /// can't turn a timeout into an unbounded hang.
 const KILL_REAP_SECS: u64 = 5;
 
+/// Cancellation-safe owner for a detached deploy process tree.
+///
+/// Tokio's `Child::kill_on_drop` only kills the direct shell wrapper. A deploy
+/// future can be aborted at any `.await`, before the explicit timeout/error
+/// cleanup below runs, so this guard synchronously kills the detached process
+/// group from `Drop` as well. A normally reaped child is explicitly disarmed.
+struct DeployChildGuard {
+    child: tokio::process::Child,
+    armed: bool,
+}
+
+impl DeployChildGuard {
+    fn new(child: tokio::process::Child) -> Self {
+        Self { child, armed: true }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        &mut self.child
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn kill_tree_now(&mut self) {
+        let _ = crate::spawn_util::kill_process_group(&self.child);
+        let _ = self.child.start_kill();
+    }
+
+    async fn kill_tree_and_reap(&mut self) {
+        self.kill_tree_now();
+        let _ = tokio::time::timeout(Duration::from_secs(KILL_REAP_SECS), self.child.wait()).await;
+    }
+}
+
+impl Drop for DeployChildGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // `Drop` cannot await. The group kill reaches detached descendants;
+            // `start_kill` backs it up for the direct child. Tokio performs its
+            // normal kill-on-drop/reap bookkeeping when `child` is then dropped.
+            self.kill_tree_now();
+        }
+    }
+}
+
 /// A recognised deployment platform. Detected purely from files already in the
 /// workspace; each variant maps to a single canonical CLI command.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -362,10 +408,11 @@ pub async fn run_deploy(workspace: &Path, command: Option<&str>) -> DeployProof 
 /// `timeout_secs`. Always returns a [`DeployProof`] — fail-open, never hangs.
 ///
 /// **Kill + bound (the audit fix).** The command is spawned with
-/// `kill_on_drop(true)` AND detached into its own session/process-group, so on
-/// timeout we kill the WHOLE tree (the `sh -c` wrapper forks `npx` → `node`,
-/// etc.) — tokio dropping the `Child` alone would leave those descendants
-/// running. Output is captured through a bounded, tail-retaining reader
+/// `kill_on_drop(true)` AND detached into its own session/process-group. A
+/// cancellation-safe guard kills the WHOLE tree on timeout, wait failure, or
+/// when the caller aborts/drops this future (the `sh -c` wrapper forks `npx` →
+/// `node`, etc.) — tokio dropping the `Child` alone would leave those
+/// descendants running. Output is captured through a bounded, tail-retaining reader
 /// ([`read_capped_tail`]) instead of `Command::output()`, so a chatty command
 /// can't buffer unbounded stdout/stderr into memory; the reader always drains so
 /// the child never blocks on a full pipe.
@@ -396,7 +443,7 @@ async fn run_deploy_command(
     // stdout/stderr are piped. Fail-open (see spawn_util).
     crate::spawn_util::detach_from_controlling_terminal(&mut dcmd);
     let mut child = match dcmd.spawn() {
-        Ok(c) => c,
+        Ok(c) => DeployChildGuard::new(c),
         Err(e) => {
             let mut proof =
                 DeployProof::not_deployed(platform, format!("could not run deploy command: {e}"));
@@ -410,24 +457,28 @@ async fn run_deploy_command(
     // (bounding memory on a chatty deploy) while always draining so the child
     // never blocks on a full pipe.
     let stdout_task = child
+        .child_mut()
         .stdout
         .take()
         .map(|h| tokio::spawn(read_capped_tail(h, OUTPUT_CAP)));
     let stderr_task = child
+        .child_mut()
         .stderr
         .take()
         .map(|h| tokio::spawn(read_capped_tail(h, OUTPUT_CAP)));
 
     // Race the command's exit against the deploy budget.
-    let wait_result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
-    if wait_result.is_err() {
-        // Timed out: KILL the whole process group (detached above) so `npx`/`node`
-        // descendants die too — dropping the `Child` alone would leave them
-        // running. `start_kill` + `kill_on_drop` back up the direct child; the
-        // reap is bounded so a wedged wait() can't hang.
-        let _ = crate::spawn_util::kill_process_group(&child);
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(KILL_REAP_SECS), child.wait()).await;
+    let wait_result =
+        tokio::time::timeout(Duration::from_secs(timeout_secs), child.child_mut().wait()).await;
+    match &wait_result {
+        Ok(Ok(_)) => child.disarm(),
+        Ok(Err(_)) | Err(_) => {
+            // Timeout or a failed `wait()` leaves the child's fate uncertain.
+            // Kill the whole detached tree and bound the reap. If this future
+            // is itself cancelled during the reap, the still-armed Drop guard
+            // repeats the synchronous group kill.
+            child.kill_tree_and_reap().await;
+        }
     }
 
     let raw_stdout = join_capped(stdout_task).await;
@@ -467,13 +518,6 @@ async fn run_deploy_command(
             }
         }
         Ok(Err(e)) => {
-            // #21 — `wait()` itself failed, so the child's fate is unknown and it may
-            // still be running. Tear down its whole GROUP (a bare drop + `kill_on_drop`
-            // reaps only the direct child, leaving detached `npx`/`node` descendants), the
-            // same as the timeout branch. Bounded so a wedged wait can't hang.
-            let _ = crate::spawn_util::kill_process_group(&child);
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(Duration::from_secs(KILL_REAP_SECS), child.wait()).await;
             let mut proof =
                 DeployProof::not_deployed(platform, format!("could not run deploy command: {e}"));
             proof.command = Some(command);
@@ -931,6 +975,83 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(20),
             "must return promptly after killing the group, not wait out the pipe holder"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_test_pid(path: &Path) -> i32 {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(raw) = fs::read_to_string(path) {
+                    if let Ok(pid) = raw.trim().parse::<i32>() {
+                        if pid > 0 {
+                            return pid;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deploy test process must publish its pid promptly")
+    }
+
+    #[cfg(unix)]
+    fn unix_process_is_running(pid: i32) -> bool {
+        std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|output| {
+                let state = String::from_utf8_lossy(&output.stdout);
+                let state = state.trim();
+                !state.is_empty() && !state.starts_with('Z')
+            })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aborting_deploy_future_kills_detached_process_tree() {
+        let tmp = TempDir::new().unwrap();
+        let shell_pid_path = tmp.path().join("deploy-shell.pid");
+        let grandchild_pid_path = tmp.path().join("deploy-grandchild.pid");
+        let workspace = tmp.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            run_deploy_command(
+                &workspace,
+                DeployTarget::Docker,
+                concat!(
+                    "printf '%s\\n' \"$$\" > deploy-shell.pid; ",
+                    "sh -c 'printf \"%s\\n\" \"$$\" > deploy-grandchild.pid; ",
+                    "while :; do sleep 30; done' & wait"
+                )
+                .to_string(),
+                30,
+            )
+            .await
+        });
+
+        let shell_pid = wait_for_test_pid(&shell_pid_path).await;
+        let grandchild_pid = wait_for_test_pid(&grandchild_pid_path).await;
+        assert!(unix_process_is_running(shell_pid));
+        assert!(unix_process_is_running(grandchild_pid));
+
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("the deploy task was aborted")
+                .is_cancelled(),
+            "Tokio must cancel and drop the running deploy future"
+        );
+
+        let stopped = tokio::time::timeout(Duration::from_secs(3), async {
+            while unix_process_is_running(shell_pid) || unix_process_is_running(grandchild_pid) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "dropping the deploy future must stop shell {shell_pid} and descendant {grandchild_pid}"
         );
     }
 

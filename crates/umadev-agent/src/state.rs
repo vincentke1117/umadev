@@ -41,13 +41,25 @@ pub struct WorkflowState {
     pub backend: String,
     /// The base's OWN persisted conversation id (claude's pinned `--session-id`,
     /// codex's `thread.id`), captured at run-open. This is the load-bearing
-    /// pointer for **full-context cross-session resume**: a later `/continue`
-    /// re-opens the SAME base conversation (`--resume` / `thread/resume`) so the
-    /// build picks up with the base's accumulated reasoning instead of a cold
-    /// brain that "forgot the task". `None` when the base exposes no resumable id
-    /// (e.g. offline / opencode). Near-zero extra storage — a ~36-byte UUID.
+    /// pointer for **full-context cross-session resume**. It is opaque authority,
+    /// not sufficient by itself: a caller must validate
+    /// [`Self::base_resume_identity`] before handing it to a base. An ineligible
+    /// or absent identity opens fresh and transfers context through UmaDev's
+    /// transcript instead. `None` when the base exposes no resumable id.
     #[serde(default)]
     pub base_session_id: Option<String>,
+    /// Immutable launch/effective-sandbox identity bound to
+    /// [`Self::base_session_id`]. A resumable id is authority-bearing state, so
+    /// callers must validate this record against the next base, canonical
+    /// workspace, permission profile, and requested sandbox before loading it.
+    /// Legacy files omit the field; Grok Build treats that as non-resumable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_resume_identity: Option<umadev_runtime::BaseResumeIdentity>,
+    /// Access/approval posture selected when this run was started. Optional for
+    /// backward compatibility with workflow states written before this field
+    /// existed; such states resolve conservatively to Guarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<umadev_runtime::BasePermissionProfile>,
     /// Spec version the agent is conformant against.
     pub spec_version: String,
 }
@@ -65,8 +77,18 @@ impl WorkflowState {
             note: String::new(),
             backend: String::new(),
             base_session_id: None,
+            base_resume_identity: None,
+            permission_profile: Some(umadev_runtime::BasePermissionProfile::Guarded),
             spec_version: umadev_spec::SPEC_VERSION.to_string(),
         }
+    }
+
+    /// Permission posture to use when resuming this workflow. Legacy states
+    /// lacked the field and therefore resume as Guarded, never Auto.
+    #[must_use]
+    pub fn resolved_permission_profile(&self) -> umadev_runtime::BasePermissionProfile {
+        self.permission_profile
+            .unwrap_or(umadev_runtime::BasePermissionProfile::Guarded)
     }
 }
 
@@ -124,7 +146,7 @@ fn prune_history(dir: &Path, keep: usize) {
 ///
 /// The write is atomic: the JSON is first written to a sibling `.tmp`
 /// file and then renamed into place. Before overwriting, the previous state
-/// is snapshotted to `.umadev/history/` (see [`snapshot_previous`]) so
+/// is snapshotted to `.umadev/history/` by the internal snapshot writer so
 /// every transition is recoverable via `umadev rollback`.
 pub fn write_workflow_state(project_root: &Path, state: &WorkflowState) -> std::io::Result<()> {
     snapshot_previous(project_root);
@@ -183,7 +205,7 @@ pub fn restore_snapshot(project_root: &Path, timestamp: &str) -> std::io::Result
 #[derive(Debug)]
 pub enum ReadState {
     /// The state file exists and parsed.
-    Ok(WorkflowState),
+    Ok(Box<WorkflowState>),
     /// No state file — the user has not started a run yet.
     Missing,
     /// The file exists but is unparseable. Carries the file path + parse
@@ -215,7 +237,7 @@ pub fn read_workflow_state_diagnostic(project_root: &Path) -> ReadState {
         }
     };
     match serde_json::from_str::<WorkflowState>(&text) {
-        Ok(s) => ReadState::Ok(s),
+        Ok(s) => ReadState::Ok(Box::new(s)),
         Err(e) => ReadState::Corrupt {
             path,
             error: format!("parse error: {e}"),
@@ -230,7 +252,7 @@ pub fn read_workflow_state_diagnostic(project_root: &Path) -> ReadState {
 #[must_use]
 pub fn read_workflow_state(project_root: &Path) -> Option<WorkflowState> {
     match read_workflow_state_diagnostic(project_root) {
-        ReadState::Ok(s) => Some(s),
+        ReadState::Ok(s) => Some(*s),
         ReadState::Missing => None,
         ReadState::Corrupt { path, error } => {
             // Surface corruption through tracing, not stderr: this can be read
@@ -254,7 +276,8 @@ pub fn read_workflow_state(project_root: &Path) -> Option<WorkflowState> {
 /// it to completion. Reuses the Wave-1 [`crate::plan_state`] plan (read-only — it
 /// does not modify the plan) so there is one source of truth for build progress.
 ///
-/// Returns `None` when there is no plan, the plan is fully [`StepStatus::Done`],
+/// Returns `None` when there is no plan, the plan is fully
+/// [`crate::plan_state::StepStatus::Done`],
 /// or the plan has no steps — i.e. there is nothing to resume. Fail-open by
 /// construction: `plan_state::load` already swallows a missing / corrupt file
 /// (→ `None`), so this never errors and never blocks launch.
@@ -363,19 +386,43 @@ mod tests {
     }
 
     #[test]
+    fn permission_profile_roundtrips_for_plan_and_auto() {
+        use umadev_runtime::BasePermissionProfile;
+
+        let tmp = TempDir::new().unwrap();
+        for profile in [BasePermissionProfile::Plan, BasePermissionProfile::Auto] {
+            let mut state = WorkflowState::new(Phase::Frontend);
+            state.permission_profile = Some(profile);
+            write_workflow_state(tmp.path(), &state).unwrap();
+            let restored = read_workflow_state(tmp.path()).unwrap();
+            assert_eq!(restored.permission_profile, Some(profile));
+            assert_eq!(restored.resolved_permission_profile(), profile);
+        }
+    }
+
+    #[test]
     fn base_session_id_roundtrips_and_defaults_for_legacy() {
         // The base session id is persisted on run-open and read back verbatim — the
         // pointer a `/continue` resumes the base conversation with (P0 piece #1).
         let tmp = TempDir::new().unwrap();
         let mut s = WorkflowState::new(Phase::Frontend);
         s.base_session_id = Some("c0ffee00-1234-4abc-8def-0123456789ab".to_string());
+        s.backend = "grok-build".to_string();
+        s.base_resume_identity = Some(umadev_runtime::BaseResumeIdentity::requested_only(
+            "grok-build",
+            std::fs::canonicalize(tmp.path()).unwrap(),
+            umadev_runtime::BasePermissionProfile::Guarded,
+            umadev_runtime::BaseSandboxRequest::Off,
+            true,
+        ));
         write_workflow_state(tmp.path(), &s).unwrap();
         let back = read_workflow_state(tmp.path()).unwrap();
         assert_eq!(
             back.base_session_id.as_deref(),
             Some("c0ffee00-1234-4abc-8def-0123456789ab"),
-            "the base session id round-trips so resume can issue --resume"
+            "the opaque base id round-trips alongside its separately validated identity"
         );
+        assert_eq!(back.base_resume_identity, s.base_resume_identity);
 
         // A legacy state written before the field existed must still read (defaults
         // to None — no resumable id, the caller degrades to a fresh session).
@@ -395,6 +442,12 @@ mod tests {
         assert_eq!(
             legacy_state.base_session_id, None,
             "missing field defaults to None"
+        );
+        assert_eq!(legacy_state.base_resume_identity, None);
+        assert_eq!(
+            legacy_state.resolved_permission_profile(),
+            umadev_runtime::BasePermissionProfile::Guarded,
+            "a legacy state must never silently resume as Auto"
         );
     }
 

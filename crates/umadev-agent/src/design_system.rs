@@ -1556,6 +1556,24 @@ fn drift_in_file(path: &str, content: &str, ts: &TokenSet) -> Vec<Finding> {
 }
 
 /// The first color literal in `lower` for which `reject` is true.
+fn rejected_hex_literal(
+    lower: &str,
+    marker: usize,
+    digits: usize,
+    reject: &impl Fn(Srgb) -> bool,
+) -> Option<String> {
+    let hex = lower.get(marker + 1..marker + 1 + digits)?;
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let next = lower[marker + 1 + digits..].chars().next();
+    if next.is_some_and(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let color = parse_color(&format!("#{hex}"))?;
+    reject(color).then(|| format!("#{hex}"))
+}
+
 fn first_color_literal(lower: &str, reject: impl Fn(Srgb) -> bool) -> Option<String> {
     // Hex literals.
     let bytes = lower.as_bytes();
@@ -1563,19 +1581,8 @@ fn first_color_literal(lower: &str, reject: impl Fn(Srgb) -> bool) -> Option<Str
     while i < bytes.len() {
         if bytes[i] == b'#' {
             for len in [6usize, 3] {
-                if let Some(h) = lower.get(i + 1..i + 1 + len) {
-                    if h.bytes().all(|b| b.is_ascii_hexdigit()) {
-                        let next = lower[i + 1 + len..].chars().next();
-                        if next.is_some_and(|c| c.is_ascii_hexdigit()) {
-                            continue; // a longer hex run; try the other length
-                        }
-                        if let Some(c) = parse_color(&format!("#{h}")) {
-                            if reject(c) {
-                                return Some(format!("#{h}"));
-                            }
-                        }
-                        break;
-                    }
+                if let Some(literal) = rejected_hex_literal(lower, i, len, &reject) {
+                    return Some(literal);
                 }
             }
         }

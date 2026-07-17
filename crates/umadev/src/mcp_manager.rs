@@ -1,7 +1,7 @@
 //! MCP server management — install/list/remove MCP servers for the host.
 //!
-//! Each of the three first-class bases discovers MCP servers from a DIFFERENT
-//! config file in a DIFFERENT format, so "install one MCP" means writing the
+//! The five first-class bases discover MCP servers from their own project
+//! config files, so "install one MCP" means writing the
 //! right file for the chosen base:
 //!
 //! | base          | file (project-scoped)   | format                                   |
@@ -9,6 +9,8 @@
 //! | `claude-code` | `.mcp.json`             | JSON `mcpServers` map                     |
 //! | `codex`       | `.codex/config.toml`    | TOML `[mcp_servers.<name>]` tables        |
 //! | `opencode`    | `opencode.json`         | JSON `mcp` map (`type`/`command` array)   |
+//! | `grok-build`  | `.grok/config.toml`     | TOML `[mcp_servers.<name>]` tables        |
+//! | `kimi-code`   | `.kimi-code/mcp.json`   | JSON `mcpServers` map                     |
 //!
 //! Every writer **parse-merges**: it loads the user's existing file, preserves
 //! unknown servers + unknown top-level keys (and, for TOML, comments and
@@ -39,6 +41,10 @@ pub enum Backend {
     Codex,
     /// OpenCode — `opencode.json` (`mcp` JSON map, `command` as an array).
     OpenCode,
+    /// Grok Build — `.grok/config.toml` (`[mcp_servers.<name>]`).
+    GrokBuild,
+    /// Kimi Code — `.kimi-code/mcp.json` (`mcpServers` JSON map).
+    KimiCode,
 }
 
 impl Backend {
@@ -53,15 +59,26 @@ impl Backend {
             "claude-code" | "claude" => Ok(Self::ClaudeCode),
             "codex" => Ok(Self::Codex),
             "opencode" => Ok(Self::OpenCode),
+            "grok-build" | "grok" => Ok(Self::GrokBuild),
+            "kimi-code" | "kimi" => Ok(Self::KimiCode),
             other => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("unknown backend `{other}` (use claude-code | codex | opencode | all)"),
+                format!(
+                    "unknown backend `{other}` (use claude-code | codex | opencode | \
+                     grok-build | kimi-code | all)"
+                ),
             )),
         }
     }
 
-    /// All three bases, in `BACKEND_IDS` order — the fan-out for `--backend all`.
-    pub const ALL: [Backend; 3] = [Self::ClaudeCode, Self::Codex, Self::OpenCode];
+    /// All five bases, in `BACKEND_IDS` order — the fan-out for `--backend all`.
+    pub const ALL: [Backend; 5] = [
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::OpenCode,
+        Self::GrokBuild,
+        Self::KimiCode,
+    ];
 
     /// The base's display id.
     #[must_use]
@@ -70,6 +87,8 @@ impl Backend {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
+            Self::GrokBuild => "grok-build",
+            Self::KimiCode => "kimi-code",
         }
     }
 
@@ -80,6 +99,8 @@ impl Backend {
             Self::ClaudeCode => ".mcp.json",
             Self::Codex => ".codex/config.toml",
             Self::OpenCode => "opencode.json",
+            Self::GrokBuild => ".grok/config.toml",
+            Self::KimiCode => ".kimi-code/mcp.json",
         }
     }
 }
@@ -154,28 +175,39 @@ impl McpConfig {
     /// and then overwrite it, which would wipe the user's MCP servers.
     pub fn load(project_root: &Path) -> std::io::Result<Self> {
         let path = project_root.join(".mcp.json");
-        match std::fs::read_to_string(&path) {
+        Self::load_path(&path)
+    }
+
+    /// Load a standard `mcpServers` JSON object from an explicit base path.
+    fn load_path(path: &Path) -> std::io::Result<Self> {
+        match std::fs::read_to_string(path) {
             Ok(text) if text.trim().is_empty() => Ok(Self::default()),
             Ok(text) => serde_json::from_str(&text).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        ".mcp.json exists but isn't valid JSON ({e}); refusing to overwrite it and \
-                         lose your MCP servers. Fix or remove {} and retry.",
+                        "{} exists but isn't valid JSON ({e}); refusing to overwrite it and lose \
+                         your MCP servers. Fix or remove it and retry.",
                         path.display()
                     ),
                 )
             }),
-            Err(_) => Ok(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e),
         }
     }
 
     /// Save `.mcp.json` to the project root (atomic: temp + rename).
     pub fn save(&self, project_root: &Path) -> std::io::Result<PathBuf> {
         let path = project_root.join(".mcp.json");
+        self.save_path(&path)
+    }
+
+    /// Save a standard `mcpServers` JSON object to an explicit base path.
+    fn save_path(&self, path: &Path) -> std::io::Result<PathBuf> {
         let json = serde_json::to_string_pretty(self).unwrap_or_default();
-        atomic_write(&path, &(json + "\n"))?;
-        Ok(path)
+        atomic_write(path, &(json + "\n"))?;
+        Ok(path.to_path_buf())
     }
 
     /// Install (or replace) a named MCP server.
@@ -270,6 +302,8 @@ pub fn install(
         }
         Backend::Codex => codex::install(project_root, name, entry),
         Backend::OpenCode => opencode::install(project_root, name, entry),
+        Backend::GrokBuild => grok::install(project_root, name, entry),
+        Backend::KimiCode => kimi::install(project_root, name, entry),
     }
 }
 
@@ -296,6 +330,8 @@ pub fn remove(
         }
         Backend::Codex => codex::remove(project_root, name),
         Backend::OpenCode => opencode::remove(project_root, name),
+        Backend::GrokBuild => grok::remove(project_root, name),
+        Backend::KimiCode => kimi::remove(project_root, name),
     }
 }
 
@@ -318,6 +354,8 @@ pub fn list(backend: Backend, project_root: &Path) -> std::io::Result<Vec<Server
         }
         Backend::Codex => codex::list(project_root),
         Backend::OpenCode => opencode::list(project_root),
+        Backend::GrokBuild => grok::list(project_root),
+        Backend::KimiCode => kimi::list(project_root),
     }
 }
 
@@ -346,6 +384,84 @@ fn summarize_json_entry(entry: &serde_json::Value) -> String {
         url.to_string()
     } else {
         "(configured)".to_string()
+    }
+}
+
+mod grok {
+    use super::{codex, Backend, McpServerEntry, ServerInfo};
+    use std::path::{Path, PathBuf};
+
+    fn path(project_root: &Path) -> PathBuf {
+        project_root.join(Backend::GrokBuild.config_rel_path())
+    }
+
+    pub(super) fn install(
+        project_root: &Path,
+        name: &str,
+        entry: &McpServerEntry,
+    ) -> std::io::Result<PathBuf> {
+        codex::install_at(&path(project_root), name, entry)
+    }
+
+    pub(super) fn remove(project_root: &Path, name: &str) -> std::io::Result<(PathBuf, bool)> {
+        codex::remove_at(&path(project_root), name)
+    }
+
+    pub(super) fn list(project_root: &Path) -> std::io::Result<Vec<ServerInfo>> {
+        codex::list_at(&path(project_root))
+    }
+}
+
+/// Kimi Code's project-scoped MCP file uses the same lossless
+/// `mcpServers` JSON envelope as Claude Code, but lives at the vendor's
+/// authoritative `.kimi-code/mcp.json` path. Keeping an explicit adapter
+/// prevents one base's config from ever being written into another's file.
+mod kimi {
+    use super::{summarize_json_entry, Backend, McpConfig, McpServerEntry, ServerInfo};
+    use std::path::{Path, PathBuf};
+
+    fn path(project_root: &Path) -> PathBuf {
+        project_root.join(Backend::KimiCode.config_rel_path())
+    }
+
+    pub(super) fn install(
+        project_root: &Path,
+        name: &str,
+        entry: &McpServerEntry,
+    ) -> std::io::Result<PathBuf> {
+        let path = path(project_root);
+        let mut config = McpConfig::load_path(&path)?;
+        config.install(name, entry.clone());
+        config.save_path(&path)
+    }
+
+    pub(super) fn remove(project_root: &Path, name: &str) -> std::io::Result<(PathBuf, bool)> {
+        let path = path(project_root);
+        if !path.exists() {
+            return Ok((path, false));
+        }
+        let mut config = McpConfig::load_path(&path)?;
+        let removed = config.remove(name);
+        if removed {
+            config.save_path(&path)?;
+        }
+        Ok((path, removed))
+    }
+
+    pub(super) fn list(project_root: &Path) -> std::io::Result<Vec<ServerInfo>> {
+        let path = path(project_root);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let config = McpConfig::load_path(&path)?;
+        Ok(config
+            .list()
+            .into_iter()
+            .map(|(name, entry)| ServerInfo {
+                name: name.to_string(),
+                detail: summarize_json_entry(entry),
+            })
+            .collect())
     }
 }
 
@@ -380,7 +496,8 @@ mod codex {
                     ),
                 )
             }),
-            Err(_) => Ok(DocumentMut::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
+            Err(e) => Err(e),
         }
     }
 
@@ -390,7 +507,15 @@ mod codex {
         entry: &McpServerEntry,
     ) -> std::io::Result<PathBuf> {
         let path = config_path(project_root);
-        let mut doc = load_doc(&path)?;
+        install_at(&path, name, entry)
+    }
+
+    pub(super) fn install_at(
+        path: &Path,
+        name: &str,
+        entry: &McpServerEntry,
+    ) -> std::io::Result<PathBuf> {
+        let mut doc = load_doc(path)?;
 
         // Ensure `[mcp_servers]` is a table (create it implicit-of-dotted so the
         // serialized form is the idiomatic `[mcp_servers.<name>]`).
@@ -425,32 +550,40 @@ mod codex {
         }
         servers.insert(name, Item::Table(srv));
 
-        atomic_write(&path, &doc.to_string())?;
-        Ok(path)
+        atomic_write(path, &doc.to_string())?;
+        Ok(path.to_path_buf())
     }
 
     pub(super) fn remove(project_root: &Path, name: &str) -> std::io::Result<(PathBuf, bool)> {
         let path = config_path(project_root);
+        remove_at(&path, name)
+    }
+
+    pub(super) fn remove_at(path: &Path, name: &str) -> std::io::Result<(PathBuf, bool)> {
         if !path.exists() {
-            return Ok((path, false));
+            return Ok((path.to_path_buf(), false));
         }
-        let mut doc = load_doc(&path)?;
+        let mut doc = load_doc(path)?;
         let removed = doc
             .get_mut("mcp_servers")
             .and_then(Item::as_table_like_mut)
             .is_some_and(|t| t.remove(name).is_some());
         if removed {
-            atomic_write(&path, &doc.to_string())?;
+            atomic_write(path, &doc.to_string())?;
         }
-        Ok((path, removed))
+        Ok((path.to_path_buf(), removed))
     }
 
     pub(super) fn list(project_root: &Path) -> std::io::Result<Vec<ServerInfo>> {
         let path = config_path(project_root);
+        list_at(&path)
+    }
+
+    pub(super) fn list_at(path: &Path) -> std::io::Result<Vec<ServerInfo>> {
         if !path.exists() {
             return Ok(vec![]);
         }
-        let doc = load_doc(&path)?;
+        let doc = load_doc(path)?;
         let Some(servers) = doc.get("mcp_servers").and_then(Item::as_table_like) else {
             return Ok(vec![]);
         };
@@ -517,7 +650,8 @@ mod opencode {
                     ),
                 )),
             },
-            Err(_) => Ok(Map::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+            Err(e) => Err(e),
         }
     }
 
@@ -783,11 +917,66 @@ mod tests {
         assert_eq!(Backend::parse("claude-code").unwrap(), Backend::ClaudeCode);
         assert_eq!(Backend::parse("codex").unwrap(), Backend::Codex);
         assert_eq!(Backend::parse("opencode").unwrap(), Backend::OpenCode);
+        assert_eq!(Backend::parse("grok").unwrap(), Backend::GrokBuild);
+        assert_eq!(Backend::parse("kimi").unwrap(), Backend::KimiCode);
+        for retired in ["cursor", "codebuddy", "droid", "qwen-code"] {
+            assert!(
+                Backend::parse(retired).is_err(),
+                "{retired} must stay retired"
+            );
+        }
         assert!(Backend::parse("all").is_err()); // caller fans out, not parse()
         assert!(Backend::parse("bogus").is_err());
-        assert_eq!(Backend::ALL.len(), 3);
+        assert_eq!(Backend::ALL.len(), 5);
+        assert_eq!(Backend::ALL.map(Backend::id), umadev_host::BACKEND_IDS);
         assert_eq!(Backend::Codex.config_rel_path(), ".codex/config.toml");
         assert_eq!(Backend::OpenCode.config_rel_path(), "opencode.json");
+        assert_eq!(Backend::GrokBuild.config_rel_path(), ".grok/config.toml");
+        assert_eq!(Backend::KimiCode.config_rel_path(), ".kimi-code/mcp.json");
+    }
+
+    #[test]
+    fn new_base_mcp_configs_roundtrip_without_clobbering() {
+        for backend in [Backend::GrokBuild, Backend::KimiCode] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let path = install(backend, tmp.path(), "github", &npx_entry()).unwrap();
+            assert_eq!(path, tmp.path().join(backend.config_rel_path()));
+            let servers = list(backend, tmp.path()).unwrap();
+            assert_eq!(servers.len(), 1, "{backend:?}");
+            assert_eq!(servers[0].name, "github");
+            assert!(servers[0].detail.contains("npx"));
+            let (_, removed) = remove(backend, tmp.path(), "github").unwrap();
+            assert!(removed, "{backend:?}");
+            assert!(list(backend, tmp.path()).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn grok_emits_its_native_schema() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        install(Backend::GrokBuild, tmp.path(), "gh", &npx_entry()).unwrap();
+        let grok = std::fs::read_to_string(tmp.path().join(".grok/config.toml")).unwrap();
+        assert!(grok.contains("[mcp_servers.gh]"));
+        assert!(grok.contains("command = \"npx\""));
+    }
+
+    #[test]
+    fn kimi_emits_its_native_project_schema_and_preserves_unknown_fields() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join(".kimi-code/mcp.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"existing":{"url":"https://example.test/mcp","enabled":false}},"future":42}"#,
+        )
+        .unwrap();
+
+        install(Backend::KimiCode, tmp.path(), "gh", &npx_entry()).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["future"], 42);
+        assert_eq!(value["mcpServers"]["existing"]["enabled"], false);
+        assert_eq!(value["mcpServers"]["gh"]["command"], "npx");
     }
 
     #[test]

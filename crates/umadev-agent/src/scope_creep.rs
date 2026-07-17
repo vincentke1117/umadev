@@ -27,23 +27,21 @@
 //!   - a new **dependency** in a MANIFEST — the file that carries the decision (new
 //!     code you did not write, and a new supply chain). Never a lockfile: that is the
 //!     resolver's transitive output, so one planned install would read as a hundred
-//!     unclaimed dependencies (see [`LOCKFILES`]),
+//!     unclaimed dependencies (using the internal lockfile list),
 //!   - a new **public route** (new attack surface, new contract).
-//! - **ADVISORY** — an unclaimed EDIT to a file that already existed. A line changed
-//!   inside existing code is ordinary drift; surfacing it as a note keeps the signal
-//!   honest without crying wolf.
+//! - **BLOCKING** — an unclaimed EDIT to an existing file as well. A requested SEO
+//!   change that quietly edits auth, build, or unrelated UI code is still out of
+//!   scope even though it created no new file. Execution contracts make incidental
+//!   wiring explicit in the responsible step instead of treating drift as harmless.
 //!
 //! ## Fail-open (the repo's hard rule)
-//! Silent — no findings at all, not even advisory — when: NO step declares a surface
-//! (the overwhelmingly common case for a plan the brain wrote without the `files`
-//! field; an absent declaration is not a claim that nothing will change), the run diff
-//! cannot be read, or there is no run baseline to diff against. The check never
-//! invents a finding out of a missing declaration.
+//! A missing run diff/baseline remains fail-open because there is no evidence to
+//! judge. A missing `files` declaration is different: it is a known malformed
+//! execution contract, reported as a blocking preflight finding before mutation.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::critics::Seat;
 use crate::plan_state::{Plan, StepKind};
 
 /// One scope finding.
@@ -156,16 +154,34 @@ const MAX_FINDINGS: usize = 20;
 
 /// The set of changes this run made that belong to NO plan step.
 ///
-/// Returns BOTH severities (see the module docs); `blocking` selects which ones the
-/// deterministic floor must fail on. Empty — always — when no step declared a surface,
-/// when the run diff is unreadable, or when everything that changed was claimed.
+/// Returns contract findings; current execution-scope violations are blocking.
+/// Empty when the run diff is unreadable/no baseline exists, a review-only plan has
+/// no writer, or every changed path was claimed.
 ///
 /// Bounded: one shadow-repo diff, one backend-route extraction over the changed set,
 /// and at most one before/after manifest comparison per changed manifest.
 #[must_use]
 pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
-    // FAIL-OPEN GATE #1: no step declared anything ⇒ the plan made no claim about
-    // where it would write, so there is nothing to hold the tree against. Silent.
+    // EXECUTION-CONTRACT GATE: every mutating step contributes to the denominator.
+    // Missing declarations are not an IO/parser surprise; they are an explicit plan
+    // defect. Report it instead of switching the whole floor off.
+    let missing: Vec<&str> = plan
+        .steps
+        .iter()
+        .filter(|step| step.kind == StepKind::Build && step.files.is_empty())
+        .map(|step| step.id.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return vec![ScopeFinding {
+            blocking: true,
+            message: format!(
+                "scope: execution contract incomplete — build step(s) [{}] declared no file surface; re-plan them with explicit files.create/files.modify before writing",
+                missing.join(", ")
+            ),
+            file: String::new(),
+        }];
+    }
+
     let claims: Vec<&str> = plan
         .steps
         .iter()
@@ -173,23 +189,7 @@ pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
         .filter(|p| !p.trim().is_empty())
         .collect();
     if claims.is_empty() {
-        return Vec::new();
-    }
-
-    // FAIL-OPEN GATE #1b — THE ONE THAT MATTERS. A PARTIAL declaration is worse than
-    // none: if some code-writing step declared its surface and another did not, then
-    // everything the silent step legitimately writes looks "unclaimed", and the check
-    // would block a run for doing exactly what it was asked to do. The union of
-    // surfaces is only a meaningful denominator when EVERY step that writes code has
-    // contributed to it. One silent code step ⇒ the whole check stands down.
-    //
-    // (Doc seats are exempt: their deliverables live under `output/`, which is not the
-    // team's source surface and is ignored below either way.)
-    let a_code_step_declared_nothing = plan
-        .steps
-        .iter()
-        .any(|s| s.kind == StepKind::Build && writes_code(s.seat) && s.files.is_empty());
-    if a_code_step_declared_nothing {
+        // A review-only plan has no writer and therefore no source scope to check.
         return Vec::new();
     }
 
@@ -201,22 +201,21 @@ pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
     // `TooLarge` is DIFFERENT, and it must not be silent. A monorepo run that touches
     // more files than the diff can analyze gets NO scope enforcement — and the old code
     // returned an empty vec, which reads here as "nothing changed", so the floor stood
-    // down with no warn, no event and no advisory: the user never learned that a floor
-    // they were relying on had gone dark. A floor that goes dark must SAY so, so this
-    // returns one ADVISORY finding (never blocking — we have no evidence to block ON).
+    // down with no warn: the user never learned that a floor they were relying on had
+    // gone dark. This known analysis-limit condition blocks completion until the run
+    // is split; it is not an unexpected IO error and must not masquerade as clean.
     let changed = match crate::checkpoint::run_diff_since_baseline(root) {
         crate::checkpoint::RunDiff::Changed(files) => files,
         crate::checkpoint::RunDiff::Unavailable => return Vec::new(),
         crate::checkpoint::RunDiff::TooLarge(count) => {
             return vec![ScopeFinding {
-                blocking: false,
+                blocking: true,
                 message: format!(
                     "scope: the scope floor stood down for this run — {count}+ changed files \
                      exceed the {cap}-file analysis cap, so no unclaimed file / dependency / \
-                     route can be established. A partial view would misread every unlisted \
-                     file as unchanged, which is worse than no view. Narrow the run (fewer \
-                     steps per plan, or a smaller workspace root) to get scope enforcement \
-                     back.",
+                     route can be established. An unverifiable scope cannot be called \
+                     complete. Split/re-plan the run (fewer steps or a smaller workspace \
+                     root) to restore enforcement.",
                     cap = crate::checkpoint::MAX_CHANGED_FILES,
                 ),
                 file: String::new(),
@@ -313,32 +312,18 @@ pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
         }
 
         // 4. Everything else: an unclaimed EDIT to a file that already existed.
-        //    ADVISORY — ordinary drift, worth seeing, not worth blocking.
+        //    It is still work nobody authorised. Incidental wiring belongs in the
+        //    responsible step's declared surface; otherwise the delivery blocks.
         out.push(ScopeFinding {
-            blocking: false,
+            blocking: true,
             message: format!(
-                "scope (advisory): `{path}` was edited but no plan step declared it — expected \
-                 if it is incidental wiring; worth a look if it is real work nobody planned"
+                "scope: `{path}` was edited but no plan step declared it — remove the change or \
+                 explicitly re-plan it as required wiring before continuing"
             ),
             file: path.to_string(),
         });
     }
     out
-}
-
-/// Whether a seat, on a BUILD step, writes to the team's SOURCE surface (as opposed to
-/// the doc blackboard under `output/`). These are the seats whose silence would make
-/// the union of declared surfaces an incomplete denominator — see the partial-
-/// declaration gate in [`unclaimed_changes`].
-fn writes_code(seat: Seat) -> bool {
-    matches!(
-        seat,
-        Seat::FrontendEngineer
-            | Seat::BackendEngineer
-            | Seat::QaEngineer
-            | Seat::SecurityEngineer
-            | Seat::DevopsEngineer
-    )
 }
 
 /// Whether a declared claim covers a changed path. A claim is either an exact
@@ -364,11 +349,13 @@ fn claim_covers(claim: &str, path: &str) -> bool {
 }
 
 /// Whether a changed path is outside the team's source surface entirely (UmaDev's own
-/// artifacts, the doc blackboard, vendored/build/cache trees) — the ignored DIRECTORY
-/// NAMES matched at ANY depth (see [`IGNORED_DIR_SEGMENTS`]).
+/// artifacts, generated lockfiles, the doc blackboard, vendored/build/cache trees) —
+/// the ignored DIRECTORY NAMES matched at ANY depth (see [`IGNORED_DIR_SEGMENTS`]).
 fn is_ignored(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    IGNORED_PREFIXES.iter().any(|p| lower.starts_with(p))
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    LOCKFILES.contains(&name)
+        || IGNORED_PREFIXES.iter().any(|p| lower.starts_with(p))
         || lower
             .split('/')
             .any(|seg| IGNORED_DIR_SEGMENTS.contains(&seg))
@@ -540,6 +527,7 @@ fn dependency_names(rel: &str, text: &str) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::critics::Seat;
     use crate::plan_state::{AcceptanceSpec, PlanStep, StepFiles, StepStatus};
 
     /// A workspace with a shadow-repo RUN BASELINE already taken — the state every
@@ -592,10 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn silent_when_no_step_declares_a_surface() {
-        // THE FAIL-OPEN CONTRACT: a plan the brain wrote without the `files` field
-        // makes no claim about where it will write, so there is nothing to hold the
-        // tree against. Not one finding — not even advisory — no matter what changed.
+    fn missing_surface_is_an_explicit_contract_failure() {
         let Some(tmp) = baselined_workspace() else {
             return;
         };
@@ -606,10 +591,10 @@ mod tests {
             r#"{"dependencies":{"react":"18","left-pad":"1"}}"#,
         );
         let plan = plan_claiming(&[]);
-        assert!(
-            unclaimed_changes(tmp.path(), &plan).is_empty(),
-            "an absent declaration is not a claim that nothing will change"
-        );
+        let findings = unclaimed_changes(tmp.path(), &plan);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].blocking);
+        assert!(findings[0].message.contains("contract incomplete"));
     }
 
     #[test]
@@ -618,8 +603,7 @@ mod tests {
         // view would misread every unlisted file as "unchanged". But the old code
         // returned an empty vec, which reads here as "nothing changed": a monorepo
         // touching 2500 files got ZERO scope enforcement, silently, and never learned
-        // why. A floor that goes dark must SAY so — advisory (we have no evidence to
-        // block on), but never invisible.
+        // why. A known analysis cap must fail completion until the work is split.
         let Some(tmp) = baselined_workspace() else {
             return;
         };
@@ -631,11 +615,11 @@ mod tests {
         assert_eq!(
             findings.len(),
             1,
-            "exactly one stand-down advisory: {findings:?}"
+            "exactly one stand-down failure: {findings:?}"
         );
         assert!(
-            !findings[0].blocking,
-            "no view ⇒ no evidence ⇒ never blocking (fail-open)"
+            findings[0].blocking,
+            "known unverifiable scope cannot be called complete"
         );
         assert!(
             findings[0].message.contains("stood down"),
@@ -672,21 +656,21 @@ mod tests {
     }
 
     #[test]
-    fn blocks_an_unclaimed_new_dependency_but_not_a_version_bump() {
+    fn blocks_an_unclaimed_manifest_edit_and_identifies_new_dependencies() {
         let Some(tmp) = baselined_workspace() else {
             return;
         };
-        // A VERSION BUMP of an already-present dep is not a new dependency.
+        // A VERSION BUMP is not mislabelled as a newly-added dependency, but the
+        // manifest edit is still outside a plan that only claimed source code.
         write(
             tmp.path(),
             "package.json",
             r#"{"dependencies":{"react":"19"}}"#,
         );
         let bumped = unclaimed_changes(tmp.path(), &plan_claiming(&["src/planned.ts"]));
-        assert!(
-            !bumped.iter().any(|x| x.blocking),
-            "a version bump is not an unclaimed dependency: {bumped:?}"
-        );
+        assert_eq!(bumped.len(), 1, "one generic scope finding: {bumped:?}");
+        assert!(bumped[0].blocking);
+        assert!(!bumped[0].message.contains("gained dependency"));
 
         // A genuinely NEW dependency nobody claimed blocks.
         write(
@@ -729,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unclaimed_line_edit_is_advisory_and_a_claimed_one_is_silent() {
+    fn an_unclaimed_line_edit_blocks_and_a_claimed_one_is_silent() {
         let Some(tmp) = baselined_workspace() else {
             return;
         };
@@ -741,8 +725,8 @@ mod tests {
         );
         let f = unclaimed_changes(tmp.path(), &plan_claiming(&["src/planned.ts"]));
         assert_eq!(f.len(), 1, "{f:?}");
-        assert!(!f[0].blocking, "an edit inside existing code is advisory");
-        assert!(f[0].message.contains("advisory"), "{f:?}");
+        assert!(f[0].blocking, "an unclaimed edit is outside the contract");
+        assert!(f[0].message.contains("edited"), "{f:?}");
 
         // The same edit, CLAIMED by the step's surface → silent.
         let claimed = unclaimed_changes(tmp.path(), &plan_claiming(&["src/"]));

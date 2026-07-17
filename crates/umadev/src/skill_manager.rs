@@ -93,6 +93,7 @@ impl SkillRegistry {
 
         // A malicious manifest name (`../../..`) would escape skills_dir.
         safe_component(&manifest.name)?;
+        reject_learned_skill_reserved_name(&manifest.name)?;
         let dest = self.skills_dir().join(&manifest.name);
         std::fs::create_dir_all(&dest)?;
 
@@ -258,6 +259,7 @@ impl SkillRegistry {
     /// Remove a skill by name.
     pub fn remove(&self, name: &str) -> std::io::Result<()> {
         safe_component(name)?;
+        reject_learned_skill_reserved_name(name)?;
         let dir = self.skills_dir().join(name);
         if !dir.exists() {
             return Err(std::io::Error::new(
@@ -268,42 +270,18 @@ impl SkillRegistry {
 
         // Load manifest to know what to clean up.
         let manifest_path = dir.join("manifest.json");
-        if let Ok(text) = std::fs::read_to_string(&manifest_path) {
-            if let Ok(manifest) = serde_json::from_str::<SkillManifest>(&text) {
-                // Remove knowledge docs.
-                let knowledge_dir = self
-                    .project_root
-                    .join("knowledge")
-                    .join("skills")
-                    .join(name);
-                let _ = std::fs::remove_dir_all(&knowledge_dir);
-
-                // Remove system prompt block from CLAUDE.md.
-                if !manifest.system_prompt.is_empty() {
-                    let claude_md = self.project_root.join("CLAUDE.md");
-                    if let Ok(content) = std::fs::read_to_string(&claude_md) {
-                        let start_marker = format!("<!-- skill:{} -->", name);
-                        let end_marker = format!("<!-- /skill:{} -->", name);
-                        let mut cleaned = String::new();
-                        let mut skip = false;
-                        for line in content.lines() {
-                            if line.contains(&start_marker) {
-                                skip = true;
-                                continue;
-                            }
-                            if line.contains(&end_marker) {
-                                skip = false;
-                                continue;
-                            }
-                            if !skip {
-                                cleaned.push_str(line);
-                                cleaned.push('\n');
-                            }
-                        }
-                        // Atomic rewrite — never leave a half-written CLAUDE.md.
-                        let _ = atomic_write(&claude_md, &cleaned);
-                    }
-                }
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<SkillManifest>(&text).ok());
+        if let Some(manifest) = manifest {
+            let knowledge_dir = self
+                .project_root
+                .join("knowledge")
+                .join("skills")
+                .join(name);
+            let _ = std::fs::remove_dir_all(&knowledge_dir);
+            if !manifest.system_prompt.is_empty() {
+                remove_managed_prompt_block(&self.project_root, name);
             }
         }
 
@@ -311,6 +289,32 @@ impl SkillRegistry {
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
+}
+
+fn remove_managed_prompt_block(project_root: &Path, name: &str) {
+    let claude_md = project_root.join("CLAUDE.md");
+    let Ok(content) = std::fs::read_to_string(&claude_md) else {
+        return;
+    };
+    let start_marker = format!("<!-- skill:{name} -->");
+    let end_marker = format!("<!-- /skill:{name} -->");
+    let mut cleaned = String::new();
+    let mut skip = false;
+    for line in content.lines() {
+        if line.contains(&start_marker) {
+            skip = true;
+            continue;
+        }
+        if line.contains(&end_marker) {
+            skip = false;
+            continue;
+        }
+        if !skip {
+            cleaned.push_str(line);
+            cleaned.push('\n');
+        }
+    }
+    let _ = atomic_write(&claude_md, &cleaned);
 }
 
 /// Atomically write `content` to `path` (write a per-process temp file in the
@@ -342,6 +346,36 @@ fn safe_component(name: &str) -> std::io::Result<()> {
             std::io::ErrorKind::InvalidInput,
             format!("unsafe name `{name}` — must be a single path component"),
         ))
+    }
+}
+
+/// `.umadev/skills/` used to contain UmaDev's internal learned-skill ledger as
+/// well as user-installed packages. New versions migrate that ledger away, but
+/// old files may remain for downgrade/recovery. Never let a package install or
+/// removal claim those names — notably `remove("receipts")` previously removed
+/// the complete attribution history even though it had no package manifest.
+fn reject_learned_skill_reserved_name(name: &str) -> std::io::Result<()> {
+    let normalized = name.trim().to_ascii_lowercase();
+    let reserved = matches!(
+        normalized.as_str(),
+        "receipts"
+            | "skills.jsonl"
+            | "migration-v1.json"
+            | "learned-skills"
+            | ".write.lock"
+            | ".learned-skills-migration"
+            | ".migration-v1.json.replace-pending"
+            | ".skills.jsonl.replace-pending"
+    ) || normalized.starts_with(".skills.jsonl.")
+        || normalized.starts_with(".migration-v1.json.")
+        || normalized.starts_with(".learned-skills-");
+    if reserved {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("reserved UmaDev learned-skill name `{name}`"),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -424,6 +458,53 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let registry = SkillRegistry::new(tmp.path());
         assert!(registry.remove("nope").is_err());
+    }
+
+    #[test]
+    fn learned_skill_internal_names_are_reserved_case_insensitively() {
+        for name in [
+            "receipts",
+            "RECEIPTS",
+            "skills.jsonl",
+            "migration-v1.json",
+            "learned-skills",
+            ".write.lock",
+            ".migration-v1.json.replace-pending",
+            ".migration-v1.json.123.tmp",
+            ".skills.jsonl.replace-pending",
+            ".skills.jsonl.123.tmp",
+            ".learned-skills-migration-old",
+        ] {
+            assert!(
+                reject_learned_skill_reserved_name(name).is_err(),
+                "{name} must remain owned by the learned-skill migration"
+            );
+        }
+        assert!(reject_learned_skill_reserved_name("ordinary-package").is_ok());
+    }
+
+    #[test]
+    fn package_install_and_remove_cannot_claim_legacy_receipts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = SkillRegistry::new(tmp.path());
+        let receipts = tmp.path().join(".umadev/skills/receipts");
+        std::fs::create_dir_all(&receipts).unwrap();
+        let sentinel = receipts.join("sr1-sentinel.receipt.json");
+        std::fs::write(&sentinel, "keep").unwrap();
+
+        assert_eq!(
+            registry.remove("receipts").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+
+        let source = make_skill_dir(tmp.path(), "receipts");
+        assert_eq!(
+            registry.install(&source).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+        assert!(registry.list().is_empty());
     }
 
     #[test]

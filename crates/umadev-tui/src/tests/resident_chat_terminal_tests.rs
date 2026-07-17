@@ -1,0 +1,3317 @@
+use super::*;
+
+async fn wait_for_pending_approval(holder: &ApprovalHolder) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if holder.lock().unwrap().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the guarded consequential action must PAUSE");
+}
+
+/// Fix ⑤ (HEADLESS never blocks): the SAME `AskUserQuestion` on a NON-interactive
+/// turn must NOT park — it keeps today's observe-stash-and-continue behaviour and
+/// runs through to `TurnDone`. A run with no user to answer can never wedge.
+#[tokio::test]
+async fn headless_askuserquestion_does_not_park_auto_continues() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, mut _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let ask = umadev_runtime::SessionEvent::ToolCall {
+        name: "AskUserQuestion".into(),
+        input: serde_json::json!({"questions": [{
+            "header": "Auth", "question": "Which auth method?",
+            "options": [{"label": "Email"}]
+        }]}),
+    };
+    let (fake, _sent, ended) = FakeChatSession::new(vec![vec![
+        ask,
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+
+    // HEADLESS: interactive = false via struct-update.
+    let turn = ChatSessionTurn {
+        interactive: false,
+        ..chat_turn(
+            "set up auth",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        )
+    };
+    tokio::time::timeout(Duration::from_secs(5), drive_chat_session_turn(turn))
+        .await
+        .expect("a headless question turn must auto-continue, never block");
+
+    assert!(
+        !ended.load(std::sync::atomic::Ordering::SeqCst),
+        "headless must NOT interrupt/park — it observes + continues to TurnDone"
+    );
+    assert!(
+        matches!(route_rx.try_recv(), Ok(RouteDecision::AgenticDone { .. })),
+        "the headless turn ran through to its own TurnDone"
+    );
+}
+
+/// Fix ③ (INTERACTIVE): a Guarded consequential action (a shell command the floor
+/// would otherwise auto-allow) PAUSES and asks the user. On approval the base is
+/// answered `Allow` and the class is remembered — so the SAME action on a later turn
+/// is auto-allowed with NO second pause (the ledger suppresses the re-ask).
+#[tokio::test]
+async fn guarded_interactive_pauses_then_ledger_suppresses_reask() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // This test isolates approval/ledger behavior. A routed Build now always
+    // enters QC even without a Write tool; keep that QC clean so it does not
+    // legitimately consume the second scripted approval as a repair turn.
+    std::fs::write(tmp.path().join("app.ts"), "export const x = 1;\n").unwrap();
+    let (sink, mut _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let responded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let approve = || umadev_runtime::SessionEvent::NeedApproval {
+        req_id: "r1".into(),
+        action: "npm run build".into(), // a local shell → consequential, not a read
+        target: String::new(),
+    };
+    let done = || umadev_runtime::SessionEvent::TurnDone {
+        status: umadev_runtime::TurnStatus::Completed,
+        usage: None,
+    };
+    let (fake, _sent, _ended) =
+        FakeChatSession::new(vec![vec![approve(), done()], vec![approve(), done()]]);
+    let fake = fake.with_responses(responded.clone());
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+    let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+
+    // Turn 1: PAUSES. Drive it as a task; the event loop's role (routing the user's
+    // decision) is played by the test: poll for the pause, then approve.
+    let t1 = tokio::spawn(drive_chat_session_turn(ChatSessionTurn {
+        approval_holder: approval_holder.clone(),
+        ..chat_turn(
+            "build it",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        )
+    }));
+    // Wait for the drain to register the pause, then answer Allow.
+    wait_for_pending_approval(&approval_holder).await;
+    let p = approval_holder.lock().unwrap().take().unwrap();
+    p.reply_tx.send(ApprovalReply::Allow).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), t1)
+        .await
+        .expect("turn 1 must resume after approval")
+        .unwrap();
+    assert_eq!(
+        *responded.lock().unwrap(),
+        vec![umadev_runtime::ApprovalDecision::Allow],
+        "the approved action is answered Allow to the base"
+    );
+    assert!(
+        umadev_agent::TrustLedger::load(tmp.path()).remembers_rooted(
+            "npm run build",
+            "",
+            tmp.path()
+        ),
+        "the approved class is remembered for this project"
+    );
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::AgenticDone { .. })
+    ));
+
+    // Turn 2: the SAME action must NOT pause (ledger suppresses). If it blocked, this
+    // timeout would fire — no one is injecting a decision this time.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_chat_session_turn(ChatSessionTurn {
+            approval_holder: approval_holder.clone(),
+            ..chat_turn(
+                "build again",
+                holder.clone(),
+                sink.clone(),
+                route_tx.clone(),
+                tmp.path().to_path_buf(),
+            )
+        }),
+    )
+    .await
+    .expect("a remembered class must auto-allow with NO second pause");
+    assert!(
+        approval_holder.lock().unwrap().is_none(),
+        "no pause was registered on the remembered-class turn"
+    );
+    assert_eq!(
+        *responded.lock().unwrap(),
+        vec![
+            umadev_runtime::ApprovalDecision::Allow,
+            umadev_runtime::ApprovalDecision::Allow
+        ],
+        "turn 2 auto-allowed the remembered class"
+    );
+}
+
+/// Fix ③ (HEADLESS never blocks): the SAME Guarded consequential `NeedApproval` on a
+/// NON-interactive turn must NOT pause — it auto-decides on the floor (a reversible
+/// local shell is allowed) and runs straight through. A userless guarded run can
+/// never wedge waiting on a human.
+#[tokio::test]
+async fn guarded_headless_needapproval_does_not_pause() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, mut _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let responded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (fake, _sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::NeedApproval {
+            req_id: "r1".into(),
+            action: "npm run build".into(),
+            target: String::new(),
+        },
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let fake = fake.with_responses(responded.clone());
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+    let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_chat_session_turn(ChatSessionTurn {
+            interactive: false,
+            approval_holder: approval_holder.clone(),
+            ..chat_turn(
+                "build it",
+                holder.clone(),
+                sink.clone(),
+                route_tx.clone(),
+                tmp.path().to_path_buf(),
+            )
+        }),
+    )
+    .await
+    .expect("a headless guarded turn must auto-decide, never block");
+
+    assert!(
+        approval_holder.lock().unwrap().is_none(),
+        "headless must NEVER register an approval pause"
+    );
+    assert_eq!(
+        *responded.lock().unwrap(),
+        vec![umadev_runtime::ApprovalDecision::Allow],
+        "the reversible local shell is auto-allowed on the floor (unchanged headless)"
+    );
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::AgenticDone { .. })
+    ));
+}
+
+/// Fix ③ fail-open: if the pause is abandoned while blocked — Esc / cancel / a dead
+/// session drops the reply channel (here: the holder is cleared, as the Cancel arm
+/// and `interactive_user_present`-off paths do) — the drain must fail-open to DENY
+/// and resume, NEVER hang.
+#[tokio::test]
+async fn approval_pause_fails_open_to_deny_when_abandoned() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, mut _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let responded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (fake, _sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::NeedApproval {
+            req_id: "r1".into(),
+            action: "npm run build".into(),
+            target: String::new(),
+        },
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let fake = fake.with_responses(responded.clone());
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+    let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+
+    let t = tokio::spawn(drive_chat_session_turn(ChatSessionTurn {
+        approval_holder: approval_holder.clone(),
+        ..chat_turn(
+            "build it",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        )
+    }));
+    // Wait for the pause, then ABANDON it (drop the sender) — the cancel / dead-session
+    // fail-open path.
+    wait_for_pending_approval(&approval_holder).await;
+    clear_pending_approval(&approval_holder);
+    tokio::time::timeout(Duration::from_secs(5), t)
+        .await
+        .expect("abandoning the wait must fail-open, never hang")
+        .unwrap();
+    assert_eq!(
+        *responded.lock().unwrap(),
+        vec![umadev_runtime::ApprovalDecision::Deny],
+        "an abandoned approval fails open to DENY (the base is never left hanging)"
+    );
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::AgenticDone { .. })
+    ));
+}
+
+/// Fix A: a `TurnStatus::Failed` whose base process ACTUALLY died
+/// (`try_exit_status` is `Some`) is a genuine teardown — the session is end()-ed
+/// and the holder cleared so the next turn re-opens fresh.
+#[cfg(unix)]
+#[tokio::test]
+async fn chat_failed_turn_on_dead_base_ends_and_clears_holder() {
+    use std::os::unix::process::ExitStatusExt;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, mut _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // A failed turn AND a base process that exited → not recoverable.
+    let (fake, _sent, ended) =
+        FakeChatSession::new(vec![vec![umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Failed("fatal: base crashed".into()),
+            usage: None,
+        }]]);
+    let fake = fake.with_exit_status(std::process::ExitStatus::from_raw(256)); // exit code 1
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "hello",
+        holder.clone(),
+        sink.clone(),
+        route_tx.clone(),
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(
+        matches!(route_rx.try_recv(), Ok(RouteDecision::Failed(_))),
+        "the failure is surfaced"
+    );
+    // A genuinely-dead base IS torn down + the holder cleared (fresh re-open next).
+    assert!(
+        holder.lock().await.is_none(),
+        "a dead base must be end()-ed and the holder cleared for a fresh re-open"
+    );
+    assert!(
+        ended.load(std::sync::atomic::Ordering::SeqCst),
+        "a dead base's session must be end()-ed"
+    );
+}
+
+/// Fix A: an idle hang on a base whose process is still alive parks the session
+/// (after interrupting the hung turn) instead of tearing it down — same recovery
+/// as the turn-failure path, so the next follow-up reuses the bare session.
+#[tokio::test]
+async fn chat_idle_hang_on_live_base_parks_session() {
+    let _env = CHAT_IDLE_ENV_LOCK.lock().await;
+    let _idle = EnvRestore::set("UMADEV_IDLE_TIMEOUT_SECS", "1");
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, mut _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    // HangingChatSession stays ALIVE (try_exit_status defaults to None).
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(HangingChatSession)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "explain this code",
+        holder.clone(),
+        sink.clone(),
+        route_tx.clone(),
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    // The idle settle is still surfaced as a failure.
+    assert!(
+        matches!(route_rx.try_recv(), Ok(RouteDecision::Failed(_))),
+        "the idle settle is surfaced"
+    );
+    // The still-alive base is PARKED back for the next turn, not dropped.
+    assert!(
+        holder.lock().await.is_some(),
+        "an idle hang on a still-alive base must PARK the session for the next turn"
+    );
+}
+
+/// The core latency-fix invariant: two chat turns REUSE the one held session
+/// (never re-open / cold-start), and the session is PARKED back after each turn
+/// for the next message. A reused session gets the small per-turn authority
+/// contract, but no firmware/transcript re-injection (that remains one-time).
+#[tokio::test]
+async fn chat_reuses_one_resident_session_across_turns() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let reported_usage = umadev_runtime::Usage::exact(1_200, 300);
+
+    // Two scripted turns: each a plain text reply then a clean TurnDone.
+    let (fake, sent, ended) = FakeChatSession::new(vec![
+        vec![
+            umadev_runtime::SessionEvent::TextDelta("hi there".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: Some(reported_usage),
+            },
+        ],
+        vec![
+            umadev_runtime::SessionEvent::TextDelta("still here".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ],
+    ]);
+    // Pre-load the holder with a PRIMED session → `drive_chat_session_turn` takes
+    // it on the reuse path, so `session_for` is NEVER called (no cold start).
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+
+    // Turn 1.
+    drive_chat_session_turn(chat_turn(
+        "你好",
+        holder.clone(),
+        sink.clone(),
+        route_tx.clone(),
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+    // The live session was parked back for reuse.
+    assert!(
+        holder.lock().await.is_some(),
+        "session must be parked back after a clean turn"
+    );
+    // First turn settles as a pure chat (not a build).
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone {
+            reply,
+            director_build,
+            ..
+        }) => {
+            assert_eq!(reply, "hi there");
+            assert!(!director_build, "a pure reply is a chat, never a build");
+        }
+        other => panic!("expected AgenticDone, got {other:?}"),
+    }
+
+    // Turn 2 — the SAME held session is reused (no re-open).
+    drive_chat_session_turn(chat_turn(
+        "再说一句",
+        holder.clone(),
+        sink.clone(),
+        route_tx.clone(),
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+    assert!(holder.lock().await.is_some(), "session parked again");
+
+    // The ONE session saw BOTH user turns with a fresh authority boundary, but
+    // no firmware/transcript prefix was re-injected.
+    let sent = sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2, "both turns went to the SAME session");
+    assert!(sent[0].contains("## Current-turn authority") && sent[0].contains("你好"));
+    assert!(sent[1].contains("## Current-turn authority") && sent[1].contains("再说一句"));
+    assert!(sent.iter().all(|directive| {
+        directive.contains(
+        "Prior conversation, plans, TODOs, project documents, and remembered facts are context only"
+    )
+    }));
+    // It was never ended/interrupted (it lives on across the conversation).
+    assert!(
+        !ended.load(std::sync::atomic::Ordering::SeqCst),
+        "a resident chat session is not closed between turns"
+    );
+
+    // No chat intent card was ever emitted (the user removed it) — only worker
+    // stream text, no `IntentDecided`.
+    let mut saw_intent = false;
+    let mut saw_usage = false;
+    while let Ok(ev) = engine_rx.try_recv() {
+        if matches!(&ev, EngineEvent::IntentDecided { .. }) {
+            saw_intent = true;
+        }
+        if matches!(&ev, EngineEvent::TurnUsage { usage: Some(usage) } if *usage == reported_usage)
+        {
+            saw_usage = true;
+        }
+    }
+    assert!(
+        !saw_intent,
+        "a pure chat turn emits NO intent card (chat card removed)"
+    );
+    assert!(
+        saw_usage,
+        "resident chat forwards terminal usage to the TUI"
+    );
+}
+
+/// Cross-session base memory (step 2): a host chat turn captures the LIVE base's
+/// OWN resumable session id and carries it back on the terminal `AgenticDone`, so
+/// the event loop can persist it onto the saved chat (a relaunch then `--resume`s
+/// the base's deep context). A base WITHOUT a resumable id (opencode) carries
+/// `None` — fail-open to today's fresh-session behavior.
+#[tokio::test]
+async fn chat_turn_carries_back_the_base_session_id() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // A primed session that exposes a resumable id (claude / codex behaviour).
+    let (fake, _sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta("ok".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake.with_id("base-sess-42"))),
+    )));
+    drive_chat_session_turn(chat_turn(
+        "你好",
+        holder.clone(),
+        sink.clone(),
+        route_tx.clone(),
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone {
+            base_session_id, ..
+        }) => assert_eq!(
+            base_session_id.as_deref(),
+            Some("base-sess-42"),
+            "the live base session id rides back on the terminal decision"
+        ),
+        other => panic!("expected AgenticDone, got {other:?}"),
+    }
+
+    // A base with NO resumable id (opencode / default) carries `None` — fail-open.
+    let (fake2, _s2, _e2) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta("ok".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder2: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake2)),
+    )));
+    drive_chat_session_turn(chat_turn(
+        "再来",
+        holder2.clone(),
+        sink.clone(),
+        route_tx.clone(),
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone {
+            base_session_id, ..
+        }) => assert_eq!(
+            base_session_id, None,
+            "a base with no resumable id is fail-open (None)"
+        ),
+        other => panic!("expected AgenticDone, got {other:?}"),
+    }
+}
+
+/// The API-error surfacing fix: a chat turn whose base reports a `Failed` status
+/// (an API error like a 429 rate limit) must SURFACE that error — a
+/// `RouteDecision::Failed` carrying the actionable classifier line + the base's
+/// raw error text — and must NOT read as a clean "[agentic] 完成" (no
+/// `AgenticDone`) nor emit a "本轮无文件变更" note. The screenshot bug, end to end
+/// on the chat path.
+#[tokio::test]
+async fn chat_failed_turn_surfaces_api_error_not_a_false_done() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // The base hits a 429 mid-turn: it ends the turn with a Failed status whose
+    // message is the base's OWN error text (exactly what claude's `parse_result`
+    // now produces from an `is_error:true` result line).
+    let api_err = "API Error: Request rejected (429) · You have exceeded the 5-hour usage quota. It will reset at 2026-06-28 18:59:37.";
+    let (fake, _sent, ended) =
+        FakeChatSession::new(vec![vec![umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Failed(api_err.to_string()),
+            usage: None,
+        }]]);
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "现在还有哪些任务没有完成",
+        holder.clone(),
+        sink.clone(),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    // The turn surfaced as a FAILURE (never a false AgenticDone / "完成").
+    match route_rx.try_recv() {
+        Ok(RouteDecision::Failed(note)) => {
+            // The base's RAW error text reaches the user (never swallowed).
+            assert!(note.contains("429"), "the raw 429 error is shown: {note}");
+            assert!(
+                note.contains("usage quota"),
+                "the full base error is shown: {note}"
+            );
+            // The actionable rate-limit classifier line is prepended.
+            assert!(
+                note.contains(umadev_i18n::tl("base.fail.ratelimit")),
+                "the rate-limit diagnosis is prepended: {note}"
+            );
+        }
+        other => panic!("expected RouteDecision::Failed, got {other:?}"),
+    }
+    // No SECOND decision (a Failed turn is terminal — no false AgenticDone too).
+    assert!(
+        route_rx.try_recv().is_err(),
+        "a failed turn emits exactly one terminal decision"
+    );
+    // The failure was surfaced, but the base PROCESS is still alive
+    // (try_exit_status None), so the session is PARKED back as `Primed` for the
+    // next turn (Fix A: a recoverable 429 blip no longer tears the resident
+    // session down + forces a re-scan/re-open) — NOT end()-ed.
+    assert!(
+        !ended.load(std::sync::atomic::Ordering::SeqCst),
+        "a recoverable failure on a LIVE base parks the session, it does not end it"
+    );
+    assert!(
+        holder.lock().await.is_some(),
+        "the live session is parked back for reuse after a surfaced failure"
+    );
+    // CRUCIAL: no "本轮无文件变更 / no file changes" Note was emitted — the swallow.
+    while let Ok(ev) = engine_rx.try_recv() {
+        if let EngineEvent::Note(n) = ev {
+            assert!(
+                !n.contains("无文件变更") && !n.contains("no file changes"),
+                "a failed turn must NOT emit the no-file-changes note: {n}"
+            );
+        }
+    }
+}
+
+/// A reactive write is real workspace work for honesty/locking, but it does
+/// not retroactively claim that the Director workflow ran.
+#[tokio::test]
+async fn chat_session_reacts_to_first_write_as_build() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let (fake, _sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Write".into(),
+            input: serde_json::json!({ "file_path": "src/main.rs" }),
+        },
+        umadev_runtime::SessionEvent::TextDelta("created the file".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "建个 main",
+        holder,
+        sink.clone(),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    // The terminal decision is scoped work, not a Director build.
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone { director_build, .. }) => {
+            assert!(
+                !director_build,
+                "a write alone must not claim the Director workflow ran"
+            );
+        }
+        other => panic!("expected AgenticDone, got {other:?}"),
+    }
+    // The conservative fallback route is surfaced, but terminal truth still
+    // distinguishes that route label from actual Director execution.
+    let mut saw_route_card = false;
+    let mut saw_write = false;
+    while let Ok(ev) = engine_rx.try_recv() {
+        match ev {
+            EngineEvent::IntentDecided { class, .. } if class == "quick_edit" => {
+                saw_route_card = true;
+            }
+            EngineEvent::IntentDecided { class, .. } if class == "build" => {
+                saw_route_card = true;
+            }
+            EngineEvent::WorkerStream {
+                event: umadev_runtime::StreamEvent::ToolUse { name, .. },
+            } if name == "Write" => saw_write = true,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_route_card,
+        "the first write surfaces its route while terminal truth stays separate"
+    );
+    assert!(saw_write, "the write tool call streams live");
+}
+
+/// An availability-fallback write is recorded as real work for source truth,
+/// but cannot claim Director/session-handback semantics without a healthy
+/// semantic model verdict.
+#[tokio::test]
+async fn fallback_write_records_build_truth_without_flagship_qc() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Pre-seed a real, slop-free source file so the source-present honesty floor
+    // PASSES and the governance scan is clean — the QC pass runs and settles clean.
+    std::fs::write(tmp.path().join("app.ts"), "export const x = 1;").unwrap();
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // The base writes a file (flips to a build) then reports done.
+    let (fake, _sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Write".into(),
+            input: serde_json::json!({ "file_path": "app.ts" }),
+        },
+        umadev_runtime::SessionEvent::TextDelta("built the page".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "做个落地页",
+        holder.clone(),
+        sink.clone(),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    // The terminal decision records a scoped turn, not a Director run.
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone { director_build, .. }) => {
+            assert!(
+                !director_build,
+                "fallback write truth must not impersonate Director usage"
+            );
+        }
+        other => panic!("expected AgenticDone, got {other:?}"),
+    }
+    // The write remains honest build work, but the missing intent fork means
+    // no semantic authority exists for broad governance/team review.
+    let mut saw_qc = false;
+    while let Ok(ev) = engine_rx.try_recv() {
+        if let EngineEvent::Note(n) = ev {
+            if n.contains("构建完成") || n.contains("honesty + QC") || n.contains("team ·") {
+                saw_qc = true;
+            }
+        }
+    }
+    assert!(!saw_qc, "fallback writes must not launch flagship QC");
+    // The live session is parked back for reuse after the scoped turn.
+    assert!(
+        holder.lock().await.is_some(),
+        "the session is parked back after the scoped fallback turn"
+    );
+}
+
+/// Production-path proof that the resident TUI obeys the model's semantic
+/// decision in the DOWNWARD direction before the writer acts. The same text is
+/// a deterministic BackendOnly/Build, but the read-only fork recognises a
+/// bounded optimization and returns QuickEdit; only that lane reaches writer.
+#[tokio::test]
+async fn resident_chat_uses_fork_model_to_downgrade_build_floor_before_write() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("app.ts"), "export const x = 1;").unwrap();
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let (fork, fork_sent, fork_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "quick_edit",
+                "authorization": "mutating",
+                "kind": "backend_only",
+                "complexity": "simple",
+                "confidence": 0.96
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let (writer, writer_sent, _writer_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Edit".into(),
+            input: serde_json::json!({ "file_path": "app.ts" }),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "edit applied".into(),
+        },
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "npm run lint" }),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "lint passed".into(),
+        },
+        umadev_runtime::SessionEvent::TextDelta("optimized the hot path".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let writer = writer.with_fork(Box::new(fork));
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "优化后端代码，提升接口性能",
+        holder,
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::AgenticDone { .. })
+    ));
+    assert_eq!(fork_sent.lock().unwrap().len(), 1, "one model triage turn");
+    assert!(
+        fork_ended.load(std::sync::atomic::Ordering::SeqCst),
+        "the read-only intent fork is closed"
+    );
+    let writer_directives = writer_sent.lock().unwrap();
+    assert_eq!(writer_directives.len(), 1, "no team/QC writer re-drive");
+    assert!(writer_directives[0].contains("Model-decided route: quick_edit / fast"));
+    assert!(writer_directives[0].contains("smallest necessary edit"));
+    drop(writer_directives);
+
+    while let Ok(event) = engine_rx.try_recv() {
+        match event {
+            EngineEvent::Note(note) => {
+                assert!(!note.contains(umadev_i18n::tl("intent.fallback")));
+                assert!(
+                    !(note.contains("honesty + QC") || note.contains("team ·")),
+                    "model-routed QuickEdit must not launch flagship QC: {note}"
+                );
+            }
+            EngineEvent::IntentDecided { class, .. } => {
+                assert_eq!(class, "quick_edit");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn model_read_only_route_executes_on_sandboxed_child_not_writer() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (readonly, readonly_sent, readonly_ended) = FakeChatSession::new(vec![
+        vec![
+            umadev_runtime::SessionEvent::TextDelta(
+                serde_json::json!({
+                    "class": "chat",
+                    "authorization": "read_only",
+                    "kind": "light",
+                    "complexity": "simple",
+                    "confidence": 0.99
+                })
+                .to_string(),
+            ),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ],
+        vec![
+            umadev_runtime::SessionEvent::TextDelta("当然，可以正常聊。".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ],
+    ]);
+    let (writer, writer_sent, writer_ended) = FakeChatSession::new(Vec::new());
+    let writer = writer.with_fork(Box::new(readonly));
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "我们正常聊聊天",
+        holder.clone(),
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone {
+            reply,
+            director_build,
+            ..
+        }) => {
+            assert_eq!(reply, "当然，可以正常聊。");
+            assert!(!director_build);
+        }
+        other => panic!("expected read-only reply, got {other:?}"),
+    }
+    assert!(
+        writer_sent.lock().unwrap().is_empty(),
+        "writer saw no user turn"
+    );
+    for _ in 0..20 {
+        if writer_ended.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(writer_ended.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!readonly_ended.load(std::sync::atomic::Ordering::SeqCst));
+    let directives = readonly_sent.lock().unwrap().clone();
+    assert_eq!(directives.len(), 2, "one triage turn + one answer turn");
+    assert!(directives[1].contains("read-only answer"));
+    assert!(matches!(
+        *holder.lock().await,
+        Some(ResidentChat::ReadOnlyPrimed(_))
+    ));
+}
+
+#[tokio::test]
+async fn resident_turn_sends_ordered_typed_input_and_surfaces_its_receipt() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let image = tmp.path().join("图 像.png");
+    let file = tmp.path().join("需求 文档.md");
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+    std::fs::write(&file, "# requirement\n").unwrap();
+    let input = TurnInput::new(vec![
+        TurnInputBlock::Text {
+            text: "前 ".to_string(),
+        },
+        TurnInputBlock::Image {
+            path: image.clone(),
+        },
+        TurnInputBlock::Text {
+            text: " 中 ".to_string(),
+        },
+        TurnInputBlock::File {
+            path: file.clone(),
+            mode: umadev_runtime::FileInputMode::MaterializeText,
+        },
+        TurnInputBlock::Text {
+            text: " 后".to_string(),
+        },
+    ]);
+    let received: Arc<std::sync::Mutex<Vec<TurnInput>>> = Arc::default();
+    let readonly = TypedRouteSession {
+        stage: 0,
+        current: std::collections::VecDeque::new(),
+        received: Arc::clone(&received),
+    };
+    let (writer, writer_sent, _writer_ended) = FakeChatSession::new(Vec::new());
+    let writer = writer.with_fork(Box::new(readonly));
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let turn = ChatSessionTurn {
+        input,
+        ..chat_turn(
+            "前 [图片 1] 中 [文件 1] 后",
+            holder,
+            sink,
+            route_tx,
+            tmp.path().to_path_buf(),
+        )
+    };
+
+    drive_chat_session_turn(turn).await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::AgenticDone { reply, .. }) if reply == "typed input received"
+    ));
+    assert!(
+        writer_sent.lock().unwrap().is_empty(),
+        "the full-access parent never receives the read-only typed turn"
+    );
+    let received = received.lock().unwrap();
+    assert_eq!(received.len(), 1);
+    let blocks = &received[0].blocks;
+    assert_eq!(
+        blocks.iter().map(TurnInputBlock::kind).collect::<Vec<_>>(),
+        vec![
+            TurnInputBlockKind::Text,
+            TurnInputBlockKind::Image,
+            TurnInputBlockKind::Text,
+            TurnInputBlockKind::File,
+            TurnInputBlockKind::Text,
+        ]
+    );
+    assert!(matches!(&blocks[1], TurnInputBlock::Image { path } if path == &image));
+    assert!(matches!(&blocks[3], TurnInputBlock::File { path, .. } if path == &file));
+    drop(received);
+
+    let mut saw_receipt = false;
+    while let Ok(event) = engine_rx.try_recv() {
+        if let EngineEvent::TransientStatus(Some(status)) = event {
+            saw_receipt |= status.contains("Native")
+                && status.contains("MaterializedText")
+                && status.contains("image/png");
+        }
+    }
+    assert!(
+        saw_receipt,
+        "the state area receives the actual delivery report"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_caps_mutating_model_verdict_before_director_or_disk_write() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (readonly, readonly_sent, _readonly_ended) = FakeChatSession::new(vec![
+        vec![
+            umadev_runtime::SessionEvent::TextDelta(
+                serde_json::json!({
+                    "class": "build",
+                    "authorization": "mutating",
+                    "kind": "greenfield",
+                    "complexity": "complex",
+                    "confidence": 0.99
+                })
+                .to_string(),
+            ),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ],
+        vec![
+            umadev_runtime::SessionEvent::TextDelta(
+                "当前是规划模式，我先为你说明实现方案。".into(),
+            ),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ],
+    ]);
+    let (writer, writer_sent, writer_ended) = FakeChatSession::new(Vec::new());
+    let writer = writer.with_fork(Box::new(readonly));
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::ReadOnlyPrimed(Box::new(writer)),
+    )));
+    let mut turn = chat_turn(
+        "构建一个完整应用",
+        holder,
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    );
+    turn.mode = umadev_agent::TrustMode::Plan;
+    turn.permissions = umadev_runtime::BasePermissionProfile::Plan;
+
+    drive_chat_session_turn(turn).await;
+
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone {
+            reply,
+            director_build,
+            ..
+        }) => {
+            assert!(reply.contains("规划模式"));
+            assert!(!director_build, "Plan mode cannot enter Director");
+        }
+        other => panic!("expected a read-only Plan reply, got {other:?}"),
+    }
+    assert!(
+        route_rx.try_recv().is_err(),
+        "Plan mode must not emit DirectorStarted before the terminal reply"
+    );
+    assert!(writer_sent.lock().unwrap().is_empty(), "writer saw no turn");
+    for _ in 0..20 {
+        if writer_ended.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(writer_ended.load(std::sync::atomic::Ordering::SeqCst));
+    let directives = readonly_sent.lock().unwrap().clone();
+    assert_eq!(
+        directives.len(),
+        2,
+        "one triage turn + one read-only answer"
+    );
+    assert!(directives[1].contains("This is read-only."));
+    assert!(directives[1].contains("Model-decided route: explain / fast"));
+    assert!(
+        !tmp.path().join(".umadev/workflow-state.json").exists(),
+        "Plan-mode natural language must not create Director workflow state"
+    );
+}
+
+#[tokio::test]
+async fn model_clarification_pauses_before_writer_lock_branch_or_turn() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (fork, _fork_sent, fork_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "build",
+                "authorization": "mutating",
+                "kind": "greenfield",
+                "complexity": "medium",
+                "clarify_question": "这个入口面向哪类用户？",
+                "clarify_options": ["管理员", "普通用户"],
+                "confidence": 0.62
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let (writer, writer_sent, writer_ended) = FakeChatSession::new(Vec::new());
+    let writer = writer.with_fork(Box::new(fork));
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "给这个入口加一套登录流程",
+        holder.clone(),
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone {
+            reply,
+            director_build,
+            ..
+        }) => {
+            assert!(!director_build);
+            assert!(reply.contains("这个入口面向哪类用户？"));
+            assert!(reply.contains("1. 管理员"));
+            assert!(reply.contains("2. 普通用户"));
+        }
+        other => panic!("expected clarification reply, got {other:?}"),
+    }
+    assert!(
+        writer_sent.lock().unwrap().is_empty(),
+        "writer was never driven"
+    );
+    assert!(fork_ended.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        !writer_ended.load(std::sync::atomic::Ordering::SeqCst),
+        "the untouched resident session is parked, not closed"
+    );
+    assert!(holder.lock().await.is_some());
+    assert!(
+        !tmp.path().join(".umadev/run.lock").exists(),
+        "clarification never acquires the writer lock"
+    );
+}
+
+#[tokio::test]
+async fn quick_edit_write_skips_flagship_qc_and_team_review() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("app.ts"), "export const title = 'old';").unwrap();
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "quick_edit",
+                "authorization": "mutating",
+                "kind": "light",
+                "complexity": "simple",
+                "confidence": 0.97
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let (fake, sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Edit".into(),
+            input: serde_json::json!({ "file_path": "app.ts" }),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "edit applied".into(),
+        },
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "npm run lint" }),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "lint passed".into(),
+        },
+        umadev_runtime::SessionEvent::TextDelta("updated SEO metadata".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let fake = fake.with_fork(Box::new(intent_fork));
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "帮我搞一下 SEO",
+        holder,
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::AgenticDone {
+            director_build: false,
+            ..
+        })
+    ));
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        1,
+        "a QuickEdit never sends a QC/review turn"
+    );
+    while let Ok(event) = engine_rx.try_recv() {
+        if let EngineEvent::Note(note) = event {
+            assert!(
+                !(note.contains("构建完成")
+                    || note.contains("honesty + QC")
+                    || note.contains("team ·")),
+                "QuickEdit must not launch flagship QC/team review: {note}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn quick_edit_write_without_targeted_verification_is_not_completed() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("app.ts"), "export const title = 'old';").unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "quick_edit",
+                "authorization": "mutating",
+                "kind": "light",
+                "complexity": "simple",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let (writer, _sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Edit".into(),
+            input: serde_json::json!({ "file_path": "app.ts" }),
+        },
+        umadev_runtime::SessionEvent::TextDelta("updated metadata".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer.with_fork(Box::new(intent_fork)))),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "只改一下 SEO 标题",
+        holder.clone(),
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    match route_rx.try_recv() {
+        Ok(RouteDecision::Failed(note)) => assert_eq!(
+            note,
+            umadev_i18n::tl("intent.targeted_verification_missing")
+        ),
+        other => panic!("unverified scoped write must be blocked, got {other:?}"),
+    }
+    assert!(
+        holder.lock().await.is_some(),
+        "session remains available to verify"
+    );
+    let runs = umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 1);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].tasks[0].state,
+        umadev_agent::task_lifecycle::AgentTaskState::Failed,
+        "an unverified resident write is durably failed"
+    );
+}
+
+#[tokio::test]
+async fn quick_edit_codex_output_delta_never_settles_verifier_early() {
+    // Exercise both verdicts with the exact Codex process-log order:
+    // completed Write, started verifier, non-terminal outputDelta, then the
+    // real item/completed verdict. The delta must neither consume the FIFO
+    // entry nor mint a green result from optimistic-looking progress text.
+    for final_ok in [false, true] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("app.ts"), "export const title = 'old';").unwrap();
+        let (sink, _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::TextDelta(
+                serde_json::json!({
+                    "class": "quick_edit",
+                    "authorization": "mutating",
+                    "kind": "light",
+                    "complexity": "simple",
+                    "confidence": 0.99
+                })
+                .to_string(),
+            ),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]]);
+        let (writer, _sent, _ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::ToolCall {
+                name: "Write".into(),
+                input: serde_json::json!({ "file_path": "app.ts" }),
+            },
+            umadev_runtime::SessionEvent::ToolResult {
+                ok: true,
+                summary: "file written".into(),
+            },
+            umadev_runtime::SessionEvent::ToolCall {
+                name: "Bash".into(),
+                input: serde_json::json!({ "command": "cargo test -q" }),
+            },
+            umadev_runtime::SessionEvent::ToolOutputDelta(
+                "running: 42 checks passed so far\n".into(),
+            ),
+            umadev_runtime::SessionEvent::ToolResult {
+                ok: final_ok,
+                summary: if final_ok {
+                    "all tests passed".into()
+                } else {
+                    "final test failed".into()
+                },
+            },
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]]);
+        let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(writer.with_fork(Box::new(intent_fork)))),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "只改一下 SEO 标题",
+            holder,
+            sink,
+            route_tx,
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        let decision = route_rx.try_recv();
+        if final_ok {
+            assert!(
+                matches!(&decision, Ok(RouteDecision::AgenticDone { .. })),
+                "the real successful terminal result should verify: {decision:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    &decision,
+                    Ok(RouteDecision::Failed(note))
+                        if note == umadev_i18n::tl("intent.targeted_verification_missing")
+                ),
+                "optimistic progress cannot hide the failed terminal result: {decision:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn quick_edit_verification_before_last_write_is_not_completed() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("app.ts"), "export const title = 'old';").unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "quick_edit",
+                "authorization": "mutating",
+                "kind": "light",
+                "complexity": "simple",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let (writer, _sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "cargo test -q" }),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "tests passed".into(),
+        },
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Edit".into(),
+            input: serde_json::json!({ "file_path": "app.ts" }),
+        },
+        umadev_runtime::SessionEvent::TextDelta("updated metadata".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer.with_fork(Box::new(intent_fork)))),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "只改一下 SEO 标题",
+        holder,
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::Failed(note))
+            if note == umadev_i18n::tl("intent.targeted_verification_missing")
+    ));
+}
+
+#[tokio::test]
+async fn quick_edit_successful_verifier_then_arbitrary_shell_write_is_not_completed() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("app.ts"), "export const title = 'old';").unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "quick_edit",
+                "authorization": "mutating",
+                "kind": "light",
+                "complexity": "simple",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let (writer, _sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "cargo test -q" }),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "tests passed".into(),
+        },
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "touch app.ts" }),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "command completed".into(),
+        },
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer.with_fork(Box::new(intent_fork)))),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "只改一下 SEO 标题",
+        holder,
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::Failed(note))
+            if note == umadev_i18n::tl("intent.targeted_verification_missing")
+    ));
+}
+
+#[tokio::test]
+async fn quick_edit_keeps_fifo_across_output_delta_then_failed_verifier() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("app.ts"), "export const title = 'old';").unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "quick_edit",
+                "authorization": "mutating",
+                "kind": "light",
+                "complexity": "simple",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let (writer, _sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Edit".into(),
+            input: serde_json::json!({ "file_path": "app.ts" }),
+        },
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "cargo test -q" }),
+        },
+        // Codex process logs stream this while the command is still running.
+        // It must not consume either queued call or manufacture a green result.
+        umadev_runtime::SessionEvent::ToolOutputDelta("running tests...\n".into()),
+        // Result 1 belongs to Edit; it must not be mistaken for the queued test.
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "edit applied".into(),
+        },
+        // The actual verifier failed, so the turn remains unverified.
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: false,
+            summary: "test failed".into(),
+        },
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer.with_fork(Box::new(intent_fork)))),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "只改一下 SEO 标题",
+        holder,
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::Failed(note))
+            if note == umadev_i18n::tl("intent.targeted_verification_missing")
+    ));
+}
+
+#[tokio::test]
+async fn routed_build_without_write_tool_still_runs_source_gate_and_flagship_qc() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "build",
+                "authorization": "mutating",
+                "kind": "greenfield",
+                "complexity": "medium",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    // The writer CLAIMS completion but emits no Write/Edit/Bash tool and leaves
+    // an empty workspace. A second batch lets the bounded QC repair turn settle.
+    let (writer, sent, ended) = FakeChatSession::new(vec![
+        vec![
+            umadev_runtime::SessionEvent::TextDelta("I implemented the entire application".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ],
+        vec![umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        }],
+        vec![umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        }],
+        vec![umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        }],
+        vec![umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        }],
+    ]);
+    let writer = writer
+        .with_id("director-session-1")
+        .with_fork(Box::new(intent_fork));
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "构建一个完整应用",
+        holder,
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert_eq!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::DirectorStarted {
+            requirement: "构建一个完整应用".to_string(),
+        }),
+        "the UI learns about a model-promoted director before it settles"
+    );
+    match route_rx.try_recv() {
+        Ok(RouteDecision::Failed(reason)) => assert!(
+            reason.contains("ZERO real source files")
+                || reason.contains("0 source file(s)")
+                || reason.contains("没有任何真实源码"),
+            "the objective source rejection is the terminal result: {reason}"
+        ),
+        other => panic!("expected an honest failed completion, got {other:?}"),
+    }
+    assert!(
+        sent.lock().unwrap().len() >= 2,
+        "the routed Build must enter the QC pass even without a write tool"
+    );
+    let mut saw_source_abort = false;
+    let mut saw_director_intent = false;
+    while let Ok(event) = engine_rx.try_recv() {
+        match event {
+            EngineEvent::Note(note) => {
+                saw_source_abort |= note.contains(ABORT_SENTINEL);
+            }
+            EngineEvent::IntentDecided { class, .. } => {
+                saw_director_intent |= class == "build";
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_source_abort,
+        "a phantom Build completion must hit the source-present hard gate"
+    );
+    assert!(
+        saw_director_intent,
+        "a healthy model Build must enter the routed director workflow"
+    );
+    assert!(
+        ended.load(std::sync::atomic::Ordering::SeqCst),
+        "the director owns and settles the reused resident writer"
+    );
+    let state = umadev_agent::read_workflow_state(tmp.path())
+        .expect("a natural-language director build writes workflow state");
+    assert_eq!(state.requirement, "构建一个完整应用");
+    assert_eq!(state.base_session_id.as_deref(), Some("director-session-1"));
+}
+
+#[tokio::test]
+async fn successful_routed_build_hands_exact_director_session_back() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("app.ts"), "export const ready = true;\n").unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "build",
+                "authorization": "mutating",
+                "kind": "greenfield",
+                "complexity": "medium",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let (writer, _sent, ended) = FakeChatSession::new(vec![
+        vec![
+            umadev_runtime::SessionEvent::TextDelta("Implemented and verified.".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ],
+        vec![umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        }],
+    ]);
+    let passing_critic = || {
+        FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::TextDelta(
+                serde_json::json!({
+                    "accepts": true,
+                    "blocking": [],
+                    "remediation": [],
+                    "advisory": [],
+                    "evidence": ["scripted quality-review fixture"]
+                })
+                .to_string(),
+            ),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]])
+        .0
+    };
+    let writer = writer
+        .with_id("director-success-1")
+        .with_fork(Box::new(intent_fork))
+        // The greenfield route's quality roster is frontend, backend, QA and
+        // security. Keep the integration fixture aligned with that real
+        // review contract instead of silently exercising unavailable critics.
+        .with_fork(Box::new(passing_critic()))
+        .with_fork(Box::new(passing_critic()))
+        .with_fork(Box::new(passing_critic()))
+        .with_fork(Box::new(passing_critic()));
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "构建一个完整应用",
+        holder,
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::DirectorStarted { .. })
+    ));
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone {
+            director_build: true,
+            base_session_id,
+            ..
+        }) => assert_eq!(base_session_id.as_deref(), Some("director-success-1")),
+        other => panic!("expected successful director completion, got {other:?}"),
+    }
+    assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn deterministic_fallback_build_stays_resident_without_flagship_qc() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("app.ts"), "export const x = 1;\n").unwrap();
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    // No scripted fork: semantic routing is unavailable, so the clear Build
+    // wording is only an availability fallback. One resident answer must not
+    // earn a DirectorStarted transition or a broad QC re-drive.
+    let (writer, sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta("I inspected the request.".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "构建一个完整应用",
+        holder,
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone { director_build, .. }) => assert!(
+            !director_build,
+            "a no-write fallback verdict cannot claim a governed build"
+        ),
+        other => panic!("expected one resident completion, got {other:?}"),
+    }
+    assert!(
+        route_rx.try_recv().is_err(),
+        "no DirectorStarted transition"
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1, "no flagship QC re-drive");
+    while let Ok(event) = engine_rx.try_recv() {
+        if let EngineEvent::Note(note) = event {
+            assert!(
+                !(note.contains("honesty + QC") || note.contains("team ·")),
+                "availability fallback must not launch team QC: {note}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn bash_file_change_is_post_turn_work_but_quick_edit_skips_flagship_qc() {
+    let tmp = init_git_repo();
+    let target = tmp.path().join("src/generated.rs");
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "quick_edit",
+                "authorization": "mutating",
+                "kind": "light",
+                "complexity": "simple",
+                "scope": ["src/generated.rs"],
+                "confidence": 0.98
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let (writer, sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "generate src/generated.rs"}),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "generated source".into(),
+        },
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "cargo check"}),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "cargo check passed".into(),
+        },
+        umadev_runtime::SessionEvent::TextDelta("created src/generated.rs".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let writer = writer
+        .with_fork(Box::new(intent_fork))
+        .with_send_effect(move || {
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, "pub fn generated() {}\n").unwrap();
+        });
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "生成一个很小的 Rust 文件",
+        holder,
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::AgenticDone {
+            director_build: false,
+            ..
+        })
+    ));
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        1,
+        "a Bash-backed QuickEdit is real work but never launches flagship QC"
+    );
+    let mut saw_real_change = false;
+    while let Ok(event) = engine_rx.try_recv() {
+        if let EngineEvent::Note(note) = event {
+            // Porcelain v1 may collapse a wholly-untracked directory to
+            // `src/`; either spelling is objective evidence of this write.
+            saw_real_change |= note.contains("src/generated.rs") || note.contains("src/");
+            assert!(
+                !(note.contains("构建完成")
+                    || note.contains("honesty + QC")
+                    || note.contains("team ·")),
+                "QuickEdit must stay on targeted verification: {note}"
+            );
+        }
+    }
+    assert!(
+        saw_real_change,
+        "the objective git delta must surface the Bash-created code path"
+    );
+}
+
+#[tokio::test]
+async fn docs_only_write_does_not_become_code_build_or_run_flagship_qc() {
+    let tmp = init_git_repo();
+    let target = tmp.path().join("README.md");
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "quick_edit",
+                "authorization": "mutating",
+                "kind": "docs_only",
+                "complexity": "simple",
+                "scope": ["README.md"],
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let (writer, sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Write".into(),
+            input: serde_json::json!({"file_path": "README.md"}),
+        },
+        umadev_runtime::SessionEvent::TextDelta("updated README.md".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let writer = writer
+        .with_fork(Box::new(intent_fork))
+        .with_send_effect(move || std::fs::write(target, "# Documentation\n").unwrap());
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "只更新 README 文档",
+        holder,
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::AgenticDone {
+            director_build: false,
+            ..
+        })
+    ));
+    assert_eq!(sent.lock().unwrap().len(), 1, "DocsOnly has no QC turn");
+    let runs = umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 1);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].tasks[0].state,
+        umadev_agent::task_lifecycle::AgentTaskState::Succeeded,
+        "a real docs diff that passed its scope contract is durable success"
+    );
+    while let Ok(event) = engine_rx.try_recv() {
+        if let EngineEvent::Note(note) = event {
+            assert!(
+                !(note.contains(ABORT_SENTINEL)
+                    || note.contains("构建完成")
+                    || note.contains("honesty + QC")
+                    || note.contains("team ·")),
+                "DocsOnly must not enter the code-build gates: {note}"
+            );
+        }
+    }
+}
+
+/// The other half of the unification invariant: a PURE chat reply (no write, no
+/// `became_build`) must NOT run the post-build QC pass — it stays light + fast,
+/// with no `team · …` QC notes and no extra fix directives. This guards the
+/// latency: conversation is never slowed by the build-only QC machinery.
+#[tokio::test]
+async fn pure_chat_reply_skips_the_post_build_qc_pass() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // A pure text reply — no write tool, so `became_build` stays false.
+    let (fake, sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta("here is my answer".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "你好,解释一下闭包",
+        holder.clone(),
+        sink.clone(),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    // Settles as a pure chat (not a build).
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone {
+            director_build,
+            reply,
+            ..
+        }) => {
+            assert!(!director_build, "a pure reply is a chat, never a build");
+            assert_eq!(reply, "here is my answer");
+        }
+        other => panic!("expected AgenticDone, got {other:?}"),
+    }
+    // NO post-build QC note fired — the conversation stayed on the light path.
+    while let Ok(ev) = engine_rx.try_recv() {
+        if let EngineEvent::Note(n) = ev {
+            assert!(
+                !(n.contains("构建完成") || n.contains("honesty + QC")),
+                "a pure chat reply must NOT run the post-build QC pass: {n:?}"
+            );
+        }
+    }
+    // EXACTLY one directive was sent (the user turn) — no QC fix directive was
+    // ever folded back, so a pure chat is never slowed by rework.
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        1,
+        "a pure chat reply drives exactly one directive — no QC rework"
+    );
+    assert!(
+        umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 1).is_empty(),
+        "Chat/Explain must not enter the durable writer ledger"
+    );
+}
+
+/// An interrupted turn (ESC reflected by the base as `TurnStatus::Interrupted`)
+/// PARKS the still-alive session back for reuse and settles `thinking` via a
+/// (non-build) terminal decision — it does NOT close the resident session.
+#[tokio::test]
+async fn chat_session_interrupt_parks_session_for_reuse() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let (fake, _sent, ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta("partial".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Interrupted,
+            usage: None,
+        },
+    ]]);
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "停",
+        holder.clone(),
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(
+        holder.lock().await.is_some(),
+        "an interrupted turn parks the live session back for reuse"
+    );
+    assert!(
+        !ended.load(std::sync::atomic::Ordering::SeqCst),
+        "interrupt does NOT close the resident session"
+    );
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone { director_build, .. }) => {
+            assert!(!director_build, "an interrupted turn settles as a chat");
+        }
+        other => panic!("expected AgenticDone, got {other:?}"),
+    }
+}
+
+/// A PRE-LOADED warm session (the latency fix): the holder already carries a
+/// `Warm` session by the time the user sends, so the FIRST turn does NOT
+/// cold-start (`session_for` is never called) — it only sends the first directive
+/// into the already-resident base and parks it back PRIMED for reuse. The first
+/// directive front-loads the bounded conversation transcript so the warm session
+/// inherits the prior dialogue.
+#[tokio::test]
+async fn preloaded_warm_session_is_used_without_a_cold_start() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let (fake, sent, ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta("warm reply".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    // Park a WARM session (claude → no firmware prefix on the first directive)
+    // exactly as the background pre-load would have.
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Warm(WarmChatSession {
+            session: Box::new(fake),
+            firmware: None,
+            backend: "claude-code".to_string(),
+            permissions: umadev_runtime::BasePermissionProfile::Guarded,
+            generation: 0,
+        }),
+    )));
+
+    // Drive a turn whose snapshot carries a one-line prior conversation so we can
+    // assert the FIRST directive front-loads it (the warm session is fresh memory).
+    let mut turn = chat_turn(
+        "继续",
+        holder.clone(),
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    );
+    turn.conversation = vec![
+        umadev_runtime::Message {
+            role: "user".into(),
+            content: "之前的问题".into(),
+        },
+        umadev_runtime::Message {
+            role: "assistant".into(),
+            content: "之前的回答".into(),
+        },
+    ];
+    drive_chat_session_turn(turn).await;
+
+    // The warm session was consumed and re-parked as `Primed` (alive, reusable).
+    assert!(
+        matches!(*holder.lock().await, Some(ResidentChat::Primed(_))),
+        "a warm session becomes primed after its first turn"
+    );
+    assert!(
+        !ended.load(std::sync::atomic::Ordering::SeqCst),
+        "the warm session is reused, never closed, after the first turn"
+    );
+    // The FIRST directive front-loaded the prior dialogue (warm session has no
+    // native memory of it yet) — so it is NOT the bare user turn.
+    let sent = sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1, "exactly one directive into the warm session");
+    assert!(
+        sent[0].contains("继续") && sent[0].contains("之前的回答"),
+        "first directive front-loads the transcript onto the warm session: {:?}",
+        sent[0]
+    );
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone {
+            reply,
+            director_build,
+            ..
+        }) => {
+            assert_eq!(reply, "warm reply");
+            assert!(!director_build);
+        }
+        other => panic!("expected AgenticDone, got {other:?}"),
+    }
+}
+
+/// The first directive for a warm session: claude gets history ONLY (firmware is
+/// native via `--append-system-prompt`); a non-claude base (no native system
+/// slot) gets the firmware re-prefixed onto the directive too.
+#[test]
+fn first_chat_directive_prefixes_firmware_only_for_non_claude() {
+    let convo: Vec<Message> = Vec::new();
+    // claude: firmware present but NEVER restated on the directive.
+    let route = umadev_agent::deterministic_route("做个登录页");
+    let claude = first_chat_directive(
+        Some("FW-BLOCK"),
+        "claude-code",
+        &convo,
+        "做个登录页",
+        "做个登录页",
+        &route,
+    );
+    assert!(
+        !claude.contains("FW-BLOCK"),
+        "claude firmware is native — never re-prefixed: {claude:?}"
+    );
+    assert!(claude.contains("做个登录页"));
+    // codex: no native system slot → firmware is prefixed onto the directive.
+    let codex = first_chat_directive(
+        Some("FW-BLOCK"),
+        "codex",
+        &convo,
+        "做个登录页",
+        "做个登录页",
+        &route,
+    );
+    assert!(
+        codex.starts_with("FW-BLOCK"),
+        "non-claude firmware is front-loaded onto the first directive: {codex:?}"
+    );
+    assert!(codex.contains("做个登录页"));
+    // No firmware → bare goal regardless of base.
+    let bare = first_chat_directive(None, "opencode", &convo, "做个登录页", "做个登录页", &route);
+    assert!(bare.contains("## Current-turn authority"));
+    assert!(bare.contains("做个登录页"));
+}
+
+#[test]
+fn scope_contract_is_route_sized_and_history_is_not_authority() {
+    let read = scoped_chat_directive(
+        "what is Rust?",
+        &umadev_agent::deterministic_route("what is Rust?"),
+    );
+    assert!(read.contains("without tools, commands, file writes, reviews, or QC"));
+    assert!(read.contains("context only"));
+
+    let mut explain_route = umadev_agent::deterministic_route("what is Rust?");
+    explain_route.class = umadev_agent::RouteClass::Explain;
+    let explain = scoped_chat_directive("解释现有代码", &explain_route);
+    assert!(explain.contains("necessary read/search tools"));
+    assert!(explain.contains("do not run mutating commands, write files"));
+
+    let edit = scoped_chat_directive(
+        "改个文案，把标题改成 Welcome",
+        &umadev_agent::deterministic_route("改个文案，把标题改成 Welcome"),
+    );
+    assert!(edit.contains("smallest necessary edit"));
+    assert!(edit.contains("Do not launch a team or broad review"));
+    assert!(edit.contains("## Latest request\n改个文案，把标题改成 Welcome"));
+}
+
+/// The turn-time resident guard (the post-`/backend`-switch ordering race): a
+/// parked WARM session pinned to ANOTHER base is rejected as stale (the caller
+/// closes it and lazily opens the right base), while a matching warm session and
+/// any primed session pass through untouched.
+#[test]
+fn resident_for_turn_rejects_a_warm_session_from_another_base() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let claude_identity = SessionIdentity::for_launch(
+        "claude-code",
+        workspace.path(),
+        umadev_runtime::BasePermissionProfile::Guarded,
+    )
+    .unwrap();
+    let codex_identity = SessionIdentity::for_launch(
+        "codex",
+        workspace.path(),
+        umadev_runtime::BasePermissionProfile::Guarded,
+    )
+    .unwrap();
+    // Stale: warm claude parked, but the turn now runs on codex.
+    let (fake, _s, _e) = FakeChatSession::new(vec![]);
+    let parked = Some(ResidentChat::Warm(WarmChatSession {
+        session: Box::new(fake),
+        firmware: Some("FW".into()),
+        backend: "claude-code".into(),
+        permissions: umadev_runtime::BasePermissionProfile::Guarded,
+        generation: 0,
+    }));
+    let (usable, stale) =
+        resident_for_turn(parked, Some(&codex_identity), Some(&claude_identity), 0);
+    assert!(
+        usable.is_none(),
+        "a wrong-base warm session is never served"
+    );
+    assert!(
+        matches!(stale, Some(ResidentChat::Warm(_))),
+        "the stale warm session is returned for closing"
+    );
+    // Matching: warm codex serves a codex turn.
+    let (fake, _s, _e) = FakeChatSession::new(vec![]);
+    let parked = Some(ResidentChat::Warm(WarmChatSession {
+        session: Box::new(fake),
+        firmware: None,
+        backend: "codex".into(),
+        permissions: umadev_runtime::BasePermissionProfile::Guarded,
+        generation: 0,
+    }));
+    let (usable, stale) =
+        resident_for_turn(parked, Some(&codex_identity), Some(&codex_identity), 0);
+    assert!(matches!(usable, Some(ResidentChat::Warm(_))));
+    assert!(stale.is_none());
+    // Primed is trusted only under the holder's exact permission profile;
+    // generation invalidation prevents an older turn from parking one here.
+    let (fake, _s, _e) = FakeChatSession::new(vec![]);
+    let (usable, stale) = resident_for_turn(
+        Some(ResidentChat::Primed(Box::new(fake))),
+        Some(&codex_identity),
+        Some(&codex_identity),
+        0,
+    );
+    assert!(matches!(usable, Some(ResidentChat::Primed(_))));
+    assert!(stale.is_none());
+    // A canonical workspace mismatch is just as stale as a backend mismatch.
+    let other_workspace = tempfile::TempDir::new().unwrap();
+    let other_identity = SessionIdentity::for_launch(
+        "codex",
+        other_workspace.path(),
+        umadev_runtime::BasePermissionProfile::Guarded,
+    )
+    .unwrap();
+    let (fake, _s, _e) = FakeChatSession::new(vec![]);
+    let (usable, stale) = resident_for_turn(
+        Some(ResidentChat::Primed(Box::new(fake))),
+        Some(&other_identity),
+        Some(&codex_identity),
+        0,
+    );
+    assert!(usable.is_none());
+    assert!(matches!(stale, Some(ResidentChat::Primed(_))));
+    // Empty holder stays empty.
+    let (usable, stale) = resident_for_turn(None, None, None, 0);
+    assert!(usable.is_none() && stale.is_none());
+}
+
+#[test]
+fn resident_for_turn_rejects_stale_generation_and_permission_profiles() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let requested_plan = SessionIdentity::for_launch(
+        "codex",
+        workspace.path(),
+        umadev_runtime::BasePermissionProfile::Plan,
+    )
+    .unwrap();
+    let parked_auto = SessionIdentity::for_launch(
+        "codex",
+        workspace.path(),
+        umadev_runtime::BasePermissionProfile::Auto,
+    )
+    .unwrap();
+    let (fake, _sent, _ended) = FakeChatSession::new(vec![]);
+    let warm = ResidentChat::Warm(WarmChatSession {
+        session: Box::new(fake),
+        firmware: None,
+        backend: "codex".into(),
+        permissions: umadev_runtime::BasePermissionProfile::Auto,
+        generation: 4,
+    });
+    let (usable, stale) =
+        resident_for_turn(Some(warm), Some(&requested_plan), Some(&parked_auto), 4);
+    assert!(usable.is_none());
+    assert!(matches!(stale, Some(ResidentChat::Warm(_))));
+
+    let (fake, _sent, _ended) = FakeChatSession::new(vec![]);
+    let warm = ResidentChat::Warm(WarmChatSession {
+        session: Box::new(fake),
+        firmware: None,
+        backend: "codex".into(),
+        permissions: umadev_runtime::BasePermissionProfile::Guarded,
+        generation: 3,
+    });
+    let guarded_identity = SessionIdentity::for_launch(
+        "codex",
+        workspace.path(),
+        umadev_runtime::BasePermissionProfile::Guarded,
+    )
+    .unwrap();
+    let (usable, stale) = resident_for_turn(
+        Some(warm),
+        Some(&guarded_identity),
+        Some(&guarded_identity),
+        4,
+    );
+    assert!(usable.is_none());
+    assert!(matches!(stale, Some(ResidentChat::Warm(_))));
+
+    let (fake, _sent, _ended) = FakeChatSession::new(vec![]);
+    let (usable, stale) = resident_for_turn(
+        Some(ResidentChat::Primed(Box::new(fake))),
+        Some(&requested_plan),
+        Some(&parked_auto),
+        4,
+    );
+    assert!(usable.is_none());
+    assert!(matches!(stale, Some(ResidentChat::Primed(_))));
+}
+
+#[tokio::test]
+async fn resident_holder_never_parks_a_cancelled_generation() {
+    let holder = ChatSessionHolder::new(None);
+    let started_generation = holder.generation();
+    holder.invalidate();
+    let (fake, _sent, ended) = FakeChatSession::new(vec![]);
+    let workspace = tempfile::TempDir::new().unwrap();
+    let identity = SessionIdentity::for_launch(
+        "codex",
+        workspace.path(),
+        umadev_runtime::BasePermissionProfile::Auto,
+    )
+    .unwrap();
+    let parked = holder
+        .park_if_current(
+            started_generation,
+            identity,
+            ResidentChat::Primed(Box::new(fake)),
+        )
+        .await;
+    assert!(!parked, "a cancelled generation has no right to re-park");
+    assert!(holder.lock().await.is_none());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !ended.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a rejected stale process is closed off-path");
+}
+
+/// The transient-failure park disposition: a FIRST front-loaded directive that
+/// streamed NOTHING re-parks `Warm` (the next turn re-feeds the transcript — the
+/// base may never have absorbed it); streamed evidence or a bare `Primed`
+/// acquire re-parks `Primed` (the pre-existing behavior).
+#[tokio::test]
+async fn park_after_transient_failure_reparks_warm_only_for_an_unabsorbed_first_directive() {
+    // First directive + nothing streamed → Warm (full re-feed next turn).
+    let front = AttemptDirective::FrontLoaded {
+        firmware: Some("FW".into()),
+    };
+    let (fake, _s, _e) = FakeChatSession::new(vec![]);
+    let parked = park_after_transient_failure(
+        Box::new(fake),
+        &front,
+        false,
+        "codex",
+        umadev_runtime::BasePermissionProfile::Guarded,
+        7,
+    );
+    match parked {
+        ResidentChat::Warm(w) => {
+            assert_eq!(w.firmware.as_deref(), Some("FW"), "the firmware is carried");
+            assert_eq!(w.backend, "codex");
+        }
+        ResidentChat::Primed(_) | ResidentChat::ReadOnlyPrimed(_) => {
+            panic!("an unabsorbed first directive must re-park Warm")
+        }
+    }
+    // First directive but the base DID stream → Primed (it absorbed the history).
+    let (fake, _s, _e) = FakeChatSession::new(vec![]);
+    let parked = park_after_transient_failure(
+        Box::new(fake),
+        &front,
+        true,
+        "codex",
+        umadev_runtime::BasePermissionProfile::Guarded,
+        7,
+    );
+    assert!(matches!(parked, ResidentChat::Primed(_)));
+    // A bare Primed reuse (no first directive this attempt) stays Primed.
+    let (fake, _s, _e) = FakeChatSession::new(vec![]);
+    let parked = park_after_transient_failure(
+        Box::new(fake),
+        &AttemptDirective::Bare,
+        false,
+        "codex",
+        umadev_runtime::BasePermissionProfile::Guarded,
+        7,
+    );
+    assert!(matches!(parked, ResidentChat::Primed(_)));
+}
+
+/// End-to-end amnesia regression on the resident chat path: the FIRST
+/// front-loaded directive fails with a KNOWN-transient error (429) and ZERO
+/// events streamed — the base never absorbed the transcript. The session must
+/// re-park `Warm` so the NEXT turn re-feeds the full front-load (firmware +
+/// prior dialogue), instead of going out bare into an empty brain.
+#[tokio::test]
+async fn unabsorbed_first_directive_failure_refeeds_the_transcript_on_the_next_turn() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // Turn 1: an immediate KNOWN-transient failure (no auto-redrive, base still
+    // alive), with NO events before it. Turn 2: a clean completion.
+    let (fake, sent, _ended) = FakeChatSession::new(vec![
+        vec![umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Failed("429 Too Many Requests".into()),
+            usage: None,
+        }],
+        vec![
+            umadev_runtime::SessionEvent::TextDelta("有上下文的回答".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ],
+    ]);
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Warm(WarmChatSession {
+            session: Box::new(fake),
+            firmware: Some("FW-CODEX".into()),
+            backend: "codex".into(),
+            permissions: umadev_runtime::BasePermissionProfile::Guarded,
+            generation: 0,
+        }),
+    )));
+    let prior = vec![
+        umadev_runtime::Message {
+            role: "user".into(),
+            content: "MARKER-EARLIER 我们之前定了用 SQLite".into(),
+        },
+        umadev_runtime::Message {
+            role: "assistant".into(),
+            content: "好的,表结构已定".into(),
+        },
+    ];
+
+    // Turn 1 — fails clean; the session must re-park WARM (not Primed).
+    let mut turn = chat_turn(
+        "继续实现",
+        holder.clone(),
+        sink.clone(),
+        route_tx.clone(),
+        tmp.path().to_path_buf(),
+    );
+    turn.backend = "codex".into();
+    turn.conversation = prior.clone();
+    drive_chat_session_turn(turn).await;
+    assert!(
+        matches!(route_rx.try_recv(), Ok(RouteDecision::Failed(_))),
+        "the transient failure is surfaced honestly"
+    );
+    assert!(
+        matches!(*holder.lock().await, Some(ResidentChat::Warm(_))),
+        "an unabsorbed first directive re-parks the session WARM for a full re-feed"
+    );
+
+    // Turn 2 — the re-fed first directive carries the current route-sized
+    // identity/authority overlay AND the prior dialogue again (the amnesia
+    // fix), then completes and parks Primed. The old warm placeholder firmware
+    // is intentionally replaced after model routing.
+    let mut turn = chat_turn(
+        "再试一次",
+        holder.clone(),
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    );
+    turn.backend = "codex".into();
+    turn.conversation = prior;
+    drive_chat_session_turn(turn).await;
+    let sent = sent.lock().unwrap().clone();
+    assert_eq!(
+        sent.len(),
+        2,
+        "two directives into the same session: {sent:?}"
+    );
+    assert!(
+        sent[0].contains("Current-turn authority") && sent[0].contains("MARKER-EARLIER"),
+        "the first attempt front-loaded route firmware + transcript: {:?}",
+        sent[0]
+    );
+    assert!(
+        sent[1].contains("Current-turn authority") && sent[1].contains("MARKER-EARLIER"),
+        "the retry turn RE-FEEDS the full front-load (no bare amnesia turn): {:?}",
+        sent[1]
+    );
+    assert!(
+        matches!(*holder.lock().await, Some(ResidentChat::Primed(_))),
+        "a completed turn parks Primed as before"
+    );
+}
+
+/// The background pre-load is a NO-OP for a non-host (offline) brain — there is no
+/// resident process to keep, so the holder stays empty and the first chat turn
+/// lazily opens exactly as before. (Hermetic: an offline id never spawns a base.)
+#[tokio::test]
+async fn preload_is_a_noop_for_a_non_host_backend() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let holder = ChatSessionHolder::new(None);
+    spawn_chat_session_preload(
+        Some("offline"),
+        String::new(),
+        tmp.path().to_path_buf(),
+        umadev_runtime::BasePermissionProfile::Guarded,
+        None,
+        holder.clone(),
+    );
+    // Also a `None` backend (no base configured) — both must leave the holder empty.
+    spawn_chat_session_preload(
+        None,
+        String::new(),
+        tmp.path().to_path_buf(),
+        umadev_runtime::BasePermissionProfile::Guarded,
+        None,
+        holder.clone(),
+    );
+    // Give any (wrongly-)spawned task a chance to run, then assert nothing landed.
+    tokio::task::yield_now().await;
+    assert!(
+        holder.lock().await.is_none(),
+        "a non-host / unconfigured pre-load never lands a session"
+    );
+}
+
+/// `ResidentChat::end` releases the underlying base in BOTH states (warm + primed)
+/// — the cleanup the cancel / `/clear` / backend-switch / quit paths rely on.
+#[tokio::test]
+async fn resident_chat_end_closes_warm_and_primed() {
+    let (warm_fake, _s, warm_ended) = FakeChatSession::new(vec![]);
+    ResidentChat::Warm(WarmChatSession {
+        session: Box::new(warm_fake),
+        firmware: None,
+        backend: "claude-code".to_string(),
+        permissions: umadev_runtime::BasePermissionProfile::Guarded,
+        generation: 0,
+    })
+    .end()
+    .await;
+    assert!(
+        warm_ended.load(std::sync::atomic::Ordering::SeqCst),
+        "ending a warm resident closes its base"
+    );
+    let (primed_fake, _s2, primed_ended) = FakeChatSession::new(vec![]);
+    ResidentChat::Primed(Box::new(primed_fake)).end().await;
+    assert!(
+        primed_ended.load(std::sync::atomic::Ordering::SeqCst),
+        "ending a primed resident closes its base"
+    );
+}
+
+// --- Rendering self-heal (P0 every-frame repaint / P2 probe / P3
+// contamination) ------------------------------------------------------------
+
+#[test]
+fn size_poll_detects_a_lost_resize_event_only_on_a_real_change() {
+    // No baseline yet (startup / first poll) → record only, never heal: the
+    // initial paint must not be preceded by a spurious clear.
+    assert!(
+        !size_poll_detected_resize(None, Some((120, 30))),
+        "the first size reading is a baseline, not a resize"
+    );
+    // Unchanged size → no heal. This is the idle steady state — the 80ms tick
+    // polls forever, so an identical reading MUST stay silent (the
+    // no-per-frame-clear anti-flicker contract).
+    assert!(
+        !size_poll_detected_resize(Some((120, 30)), Some((120, 30))),
+        "an unchanged size must never trigger a clear (idle = no flicker)"
+    );
+    // Width shrink — the fullscreen/drag case: rows painted at the stale wider
+    // width overflow the new terminal, autowrap spills the status bar's tail
+    // down the left column. The poll must catch it even with no Resize event.
+    assert!(
+        size_poll_detected_resize(Some((160, 40)), Some((120, 40))),
+        "a width change with no delivered Resize event must heal"
+    );
+    // Growth and a height-only change count too.
+    assert!(size_poll_detected_resize(Some((120, 30)), Some((160, 30))));
+    assert!(size_poll_detected_resize(Some((120, 30)), Some((120, 31))));
+    // A failed backend size query fabricates nothing (fail-open), with or
+    // without a baseline — and it must not erase the baseline either (the
+    // caller keeps the old one so a later good reading still compares).
+    assert!(!size_poll_detected_resize(Some((120, 30)), None));
+    assert!(!size_poll_detected_resize(None, None));
+}
+
+#[test]
+fn poll_detected_resize_runs_the_same_heal_as_an_event_resize() {
+    // The shared reaction (`apply_resize_heal`) — used by BOTH a delivered
+    // Event::Resize and the tick-time size-poll fallback — opens the
+    // RESIZE_HEAL_WINDOW, so every frame for a short spell repaints IN PLACE
+    // (HealMode::Invalidate) and the terminal's multi-frame buffer settle heals
+    // too, not just one frame. It deliberately does NOT contaminate: a resize
+    // shows OUR cells at the wrong geometry (drift), not foreign bytes, so it
+    // must not pay an ED(2) erase + its (0,0) cursor sweep.
+    let mut last_resize_at = None;
+    apply_resize_heal(&mut last_resize_at);
+    assert!(
+        last_resize_at.is_some_and(|t| t.elapsed() < RESIZE_HEAL_WINDOW),
+        "a detected resize opens the resize heal window for the settle frames"
+    );
+}
+
+// --- The heal split: drift repaints in place, contamination erases -----------
+
+#[test]
+fn heal_mode_erases_only_for_contamination_and_invalidates_for_drift() {
+    // Drift (the streaming cadence / the resize + focus settle windows): repaint
+    // every cell IN PLACE. No ED(2), no (0,0) cursor park, no flash, and no
+    // dependence on the terminal honoring DEC 2026.
+    assert_eq!(
+        heal_mode(true, false),
+        HealMode::Invalidate,
+        "drift heals in place — never an erase"
+    );
+    // True contamination (an out-of-band write / Ctrl+L / /redraw): the screen
+    // holds bytes we never wrote, so only an erase is honest.
+    assert_eq!(
+        heal_mode(false, true),
+        HealMode::Erase,
+        "contamination erases"
+    );
+    // Contamination wins when both are pending — the erase subsumes the repaint,
+    // so a frame never pays two heals.
+    assert_eq!(
+        heal_mode(true, true),
+        HealMode::Erase,
+        "contamination subsumes a concurrent drift heal (exactly one heal per frame)"
+    );
+    // The steady state — a pure scroll, an idle screen, a prompt being typed at:
+    // NOTHING. This is the anti-flicker contract: no per-frame heal, ever.
+    assert_eq!(
+        heal_mode(false, false),
+        HealMode::None,
+        "no drift and no contamination → plain incremental diff (no flicker)"
+    );
+}
+
+/// A `Write` sink that keeps its bytes reachable — `CrosstermBackend`'s own
+/// writer is private, so a recording backend has to own the tap itself.
+#[derive(Clone, Default)]
+struct Tap(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+impl Tap {
+    /// Take everything written so far, as a lossy string.
+    fn drain(&self) -> String {
+        let bytes = std::mem::take(&mut *self.0.borrow_mut());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl std::io::Write for Tap {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A `Terminal` over the REAL `AnchoredBackend` + `CrosstermBackend`, writing its
+/// escape sequences into a [`Tap`] instead of a TTY — so a test can assert on the
+/// EXACT bytes a frame put on the wire.
+fn recording_terminal(w: u16, h: u16) -> (ratatui::Terminal<AnchoredBackend<Tap>>, Tap) {
+    let tap = Tap::default();
+    let backend = AnchoredBackend::new(CrosstermBackend::new(tap.clone()));
+    let terminal = ratatui::Terminal::with_options(
+        backend,
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, w, h)),
+        },
+    )
+    .expect("a Tap-backed terminal cannot fail");
+    (terminal, tap)
+}
+
+/// Paint `text` at (0, 0) — a tiny stand-in for a real frame.
+fn draw_text(terminal: &mut ratatui::Terminal<AnchoredBackend<Tap>>, text: &str) {
+    terminal
+        .draw(|f| {
+            f.render_widget(
+                ratatui::widgets::Paragraph::new(text),
+                ratatui::layout::Rect::new(0, 0, f.area().width, 1),
+            );
+        })
+        .expect("a Tap-backed draw cannot fail");
+}
+
+/// Whether the wire carries ANY screen-erase op — the thing a drift heal must
+/// never emit. `ED(2)` (`\x1b[2J`, what `Clear(All)` sends on a fullscreen
+/// viewport) and `ED(0)` (`\x1b[J` / `\x1b[0J`, the erase-to-end a fixed
+/// viewport's per-row clear sends) both blank real cells and, on Windows, park
+/// the cursor at (0, 0) — the flash + the cursor sweep.
+fn erases_the_screen(wire: &str) -> bool {
+    wire.contains("\x1b[2J") || wire.contains("\x1b[J") || wire.contains("\x1b[0J")
+}
+
+#[test]
+fn a_drift_heal_repaints_without_erasing_while_contamination_still_erases() {
+    // THE central behavioral claim of the heal split, asserted on the wire.
+    let (mut terminal, tap) = recording_terminal(12, 2);
+    draw_text(&mut terminal, "hello");
+    let _first = tap.drain();
+
+    // A second identical frame with NO heal: ratatui's own-buffer diff is empty,
+    // so nothing is repainted. (This is exactly why drift can never self-heal —
+    // and why the heal below has to exist at all.)
+    draw_text(&mut terminal, "hello");
+    let steady = tap.drain();
+    assert!(
+        !steady.contains('h'),
+        "an unchanged frame emits no cells (the empty diff that lets drift persist): {steady:?}"
+    );
+
+    // DRIFT heal → repaint every cell IN PLACE. No erase, and the cells come back.
+    apply_heal(&mut terminal, HealMode::Invalidate);
+    draw_text(&mut terminal, "hello");
+    let healed = tap.drain();
+    assert!(
+        !erases_the_screen(&healed),
+        "a drift heal must emit NO erase op — the erase is the flash + the (0,0) cursor sweep: {healed:?}"
+    );
+    assert!(
+        healed.contains("hello"),
+        "a drift heal must re-emit the frame's cells in place: {healed:?}"
+    );
+
+    // CONTAMINATION heal → the erase the caller actually asked for.
+    apply_heal(&mut terminal, HealMode::Erase);
+    draw_text(&mut terminal, "hello");
+    let erased = tap.drain();
+    assert!(
+        erases_the_screen(&erased),
+        "contamination must still erase the screen: {erased:?}"
+    );
+    assert!(erased.contains("hello"), "…and repaint: {erased:?}");
+
+    // And HealMode::None touches nothing.
+    apply_heal(&mut terminal, HealMode::None);
+    draw_text(&mut terminal, "hello");
+    let none = tap.drain();
+    assert!(
+        !erases_the_screen(&none) && !none.contains('h'),
+        "no heal → plain (here: empty) incremental diff: {none:?}"
+    );
+}
+
+#[test]
+fn a_drift_heal_repaints_cells_that_are_blank_in_the_new_frame() {
+    // The trap in a plain `Buffer::reset()`-based invalidation: reset fills with
+    // `Cell::EMPTY` (a space in the default style), so a cell that is ALSO blank
+    // in the new frame diffs EQUAL and is SKIPPED — and whatever garbage the
+    // drift left in that cell survives the "full" repaint. `invalidate_frame`
+    // poisons the previous buffer with a symbol no real cell can hold, so every
+    // cell — blanks included — is re-emitted. Assert it on the wire: a heal frame
+    // whose content is entirely blank must still write spaces over the screen.
+    let (mut terminal, tap) = recording_terminal(6, 1);
+    draw_text(&mut terminal, "abcdef");
+    let _ = tap.drain();
+
+    apply_heal(&mut terminal, HealMode::Invalidate);
+    // The new frame is BLANK — every cell is a default-styled space.
+    draw_text(&mut terminal, "");
+    let healed = tap.drain();
+    assert!(
+        healed.contains("      "),
+        "a drift heal must paint the blank cells too, or stale glyphs survive it: {healed:?}"
+    );
+    assert!(
+        !erases_the_screen(&healed),
+        "…and still without an erase: {healed:?}"
+    );
+}
+
+// --- Cursor-advance re-anchoring (the ambiguous-width root cause) ------------
+
+#[test]
+fn the_backend_re_anchors_the_cursor_after_a_non_ascii_cell() {
+    use ratatui::backend::Backend as _;
+    use ratatui::buffer::Cell;
+
+    // ratatui's stock crossterm backend suppresses the MoveTo whenever the next
+    // cell sits at `prev.x + 1` — it ASSUMES every printed cell advanced the real
+    // cursor exactly one column. For an East-Asian AMBIGUOUS-width glyph (`·`,
+    // `─`, `—`, `…`) `unicode-width` says 1 but a CJK-locale terminal renders 2,
+    // so the real cursor ends up one column further right and EVERY later cell in
+    // the row lands in the wrong place. `AnchoredBackend` re-emits an explicit
+    // MoveTo after any non-ASCII cell, so the disagreement self-corrects at the
+    // very next cell instead of cascading.
+    let tap = Tap::default();
+    let mut backend = AnchoredBackend::new(CrosstermBackend::new(tap.clone()));
+    let cells: Vec<(u16, u16, Cell)> = "a·b"
+        .chars()
+        .enumerate()
+        .map(|(i, ch)| {
+            let mut c = Cell::EMPTY;
+            c.set_symbol(&ch.to_string());
+            (u16::try_from(i).unwrap(), 0, c)
+        })
+        .collect();
+    backend
+        .draw(cells.iter().map(|(x, y, c)| (*x, *y, c)))
+        .expect("a Tap-backed draw cannot fail");
+    let wire = tap.drain();
+
+    // The cell AFTER the ambiguous-width `·` is re-anchored with an explicit
+    // MoveTo (1-based CSI row;col H → column index 2 = `\x1b[1;3H`).
+    assert!(
+        wire.contains("\x1b[1;3H"),
+        "the cell after a non-ASCII glyph must be re-anchored with an explicit MoveTo: {wire:?}"
+    );
+    // …while the cell after the pure-ASCII `a` still rides the contiguous-run
+    // shortcut (no MoveTo at column index 1 → `\x1b[1;2H`), so a pure-ASCII frame
+    // is byte-for-byte what stock ratatui would emit — the anchoring is free.
+    assert!(
+        !wire.contains("\x1b[1;2H"),
+        "an ASCII predecessor must keep the MoveTo suppression (no per-cell cost): {wire:?}"
+    );
+    assert!(wire.contains('a') && wire.contains('·') && wire.contains('b'));
+}
+
+#[test]
+fn the_backend_never_queries_stdin_for_a_cursor_position() {
+    use ratatui::backend::Backend as _;
+    use ratatui::layout::Position;
+
+    let tap = Tap::default();
+    let mut backend = AnchoredBackend::new(CrosstermBackend::new(tap.clone()));
+    backend
+        .set_cursor_position(Position { x: 7, y: 3 })
+        .expect("a Tap-backed cursor move cannot fail");
+    let _ = tap.drain();
+
+    assert_eq!(
+        backend.get_cursor_position().unwrap(),
+        Position { x: 7, y: 3 }
+    );
+    assert!(
+        !tap.drain().contains("\x1b[6n"),
+        "cursor reads must use the owned logical position, never a blocking terminal query"
+    );
+}
+
+#[test]
+fn ascii_advance_is_the_only_certain_one() {
+    assert!(cell_advance_is_certain("a"));
+    assert!(cell_advance_is_certain(" "));
+    // Every ambiguous-width glyph UmaDev's own chrome uses — the actual garble
+    // sources — must force a re-anchor.
+    for amb in ["·", "─", "—", "…", "│", "▸"] {
+        assert!(
+            !cell_advance_is_certain(amb),
+            "{amb:?} is ambiguous/wide — its column advance is NOT certain"
+        );
+    }
+    // …and so must a plain CJK glyph.
+    assert!(!cell_advance_is_certain("中"));
+}
+
+#[test]
+fn autowrap_is_disabled_on_enter_and_restored_on_exit() {
+    // DECAWM off (`\x1b[?7l`) for the alt-screen session: with autowrap ON, one
+    // glyph the terminal renders wider than `unicode-width` predicted pushes the
+    // row's tail past the right margin, the terminal SPILLS it onto the next
+    // line, and the corruption cascades down the whole screen — invisible to
+    // ratatui's own-buffer diff, so it can never be repaired. With DECAWM off the
+    // overflow is dropped at the margin and the damage cannot leave its row.
+    let mut enable = Vec::new();
+    enable_terminal_modes(&mut enable, true).expect("a Vec sink cannot fail");
+    let enable = String::from_utf8_lossy(&enable).into_owned();
+    assert!(
+        enable.contains("\x1b[?7l"),
+        "the enable block must disable autowrap: {enable:?}"
+    );
+
+    // …and the shell gets it back: a primary buffer with DECAWM off is unusable
+    // (long command lines overtype themselves at the right margin).
+    let mut restore = Vec::new();
+    restore_sequence_inner(&mut restore, false);
+    let restore = String::from_utf8_lossy(&restore).into_owned();
+    assert!(
+        restore.contains("\x1b[?7h"),
+        "the restore sequence must re-enable autowrap: {restore:?}"
+    );
+    // On the PRIMARY buffer: the re-enable must land AFTER LeaveAlternateScreen
+    // (`\x1b[?1049l`), or it would only restore the alt screen we are discarding.
+    let leave = restore.find("\x1b[?1049l").expect("leaves the alt screen");
+    let wrap_on = restore.find("\x1b[?7h").expect("re-enables autowrap");
+    assert!(
+        wrap_on > leave,
+        "autowrap must be restored on the PRIMARY buffer, after the alt-screen leave"
+    );
+}
+
+#[test]
+fn focus_gain_reasserts_the_dec_modes_and_opens_the_heal_window() {
+    // Windows Terminal / ConPTY STRIP DEC private modes while the window is
+    // unfocused. Coming back, focus reporting (1004), bracketed paste (2004),
+    // mouse capture and — now load-bearing — autowrap-OFF (?7l) may simply be
+    // gone, so the very next ambiguous-width glyph would wrap and cascade again.
+    // The focus-return reaction therefore re-asserts the WHOLE enable block
+    // (idempotent, the same one startup uses) before it heals, and opens the
+    // multi-frame heal window so the terminal's own settle-redraw can't win.
+    let (mut terminal, tap) = recording_terminal(20, 3);
+    let mut last_focus_gained_at = None;
+    apply_focus_heal(&mut terminal, true, &mut last_focus_gained_at);
+    let wire = tap.drain();
+
+    assert!(
+        wire.contains("\x1b[?7l"),
+        "focus return must re-assert autowrap-OFF — ConPTY drops it while unfocused: {wire:?}"
+    );
+    assert!(
+        wire.contains("\x1b[?1004h"),
+        "…and focus reporting, or the NEXT focus return is never even delivered: {wire:?}"
+    );
+    assert!(
+        wire.contains("\x1b[?2004h"),
+        "…and bracketed paste: {wire:?}"
+    );
+    assert!(
+        !wire.contains("\x1b[?1049h"),
+        "focus return must not replay stateful alternate-screen entry: {wire:?}"
+    );
+    assert!(
+        last_focus_gained_at.is_some_and(|t| t.elapsed() < FOCUS_HEAL_WINDOW),
+        "focus return opens the heal window for the terminal's multi-frame settle"
+    );
+}
+
+#[test]
+fn the_background_probe_runs_after_the_alternate_screen_is_up() {
+    // A pre-alt capability query can stall ConPTY resize delivery. Lock the
+    // startup order structurally; normalize CRLF for Windows checkouts.
+    let source = include_str!("../lib.rs").replace("\r\n", "\n");
+    let alt_screen = source
+        .find("stdout.execute(EnterAlternateScreen)")
+        .expect("setup_terminal enters the alternate screen once");
+    let probe = source
+        .find("request_background_color(terminal.backend_mut())")
+        .expect("event_loop sends the OSC 11 query through its writer");
+    assert!(
+        alt_screen < probe,
+        "alternate-screen entry must precede the OSC 11 query"
+    );
+}
+
+#[test]
+fn synchronized_output_brackets_are_emitted_unconditionally() {
+    // DEC 2026 is a PRIVATE mode: a terminal that doesn't implement it silently
+    // ignores the escape, and crossterm's Windows path has a literal no-op
+    // `execute_winapi` for both. Emitting is therefore free — which is what makes
+    // the whole env-allowlist + DECRQM-probe apparatus (deleted) unnecessary.
+    // Locked here as a byte-level contract so nobody re-introduces a capability
+    // gate around it.
+    let mut buf = Vec::new();
+    buf.execute(BeginSynchronizedUpdate)
+        .expect("a Vec sink cannot fail");
+    buf.execute(EndSynchronizedUpdate)
+        .expect("a Vec sink cannot fail");
+    let wire = String::from_utf8_lossy(&buf).into_owned();
+    assert_eq!(
+        wire, "\x1b[?2026h\x1b[?2026l",
+        "BSU/ESU are 8 bytes each and are always safe to emit"
+    );
+}
+
+#[test]
+fn owned_focus_in_sequence_drives_a_full_repaint() {
+    // End-to-end through the OWNED input pipeline (tokenizer → decoder): the
+    // focus-in escape `\x1b[I` must decode to a focus-in event, which the reader
+    // maps to `Event::FocusGained` and the event loop routes to
+    // `App::contaminate_terminal` (P3) — one healing clear+repaint on return.
+    // This is the owned-path (non-Windows default) counterpart to the native
+    // `Event::FocusGained` the Windows `EventStream` delivers.
+    use crate::input::decode::{Decoder, InputEvent};
+    use crate::input::tokenize::Tokenizer;
+    let mut tk = Tokenizer::for_stdin();
+    let mut dec = Decoder::new();
+    let mut got_focus_in = false;
+    for token in tk.feed(b"\x1b[I") {
+        for ev in dec.feed_token(token) {
+            if ev == InputEvent::Focus(true) {
+                got_focus_in = true;
+            }
+        }
+    }
+    assert!(
+        got_focus_in,
+        "the owned tokenizer decodes CSI I (`\\x1b[I`) to a focus-in event"
+    );
+}
+
+#[test]
+fn setup_enables_and_restore_disables_focus_change_reporting() {
+    use crossterm::ExecutableCommand as _;
+    // Setup turns focus-change reporting ON via `EnableFocusChange`
+    // (DEC private mode 1004 = `\x1b[?1004h`), the exact escape `setup_terminal`
+    // writes so the terminal reports focus in/out.
+    let mut enable_buf: Vec<u8> = Vec::new();
+    let _ = enable_buf.execute(EnableFocusChange);
+    assert!(
+        String::from_utf8_lossy(&enable_buf).contains("\x1b[?1004h"),
+        "setup must enable focus-change reporting (mode 1004h)"
+    );
+    // Teardown / panic hook / mid-setup failure all route through
+    // `restore_sequence`, which must turn it back OFF symmetrically so focus
+    // reports never leak as `\x1b[I` / `\x1b[O` text at the restored shell.
+    let mut restore_buf: Vec<u8> = Vec::new();
+    restore_sequence(&mut restore_buf);
+    assert!(
+        String::from_utf8_lossy(&restore_buf).contains("\x1b[?1004l"),
+        "restore must disable focus-change reporting (mode 1004l)"
+    );
+}
+
+#[test]
+fn r5_gap_detection_trips_only_past_the_threshold() {
+    let threshold = Duration::from_secs(5);
+    // A long gap (sleep/wake / re-attach) → reassert.
+    assert!(
+        resume_gap_elapsed(Duration::from_secs(5), threshold),
+        "a gap at the threshold trips the reassert"
+    );
+    assert!(
+        resume_gap_elapsed(Duration::from_secs(30), threshold),
+        "a long gap trips the reassert"
+    );
+    // Normal typing cadence → no reassert.
+    assert!(
+        !resume_gap_elapsed(Duration::from_millis(200), threshold),
+        "normal typing never trips the reassert"
+    );
+    assert!(
+        !resume_gap_elapsed(Duration::from_secs(4), threshold),
+        "a sub-threshold gap never trips the reassert"
+    );
+}
+
+#[test]
+fn settle_edge_contaminates_the_terminal_once() {
+    // The live→settled true→false edge (a turn/run just ended) contaminates
+    // the terminal so the final settled frame gets ONE clean full repaint on
+    // a non-sync terminal — the drift a long streaming run accumulated must
+    // not freeze on screen. Exercised through the same App flag the event
+    // loop drains; steady states never contaminate.
+    let (app, _tmp) = build_test_app();
+    // The loop-top edge detector: contaminate ONLY on true→false.
+    for (was, now, expect) in [
+        (true, false, true),   // the settling edge → one heal
+        (true, true, false),   // steady live run → no thrash
+        (false, false, false), // steady idle → no thrash
+        (false, true, false),  // starting a turn is not a settle
+    ] {
+        if was && !now {
+            app.contaminate_terminal();
+        }
+        assert_eq!(
+            app.take_terminal_contaminated(),
+            expect,
+            "was_live={was} now_live={now}"
+        );
+    }
+    // And the drain is one-shot: the healing repaint fires exactly once.
+    assert!(
+        !app.take_terminal_contaminated(),
+        "contamination drains once"
+    );
+}
+
+#[test]
+fn idle_animation_tick_does_not_force_a_redraw() {
+    let (mut app, _tmp) = build_test_app();
+
+    assert!(
+        !tick_needs_draw(&app, false),
+        "a settled chat should not repaint every 80ms tick while the user reads scrollback"
+    );
+
+    app.thinking = true;
+    assert!(
+        tick_needs_draw(&app, false),
+        "a live thinking spinner still needs tick-driven redraws"
+    );
+    app.thinking = false;
+
+    app.register_run_task("long build");
+    assert!(
+        tick_needs_draw(&app, false),
+        "a running background task keeps elapsed/status animation fresh"
+    );
+}
+
+#[test]
+fn transcript_reflow_repaints_on_rebase_and_shrink_but_not_steady_growth() {
+    // The `MAX_RENDER_ROWS` front-trim FIRST crosses in (prev_cut 0 → cut > 0):
+    // the whole retained window re-based → repaint once on the crossing.
+    assert!(
+        transcript_reflow_needs_repaint(8000, 8000, 0, 50),
+        "the MAX_RENDER_ROWS split re-base forces a repaint"
+    );
+    // Already trimming and the trim merely advances by a row (cut 50 → 51) with
+    // the total capped: the painted tail is identical → NO repaint (no thrash
+    // over a marathon streaming run).
+    assert!(
+        !transcript_reflow_needs_repaint(8000, 8000, 50, 51),
+        "a per-row trim advance past the cap does not thrash the repaint"
+    );
+    // The transcript SHRANK (a fold/collapse toggle, `/compact`, `/clear`, or
+    // the live indicator removed at settle) → repaint (vacated rows below).
+    assert!(
+        transcript_reflow_needs_repaint(500, 480, 0, 0),
+        "a transcript shrink forces a repaint"
+    );
+    // Steady bottom-pinned streaming GROWTH (total climbs, no trim yet) → the
+    // diff paints the new tail cleanly → NO repaint.
+    assert!(
+        !transcript_reflow_needs_repaint(500, 512, 0, 0),
+        "steady streaming growth never forces a repaint"
+    );
+    // A first frame (prev_total 0 → some) is growth, not a shrink → no repaint.
+    assert!(
+        !transcript_reflow_needs_repaint(0, 300, 0, 0),
+        "the first populated frame does not spuriously repaint"
+    );
+}
+
+#[test]
+fn resume_gap_honors_env_override_and_floor() {
+    // Default when unset.
+    let _resume = EnvRestore::remove("UMADEV_RESUME_GAP_SECS");
+    assert_eq!(
+        resume_gap(),
+        Duration::from_secs(5),
+        "default resume gap 5s"
+    );
+    // A valid override is honored.
+    std::env::set_var("UMADEV_RESUME_GAP_SECS", "10");
+    assert_eq!(resume_gap(), Duration::from_secs(10), "resume override 10s");
+    // Garbage is rejected by the `>= 1` floor → falls back to the default,
+    // so a misconfig can't thrash the mode reassert on every keystroke.
+    std::env::set_var("UMADEV_RESUME_GAP_SECS", "nonsense");
+    assert_eq!(
+        resume_gap(),
+        Duration::from_secs(5),
+        "garbage resume gap floors back to the default"
+    );
+}

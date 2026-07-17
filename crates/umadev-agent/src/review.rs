@@ -81,7 +81,7 @@ impl ReviewReport {
 }
 
 /// Workspace-relative path of the review report. The slug is sanitized
-/// (see [`crate::runner::sanitize_slug`]) so a hostile/accidental slug
+/// (using the runner's internal slug sanitizer) so a hostile/accidental slug
 /// (`../x`, `/tmp/x`) can't move the report outside `output/`.
 #[must_use]
 pub fn review_report_rel_path(slug: &str) -> String {

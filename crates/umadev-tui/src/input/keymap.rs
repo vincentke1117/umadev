@@ -12,12 +12,12 @@
 //!
 //! This module is the convergence point:
 //!
-//! - [`char_to_key`] is the single char→key table. The owned decoder consumes
+//! - the internal `char_to_key` function is the single char→key table. The owned decoder consumes
 //!   it directly (its text bytes ARE chars); the legacy path reaches the same
 //!   table through [`normalize_key`].
 //! - [`normalize_key`] folds any *literal control-char* key form a backend may
 //!   surface (`Char('\u{8}')` for Backspace from Windows/ConPTY,
-//!   `Char('\u{3}')` for Ctrl+C, …) through [`char_to_key`], preserving the
+//!   `Char('\u{3}')` for Ctrl+C, …) through that same table, preserving the
 //!   incoming modifiers. It is idempotent, so applying it to an
 //!   already-normalized event is a no-op.
 //! - [`normalize_event`] lifts [`normalize_key`] to whole
@@ -75,7 +75,7 @@ pub(crate) fn char_to_key(c: char) -> KeyEvent {
 /// A backend that surfaces a C0 control byte / DEL as a literal
 /// `KeyCode::Char` (Windows/ConPTY Backspace as `Char('\u{8}')` or
 /// `Char('\u{7f}')`, a raw Ctrl-C as `Char('\u{3}')`, …) is folded through
-/// [`char_to_key`] — the SAME table the owned decoder uses — with the incoming
+/// the internal `char_to_key` function — the SAME table the owned decoder uses — with the incoming
 /// modifiers preserved (so an Alt-prefixed BS/DEL becomes Alt+Backspace on
 /// both paths). Everything else passes through unchanged; a pair that is
 /// already normalized stays fixed (idempotent).

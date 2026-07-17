@@ -270,7 +270,7 @@ pub fn mentions_ui_surface(requirement: &str) -> bool {
 /// "generating a README runs a full review" case. This is deliberately DISTINCT from
 /// [`TaskKind::DocsOnly`], which is a heavyweight PLANNING doc (a PRD / 需求文档 /
 /// 技术方案 / 调研报告 that legitimately earns a PM + architect + designer doc-review):
-/// a README is just a file. Callers still veto on [`has_heavy_signal`] so "a
+/// a README is just a file. Callers still apply the internal heavy-signal veto so "a
 /// readme-generator SaaS platform" (a real product that merely mentions a readme) is
 /// never downgraded. Deterministic + fail-open.
 #[must_use]
@@ -290,10 +290,10 @@ pub fn is_doc_task(requirement: &str) -> bool {
 /// task, NOT a product build, so without this floor a document whose phrasing missed
 /// every narrower keyword would fall to the heavyweight [`TaskKind::Greenfield`] default
 /// (a full 8-seat team building+reviewing a .md — the token-burn bug). Still vetoed by
-/// [`has_heavy_signal`] so "build a docs PLATFORM" (a real product that merely mentions
+/// the internal heavy-signal classifier so "build a docs PLATFORM" (a real product that merely mentions
 /// documents) stays a product. Deterministic + fail-open.
 ///
-/// The [`has_heavy_signal`] veto is baked IN here (unlike the raw [`is_doc_task`]) so
+/// The heavy-signal veto is baked IN here (unlike the raw [`is_doc_task`]) so
 /// every caller — the QC short-circuit, the source-present floor, the TUI team
 /// sizing — agrees that a docs-platform PRODUCT is NOT a document task without each
 /// re-applying the veto.
@@ -836,7 +836,7 @@ fn asks_to_build_new_scope(q: &str) -> bool {
 ///    candidates. [`TaskKind::Greenfield`] / [`TaskKind::BackendOnly`] and the
 ///    lean bug-fix/refactor paths always stay strict.
 /// 2. **Requirement text** — any heavyweight signal (auth / database / payment /
-///    api / backend / dashboard / platform — see [`has_heavy_signal`]) vetoes
+///    api / backend / dashboard / platform — see the internal heavy-signal classifier) vetoes
 ///    the lenient context.
 /// 3. **Architecture doc + produced source** — if the architecture doc declares
 ///    an API surface or data model, or any produced source file carries server
@@ -970,7 +970,7 @@ pub const GOVERNANCE_CONTEXT_REL: &str = ".umadev/governance-context.json";
 /// the first file is written.
 ///
 /// The COLOUR permission is not re-derived here — it is carried forward from whatever the
-/// run door already recorded for this same requirement (see [`stored_color_permission`]).
+/// run door already recorded for this same requirement (see the internal stored-color resolver).
 /// This function runs on every base tool call and has no brain; only
 /// [`persist_project_context_with_color`] may set the permission.
 ///

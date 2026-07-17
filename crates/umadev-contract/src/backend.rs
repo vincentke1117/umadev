@@ -809,7 +809,8 @@ fn paths_align(reg_path: &str, planned_path: &str) -> bool {
 /// prefix appear anywhere in the source" substring check: a frontend `fetch`
 /// call or a comment is not a [`BackendRoute`], so it can no longer satisfy the
 /// endpoint. A registration matches when its method covers the planned verb
-/// (or is a wildcard) and its path aligns (see [`paths_align`]).
+/// (or is a wildcard) and its path aligns according to the crate's
+/// right-aligned template-segment matching rules.
 #[must_use]
 pub fn route_registered(routes: &[BackendRoute], method: HttpVerb, path: &str) -> bool {
     routes
@@ -975,14 +976,25 @@ pub(crate) fn strip_comments_jsts(src: &str) -> String {
 /// vendored / generated dirs; never follows symlinks, matching the frontend
 /// walker's no-follow contract).
 fn collect_backend_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > MAX_DEPTH || out.len() >= MAX_FILES {
+    collect_backend_sources_bounded(dir, out, depth, MAX_FILES);
+}
+
+fn collect_backend_sources_bounded(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    depth: usize,
+    max_files: usize,
+) {
+    if depth > MAX_DEPTH || out.len() >= max_files {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in rd.flatten() {
-        if out.len() >= MAX_FILES {
+    let mut entries = rd.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        if out.len() >= max_files {
             return;
         }
         let p = entry.path();
@@ -997,7 +1009,7 @@ fn collect_backend_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                 continue;
             }
-            collect_backend_sources(&p, out, depth + 1);
+            collect_backend_sources_bounded(&p, out, depth + 1, max_files);
         } else if meta.is_file() {
             let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
             if BACKEND_EXTS.contains(&ext) {
@@ -1010,6 +1022,21 @@ fn collect_backend_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_backend_walk_selects_stable_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for name in ["z.rs", "b.rs", "a.rs"] {
+            std::fs::write(tmp.path().join(name), "fn route() {}\n").unwrap();
+        }
+        let mut files = Vec::new();
+        collect_backend_sources_bounded(tmp.path(), &mut files, 0, 2);
+        let names = files
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["a.rs", "b.rs"]);
+    }
 
     fn paths(routes: &[BackendRoute]) -> Vec<(Option<HttpVerb>, &str)> {
         routes.iter().map(|r| (r.method, r.path.as_str())).collect()

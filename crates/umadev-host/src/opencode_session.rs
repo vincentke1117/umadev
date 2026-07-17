@@ -9,18 +9,21 @@
 //! - spawns `opencode serve --hostname 127.0.0.1 --port 0` **once** as a resident
 //!   HTTP server, scrapes the real bound port from its stdout `listening on
 //!   http://HOST:PORT` line, and talks to it over HTTP for the whole run;
-//! - opens **one** session (`POST /session`) with a wildcard permission ruleset
-//!   so tool calls (file writes / bash) are silently pre-approved — the base
-//!   keeps context across phases and runs its own agentic tool loop (it WRITES
-//!   files), instead of narrating a paragraph and asking "shall I continue?";
+//! - opens **one** session (`POST /session`) with a permission-profile ruleset:
+//!   Auto silently pre-approves tools, Guarded only pre-approves known read-only
+//!   inspection and asks on every other tool, and Plan denies every non-read tool.
+//!   The base keeps context across phases and runs its own agentic tool loop (it
+//!   WRITES files when the selected profile authorizes it), instead of narrating
+//!   a paragraph and asking "shall I continue?";
 //! - subscribes the server-sent-events stream (`GET /event`, long-lived) in a
 //!   background task that parses each `data: {id,type,properties}` frame into a
 //!   [`SessionEvent`](umadev_runtime::SessionEvent);
 //! - injects one **directive per phase** (`POST /session/:id/prompt_async`, the
 //!   same session = context flows);
-//! - exposes the [`BaseSession`] contract the 9-phase runner drives.
+//! - exposes the [`umadev_runtime::BaseSession`] contract the 9-phase runner
+//!   drives.
 //!
-//! ## Wire protocol (verified against opencode source — `opencode-dev/packages`)
+//! ## Wire protocol (verified against the upstream `anomalyco/opencode` source)
 //!
 //! Authoritative references (read directly, not from memory):
 //! - serve + listening line: `packages/opencode/src/cli/cmd/serve.ts`
@@ -31,18 +34,21 @@
 //!   `opencode`.
 //! - directory routing: the `x-opencode-directory` request header / `?directory=`
 //!   query param, in `.../middleware/workspace-routing.ts`.
-//! - routes: `.../groups/session.ts` (`POST /session`, `POST
-//!   /session/:id/prompt_async`, `POST /session/:id/abort`, `DELETE
-//!   /session/:id`) and `.../groups/permission.ts` (`POST
+//! - routes: `.../groups/session.ts` plus `.../handlers/session.ts` (`POST
+//!   /session`, `GET/PATCH /session/:id`,
+//!   `POST /session/:id/prompt_async`, `POST /session/:id/abort`, and the
+//!   destructive `DELETE /session/:id` used only by ephemeral critic forks),
+//!   `.../groups/permission.ts` (`POST
 //!   /permission/:id/reply`). NOTE the deprecated
 //!   `/session/:id/permissions/:id` route — we use the live
-//!   `/permission/.../reply`.
+//!   `/permission/.../reply`; and `.../groups/question.ts` (`POST
+//!   /question/:id/reply|reject`).
 //! - create vs prompt model shapes DIFFER: create's `model` is
 //!   `{id,providerID,variant?}` (`session.ts CreateInput`); prompt's `model` is
 //!   `{providerID,modelID}` (`session/prompt.ts PromptInput` -> `ModelRef`). We
 //!   pass NEITHER by default (the base uses its own configured model) so we can
 //!   never send a malformed shape; an explicit provider/model id is honored.
-//! - SSE framing: `.../handlers/event.ts` —
+//! - SSE framing: `.../groups/event.ts` plus `.../handlers/event.ts` —
 //!   `JSON.stringify({id,type,properties})` per `data:` line; first frame
 //!   `server.connected`, 10s `server.heartbeat`.
 //! - event semantics (mirrors opencode's OWN consumer,
@@ -54,6 +60,8 @@
 //!   - `session.error` -> `properties.error{name,data.message}`.
 //!   - `permission.asked` -> `PermissionV1.Request` fields: `id` (`per...`),
 //!     `permission`, `patterns`. Reply `once`/`always`/`reject`.
+//!   - `question.asked` -> ordered QuestionV1 questions. Answers are arrays of
+//!     selected labels/custom text, one array per question.
 //!   - **turn done** is `session.status` with `properties.status.type=="idle"`.
 //!   - tool-state schema: `packages/core/src/v1/session.ts` (`ToolPart`,
 //!     `ToolState{Pending,Running,Completed,Error}`).
@@ -61,11 +69,15 @@
 //!
 //! ## Fail-open by contract
 //! Server won't start / SSE drops / an HTTP call errors / the session is busy ->
-//! the session surfaces a [`TurnStatus::Failed`] (or `next_event` -> `None`),
+//! the session surfaces a [`umadev_runtime::TurnStatus::Failed`] (or
+//! `next_event` -> `None`),
 //! never a panic. A driver bug must never crash the host.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -73,15 +85,35 @@ use futures::StreamExt as _;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
-use tokio::sync::mpsc;
-use umadev_runtime::{ApprovalDecision, BaseSession, SessionError, SessionEvent, TurnStatus};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use umadev_runtime::{
+    ApprovalDecision, BackgroundTaskSignal, BasePermissionProfile, BaseSession,
+    DeliveryReceiptStage, DeliveryReport, HostAnswer, HostApprovalOption, HostApprovalOptionKind,
+    HostQuestion, HostQuestionKind, HostQuestionOption, HostRequest, HostResponse, InputDelivery,
+    ResumeCapability, SessionCapabilities, SessionError, SessionEvent, SteerSemantics,
+    SubagentVisibility, TurnInput, TurnStatus, Usage,
+};
 
 use crate::spawn_parts;
-use crate::stderr_tail::{drain_stderr_into, StderrTail};
+use crate::stderr_tail::{StderrDrain, StderrTail};
 use crate::{reap_after_kill, END_REAP_BUDGET};
 
 /// How many events the SSE-reader task may buffer ahead of the consumer.
 const EVENT_CHANNEL_CAP: usize = 256;
+const MAX_INPUT_BODY_BYTES: usize = 24 * 1024 * 1024;
+const MAX_SSE_LINE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SSE_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SERVE_STDOUT_LINE_BYTES: usize = 64 * 1024;
+const MAX_TRACKED_MESSAGE_ROLES: usize = 512;
+
+/// Correlate OpenCode's session-scoped SSE status edges with the locally sent
+/// turn. The protocol does not carry a turn id on `session.status`, so an idle
+/// edge is accepted only after this client armed a prompt *and* observed the
+/// official `busy`/`retry` edge for that prompt.
+type TurnSseGate = Arc<AtomicU8>;
+const SSE_TURN_UNARMED: u8 = 0;
+const SSE_TURN_ARMED: u8 = 1;
+const SSE_TURN_ACTIVE: u8 = 2;
 
 /// How long to wait for `opencode serve` to print its `listening on ...` line
 /// before giving up (fail-open: a slow/stuck server start surfaces as a
@@ -108,12 +140,30 @@ pub struct OpenCodeSession {
     /// idle (a bad model / not logged in / a config error opencode prints to
     /// stderr before falling silent).
     stderr: StderrTail,
+    stderr_drain: StderrDrain,
     /// HTTP transport (base url + auth header baked into each call).
     http: HttpCtx,
     /// The opencode session id (`ses_...`) created at `start`.
     session_id: String,
+    /// Explicit provider/model selected for the writer session, when one was
+    /// supplied by UmaDev. Read-only forks reuse it; otherwise they omit the
+    /// field and inherit OpenCode's configured default model.
+    model: Option<String>,
     /// SSE -> normalized event channel, fed by the background reader task.
     events: mpsc::Receiver<SessionEvent>,
+    /// Own the long-lived SSE pump so `end`/`Drop` can stop it deterministically.
+    sse_task: Option<tokio::task::JoinHandle<()>>,
+    /// Writer sessions are persistent OpenCode conversations. Stopping UmaDev
+    /// must never delete their transcript; only explicitly ephemeral critic
+    /// sessions use the destructive cleanup policy.
+    lifecycle: SessionLifecycle,
+    /// Request kind and question ordering retained until a typed host reply is
+    /// encoded back onto OpenCode's permission/question endpoint.
+    pending_interactions: HashMap<String, PendingInteraction>,
+    /// Armed immediately before a successful prompt can produce events. The SSE
+    /// pump consumes it exactly once at the terminal idle/error edge, preventing
+    /// startup or duplicated idle frames from completing a later turn.
+    turn_sse_gate: TurnSseGate,
     /// `true` once a turn directive is in flight and not yet idle. The runner
     /// owns serial discipline (it sends the next directive only after the prior
     /// turn's idle `TurnDone`); this mirrors that state so a caller can cheaply
@@ -123,6 +173,109 @@ pub struct OpenCodeSession {
     turn_active: bool,
 }
 
+/// Whether closing a local `opencode serve` attachment also destroys the
+/// OpenCode conversation. Main writer/resumed sessions are always persistent;
+/// isolated read-only critic forks are intentionally ephemeral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionLifecycle {
+    Persistent,
+    Ephemeral,
+}
+
+impl SessionLifecycle {
+    const fn deletes_session(self) -> bool {
+        matches!(self, Self::Ephemeral)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingInteraction {
+    Permission,
+    Question { question_ids: Vec<String> },
+}
+
+fn remember_interaction(pending: &mut HashMap<String, PendingInteraction>, event: &SessionEvent) {
+    let SessionEvent::HostRequest { req_id, request } = event else {
+        return;
+    };
+    let interaction = match request {
+        HostRequest::Approval { .. } => PendingInteraction::Permission,
+        HostRequest::UserInput { questions, .. } => PendingInteraction::Question {
+            question_ids: questions.iter().map(|q| q.id.clone()).collect(),
+        },
+        _ => return,
+    };
+    pending.insert(req_id.clone(), interaction);
+}
+
+fn ordered_question_answers(
+    question_ids: &[String],
+    answers: Vec<HostAnswer>,
+) -> Option<Vec<Vec<String>>> {
+    let mut by_id = HashMap::with_capacity(answers.len());
+    for answer in answers {
+        if by_id.insert(answer.question_id, answer.values).is_some() {
+            return None;
+        }
+    }
+    if by_id.len() != question_ids.len() {
+        return None;
+    }
+    question_ids
+        .iter()
+        .map(|id| by_id.remove(id))
+        .collect::<Option<Vec<_>>>()
+}
+
+fn permission_reply_for(response: HostResponse) -> &'static str {
+    let HostResponse::Approval {
+        decision,
+        selected_option_id,
+        ..
+    } = response
+    else {
+        return "reject";
+    };
+    match (decision, selected_option_id.as_deref()) {
+        (ApprovalDecision::Allow, None | Some("once")) => "once",
+        (ApprovalDecision::Allow, Some("always")) => "always",
+        // A response whose binary decision conflicts with the selected vendor
+        // option, or carries an unknown option id, must never gain authority.
+        _ => "reject",
+    }
+}
+
+async fn respond_to_interaction(
+    http: &HttpCtx,
+    req_id: &str,
+    interaction: PendingInteraction,
+    response: HostResponse,
+) -> Result<(), SessionError> {
+    match interaction {
+        PendingInteraction::Permission => http
+            .permission_reply(req_id, permission_reply_for(response))
+            .await
+            .map_err(SessionError::Send),
+        PendingInteraction::Question { question_ids } => match response {
+            HostResponse::UserInput { answers } => {
+                let Some(answers) = ordered_question_answers(&question_ids, answers) else {
+                    return http
+                        .question_reject(req_id)
+                        .await
+                        .map_err(SessionError::Send);
+                };
+                http.question_reply(req_id, &answers)
+                    .await
+                    .map_err(SessionError::Send)
+            }
+            _ => http
+                .question_reject(req_id)
+                .await
+                .map_err(SessionError::Send),
+        },
+    }
+}
+
 /// Default per-request timeout for the non-streaming JSON calls (create / prompt
 /// / abort / delete / permission-reply). Without it a local `opencode serve`
 /// that accepts the connection but never responds would hang start / send /
@@ -130,6 +283,231 @@ pub struct OpenCodeSession {
 /// long-lived SSE GET). Fail-open: a timeout surfaces as a clean `Err`, never a
 /// hang.
 const JSON_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// No session may accept its first prompt until the server has accepted the SSE
+/// subscription. Keep that handshake bounded independently from the
+/// intentionally timeout-free long-lived event stream.
+const SSE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// OpenCode's parent `idle` can arrive while task-tool child sessions are still
+/// busy. Keep the reconciliation bounded so an unhealthy local server can never
+/// wedge the host indefinitely.
+const CHILD_SETTLE_TIMEOUT: Duration = Duration::from_secs(300);
+const CHILD_SETTLE_POLL: Duration = Duration::from_millis(250);
+const CHILD_SETTLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const CHILD_SETTLE_MAX_ERRORS: usize = 3;
+const CHILD_TREE_MAX_NODES: usize = 64;
+const CHILD_TREE_MAX_DEPTH: usize = 8;
+
+#[derive(Clone, Copy)]
+struct ChildSettleConfig {
+    timeout: Duration,
+    poll: Duration,
+    request_timeout: Duration,
+    max_errors: usize,
+}
+
+impl Default for ChildSettleConfig {
+    fn default() -> Self {
+        Self {
+            timeout: CHILD_SETTLE_TIMEOUT,
+            poll: CHILD_SETTLE_POLL,
+            request_timeout: CHILD_SETTLE_REQUEST_TIMEOUT,
+            max_errors: CHILD_SETTLE_MAX_ERRORS,
+        }
+    }
+}
+
+/// State shared across all turns on one OpenCode session. Child sessions remain
+/// listed after they finish, so remembering them avoids replaying old lifecycle
+/// edges on every later parent turn.
+#[derive(Default)]
+struct ChildLifecycle {
+    known: BTreeSet<String>,
+    live: BTreeSet<String>,
+    last_level: BTreeSet<String>,
+}
+
+impl ChildLifecycle {
+    /// Prefer the project-wide SSE stream when it exposes child lineage/status;
+    /// the HTTP reconciliation at parent-idle remains the loss-recovery path.
+    fn observe_sse(&mut self, payload: &str, parent_id: &str) -> Vec<SessionEvent> {
+        let Ok(frame) = serde_json::from_str::<Value>(payload) else {
+            return Vec::new();
+        };
+        let kind = frame.get("type").and_then(Value::as_str).unwrap_or("");
+        let props = frame.get("properties").unwrap_or(&Value::Null);
+        let mut children = self.known.clone();
+        let mut statuses = self
+            .live
+            .iter()
+            .cloned()
+            .map(|id| (id, "busy".to_string()))
+            .collect::<BTreeMap<_, _>>();
+        match kind {
+            "session.created" | "session.updated" => {
+                let Some(info) = props.get("info") else {
+                    return Vec::new();
+                };
+                let Some(id) = info.get("id").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                let Some(parent) = info.get("parentID").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                if parent != parent_id && !self.known.contains(parent) {
+                    return Vec::new();
+                }
+                children.insert(id.to_string());
+                statuses.insert(id.to_string(), "busy".to_string());
+            }
+            "session.status" => {
+                let Some(id) = props.get("sessionID").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                if !self.known.contains(id) {
+                    return Vec::new();
+                }
+                match props
+                    .get("status")
+                    .and_then(|status| status.get("type"))
+                    .and_then(Value::as_str)
+                {
+                    Some("busy" | "retry") => {
+                        statuses.insert(id.to_string(), "busy".to_string());
+                    }
+                    Some("idle") => {
+                        statuses.remove(id);
+                    }
+                    _ => return Vec::new(),
+                }
+            }
+            "session.error" => {
+                let Some(id) = props.get("sessionID").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                if !self.known.contains(id) {
+                    return Vec::new();
+                }
+                statuses.remove(id);
+            }
+            "permission.asked" => {
+                let Some(id) = props.get("sessionID").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                return if self.known.contains(id) {
+                    translate_permission(props, id)
+                } else {
+                    Vec::new()
+                };
+            }
+            "question.asked" => {
+                let Some(id) = props.get("sessionID").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                return if self.known.contains(id) {
+                    translate_question(props, id)
+                } else {
+                    Vec::new()
+                };
+            }
+            _ => return Vec::new(),
+        }
+        self.apply_snapshot(children, &statuses)
+    }
+
+    fn apply_snapshot(
+        &mut self,
+        children: BTreeSet<String>,
+        statuses: &BTreeMap<String, String>,
+    ) -> Vec<SessionEvent> {
+        let live = children
+            .iter()
+            .filter(|id| {
+                matches!(
+                    statuses.get(*id).map(String::as_str),
+                    Some("busy" | "retry")
+                )
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut out = Vec::new();
+
+        for id in children.difference(&self.known) {
+            out.push(SessionEvent::BackgroundTask(
+                BackgroundTaskSignal::Started { id: id.clone() },
+            ));
+        }
+        // A child can finish before the first parent-idle reconciliation. Close
+        // that observed lifecycle immediately instead of leaving a stale task.
+        for id in children.difference(&self.known) {
+            if !live.contains(id) {
+                out.push(SessionEvent::BackgroundTask(
+                    BackgroundTaskSignal::Finished { id: id.clone() },
+                ));
+            }
+        }
+        for id in self.live.difference(&live) {
+            out.push(SessionEvent::BackgroundTask(
+                BackgroundTaskSignal::Finished { id: id.clone() },
+            ));
+        }
+        for id in live.difference(&self.live) {
+            if self.known.contains(id) {
+                out.push(SessionEvent::BackgroundTask(
+                    BackgroundTaskSignal::Started { id: id.clone() },
+                ));
+            }
+        }
+        if live != self.last_level {
+            out.push(SessionEvent::BackgroundTask(BackgroundTaskSignal::Live {
+                agent_ids: live.iter().cloned().collect(),
+            }));
+            self.last_level.clone_from(&live);
+        }
+        self.known.extend(children);
+        self.live = live;
+        out
+    }
+
+    fn fail_open_events(&mut self) -> Vec<SessionEvent> {
+        let mut out = self
+            .live
+            .iter()
+            .cloned()
+            .map(|id| SessionEvent::BackgroundTask(BackgroundTaskSignal::Finished { id }))
+            .collect::<Vec<_>>();
+        if !self.last_level.is_empty() {
+            out.push(SessionEvent::BackgroundTask(BackgroundTaskSignal::Live {
+                agent_ids: Vec::new(),
+            }));
+        }
+        self.live.clear();
+        self.last_level.clear();
+        out
+    }
+}
+
+fn parent_turn_is_active(payload: &str, parent_id: &str) -> bool {
+    let Ok(frame) = serde_json::from_str::<Value>(payload) else {
+        return false;
+    };
+    let kind = frame.get("type").and_then(Value::as_str).unwrap_or("");
+    let props = frame.get("properties").unwrap_or(&Value::Null);
+    match kind {
+        "session.status" => {
+            props.get("sessionID").and_then(Value::as_str) == Some(parent_id)
+                && matches!(
+                    props
+                        .get("status")
+                        .and_then(|status| status.get("type"))
+                        .and_then(Value::as_str),
+                    Some("busy" | "retry")
+                )
+        }
+        _ => false,
+    }
+}
 
 /// The HTTP context shared by every call: base url, auth header, project dir.
 #[derive(Clone)]
@@ -150,6 +528,44 @@ struct HttpCtx {
     directory: String,
 }
 
+async fn spawn_serve(
+    program: &str,
+    workspace: &Path,
+    serve_timeout: Duration,
+) -> Result<(Child, StderrTail, StderrDrain, HttpCtx), SessionError> {
+    let password = random_password();
+    let (prog, lead) = spawn_parts(program);
+    let mut cmd = Command::new(prog);
+    cmd.args(&lead);
+    cmd.args(serve_args());
+    cmd.current_dir(workspace);
+    cmd.env("OPENCODE_SERVER_PASSWORD", &password);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = crate::spawn_retrying_etxtbsy(&mut cmd)
+        .map_err(|e| SessionError::Start(spawn_err(program, &e)))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SessionError::Start("opencode serve: no stdout pipe".to_string()))?;
+    let stderr = StderrTail::new();
+    let stderr_drain = child.stderr.take().map_or_else(StderrDrain::empty, |pipe| {
+        StderrDrain::spawn(pipe, stderr.clone())
+    });
+    let base_url = match read_listening_url(stdout, serve_timeout).await {
+        Ok(url) => url,
+        Err(error) => {
+            let _ = child.start_kill();
+            return Err(SessionError::Start(error));
+        }
+    };
+    let http = HttpCtx::new(base_url, &password, workspace);
+    Ok((child, stderr, stderr_drain, http))
+}
+
 impl OpenCodeSession {
     /// Start a session driving the default `opencode` binary
     /// (`UMADEV_OPENCODE_BIN` override honored), serving in `workspace`.
@@ -159,24 +575,26 @@ impl OpenCodeSession {
     /// (`provider/model`); `None` (the default) uses whatever model the base is
     /// already configured with — UmaDev injects no model endpoint of its own.
     ///
-    /// `autonomous` selects the session's permission ruleset, mirroring codex's
-    /// `approvalPolicy` tiering so all three bases behave consistently: `true`
-    /// (the `auto` trust tier) installs a wildcard `allow` ruleset so the agentic
-    /// loop runs silently; `false` (the `guarded` tier) installs a finer ruleset
-    /// that routes writes / dangerous bash through `permission.asked` (→ a
-    /// `NeedApproval` the orchestrator answers), so the guarded human-in-the-loop
-    /// posture is the same on opencode as on codex (`on-request`) and claude
-    /// (`default`). Governance still audits every tool call via the event stream
-    /// regardless of tier.
+    /// The permission profile selects read-only Plan, approval-gated Guarded, or
+    /// pre-authorized Auto rules while governance keeps observing the event stream.
     pub async fn start(
         workspace: &Path,
         agent: Option<&str>,
         model: Option<&str>,
-        autonomous: bool,
+        permissions: BasePermissionProfile,
     ) -> Result<Self, SessionError> {
         let program =
             std::env::var("UMADEV_OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());
-        Self::start_with_program(&program, workspace, agent, model, autonomous).await
+        Self::start_with_program_timeout_profile(
+            &program,
+            workspace,
+            agent,
+            model,
+            permissions,
+            serve_start_timeout(),
+        )
+        .await
+        .map_err(crate::redaction::sanitize_session_error)
     }
 
     /// Start a session against an explicit `program` (mainly for tests, where
@@ -199,6 +617,7 @@ impl OpenCodeSession {
             serve_start_timeout(),
         )
         .await
+        .map_err(crate::redaction::sanitize_session_error)
     }
 
     /// Start with an explicit serve-start `timeout` — the testable core, so a
@@ -212,52 +631,48 @@ impl OpenCodeSession {
         autonomous: bool,
         serve_timeout: Duration,
     ) -> Result<Self, SessionError> {
-        let password = random_password();
-        let (prog, lead) = spawn_parts(program);
-        let mut cmd = Command::new(prog);
-        cmd.args(&lead);
-        cmd.args(serve_args());
-        cmd.current_dir(workspace);
-        // The customer's full environment is inherited UNCHANGED (the base
-        // self-authenticates with its own login) — we ONLY add the server
-        // password so our HTTP calls can authenticate against this private,
-        // loopback-only server. UmaDev injects no model endpoint.
-        cmd.env("OPENCODE_SERVER_PASSWORD", &password);
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.kill_on_drop(true);
-
-        let mut child = crate::spawn_retrying_etxtbsy(&mut cmd)
-            .map_err(|e| SessionError::Start(spawn_err(program, &e)))?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| SessionError::Start("opencode serve: no stdout pipe".to_string()))?;
-        // Drain stderr on its own task (so a noisy server can't stall on a full
-        // pipe) AND capture a bounded tail for idle diagnosis.
-        let stderr_tail = StderrTail::new();
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(drain_stderr_into(stderr, stderr_tail.clone()));
-        }
-
-        // Scrape the real bound base url from the server's stdout (port 0 = the
-        // OS picks the port, so we MUST read it back; cannot assume a port).
-        let base_url = match read_listening_url(stdout, serve_timeout).await {
-            Ok(url) => url,
-            Err(e) => {
-                let _ = child.start_kill();
-                return Err(SessionError::Start(e));
-            }
+        let permissions = if autonomous {
+            BasePermissionProfile::Auto
+        } else {
+            BasePermissionProfile::Guarded
         };
+        Self::start_with_program_timeout_profile(
+            program,
+            workspace,
+            agent,
+            model,
+            permissions,
+            serve_timeout,
+        )
+        .await
+        .map_err(crate::redaction::sanitize_session_error)
+    }
 
-        let http = HttpCtx::new(base_url, &password, workspace);
+    async fn start_with_program_timeout_profile(
+        program: &str,
+        workspace: &Path,
+        agent: Option<&str>,
+        model: Option<&str>,
+        permissions: BasePermissionProfile,
+        serve_timeout: Duration,
+    ) -> Result<Self, SessionError> {
+        // Do not rely on the startup picker having run: configured users and
+        // programmatic callers can open a session directly. The same fail-closed
+        // version boundary as the one-shot driver therefore runs immediately
+        // before `serve`, preventing an affected OpenCode from silently exposing
+        // Plan writes through Task subagents.
+        crate::opencode::probe_safe_opencode_version(program, workspace)
+            .await
+            .map_err(SessionError::Start)?;
+        let (mut child, stderr_tail, stderr_drain, http) =
+            spawn_serve(program, workspace, serve_timeout).await?;
 
-        // Open the one session for the whole run. The ruleset follows the autonomy
-        // tier (`autonomous` → wildcard allow; guarded → writes/dangerous bash ask),
-        // so opencode's gate posture matches codex / claude.
-        let session_id = match http.create_session(agent, model, autonomous).await {
+        // Open the one session for the whole run. The ruleset follows the permission
+        // profile: Auto is wildcard-allow, Guarded is ask-by-default with a narrow
+        // read-only allowlist, and Plan is deny-by-default. This keeps opencode's
+        // gate posture aligned with codex / claude without silently authorizing a
+        // future tool or an MCP-provided mutator.
+        let session_id = match http.create_session_profile(agent, model, permissions).await {
             Ok(id) => id,
             Err(e) => {
                 let _ = child.start_kill();
@@ -265,21 +680,131 @@ impl OpenCodeSession {
             }
         };
 
-        // Subscribe the SSE stream for THIS session id and pump normalized
-        // events into a channel a background task owns.
-        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAP);
-        let stream_http = http.clone();
-        let stream_session = session_id.clone();
-        tokio::spawn(pump_sse(stream_http, stream_session, tx));
+        let (rx, sse_task, turn_sse_gate) = match http.attach_sse(&session_id).await {
+            Ok(attached) => attached,
+            Err(error) => {
+                let _ = child.start_kill();
+                return Err(SessionError::Start(error));
+            }
+        };
 
         Ok(Self {
             child: std::sync::Mutex::new(child),
             stderr: stderr_tail,
+            stderr_drain,
             http,
             session_id,
+            model: model.map(str::to_owned),
             events: rx,
+            sse_task: Some(sse_task),
+            lifecycle: SessionLifecycle::Persistent,
+            pending_interactions: HashMap::new(),
+            turn_sse_gate,
             turn_active: false,
         })
+    }
+
+    /// Re-attach to a persisted OpenCode conversation on a newly spawned
+    /// `opencode serve` process. OpenCode stores sessions outside the resident
+    /// HTTP process, so cross-process resume is a GET + permission refresh +
+    /// fresh SSE subscription, not a new `POST /session`.
+    pub async fn resume(
+        workspace: &Path,
+        model: Option<&str>,
+        session_id: &str,
+        permissions: BasePermissionProfile,
+    ) -> Result<Self, SessionError> {
+        let program =
+            std::env::var("UMADEV_OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());
+        Self::resume_with_program_timeout(
+            &program,
+            workspace,
+            model,
+            session_id,
+            permissions,
+            serve_start_timeout(),
+        )
+        .await
+        .map_err(crate::redaction::sanitize_session_error)
+    }
+
+    /// Testable resume constructor with an explicit serve program and timeout.
+    pub async fn resume_with_program_timeout(
+        program: &str,
+        workspace: &Path,
+        model: Option<&str>,
+        session_id: &str,
+        permissions: BasePermissionProfile,
+        serve_timeout: Duration,
+    ) -> Result<Self, SessionError> {
+        let session_id = session_id.trim();
+        if session_id.is_empty()
+            || !session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(SessionError::Start(
+                "opencode resume requires a valid session id".to_string(),
+            ));
+        }
+        crate::opencode::probe_safe_opencode_version(program, workspace)
+            .await
+            .map_err(SessionError::Start)
+            .map_err(crate::redaction::sanitize_session_error)?;
+
+        let (mut child, stderr, stderr_drain, http) =
+            spawn_serve(program, workspace, serve_timeout)
+                .await
+                .map_err(crate::redaction::sanitize_session_error)?;
+
+        if let Err(error) = http.get_session(session_id).await {
+            let _ = child.start_kill();
+            return Err(crate::redaction::sanitize_session_error(
+                SessionError::Start(format!("resume opencode session `{session_id}`: {error}")),
+            ));
+        }
+        // Always replace the persisted ruleset before attaching the stream.
+        // This is the fail-closed boundary that prevents a prior Auto session's
+        // wildcard allow from surviving a Guarded/Plan resume.
+        if let Err(error) = http.apply_permissions(session_id, permissions).await {
+            let _ = child.start_kill();
+            return Err(crate::redaction::sanitize_session_error(
+                SessionError::Start(format!(
+                    "refresh opencode session permissions `{session_id}`: {error}"
+                )),
+            ));
+        }
+
+        let (rx, sse_task, turn_sse_gate) = match http.attach_sse(session_id).await {
+            Ok(attached) => attached,
+            Err(error) => {
+                let _ = child.start_kill();
+                return Err(crate::redaction::sanitize_session_error(
+                    SessionError::Start(error),
+                ));
+            }
+        };
+        Ok(Self {
+            child: std::sync::Mutex::new(child),
+            stderr,
+            stderr_drain,
+            http,
+            session_id: session_id.to_string(),
+            model: model.map(str::to_owned),
+            events: rx,
+            sse_task: Some(sse_task),
+            lifecycle: SessionLifecycle::Persistent,
+            pending_interactions: HashMap::new(),
+            turn_sse_gate,
+            turn_active: false,
+        })
+    }
+
+    async fn stop_sse(&mut self) {
+        if let Some(task) = self.sse_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     /// The opencode session id this session drives. Exposed for diagnostics.
@@ -297,8 +822,79 @@ impl OpenCodeSession {
     }
 }
 
+impl Drop for OpenCodeSession {
+    fn drop(&mut self) {
+        if let Some(task) = self.sse_task.take() {
+            task.abort();
+        }
+    }
+}
+
+fn opencode_parts(
+    input: &crate::turn_input::PreparedTurnInput,
+) -> Result<(Vec<Value>, Vec<InputDelivery>), SessionError> {
+    let mut parts = Vec::with_capacity(input.blocks.len());
+    let mut deliveries = Vec::with_capacity(input.blocks.len());
+    for (index, block) in input.blocks.iter().enumerate() {
+        match block {
+            crate::turn_input::PreparedBlock::Text(text) => {
+                parts.push(json!({"type":"text", "text":text}));
+            }
+            crate::turn_input::PreparedBlock::Image(attachment)
+            | crate::turn_input::PreparedBlock::File { attachment, .. } => {
+                let uri =
+                    crate::turn_input::file_uri(&attachment.canonical_path, index, block.kind())?;
+                let filename = attachment
+                    .canonical_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("attachment");
+                parts.push(json!({
+                    "type":"file",
+                    "mime":attachment.media_type,
+                    "url":uri,
+                    "filename":filename
+                }));
+            }
+        }
+        deliveries.push(InputDelivery::Native);
+    }
+    Ok((parts, deliveries))
+}
+
+fn acknowledged_delivery_report(
+    prepared: &crate::turn_input::PreparedTurnInput,
+    deliveries: &[InputDelivery],
+    encoded_bytes: usize,
+) -> DeliveryReport {
+    let mut report = prepared.report(deliveries, encoded_bytes);
+    // The documented prompt_async endpoint has returned a successful HTTP
+    // response for this exact request. This proves server acceptance, not that
+    // the model has started or completed processing it.
+    report.receipt = DeliveryReceiptStage::ProtocolAcknowledged;
+    report
+}
+
 #[async_trait]
 impl BaseSession for OpenCodeSession {
+    fn capabilities(&self) -> SessionCapabilities {
+        SessionCapabilities {
+            mid_turn_steer: false,
+            set_model: false,
+            set_mode: false,
+            set_thinking: false,
+            text_input: InputDelivery::Native,
+            image_input: InputDelivery::Native,
+            file_input: InputDelivery::Native,
+            steer: SteerSemantics::Unsupported,
+            resume: ResumeCapability::Native,
+            subagents: SubagentVisibility::AuthoritativeLiveSet,
+            prompt_queue: umadev_runtime::PromptQueueCapability::Unsupported,
+            background_process_control:
+                umadev_runtime::BackgroundProcessControlCapability::Unsupported,
+        }
+    }
+
     async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
         // A read-only critic fork: open a NEW, INDEPENDENT opencode session on
         // the SAME resident server, but with a DENY ruleset so every tool call
@@ -309,20 +905,12 @@ impl BaseSession for OpenCodeSession {
         //
         // Fail-open: a `create_session` failure surfaces as `Start`, which the
         // caller treats exactly like `ForkUnsupported` (degrade, never block).
-        let session_id = self
-            .http
-            .create_readonly_session()
+        self.http
+            .start_readonly_fork(self.model.as_deref())
             .await
-            .map_err(SessionError::Start)?;
-        // Its own SSE subscription, scoped to the fork session id.
-        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAP);
-        tokio::spawn(pump_sse(self.http.clone(), session_id.clone(), tx));
-        Ok(Box::new(OpenCodeForkSession {
-            http: self.http.clone(),
-            session_id,
-            events: rx,
-            turn_active: false,
-        }))
+            .map(|fork| Box::new(fork) as Box<dyn BaseSession>)
+            .map_err(SessionError::Start)
+            .map_err(crate::redaction::sanitize_session_error)
     }
 
     async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
@@ -331,10 +919,20 @@ impl BaseSession for OpenCodeSession {
         // next directive after observing the previous turn's idle TurnDone, so
         // we never hit a `SessionBusyError` here. Fail-open: an HTTP error is a
         // Send error the runner can surface as a failed turn.
+        if self
+            .sse_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(SessionError::Send(
+                "opencode event stream is not running".to_string(),
+            ));
+        }
+        self.turn_sse_gate.store(SSE_TURN_ARMED, Ordering::Release);
         self.turn_active = true;
         let res = self
             .http
-            .prompt_async(&self.session_id, &directive)
+            .prompt_async(&self.session_id, &directive, self.model.as_deref())
             .await
             .map_err(SessionError::Send);
         if res.is_err() {
@@ -342,15 +940,57 @@ impl BaseSession for OpenCodeSession {
             // clear the flag so the state machine stays honest and a later
             // `is_turn_active` / re-drive isn't blocked by a phantom turn.
             self.turn_active = false;
+            self.turn_sse_gate
+                .store(SSE_TURN_UNARMED, Ordering::Release);
         }
-        res
+        res.map_err(crate::redaction::sanitize_session_error)
+    }
+
+    async fn send_input(&mut self, input: TurnInput) -> Result<DeliveryReport, SessionError> {
+        crate::turn_input::ensure_supported(&input, self.capabilities())?;
+        let prepared = crate::turn_input::prepare(input).await?;
+        let (parts, deliveries) = opencode_parts(&prepared)?;
+        if self
+            .sse_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(SessionError::Send(
+                "opencode event stream is not running".to_string(),
+            ));
+        }
+        self.turn_sse_gate.store(SSE_TURN_ARMED, Ordering::Release);
+        self.turn_active = true;
+        let result = self
+            .http
+            .prompt_async_parts(&self.session_id, parts, self.model.as_deref())
+            .await
+            .map_err(SessionError::Send);
+        if result.is_err() {
+            self.turn_active = false;
+            self.turn_sse_gate
+                .store(SSE_TURN_UNARMED, Ordering::Release);
+        }
+        let encoded_bytes = result.map_err(crate::redaction::sanitize_session_error)?;
+        Ok(acknowledged_delivery_report(
+            &prepared,
+            &deliveries,
+            encoded_bytes,
+        ))
     }
 
     async fn next_event(&mut self) -> Option<SessionEvent> {
         // No internal timeout BY DESIGN — the runner owns phase/run budgets and
         // races this against them (then calls `interrupt`). Keep the session a
         // pure relay so a synthetic TurnDone never races a real `idle`.
-        let ev = self.events.recv().await;
+        let ev = self
+            .events
+            .recv()
+            .await
+            .map(crate::redaction::sanitize_session_event);
+        if let Some(event) = ev.as_ref() {
+            remember_interaction(&mut self.pending_interactions, event);
+        }
         if matches!(ev, Some(SessionEvent::TurnDone { .. }) | None) {
             self.turn_active = false;
         }
@@ -362,6 +1002,7 @@ impl BaseSession for OpenCodeSession {
         req_id: &str,
         decision: ApprovalDecision,
     ) -> Result<(), SessionError> {
+        let interaction = self.pending_interactions.remove(req_id);
         // opencode permission reply vocabulary is `once`/`always`/`reject`
         // (`PermissionV1.Reply`). Allow -> `once` (grant just this call); Deny ->
         // `reject`. We never auto-`always` — escalation stays the runner's call.
@@ -369,32 +1010,74 @@ impl BaseSession for OpenCodeSession {
             ApprovalDecision::Allow => "once",
             ApprovalDecision::Deny => "reject",
         };
-        self.http
-            .permission_reply(req_id, reply)
-            .await
-            .map_err(SessionError::Send)
+        let result = if matches!(
+            interaction.as_ref(),
+            Some(PendingInteraction::Question { .. })
+        ) {
+            self.http.question_reject(req_id).await
+        } else {
+            self.http.permission_reply(req_id, reply).await
+        }
+        .map_err(SessionError::Send);
+        if result.is_err() {
+            if let Some(interaction) = interaction {
+                self.pending_interactions
+                    .insert(req_id.to_string(), interaction);
+            }
+        }
+        result.map_err(crate::redaction::sanitize_session_error)
+    }
+
+    async fn respond_host(
+        &mut self,
+        req_id: &str,
+        response: HostResponse,
+    ) -> Result<(), SessionError> {
+        let Some(interaction) = self.pending_interactions.remove(req_id) else {
+            return Err(SessionError::Send(format!(
+                "opencode host response has no pending request `{req_id}`"
+            )));
+        };
+        let retry = interaction.clone();
+        let result = respond_to_interaction(&self.http, req_id, interaction, response).await;
+        if result.is_err() {
+            self.pending_interactions.insert(req_id.to_string(), retry);
+        }
+        result.map_err(crate::redaction::sanitize_session_error)
     }
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
         self.turn_active = false;
+        self.turn_sse_gate
+            .store(SSE_TURN_UNARMED, Ordering::Release);
         self.http
             .abort(&self.session_id)
             .await
             .map_err(SessionError::Send)
+            .map_err(crate::redaction::sanitize_session_error)
     }
 
     async fn end(&mut self) -> Result<(), SessionError> {
-        // Best-effort: delete the session, then kill the resident server AND wait
-        // (bounded) for it to be reaped so no orphan `opencode serve` lingers and
-        // shutdown timing is deterministic. On overrun we fail open to
-        // kill_on_drop. Consistent with claude / codex `end()`.
-        let _ = self.http.delete_session(&self.session_id).await;
+        // A writer conversation is durable OpenCode state. Closing UmaDev only
+        // detaches its SSE stream and stops the resident HTTP process; deleting
+        // here would make cross-process `/continue` impossible.
+        self.stop_sse().await;
+        let _ = self
+            .http
+            .finish_session(&self.session_id, self.lifecycle)
+            .await;
+        self.pending_interactions.clear();
         reap_after_kill(&self.child, END_REAP_BUDGET).await;
+        self.stderr_drain.shutdown().await;
         Ok(())
     }
 
     fn stderr_tail(&self) -> Option<String> {
         self.stderr.snapshot()
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        Some(&self.session_id)
     }
 
     fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
@@ -417,27 +1100,120 @@ pub struct OpenCodeForkSession {
     http: HttpCtx,
     session_id: String,
     events: mpsc::Receiver<SessionEvent>,
+    /// The fork owns its SSE subscription. Keeping the handle makes `end` and
+    /// `Drop` deterministic instead of leaking one pump per intent/review turn.
+    sse_task: Option<tokio::task::JoinHandle<()>>,
+    lifecycle: SessionLifecycle,
+    pending_interactions: HashMap<String, PendingInteraction>,
+    turn_sse_gate: TurnSseGate,
     turn_active: bool,
+}
+
+impl OpenCodeForkSession {
+    async fn stop_sse(&mut self) {
+        if let Some(task) = self.sse_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for OpenCodeForkSession {
+    fn drop(&mut self) {
+        if let Some(task) = self.sse_task.take() {
+            task.abort();
+        }
+    }
 }
 
 #[async_trait]
 impl BaseSession for OpenCodeForkSession {
+    fn capabilities(&self) -> SessionCapabilities {
+        SessionCapabilities {
+            mid_turn_steer: false,
+            set_model: false,
+            set_mode: false,
+            set_thinking: false,
+            text_input: InputDelivery::Native,
+            image_input: InputDelivery::Native,
+            file_input: InputDelivery::Native,
+            steer: SteerSemantics::Unsupported,
+            resume: ResumeCapability::Unsupported,
+            subagents: SubagentVisibility::AuthoritativeLiveSet,
+            prompt_queue: umadev_runtime::PromptQueueCapability::Unsupported,
+            background_process_control:
+                umadev_runtime::BackgroundProcessControlCapability::Unsupported,
+        }
+    }
+
     async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
+        if self
+            .sse_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(SessionError::Send(
+                "opencode fork event stream is not running".to_string(),
+            ));
+        }
+        self.turn_sse_gate.store(SSE_TURN_ARMED, Ordering::Release);
         self.turn_active = true;
         let res = self
             .http
-            .prompt_async(&self.session_id, &directive)
+            .prompt_async(&self.session_id, &directive, None)
             .await
             .map_err(SessionError::Send);
         if res.is_err() {
             // Reset on a failed send so the fork's state machine stays honest.
             self.turn_active = false;
+            self.turn_sse_gate
+                .store(SSE_TURN_UNARMED, Ordering::Release);
         }
-        res
+        res.map_err(crate::redaction::sanitize_session_error)
+    }
+
+    async fn send_input(&mut self, input: TurnInput) -> Result<DeliveryReport, SessionError> {
+        crate::turn_input::ensure_supported(&input, self.capabilities())?;
+        let prepared = crate::turn_input::prepare(input).await?;
+        let (parts, deliveries) = opencode_parts(&prepared)?;
+        if self
+            .sse_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(SessionError::Send(
+                "opencode fork event stream is not running".to_string(),
+            ));
+        }
+        self.turn_sse_gate.store(SSE_TURN_ARMED, Ordering::Release);
+        self.turn_active = true;
+        let result = self
+            .http
+            .prompt_async_parts(&self.session_id, parts, None)
+            .await
+            .map_err(SessionError::Send);
+        if result.is_err() {
+            self.turn_active = false;
+            self.turn_sse_gate
+                .store(SSE_TURN_UNARMED, Ordering::Release);
+        }
+        let encoded_bytes = result.map_err(crate::redaction::sanitize_session_error)?;
+        Ok(acknowledged_delivery_report(
+            &prepared,
+            &deliveries,
+            encoded_bytes,
+        ))
     }
 
     async fn next_event(&mut self) -> Option<SessionEvent> {
-        let ev = self.events.recv().await;
+        let ev = self
+            .events
+            .recv()
+            .await
+            .map(crate::redaction::sanitize_session_event);
+        if let Some(event) = ev.as_ref() {
+            remember_interaction(&mut self.pending_interactions, event);
+        }
         if matches!(ev, Some(SessionEvent::TurnDone { .. }) | None) {
             self.turn_active = false;
         }
@@ -447,33 +1223,75 @@ impl BaseSession for OpenCodeForkSession {
     async fn respond(
         &mut self,
         req_id: &str,
-        decision: ApprovalDecision,
+        _decision: ApprovalDecision,
     ) -> Result<(), SessionError> {
-        // A read-only fork should never need to approve a write, but honor the
-        // contract: Allow→`once`, Deny→`reject` (the deny ruleset means the base
-        // would already have rejected the mutating call).
-        let reply = match decision {
-            ApprovalDecision::Allow => "once",
-            ApprovalDecision::Deny => "reject",
+        let interaction = self.pending_interactions.remove(req_id);
+        // Defense in depth: a read-only fork never turns a permission prompt
+        // into authority. This also rejects a future/unknown or MCP tool if a
+        // server version asks despite the deny-by-default session ruleset.
+        let result = if matches!(
+            interaction.as_ref(),
+            Some(PendingInteraction::Question { .. })
+        ) {
+            self.http.question_reject(req_id).await
+        } else {
+            self.http.permission_reply(req_id, "reject").await
+        }
+        .map_err(SessionError::Send);
+        if result.is_err() {
+            if let Some(interaction) = interaction {
+                self.pending_interactions
+                    .insert(req_id.to_string(), interaction);
+            }
+        }
+        result.map_err(crate::redaction::sanitize_session_error)
+    }
+
+    async fn respond_host(
+        &mut self,
+        req_id: &str,
+        _response: HostResponse,
+    ) -> Result<(), SessionError> {
+        let interaction = self.pending_interactions.remove(req_id);
+        let result = match interaction.as_ref() {
+            Some(PendingInteraction::Question { .. }) => self
+                .http
+                .question_reject(req_id)
+                .await
+                .map_err(SessionError::Send),
+            Some(PendingInteraction::Permission) | None => self
+                .http
+                .permission_reply(req_id, "reject")
+                .await
+                .map_err(SessionError::Send),
         };
-        self.http
-            .permission_reply(req_id, reply)
-            .await
-            .map_err(SessionError::Send)
+        if result.is_err() {
+            if let Some(interaction) = interaction {
+                self.pending_interactions
+                    .insert(req_id.to_string(), interaction);
+            }
+        }
+        result.map_err(crate::redaction::sanitize_session_error)
     }
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
         self.turn_active = false;
+        self.turn_sse_gate
+            .store(SSE_TURN_UNARMED, Ordering::Release);
         self.http
             .abort(&self.session_id)
             .await
             .map_err(SessionError::Send)
+            .map_err(crate::redaction::sanitize_session_error)
     }
 
     async fn end(&mut self) -> Result<(), SessionError> {
-        // Delete ONLY this fork's session — NEVER the shared resident server
-        // (the parent OpenCodeSession owns that child's lifetime).
-        let _ = self.http.delete_session(&self.session_id).await;
+        self.stop_sse().await;
+        let _ = self
+            .http
+            .finish_session(&self.session_id, self.lifecycle)
+            .await;
+        self.pending_interactions.clear();
         Ok(())
     }
 }
@@ -544,19 +1362,28 @@ impl HttpCtx {
     /// (see [`session_ruleset`]). Returns the created `session.id`. The `model`
     /// here, if any, uses CREATE's shape `{id,providerID,variant?}` (distinct from
     /// prompt's `{providerID,modelID}`).
+    #[cfg(test)]
     async fn create_session(
         &self,
         agent: Option<&str>,
         model: Option<&str>,
         autonomous: bool,
     ) -> Result<String, String> {
-        let mut body = json!({
-            // Ruleset: `[{permission,pattern,action}]` (permission.ts Rule). The
-            // tier picks it: autonomous → wildcard allow (silent); guarded →
-            // writes / dangerous bash `ask` (→ `permission.asked`). Governance
-            // still audits every tool call via the event stream regardless.
-            "permission": session_ruleset(autonomous),
-        });
+        let permissions = if autonomous {
+            BasePermissionProfile::Auto
+        } else {
+            BasePermissionProfile::Guarded
+        };
+        self.create_session_profile(agent, model, permissions).await
+    }
+
+    async fn create_session_profile(
+        &self,
+        agent: Option<&str>,
+        model: Option<&str>,
+        permissions: BasePermissionProfile,
+    ) -> Result<String, String> {
+        let mut body = session_permission_payload(permissions);
         if let Some(a) = agent {
             body["agent"] = json!(a);
         }
@@ -583,27 +1410,66 @@ impl HttpCtx {
             .ok_or_else(|| "POST /session: response missing `id`".to_string())
     }
 
-    /// `POST /session` with a READ-ONLY ruleset for a critic fork: allow the
-    /// read/inspect surface (`read`/`grep`/`glob`/`list`/`webfetch`) but DENY every
-    /// MUTATING tool (`edit`/`write`/`bash`) — so the seat can actually READ the
-    /// blackboard it judges while the single-writer invariant still holds. A blanket
-    /// `*/*/deny` (the old form) also rejected reads, leaving the critic unable to open
-    /// the very artifacts it reviews. Also deny `question`/`plan_enter`/`plan_exit` so a
-    /// forked critic can't wedge the read-only session on an unanswerable prompt either.
-    /// More-specific rules win over the `*` allow floor. Returns the created `session.id`.
-    async fn create_readonly_session(&self) -> Result<String, String> {
-        let body = json!({
-            "permission": [
-                { "permission": "*", "pattern": "*", "action": "allow" },
-                { "permission": "edit", "pattern": "*", "action": "deny" },
-                { "permission": "write", "pattern": "*", "action": "deny" },
-                { "permission": "bash", "pattern": "*", "action": "deny" },
-                { "permission": "question", "pattern": "*", "action": "deny" },
-                { "permission": "plan_enter", "pattern": "*", "action": "deny" },
-                { "permission": "plan_exit", "pattern": "*", "action": "deny" },
-            ],
-            "agent": "build",
+    /// Validate that a persisted conversation exists on this newly spawned
+    /// server attachment before we expose a resumed session to the runner.
+    async fn get_session(&self, session_id: &str) -> Result<Value, String> {
+        let resp = self
+            .req(reqwest::Method::GET, &format!("/session/{session_id}"))
+            .send()
+            .await
+            .map_err(|e| format!("GET /session/{session_id}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("GET /session/{session_id}: HTTP {}", resp.status()));
+        }
+        let value: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("GET /session/{session_id} decode: {e}"))?;
+        if value.get("id").and_then(Value::as_str) != Some(session_id) {
+            return Err(format!(
+                "GET /session/{session_id}: response id does not match"
+            ));
+        }
+        Ok(value)
+    }
+
+    /// Replace (not merge) the persisted session ruleset before resume. The
+    /// official PATCH route accepts `permission` as a complete ruleset.
+    async fn apply_permissions(
+        &self,
+        session_id: &str,
+        permissions: BasePermissionProfile,
+    ) -> Result<(), String> {
+        let resp = self
+            .req(reqwest::Method::PATCH, &format!("/session/{session_id}"))
+            .json(&session_permission_payload(permissions))
+            .send()
+            .await
+            .map_err(|e| format!("PATCH /session/{session_id}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "PATCH /session/{session_id}: HTTP {}",
+                resp.status()
+            ));
+        }
+        Ok(())
+    }
+
+    /// `POST /session` with a deny-by-default READ-ONLY ruleset for an
+    /// intent/review fork. Only the local source-inspection tools are allowed;
+    /// `task`, `patch`, shells, unknown future tools and MCP tools therefore all
+    /// remain denied by the wildcard floor.
+    ///
+    /// Reuse an explicitly selected writer model when available. With no
+    /// explicit selection, omit both model and agent so OpenCode applies the
+    /// user's configured defaults instead of UmaDev hard-coding `build`.
+    async fn create_readonly_session(&self, model: Option<&str>) -> Result<String, String> {
+        let mut body = json!({
+            "permission": readonly_session_ruleset(),
         });
+        if let Some((provider, m)) = model.and_then(split_provider_model) {
+            body["model"] = json!({ "id": m, "providerID": provider });
+        }
         let resp = self
             .req(reqwest::Method::POST, "/session")
             .json(&body)
@@ -623,29 +1489,126 @@ impl HttpCtx {
             .ok_or_else(|| "POST /session (fork): response missing `id`".to_string())
     }
 
+    async fn attach_sse(
+        &self,
+        session_id: &str,
+    ) -> Result<
+        (
+            mpsc::Receiver<SessionEvent>,
+            tokio::task::JoinHandle<()>,
+            TurnSseGate,
+        ),
+        String,
+    > {
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let turn_sse_gate: TurnSseGate = Arc::new(AtomicU8::new(SSE_TURN_UNARMED));
+        let task = tokio::spawn(pump_sse_with_ready(
+            self.clone(),
+            session_id.to_string(),
+            tx,
+            Some(ready_tx),
+            Arc::clone(&turn_sse_gate),
+        ));
+        match tokio::time::timeout(SSE_READY_TIMEOUT, ready_rx).await {
+            Ok(Ok(Ok(()))) => Ok((rx, task, turn_sse_gate)),
+            Ok(Ok(Err(error))) => {
+                task.abort();
+                Err(format!("event stream: {error}"))
+            }
+            Ok(Err(_)) => {
+                task.abort();
+                Err("event stream ended before ready".to_string())
+            }
+            Err(_) => {
+                task.abort();
+                Err(format!(
+                    "event stream was not ready within {}s",
+                    SSE_READY_TIMEOUT.as_secs()
+                ))
+            }
+        }
+    }
+
+    /// Create a read-only fork and wait until its independent SSE subscription
+    /// is accepted before returning it to the caller. Without this barrier a
+    /// fast `prompt_async` can complete before the event stream is listening,
+    /// losing the verdict and leaving intent routing to time out.
+    async fn start_readonly_fork(
+        &self,
+        model: Option<&str>,
+    ) -> Result<OpenCodeForkSession, String> {
+        let session_id = self.create_readonly_session(model).await?;
+        match self.attach_sse(&session_id).await {
+            Ok((rx, sse_task, turn_sse_gate)) => Ok(OpenCodeForkSession {
+                http: self.clone(),
+                session_id,
+                events: rx,
+                sse_task: Some(sse_task),
+                lifecycle: SessionLifecycle::Ephemeral,
+                pending_interactions: HashMap::new(),
+                turn_sse_gate,
+                turn_active: false,
+            }),
+            Err(error) => {
+                let _ = self.delete_session(&session_id).await;
+                Err(format!("fork event stream: {error}"))
+            }
+        }
+    }
+
     /// `POST /session/:id/prompt_async` — inject a phase directive. Returns
     /// immediately (NoContent); the work streams over SSE.
-    async fn prompt_async(&self, session_id: &str, directive: &str) -> Result<(), String> {
-        let body = json!({
-            "parts": [{ "type": "text", "text": directive }],
-        });
+    async fn prompt_async(
+        &self,
+        session_id: &str,
+        directive: &str,
+        model: Option<&str>,
+    ) -> Result<(), String> {
+        self.prompt_async_parts(
+            session_id,
+            vec![json!({"type":"text", "text":directive})],
+            model,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn prompt_async_parts(
+        &self,
+        session_id: &str,
+        parts: Vec<Value>,
+        model: Option<&str>,
+    ) -> Result<usize, String> {
+        let mut body = json!({"parts":parts});
+        if let Some((provider, model)) = model.and_then(split_provider_model) {
+            body["model"] = json!({ "providerID": provider, "modelID": model });
+        }
+        let encoded =
+            serde_json::to_vec(&body).map_err(|error| format!("prompt_async: {error}"))?;
+        if encoded.len() > MAX_INPUT_BODY_BYTES {
+            return Err("prompt_async: encoded input exceeds the 24 MiB body limit".to_string());
+        }
+        let encoded_bytes = encoded.len();
         let resp = self
             .req(
                 reqwest::Method::POST,
                 &format!("/session/{session_id}/prompt_async"),
             )
-            .json(&body)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(encoded)
             .send()
             .await
             .map_err(|e| format!("prompt_async: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("prompt_async: HTTP {}", resp.status()));
         }
-        Ok(())
+        Ok(encoded_bytes)
     }
 
     /// `POST /permission/:id/reply {reply}` — answer a `permission.asked`.
     async fn permission_reply(&self, request_id: &str, reply: &str) -> Result<(), String> {
+        let request_id = encode_path_segment(request_id);
         let resp = self
             .req(
                 reqwest::Method::POST,
@@ -657,6 +1620,47 @@ impl HttpCtx {
             .map_err(|e| format!("permission reply: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("permission reply: HTTP {}", resp.status()));
+        }
+        Ok(())
+    }
+
+    /// `POST /question/:id/reply {answers}`. OpenCode expects one array of
+    /// selected labels/custom text per question, in the original order.
+    async fn question_reply(
+        &self,
+        request_id: &str,
+        answers: &[Vec<String>],
+    ) -> Result<(), String> {
+        let request_id = encode_path_segment(request_id);
+        let resp = self
+            .req(
+                reqwest::Method::POST,
+                &format!("/question/{request_id}/reply"),
+            )
+            .json(&json!({ "answers": answers }))
+            .send()
+            .await
+            .map_err(|e| format!("question reply: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("question reply: HTTP {}", resp.status()));
+        }
+        Ok(())
+    }
+
+    /// Explicitly dismiss an unsupported, cancelled, or malformed question so
+    /// the OpenCode turn cannot remain blocked forever.
+    async fn question_reject(&self, request_id: &str) -> Result<(), String> {
+        let request_id = encode_path_segment(request_id);
+        let resp = self
+            .req(
+                reqwest::Method::POST,
+                &format!("/question/{request_id}/reject"),
+            )
+            .send()
+            .await
+            .map_err(|e| format!("question reject: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("question reject: HTTP {}", resp.status()));
         }
         Ok(())
     }
@@ -679,11 +1683,381 @@ impl HttpCtx {
 
     /// `DELETE /session/:id` — best-effort cleanup at `end`.
     async fn delete_session(&self, session_id: &str) -> Result<(), String> {
-        self.req(reqwest::Method::DELETE, &format!("/session/{session_id}"))
+        let resp = self
+            .req(reqwest::Method::DELETE, &format!("/session/{session_id}"))
             .send()
             .await
             .map_err(|e| format!("delete session: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("delete session: HTTP {}", resp.status()));
+        }
         Ok(())
+    }
+
+    async fn finish_session(
+        &self,
+        session_id: &str,
+        lifecycle: SessionLifecycle,
+    ) -> Result<(), String> {
+        if lifecycle.deletes_session() {
+            self.delete_session(session_id).await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Official OpenCode API: direct child sessions created by the task tool.
+    async fn child_sessions(&self, session_id: &str) -> Result<BTreeSet<String>, String> {
+        let resp = self
+            .req(
+                reqwest::Method::GET,
+                &format!("/session/{session_id}/children"),
+            )
+            .send()
+            .await
+            .map_err(|e| format!("children: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("children: HTTP {}", resp.status()));
+        }
+        let value: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("children decode: {e}"))?;
+        let Some(children) = value.as_array() else {
+            return Err("children decode: expected array".to_string());
+        };
+        Ok(children
+            .iter()
+            .filter_map(|child| child.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Bounded breadth-first traversal. OpenCode exposes direct children per
+    /// endpoint; task agents may themselves delegate, so one-level polling can
+    /// miss a live grandchild when its SSE creation edge was lost.
+    async fn child_session_tree(&self, root_id: &str) -> Result<BTreeSet<String>, String> {
+        let mut found = BTreeSet::new();
+        let mut visited = BTreeSet::from([root_id.to_string()]);
+        let mut frontier = vec![(root_id.to_string(), 0usize)];
+        while let Some((parent, depth)) = frontier.pop() {
+            let children = self.child_sessions(&parent).await?;
+            if depth >= CHILD_TREE_MAX_DEPTH && !children.is_empty() {
+                return Err(format!(
+                    "child session tree exceeds depth cap {CHILD_TREE_MAX_DEPTH}"
+                ));
+            }
+            for child in children {
+                if visited.insert(child.clone()) {
+                    found.insert(child.clone());
+                    if found.len() > CHILD_TREE_MAX_NODES {
+                        return Err(format!(
+                            "child session tree exceeds node cap {CHILD_TREE_MAX_NODES}"
+                        ));
+                    }
+                    frontier.push((child, depth + 1));
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// Official OpenCode API: map of currently non-idle session statuses. The
+    /// server removes idle sessions from this map, so a listed child absent from
+    /// the map is terminal/idle.
+    async fn session_statuses(&self) -> Result<BTreeMap<String, String>, String> {
+        let resp = self
+            .req(reqwest::Method::GET, "/session/status")
+            .send()
+            .await
+            .map_err(|e| format!("session status: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("session status: HTTP {}", resp.status()));
+        }
+        let value: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("session status decode: {e}"))?;
+        let Some(statuses) = value.as_object() else {
+            return Err("session status decode: expected object".to_string());
+        };
+        Ok(statuses
+            .iter()
+            .filter_map(|(id, status)| {
+                status
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|kind| (id.clone(), kind.to_string()))
+            })
+            .collect())
+    }
+}
+
+async fn send_event(tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) -> bool {
+    tx.send(crate::redaction::sanitize_session_event(event))
+        .await
+        .is_ok()
+}
+
+fn failed_turn(reason: impl Into<String>) -> SessionEvent {
+    SessionEvent::TurnDone {
+        status: TurnStatus::Failed(reason.into()),
+        usage: None,
+    }
+}
+
+async fn send_events(tx: &mpsc::Sender<SessionEvent>, events: Vec<SessionEvent>) -> bool {
+    for event in events {
+        if !send_event(tx, event).await {
+            return false;
+        }
+    }
+    true
+}
+
+async fn forward_open_code_events(
+    http: &HttpCtx,
+    session_id: &str,
+    tx: &mpsc::Sender<SessionEvent>,
+    lifecycle: &Arc<Mutex<ChildLifecycle>>,
+    settle_state: &Arc<AtomicU8>,
+    turn_sse_gate: &TurnSseGate,
+    events: Vec<SessionEvent>,
+) -> bool {
+    for event in events {
+        if !terminal_event_belongs_to_armed_turn(&event, turn_sse_gate) {
+            // An initial, duplicated, or delayed terminal edge is not evidence
+            // that the currently displayed turn completed.
+            continue;
+        }
+        match event {
+            SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                usage,
+            } => {
+                if settle_state
+                    .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    let http = http.clone();
+                    let session_id = session_id.to_string();
+                    let tx = tx.clone();
+                    let lifecycle = lifecycle.clone();
+                    let settle_state = settle_state.clone();
+                    tokio::spawn(async move {
+                        let result = settle_children(
+                            &http,
+                            &session_id,
+                            &tx,
+                            &lifecycle,
+                            ChildSettleConfig::default(),
+                        )
+                        .await;
+                        if settle_state
+                            .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let status = match result {
+                            Ok(()) => TurnStatus::Completed,
+                            Err(error) => {
+                                tracing::warn!(target: "opencode_session", "{error}");
+                                let events = lifecycle.lock().await.fail_open_events();
+                                if !send_events(&tx, events).await {
+                                    return;
+                                }
+                                TurnStatus::Failed(error)
+                            }
+                        };
+                        let _ = send_event(&tx, SessionEvent::TurnDone { status, usage }).await;
+                    });
+                }
+            }
+            event => {
+                if matches!(event, SessionEvent::TurnDone { .. }) {
+                    settle_state.store(2, Ordering::SeqCst);
+                }
+                if !send_event(tx, event).await {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn terminal_event_belongs_to_armed_turn(event: &SessionEvent, gate: &TurnSseGate) -> bool {
+    match event {
+        // An idle status is session-scoped rather than turn-scoped. Requiring
+        // the preceding busy/retry edge prevents an initial or delayed idle
+        // from completing a newly armed turn. A premature idle leaves the gate
+        // armed so the real busy -> idle sequence can still complete it.
+        SessionEvent::TurnDone {
+            status: TurnStatus::Completed,
+            ..
+        } => gate
+            .compare_exchange(
+                SSE_TURN_ACTIVE,
+                SSE_TURN_UNARMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok(),
+        // A session.error is already an explicit failure for this session. It
+        // may precede the busy edge, so accept it for either armed state while
+        // still rejecting errors arriving with no locally outstanding prompt.
+        SessionEvent::TurnDone { .. } => {
+            gate.swap(SSE_TURN_UNARMED, Ordering::AcqRel) != SSE_TURN_UNARMED
+        }
+        _ => true,
+    }
+}
+
+/// Reconcile task-tool child sessions after the parent reports `idle`. Polling
+/// runs in a detached task while the SSE pump keeps forwarding approvals/events.
+/// Requests and total duration are bounded. Completion is honest: all children
+/// must be idle, or the turn ends Failed instead of hanging.
+async fn settle_children(
+    http: &HttpCtx,
+    parent_id: &str,
+    tx: &mpsc::Sender<SessionEvent>,
+    lifecycle: &Arc<Mutex<ChildLifecycle>>,
+    cfg: ChildSettleConfig,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + cfg.timeout;
+    let mut errors = 0usize;
+    loop {
+        let snapshot = tokio::time::timeout(cfg.request_timeout, async {
+            tokio::join!(http.child_session_tree(parent_id), http.session_statuses())
+        })
+        .await;
+        match snapshot {
+            Ok((Ok(mut children), Ok(statuses))) => {
+                errors = 0;
+                // Direct `/children` is authoritative for the first level. SSE
+                // can additionally reveal nested descendants; keep any such
+                // known session while the status endpoint still marks it live.
+                let (events, settled) = {
+                    let mut lifecycle = lifecycle.lock().await;
+                    children.extend(
+                        lifecycle
+                            .known
+                            .iter()
+                            .filter(|id| {
+                                matches!(
+                                    statuses.get(*id).map(String::as_str),
+                                    Some("busy" | "retry")
+                                )
+                            })
+                            .cloned(),
+                    );
+                    let events = lifecycle.apply_snapshot(children, &statuses);
+                    (events, lifecycle.live.is_empty())
+                };
+                if !send_events(tx, events).await {
+                    return Ok(());
+                }
+                if settled {
+                    return Ok(());
+                }
+            }
+            Ok((children, statuses)) => {
+                errors += 1;
+                if errors >= cfg.max_errors.max(1) {
+                    return Err(format!(
+                        "opencode child-session reconciliation failed: children={:?}; status={:?}",
+                        children.err(),
+                        statuses.err()
+                    ));
+                }
+            }
+            Err(_) => {
+                errors += 1;
+                if errors >= cfg.max_errors.max(1) {
+                    return Err("opencode child-session reconciliation timed out".to_string());
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "opencode child sessions did not settle within {}s",
+                cfg.timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(cfg.poll).await;
+    }
+}
+
+/// Incremental SSE decoder with independent line and logical-frame ceilings.
+/// HTTP chunks may split anywhere (including in CRLF and UTF-8), so framing is
+/// byte-based and text is decoded only after LF. Unknown SSE fields are ignored.
+struct BoundedSseDecoder {
+    line: Vec<u8>,
+    data_lines: Vec<String>,
+    frame_bytes: usize,
+    max_line_bytes: usize,
+    max_frame_bytes: usize,
+}
+
+impl Default for BoundedSseDecoder {
+    fn default() -> Self {
+        Self {
+            line: Vec::new(),
+            data_lines: Vec::new(),
+            frame_bytes: 0,
+            max_line_bytes: MAX_SSE_LINE_BYTES,
+            max_frame_bytes: MAX_SSE_FRAME_BYTES,
+        }
+    }
+}
+
+impl BoundedSseDecoder {
+    #[cfg(test)]
+    fn with_limits(max_line_bytes: usize, max_frame_bytes: usize) -> Self {
+        Self {
+            max_line_bytes,
+            max_frame_bytes,
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
+        let mut payloads = Vec::new();
+        for byte in chunk {
+            if self.line.len() >= self.max_line_bytes {
+                return Err("opencode SSE line exceeded the 32 MiB safety limit".to_string());
+            }
+            self.line.push(*byte);
+            if *byte != b'\n' {
+                continue;
+            }
+            let line_bytes = std::mem::take(&mut self.line);
+            let line = String::from_utf8_lossy(&line_bytes);
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                if !self.data_lines.is_empty() {
+                    payloads.push(self.data_lines.join("\n"));
+                    self.data_lines.clear();
+                    self.frame_bytes = 0;
+                }
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                let data = rest.strip_prefix(' ').unwrap_or(rest);
+                let separator = usize::from(!self.data_lines.is_empty());
+                self.frame_bytes = self
+                    .frame_bytes
+                    .checked_add(separator)
+                    .and_then(|bytes| bytes.checked_add(data.len()))
+                    .ok_or_else(|| "opencode SSE frame size overflow".to_string())?;
+                if self.frame_bytes > self.max_frame_bytes {
+                    return Err(
+                        "opencode SSE data frame exceeded the 32 MiB safety limit".to_string()
+                    );
+                }
+                self.data_lines.push(data.to_string());
+            }
+        }
+        Ok(payloads)
     }
 }
 
@@ -691,7 +2065,29 @@ impl HttpCtx {
 /// into `tx` forever. On stream end / error (the server died or the connection
 /// dropped) emit a terminal `Failed` so a mid-turn drop surfaces as
 /// `TurnDone{Failed}` rather than a silent hang. Fail-open throughout.
+#[cfg(test)]
 async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEvent>) {
+    pump_sse_with_ready(
+        http,
+        session_id,
+        tx,
+        None,
+        Arc::new(AtomicU8::new(SSE_TURN_ACTIVE)),
+    )
+    .await;
+}
+
+/// SSE pump core with an optional one-shot subscription barrier. The ready
+/// signal fires only after OpenCode accepted the event-stream request and sent
+/// successful response headers; failure is reported through both the barrier
+/// and the normal terminal session event.
+async fn pump_sse_with_ready(
+    http: HttpCtx,
+    session_id: String,
+    tx: mpsc::Sender<SessionEvent>,
+    mut ready: Option<oneshot::Sender<Result<(), String>>>,
+    turn_sse_gate: TurnSseGate,
+) {
     // Loopback-only: `base_url` is the address WE scraped from our OWN
     // `opencode serve` child's stdout (always 127.0.0.1) — not attacker input.
     let url = format!("{}/event?directory={}", http.base_url, http.directory);
@@ -706,75 +2102,108 @@ async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEve
     let resp = match resp {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
-            let _ = tx
-                .send(SessionEvent::TurnDone {
-                    status: TurnStatus::Failed(format!("event stream: HTTP {}", r.status())),
-                    // opencode's SSE carries no token usage → always None; the
-                    // consumer estimates (chars/4) so `/usage` stays honest (F3).
-                    usage: None,
-                })
-                .await;
+            let error = format!("event stream: HTTP {}", r.status());
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err(error.clone()));
+            }
+            let _ = send_event(&tx, failed_turn(error)).await;
             return;
         }
         Err(e) => {
-            let _ = tx
-                .send(SessionEvent::TurnDone {
-                    status: TurnStatus::Failed(format!("event stream connect: {e}")),
-                    usage: None,
-                })
-                .await;
+            let error = format!("event stream connect: {e}");
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err(error.clone()));
+            }
+            let _ = send_event(&tx, failed_turn(error)).await;
             return;
         }
     };
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Ok(()));
+    }
 
     // SSE framing: lines `event: ...` / `data: ...`, frames separated by a blank
     // line (handlers/event.ts encodes `JSON.stringify(payload)` per data line).
     // Accumulate `data:` lines until a blank line, then parse one frame.
     let mut byte_stream = resp.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    let mut data_lines: Vec<String> = Vec::new();
+    let mut decoder = BoundedSseDecoder::default();
     // Per-part streaming state (text suffix lengths + which tools already emitted a
     // ToolCall), so a cumulative text update forwards only its new suffix and a
     // tool that skipped its `running` frame still gets a back-filled ToolCall (F6).
     // Lives for the whole subscription.
     let mut tracker = PartTracker::default();
+    let child_lifecycle = Arc::new(Mutex::new(ChildLifecycle::default()));
+    // 0 = active/ready for idle, 1 = child reconciliation in flight, 2 = one
+    // terminal boundary already won. Parent activity resets it for the next turn.
+    let settle_state = Arc::new(AtomicU8::new(0));
     while let Some(chunk) = byte_stream.next().await {
         let Ok(bytes) = chunk else {
             break; // stream error -> fall through to terminal Failed
         };
-        buf.extend_from_slice(&bytes);
-        // Drain complete lines (split on '\n'; tolerate '\r\n').
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line_bytes);
-            let line = line.trim_end_matches(['\r', '\n']);
-            if line.is_empty() {
-                // Frame boundary: parse the accumulated data payload.
-                if !data_lines.is_empty() {
-                    let payload = data_lines.join("\n");
-                    data_lines.clear();
-                    for ev in translate_frame_tracked(&payload, &session_id, &mut tracker) {
-                        if tx.send(ev).await.is_err() {
-                            return; // consumer dropped
-                        }
-                        // NOTE: keep streaming after an idle TurnDone — the SAME
-                        // subscription serves every phase's turn (one long GET).
-                    }
+        let payloads = match decoder.push(&bytes) {
+            Ok(payloads) => payloads,
+            Err(error) => {
+                if turn_sse_gate.swap(SSE_TURN_UNARMED, Ordering::AcqRel) != SSE_TURN_UNARMED {
+                    let _ = send_event(&tx, failed_turn(error)).await;
                 }
-            } else if let Some(rest) = line.strip_prefix("data:") {
-                data_lines.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+                return;
             }
-            // `event:` / `id:` / `:`-comment lines are ignored — `type` lives
-            // inside the JSON payload, not the SSE `event:` field.
+        };
+        for payload in payloads {
+            if parent_turn_is_active(&payload, &session_id) {
+                if turn_sse_gate
+                    .compare_exchange(
+                        SSE_TURN_ARMED,
+                        SSE_TURN_ACTIVE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    // A fresh official busy/retry edge is the exact boundary at
+                    // which usage from the previous prompt must become
+                    // unreachable. Duplicate retry/busy frames do not reset an
+                    // already-active turn.
+                    tracker.begin_turn();
+                }
+                settle_state.store(0, Ordering::SeqCst);
+            }
+            let child_events = child_lifecycle
+                .lock()
+                .await
+                .observe_sse(&payload, &session_id);
+            if !send_events(&tx, child_events).await {
+                return;
+            }
+            let capture_usage = turn_sse_gate.load(Ordering::Acquire) == SSE_TURN_ACTIVE;
+            let events = translate_frame_tracked_for_turn(
+                &payload,
+                &session_id,
+                &mut tracker,
+                capture_usage,
+            );
+            if !forward_open_code_events(
+                &http,
+                &session_id,
+                &tx,
+                &child_lifecycle,
+                &settle_state,
+                &turn_sse_gate,
+                events,
+            )
+            .await
+            {
+                return;
+            }
+            // Keep streaming after a settled TurnDone — the SAME
+            // subscription serves every phase's turn (one long GET).
         }
     }
     // Stream ended / errored -> terminal failure so the runner never hangs.
-    let _ = tx
-        .send(SessionEvent::TurnDone {
-            status: TurnStatus::Failed("event stream ended".to_string()),
-            usage: None,
-        })
-        .await;
+    settle_state.store(2, Ordering::SeqCst);
+    if turn_sse_gate.swap(SSE_TURN_UNARMED, Ordering::AcqRel) != SSE_TURN_UNARMED {
+        let _ = send_event(&tx, failed_turn("event stream ended")).await;
+    }
 }
 
 /// Per-subscription state the streaming pump threads across SSE frames.
@@ -788,8 +2217,158 @@ async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEve
 #[derive(Default)]
 pub struct PartTracker {
     text_lens: std::collections::HashMap<String, usize>,
+    reasoning_lens: std::collections::HashMap<String, usize>,
     tools_called: std::collections::HashSet<String>,
+    /// Tool part ids whose terminal result was already emitted. OpenCode may
+    /// replay the same completed/error SSE frame; without this guard one real
+    /// execution became multiple pitfall episodes downstream.
+    tools_finished: std::collections::HashSet<String>,
     session_model: Option<String>,
+    /// Authoritative `message.updated.info.role` keyed by message id. OpenCode
+    /// publishes the just-submitted user message through the same
+    /// `message.part.updated` stream as assistant output, so text without an
+    /// assistant role must never become [`SessionEvent::TextDelta`].
+    message_roles: HashMap<String, OpenCodeMessageRole>,
+    message_role_order: VecDeque<String>,
+    /// Latest exact usage for every assistant message in the current locally
+    /// armed turn. OpenCode resends `message.updated` as tokens grow; replacing
+    /// by message id avoids double-counting, while summing distinct assistant
+    /// messages includes tool-continuation model calls in the same turn.
+    assistant_usage: HashMap<String, Usage>,
+}
+
+impl PartTracker {
+    fn begin_turn(&mut self) {
+        self.assistant_usage.clear();
+    }
+
+    fn observe_message_role(&mut self, props: &Value, session_id: &str) {
+        if props.get("sessionID").and_then(Value::as_str) != Some(session_id) {
+            return;
+        }
+        let Some(info) = props.get("info") else {
+            return;
+        };
+        if info.get("sessionID").and_then(Value::as_str) != Some(session_id) {
+            return;
+        }
+        let Some(message_id) = info
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let role = match info.get("role").and_then(Value::as_str) {
+            Some("assistant") => OpenCodeMessageRole::Assistant,
+            Some("user") => OpenCodeMessageRole::User,
+            _ => return,
+        };
+        if self
+            .message_roles
+            .insert(message_id.to_string(), role)
+            .is_none()
+        {
+            self.message_role_order.push_back(message_id.to_string());
+        }
+        while self.message_role_order.len() > MAX_TRACKED_MESSAGE_ROLES {
+            if let Some(expired) = self.message_role_order.pop_front() {
+                self.message_roles.remove(&expired);
+            }
+        }
+    }
+
+    fn text_part_is_assistant(&self, part: &Value) -> bool {
+        let Some(message_id) = part
+            .get("messageID")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            // Compatibility for old recorded frames that predate message ids.
+            return true;
+        };
+        matches!(
+            self.message_roles.get(message_id),
+            Some(OpenCodeMessageRole::Assistant)
+        )
+    }
+
+    fn observe_message_usage(&mut self, props: &Value, session_id: &str) {
+        if props.get("sessionID").and_then(Value::as_str) != Some(session_id) {
+            return;
+        }
+        let Some(info) = props.get("info") else {
+            return;
+        };
+        if info.get("sessionID").and_then(Value::as_str) != Some(session_id)
+            || info.get("role").and_then(Value::as_str) != Some("assistant")
+        {
+            return;
+        }
+        let Some(message_id) = info
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let Some(usage) = info.get("tokens").and_then(parse_opencode_usage) else {
+            return;
+        };
+        self.assistant_usage.insert(message_id.to_string(), usage);
+    }
+
+    fn take_turn_usage(&mut self) -> Option<Usage> {
+        if self.assistant_usage.is_empty() {
+            return None;
+        }
+        let usage = self
+            .assistant_usage
+            .values()
+            .copied()
+            .reduce(Usage::merge)?;
+        self.assistant_usage.clear();
+        Some(usage)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeMessageRole {
+    User,
+    Assistant,
+}
+
+/// Parse the official assistant `info.tokens` shape. Cache reads/writes are
+/// consumed input and reasoning is generated output, matching the accounting
+/// convention used by the other four base drivers. A partial, negative,
+/// fractional, or otherwise malformed shape is ignored rather than replacing a
+/// previously valid update for that assistant message.
+fn parse_opencode_usage(tokens: &Value) -> Option<Usage> {
+    let component = |value: Option<&Value>| value?.as_u64();
+    let uncached_input = component(tokens.get("input"))?;
+    let plain_output = component(tokens.get("output"))?;
+    let reasoning_tokens = component(tokens.get("reasoning"))?;
+    let cached_read_tokens = component(tokens.pointer("/cache/read"))?;
+    let cached_write_tokens = component(tokens.pointer("/cache/write"))?;
+    let input_tokens = uncached_input
+        .checked_add(cached_read_tokens)?
+        .checked_add(cached_write_tokens)?;
+    let output_tokens = plain_output.checked_add(reasoning_tokens)?;
+    let total_tokens = input_tokens.checked_add(output_tokens)?;
+    if let Some(wire_total) = tokens.get("total") {
+        if wire_total.as_u64()? != total_tokens {
+            return None;
+        }
+    }
+    Some(Usage {
+        cached_read_tokens,
+        cached_write_tokens,
+        reasoning_tokens,
+        ..Usage::exact(input_tokens, output_tokens)
+    })
 }
 
 /// Translate one SSE frame's JSON payload (`{id,type,properties}`) into zero or
@@ -814,16 +2393,45 @@ pub fn translate_frame_tracked(
     session_id: &str,
     tracker: &mut PartTracker,
 ) -> Vec<SessionEvent> {
+    translate_frame_tracked_for_turn(payload, session_id, tracker, true)
+}
+
+fn translate_frame_tracked_for_turn(
+    payload: &str,
+    session_id: &str,
+    tracker: &mut PartTracker,
+    capture_usage: bool,
+) -> Vec<SessionEvent> {
+    translate_frame_tracked_raw(payload, session_id, tracker, capture_usage)
+        .into_iter()
+        .map(crate::redaction::sanitize_session_event)
+        .collect()
+}
+
+fn translate_frame_tracked_raw(
+    payload: &str,
+    session_id: &str,
+    tracker: &mut PartTracker,
+    capture_usage: bool,
+) -> Vec<SessionEvent> {
     let Ok(v) = serde_json::from_str::<Value>(payload) else {
         return Vec::new();
     };
     let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
     let props = v.get("properties").cloned().unwrap_or(Value::Null);
     match kind {
+        "message.updated" => {
+            tracker.observe_message_role(&props, session_id);
+            if capture_usage {
+                tracker.observe_message_usage(&props, session_id);
+            }
+            Vec::new()
+        }
         "message.part.updated" => translate_part(&props, session_id, tracker),
-        "session.error" => translate_error(&props, session_id),
+        "session.error" => translate_error(&props, session_id, tracker),
         "permission.asked" => translate_permission(&props, session_id),
-        "session.status" => translate_status(&props, session_id),
+        "question.asked" => translate_question(&props, session_id),
+        "session.status" => translate_status(&props, session_id, tracker),
         "session.created" | "session.updated" => {
             translate_session_model(&props, session_id, tracker)
         }
@@ -943,7 +2551,16 @@ fn translate_part(props: &Value, session_id: &str, tracker: &mut PartTracker) ->
     }
     match part.get("type").and_then(Value::as_str) {
         Some("tool") => translate_tool_part(part, tracker),
-        Some("text") => {
+        Some("text" | "reasoning") => {
+            // The global SSE stream repeats the user's submitted message as a
+            // text part. Only an explicitly assistant-attributed message may be
+            // projected into the assistant transcript. A modern part with an
+            // unknown role is withheld rather than risking a user→assistant
+            // attribution error; legacy parts without messageID retain their
+            // historical behavior.
+            if !tracker.text_part_is_assistant(part) {
+                return Vec::new();
+            }
             let Some(full) = part
                 .get("text")
                 .and_then(Value::as_str)
@@ -960,7 +2577,13 @@ fn translate_part(props: &Value, session_id: &str, tracker: &mut PartTracker) ->
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let prev = tracker.text_lens.get(&id).copied().unwrap_or(0);
+            let reasoning = part.get("type").and_then(Value::as_str) == Some("reasoning");
+            let lengths = if reasoning {
+                &mut tracker.reasoning_lens
+            } else {
+                &mut tracker.text_lens
+            };
+            let prev = lengths.get(&id).copied().unwrap_or(0);
             // Cumulative growth → suffix; a non-monotonic / replaced part (shorter,
             // or `prev` not a char boundary) re-emits the whole current text.
             let suffix = if full.len() >= prev && full.is_char_boundary(prev) {
@@ -968,9 +2591,11 @@ fn translate_part(props: &Value, session_id: &str, tracker: &mut PartTracker) ->
             } else {
                 full
             };
-            tracker.text_lens.insert(id, full.len());
+            lengths.insert(id, full.len());
             if suffix.is_empty() {
                 Vec::new()
+            } else if reasoning {
+                vec![SessionEvent::ThinkingDelta(suffix.to_string())]
             } else {
                 vec![SessionEvent::TextDelta(suffix.to_string())]
             }
@@ -991,6 +2616,28 @@ fn translate_part(props: &Value, session_id: &str, tracker: &mut PartTracker) ->
 /// emitted a `ToolCall` and we have a usable input, we BACK-FILL the `ToolCall`
 /// (normalized name + input) before the `ToolResult`. The `tools_called` set keeps
 /// the normal `running → completed` path from double-emitting.
+fn opencode_tool_call_event(call_id: Option<&str>, name: String, input: Value) -> SessionEvent {
+    match call_id.filter(|id| !id.is_empty()) {
+        Some(call_id) => SessionEvent::ToolCallCorrelated {
+            call_id: call_id.to_string(),
+            name,
+            input,
+        },
+        None => SessionEvent::ToolCall { name, input },
+    }
+}
+
+fn opencode_tool_result_event(call_id: Option<&str>, ok: bool, summary: String) -> SessionEvent {
+    match call_id.filter(|id| !id.is_empty()) {
+        Some(call_id) => SessionEvent::ToolResultCorrelated {
+            call_id: call_id.to_string(),
+            ok,
+            summary,
+        },
+        None => SessionEvent::ToolResult { ok, summary },
+    }
+}
+
 fn translate_tool_part(part: &Value, tracker: &mut PartTracker) -> Vec<SessionEvent> {
     // Normalize opencode's tool shape to the claude-shaped names + input keys the
     // agent-side consumers (diff card, audit, governance, tool-row detail)
@@ -1001,21 +2648,23 @@ fn translate_tool_part(part: &Value, tracker: &mut PartTracker) -> Vec<SessionEv
     let state = part.get("state").cloned().unwrap_or(Value::Null);
     let status = state.get("status").and_then(Value::as_str).unwrap_or("");
     let input = normalize_tool_input(state.get("input").cloned().unwrap_or(Value::Null));
-    // A stable id for THIS tool part so back-fill is per-part (fail-open to the
-    // call id, else the empty string → a single anonymous part, still correct for
-    // the common single-tool frame).
-    let part_id = part
+    let vendor_part_id = part
         .get("id")
-        .or_else(|| part.get("callID"))
         .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    // Tracking may fall back to callID for old frames, but only the official
+    // part.id is exposed as the cross-component correlation id.
+    let tracking_id = vendor_part_id
+        .or_else(|| part.get("callID").and_then(Value::as_str))
         .unwrap_or("")
         .to_string();
+    let call_id = vendor_part_id;
     match status {
         // running = the tool actually started (input now finalized) — the ToolCall
         // truth. Mark the part so a later `completed` doesn't re-emit it.
         "running" => {
-            tracker.tools_called.insert(part_id);
-            vec![SessionEvent::ToolCall { name, input }]
+            tracker.tools_called.insert(tracking_id);
+            vec![opencode_tool_call_event(call_id, name, input)]
         }
         "completed" => {
             // The cap widens to the full captured output when the user opts into
@@ -1033,10 +2682,11 @@ fn translate_tool_part(part: &Value, tracker: &mut PartTracker) -> Vec<SessionEv
                 crate::process_logs::truncate_preview(raw, crate::process_logs::cap_for(on), on);
             backfilled_tool_events(
                 tracker,
-                &part_id,
+                &tracking_id,
+                call_id,
                 &name,
                 &input,
-                SessionEvent::ToolResult { ok: true, summary },
+                opencode_tool_result_event(call_id, true, summary),
             )
         }
         "error" => {
@@ -1049,10 +2699,11 @@ fn translate_tool_part(part: &Value, tracker: &mut PartTracker) -> Vec<SessionEv
                 crate::process_logs::truncate_preview(raw, crate::process_logs::cap_for(on), on);
             backfilled_tool_events(
                 tracker,
-                &part_id,
+                &tracking_id,
+                call_id,
                 &name,
                 &input,
-                SessionEvent::ToolResult { ok: false, summary },
+                opencode_tool_result_event(call_id, false, summary),
             )
         }
         // pending = queued, no finalized input yet -> wait for running/completed.
@@ -1062,28 +2713,29 @@ fn translate_tool_part(part: &Value, tracker: &mut PartTracker) -> Vec<SessionEv
 
 /// Build the events for a terminal (`completed` / `error`) tool frame, BACK-FILLING
 /// a `ToolCall` first if this part never emitted one and it carries a usable input
-/// (F6). The `result` event is always emitted. Marks the part as called so a
-/// duplicate terminal frame can't re-emit the `ToolCall`.
+/// (F6). A terminal result is emitted once per non-empty part id; replayed SSE
+/// terminal frames are idempotent so one execution cannot inflate pitfall hits.
 fn backfilled_tool_events(
     tracker: &mut PartTracker,
-    part_id: &str,
+    tracking_id: &str,
+    call_id: Option<&str>,
     name: &str,
     input: &Value,
     result: SessionEvent,
 ) -> Vec<SessionEvent> {
-    let already_called = tracker.tools_called.contains(part_id);
+    if !tracking_id.is_empty() && !tracker.tools_finished.insert(tracking_id.to_string()) {
+        return Vec::new();
+    }
+    let already_called = tracker.tools_called.contains(tracking_id);
     // Only back-fill when we have a real input object — a terminal frame with no
     // recoverable input can't be a faithful ToolCall (fail-open: just the result,
     // exactly as before). A non-null object (even `{}`) is enough: the consumer
     // keys off the tool NAME for the audit/diff, and a `{}` still attributes it.
     let have_input = !input.is_null();
     if !already_called && have_input {
-        tracker.tools_called.insert(part_id.to_string());
+        tracker.tools_called.insert(tracking_id.to_string());
         vec![
-            SessionEvent::ToolCall {
-                name: name.to_string(),
-                input: input.clone(),
-            },
+            opencode_tool_call_event(call_id, name.to_string(), input.clone()),
             result,
         ]
     } else {
@@ -1094,7 +2746,11 @@ fn backfilled_tool_events(
 /// `session.error` -> a terminal `TurnDone{Failed}` so a base-side error ends
 /// the phase (rather than hanging until the run budget). `properties.error`
 /// carries `{name, data.message}` (see `cli/cmd/run.ts`).
-fn translate_error(props: &Value, session_id: &str) -> Vec<SessionEvent> {
+fn translate_error(
+    props: &Value,
+    session_id: &str,
+    tracker: &mut PartTracker,
+) -> Vec<SessionEvent> {
     // session.error may omit sessionID for global errors; if present it must
     // match. Either way we treat it as a turn-ending failure (fail-open).
     if let Some(sid) = props.get("sessionID").and_then(Value::as_str) {
@@ -1112,15 +2768,12 @@ fn translate_error(props: &Value, session_id: &str) -> Vec<SessionEvent> {
         .to_string();
     vec![SessionEvent::TurnDone {
         status: TurnStatus::Failed(msg),
-        // opencode's SSE reports no token usage (F3) → estimate downstream.
-        usage: None,
+        usage: tracker.take_turn_usage(),
     }]
 }
 
-/// `permission.asked` -> `NeedApproval`. `properties` is a `PermissionV1.Request`
-/// (`{id,sessionID,permission,patterns,...}`). The `id` (`per...`) is what
-/// `respond` replies against. With the wildcard ruleset this is rare, but a
-/// finer ruleset (gate / dangerous mode) can still ask.
+/// Preserve OpenCode's permission request as a typed approval, including its
+/// three exact reply choices. Unknown/future permissions remain approval-gated.
 fn translate_permission(props: &Value, session_id: &str) -> Vec<SessionEvent> {
     if props.get("sessionID").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
@@ -1143,17 +2796,159 @@ fn translate_permission(props: &Value, session_id: &str) -> Vec<SessionEvent> {
                 .join(", ")
         })
         .unwrap_or_default();
-    vec![SessionEvent::NeedApproval {
+    let message = props
+        .get("metadata")
+        .and_then(|metadata| metadata.get("description"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    vec![SessionEvent::HostRequest {
         req_id: req_id.to_string(),
-        action,
-        target,
+        request: HostRequest::Approval {
+            action,
+            target,
+            message,
+            options: vec![
+                HostApprovalOption {
+                    id: "once".to_string(),
+                    label: "Allow once".to_string(),
+                    kind: HostApprovalOptionKind::AllowOnce,
+                },
+                HostApprovalOption {
+                    id: "always".to_string(),
+                    label: "Always allow".to_string(),
+                    kind: HostApprovalOptionKind::AllowAlways,
+                },
+                HostApprovalOption {
+                    id: "reject".to_string(),
+                    label: "Reject".to_string(),
+                    kind: HostApprovalOptionKind::RejectOnce,
+                },
+            ],
+            metadata: json!({
+                "session_id": session_id,
+                "patterns": props.get("patterns").cloned().unwrap_or(Value::Null),
+                "always": props.get("always").cloned().unwrap_or(Value::Null),
+            }),
+        },
+    }]
+}
+
+/// Convert OpenCode QuestionV1 (`question.asked`) into ordered typed questions.
+/// Question IDs are deterministic derivatives of the request id because the
+/// protocol identifies the request and question position, not each question.
+fn translate_question(props: &Value, session_id: &str) -> Vec<SessionEvent> {
+    if props.get("sessionID").and_then(Value::as_str) != Some(session_id) {
+        return Vec::new();
+    }
+    let Some(req_id) = props.get("id").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(raw_questions) = props.get("questions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    if raw_questions.is_empty() {
+        return Vec::new();
+    }
+
+    let questions = raw_questions
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            let header = raw
+                .get("header")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let prompt = raw
+                .get("question")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .or_else(|| header.clone())
+                .unwrap_or_else(|| "OpenCode question".to_string());
+            let multiple = raw
+                .get("multiple")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let custom = raw.get("custom").and_then(Value::as_bool).unwrap_or(true);
+            let options = raw
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|option| {
+                    let label = option
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?;
+                    Some(HostQuestionOption {
+                        value: label.to_string(),
+                        label: label.to_string(),
+                        description: option
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string),
+                        preview: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let kind = if options.is_empty() {
+                HostQuestionKind::Text
+            } else if multiple && custom {
+                HostQuestionKind::Other("multi_choice_or_text".to_string())
+            } else if multiple {
+                HostQuestionKind::MultiChoice
+            } else if custom {
+                HostQuestionKind::Other("single_choice_or_text".to_string())
+            } else {
+                HostQuestionKind::SingleChoice
+            };
+            HostQuestion {
+                id: format!("{req_id}:{index}"),
+                header,
+                prompt,
+                kind,
+                required: !multiple,
+                options,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let custom = raw_questions
+        .iter()
+        .map(|question| {
+            question
+                .get("custom")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    vec![SessionEvent::HostRequest {
+        req_id: req_id.to_string(),
+        request: HostRequest::UserInput {
+            questions,
+            metadata: json!({
+                "session_id": session_id,
+                "custom_answers": custom,
+                "tool": props.get("tool").cloned().unwrap_or(Value::Null),
+            }),
+        },
     }]
 }
 
 /// `session.status` -> `TurnDone{Completed}` when `status.type=="idle"` for our
 /// session. This is THE authoritative turn-done boundary (`cli/cmd/run.ts`
 /// breaks its loop on exactly this). `busy`/`retry` carry no turn semantics.
-fn translate_status(props: &Value, session_id: &str) -> Vec<SessionEvent> {
+fn translate_status(
+    props: &Value,
+    session_id: &str,
+    tracker: &mut PartTracker,
+) -> Vec<SessionEvent> {
     if props.get("sessionID").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
     }
@@ -1165,8 +2960,7 @@ fn translate_status(props: &Value, session_id: &str) -> Vec<SessionEvent> {
     if idle {
         vec![SessionEvent::TurnDone {
             status: TurnStatus::Completed,
-            // opencode's SSE reports no token usage (F3) → estimate downstream.
-            usage: None,
+            usage: tracker.take_turn_usage(),
         }]
     } else {
         Vec::new()
@@ -1183,16 +2977,14 @@ async fn read_listening_url(stdout: ChildStdout, timeout: Duration) -> Result<St
         // banner can't abort the scrape, and so the SAME reader can be handed to
         // the lifetime drain below.
         let mut reader = BufReader::new(stdout);
-        let mut line_buf = Vec::new();
         loop {
-            line_buf.clear();
-            match reader.read_until(b'\n', &mut line_buf).await {
-                Ok(0) => {
+            match read_bounded_serve_line(&mut reader, MAX_SERVE_STDOUT_LINE_BYTES).await {
+                Ok(None) => {
                     return Err(
                         "opencode serve exited before announcing a listen address".to_string()
                     );
                 }
-                Ok(_) => {
+                Ok(Some(line_buf)) => {
                     let line = String::from_utf8_lossy(&line_buf);
                     if let Some(url) = parse_listening_url(&line) {
                         // M8: the server is LONG-LIVED. If we drop its stdout reader
@@ -1228,6 +3020,48 @@ async fn read_listening_url(stdout: ChildStdout, timeout: Duration) -> Result<St
     }
 }
 
+async fn read_bounded_serve_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut bytes = Vec::new();
+    let mut oversized = false;
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .map_err(|error| format!("opencode serve stdout read error: {error}"))?;
+        if available.is_empty() {
+            if bytes.is_empty() && !oversized {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if !oversized {
+            let remaining = limit.saturating_sub(bytes.len());
+            if take > remaining {
+                oversized = true;
+                bytes.clear();
+            } else {
+                bytes.extend_from_slice(&available[..take]);
+            }
+        }
+        reader.consume(take);
+        if newline.is_some() {
+            break;
+        }
+    }
+    if oversized {
+        Err(format!(
+            "opencode serve stdout line exceeded the {limit}-byte safety limit"
+        ))
+    } else {
+        Ok(Some(bytes))
+    }
+}
+
 /// Pull the `http://HOST:PORT` base url out of opencode's listening line
 /// (`opencode server listening on http://127.0.0.1:54321`, per `serve.ts`).
 /// Returns the bare `scheme://host:port` (no trailing path), trimming any
@@ -1259,85 +3093,121 @@ fn split_provider_model(id: &str) -> Option<(&str, &str)> {
     }
 }
 
+fn encode_path_segment(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+/// Least-authority rules for model-side intent triage and critic review.
+/// OpenCode resolves the specific tool rules over the wildcard floor, so this
+/// is deliberately deny-by-default: only local, non-mutating source inspection
+/// is admitted. In particular, delegation (`task`), all write/shell tools,
+/// unknown future tools and MCP-provided tools stay denied without relying on
+/// an exhaustive blocklist.
+fn readonly_session_ruleset() -> Value {
+    json!([
+        { "permission": "*", "pattern": "*", "action": "deny" },
+        { "permission": "read", "pattern": "*", "action": "allow" },
+        { "permission": "grep", "pattern": "*", "action": "allow" },
+        { "permission": "glob", "pattern": "*", "action": "allow" },
+        { "permission": "list", "pattern": "*", "action": "allow" },
+    ])
+}
+
+fn plan_session_ruleset() -> Value {
+    json!([
+        { "permission": "*", "pattern": "*", "action": "deny" },
+        { "permission": "read", "pattern": "*", "action": "allow" },
+        { "permission": "grep", "pattern": "*", "action": "allow" },
+        { "permission": "glob", "pattern": "*", "action": "allow" },
+        { "permission": "list", "pattern": "*", "action": "allow" },
+        { "permission": "question", "pattern": "*", "action": "allow" },
+    ])
+}
+
 /// Build the `POST /session` permission ruleset for the autonomy tier — the
 /// opencode counterpart of codex's `approvalPolicy` (`never` vs `on-request`) and
-/// claude's `--permission-mode` (`acceptEdits` vs `default`), so all three bases
-/// share ONE gate posture.
+/// claude's `--permission-mode` (`acceptEdits` vs `default`), so all three native
+/// bases share ONE gate posture.
 ///
 /// - `autonomous == true` (the `auto` trust tier): a single wildcard `allow` rule
 ///   — every tool call is silently pre-approved, the agentic loop runs without a
 ///   per-event round-trip. Governance still audits each call via the event stream.
-/// - `autonomous == false` (the `guarded` tier): writes (`edit`/`write`) and
-///   DANGEROUS bash patterns route to `ask`, so the server raises
-///   `permission.asked` (→ a `NeedApproval` the orchestrator answers via the
-///   trust-tiered `approval_decision`); everything else stays `allow`. opencode
-///   evaluates rules so that a more specific pattern wins, so the broad `*/*`
-///   `allow` is the floor and the narrower `ask` rules override it for the
-///   sensitive surfaces. Mirrors codex's `on-request` (where the server asks
-///   before a command/file change) — a consistent human-in-the-loop tier.
+/// - `autonomous == false` (the `guarded` tier): only known local source-inspection
+///   permissions are pre-authorized. The wildcard floor is `ask`, so writes,
+///   patches, shells, delegation, unknown future tools, and MCP-provided tools all
+///   raise `permission.asked` (→ a `NeedApproval` the orchestrator answers via the
+///   trust-tiered `approval_decision`). opencode evaluates a specific permission
+///   over the wildcard floor. Mirrors codex's `on-request`, while making the
+///   authorization boundary fail-closed when the tool vocabulary grows.
 ///
-/// **Fail-open posture:** the guarded ruleset is the CONSERVATIVE choice (it asks
-/// rather than silently allowing), so even if a finer rule fails to register the
-/// session never silently runs an ungoverned write — at worst it asks more than
-/// needed, which the orchestrator answers. Pure; exposed for tests.
+/// Runtime/protocol failures remain fail-open to UmaDev's governance contract (an
+/// error is surfaced rather than crashing the host), but AUTHORIZATION itself is
+/// fail-closed: an unrecognized permission is never silently granted in Guarded or
+/// Plan. Pure; exposed for tests.
 #[must_use]
 pub fn session_ruleset(autonomous: bool) -> Value {
-    if autonomous {
-        // The whole loop runs silently (audited, not gated) — EXCEPT the base must not
-        // be allowed to ask a clarifying `question` or toggle plan mode
-        // (`plan_enter`/`plan_exit`): UmaDev drives opencode NON-interactively, so there
-        // is no channel to answer such a prompt, and a permitted question makes the base
-        // block forever waiting on a reply → the session never reaches `session.status
-        // {idle}` → the phase HANGS (the reported "调用工具… 8684s"). Deny them exactly as
-        // opencode's OWN `run.ts` seeds for every non-interactive run; more-specific
-        // rules win over the `*` allow floor.
+    let permissions = if autonomous {
+        BasePermissionProfile::Auto
+    } else {
+        BasePermissionProfile::Guarded
+    };
+    session_ruleset_for_profile(permissions)
+}
+
+fn session_ruleset_for_profile(permissions: BasePermissionProfile) -> Value {
+    if permissions.auto_approve() {
+        // Questions are safe to start because the HTTP/SSE driver now carries
+        // QuestionV1 answers back in-turn. Plan-mode toggles remain disabled: the
+        // UmaDev permission profile is authoritative for the session.
         return json!([
             { "permission": "*", "pattern": "*", "action": "allow" },
-            { "permission": "question", "pattern": "*", "action": "deny" },
+            { "permission": "question", "pattern": "*", "action": "allow" },
             { "permission": "plan_enter", "pattern": "*", "action": "deny" },
             { "permission": "plan_exit", "pattern": "*", "action": "deny" },
         ]);
     }
-    // Guarded: allow by default, but ASK before a write / a dangerous shell verb.
-    // Order matters only for human readability — opencode resolves by specificity,
-    // not array order — so the broad allow comes first as the floor.
+    if matches!(permissions, BasePermissionProfile::Plan) {
+        return plan_session_ruleset();
+    }
+    // Guarded: authorization is ASK-by-default. Only the small set of permissions
+    // whose contract is local source inspection is pre-authorized. Explicit asks
+    // for today's known mutation/delegation surfaces document the intended posture;
+    // the wildcard ask contains every future or MCP-provided tool automatically.
+    // opencode resolves the specific permission over the wildcard floor.
     json!([
-        { "permission": "*", "pattern": "*", "action": "allow" },
-        // Non-interactive driving has no channel to answer a clarifying `question` or a
-        // plan-mode toggle, so a permitted one wedges the session (never reaches idle →
-        // the phase hangs). Deny them in EVERY tier, exactly as opencode's own `run.ts`
-        // does for non-interactive runs. More-specific than the `*` allow floor → wins.
-        { "permission": "question", "pattern": "*", "action": "deny" },
+        { "permission": "*", "pattern": "*", "action": "ask" },
+        { "permission": "question", "pattern": "*", "action": "allow" },
         { "permission": "plan_enter", "pattern": "*", "action": "deny" },
         { "permission": "plan_exit", "pattern": "*", "action": "deny" },
+        // Known read-only, local source inspection. Keep this list deliberately
+        // narrow: adding a tool here is an authorization decision, not compatibility
+        // plumbing. Network retrieval and external-directory access therefore ask.
+        { "permission": "read", "pattern": "*", "action": "allow" },
+        { "permission": "grep", "pattern": "*", "action": "allow" },
+        { "permission": "glob", "pattern": "*", "action": "allow" },
+        { "permission": "list", "pattern": "*", "action": "allow" },
+        // Known potentially mutating/delegating surfaces. These explicit rules are
+        // semantically redundant with the wildcard ask, but keep the contract clear
+        // and guard against a future broad allow being reintroduced below.
         { "permission": "edit", "pattern": "*", "action": "ask" },
         { "permission": "write", "pattern": "*", "action": "ask" },
-        // Destructive / irreversible shell verbs the orchestrator must vet. The
-        // patterns mirror the dangerous-bash floor governance enforces elsewhere
-        // (`umadev_governance::rules::check_dangerous_bash`). opencode matches
-        // these as globs (`*` = any run), so each dangerous FORM needs a
-        // substring pattern — a prefix-only rule (`rm *`, `git push*`) is
-        // bypassed by an equivalent form that doesn't start with the verb
-        // (`sudo rm -rf /`, `git -C /repo push`). We ask on the substring forms:
-        //   • `*rm -rf*` / `*rm -fr*` — both flag orders, anywhere in the line
-        //     (also catches `rm -rf -- /`, `rm -rf /*`, `sudo rm -rf ~`).
-        //   • `rm *` — a bare `rm` at the start of the command.
-        //   • `*git *push*` — any `git … push` (incl. `git -C /repo push`), not
-        //     just a command that literally starts with `git push`.
-        //   • `*git *clean*` — `git clean -fdx` (and `git -C x clean …`), which
-        //     deletes untracked/ignored files irreversibly.
-        //   • `*git *reset --hard*` — discards uncommitted work with no recovery.
-        { "permission": "bash", "pattern": "rm *", "action": "ask" },
-        { "permission": "bash", "pattern": "*rm -rf*", "action": "ask" },
-        { "permission": "bash", "pattern": "*rm -fr*", "action": "ask" },
-        { "permission": "bash", "pattern": "git push*", "action": "ask" },
-        { "permission": "bash", "pattern": "*git *push*", "action": "ask" },
-        { "permission": "bash", "pattern": "*git *clean*", "action": "ask" },
-        { "permission": "bash", "pattern": "*git *reset --hard*", "action": "ask" },
-        { "permission": "bash", "pattern": "*sudo *", "action": "ask" },
-        { "permission": "bash", "pattern": "*curl *", "action": "ask" },
-        { "permission": "bash", "pattern": "*wget *", "action": "ask" },
+        { "permission": "patch", "pattern": "*", "action": "ask" },
+        { "permission": "bash", "pattern": "*", "action": "ask" },
+        { "permission": "task", "pattern": "*", "action": "ask" },
     ])
+}
+
+fn session_permission_payload(permissions: BasePermissionProfile) -> Value {
+    json!({ "permission": session_ruleset_for_profile(permissions) })
 }
 
 /// The fixed `opencode serve` argument vector: loopback host, OS-assigned port.
@@ -1407,6 +3277,17 @@ fn spawn_err(program: &str, e: &std::io::Error) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn write_json_response(stream: &mut std::net::TcpStream, body: &[u8]) {
+        use std::io::Write as _;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+    }
+
     // pure-unit (platform-independent)
 
     #[test]
@@ -1441,6 +3322,25 @@ mod tests {
         assert!(parse_listening_url("http://").is_none());
     }
 
+    #[tokio::test]
+    async fn bounded_serve_reader_discards_oversize_and_recovers_at_next_line() {
+        let bytes = b"0123456789\nlistening on http://127.0.0.1:7\r\nlast";
+        let mut reader = BufReader::with_capacity(2, &bytes[..]);
+        assert!(read_bounded_serve_line(&mut reader, 8).await.is_err());
+        assert_eq!(
+            read_bounded_serve_line(&mut reader, 64).await.unwrap(),
+            Some(b"listening on http://127.0.0.1:7\r\n".to_vec())
+        );
+        assert_eq!(
+            read_bounded_serve_line(&mut reader, 64).await.unwrap(),
+            Some(b"last".to_vec())
+        );
+        assert!(read_bounded_serve_line(&mut reader, 64)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn base64_matches_known_vectors() {
         // RFC 4648 test vectors + the actual `opencode:<pw>` shape.
@@ -1461,6 +3361,15 @@ mod tests {
         assert!(split_provider_model("claude-sonnet-4-6").is_none());
         assert!(split_provider_model("/model").is_none());
         assert!(split_provider_model("provider/").is_none());
+    }
+
+    #[test]
+    fn request_ids_are_encoded_as_one_url_path_segment() {
+        assert_eq!(encode_path_segment("ask_safe-1"), "ask_safe-1");
+        assert_eq!(
+            encode_path_segment("../question?x=1"),
+            "..%2Fquestion%3Fx%3D1"
+        );
     }
 
     #[test]
@@ -1519,6 +3428,167 @@ mod tests {
         assert!(translate_frame(&payload, "other_session").is_empty());
     }
 
+    fn assistant_usage_frame(session_id: &str, message_id: &str, tokens: &Value) -> String {
+        json!({
+            "id": format!("evt_{message_id}"),
+            "type": "message.updated",
+            "properties": {
+                "sessionID": session_id,
+                "info": {
+                    "id": message_id,
+                    "sessionID": session_id,
+                    "role": "assistant",
+                    "tokens": tokens
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn idle_frame(session_id: &str) -> String {
+        json!({
+            "type": "session.status",
+            "properties": {"sessionID": session_id, "status": {"type": "idle"}}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn assistant_message_usage_is_exact_per_turn_and_does_not_double_count_updates() {
+        let usage_frame = |message_id: &str,
+                           input: u64,
+                           output: u64,
+                           reasoning: u64,
+                           cache_read: u64,
+                           cache_write: Value| {
+            assistant_usage_frame(
+                "ses_abc",
+                message_id,
+                &json!({
+                    "input": input, "output": output, "reasoning": reasoning,
+                    "cache": {"read": cache_read, "write": cache_write}
+                }),
+            )
+        };
+        let idle = idle_frame("ses_abc");
+
+        let mut tracker = PartTracker::default();
+        tracker.begin_turn();
+        // `message.updated` is cumulative for one assistant message. The second
+        // msg_1 frame replaces the first; it must not be added to it.
+        assert!(translate_frame_tracked(
+            &usage_frame("msg_1", 100, 10, 2, 20, json!(3)),
+            "ses_abc",
+            &mut tracker,
+        )
+        .is_empty());
+        assert!(translate_frame_tracked(
+            &usage_frame("msg_1", 120, 12, 3, 25, json!(5)),
+            "ses_abc",
+            &mut tracker,
+        )
+        .is_empty());
+        // A distinct assistant message is a second model call in the same user
+        // turn (for example after a tool result), so its usage is added once.
+        assert!(translate_frame_tracked(
+            &usage_frame("msg_2", 40, 4, 1, 10, json!(0)),
+            "ses_abc",
+            &mut tracker,
+        )
+        .is_empty());
+        // A malformed later update cannot erase msg_2's last valid exact value.
+        assert!(translate_frame_tracked(
+            &usage_frame("msg_2", 99, 9, 1, 1, Value::Null),
+            "ses_abc",
+            &mut tracker,
+        )
+        .is_empty());
+
+        assert_eq!(
+            translate_frame_tracked(&idle, "ses_abc", &mut tracker),
+            vec![SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                // msg_1: (120+25+5, 12+3); msg_2: (40+10, 4+1).
+                usage: Some(Usage {
+                    cached_read_tokens: 35,
+                    cached_write_tokens: 5,
+                    reasoning_tokens: 4,
+                    ..Usage::exact(200, 20)
+                }),
+            }]
+        );
+        assert_eq!(
+            translate_frame_tracked(&idle, "ses_abc", &mut tracker),
+            vec![SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                usage: None,
+            }],
+            "idle drains the turn accumulator; usage cannot leak into a later turn"
+        );
+
+        tracker.begin_turn();
+        let _ = translate_frame_tracked(
+            &usage_frame("msg_1", 7, 3, 4, 1, json!(2)),
+            "ses_abc",
+            &mut tracker,
+        );
+        assert!(matches!(
+            translate_frame_tracked(&idle, "ses_abc", &mut tracker).as_slice(),
+            [SessionEvent::TurnDone {
+                usage: Some(Usage {
+                    input_tokens: 10,
+                    output_tokens: 7,
+                    cached_read_tokens: 1,
+                    cached_write_tokens: 2,
+                    reasoning_tokens: 4,
+                    ..
+                }),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn usage_capture_ignores_replay_off_session_and_malformed_protocol_frames() {
+        let exact = json!({
+            "input": 8, "output": 3, "reasoning": 2,
+            "cache": {"read": 4, "write": 1}
+        });
+        let mut tracker = PartTracker::default();
+
+        // Startup/history replay arrives while no locally armed turn is active.
+        let _ = translate_frame_tracked_for_turn(
+            &assistant_usage_frame("ses_abc", "old", &exact),
+            "ses_abc",
+            &mut tracker,
+            false,
+        );
+        // A sibling session must never enter this session's accumulator.
+        let _ = translate_frame_tracked_for_turn(
+            &assistant_usage_frame("ses_other", "other", &exact),
+            "ses_abc",
+            &mut tracker,
+            true,
+        );
+        // Official fields are all required for exact accounting. A fractional,
+        // negative, or missing cache member is not guessed.
+        for tokens in [
+            json!({"input":1.5,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}),
+            json!({"input":1,"output":-2,"reasoning":0,"cache":{"read":0,"write":0}}),
+            json!({"input":1,"output":2,"reasoning":0,"cache":{"read":0}}),
+            json!({"input":1,"output":2,"reasoning":0,"cache":{"read":0,"write":0},"total":99}),
+            json!({"input":18_446_744_073_709_551_615_u64,"output":2,"reasoning":0,"cache":{"read":1,"write":0}}),
+        ] {
+            let _ = translate_frame_tracked_for_turn(
+                &assistant_usage_frame("ses_abc", "bad", &tokens),
+                "ses_abc",
+                &mut tracker,
+                true,
+            );
+        }
+        assert!(tracker.take_turn_usage().is_none());
+    }
+
     #[test]
     fn translate_tool_running_is_a_toolcall_with_input() {
         let frame = serde_json::json!({
@@ -1544,7 +3614,12 @@ mod tests {
         let evs = translate_frame(&frame, "ses_abc");
         assert_eq!(evs.len(), 1);
         match &evs[0] {
-            SessionEvent::ToolCall { name, input } => {
+            SessionEvent::ToolCallCorrelated {
+                call_id,
+                name,
+                input,
+            } => {
+                assert_eq!(call_id, "prt_1");
                 // Normalized to the claude-shape the agent's diff/audit consumers
                 // recognize: `write`→`Write`, `filePath`→`file_path`.
                 assert_eq!(name, "Write");
@@ -1607,6 +3682,104 @@ mod tests {
             })
             .collect();
         assert_eq!(joined, "Hello world");
+    }
+
+    #[test]
+    fn user_message_parts_never_become_assistant_text() {
+        let mut tracker = PartTracker::default();
+        let message = json!({
+            "type": "message.updated",
+            "properties": {
+                "sessionID": "ses_abc",
+                "info": {
+                    "id": "msg_user",
+                    "sessionID": "ses_abc",
+                    "role": "user"
+                }
+            }
+        })
+        .to_string();
+        assert!(translate_frame_tracked(&message, "ses_abc", &mut tracker).is_empty());
+
+        let echoed_prompt = json!({
+            "type": "message.part.updated",
+            "properties": { "part": {
+                "id": "prt_user",
+                "messageID": "msg_user",
+                "sessionID": "ses_abc",
+                "type": "text",
+                "text": "the user's prompt"
+            }}
+        })
+        .to_string();
+        assert!(
+            translate_frame_tracked(&echoed_prompt, "ses_abc", &mut tracker).is_empty(),
+            "a user-authored part must not be projected as assistant output"
+        );
+    }
+
+    #[test]
+    fn modern_text_requires_explicit_assistant_attribution() {
+        let mut tracker = PartTracker::default();
+        let part = json!({
+            "type": "message.part.updated",
+            "properties": { "part": {
+                "id": "prt_assistant",
+                "messageID": "msg_assistant",
+                "sessionID": "ses_abc",
+                "type": "text",
+                "text": "model reply"
+            }}
+        })
+        .to_string();
+        assert!(
+            translate_frame_tracked(&part, "ses_abc", &mut tracker).is_empty(),
+            "an unattributed modern part must fail closed"
+        );
+
+        let message = json!({
+            "type": "message.updated",
+            "properties": {
+                "sessionID": "ses_abc",
+                "info": {
+                    "id": "msg_assistant",
+                    "sessionID": "ses_abc",
+                    "role": "assistant"
+                }
+            }
+        })
+        .to_string();
+        assert!(translate_frame_tracked(&message, "ses_abc", &mut tracker).is_empty());
+        assert_eq!(
+            translate_frame_tracked(&part, "ses_abc", &mut tracker),
+            [SessionEvent::TextDelta("model reply".to_string())]
+        );
+    }
+
+    #[test]
+    fn cumulative_reasoning_part_emits_thinking_suffixes() {
+        let mut tracker = PartTracker::default();
+        let part = |text: &str| {
+            json!({
+                "type": "message.part.updated",
+                "properties": { "part": {
+                    "id": "prt_reason", "sessionID": "ses_abc",
+                    "type": "reasoning", "text": text
+                }}
+            })
+            .to_string()
+        };
+        assert_eq!(
+            translate_frame_tracked(&part("Inspect"), "ses_abc", &mut tracker),
+            [SessionEvent::ThinkingDelta("Inspect".to_string())]
+        );
+        assert_eq!(
+            translate_frame_tracked(&part("Inspect files"), "ses_abc", &mut tracker),
+            [SessionEvent::ThinkingDelta(" files".to_string())]
+        );
+        assert!(
+            translate_frame_tracked(&part("Inspect files"), "ses_abc", &mut tracker).is_empty()
+        );
     }
 
     #[test]
@@ -1673,7 +3846,12 @@ mod tests {
             "running → exactly one ToolCall: {running:?}"
         );
         match &running[0] {
-            SessionEvent::ToolCall { name, input } => {
+            SessionEvent::ToolCallCorrelated {
+                call_id,
+                name,
+                input,
+            } => {
+                assert_eq!(call_id, "prt_w");
                 assert_eq!(name, "Write");
                 // camelCase input key was normalized to snake_case for the consumer.
                 assert_eq!(input["file_path"], "src/app.ts");
@@ -1684,11 +3862,83 @@ mod tests {
         let completed = translate_frame_tracked(&frame("completed"), "ses_abc", &mut tracker);
         assert_eq!(
             completed,
-            vec![SessionEvent::ToolResult {
+            vec![SessionEvent::ToolResultCorrelated {
+                call_id: "prt_w".to_string(),
                 ok: true,
                 summary: "wrote src/app.ts".to_string()
             }],
             "completed after running must not re-emit the ToolCall"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_results_keep_part_ids_when_they_finish_out_of_order() {
+        let mut tracker = PartTracker::default();
+        let frame = |id: &str, status: &str, summary: &str| {
+            serde_json::json!({
+                "type":"message.part.updated",
+                "properties":{"part":{
+                    "id":id,
+                    "sessionID":"ses_abc",
+                    "type":"tool",
+                    "tool":"bash",
+                    "state":{
+                        "status":status,
+                        "input":{"command":format!("run {id}")},
+                        "title":summary
+                    }
+                }}
+            })
+            .to_string()
+        };
+
+        let mut events = Vec::new();
+        events.extend(translate_frame_tracked(
+            &frame("part-A", "running", ""),
+            "ses_abc",
+            &mut tracker,
+        ));
+        events.extend(translate_frame_tracked(
+            &frame("part-B", "running", ""),
+            "ses_abc",
+            &mut tracker,
+        ));
+        events.extend(translate_frame_tracked(
+            &frame("part-B", "completed", "result B"),
+            "ses_abc",
+            &mut tracker,
+        ));
+        events.extend(translate_frame_tracked(
+            &frame("part-A", "completed", "result A"),
+            "ses_abc",
+            &mut tracker,
+        ));
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                SessionEvent::ToolCallCorrelated { call_id: a, .. },
+                SessionEvent::ToolCallCorrelated { call_id: b, .. },
+                SessionEvent::ToolResultCorrelated { call_id: rb, summary: sb, .. },
+                SessionEvent::ToolResultCorrelated { call_id: ra, summary: sa, .. }
+            ] if a == "part-A"
+                && b == "part-B"
+                && rb == "part-B"
+                && sb == "result B"
+                && ra == "part-A"
+                && sa == "result A"
+        ));
+
+        let mut activity = umadev_runtime::ToolActivity::default();
+        assert!(activity.observe(&events[0]));
+        assert!(activity.observe(&events[1]));
+        assert!(
+            activity.observe(&events[2]),
+            "finishing B must leave A active"
+        );
+        assert!(
+            !activity.observe(&events[3]),
+            "A then settles independently"
         );
     }
 
@@ -1714,7 +3964,12 @@ mod tests {
         let evs = translate_frame_tracked(&merged, "ses_abc", &mut tracker);
         assert_eq!(evs.len(), 2, "merged tool → ToolCall + ToolResult: {evs:?}");
         match &evs[0] {
-            SessionEvent::ToolCall { name, input } => {
+            SessionEvent::ToolCallCorrelated {
+                call_id,
+                name,
+                input,
+            } => {
+                assert_eq!(call_id, "prt_m");
                 assert_eq!(name, "Write", "back-filled call uses the normalized name");
                 assert_eq!(
                     input["file_path"], "src/new.ts",
@@ -1724,9 +3979,14 @@ mod tests {
             other => panic!("expected a back-filled Write ToolCall first, got {other:?}"),
         }
         assert!(
-            matches!(&evs[1], SessionEvent::ToolResult { ok: true, .. }),
+            matches!(&evs[1], SessionEvent::ToolResultCorrelated { call_id, ok: true, .. } if call_id == "prt_m"),
             "the ToolResult still follows: {:?}",
             evs[1]
+        );
+        let replay = translate_frame_tracked(&merged, "ses_abc", &mut tracker);
+        assert!(
+            replay.is_empty(),
+            "a replayed terminal frame is the same tool execution, not a second result: {replay:?}"
         );
     }
 
@@ -1746,7 +4006,8 @@ mod tests {
         let evs = translate_frame_tracked(&no_input, "ses_abc", &mut tracker);
         assert_eq!(
             evs,
-            vec![SessionEvent::ToolResult {
+            vec![SessionEvent::ToolResultCorrelated {
+                call_id: "prt_n".to_string(),
                 ok: true,
                 summary: "ok".to_string()
             }],
@@ -1790,7 +4051,340 @@ mod tests {
     }
 
     #[test]
-    fn translate_permission_asked_is_needapproval() {
+    fn idle_terminal_requires_busy_after_arm_and_is_consumed_once() {
+        let gate: TurnSseGate = Arc::new(AtomicU8::new(SSE_TURN_UNARMED));
+        let done = SessionEvent::TurnDone {
+            status: TurnStatus::Completed,
+            usage: None,
+        };
+        assert!(!terminal_event_belongs_to_armed_turn(&done, &gate));
+        gate.store(SSE_TURN_ARMED, Ordering::Release);
+        assert!(
+            !terminal_event_belongs_to_armed_turn(&done, &gate),
+            "idle before the official busy edge is not turn completion"
+        );
+        assert_eq!(gate.load(Ordering::Acquire), SSE_TURN_ARMED);
+        gate.store(SSE_TURN_ACTIVE, Ordering::Release);
+        assert!(terminal_event_belongs_to_armed_turn(&done, &gate));
+        assert!(
+            !terminal_event_belongs_to_armed_turn(&done, &gate),
+            "a duplicated or delayed idle cannot complete the next turn"
+        );
+        assert!(terminal_event_belongs_to_armed_turn(
+            &SessionEvent::TextDelta("progress".to_string()),
+            &gate
+        ));
+    }
+
+    #[test]
+    fn bounded_sse_decoder_handles_half_crlf_multiline_unknown_and_oversize() {
+        let mut decoder = BoundedSseDecoder::with_limits(64, 64);
+        assert!(decoder.push(b"event: message\r\nda").unwrap().is_empty());
+        let payloads = decoder
+            .push(b"ta: {\"a\":1,\r\ndata: \"b\":2}\r\n\r\n")
+            .unwrap();
+        assert_eq!(payloads, vec!["{\"a\":1,\n\"b\":2}"]);
+
+        let mut decoder = BoundedSseDecoder::with_limits(8, 64);
+        assert!(decoder.push(b"012345678\n").is_err());
+
+        let mut decoder = BoundedSseDecoder::with_limits(64, 8);
+        assert!(decoder.push(b"data: 12345\ndata: 67890\n").is_err());
+    }
+
+    #[test]
+    fn child_lifecycle_waits_for_every_child_and_normalizes_edges() {
+        let mut lifecycle = ChildLifecycle::default();
+        let children = ["child-a", "child-b"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let statuses = [
+            ("child-a".to_string(), "busy".to_string()),
+            ("child-b".to_string(), "retry".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let first = lifecycle.apply_snapshot(children, &statuses);
+        assert_eq!(lifecycle.live.len(), 2);
+        assert!(first.iter().any(|event| matches!(
+            event,
+            SessionEvent::BackgroundTask(BackgroundTaskSignal::Live { agent_ids })
+                if agent_ids == &["child-a".to_string(), "child-b".to_string()]
+        )));
+
+        let children = ["child-a", "child-b"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let statuses = [("child-b".to_string(), "busy".to_string())]
+            .into_iter()
+            .collect();
+        let second = lifecycle.apply_snapshot(children, &statuses);
+        assert!(second.iter().any(|event| matches!(
+            event,
+            SessionEvent::BackgroundTask(BackgroundTaskSignal::Finished { id })
+                if id == "child-a"
+        )));
+        assert_eq!(
+            lifecycle.live,
+            ["child-b".to_string()].into_iter().collect()
+        );
+
+        let children = ["child-a", "child-b"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let third = lifecycle.apply_snapshot(children, &BTreeMap::new());
+        assert!(third.iter().any(|event| matches!(
+            event,
+            SessionEvent::BackgroundTask(BackgroundTaskSignal::Finished { id })
+                if id == "child-b"
+        )));
+        assert!(lifecycle.live.is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_reconciliation_service_failure_is_bounded_and_explicit() {
+        let http = HttpCtx::new_with_timeout(
+            "http://127.0.0.1:1".to_string(),
+            "pw",
+            Path::new("/proj"),
+            Duration::from_millis(50),
+        );
+        let (tx, _rx) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let lifecycle = Arc::new(Mutex::new(ChildLifecycle::default()));
+        let result = settle_children(
+            &http,
+            "parent",
+            &tx,
+            &lifecycle,
+            ChildSettleConfig {
+                timeout: Duration::from_millis(200),
+                poll: Duration::from_millis(1),
+                request_timeout: Duration::from_millis(50),
+                max_errors: 2,
+            },
+        )
+        .await;
+        let error = result.expect_err("an unavailable server must be an explicit failure");
+        assert!(error.contains("reconciliation failed") || error.contains("timed out"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn child_reconciliation_keeps_sse_and_approvals_live_until_one_turn_done() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_calls = Arc::new(AtomicUsize::new(0));
+        let child_idle = Arc::new(AtomicBool::new(false));
+        let calls = status_calls.clone();
+        let idle = child_idle.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let line = request.lines().next().unwrap_or("");
+                let body: &[u8] = if line.starts_with("GET /session/parent/children") {
+                    br#"[{"id":"child-a"}]"#
+                } else if line.starts_with("GET /session/child-a/children") {
+                    br#"[{"id":"grandchild-a"}]"#
+                } else if line.starts_with("GET /session/grandchild-a/children") {
+                    b"[]"
+                } else if line.starts_with("GET /session/status") {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if idle.load(Ordering::SeqCst) {
+                        b"{}"
+                    } else {
+                        br#"{"child-a":{"type":"busy"},"grandchild-a":{"type":"busy"}}"#
+                    }
+                } else {
+                    b"{}"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, response.as_bytes()).await;
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body).await;
+            }
+        });
+
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let lifecycle = Arc::new(Mutex::new(ChildLifecycle::default()));
+        let settle_state = Arc::new(AtomicU8::new(0));
+        let turn_sse_gate: TurnSseGate = Arc::new(AtomicU8::new(SSE_TURN_ACTIVE));
+        let created = json!({
+            "type": "session.created",
+            "properties": { "info": { "id": "child-a", "parentID": "parent" } }
+        })
+        .to_string();
+        let started = lifecycle.lock().await.observe_sse(&created, "parent");
+        assert!(send_events(&tx, started).await);
+        assert!(
+            forward_open_code_events(
+                &http,
+                "parent",
+                &tx,
+                &lifecycle,
+                &settle_state,
+                &turn_sse_gate,
+                vec![SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: Some(Usage::exact(321, 45)),
+                }],
+            )
+            .await
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while status_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached reconciler polled while SSE stayed available");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if lifecycle.lock().await.known.contains("grandchild-a") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded HTTP traversal recovers an SSE-missed grandchild");
+
+        let permission = json!({
+            "type": "permission.asked",
+            "properties": {
+                "id": "per-child", "sessionID": "child-a",
+                "permission": "bash", "patterns": ["cargo test"]
+            }
+        })
+        .to_string();
+        let approval = lifecycle.lock().await.observe_sse(&permission, "parent");
+        assert!(send_events(&tx, approval).await);
+        assert!(
+            forward_open_code_events(
+                &http,
+                "parent",
+                &tx,
+                &lifecycle,
+                &settle_state,
+                &turn_sse_gate,
+                vec![
+                    SessionEvent::TextDelta("parent progress".to_string()),
+                    SessionEvent::ToolCall {
+                        name: "Read".to_string(),
+                        input: json!({"file_path": "README.md"}),
+                    },
+                ],
+            )
+            .await
+        );
+
+        let mut before_idle = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !(before_idle.iter().any(|event| {
+                matches!(
+                    event,
+                    SessionEvent::HostRequest { req_id, request: HostRequest::Approval { .. } }
+                        if req_id == "per-child"
+                )
+            }) && before_idle.iter().any(|event| {
+                matches!(
+                    event,
+                    SessionEvent::TextDelta(text) if text == "parent progress"
+                )
+            }) && before_idle.iter().any(|event| {
+                matches!(
+                    event,
+                    SessionEvent::ToolCall { name, .. } if name == "Read"
+                )
+            })) {
+                before_idle.push(rx.recv().await.expect("channel remains open"));
+            }
+        })
+        .await
+        .expect("approval, parent text, and parent tool remain live during settle");
+        assert!(before_idle.iter().any(|event| matches!(
+            event,
+            SessionEvent::HostRequest { req_id, request: HostRequest::Approval { .. } }
+                if req_id == "per-child"
+        )));
+        assert!(before_idle.iter().any(
+            |event| matches!(event, SessionEvent::TextDelta(text) if text == "parent progress")
+        ));
+        assert!(before_idle
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ToolCall { name, .. } if name == "Read")));
+        assert!(!before_idle
+            .iter()
+            .any(|event| matches!(event, SessionEvent::TurnDone { .. })));
+
+        child_idle.store(true, Ordering::SeqCst);
+        let mut done = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("child terminal reconciliation completes")
+                .expect("channel remains open");
+            let terminal = matches!(event, SessionEvent::TurnDone { .. });
+            done.push(event);
+            if terminal {
+                break;
+            }
+        }
+        assert!(done.iter().any(|event| matches!(
+            event,
+            SessionEvent::BackgroundTask(BackgroundTaskSignal::Finished { id }) if id == "child-a"
+        )));
+        assert!(before_idle.iter().any(|event| matches!(
+            event,
+            SessionEvent::BackgroundTask(BackgroundTaskSignal::Started { id }) if id == "grandchild-a"
+        )) || done.iter().any(|event| matches!(
+            event,
+            SessionEvent::BackgroundTask(BackgroundTaskSignal::Started { id }) if id == "grandchild-a"
+        )));
+        assert_eq!(
+            done.iter()
+                .filter(|event| matches!(event, SessionEvent::TurnDone { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            done.iter().any(|event| matches!(
+                event,
+                SessionEvent::TurnDone {
+                    usage: Some(Usage {
+                        input_tokens: 321,
+                        output_tokens: 45,
+                        ..
+                    }),
+                    ..
+                }
+            )),
+            "child reconciliation must preserve the parent turn's exact usage: {done:?}"
+        );
+        assert_eq!(settle_state.load(Ordering::SeqCst), 2);
+        assert!(lifecycle.lock().await.live.is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn translate_permission_asked_is_typed_approval() {
         let frame = serde_json::json!({
             "type": "permission.asked",
             "properties": {
@@ -1801,17 +4395,112 @@ mod tests {
         })
         .to_string();
         match &translate_frame(&frame, "ses_abc")[0] {
-            SessionEvent::NeedApproval {
+            SessionEvent::HostRequest {
                 req_id,
-                action,
-                target,
+                request:
+                    HostRequest::Approval {
+                        action,
+                        target,
+                        options,
+                        ..
+                    },
             } => {
                 assert_eq!(req_id, "per_xyz");
                 assert_eq!(action, "bash");
                 assert!(target.contains("rm -rf *"));
+                assert_eq!(
+                    options
+                        .iter()
+                        .map(|option| option.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["once", "always", "reject"]
+                );
             }
-            other => panic!("expected NeedApproval, got {other:?}"),
+            other => panic!("expected typed approval, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn translate_question_asked_preserves_order_choices_and_custom_answers() {
+        let frame = json!({
+            "type": "question.asked",
+            "properties": {
+                "id": "ask_7", "sessionID": "ses_abc",
+                "questions": [
+                    {
+                        "header": "Database", "question": "Pick one",
+                        "options": [
+                            {"label": "SQLite", "description": "Local"},
+                            {"label": "Postgres", "description": "Server"}
+                        ],
+                        "multiple": false, "custom": false
+                    },
+                    {
+                        "header": "Checks", "question": "Pick checks",
+                        "options": [{"label": "Lint", "description": "Fast"}],
+                        "multiple": true, "custom": true
+                    }
+                ],
+                "tool": {"messageID": "msg_1", "callID": "call_1"}
+            }
+        })
+        .to_string();
+        match &translate_frame(&frame, "ses_abc")[0] {
+            SessionEvent::HostRequest {
+                req_id,
+                request:
+                    HostRequest::UserInput {
+                        questions,
+                        metadata,
+                    },
+            } => {
+                assert_eq!(req_id, "ask_7");
+                assert_eq!(questions.len(), 2);
+                assert_eq!(questions[0].id, "ask_7:0");
+                assert_eq!(questions[0].kind, HostQuestionKind::SingleChoice);
+                assert_eq!(questions[0].options[1].value, "Postgres");
+                assert_eq!(questions[1].id, "ask_7:1");
+                assert_eq!(
+                    questions[1].kind,
+                    HostQuestionKind::Other("multi_choice_or_text".to_string())
+                );
+                assert_eq!(metadata["tool"]["callID"], "call_1");
+                assert_eq!(metadata["custom_answers"], json!([false, true]));
+            }
+            other => panic!("expected typed user input, got {other:?}"),
+        }
+        assert!(translate_frame(&frame, "other").is_empty());
+    }
+
+    #[test]
+    fn child_question_is_forwarded_as_typed_user_input() {
+        let mut lifecycle = ChildLifecycle::default();
+        let created = json!({
+            "type": "session.created",
+            "properties": {"info": {"id": "child", "parentID": "parent"}}
+        })
+        .to_string();
+        let _ = lifecycle.observe_sse(&created, "parent");
+        let question = json!({
+            "type": "question.asked",
+            "properties": {
+                "id": "ask_child", "sessionID": "child",
+                "questions": [{
+                    "header": "Child", "question": "Continue?",
+                    "options": [{"label": "Yes", "description": "Continue"}],
+                    "multiple": false, "custom": false
+                }]
+            }
+        })
+        .to_string();
+        let events = lifecycle.observe_sse(&question, "parent");
+        assert!(matches!(
+            events.as_slice(),
+            [SessionEvent::HostRequest {
+                req_id,
+                request: HostRequest::UserInput { .. }
+            }] if req_id == "ask_child"
+        ));
     }
 
     #[test]
@@ -1889,12 +4578,7 @@ mod tests {
                     assert!(lower.contains("authorization: basic "));
                     assert!(lower.contains("x-opencode-directory:"));
                     let body = br#"{"id":"ses_fake","title":"t","directory":"/x"}"#;
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    s.write_all(resp.as_bytes()).unwrap();
-                    s.write_all(body).unwrap();
+                    write_json_response(&mut s, body);
                 } else if request_line.starts_with("GET /event") {
                     // Stream SSE frames: tool running, then completed, then idle.
                     s.write_all(
@@ -1912,8 +4596,17 @@ mod tests {
                             .unwrap();
                         s.flush().unwrap();
                     }
-                    // Hold briefly so the client drains all frames before close.
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    // Keep this SSE socket alive on another thread so the fake
+                    // server can concurrently answer child/status reconciliation,
+                    // matching the real HTTP server's connection concurrency.
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        drop(s);
+                    });
+                } else if request_line.starts_with("GET /session/ses_fake/children") {
+                    write_json_response(&mut s, b"[]");
+                } else if request_line.starts_with("GET /session/status") {
+                    write_json_response(&mut s, b"{}");
                 } else {
                     // prompt_async / abort / delete -> 204 NoContent.
                     s.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
@@ -1935,7 +4628,7 @@ mod tests {
         tokio::spawn(pump_sse(http.clone(), session_id.clone(), tx));
 
         // Inject a directive (prompt_async).
-        http.prompt_async(&session_id, "build the thing")
+        http.prompt_async(&session_id, "build the thing", None)
             .await
             .unwrap();
 
@@ -1970,8 +4663,47 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn readonly_ruleset_is_an_exact_read_allowlist() {
+        let rules = readonly_session_ruleset();
+        let rules = rules.as_array().expect("ruleset array");
+        let effective_action = |permission: &str| {
+            rules
+                .iter()
+                .filter(|rule| {
+                    matches!(rule["permission"].as_str(), Some("*"))
+                        || rule["permission"].as_str() == Some(permission)
+                })
+                .filter_map(|rule| rule["action"].as_str())
+                .next_back()
+        };
+
+        for permission in ["read", "grep", "glob", "list"] {
+            assert_eq!(effective_action(permission), Some("allow"), "{permission}");
+        }
+        for permission in [
+            "task",
+            "patch",
+            "edit",
+            "write",
+            "bash",
+            "webfetch",
+            "mcp",
+            "mcp_database_write",
+            "future_unknown_tool",
+        ] {
+            assert_eq!(effective_action(permission), Some("deny"), "{permission}");
+        }
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule["permission"] == "*" && rule["action"] == "allow"),
+            "read-only forks must never have a wildcard allow floor: {rules:?}"
+        );
+    }
+
     #[tokio::test]
-    async fn create_readonly_session_sends_deny_ruleset() {
+    async fn create_readonly_session_sends_allowlist_and_reuses_model() {
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1982,10 +4714,23 @@ mod tests {
                     .await
                     .unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                // The body must carry a DENY ruleset — the read-only fence.
+                // The transmitted body is deny-by-default, contains the exact
+                // local-read allowlist, and never hard-codes a build agent.
+                let posted: Value = serde_json::from_str(
+                    req.split_once("\r\n\r\n")
+                        .map(|(_, body)| body)
+                        .expect("request body"),
+                )
+                .expect("JSON request body");
+                assert_eq!(posted["permission"], readonly_session_ruleset());
                 assert!(
-                    req.contains("\"action\":\"deny\""),
-                    "fork session must request a deny ruleset: {req}"
+                    posted.get("agent").is_none(),
+                    "fork must not force build: {posted}"
+                );
+                assert_eq!(
+                    posted["model"],
+                    json!({ "id": "claude-sonnet", "providerID": "anthropic" }),
+                    "fork must reuse the explicitly selected writer model"
                 );
                 let body = br#"{"id":"ses_fork"}"#;
                 let resp = format!(
@@ -1998,19 +4743,78 @@ mod tests {
         });
         let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
         let id = http
-            .create_readonly_session()
+            .create_readonly_session(Some("anthropic/claude-sonnet"))
             .await
             .expect("read-only session created");
         assert_eq!(id, "ses_fork");
         server.abort();
     }
 
+    #[tokio::test]
+    async fn readonly_fork_waits_until_sse_subscription_is_ready() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut create, _) = listener.accept().await.expect("create connection");
+            let mut buf = vec![0u8; 8192];
+            let _ = tokio::io::AsyncReadExt::read(&mut create, &mut buf).await;
+            let body = br#"{"id":"ses_fork"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut create, response.as_bytes())
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut create, body)
+                .await
+                .unwrap();
+
+            let (mut stream, _) = listener.accept().await.expect("SSE connection");
+            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                .await
+                .unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                request.starts_with("GET /event?"),
+                "unexpected SSE request: {request}"
+            );
+            let _ = seen_tx.send(());
+            let _ = release_rx.await;
+            tokio::io::AsyncWriteExt::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let opening = tokio::spawn(async move { http.start_readonly_fork(None).await });
+        tokio::time::timeout(Duration::from_secs(2), seen_rx)
+            .await
+            .expect("SSE request observed")
+            .expect("SSE observer alive");
+        assert!(
+            !opening.is_finished(),
+            "fork must not return before SSE response establishes the subscription"
+        );
+        let _ = release_tx.send(());
+        let fork = tokio::time::timeout(Duration::from_secs(2), opening)
+            .await
+            .expect("fork ready")
+            .expect("join succeeds")
+            .expect("fork opens");
+        drop(fork);
+        server.abort();
+    }
+
     #[test]
-    fn session_ruleset_autonomous_allows_all_but_denies_interactive_prompts() {
-        // The `auto` tier runs the loop silently — a broad `allow` floor — EXCEPT it
-        // must DENY the interactive prompts (`question`/`plan_enter`/`plan_exit`), which
-        // would wedge a non-interactive session (no channel to answer → never idle → the
-        // phase hangs). Mirrors opencode's own `run.ts` for non-interactive runs.
+    fn session_ruleset_autonomous_allows_questions_but_not_plan_toggles() {
         let r = session_ruleset(true);
         let arr = r.as_array().expect("ruleset is an array");
         assert!(
@@ -2018,150 +4822,152 @@ mod tests {
                 .any(|x| x["permission"] == "*" && x["action"] == "allow"),
             "autonomous keeps the broad allow floor: {arr:?}"
         );
-        for perm in ["question", "plan_enter", "plan_exit"] {
+        assert_eq!(
+            effective_permission_action(&r, "question"),
+            Some("allow"),
+            "QuestionV1 is handled by the typed host channel"
+        );
+        for perm in ["plan_enter", "plan_exit"] {
             assert!(
                 arr.iter()
                     .any(|x| x["permission"] == perm && x["action"] == "deny"),
                 "autonomous must DENY the interactive prompt {perm}: {arr:?}"
             );
         }
-        // Nothing else is denied — the loop is otherwise fully autonomous.
         assert_eq!(
             arr.iter().filter(|x| x["action"] == "deny").count(),
-            3,
-            "autonomous denies ONLY the three interactive prompts: {arr:?}"
+            2,
+            "autonomous denies only base-side plan toggles: {arr:?}"
         );
+        for permission in ["patch", "future_write_tool", "mcp__filesystem__write_file"] {
+            assert_eq!(
+                effective_permission_action(&r, permission),
+                Some("allow"),
+                "Auto explicitly authorizes {permission} through its wildcard floor"
+            );
+        }
     }
 
     #[test]
-    fn session_ruleset_guarded_asks_on_writes_and_dangerous_bash() {
-        // The `guarded` tier: allow is the floor, but writes/edits and dangerous
-        // shell verbs route to `ask` so the server raises `permission.asked`
-        // (→ NeedApproval) — opencode's counterpart of codex `on-request`.
+    fn session_ruleset_guarded_is_read_allowlisted_and_ask_by_default() {
+        // The Guarded tier is authorization-fail-closed: local inspection is
+        // pre-authorized, while every potentially mutating, delegating, future, or
+        // MCP-provided permission routes through `permission.asked`.
         let r = session_ruleset(false);
         let arr = r.as_array().expect("ruleset is an array");
-        // There is a broad allow floor …
         assert!(
             arr.iter()
+                .any(|x| x["permission"] == "*" && x["action"] == "ask"),
+            "guarded must keep an ask-by-default wildcard floor: {arr:?}"
+        );
+        assert!(
+            !arr.iter()
                 .any(|x| x["permission"] == "*" && x["action"] == "allow"),
-            "guarded keeps a broad allow floor: {arr:?}"
+            "guarded must never reintroduce a wildcard allow: {arr:?}"
         );
-        // … and an `ask` rule for each write permission.
-        for perm in ["edit", "write"] {
-            assert!(
-                arr.iter()
-                    .any(|x| x["permission"] == perm && x["action"] == "ask"),
-                "guarded must ASK before a {perm}: {arr:?}"
+
+        for permission in ["read", "grep", "glob", "list"] {
+            assert_eq!(
+                effective_permission_action(&r, permission),
+                Some("allow"),
+                "known local inspection permission {permission} is safe to pre-authorize"
             );
         }
-        // … and at least one dangerous-bash `ask` rule.
-        assert!(
-            arr.iter()
-                .any(|x| x["permission"] == "bash" && x["action"] == "ask"),
-            "guarded must ASK before a dangerous bash verb: {arr:?}"
-        );
-        // The ONLY denies are the interactive prompts (`question`/`plan_enter`/
-        // `plan_exit`) that would wedge a non-interactive session — the writer surface
-        // itself is never blanket-denied (writes route to `ask`, reads/bash to `allow`).
-        for perm in ["question", "plan_enter", "plan_exit"] {
-            assert!(
-                arr.iter()
-                    .any(|x| x["permission"] == perm && x["action"] == "deny"),
-                "guarded must DENY the interactive prompt {perm}: {arr:?}"
+
+        for permission in [
+            "edit",
+            "write",
+            "patch",
+            "bash",
+            "task",
+            "future_write_tool",
+            "mcp__filesystem__write_file",
+        ] {
+            assert_eq!(
+                effective_permission_action(&r, permission),
+                Some("ask"),
+                "Guarded must ASK before {permission}"
             );
         }
-        assert!(
-            !arr.iter().any(|x| x["action"] == "deny"
-                && x["permission"] != "question"
-                && x["permission"] != "plan_enter"
-                && x["permission"] != "plan_exit"),
-            "guarded never blanket-denies a real tool (only the interactive prompts): {arr:?}"
+
+        assert_eq!(
+            effective_permission_action(&r, "question"),
+            Some("allow"),
+            "guarded questions use the typed host response channel"
         );
+        for permission in ["plan_enter", "plan_exit"] {
+            assert_eq!(
+                effective_permission_action(&r, permission),
+                Some("deny"),
+                "non-interactive Guarded sessions must deny {permission}"
+            );
+        }
     }
 
-    /// A minimal model of opencode's glob matching (the ruleset patterns only
-    /// use `*` = "any run, including empty"; everything else is a literal). Used
-    /// to assert the guarded bash patterns actually catch the dangerous forms —
-    /// a behavioural check on the pattern set, not just its presence.
-    fn glob_match(pattern: &str, text: &str) -> bool {
-        let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
-        // Two-pointer wildcard match with backtracking on the last `*`.
-        let (mut pi, mut ti) = (0usize, 0usize);
-        let (mut star, mut mark) = (None, 0usize);
-        while ti < t.len() {
-            if pi < p.len() && (p[pi] == t[ti]) {
-                pi += 1;
-                ti += 1;
-            } else if pi < p.len() && p[pi] == '*' {
-                star = Some(pi);
-                mark = ti;
-                pi += 1;
-            } else if let Some(s) = star {
-                pi = s + 1;
-                mark += 1;
-                ti = mark;
-            } else {
-                return false;
+    #[test]
+    fn session_ruleset_plan_allows_only_local_inspection() {
+        let rules = session_ruleset_for_profile(BasePermissionProfile::Plan);
+        for permission in ["read", "grep", "glob", "list", "question"] {
+            assert_eq!(
+                effective_permission_action(&rules, permission),
+                Some("allow"),
+                "Plan permits local inspection/questions through {permission}"
+            );
+        }
+        for permission in [
+            "edit",
+            "write",
+            "patch",
+            "bash",
+            "task",
+            "future_write_tool",
+            "mcp__filesystem__write_file",
+        ] {
+            assert_eq!(
+                effective_permission_action(&rules, permission),
+                Some("deny"),
+                "Plan must deny {permission} through its wildcard floor"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_and_resume_share_the_exact_profile_payload_matrix() {
+        for (profile, mutating_action) in [
+            (BasePermissionProfile::Plan, "deny"),
+            (BasePermissionProfile::Guarded, "ask"),
+            (BasePermissionProfile::Auto, "allow"),
+        ] {
+            let payload = session_permission_payload(profile);
+            assert_eq!(payload["permission"], session_ruleset_for_profile(profile));
+            for permission in ["edit", "write", "bash", "future_mutator"] {
+                assert_eq!(
+                    effective_permission_action(&payload["permission"], permission),
+                    Some(mutating_action),
+                    "{profile:?} {permission}"
+                );
             }
         }
-        while pi < p.len() && p[pi] == '*' {
-            pi += 1;
-        }
-        pi == p.len()
     }
 
-    #[test]
-    fn glob_match_models_opencode_wildcards() {
-        assert!(glob_match("rm *", "rm -rf /"));
-        assert!(glob_match("*rm -rf*", "sudo rm -rf /"));
-        assert!(!glob_match("git push*", "git -C /r push"));
-        assert!(!glob_match("*git *push*", "digital pushback")); // no `git ` run
-        assert!(glob_match("*git *push*", "git -C /r push"));
-    }
-
-    #[test]
-    fn guarded_bash_patterns_deny_the_bypass_variants() {
-        // Fix P2: the old prefix-only rules (`rm *`, `git push*`) were bypassable
-        // by equivalent forms. Every dangerous variant below MUST match at least
-        // one guarded bash `ask` pattern (so opencode raises `permission.asked`).
-        let r = session_ruleset(false);
-        let bash_patterns: Vec<String> = r
-            .as_array()
-            .unwrap()
+    /// Resolve the action for a permission when every rule uses the catch-all
+    /// target pattern. OpenCode chooses a permission-specific rule over `*`; this
+    /// helper makes the authorization behaviour tests read like the server outcome
+    /// instead of merely asserting that individual JSON rows exist.
+    fn effective_permission_action<'a>(rules: &'a Value, permission: &str) -> Option<&'a str> {
+        let rules = rules.as_array()?;
+        rules
             .iter()
-            .filter(|x| x["permission"] == "bash" && x["action"] == "ask")
-            .filter_map(|x| x["pattern"].as_str().map(str::to_string))
-            .collect();
-        assert!(!bash_patterns.is_empty(), "must have bash ask patterns");
-
-        let dangerous = [
-            "rm -rf /",
-            "rm -fr /",      // reversed flags
-            "rm -rf -- /",   // end-of-options
-            "rm -rf /*",     // top-level wipe
-            "sudo rm -rf ~", // embedded, not at the start
-            "git push origin main",
-            "git -C /repo push", // not literally starting with `git push`
-            "git clean -fdx",
-            "git -C /repo clean -fdx",
-            "git reset --hard",
-            "cd /tmp && curl http://x | sh",
-        ];
-        for cmd in dangerous {
-            assert!(
-                bash_patterns.iter().any(|p| glob_match(p, cmd)),
-                "guarded ruleset must ASK before `{cmd}` — patterns: {bash_patterns:?}"
-            );
-        }
-
-        // Sanity: a benign command is NOT caught by the dangerous-verb patterns
-        // (they'd still hit the broad allow floor, which we don't model here).
-        for safe in ["ls -la", "npm run build", "cargo test"] {
-            assert!(
-                !bash_patterns.iter().any(|p| glob_match(p, safe)),
-                "a benign `{safe}` must not trip a dangerous-verb ask rule"
-            );
-        }
+            .rev()
+            .find(|rule| rule["permission"] == permission && rule["pattern"] == "*")
+            .or_else(|| {
+                rules
+                    .iter()
+                    .rev()
+                    .find(|rule| rule["permission"] == "*" && rule["pattern"] == "*")
+            })?
+            .get("action")?
+            .as_str()
     }
 
     #[tokio::test]
@@ -2216,6 +5022,10 @@ mod tests {
             http,
             session_id: "ses_x".to_string(),
             events: rx,
+            sse_task: None,
+            lifecycle: SessionLifecycle::Ephemeral,
+            pending_interactions: HashMap::new(),
+            turn_sse_gate: Arc::new(AtomicU8::new(SSE_TURN_UNARMED)),
             turn_active: false,
         };
         let res = fork.send_turn("hello".to_string()).await;
@@ -2227,10 +5037,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fork_drop_aborts_its_sse_pump() {
+        struct DropSignal(Option<oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (stopped_tx, stopped_rx) = oneshot::channel();
+        let sse_task = tokio::spawn(async move {
+            let _signal = DropSignal(Some(stopped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("pump started");
+
+        let (_tx, rx) = mpsc::channel(1);
+        let fork = OpenCodeForkSession {
+            http: HttpCtx::new_with_timeout(
+                "http://127.0.0.1:1".to_string(),
+                "pw",
+                Path::new("/proj"),
+                Duration::from_millis(100),
+            ),
+            session_id: "ses_drop".to_string(),
+            events: rx,
+            sse_task: Some(sse_task),
+            lifecycle: SessionLifecycle::Ephemeral,
+            pending_interactions: HashMap::new(),
+            turn_sse_gate: Arc::new(AtomicU8::new(SSE_TURN_UNARMED)),
+            turn_active: false,
+        };
+        drop(fork);
+        tokio::time::timeout(Duration::from_secs(2), stopped_rx)
+            .await
+            .expect("aborted pump drops promptly")
+            .expect("drop signal delivered");
+    }
+
+    #[tokio::test]
+    async fn readonly_fork_rejects_even_an_allow_response() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("permission reply");
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                .await
+                .unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                request.contains("\"reply\":\"reject\""),
+                "read-only fork must reject authority escalation: {request}"
+            );
+            assert!(!request.contains("\"reply\":\"once\""));
+            tokio::io::AsyncWriteExt::write_all(
+                &mut sock,
+                b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+        let (_tx, rx) = mpsc::channel(1);
+        let mut fork = OpenCodeForkSession {
+            http: HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")),
+            session_id: "ses_readonly".to_string(),
+            events: rx,
+            sse_task: None,
+            lifecycle: SessionLifecycle::Ephemeral,
+            pending_interactions: HashMap::new(),
+            turn_sse_gate: Arc::new(AtomicU8::new(SSE_TURN_UNARMED)),
+            turn_active: false,
+        };
+        fork.respond("per_write", ApprovalDecision::Allow)
+            .await
+            .expect("reject reply succeeds");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_responses_use_distinct_question_and_permission_routes() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for expected in ["question", "permission", "reject"] {
+                let (mut sock, _) = listener.accept().await.expect("typed response");
+                let mut buf = vec![0u8; 8192];
+                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                match expected {
+                    "question" => {
+                        assert!(request.starts_with("POST /question/ask_1/reply "));
+                        let body = request.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+                        assert_eq!(
+                            serde_json::from_str::<Value>(body).unwrap(),
+                            json!({"answers": [["first"], ["second", "custom"]]})
+                        );
+                    }
+                    "permission" => {
+                        assert!(request.starts_with("POST /permission/per_1/reply "));
+                        assert!(request.contains("\"reply\":\"always\""));
+                    }
+                    _ => {
+                        assert!(request.starts_with("POST /question/ask_bad/reject "));
+                    }
+                }
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut sock,
+                    b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+
+        respond_to_interaction(
+            &http,
+            "ask_1",
+            PendingInteraction::Question {
+                question_ids: vec!["ask_1:0".to_string(), "ask_1:1".to_string()],
+            },
+            HostResponse::UserInput {
+                answers: vec![
+                    HostAnswer {
+                        question_id: "ask_1:1".to_string(),
+                        values: vec!["second".to_string(), "custom".to_string()],
+                    },
+                    HostAnswer {
+                        question_id: "ask_1:0".to_string(),
+                        values: vec!["first".to_string()],
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap();
+        respond_to_interaction(
+            &http,
+            "per_1",
+            PendingInteraction::Permission,
+            HostResponse::Approval {
+                decision: ApprovalDecision::Allow,
+                selected_option_id: Some("always".to_string()),
+                message: None,
+            },
+        )
+        .await
+        .unwrap();
+        respond_to_interaction(
+            &http,
+            "ask_bad",
+            PendingInteraction::Question {
+                question_ids: vec!["ask_bad:0".to_string()],
+            },
+            HostResponse::UserInput {
+                answers: vec![HostAnswer {
+                    question_id: "wrong".to_string(),
+                    values: vec!["unsafe".to_string()],
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_preserves_writer_and_deletes_only_ephemeral_fork() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+
+        http.finish_session("ses_writer", SessionLifecycle::Persistent)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "persistent writer cleanup must not issue DELETE"
+        );
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("fork DELETE");
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                .await
+                .unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("DELETE /session/ses_fork "));
+            tokio::io::AsyncWriteExt::write_all(
+                &mut sock,
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntrue",
+            )
+            .await
+            .unwrap();
+        });
+        http.finish_session("ses_fork", SessionLifecycle::Ephemeral)
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn guarded_create_session_sends_ask_ruleset() {
         // End-to-end: a guarded (`autonomous = false`) create_session POSTs the
-        // ask-on-writes ruleset, so opencode will raise `permission.asked` for a
-        // write — the same human-in-the-loop posture codex gets from `on-request`.
+        // ask-by-default ruleset, so opencode will raise `permission.asked` for a
+        // write, patch, shell, future tool, or MCP mutator — the same
+        // human-in-the-loop posture codex gets from `on-request`.
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2241,11 +5265,13 @@ mod tests {
                     .await
                     .unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                // The guarded body carries an `ask` action (not pure wildcard allow).
-                assert!(
-                    req.contains("\"action\":\"ask\""),
-                    "guarded session must request an ask ruleset: {req}"
-                );
+                let posted: Value = serde_json::from_str(
+                    req.split_once("\r\n\r\n")
+                        .map(|(_, body)| body)
+                        .expect("request body"),
+                )
+                .expect("JSON request body");
+                assert_eq!(posted["permission"], session_ruleset(false));
                 let body = br#"{"id":"ses_guarded"}"#;
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2262,6 +5288,115 @@ mod tests {
             .expect("guarded session created");
         assert_eq!(id, "ses_guarded");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn prompt_async_uses_prompt_model_shape_for_explicit_selection() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("prompt request");
+            let mut buf = vec![0u8; 8192];
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                .await
+                .unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("POST /session/ses_model/prompt_async "));
+            let body = request.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+            let posted: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                posted["model"],
+                json!({"providerID": "anthropic", "modelID": "claude-sonnet"})
+            );
+            assert!(posted["model"].get("id").is_none());
+            tokio::io::AsyncWriteExt::write_all(
+                &mut sock,
+                b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        http.prompt_async("ses_model", "continue", Some("anthropic/claude-sonnet"))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_prompt_async_returns_an_exact_protocol_receipt() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("prompt request");
+            let mut buf = vec![0_u8; 8192];
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                .await
+                .unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("POST /session/ses_ack/prompt_async "));
+            tokio::io::AsyncWriteExt::write_all(
+                &mut sock,
+                b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let (_tx, rx) = mpsc::channel(1);
+        let mut session = OpenCodeForkSession {
+            http,
+            session_id: "ses_ack".to_string(),
+            events: rx,
+            sse_task: None,
+            lifecycle: SessionLifecycle::Persistent,
+            pending_interactions: HashMap::new(),
+            turn_sse_gate: Arc::new(AtomicU8::new(SSE_TURN_UNARMED)),
+            turn_active: false,
+        };
+
+        let report = session
+            .send_input(TurnInput::text("continue"))
+            .await
+            .expect("documented 204 response accepts the exact prompt");
+        assert_eq!(report.receipt, DeliveryReceiptStage::ProtocolAcknowledged);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_file_part_uses_a_roundtrippable_file_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("中文 路径.txt");
+        std::fs::write(&file, "fixture").unwrap();
+        let prepared = crate::turn_input::prepare(TurnInput::new(vec![
+            umadev_runtime::TurnInputBlock::Text {
+                text: "before".into(),
+            },
+            umadev_runtime::TurnInputBlock::File {
+                path: file.clone(),
+                mode: umadev_runtime::FileInputMode::NativeOnly,
+            },
+            umadev_runtime::TurnInputBlock::Text {
+                text: "after".into(),
+            },
+        ]))
+        .await
+        .unwrap();
+        let (parts, deliveries) = opencode_parts(&prepared).unwrap();
+        assert_eq!(parts[0]["text"], "before");
+        assert_eq!(parts[1]["type"], "file");
+        assert_eq!(parts[1]["mime"], "text/plain; charset=utf-8");
+        assert_eq!(parts[2]["text"], "after");
+        let uri = url::Url::parse(parts[1]["url"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(uri.to_file_path().unwrap()).unwrap(),
+            std::fs::canonicalize(file).unwrap()
+        );
+        assert_eq!(deliveries, vec![InputDelivery::Native; 3]);
     }
 
     #[tokio::test]
@@ -2390,7 +5525,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho 'opencode server listening on http://127.0.0.1:{port}'\nsleep 60\n"
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '1.17.16'; exit 0; fi\necho 'opencode server listening on http://127.0.0.1:{port}'\nsleep 60\n"
             ),
         )
         .unwrap();
@@ -2420,6 +5555,113 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn resume_gets_session_replaces_permissions_and_reattaches_sse() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sse_seen_tx, sse_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut sse_seen_tx = Some(sse_seen_tx);
+            for step in 0..3 {
+                let (mut sock, _) = listener.accept().await.expect("resume request");
+                let mut buf = vec![0u8; 8192];
+                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                match step {
+                    0 => {
+                        assert!(request.starts_with("GET /session/ses_resume "));
+                        let body = br#"{"id":"ses_resume","title":"persisted"}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        tokio::io::AsyncWriteExt::write_all(&mut sock, response.as_bytes())
+                            .await
+                            .unwrap();
+                        tokio::io::AsyncWriteExt::write_all(&mut sock, body)
+                            .await
+                            .unwrap();
+                    }
+                    1 => {
+                        assert!(request.starts_with("PATCH /session/ses_resume "));
+                        let body = request.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+                        let posted: Value = serde_json::from_str(body).unwrap();
+                        assert_eq!(
+                            posted["permission"],
+                            session_ruleset_for_profile(BasePermissionProfile::Plan)
+                        );
+                        assert_eq!(
+                            effective_permission_action(&posted["permission"], "future_mutator"),
+                            Some("deny"),
+                            "resume must replace a possible stale Auto wildcard allow"
+                        );
+                        let response_body = br#"{"id":"ses_resume"}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            response_body.len()
+                        );
+                        tokio::io::AsyncWriteExt::write_all(&mut sock, response.as_bytes())
+                            .await
+                            .unwrap();
+                        tokio::io::AsyncWriteExt::write_all(&mut sock, response_body)
+                            .await
+                            .unwrap();
+                    }
+                    _ => {
+                        assert!(request.starts_with("GET /event?"));
+                        let _ = sse_seen_tx.take().expect("one SSE").send(());
+                        tokio::io::AsyncWriteExt::write_all(
+                            &mut sock,
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+            }
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("fake-opencode-resume");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '1.18.1'; exit 0; fi\necho 'opencode server listening on http://127.0.0.1:{port}'\nsleep 60\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut session = OpenCodeSession::resume_with_program_timeout(
+            script.to_str().unwrap(),
+            dir.path(),
+            None,
+            "ses_resume",
+            BasePermissionProfile::Plan,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("persisted session resumes");
+        assert_eq!(session.session_id(), "ses_resume");
+        assert_eq!(
+            <OpenCodeSession as BaseSession>::session_id(&session),
+            Some("ses_resume"),
+            "workflow state must persist the OpenCode resume pointer"
+        );
+        tokio::time::timeout(Duration::from_secs(2), sse_seen_rx)
+            .await
+            .expect("SSE reattached")
+            .expect("SSE observer alive");
+        session.end().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn start_times_out_when_serve_never_announces() {
         use std::os::unix::fs::PermissionsExt as _;
         // A fake serve that prints nothing and just hangs -> start must fail
@@ -2428,7 +5670,11 @@ mod tests {
         // that a concurrent test would observe.
         let dir = tempfile::TempDir::new().unwrap();
         let script = dir.path().join("silent-serve");
-        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '1.17.16'; exit 0; fi\nsleep 30\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let res = OpenCodeSession::start_with_program_timeout(
             script.to_str().unwrap(),
@@ -2506,5 +5752,53 @@ mod tests {
             "stdout was not drained for the session lifetime — the server blocked on a full pipe"
         );
         let _ = child.start_kill();
+    }
+
+    #[test]
+    fn native_events_redact_before_transcript_tool_activity_and_audit() {
+        const SECRET: &str = "SYNTH_OPENCODE_SESSION_SECRET_83";
+        let mut tracker = PartTracker::default();
+        let text = serde_json::json!({
+            "type": "message.part.updated",
+            "properties": {"part": {
+                "id": "part-text-secret",
+                "sessionID": "ses_secret",
+                "type": "text",
+                "text": format!("password={SECRET}")
+            }}
+        })
+        .to_string();
+        let tool = serde_json::json!({
+            "type": "message.part.updated",
+            "properties": {"part": {
+                "id": "part-tool-secret",
+                "sessionID": "ses_secret",
+                "type": "tool",
+                "tool": "bash",
+                "state": {
+                    "status": "completed",
+                    "input": {
+                        "command": format!("curl -H 'Authorization: Bearer {SECRET}' example.test"),
+                        "password": SECRET,
+                        "nextPageToken": "safe-page-3"
+                    },
+                    "title": format!("private_key={SECRET}")
+                }
+            }}
+        })
+        .to_string();
+        let mut events = translate_frame_tracked(&text, "ses_secret", &mut tracker);
+        events.extend(translate_frame_tracked(&tool, "ses_secret", &mut tracker));
+        let audit_view = format!("{events:?}");
+        assert!(
+            !audit_view.contains(SECRET),
+            "event/audit leaked: {audit_view}"
+        );
+        assert!(audit_view.contains("safe-page-3"));
+
+        let mut activity = umadev_runtime::ToolActivity::default();
+        for event in &events {
+            activity.observe(event);
+        }
     }
 }

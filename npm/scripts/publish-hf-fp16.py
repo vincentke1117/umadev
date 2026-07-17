@@ -80,7 +80,7 @@ def main() -> None:
             repo_type="model",
         )
 
-    print("\n✅ done. Your fp16 model is live at:")
+    print("\n[ok] done. Your fp16 model is live at:")
     print(f"   https://huggingface.co/{repo_id}")
     print("   files: config.json · tokenizer.json · model.safetensors (fp16, ~224MB)")
     print(f"\nNext: tell the maintainer the repo id  '{repo_id}'  and cli.js will point")
