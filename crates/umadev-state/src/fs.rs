@@ -492,7 +492,7 @@ mod tests {
         let mut permanent_attempts = 0;
         let error = retry_transient_windows_fs(|| {
             permanent_attempts += 1;
-            Err(std::io::Error::from_raw_os_error(87))
+            Err::<(), _>(std::io::Error::from_raw_os_error(87))
         })
         .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(87));
