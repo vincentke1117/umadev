@@ -221,44 +221,19 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     writer.write_all(&[0x03]).expect("clear pasted draft");
     writer.flush().expect("flush whole-draft clear key");
 
-    // ConPTY can leave several already-painted paste frames queued behind its
-    // output pipe. Render a unique draft first so the reader has crossed that
-    // backlog before it is allowed to recognize the intentional `/quit`.
-    const CLEAR_SYNC_PROBE: &str = "umadev-clear-sync-probe";
-    writer
-        .write_all(CLEAR_SYNC_PROBE.as_bytes())
-        .expect("type clear synchronization probe");
-    writer.flush().expect("flush clear synchronization probe");
-    let clear_deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let rendered = {
-            let bytes = captured.lock().expect("lock terminal capture");
-            let raw = String::from_utf8_lossy(&bytes);
-            umadev_agent::base_error::strip_ansi(&raw).contains(">_ umadev-clear-sync-probe")
-        };
-        if rendered {
-            break;
-        }
-        assert!(
-            Instant::now() < clear_deadline,
-            "UmaDev did not render the clear synchronization probe"
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
-    writer
-        .write_all(&[0x03])
-        .expect("clear synchronization probe");
-    writer.flush().expect("flush synchronization clear key");
-
     let command_capture_start = captured.lock().expect("lock terminal capture").len();
-    writer.write_all(b"/exit").expect("type /exit alias");
-    writer.flush().expect("flush /exit text");
+    const SUBMIT_SYNC: &str = "⚑";
+    writer
+        .write_all(format!("/quit {SUBMIT_SYNC}").as_bytes())
+        .expect("type synchronized /quit command");
+    writer.flush().expect("flush synchronized /quit text");
     let command_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let rendered = {
             let bytes = captured.lock().expect("lock terminal capture");
-            let raw = String::from_utf8_lossy(&bytes[command_capture_start..]);
-            umadev_agent::base_error::strip_ansi(&raw).contains("/exit")
+            bytes[command_capture_start..]
+                .windows(SUBMIT_SYNC.len())
+                .any(|window| window == SUBMIT_SYNC.as_bytes())
         };
         if rendered {
             break;
@@ -268,7 +243,7 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
             let raw = String::from_utf8_lossy(&bytes[command_capture_start..]);
             let visible = umadev_agent::base_error::strip_ansi(&raw);
             panic!(
-                "UmaDev did not render the intentional /exit command; visible terminal tail: {visible}"
+                "UmaDev did not render the synchronized /quit command; visible terminal tail: {visible}"
             );
         }
         thread::sleep(Duration::from_millis(25));
@@ -280,8 +255,8 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     // ConPTY's UTF-8 pipe needs the Windows CRLF line ending once the input
     // frame is fully rendered; Unix PTYs represent Enter as a lone CR.
     let submit: &[u8] = if cfg!(windows) { b"\r\n" } else { b"\r" };
-    writer.write_all(submit).expect("press Enter after /exit");
-    writer.flush().expect("flush /exit submit key");
+    writer.write_all(submit).expect("press Enter after /quit");
+    writer.flush().expect("flush /quit submit key");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let (status, timed_out) = loop {
@@ -301,7 +276,7 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     let output_bytes = captured.lock().expect("lock terminal capture");
     let output = String::from_utf8_lossy(&output_bytes);
 
-    assert!(!timed_out, "UmaDev did not accept /exit: {output}");
+    assert!(!timed_out, "UmaDev did not accept /quit: {output}");
     assert!(status.success(), "UmaDev exited unsuccessfully: {status}");
     assert!(
         output.contains("UmaDev"),
