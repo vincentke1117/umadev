@@ -221,6 +221,35 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     writer.write_all(&[0x03]).expect("clear pasted draft");
     writer.flush().expect("flush whole-draft clear key");
 
+    // ConPTY can leave several already-painted paste frames queued behind its
+    // output pipe. Render a unique draft first so the reader has crossed that
+    // backlog before it is allowed to recognize the intentional `/quit`.
+    const CLEAR_SYNC_PROBE: &str = "umadev-clear-sync-probe";
+    writer
+        .write_all(CLEAR_SYNC_PROBE.as_bytes())
+        .expect("type clear synchronization probe");
+    writer.flush().expect("flush clear synchronization probe");
+    let clear_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rendered = {
+            let bytes = captured.lock().expect("lock terminal capture");
+            let raw = String::from_utf8_lossy(&bytes);
+            umadev_agent::base_error::strip_ansi(&raw).contains(">_ umadev-clear-sync-probe")
+        };
+        if rendered {
+            break;
+        }
+        assert!(
+            Instant::now() < clear_deadline,
+            "UmaDev did not render the clear synchronization probe"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    writer
+        .write_all(&[0x03])
+        .expect("clear synchronization probe");
+    writer.flush().expect("flush synchronization clear key");
+
     let command_capture_start = captured.lock().expect("lock terminal capture").len();
     writer.write_all(b"/quit").expect("type /quit");
     writer.flush().expect("flush /quit text");
