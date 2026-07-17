@@ -215,10 +215,11 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
         "an embedded newline in bracketed paste submitted /quit instead of remaining atomic"
     );
 
-    // Clear the pasted draft before sending the intentional command. Ctrl+U is
-    // portable across the required shells and exercises the real editing path.
-    writer.write_all(&[0x15]).expect("clear pasted draft");
-    writer.flush().expect("flush clear-line key");
+    // Clear the entire pasted draft before sending the intentional command.
+    // Idle Ctrl+C is UmaDev's cross-platform whole-input clear gesture; Ctrl+U
+    // only clears the current line and leaves earlier bracketed-paste lines.
+    writer.write_all(&[0x03]).expect("clear pasted draft");
+    writer.flush().expect("flush whole-draft clear key");
 
     writer.write_all(b"/quit\r").expect("send /quit");
     writer.flush().expect("flush /quit");
