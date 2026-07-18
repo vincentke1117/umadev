@@ -1159,15 +1159,11 @@ impl HostDriver for AcpDriver {
                 }
             },
         };
+        // Any installed version that answers `--version` probes Ready — an
+        // unaudited Kimi is no longer marked Unhealthy in the picker. It runs on the
+        // baseline ACP contract (the enhanced source-verified capabilities stay
+        // gated behind the audited version), matching how Grok already degrades.
         match version_output(&program).await {
-            Some(version)
-                if matches!(self.vendor, AcpVendor::Kimi)
-                    && !crate::kimi_contract::is_audited_cli_version(&version) =>
-            {
-                ProbeResult::Unhealthy {
-                    detail: kimi_version_mismatch_detail(&version),
-                }
-            }
             Some(version) => ProbeResult::Ready {
                 version,
                 auth_state: self.probe_auth().await,
@@ -8154,13 +8150,19 @@ fn validate_initialize(vendor: AcpVendor, result: &Value) -> Result<(), SessionE
             "ACP agent did not negotiate protocol version 1".to_string(),
         ));
     }
+    // For Kimi, require the peer to be RECOGNIZABLY Kimi Code (official identity +
+    // a parseable version) — a genuinely different program on PATH (a name
+    // collision, e.g. the retired Python `kimi`) is still rejected with a clear
+    // error. But a newer Kimi Code release is NOT rejected on version: it degrades
+    // exactly like Grok, running on the baseline ACP contract with the enhanced
+    // source-verified capabilities simply off (`kimi_source_contract == false` in
+    // `negotiated_capabilities`). So a routine Kimi upgrade keeps working.
     if matches!(vendor, AcpVendor::Kimi)
-        && !kimi_source_profile_from_initialize(result).is_audited_version()
+        && !kimi_source_profile_from_initialize(result).is_kimi_code_identity()
     {
-        return Err(SessionError::Start(format!(
-            "Kimi Code ACP identity/version does not match the source-audited {} contract; install that official release or update UmaDev after a new source audit",
-            crate::kimi_contract::KIMI_CODE_SOURCE_VERSION
-        )));
+        return Err(SessionError::Start(
+            "the `kimi` on PATH did not identify itself as Kimi Code CLI over ACP — check that Kimi Code (not another `kimi`) is installed, or set UMADEV_KIMI_BIN to the Kimi Code executable".to_string(),
+        ));
     }
     Ok(())
 }
@@ -8393,35 +8395,20 @@ async fn require_resolved_vendor_program(
     vendor: AcpVendor,
     program: String,
 ) -> Result<String, SessionError> {
-    let Some(version) = version_output(&program).await else {
+    // Only require that the program is installed and answers `--version`. A version
+    // UmaDev has not source-audited is NOT refused here: the session runs on the
+    // baseline ACP protocol (protocolVersion 1 is still enforced at
+    // `validate_initialize`), and only the enhanced, source-verified capabilities
+    // stay gated behind the audited version (see `negotiated_capabilities`). This
+    // matches Grok, which already degrades instead of blocking — so a routine
+    // upstream Kimi upgrade no longer makes the base unusable.
+    if version_output(&program).await.is_none() {
         return Err(SessionError::Start(format!(
             "{} is not installed or not on PATH",
             vendor.display_name()
         )));
-    };
-    if matches!(vendor, AcpVendor::Kimi) && !crate::kimi_contract::is_audited_cli_version(&version)
-    {
-        return Err(SessionError::Start(kimi_version_mismatch_detail(&version)));
     }
     Ok(program)
-}
-
-fn kimi_version_mismatch_detail(version: &str) -> String {
-    let audited = crate::kimi_contract::KIMI_CODE_SOURCE_VERSION;
-    let install = format!("npm install -g @moonshot-ai/kimi-code@{audited}");
-    if version.trim().starts_with("kimi, version ") {
-        let locate = if cfg!(windows) {
-            "where kimi"
-        } else {
-            "which -a kimi"
-        };
-        return format!(
-            "PATH resolves `kimi` to the retired Python kimi-cli ({version}), not the source-audited Kimi Code CLI `{audited}`. Install the official replacement with `{install}`, run `{locate}` to find command collisions, then remove the legacy PATH entry or set UMADEV_KIMI_BIN to the official executable"
-        );
-    }
-    format!(
-        "Kimi Code CLI `{version}` is outside UmaDev's source-audited release `{audited}`; install that exact release with `{install}`. If multiple `kimi` commands exist, set UMADEV_KIMI_BIN to the audited executable"
-    )
 }
 
 fn resolve_and_validate_vendor_program(
@@ -9102,20 +9089,32 @@ mod tests {
     }
 
     #[test]
-    fn kimi_version_diagnostic_distinguishes_retired_python_cli_and_path_collisions() {
-        let legacy = kimi_version_mismatch_detail("kimi, version 0.53");
-        assert!(legacy.contains("retired Python kimi-cli"));
-        assert!(legacy.contains("@moonshot-ai/kimi-code@0.26.0"));
-        assert!(legacy.contains("UMADEV_KIMI_BIN"));
-        if cfg!(windows) {
-            assert!(legacy.contains("where kimi"));
-        } else {
-            assert!(legacy.contains("which -a kimi"));
-        }
+    fn a_newer_kimi_is_accepted_and_only_a_wrong_identity_is_rejected() {
+        // The reported regression: a routine Kimi upgrade (0.26.0 → 0.27.0) must NOT
+        // make the base unusable. A newer, correctly-identified Kimi Code passes
+        // validation and runs on the baseline contract (audited enhancements off);
+        // only a genuinely different program on PATH (wrong ACP identity) is refused.
+        let newer = json!({
+            "protocolVersion":1,
+            "agentInfo":{"name":"Kimi Code CLI","version":"0.27.0"},
+        });
+        assert!(
+            validate_initialize(AcpVendor::Kimi, &newer).is_ok(),
+            "a newer Kimi Code release must be accepted, not refused"
+        );
+        assert!(
+            !negotiated_capabilities(AcpVendor::Kimi, &newer).kimi_source_contract,
+            "the audited source contract stays gated behind the exact audited version"
+        );
 
-        let future = kimi_version_mismatch_detail("0.27.0");
-        assert!(future.contains("outside UmaDev's source-audited release"));
-        assert!(future.contains("UMADEV_KIMI_BIN"));
+        let wrong_program = json!({
+            "protocolVersion":1,
+            "agentInfo":{"name":"Kimi CLI","version":"0.53.0"},
+        });
+        assert!(
+            validate_initialize(AcpVendor::Kimi, &wrong_program).is_err(),
+            "a different `kimi` on PATH (wrong ACP identity) is still rejected"
+        );
     }
 
     #[test]
@@ -9630,12 +9629,24 @@ mod tests {
         assert!(capabilities.resume && capabilities.load && capabilities.set_mode);
         assert!(!capabilities.interject && !capabilities.prompt_queue);
 
-        for value in [
-            json!({"protocolVersion":1,"agentInfo":{"name":"Kimi Code CLI","version":"0.26.1"}}),
-            json!({"protocolVersion":1,"agentInfo":{"name":"Kimi CLI","version":crate::kimi_contract::KIMI_CODE_SOURCE_VERSION}}),
-        ] {
-            assert!(validate_initialize(AcpVendor::Kimi, &value).is_err());
-        }
+        // A newer Kimi Code (right identity, unaudited version) is accepted and
+        // degrades; only a WRONG identity (a different `kimi`) is rejected.
+        assert!(
+            validate_initialize(
+                AcpVendor::Kimi,
+                &json!({"protocolVersion":1,"agentInfo":{"name":"Kimi Code CLI","version":"0.26.1"}})
+            )
+            .is_ok(),
+            "a newer Kimi Code release must not be refused on version"
+        );
+        assert!(
+            validate_initialize(
+                AcpVendor::Kimi,
+                &json!({"protocolVersion":1,"agentInfo":{"name":"Kimi CLI","version":crate::kimi_contract::KIMI_CODE_SOURCE_VERSION}})
+            )
+            .is_err(),
+            "a different `kimi` (wrong ACP identity) is still rejected"
+        );
 
         let wire = serde_json::to_value(
             InitializeRequest::new(ProtocolVersion::V1).client_capabilities(

@@ -103,6 +103,21 @@ impl KimiSourceProfile {
     pub const fn is_audited_version(&self) -> bool {
         matches!(self.source_match, KimiSourceMatch::AuditedVersion)
     }
+
+    /// Whether the peer is recognizably Kimi Code at all — the official identity
+    /// plus a parseable version — regardless of whether that version is the exact
+    /// source-audited one. This is what a session gate should require: a genuinely
+    /// different program (a name collision, e.g. the retired Python `kimi`, or a
+    /// malformed identity) is rejected, while a newer Kimi Code release is allowed
+    /// to run on the baseline contract (the audited enhancements stay gated behind
+    /// [`Self::is_audited_version`]).
+    #[must_use]
+    pub const fn is_kimi_code_identity(&self) -> bool {
+        matches!(
+            self.source_match,
+            KimiSourceMatch::AuditedVersion | KimiSourceMatch::OutsideAuditedRange
+        )
+    }
 }
 
 /// Classify the official `agentInfo` identity in an ACP initialize response.
