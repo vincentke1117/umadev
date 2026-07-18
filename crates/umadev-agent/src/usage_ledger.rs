@@ -600,7 +600,7 @@ fn reclaim_stale_lock(lock_path: &Path) -> bool {
         return false;
     };
     let tomb = parent.join(format!(".usage-ledger.stale.{}", new_nonce("reclaim")));
-    if fs::rename(lock_path, &tomb).is_err() {
+    if umadev_state::fs::rename(lock_path, &tomb).is_err() {
         return false;
     }
     let _ = umadev_state::fs::remove_regular_file(&tomb.join(LOCK_OWNER));
@@ -700,7 +700,7 @@ fn safe_read_tail(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let mut file = options.open(path)?;
+    let mut file = umadev_state::fs::retry_transient(|| options.open(path))?;
     let metadata = file.metadata()?;
     if !umadev_state::fs::metadata_is_real_file(&metadata) {
         return Err(std::io::Error::new(
@@ -855,7 +855,7 @@ fn rotate_locked(path: &Path, config: LedgerConfig) -> std::io::Result<()> {
         let target = archive_path(path, index + 1);
         match fs::symlink_metadata(&source) {
             Ok(metadata) if umadev_state::fs::metadata_is_real_file(&metadata) => {
-                fs::rename(source, target)?;
+                umadev_state::fs::rename(&source, &target)?;
             }
             Ok(_) => {
                 return Err(std::io::Error::new(
@@ -869,7 +869,7 @@ fn rotate_locked(path: &Path, config: LedgerConfig) -> std::io::Result<()> {
     }
     match fs::symlink_metadata(path) {
         Ok(metadata) if umadev_state::fs::metadata_is_real_file(&metadata) => {
-            fs::rename(path, archive_path(path, 1))?;
+            umadev_state::fs::rename(path, &archive_path(path, 1))?;
         }
         Ok(_) => {
             return Err(std::io::Error::new(
@@ -1466,7 +1466,23 @@ mod tests {
                 child * 10_000 + index,
             );
             record.ts_ms = child * count + index;
-            append_record_to_path(Path::new(&path), &record, config(8 * 1024 * 1024, 3)).unwrap();
+            // The cross-process lock is correct under contention — it just makes a
+            // caller WAIT, and on a loaded Windows CI runner (Defender scanning every
+            // create_dir / rename / atomic_write) six processes hammering one lock can
+            // exceed the 10s acquisition window, surfacing WouldBlock. Production
+            // treats that as fail-open telemetry; this test asserts the STRONGER
+            // invariant that every record lands with no loss and no torn rows, so a
+            // contended WouldBlock must be RETRIED, never dropped and never `unwrap`ed
+            // into a panic. Anything other than a busy lock is still a real failure.
+            loop {
+                match append_record_to_path(Path::new(&path), &record, config(8 * 1024 * 1024, 3)) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("append failed with a non-contention error: {error}"),
+                }
+            }
         }
     }
 

@@ -443,7 +443,7 @@ impl Drop for PolicyLock {
             return;
         }
         let _ = crate::fs::remove_regular_file(&owner);
-        let _ = std::fs::remove_dir(&self.path);
+        let _ = crate::fs::remove_empty_dir(&self.path);
     }
 }
 
@@ -465,9 +465,9 @@ fn reclaim_stale_policy_lock(lock: &Path) {
         return;
     };
     let tomb = parent.join(format!(".policy.lock.stale.{}", lock_nonce()));
-    if std::fs::rename(lock, &tomb).is_ok() {
+    if crate::fs::rename(lock, &tomb).is_ok() {
         let _ = crate::fs::remove_regular_file(&tomb.join(POLICY_LOCK_OWNER));
-        let _ = std::fs::remove_dir(tomb);
+        let _ = crate::fs::remove_empty_dir(&tomb);
     }
 }
 
@@ -475,14 +475,14 @@ fn acquire_policy_lock(boundary: &Path) -> std::io::Result<PolicyLock> {
     let memory = ensure_memory_dir(boundary)?;
     let lock = memory.join(POLICY_LOCK_DIR);
     for _ in 0..POLICY_LOCK_ATTEMPTS {
-        match std::fs::create_dir(&lock) {
+        match crate::fs::create_dir(&lock) {
             Ok(()) => {
                 let nonce = lock_nonce();
                 let owner = format!("{}\n{nonce}", now_ms());
                 if let Err(error) =
                     crate::fs::atomic_write(&lock.join(POLICY_LOCK_OWNER), owner.as_bytes())
                 {
-                    let _ = std::fs::remove_dir(&lock);
+                    let _ = crate::fs::remove_empty_dir(&lock);
                     return Err(error);
                 }
                 return Ok(PolicyLock { path: lock, nonce });

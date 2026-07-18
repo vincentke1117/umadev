@@ -206,7 +206,7 @@ impl Drop for LifecycleLock {
             return;
         }
         let _ = crate::fs::remove_regular_file(&owner);
-        let _ = std::fs::remove_dir(&self.path);
+        let _ = crate::fs::remove_empty_dir(&self.path);
     }
 }
 
@@ -228,9 +228,9 @@ fn reclaim_stale_lock(lock: &Path) {
         return;
     };
     let stale = parent.join(format!(".lifecycle.lock.stale.{}", operation_id()));
-    if std::fs::rename(lock, &stale).is_ok() {
+    if crate::fs::rename(lock, &stale).is_ok() {
         let _ = crate::fs::remove_regular_file(&stale.join(LOCK_OWNER));
-        let _ = std::fs::remove_dir(stale);
+        let _ = crate::fs::remove_empty_dir(&stale);
     }
 }
 
@@ -238,14 +238,14 @@ fn acquire_lock(boundary: &Path) -> std::io::Result<LifecycleLock> {
     let memory = ensure_memory_dir(boundary)?;
     let lock = memory.join(LOCK_DIR);
     for _ in 0..LOCK_ATTEMPTS {
-        match std::fs::create_dir(&lock) {
+        match crate::fs::create_dir(&lock) {
             Ok(()) => {
                 let nonce = operation_id();
                 let owner = format!("{}\n{nonce}", now_ms());
                 if let Err(error) =
                     crate::fs::atomic_write(&lock.join(LOCK_OWNER), owner.as_bytes())
                 {
-                    let _ = std::fs::remove_dir(&lock);
+                    let _ = crate::fs::remove_empty_dir(&lock);
                     return Err(error);
                 }
                 return Ok(LifecycleLock { path: lock, nonce });
@@ -371,7 +371,7 @@ impl LifecycleTransaction {
         })?;
         crate::fs::atomic_write(&self.pending_dir.join("tombstone.json"), &tombstone_bytes)?;
         crate::fs::atomic_write(&self.audit_path, &audit_bytes)?;
-        std::fs::rename(&self.pending_dir, &self.final_dir)?;
+        crate::fs::rename(&self.pending_dir, &self.final_dir)?;
         self.committed = true;
 
         audit.state = AuditState::Committed;

@@ -202,34 +202,51 @@ pub fn codex_sandbox_override() -> Option<String> {
 /// [`crate::claude_session`] `UMADEV_CLAUDE_PERMISSION_MODE` precedent, but reads
 /// the **thread-safe shared override** ([`codex_sandbox_override`], seeded once
 /// from `UMADEV_CODEX_SANDBOX` then driven by [`set_codex_sandbox`]) rather than
-/// the env per call — a runtime `set_var` racing this read would be UB. Fail-open:
-/// Guarded and Auto use the normal execution path: an explicit override wins,
-/// otherwise Codex receives `danger-full-access`. Plan is forced to `read-only`; a
-/// project override can never silently widen a mode whose public contract is
-/// read-only.
+/// the env per call — a runtime `set_var` racing this read would be UB. Fail-open
+/// and tiered by trust mode:
+/// - **Plan** → `read-only`; a project override can never silently widen a mode
+///   whose public contract is read-only.
+/// - **Guarded** (the default) → `workspace-write`; an approved-but-misjudged
+///   command stays confined to the workspace, so the blast radius of a single
+///   wrong approval is bounded. This is the 1.0.55 behavior.
+/// - **Auto** → `danger-full-access`; the user has pre-authorized full access.
+///
+/// An explicit override (env / project config) still wins on Guarded and Auto —
+/// so a user who genuinely needs network-heavy work under Guarded can opt in —
+/// but the DEFAULT no longer hands full filesystem/process/network access to an
+/// approved command in the default mode.
 ///
 /// (The read-only critic fork — [`thread_start_params_readonly`] — is NEVER driven
 /// by this: its `read-only` sandbox is the single-writer invariant, not a knob.)
 ///
-/// This access flag is intentionally independent of confirmation-gate autonomy:
-/// Guarded still pauses at UmaDev's own gates, but the worker itself needs the
-/// same filesystem/network/process/local-port capabilities as Auto. Explicit
-/// project restrictions remain authoritative on both execution tiers.
+/// The sandbox tier is independent of confirmation-gate autonomy: Guarded still
+/// pauses at UmaDev's own gates AND now confines the worker to the workspace,
+/// while Auto both pre-authorizes gates and grants full access.
 pub(crate) fn codex_sandbox_mode(permissions: BasePermissionProfile) -> &'static str {
     let configured = codex_sandbox_override();
-    resolve_codex_launch_sandbox(permissions.full_access(), configured.as_deref())
+    resolve_codex_launch_sandbox(
+        permissions.full_access(),
+        permissions.auto_approve(),
+        configured.as_deref(),
+    )
 }
 
-/// Pure policy core for [`codex_sandbox_mode`]. A Plan session is always
-/// read-only. A normal execution session honors an explicit restriction and
-/// otherwise receives the complete development environment.
-fn resolve_codex_launch_sandbox(full_access: bool, configured: Option<&str>) -> &'static str {
+/// Pure policy core for [`codex_sandbox_mode`]. Plan is always read-only; an
+/// explicit restriction wins for the writable tiers; otherwise Auto receives the
+/// complete development environment while Guarded is confined to the workspace.
+fn resolve_codex_launch_sandbox(
+    full_access: bool,
+    auto_approve: bool,
+    configured: Option<&str>,
+) -> &'static str {
     if !full_access {
         "read-only"
     } else if configured.is_some() {
         resolve_codex_sandbox(configured)
-    } else {
+    } else if auto_approve {
         "danger-full-access"
+    } else {
+        "workspace-write"
     }
 }
 
@@ -3618,10 +3635,11 @@ mod tests {
             Path::new("/tmp/p"),
             "gpt-5-codex",
             BasePermissionProfile::Guarded,
-            resolve_codex_launch_sandbox(true, None),
+            resolve_codex_launch_sandbox(true, false, None),
         );
         assert_eq!(guarded["approvalPolicy"], "on-request");
-        assert_eq!(guarded["sandbox"], "danger-full-access");
+        // Guarded (the default) confines an approved command to the workspace.
+        assert_eq!(guarded["sandbox"], "workspace-write");
         assert_eq!(guarded["model"], "gpt-5-codex");
         assert_eq!(
             guarded["developerInstructions"],
@@ -3635,7 +3653,7 @@ mod tests {
             Path::new("/tmp/p"),
             "claude-sonnet-4-6",
             BasePermissionProfile::Plan,
-            resolve_codex_launch_sandbox(false, None),
+            resolve_codex_launch_sandbox(false, false, None),
         );
         assert_eq!(plan["approvalPolicy"], "never");
         assert_eq!(plan["sandbox"], "read-only");
@@ -3699,14 +3717,15 @@ mod tests {
             "Plan cannot be widened by a project override"
         );
 
-        // Clearing it falls back to the access-profile defaults (no env
-        // involved): Plan → read-only; Guarded/Auto execution → full access.
+        // Clearing it falls back to the access-profile defaults (no env involved):
+        // Plan → read-only; Guarded → workspace-write (approved-but-confined); Auto
+        // → full access.
         set_codex_sandbox(None);
         assert_eq!(codex_sandbox_override(), None);
         assert_eq!(codex_sandbox_mode(BasePermissionProfile::Plan), "read-only");
         assert_eq!(
             codex_sandbox_mode(BasePermissionProfile::Guarded),
-            "danger-full-access"
+            "workspace-write"
         );
         assert_eq!(
             codex_sandbox_mode(BasePermissionProfile::Auto),
@@ -3874,7 +3893,7 @@ mod tests {
             Path::new("/tmp/p"),
             "gpt-5-codex",
             BasePermissionProfile::Auto,
-            resolve_codex_launch_sandbox(true, None),
+            resolve_codex_launch_sandbox(true, true, None),
         );
         assert_eq!(auto["threadId"], "thr_main");
         assert_eq!(
@@ -3888,7 +3907,7 @@ mod tests {
             Path::new("/tmp/p"),
             "claude-sonnet-4-6",
             BasePermissionProfile::Plan,
-            resolve_codex_launch_sandbox(false, None),
+            resolve_codex_launch_sandbox(false, false, None),
         );
         assert_eq!(plan["approvalPolicy"], "never");
         assert_eq!(plan["sandbox"], "read-only");

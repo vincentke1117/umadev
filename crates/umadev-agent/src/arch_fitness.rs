@@ -704,7 +704,17 @@ fn parse_layer_spec(doc: &str) -> LayerSpec {
     for raw in doc.lines() {
         let line = raw.trim();
         // `LAYER-RULE: a !-> b` — anywhere in the doc, case-insensitive prefix.
-        if line.len() >= 11 && line[..11].eq_ignore_ascii_case("layer-rule:") {
+        // `line.get(..11)` (not `line[..11]`) because a >=11-BYTE line is not a
+        // >=11-CHAR one: byte 11 lands mid-character on CJK text (a 3-byte Chinese
+        // glyph), and a raw byte-slice there panics. Architecture docs for a
+        // Chinese-first product are overwhelmingly Chinese, so this is the common
+        // input, not an edge case — and this floor runs OUTSIDE the governance
+        // catch_unwind, so a panic here is a fail-open violation that can abort the
+        // host run. `get` yields None on a non-boundary and the rule simply skips.
+        if line
+            .get(..11)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("layer-rule:"))
+        {
             if let Some((a, b)) = line[11..].split_once("!->") {
                 let (a, b) = (clean_layer_name(a), clean_layer_name(b));
                 if !a.is_empty() && !b.is_empty() {
@@ -2414,5 +2424,25 @@ mod tests {
         for real in ["src/app.ts", "src/controller/user.ts", "lib.rs"] {
             assert!(!is_exempt(real), "{real} should NOT be exempt");
         }
+    }
+
+    #[test]
+    fn parse_layer_spec_never_panics_on_cjk_architecture_docs() {
+        // Regression: `line[..11]` panicked whenever byte 11 landed mid-character —
+        // the norm for a Chinese architecture doc (3-byte glyphs). This floor runs
+        // outside the governance catch_unwind, so the panic could abort the run.
+        // Every line here has >=11 bytes with byte 11 mid-glyph; parsing must be
+        // panic-free and simply find no layer rules.
+        let doc = "## 架构分层说明文档标题\n\
+                   前端层不允许直接访问数据库连接池对象实例\n\
+                   ## 领域层与基础设施层的依赖方向约束\n\
+                   这一段是纯中文段落用来触发字节十一落在字符中间的情况\n";
+        let spec = parse_layer_spec(doc);
+        assert!(spec.banned.is_empty());
+
+        // The real rule still parses when present (ASCII prefix, CJK layer names).
+        let with_rule = "LAYER-RULE: 前端 !-> 数据库\n## 其他\n";
+        let spec = parse_layer_spec(with_rule);
+        assert_eq!(spec.banned.len(), 1);
     }
 }

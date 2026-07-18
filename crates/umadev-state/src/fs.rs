@@ -182,6 +182,28 @@ fn retry_transient_windows_fs<T>(
     }
 }
 
+/// Retry a transient Windows filesystem denial for a bounded interval so the
+/// whole durable-store family shares one robustness level.
+///
+/// An antivirus scanner, search indexer, or a just-closing handle can briefly
+/// deny a managed-path operation with a sharing/lock/access-denied native
+/// error. This wrapper re-attempts only those transient denials and, off
+/// Windows, is a single pass-through call. Fail-open: it never changes the
+/// operation's own success or its terminal error, it only re-runs a transient
+/// failure. Sibling durable-store paths (lock directories, ledger tail reads)
+/// route their raw `std::fs` calls through here or the retrying helpers below.
+pub fn retry_transient<T>(operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    #[cfg(windows)]
+    {
+        retry_transient_windows_fs(operation)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut operation = operation;
+        operation()
+    }
+}
+
 #[cfg(windows)]
 fn symlink_metadata_path(path: &Path) -> std::io::Result<fs::Metadata> {
     retry_transient_windows_fs(|| fs::symlink_metadata(path))
@@ -232,6 +254,16 @@ fn remove_dir_path(path: &Path) -> std::io::Result<()> {
     fs::remove_dir(path)
 }
 
+/// Mutating crash-recovery for an interrupted [`atomic_write`]. It renames a
+/// leftover `pending` sibling back onto an absent `target`, restoring the last
+/// committed bytes after a writer died mid-replace.
+///
+/// This MUST run only on a write path holding the store lock ([`atomic_write`]
+/// and [`remove_regular_file`]). Its `rename(pending -> target)` replaces on
+/// Windows, so an unlocked reader that ran it could clobber a value a
+/// concurrent writer just committed to `target`, silently reverting the write.
+/// The read path therefore never calls this; it uses [`open_read_source`],
+/// which resolves the current value without mutating the namespace.
 fn recover_pending(path: &Path) -> std::io::Result<()> {
     let pending = pending_path(path)?;
     match symlink_metadata_path(&pending) {
@@ -260,7 +292,8 @@ fn recover_pending(path: &Path) -> std::io::Result<()> {
 fn rename_replacing(temp: &Path, target: &Path) -> std::io::Result<()> {
     // Windows can briefly deny a rename while an antivirus scanner, indexer,
     // or another just-closing handle still owns the file. Retry only those
-    // transient native errors (5/32/33); the helper has a hard 500 ms deadline.
+    // transient native errors (5/32/33); the helper has a bounded 2-second
+    // deadline.
     match symlink_metadata_path(target) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return rename_path(temp, target);
@@ -384,9 +417,46 @@ pub fn write_new_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Open the current readable contents of a managed file WITHOUT mutating the
+/// namespace, tolerating an in-progress [`atomic_write`] replacement window.
+///
+/// On Windows `atomic_write` replaces a value in two steps: it first moves the
+/// previous bytes to a `pending` sibling, then moves the replacement onto
+/// `target`. During that gap `target` is briefly absent while `pending` still
+/// holds the previous, still-committed value. A reader must fall back to
+/// `pending` when `target` is absent, but it must NEVER rename `pending` into
+/// place: readers do not hold the store lock, so such a rename could replace a
+/// value a concurrent writer already committed to `target`, silently reverting
+/// it (a data-integrity and privacy defect). The authoritative rename-recovery
+/// is left to the next writer under the lock ([`recover_pending`]).
+///
+/// At every instant at least one of `target`/`pending` exists while the logical
+/// file exists, so a single re-check of `target` resolves the narrow case where
+/// a writer finished (removing `pending`) between our two probes. Off Windows
+/// `pending` is never produced, so the common path opens `target` directly and
+/// the observable result is unchanged.
+fn open_read_source(path: &Path) -> std::io::Result<File> {
+    match open_read_no_follow(path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let pending = pending_path(path)?;
+            match open_read_no_follow(&pending) {
+                Ok(file) => Ok(file),
+                Err(pending_error) if pending_error.kind() == std::io::ErrorKind::NotFound => {
+                    // Either the file genuinely does not exist, or a writer
+                    // published `target` and removed `pending` between the two
+                    // probes above. Re-check `target` before reporting absence.
+                    open_read_no_follow(path)
+                }
+                Err(pending_error) => Err(pending_error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn read_bounded(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
-    recover_pending(path)?;
-    let mut file = open_read_no_follow(path)?;
+    let mut file = open_read_source(path)?;
     let length = file.metadata()?.len();
     if length > max_bytes {
         return Err(std::io::Error::new(
@@ -436,6 +506,17 @@ pub fn remove_empty_dir(path: &Path) -> std::io::Result<bool> {
 /// sharing conflicts are retried for a bounded interval.
 pub fn create_dir(path: &Path) -> std::io::Result<()> {
     create_dir_path(path)
+}
+
+/// Rename a managed path, retrying transient Windows sharing violations so the
+/// durable-store family (lock directories, ledger rotation, tombstone
+/// publication) shares one Windows robustness level.
+///
+/// Operands are not validated for links or reparse points; callers that need
+/// that must check beforehand, exactly as the internal atomic-write path does.
+/// Fail-open: it never widens the outcome of a genuine, non-transient failure.
+pub fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    rename_path(from, to)
 }
 
 #[cfg(test)]
@@ -513,5 +594,121 @@ mod tests {
         assert!(read_bounded(&link, 64).is_err());
         assert!(remove_regular_file(&link).is_err());
         assert_eq!(fs::read_to_string(outside).unwrap(), "keep");
+    }
+
+    #[test]
+    fn read_in_replace_window_reads_pending_without_mutating_the_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        atomic_write(&path, b"old").unwrap();
+
+        // Reproduce the Windows two-phase replace window by hand: the previous
+        // bytes are parked in `pending` while `target` is momentarily absent.
+        let pending = pending_path(&path).unwrap();
+        fs::rename(&path, &pending).unwrap();
+        assert!(!path.exists());
+        assert!(real_file(&pending));
+
+        // A reader must return the still-committed previous value from
+        // `pending` WITHOUT renaming it into place. The buggy read path used to
+        // run the mutating recovery here and recreate `target`, which is what
+        // let an unlocked reader clobber a concurrent writer's committed bytes.
+        assert_eq!(read_bounded(&path, 64).unwrap(), b"old");
+        assert!(!path.exists(), "a read must not recreate target");
+        assert!(real_file(&pending), "a read must leave pending untouched");
+
+        // The next writer performs the real recovery under its lock; its new
+        // value wins and the earlier read never reverted anything.
+        atomic_write(&path, b"new").unwrap();
+        assert_eq!(read_bounded(&path, 64).unwrap(), b"new");
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn read_prefers_target_over_a_leftover_pending_sibling() {
+        // Both `target` (NEW) and a stale `pending` (OLD) present: a reader must
+        // return the authoritative `target`, never the parked previous value,
+        // and must not disturb either file.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        atomic_write(&path, b"new").unwrap();
+        let pending = pending_path(&path).unwrap();
+        fs::write(&pending, b"old").unwrap();
+        assert_eq!(read_bounded(&path, 64).unwrap(), b"new");
+        assert!(real_file(&path));
+        assert!(real_file(&pending));
+    }
+
+    #[test]
+    fn a_read_in_the_replace_window_cannot_revert_a_committed_write() {
+        use std::sync::{Arc, Barrier};
+
+        // The reported race, exercised on every platform: a reader arrives while
+        // (target absent, pending=OLD), a writer commits NEW to target, and the
+        // reader must never restore OLD over the committed NEW. Deterministically
+        // correct for the fixed read path; a reintroduced clobber would surface
+        // here as an intermittent reverted value.
+        for _ in 0..64 {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("state.json");
+            atomic_write(&path, b"old").unwrap();
+            let pending = pending_path(&path).unwrap();
+
+            // Enter the mid-replace window by hand (Unix never produces it).
+            fs::rename(&path, &pending).unwrap();
+
+            let gate = Arc::new(Barrier::new(2));
+            let reader_gate = Arc::clone(&gate);
+            let reader_path = path.clone();
+            let reader = std::thread::spawn(move || {
+                reader_gate.wait();
+                if let Ok(bytes) = read_bounded(&reader_path, 64) {
+                    assert!(bytes == b"old" || bytes == b"new", "reverted/torn read");
+                }
+            });
+
+            gate.wait();
+            // Commit NEW: publish it at target, then drop the previous sibling.
+            let staged = path.with_file_name(".state.json.staged");
+            fs::write(&staged, b"new").unwrap();
+            fs::rename(&staged, &path).unwrap();
+            let _ = fs::remove_file(&pending);
+            reader.join().unwrap();
+
+            // The committed write survives; the read never reverted it.
+            assert_eq!(read_bounded(&path, 64).unwrap(), b"new");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_two_phase_replace_survives_concurrent_reads() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Drive the real Windows `atomic_write` two-phase replace against a
+        // hammering reader: every observation is a complete OLD/NEW value and
+        // the final committed write is never reverted.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        atomic_write(&path, b"old").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_path = path.clone();
+        let reader_stop = Arc::clone(&stop);
+        let reader = std::thread::spawn(move || {
+            while !reader_stop.load(Ordering::Relaxed) {
+                if let Ok(bytes) = read_bounded(&reader_path, 64) {
+                    assert!(bytes == b"old" || bytes == b"new", "reverted/torn read");
+                }
+            }
+        });
+        for _ in 0..500 {
+            atomic_write(&path, b"new").unwrap();
+            atomic_write(&path, b"old").unwrap();
+        }
+        atomic_write(&path, b"new").unwrap();
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        assert_eq!(read_bounded(&path, 64).unwrap(), b"new");
     }
 }

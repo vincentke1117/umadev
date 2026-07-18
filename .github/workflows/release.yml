@@ -193,8 +193,13 @@ jobs:
     name: release signing credentials
     runs-on: ubuntu-latest
     steps:
+      # Only enforced when signing is turned ON (repo variable SIGN_RELEASE=true).
+      # With it unset the release ships UNSIGNED — the 1.0.53–1.0.55 behavior — and
+      # this check is a clean no-op, so a tag never blocks on secrets nobody has yet.
+      # Turning signing on later means: set SIGN_RELEASE=true AND provide the secrets;
+      # a mismatch (on, but a secret missing) then fails here, which is correct.
       - name: Require native signing and publishing credentials for tags
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && vars.SIGN_RELEASE == 'true'
         shell: bash
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
@@ -371,7 +376,7 @@ jobs:
         run: cross build --release --bin umadev --features vector-local --target ${{ matrix.target }}
 
       - name: Developer ID sign and notarize (macOS)
-        if: startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'apple-darwin')
+        if: startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'apple-darwin') && vars.SIGN_RELEASE == 'true'
         shell: bash
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
@@ -418,7 +423,7 @@ jobs:
           spctl --assess --type execute --verbose=4 "$binary"
 
       - name: Authenticode sign and timestamp (Windows)
-        if: startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'windows-msvc')
+        if: startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'windows-msvc') && vars.SIGN_RELEASE == 'true'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
