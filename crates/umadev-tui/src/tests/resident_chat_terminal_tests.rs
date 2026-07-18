@@ -1,7 +1,19 @@
 use super::*;
 
+/// Safety-net bound for turn/approval operations that are EXPECTED TO COMPLETE.
+///
+/// These `timeout(...)` wrappers exist only so a genuinely hung operation cannot
+/// wedge the whole suite — the happy path settles in well under a second. On a
+/// saturated Windows CI runner the single-thread `#[tokio::test]` timer gets
+/// CPU-starved after the ~10-minute compile, so a sub-100ms operation can blow
+/// past a tight 5s wall-clock deadline and flake. A real hang never returns and
+/// is still caught here (at 60s); 60s ≫ the sub-second happy path, so a passing
+/// turn is never affected. Assert-on-timeout tests (which want the timeout to
+/// FIRE) deliberately keep their own short bounds and do NOT use this const.
+const TURN_HANG_GUARD: Duration = Duration::from_secs(60);
+
 async fn wait_for_pending_approval(holder: &ApprovalHolder) {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(TURN_HANG_GUARD, async {
         loop {
             if holder.lock().unwrap().is_some() {
                 return;
@@ -51,7 +63,7 @@ async fn headless_askuserquestion_does_not_park_auto_continues() {
             tmp.path().to_path_buf(),
         )
     };
-    tokio::time::timeout(Duration::from_secs(5), drive_chat_session_turn(turn))
+    tokio::time::timeout(TURN_HANG_GUARD, drive_chat_session_turn(turn))
         .await
         .expect("a headless question turn must auto-continue, never block");
 
@@ -113,7 +125,7 @@ async fn guarded_interactive_pauses_then_ledger_suppresses_reask() {
     wait_for_pending_approval(&approval_holder).await;
     let p = approval_holder.lock().unwrap().take().unwrap();
     p.reply_tx.send(ApprovalReply::Allow).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), t1)
+    tokio::time::timeout(TURN_HANG_GUARD, t1)
         .await
         .expect("turn 1 must resume after approval")
         .unwrap();
@@ -138,7 +150,7 @@ async fn guarded_interactive_pauses_then_ledger_suppresses_reask() {
     // Turn 2: the SAME action must NOT pause (ledger suppresses). If it blocked, this
     // timeout would fire — no one is injecting a decision this time.
     tokio::time::timeout(
-        Duration::from_secs(5),
+        TURN_HANG_GUARD,
         drive_chat_session_turn(ChatSessionTurn {
             approval_holder: approval_holder.clone(),
             ..chat_turn(
@@ -195,7 +207,7 @@ async fn guarded_headless_needapproval_does_not_pause() {
     let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
 
     tokio::time::timeout(
-        Duration::from_secs(5),
+        TURN_HANG_GUARD,
         drive_chat_session_turn(ChatSessionTurn {
             interactive: false,
             approval_holder: approval_holder.clone(),
@@ -268,7 +280,7 @@ async fn approval_pause_fails_open_to_deny_when_abandoned() {
     // fail-open path.
     wait_for_pending_approval(&approval_holder).await;
     clear_pending_approval(&approval_holder);
-    tokio::time::timeout(Duration::from_secs(5), t)
+    tokio::time::timeout(TURN_HANG_GUARD, t)
         .await
         .expect("abandoning the wait must fail-open, never hang")
         .unwrap();
@@ -2495,7 +2507,7 @@ async fn resident_holder_never_parks_a_cancelled_generation() {
         .await;
     assert!(!parked, "a cancelled generation has no right to re-park");
     assert!(holder.lock().await.is_none());
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(TURN_HANG_GUARD, async {
         while !ended.load(std::sync::atomic::Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }

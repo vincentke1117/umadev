@@ -75,6 +75,16 @@ mod tests {
         ApprovalDecision, BaseSession, SessionCapabilities, SessionEvent, SessionStateUpdate,
     };
 
+    /// Safety-net bound for a control-plane event that is EXPECTED TO ARRIVE.
+    ///
+    /// The wait only exists so a hung control plane cannot wedge the suite — the
+    /// event is emitted near-instantly on the happy path. On a saturated Windows
+    /// CI runner the single-thread `#[tokio::test]` timer gets CPU-starved after
+    /// the ~10-minute compile, so a tight wall-clock deadline can flake. A real
+    /// hang never returns and is still caught here (at 60s); 60s ≫ the sub-second
+    /// happy path, so a passing turn is never affected.
+    const CONTROL_PLANE_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
     struct ThinkingSession;
 
     #[async_trait::async_trait]
@@ -134,7 +144,7 @@ mod tests {
             false,
         );
 
-        let state = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+        let state = tokio::time::timeout(CONTROL_PLANE_HANG_GUARD, events.recv())
             .await
             .unwrap()
             .unwrap();

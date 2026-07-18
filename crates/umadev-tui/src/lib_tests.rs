@@ -1,5 +1,19 @@
 use super::*;
 
+/// Safety-net bound for turn/approval/event operations that are EXPECTED TO
+/// COMPLETE.
+///
+/// These `timeout(...)` wrappers exist only so a genuinely hung operation cannot
+/// wedge the whole suite — the happy path settles in well under a second. On a
+/// saturated Windows CI runner the single-thread `#[tokio::test]` timer gets
+/// CPU-starved after the ~10-minute compile, so a sub-100ms operation can blow
+/// past a tight wall-clock deadline and flake. A real hang never returns and is
+/// still caught here (at 60s); 60s ≫ the sub-second happy path, so a passing
+/// operation is never affected. Assert-on-timeout tests (which want the timeout
+/// to FIRE, asserting `is_err()`) deliberately keep their own short bounds and
+/// do NOT use this const.
+const TURN_HANG_GUARD: Duration = Duration::from_secs(60);
+
 fn grok_auth_offer_for_test() -> umadev_host::session_bootstrap::AuthOffer {
     umadev_host::session_bootstrap::AuthOffer::new(
         "grok-build",
@@ -571,7 +585,7 @@ async fn upstream_auto_permission_requires_a_live_explicit_verdict() {
     assert!(approval_holder.lock().unwrap().is_some());
     allow_pending_approval(&approval_holder);
 
-    let approved = tokio::time::timeout(Duration::from_secs(1), interactive)
+    let approved = tokio::time::timeout(TURN_HANG_GUARD, interactive)
         .await
         .expect("explicit approval should release the base request");
     assert!(matches!(
@@ -1825,7 +1839,7 @@ async fn detached_close_never_awaits_a_hanging_end() {
 
     // Both helpers are synchronous: they must return promptly (they only spawn),
     // never blocking on the hanging `end()`.
-    let call = tokio::time::timeout(Duration::from_secs(2), async {
+    let call = tokio::time::timeout(TURN_HANG_GUARD, async {
         detach_resident_close(ResidentChat::Primed(Box::new(HangEndSession {
             started: resident_started.clone(),
         })));
@@ -5683,7 +5697,7 @@ async fn native_prompt_queue_keeps_the_pump_alive_and_preserves_typed_blocks() {
     turn.live_input_hub = hub.clone();
     let drive = tokio::spawn(drive_chat_session_turn(turn));
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(TURN_HANG_GUARD, async {
         while !hub.prompt_queue_ready() {
             tokio::task::yield_now().await;
         }
@@ -5703,7 +5717,7 @@ async fn native_prompt_queue_keeps_the_pump_alive_and_preserves_typed_blocks() {
         PromptQueueDispatch::Enqueued
     ));
 
-    tokio::time::timeout(Duration::from_secs(10), drive)
+    tokio::time::timeout(TURN_HANG_GUARD, drive)
         .await
         .expect("queue drain stopped at an intermediate TurnDone")
         .unwrap();
@@ -5812,7 +5826,7 @@ async fn native_background_process_control_is_visible_and_session_scoped() {
         umadev_i18n::Lang::En,
         BackgroundProcessRequest::List,
     );
-    let listed = tokio::time::timeout(Duration::from_secs(1), events.recv())
+    let listed = tokio::time::timeout(TURN_HANG_GUARD, events.recv())
         .await
         .unwrap()
         .unwrap();
@@ -5829,7 +5843,7 @@ async fn native_background_process_control_is_visible_and_session_scoped() {
         umadev_i18n::Lang::En,
         BackgroundProcessRequest::Stop("bg-task".to_string()),
     );
-    let stopped_note = tokio::time::timeout(Duration::from_secs(1), events.recv())
+    let stopped_note = tokio::time::timeout(TURN_HANG_GUARD, events.recv())
         .await
         .unwrap()
         .unwrap();
@@ -5938,7 +5952,7 @@ async fn grok_folder_trust_is_settled_before_first_input_even_in_auto() {
     turn.host_input_holder = host_input_holder.clone();
 
     let drive = tokio::spawn(drive_chat_session_turn(turn));
-    let surfaced = tokio::time::timeout(Duration::from_secs(10), async {
+    let surfaced = tokio::time::timeout(TURN_HANG_GUARD, async {
         loop {
             if host_input_holder
                 .lock()
@@ -5964,7 +5978,7 @@ async fn grok_folder_trust_is_settled_before_first_input_even_in_auto() {
             decision: umadev_runtime::HostFolderTrustDecision::Trust,
         })
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), drive)
+    tokio::time::timeout(TURN_HANG_GUARD, drive)
         .await
         .expect("turn did not finish")
         .unwrap();
@@ -7428,7 +7442,7 @@ async fn interactive_askuserquestion_parks_and_waits_same_session() {
     let pending: PendingAskHolder = Arc::new(tokio::sync::Mutex::new(None));
 
     tokio::time::timeout(
-        Duration::from_secs(5),
+        TURN_HANG_GUARD,
         drive_chat_session_turn(chat_turn_with_pending(
             "set up auth",
             holder.clone(),
