@@ -1417,7 +1417,7 @@ async fn drive_plan_steps(
         )));
         persist_plan_ref(plan, options);
         finalize_phase_from_plan(plan, options, false);
-        emit_plan_completion_summary(plan, events);
+        emit_plan_completion_summary(plan, events, &[]);
         return Some(DirectorLoopOutcome::Failed(violation.message));
     }
     let mut task_tracker = match crate::plan_tasks::PlanTaskTracker::open(
@@ -1939,7 +1939,7 @@ async fn drive_plan_steps(
         Ok(crate::task_lifecycle::RunReadiness::Succeeded) if clean => {}
         Ok(readiness) => {
             clean = false;
-            task_failure_reason = Some(format!("agent task ledger settled as {readiness:?}"));
+            task_failure_reason = Some(summarize_ledger_readiness(&readiness));
         }
         Err(error) => {
             clean = false;
@@ -1979,8 +1979,9 @@ async fn drive_plan_steps(
     // (clean, budget-reached, or blocked). The live plan panel is ephemeral — it vanishes
     // when the run settles — so on an incomplete finish the user could no longer see WHICH
     // steps completed, which stalled, which never ran (reported feedback). This writes the
-    // breakdown into the transcript so the final task state always survives.
-    emit_plan_completion_summary(plan, events);
+    // breakdown into the transcript so the final task state always survives. The
+    // per-step evidence is threaded in so each Blocked step shows its own WHY.
+    emit_plan_completion_summary(plan, events, &incomplete_evidence);
     // Wave 4 (§L4 / G8): a step-driven (always deliberate) build leaves the FULL
     // shareable delivery — core docs + proof-pack + scorecard — but ONLY when the
     // build settled clean (every step Done). MEDIUM M2: passing `clean` here stops
@@ -4766,7 +4767,18 @@ fn mark_ready_steps(plan: &mut Option<Plan>, events: &Arc<dyn EventSink>, status
 /// build still shows the user exactly which steps finished, which stalled, and which never
 /// ran — the live plan panel is ephemeral and vanishes on settle. No-op on an empty plan.
 /// Fail-open by construction (it only reads the plan + emits a note).
-fn emit_plan_completion_summary(plan: &Plan, events: &Arc<dyn EventSink>) {
+///
+/// `step_reasons` maps a step id → the objective evidence recorded when that step
+/// Blocked (`incomplete_evidence`). A Blocked step surfaces its OWN one-line WHY
+/// directly under its marker line, so the cause reads per step instead of being
+/// buried in the terminal residual-evidence string. Pass `&[]` when no per-step
+/// evidence is available (an early floor-violation exit) — the summary then reads
+/// exactly as before (fail-open).
+fn emit_plan_completion_summary(
+    plan: &Plan,
+    events: &Arc<dyn EventSink>,
+    step_reasons: &[(String, String)],
+) {
     if plan.steps.is_empty() {
         return;
     }
@@ -4790,8 +4802,61 @@ fn emit_plan_completion_summary(plan: &Plan, events: &Arc<dyn EventSink>) {
             StepStatus::Pending => "[ ]",
         };
         lines.push(format!("  {marker} {} ({})", s.title, s.seat.role_id()));
+        // A Blocked step carries its OWN concise WHY line so the reason is legible
+        // per step. Fail-open: no recorded reason → the marker line alone.
+        if s.status == StepStatus::Blocked {
+            if let Some(reason) = blocked_step_reason(&s.id, step_reasons) {
+                lines.push(format!("      ↳ {reason}"));
+            }
+        }
     }
     events.emit(EngineEvent::Note(lines.join("\n")));
+}
+
+/// The concise one-line WHY for a Blocked step: the FIRST evidence recorded for
+/// this step id, stripped of the redundant ``step `<title>`[:]`` echo (the title
+/// is already on the marker line) and bounded to one legible line. `None` when
+/// nothing was recorded for the step, so the caller keeps the bare marker.
+fn blocked_step_reason(step_id: &str, step_reasons: &[(String, String)]) -> Option<String> {
+    const MAX_CHARS: usize = 200;
+    let raw = step_reasons
+        .iter()
+        .find(|(id, _)| id == step_id)
+        .map(|(_, reason)| reason.trim())
+        .filter(|reason| !reason.is_empty())?;
+    // Drop a leading ``step `<title>`[:]`` prefix; an unrecognised shape is kept
+    // verbatim so a reason is never silently emptied.
+    let concise = raw
+        .strip_prefix("step `")
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(_, after)| after.trim_start_matches(':').trim())
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or(raw);
+    Some(concise.chars().take(MAX_CHARS).collect())
+}
+
+/// A BOUNDED one-line description of a NON-success task-ledger readiness for the
+/// terminal reason string.
+///
+/// The blocked task findings are ALREADY carried (bounded to 8 items by
+/// [`qc_incomplete_reason`]) inside `plan_incomplete_reason`'s residual evidence,
+/// so this names the KIND + COUNT only. The old `format!("… {readiness:?}")` dumped
+/// the whole `Blocked([...])` vec via `Debug` — an UNBOUNDED second copy of the same
+/// findings that dominated the transcript wall. Naming the count keeps the honest
+/// "the ledger did not settle clean" signal without re-dumping the evidence.
+fn summarize_ledger_readiness(readiness: &crate::task_lifecycle::RunReadiness) -> String {
+    use crate::task_lifecycle::RunReadiness;
+    match readiness {
+        RunReadiness::Blocked(items) => {
+            let n = items.iter().filter(|item| !item.trim().is_empty()).count();
+            format!(
+                "agent task ledger settled as Blocked ({n} task finding(s) — see residual evidence above)"
+            )
+        }
+        // NotTracked / InProgress / (a non-clean) Succeeded carry no vec, so their
+        // Debug is already a short bare word — safe to render directly.
+        other => format!("agent task ledger did not settle clean ({other:?})"),
+    }
 }
 
 /// Explain why a step-driven build cannot claim `Done`. Status counts come from

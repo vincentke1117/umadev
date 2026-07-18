@@ -2351,7 +2351,7 @@ fn plan_completion_summary_lists_every_step_by_terminal_status() {
         risks: vec![],
         open_questions: vec![],
     };
-    emit_plan_completion_summary(&plan, &events);
+    emit_plan_completion_summary(&plan, &events, &[]);
     // Header carries the 1/1/1/1 counts (done / active / blocked / pending), locale-neutral.
     assert!(note_seen(
         &rec,
@@ -2375,8 +2375,82 @@ fn plan_completion_summary_lists_every_step_by_terminal_status() {
             open_questions: vec![],
         },
         &events2,
+        &[],
     );
     assert!(!note_seen(&rec2, "["), "empty plan emits nothing");
+}
+
+#[test]
+fn plan_completion_summary_attaches_per_step_blocked_reason() {
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+    let (events, rec) = sink();
+    let mk = |id: &str, seat, status| PlanStep {
+        files: plan_state::StepFiles::default(),
+        id: id.to_string(),
+        title: format!("do {id}"),
+        seat,
+        kind: StepKind::Build,
+        depends_on: vec![],
+        acceptance: AcceptanceSpec::SourcePresent,
+        evidence: Vec::new(),
+        status,
+    };
+    let plan = Plan {
+        steps: vec![
+            mk("a", crate::critics::Seat::ProductManager, StepStatus::Done),
+            mk("d", crate::critics::Seat::QaEngineer, StepStatus::Blocked),
+        ],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    // The step-keyed evidence uses the exact shape drive_plan_steps records
+    // (``step `<title>`: <gap>``) — the WHY line must strip that echoed prefix.
+    let reasons = vec![(
+        "d".to_string(),
+        "step `do d`: declared red→green on test \"standard MOM coverage\" but no test by that name is present".to_string(),
+    )];
+    emit_plan_completion_summary(&plan, &events, &reasons);
+    // The Blocked step gets a concise WHY sub-line with the prefix stripped.
+    assert!(
+        note_seen(
+            &rec,
+            "      ↳ declared red→green on test \"standard MOM coverage\" but no test by that name is present"
+        ),
+        "blocked step's own WHY line, prefix stripped"
+    );
+    // A Done step never gets a WHY sub-line.
+    let combined: String = rec
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::Note(n) => Some(n.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        combined.matches("↳").count(),
+        1,
+        "only the blocked step: {combined}"
+    );
+}
+
+#[test]
+fn ledger_readiness_summary_names_count_not_the_whole_vec() {
+    use crate::task_lifecycle::RunReadiness;
+    // A Blocked ledger with many findings must NOT dump the whole vec (the old
+    // unbounded `{:?}` wall) — it names the KIND + COUNT, since the findings are
+    // already carried (bounded) by the residual evidence.
+    let findings: Vec<String> = (0..57)
+        .map(|i| format!("UmaDev: finding number {i} (UD-ARCH-041)"))
+        .collect();
+    let summary = summarize_ledger_readiness(&RunReadiness::Blocked(findings));
+    assert!(summary.contains("Blocked (57 task finding(s)"), "{summary}");
+    assert!(
+        !summary.contains("UD-ARCH-041"),
+        "the raw findings must not be re-dumped here: {summary}"
+    );
+    assert!(summary.len() < 120, "one bounded line: {summary}");
 }
 
 #[tokio::test]
