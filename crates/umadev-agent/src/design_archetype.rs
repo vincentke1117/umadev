@@ -37,7 +37,7 @@
 //! already used: brain unreachable, offline runtime, fork refused, prose instead of JSON, a
 //! timeout, or an id outside the known set → [`DesignArchetype::undetermined`], which persists
 //! nothing, and the sync coach renderer falls back to the deterministic keyword recommendation
-//! ([`crate::coach::recommend_design_system`], now kept ONLY as that fail-fallback). The
+//! (`coach::recommend_design_system`, now kept ONLY as that fail-fallback). The
 //! pipeline is never blocked and nothing ever crashes.
 //!
 //! ## Computed ONCE at the run door, persisted, read by the sync renderer
@@ -50,7 +50,7 @@
 //! director-loop `/run` engine never renders per-phase design injection, so it neither needs
 //! nor asks the archetype question — only the colour question, which every code-writing path
 //! must persist for the write governor.) The archetype is *resolved* in
-//! [`crate::coach::load_design_system_inject`], a synchronous prompt renderer with no brain of
+//! `coach::load_design_system_inject`, a synchronous prompt renderer with no brain of
 //! its own; it READS the stored pick as its fallback (after an explicit `/design` and after the
 //! UIUX doc's own declared direction, both of which still win). One consult, one writer, one
 //! reader.
@@ -68,13 +68,13 @@ use umadev_runtime::BaseSession;
 /// question.
 ///
 /// `archetype` is `Some(id)` only when the brain returned one of the KNOWN archetype ids
-/// ([`crate::coach::DESIGN_ARCHETYPES`]); every failure path (no brain, a timeout, prose
+/// (`coach::DESIGN_ARCHETYPES`); every failure path (no brain, a timeout, prose
 /// instead of JSON, an id outside the set) yields `None`, which the caller treats as "no
 /// recommendation — use the deterministic fallback", never as an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesignArchetype {
     /// The archetype the brain chose, guaranteed to be one of
-    /// [`crate::coach::DESIGN_ARCHETYPES`], or `None` when the brain gave no usable answer.
+    /// `coach::DESIGN_ARCHETYPES`, or `None` when the brain gave no usable answer.
     ///
     /// `None` means *undetermined* — both "the brain was unavailable" and "the brain answered
     /// something we cannot use". The renderer treats those identically: fall back to the
@@ -188,8 +188,8 @@ fn archetype_system_prompt() -> String {
 /// Ask the brain which known archetype best fits `requirement`.
 ///
 /// One read-only forked consult, one strict-JSON answer, one typed pick — the SAME plumbing
-/// [`crate::color_permission::consult_color_permission`] uses ([`crate::continuous::fork_with_timeout`]
-/// → [`crate::continuous::ForkConsult`] → `judge_json`). The main (single-writer) session is
+/// [`crate::color_permission::consult_color_permission`] uses (`continuous::fork_with_timeout`
+/// → `continuous::ForkConsult` → `judge_json`). The main (single-writer) session is
 /// never touched, and nothing on disk changes — the caller persists the result.
 ///
 /// **Fail to the deterministic default at every edge** (see the module docs): an empty
