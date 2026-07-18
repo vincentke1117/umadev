@@ -45,6 +45,7 @@ mod interaction_bridge;
 pub mod link;
 mod preview;
 mod prompt_queue_ui;
+mod read_only_gate;
 pub mod selection;
 mod session_slot;
 mod tool_effects;
@@ -5391,7 +5392,22 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         // unavailable, reopen a fresh PLAN session rather than trusting a prompt on
         // a write-capable process. Conversely, a mutating turn never reuses a prior
         // read-only resident; it reopens the configured writer permissions.
-        execution_read_only = !native_command && !route.class.mutates_workspace();
+        // A non-mutating route normally runs read-only, but a read-only verdict from
+        // the DETERMINISTIC FALLBACK (the brain intent consult timed out / was
+        // unavailable, so a keyword classifier guessed) is unreliable: a keyword-miss
+        // on a real build lands non-mutating and would jail the base in claude's plan
+        // mode, where it tries the unexposed ExitPlanMode and re-plans forever (the
+        // reported deadlock, in Guarded AND Auto). [`read_only_gate::turn_executes_read_only`]
+        // refuses to jail on that low-confidence guess ONLY under an execution-capable
+        // trust mode (`permissions != Plan`) and only when the user did not explicitly
+        // ask for read-only; a confident brain verdict, Plan mode, and native commands
+        // are unchanged.
+        execution_read_only = read_only_gate::turn_executes_read_only(
+            !native_command && !route.class.mutates_workspace(),
+            route_source,
+            umadev_agent::requirement_demands_read_only(&text),
+            permissions != umadev_runtime::BasePermissionProfile::Plan,
+        );
         if execution_read_only {
             cancel_entry_task(
                 &mut entry_task,

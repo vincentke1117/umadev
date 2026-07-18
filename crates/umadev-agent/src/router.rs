@@ -1449,6 +1449,25 @@ fn explicit_observation_only_request(requirement: &str) -> bool {
     !has_follow_on_work
 }
 
+/// Whether the user's own wording explicitly constrains this turn to read-only or
+/// pure observation — e.g. "只分析，不要修改任何文件" / "do not modify any file", or a
+/// "what changed?" status query.
+///
+/// This reuses the two deterministic belts that also back the authorization ceiling
+/// (`explicit_read_only_request` and `explicit_observation_only_request`); the model
+/// still owns every ambiguous semantic case, so their keyword lists stay narrow and
+/// are not changed here.
+///
+/// The chat driver consults this before honoring a read-only verdict that came from
+/// the DETERMINISTIC FALLBACK (an unreliable keyword guess made when the brain
+/// consult timed out or was unavailable): an EXPLICIT user request to stay read-only
+/// is the user's own choice and safe to honor, whereas a bare fallback guess is not
+/// and must never jail the base in claude's plan mode.
+#[must_use]
+pub fn requirement_demands_read_only(requirement: &str) -> bool {
+    explicit_read_only_request(requirement) || explicit_observation_only_request(requirement)
+}
+
 /// Conservative no-model fallback. Ambiguous keyword-heavy prose never earns a
 /// full team by default: only a clear product/feature request stays Build; a clear
 /// mutation becomes scoped work, and everything else is read-only inspection.
@@ -2450,6 +2469,39 @@ mod tests {
             );
         }
         assert!(explicit_read_only_request("只分析原因，不要修改任何文件"));
+    }
+
+    #[test]
+    fn requirement_demands_read_only_only_for_explicit_read_only_or_observation() {
+        // Explicit whole-turn read-only wording and pure past-work/status queries are
+        // the user's own choice — the chat driver may honor them even on a fallback route.
+        for explicit in [
+            "只分析，不要修改任何文件",
+            "do not modify any file",
+            "read-only analysis",
+            "刚才做了什么",
+            "what changed",
+            "current progress",
+        ] {
+            assert!(
+                requirement_demands_read_only(explicit),
+                "explicit read-only / observation wording is a user request: {explicit}"
+            );
+        }
+        // Ordinary work requests (including a keyword-miss build) never look like an
+        // explicit read-only demand, so a fallback route on them must not be jailed.
+        for ordinary in [
+            "做一个登录页",
+            "帮我优化后端代码",
+            "build a dashboard",
+            "把这个按钮改成蓝色",
+            "只改 app.rs，不要修改其他文件",
+        ] {
+            assert!(
+                !requirement_demands_read_only(ordinary),
+                "ordinary work is not an explicit read-only demand: {ordinary}"
+            );
+        }
     }
 
     #[test]
