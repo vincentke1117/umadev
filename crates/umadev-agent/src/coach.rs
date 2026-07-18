@@ -598,10 +598,13 @@ fn render_research(slug: &str, req: &str, opts: &RunOptions, query_vec: Option<&
     )
 }
 
-/// The built-in design archetypes (seeded `knowledge/design-systems/*.md`).
-/// `recommend_design_system` maps a requirement onto one of these so the
-/// design system is ON BY DEFAULT — the user never has to run `/design`.
-const DESIGN_ARCHETYPES: &[&str] = &[
+/// The built-in design archetypes (seeded `knowledge/design-systems/*.md`) — the closed set
+/// any resolver may bind. The design system is ON BY DEFAULT, so one of these is always
+/// chosen even without `/design`: the brain picks the best fit at the run door
+/// ([`crate::design_archetype::consult_design_archetype`]), and
+/// [`recommend_design_system`] maps a requirement onto one of these deterministically as the
+/// fail-fallback when the brain gave no usable pick.
+pub(crate) const DESIGN_ARCHETYPES: &[&str] = &[
     "modern-minimal",
     "editorial-clean",
     "tech-utility",
@@ -612,10 +615,6 @@ const DESIGN_ARCHETYPES: &[&str] = &[
     "premium-luxury",
 ];
 
-/// Pick the best-fit design archetype for a requirement by product-type
-/// keyword reasoning. Returns `(archetype_id, product_label)`. This is what
-/// makes the design system **default-on**: the frontend always gets a binding
-/// token contract, even when the user never touches `/design`.
 /// Match a design-system trigger keyword against the (lower-cased) requirement. An ASCII
 /// keyword must match at a WORD BOUNDARY - so the trigger "art" hits the word "art" but NOT
 /// "startup" / "smart" / "charting", whose substring `contains` mis-selected the
@@ -945,16 +944,20 @@ fn heading_section(lower: &str, keyword: &str) -> Option<String> {
 
 /// Load the active design system markdown + seed template from the
 /// knowledge directory. **Default-on**: if the user did not pick a system
-/// via `/design`, one is auto-recommended from the requirement's product
-/// type (or read from the UIUX doc's declared direction) and injected as a
-/// binding token contract anyway. Returns a ready-to-inject block.
+/// via `/design`, one is resolved from the UIUX doc's declared direction, or —
+/// when nothing is declared — from the brain's run-door archetype judgment
+/// (see [`crate::design_archetype`]), and injected as a binding token contract
+/// anyway. Returns a ready-to-inject block.
 pub(crate) fn load_design_system_inject(opts: &RunOptions, phase: Phase) -> String {
     let mut inject = String::new();
 
     // Resolve the EFFECTIVE design system, in priority order:
     //   1. explicit user choice (`/design <name>`)
     //   2. the archetype the UIUX doc already declared (frontend phase)
-    //   3. an auto-recommendation by product type (always available)
+    //   3. the brain's best-fit archetype, judged once at the run door and
+    //      persisted (a designer's judgment, not a keyword guess)
+    //   4. the deterministic product-type recommendation — fail-fallback ONLY,
+    //      when the brain gave no usable pick
     let (ds_name, source_note): (String, String) = if !opts.design_system.is_empty() {
         (
             opts.design_system.clone(),
@@ -963,7 +966,21 @@ pub(crate) fn load_design_system_inject(opts: &RunOptions, phase: Phase) -> Stri
     } else if let Some(declared) = detect_declared_archetype(opts) {
         let note = format!("沿用 UIUX 文档已声明的视觉方向 `{declared}`");
         (declared, note)
+    } else if let Some(brain_pick) =
+        crate::design_archetype::stored_design_archetype(&opts.project_root, &opts.requirement)
+    {
+        // Nothing declared: the archetype is a designer's judgment, so it was asked of the
+        // base's brain once at the run door and persisted (see `crate::design_archetype`).
+        // Read that stored pick here — a keyword table is the wrong shape of answer.
+        let note = format!(
+            "**默认自动选定**(底座大脑判定最契合本需求) → `{brain_pick}`。无需用户手动 /design —— \
+             UmaDev 的设计系统默认就生效"
+        );
+        (brain_pick, note)
     } else {
+        // Fail-fallback ONLY: the brain gave no usable pick (offline / undetermined / a
+        // different requirement), so use the SAME conservative deterministic default the code
+        // used before — the product-type recommendation, kept for exactly this path.
         let (rec, label) = recommend_design_system(&opts.requirement);
         (
             rec.to_string(),
@@ -1629,6 +1646,96 @@ mod tests {
         assert!(inject.contains("BINDING DESIGN CONTRACT"));
         assert!(inject.contains("默认自动选定"));
         assert!(inject.contains("--text-base")); // tokens actually injected
+    }
+
+    #[test]
+    fn persisted_brain_pick_binds_when_nothing_is_declared() {
+        // No `/design`, no UIUX declaration: the archetype the brain judged at the run door
+        // (persisted to `.umadev/design-archetype.json`) is what binds — NOT the keyword table.
+        // The requirement here contains "腕表/watch" trigger words the old classifier would map
+        // to premium-luxury, yet the brain's persisted pick (tech-utility) is what lands, proving
+        // the fallback is the brain's judgment and no longer the keyword guess.
+        let tmp = TempDir::new().unwrap();
+        let ds_dir = tmp.path().join("knowledge/design-systems");
+        std::fs::create_dir_all(&ds_dir).unwrap();
+        std::fs::write(
+            ds_dir.join("tech-utility.md"),
+            "# Tech Utility\n:root { --mono-base: 13px; }\n",
+        )
+        .unwrap();
+        let mut o = opts(tmp.path());
+        o.requirement = "高端腕表品牌的库存监控后台".into();
+        o.design_system = String::new();
+        crate::design_archetype::persist_design_archetype(
+            tmp.path(),
+            &o.requirement,
+            &crate::design_archetype::DesignArchetype::chosen("tech-utility", "internal console"),
+        );
+        let inject = load_design_system_inject(&o, Phase::Frontend);
+        assert!(inject.contains("BINDING DESIGN CONTRACT"));
+        assert!(inject.contains("底座大脑判定最契合"));
+        assert!(inject.contains("--mono-base")); // the brain's pick, not premium-luxury
+    }
+
+    #[test]
+    fn declared_direction_wins_over_the_persisted_brain_pick() {
+        // The UIUX doc's own declared direction still takes priority over the run-door pick — the
+        // brain-consult only replaced the keyword FALLBACK, not the declared-archetype precedence.
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("output");
+        std::fs::create_dir_all(&out).unwrap();
+        let ds_dir = tmp.path().join("knowledge/design-systems");
+        std::fs::create_dir_all(&ds_dir).unwrap();
+        std::fs::write(
+            ds_dir.join("editorial-clean.md"),
+            "# Editorial Clean\n:root { --serif-base: 19px; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ds_dir.join("tech-utility.md"),
+            "# Tech Utility\n:root { --mono-base: 13px; }\n",
+        )
+        .unwrap();
+        let mut o = opts(tmp.path());
+        o.slug = "demo".into();
+        o.requirement = "一个内容平台".into();
+        o.design_system = String::new();
+        // UIUX doc declares editorial-clean; the persisted brain pick says tech-utility.
+        std::fs::write(
+            out.join("demo-uiux.md"),
+            "# UIUX\n## Visual direction\n选用 editorial-clean,内容优先。\n",
+        )
+        .unwrap();
+        crate::design_archetype::persist_design_archetype(
+            tmp.path(),
+            &o.requirement,
+            &crate::design_archetype::DesignArchetype::chosen("tech-utility", "irrelevant here"),
+        );
+        let inject = load_design_system_inject(&o, Phase::Frontend);
+        assert!(inject.contains("沿用 UIUX 文档已声明的视觉方向"));
+        assert!(inject.contains("--serif-base")); // declared editorial-clean bound
+        assert!(!inject.contains("--mono-base")); // the persisted pick did NOT win
+    }
+
+    #[test]
+    fn no_declaration_and_no_brain_pick_falls_back_to_the_keyword_table() {
+        // Strict fail-direction: with nothing declared AND no persisted pick (brain was
+        // undetermined / unavailable), resolution falls back to the SAME deterministic
+        // product-type recommendation the code used before.
+        let tmp = TempDir::new().unwrap();
+        let ds_dir = tmp.path().join("knowledge/design-systems");
+        std::fs::create_dir_all(&ds_dir).unwrap();
+        std::fs::write(
+            ds_dir.join("editorial-clean.md"),
+            "# Editorial Clean\n:root { --serif-base: 19px; }\n",
+        )
+        .unwrap();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个技术博客写作平台".into(); // keyword → editorial-clean
+        o.design_system = String::new();
+        let inject = load_design_system_inject(&o, Phase::Frontend);
+        assert!(inject.contains("产品类型")); // the keyword-table note
+        assert!(inject.contains("--serif-base")); // editorial-clean from the table
     }
 
     fn opts(root: &Path) -> RunOptions {

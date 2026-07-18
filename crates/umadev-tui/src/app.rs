@@ -8627,7 +8627,11 @@ impl App {
                 if self.run_started && mode.gates_auto_approve() {
                     self.push(
                         ChatRole::UmaDev,
-                        umadev_i18n::tf(self.lang, "gate.auto_approved", &[gate.id_str()]),
+                        umadev_i18n::tf(
+                            self.lang,
+                            "gate.auto_approved",
+                            &[umadev_i18n::t(self.lang, gate.human_label_key())],
+                        ),
                     );
                     self.record_trust_pass(gate.id_str());
                     self.pending_auto_continue = Some(gate);
@@ -12516,7 +12520,11 @@ impl App {
                 } else if let Some(gate) = self.active_gate.take() {
                     self.push(
                         ChatRole::UmaDev,
-                        umadev_i18n::tf(self.lang, "slash.gate_approved", &[gate.id_str()]),
+                        umadev_i18n::tf(
+                            self.lang,
+                            "slash.gate_approved",
+                            &[umadev_i18n::t(self.lang, gate.human_label_key())],
+                        ),
                     );
                     self.record_trust_pass(gate.id_str());
                     Action::Continue(gate)

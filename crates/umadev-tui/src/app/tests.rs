@@ -8413,11 +8413,17 @@ fn slash_continue_no_run_hint_redirects_to_typing_a_requirement() {
 fn preflight_message_lands_when_starting_run() {
     let mut a = fresh_app(Some("offline"));
     a.prepare_worker_routed_run("build me a thing");
-    // The UmaDev preflight message includes the 9-phase plan.
+    // The UmaDev preflight message includes the plan with HUMAN checkpoint labels —
+    // never the raw snake_case gate ids or the internal pipeline-shape wording.
     assert!(a.history.iter().any(|m| m.role == ChatRole::UmaDev
-        && m.body().contains("9 阶段")
-        && m.body().contains("docs_confirm")
-        && m.body().contains("preview_confirm")));
+        && m.body().contains("确认核心文档")
+        && m.body().contains("确认前端预览")));
+    assert!(
+        !a.history
+            .iter()
+            .any(|m| m.body().contains("docs_confirm") || m.body().contains("preview_confirm")),
+        "preflight must not leak raw snake_case gate ids"
+    );
 }
 
 // ---- cursor + editing ----

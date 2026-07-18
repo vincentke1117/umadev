@@ -312,14 +312,16 @@ pub fn calibrated_default(project_root: &Path, class: &str, default: SizeRank) -
 #[must_use]
 pub fn advisory_nudge(project_root: &Path, class: &str) -> Option<String> {
     match sizing_calibration(project_root, class)? {
-        SizingAdjustment::Heavier => Some(format!(
-            "signal · {class} 这一类历史上常被低估体量(轻量路径多次升级成真实多步构建)\
-             — 这一类的默认体量可更重一档(仅建议,本次路由/确定性底线不变)"
-        )),
-        SizingAdjustment::Lighter => Some(format!(
-            "signal · {class} 这一类历史上常被高估体量(重型路径多次只产出微小结果)\
-             — 这一类的默认体量可更轻一档(仅建议,本次路由/确定性底线不变)"
-        )),
+        SizingAdjustment::Heavier => Some(
+            "signal · 这一类需求历史上常被低估体量(轻量路径多次升级成真实多步构建)\
+             — 以后默认体量可更重一档(仅供参考,不改变本次处理与确定性底线)"
+                .to_string(),
+        ),
+        SizingAdjustment::Lighter => Some(
+            "signal · 这一类需求历史上常被高估体量(重型路径多次只产出微小结果)\
+             — 以后默认体量可更轻一档(仅供参考,不改变本次处理与确定性底线)"
+                .to_string(),
+        ),
     }
 }
 

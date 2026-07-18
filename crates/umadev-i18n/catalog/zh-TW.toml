@@ -155,13 +155,13 @@
 "status.paused" = "已暫停，等待確認"
 
 # Gate 審核卡片
-"gate.clarify.title" = "clarify — 逐條回答釐清問題,幫助底座理解你的真實需求"
+"gate.clarify.title" = "逐條回答釐清問題,幫助底座理解你的真實需求"
 "gate.clarify.checklist" = "每個問題盡量回答(或寫 'skip' 跳過)\n不確定的可以寫'你來建議'\n回答越具體,後續 PRD/程式碼越貼合預期"
 "gate.clarify.next" = "回答完後輸入 c 繼續(進入聯網調研),或描述修改意見"
-"gate.docs.title" = "docs_confirm — three core docs are ready for review"
+"gate.docs.title" = "三份核心文件已就緒,請審閱"
 "gate.docs.checklist" = "PRD: 目標 / 範圍 / 驗收標準是否涵蓋你真正要做的事?\n架構: API 介面、資料模型、技術選型是否合理?\n設計: 配色 / 字型 / 元件 token 是否符合預期, 有無暗色模式?"
 "gate.docs.next" = "看不懂沒關係 — 按 c(或回覆「確認」「通過」)信任 AI 的方案直接繼續。輸入修改意見會按你的意見重做(幾分鐘;誤觸了可以 /cancel 停)。"
-"gate.preview.title" = "preview_confirm — frontend preview is ready for review"
+"gate.preview.title" = "前端預覽已就緒,請審閱"
 "gate.preview.checklist" = "前端是否按 UIUX 設計系統實作(圖示庫 / token / 排版)?\n頁面結構和互動流是否匹配 PRD 的使用者故事?\nfetch 的介面位址是否和架構文件裡的 API 一致?"
 "gate.preview.next" = "審核前端可執行預覽。按 c 確認進入 backend / quality / delivery;輸入文字會按你的修改重做前端(幾分鐘;誤觸可 /cancel)。"
 "gate.artifacts_header" = "工件摘要:"
@@ -184,7 +184,7 @@
 "gate.action.diff_arch" = "/diff architecture    -> 查看架構"
 "gate.action.diff_uiux" = "/diff uiux            -> 查看設計系統"
 "gate.guide_prefix" = "指引: {}"
-"gate.auto_approved" = "[auto] 自主模式:已自動通過檢查點 `{}`,繼續推進…  (想逐步審核就輸入 /manual)"
+"gate.auto_approved" = "[auto] 自主模式:已自動通過{},繼續推進…  (想逐步審核就輸入 /manual)"
 
 # Structured gate picker — 一個問題 + 2-4 個帶標籤的選項(↑↓ / 數字鍵 + Enter);
 # 自由文字始終可用(直接輸入即可),選項對應到既有的確認/修改流程。
@@ -523,7 +523,7 @@
 "run.deferred" = "[排隊] 這則訊息不會干擾目前任務;目前執行結束後,會作為一般對話交給大模型重新判斷意圖。"
 "chat.queued" = "[排隊] 上一條還在回覆,這條會在它回完後立刻發出。"
 "chat.queued_preserved" = "[排隊] 已保留 {} 則尚未送出的訊息;取消完成後會按原順序繼續送出。"
-"chat.queued_duplicate_skipped" = "[note] 上一輪路由失敗後,已跳過一條完全相同的排隊訊息,避免自動重複送出。"
+"chat.queued_duplicate_skipped" = "[note] 上一輪失敗後,已跳過一條完全相同的排隊訊息,避免自動重複送出。"
 "chat.turn_failed" = "[warn] 本輪底座執行出錯(底座 `{}`): {}\n  可重試,或用 /run <需求> 顯式啟動流水線。"
 "chat.turn_failed_retrying" = "[note] 本輪底座執行出錯(底座 `{}`): {} —— 正在用新工作階段重試一次…"
 "chat.interrupted" = " [已中斷] 回覆未完成"
@@ -547,9 +547,9 @@
 "run.queued_dropped" = "[note] 執行已中止,你排隊的訊息「{}」未發送 —— 直接重新發給我即可。"
 "run.classified_build" = "-> 判斷為開發任務 · 進入 9 階段流水線(想中途停用 /cancel)"
 "design.suggest_hint" = "提示: 你還沒選設計系統。可用 /design <name> 在 run 前鎖定視覺方向:\n  {}。\n  不選也行 — worker 會自動根據需求推薦一個。"
-"run.preflight_plan" = "收到需求:\"{}\"\n\n設定: worker `{}` · 設計系統 `{}` · 範本 `{}`\n\n9 階段流水線:\n  1) research(競品 + discovery) -> 2) docs(PRD + Architecture + UIUX) -> [gate] docs_confirm\n  3) spec -> 4) frontend(按 UIUX tokens 實作) -> [gate] preview_confirm\n  5) backend -> 6) quality(5 維審查) -> 7) delivery -> proof-pack\n\n{}"
+"run.preflight_plan" = "收到需求:\"{}\"\n\n設定: worker `{}` · 設計系統 `{}` · 範本 `{}`\n\n計畫:\n  1) research(競品 + discovery) -> 2) docs(PRD + Architecture + UIUX) -> [暫停] 確認核心文件\n  3) spec -> 4) frontend(按 UIUX tokens 實作) -> [暫停] 確認前端預覽\n  5) backend -> 6) quality(5 維審查) -> 7) delivery -> proof-pack\n\n{}"
 "run.gate_line.auto" = "兩道 gate 預設自動通過(僅作為檢查點顯示);按 shift+Tab 或 /manual 可轉逐門審批。流水線啟動中…"
-"run.gate_line.guarded" = "目前守護模式:兩道 gate(docs_confirm / preview_confirm)會停下等你逐門審批;按 shift+Tab 或 /auto 可切自動通過。流水線啟動中…"
+"run.gate_line.guarded" = "目前守護模式:兩處檢查點(確認核心文件 / 確認前端預覽)會停下等你逐項審批;按 shift+Tab 或 /auto 可切自動通過。已開始…"
 "run.gate_line.plan" = "目前計劃模式:只讀出計劃、不寫程式碼(/mode guarded 或 auto 才執行)。流水線啟動中…"
 "run.cancelled" = "[已取消] 目前執行已停止,回到輸入。已完成階段的產物保留在 output/,下次 /continue 或輸入新需求都可以。"
 
@@ -569,7 +569,7 @@
 "continue.chat_directive" = "繼續完成我們上次未完成的工作。"
 "continue.resuming_plan" = "團隊 · 續跑已儲存的計畫(已完成 {}/{} 步)— 只跑剩下的部分"
 "revise.usage" = "用法:/revise <修訂說明>。\n  範例:/revise 去掉社交登入,只留 Email 密碼"
-"revise.no_gate" = "目前沒有開啟的 gate,無法修訂 — 要修改產出需要先等流水線停在 gate(docs_confirm / preview_confirm)。"
+"revise.no_gate" = "目前沒有開啟的檢查點,無法修訂 — 要修改產出需要先等執行停在檢查點(確認核心文件 / 確認前端預覽)。"
 
 # Pitfalls overlay / cancel / unknown command
 "pitfalls.overlay_title" = " 踩坑知識庫 — Esc 關閉, ↑↓ 捲動 "
@@ -746,7 +746,7 @@
 "setup.more_below" = "↓ 下面還有 {} 項"
 
 # 路由記憶（餵給底座的對話上下文，不直接展示給使用者）
-"run.classified_build_memo" = "(進入 9 階段流水線,需求:{})"
+"run.classified_build_memo" = "(正在組建團隊來做這個,需求:{})"
 
 # 檔案檢查點 / 階段標籤
 "checkpoint.phase_label" = "階段開始: {}"
@@ -775,7 +775,7 @@
 "base.init_failed" = "[warn] 無法初始化底座 `{}`: {}\n  請檢查目前底座設定,或用 /backend /offline 切換。"
 "route.resume_retry" = "[info] 續接上次工作階段失敗,已用新工作階段重試…"
 "base.empty_reply" = "[warn] 底座 `{}` 沒有回傳內容。"
-"route.failed" = "[warn] 路由失敗(底座 `{}`): {}\n  你可以重試,或用 /run <需求> 顯式啟動流水線。"
+"route.failed" = "[warn] 這一輪沒能完成 —— AI 工作端出錯了:{}\n  你可以重試,或用 /run <需求> 顯式啟動完整建置。"
 
 # 底座失敗分類器 —— 可操作診斷(classify → actionable_message)
 "base.fail.auth.claude" = "底座未登入 — 執行 `claude auth login`,或為無頭呼叫設定 CLAUDE_CODE_OAUTH_TOKEN(來自 `claude setup-token`),然後用 /continue 接續"
@@ -1012,7 +1012,7 @@
 "tui.diff.truncated" = "… 還有 {} 行(開啟檔案檢視)"
 # 輸入框下方提示列
 "tui.hint.palette" = "↑↓ 選擇 · Tab 補全 · Enter 執行"
-"tui.hint.gate_tag" = "[gate] 閘門 `{}`"
+"tui.hint.gate_tag" = "[gate] {}"
 "tui.hint.gate_action" = "· 輸入修改意見或 /continue"
 "tui.hint.multiline" = "多行 · Ctrl+J 換行（Shift+Enter 視終端支援）"
 "tui.hint.typed" = "Ctrl+J / Shift+Enter 換行 · ↑↓ 調取歷史"
@@ -1184,7 +1184,7 @@
 "agentic.done" = "[agentic] 完成。"
 # 斜線命令內聯輸出(app.rs)
 "slash.history_cleared" = "對話歷史已清空。"
-"slash.gate_approved" = "[ok] 已通過閘門 `{}` —— 繼續…"
+"slash.gate_approved" = "[ok] 已通過{} —— 繼續…"
 "slash.mcp_header" = "[package] MCP 伺服器:\n\n{}"
 "slash.skill_header" = "[skill] 技能包:\n\n{}"
 "slash.mouse_on" = "滑鼠滾輪捲動已開啟 —— Shift+拖曳可用終端原生文字選取"
@@ -1226,7 +1226,7 @@
 # --- 持續長會話執行路徑(CLI 輸出、TUI 區塊提示、階段 + 團隊評審提示) ---
 "continuous.session_active" = "持續會話已啟用({})—— 預設的長會話路徑。"
 "continuous.session_unavailable" = "  [continuous] 會話不可用({});回退到單次逐階段路徑。"
-"continuous.auto_gate_resumed" = "[auto] 關卡 {} 已自動通過 —— 繼續推進。"
+"continuous.auto_gate_resumed" = "[auto] {}已自動通過 —— 繼續推進。"
 "continuous.lean_complete" = "輕量任務已完成(無交付物料包 —— 這是一次小範圍改動)"
 "continuous.hardstop_report" = "UmaDev —— 流水線在交付前停止:{}"
 "continuous.tui_session_unavailable" = "持續會話不可用({})—— 設 UMADEV_CONTINUOUS=0 可改用逐階段路徑。"
@@ -1236,9 +1236,12 @@
 "continuous.plan_mode_skip" = "[plan] 計畫模式為唯讀:本次執行請求未啟動,工作區沒有發生變更。請切換 guarded 或 auto 後執行。"
 "continuous.phase_failed" = "[fail] {} 階段失敗:{} —— 持續會話路徑停止。"
 "continuous.no_source_hardstop" = "[fail] 未產出真實程式碼 —— 流水線停止,未交付(持續會話路徑硬關卡)。"
-"director.run_done" = "UmaDev —— 總監已完成本次建置。"
-"director.run_paused" = "UmaDev —— 本次執行已暫停在關卡 `{}`;請重新開啟 TUI(`umadev`)確認,或執行 `umadev continue` 繼續。"
-"director.no_source_hardstop" = "UmaDev —— 總監聲稱完成了建置,但工作區沒有任何真實原始碼檔案:依客觀核對,本次建置判為未完成(總監路徑硬關卡)。"
+"director.run_done" = "UmaDev —— 本次建置已完成。"
+"director.run_paused" = "UmaDev —— 本次執行已暫停在{};請重新開啟 UmaDev(`umadev`)確認,或執行 `umadev continue` 繼續。"
+"director.no_source_hardstop" = "UmaDev —— 本次建置聲稱已完成,但工作區沒有任何真實原始碼檔案:依客觀核對,本次建置判為未完成。"
+"gate.name.clarify" = "釐清提問檢查點"
+"gate.name.docs" = "核心文件確認檢查點"
+"gate.name.preview" = "前端預覽確認檢查點"
 "continuous.dangerous_action_denied" = "[gate] 危險動作需使用者確認,本回合按拒絕處理:{} -> {}(放寬:/mode auto;claude 底座要完全放行可設 UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions)"
 "continuous.tool_call_blocked" = "[gov] {} 階段:底座工具呼叫觸發 {} —— {}(target: {})"
 "continuous.phase_truncated" = "[warn] {} 階段被截斷(底座到達回合上限),保留已產出,繼續。"

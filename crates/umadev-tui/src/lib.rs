@@ -3103,7 +3103,10 @@ async fn drive_agentic_stream(
     brain: &dyn Runtime,
     task: &str,
     model: &str,
-    label: &str,
+    // The base's raw id, threaded by callers for parity with the pipeline path.
+    // A turn-failure note no longer names the base (that leaked the raw id to the
+    // user), so this is currently unused here — kept to avoid churning every caller.
+    _label: &str,
     project_root: &std::path::Path,
     director_build: bool,
     route: &RoutePlan,
@@ -3327,7 +3330,7 @@ async fn drive_agentic_stream(
             // so the user can simply retry.
             let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
                 "route.failed",
-                &[label, &e.to_string()],
+                &[&e.to_string()],
             )));
         }
     }

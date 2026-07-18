@@ -2787,7 +2787,10 @@ async fn drive_continuous_run_from(
                 // Auto tier: approve the gate ourselves and resume the next block.
                 eprintln!(
                     "\n{}",
-                    umadev_i18n::tlf("continuous.auto_gate_resumed", &[gate.id_str()])
+                    umadev_i18n::tlf(
+                        "continuous.auto_gate_resumed",
+                        &[umadev_i18n::tl(gate.human_label_key())],
+                    )
                 );
                 start_after = continuous_resume_phase(gate);
             }
@@ -2856,7 +2859,12 @@ fn director_outcome_report(outcome: &DirectorOutcome) -> String {
     match outcome {
         DirectorOutcome::Planned => umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
         DirectorOutcome::Paused { gate } => {
-            umadev_i18n::tlf("director.run_paused", &[gate.id_str()])
+            // Name the pause point with a HUMAN checkpoint label, never the raw
+            // snake_case gate id (`docs_confirm` / …) — that leaked an internal id.
+            umadev_i18n::tlf(
+                "director.run_paused",
+                &[umadev_i18n::tl(gate.human_label_key())],
+            )
         }
         DirectorOutcome::Done => umadev_i18n::tl("director.run_done").to_string(),
         DirectorOutcome::HardStop(reason) => {
@@ -8169,8 +8177,12 @@ mod tests {
             gate: Gate::PreviewConfirm,
         });
         assert!(
-            report.contains("preview_confirm"),
-            "the paused report must identify the unresolved gate: {report}"
+            report.contains(umadev_i18n::tl("gate.name.preview")),
+            "the paused report must identify the unresolved checkpoint with a human label: {report}"
+        );
+        assert!(
+            !report.contains("preview_confirm"),
+            "the paused report must NOT leak the raw snake_case gate id: {report}"
         );
         assert_ne!(
             report,

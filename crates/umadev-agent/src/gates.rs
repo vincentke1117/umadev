@@ -27,6 +27,20 @@ impl Gate {
         }
     }
 
+    /// The i18n KEY for this gate's HUMAN checkpoint label (e.g. "the core-docs
+    /// checkpoint"), for USER-FACING copy. Never surface [`Gate::id_str`] (the raw
+    /// snake_case id like `docs_confirm`) to the user — that leaks an internal id.
+    /// Returned as a key (not a localized string) so this crate stays decoupled
+    /// from the i18n runtime; the host resolves it via `umadev_i18n::t`.
+    #[must_use]
+    pub const fn human_label_key(self) -> &'static str {
+        match self {
+            Self::ClarifyGate => "gate.name.clarify",
+            Self::DocsConfirm => "gate.name.docs",
+            Self::PreviewConfirm => "gate.name.preview",
+        }
+    }
+
     /// Inverse of [`Gate::id_str`]: parse a persisted gate id back into the
     /// typed enum. Case-insensitive + whitespace-tolerant; returns `None`
     /// for unknown ids (fail-open). Replaces the ad-hoc string matches the

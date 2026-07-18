@@ -291,6 +291,23 @@ pub async fn run_block(
         permission.purple_allowed,
     );
 
+    // This run door also owns the design archetype: default-on means an archetype is bound even
+    // when the UIUX doc declares none, and which one fits is a designer's judgment. Ask the brain
+    // once here (as the colour question is asked) and persist the pick for the sync coach renderer
+    // (`crate::design_archetype`). Skipped when `/design` already pinned one, and on the lean tier
+    // (bugfix / refactor / trivial) — those seat no team and open no forks, and a small code tweak
+    // does not warrant a design consult. Fail-open: an undetermined verdict persists nothing and
+    // the renderer takes the deterministic fallback.
+    if options.design_system.is_empty() && !crate::planner::is_lean_build(&options.requirement) {
+        let archetype =
+            crate::design_archetype::consult_design_archetype(session, &options.requirement).await;
+        crate::design_archetype::persist_design_archetype(
+            &options.project_root,
+            &options.requirement,
+            &archetype,
+        );
+    }
+
     // The phases this block drives, tailored to the plan. A GATED plan
     // (`Greenfield` / `FrontendOnly` / `BackendOnly` / `DocsOnly`) keeps the
     // gate-anchored three-block split, intersected with the plan so a one-sided
@@ -4267,10 +4284,12 @@ mod tests {
             TrustMode::Guarded,
         );
         let (events, _rec) = sink();
-        // research + docs turns, then the docs gate forks a 3-seat team — script
-        // all three to ACCEPT so the gate proceeds with no rework.
+        // The run door first consults the brain for the design archetype (one fork), then
+        // research + docs turns, then the docs gate forks a 3-seat team — script the archetype
+        // pick, then all three seats to ACCEPT so the gate proceeds with no rework.
         let mut session =
             FakeBaseSession::new(vec![vec![done()], vec![done()]]).with_fork_script(vec![
+                Some(r#"{"archetype":"modern-minimal","reason":"saas dashboard"}"#.into()),
                 Some(r#"{"accepts":true}"#.into()),
                 Some(r#"{"accepts":true}"#.into()),
                 Some(r#"{"accepts":true}"#.into()),
@@ -4281,8 +4300,12 @@ mod tests {
         let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
 
         assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
-        // Three read-only forks opened (one per docs seat), run in parallel.
-        assert_eq!(*forks.lock().unwrap(), 3, "one fork per docs seat");
+        // One archetype consult at the run door + three read-only forks (one per docs seat).
+        assert_eq!(
+            *forks.lock().unwrap(),
+            4,
+            "archetype consult + one fork per docs seat"
+        );
         // All-accept → NO rework directive injected into the main session
         // (research + docs only).
         assert_eq!(sent.lock().unwrap().len(), 2, "no rework on all-accept");
@@ -4298,10 +4321,13 @@ mod tests {
             TrustMode::Guarded,
         );
         let (events, _rec) = sink();
-        // Round 0: one seat BLOCKS (3 forks). Round 1 (re-review after rework):
-        // all 3 accept (3 more forks). So 6 forks, ONE rework directive.
+        // The run door consults the archetype first (one fork), then round 0: one seat BLOCKS
+        // (3 forks). Round 1 (re-review after rework): all 3 accept (3 more forks). So 7 forks,
+        // ONE rework directive.
         let mut session =
             FakeBaseSession::new(vec![vec![done()], vec![done()]]).with_fork_script(vec![
+                // run-door archetype consult
+                Some(r#"{"archetype":"modern-minimal","reason":"saas dashboard"}"#.into()),
                 Some(r#"{"accepts":false,"blocking":["no API surface table"]}"#.into()),
                 Some(r#"{"accepts":true}"#.into()),
                 Some(r#"{"accepts":true}"#.into()),
@@ -4377,10 +4403,10 @@ mod tests {
             TrustMode::Guarded,
         );
         let (events, rec) = sink();
-        // EVERY fork FAILS (`None`) → each seat is unavailable. The legacy gate
-        // remains live, but it must not claim that the review passed.
+        // EVERY fork FAILS (`None`) → the run-door archetype consult AND each docs seat are
+        // unavailable. The legacy gate remains live, but it must not claim that the review passed.
         let mut session = FakeBaseSession::new(vec![vec![done()], vec![done()]])
-            .with_fork_script(vec![None, None, None]);
+            .with_fork_script(vec![None, None, None, None]);
         let forks = session.forks_handle();
         let sent = session.sent_handle();
 
@@ -4388,8 +4414,8 @@ mod tests {
         assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
         assert_eq!(
             *forks.lock().unwrap(),
-            3,
-            "still attempts one fork per seat"
+            4,
+            "archetype consult + one fork per seat, all attempted"
         );
         assert_eq!(
             sent.lock().unwrap().len(),

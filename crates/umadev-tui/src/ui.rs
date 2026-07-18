@@ -6364,7 +6364,11 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     } else if let Some(gate) = app.active_gate {
         let mut gate_parts = vec![
             (
-                umadev_i18n::tf(app.lang, "tui.hint.gate_tag", &[gate.id_str()]),
+                umadev_i18n::tf(
+                    app.lang,
+                    "tui.hint.gate_tag",
+                    &[umadev_i18n::t(app.lang, gate.human_label_key())],
+                ),
                 theme::WARNING(),
             ),
             (

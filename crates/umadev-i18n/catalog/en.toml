@@ -156,13 +156,13 @@
 "status.paused" = "Paused, awaiting confirmation"
 
 # Gate review cards
-"gate.clarify.title" = "clarify — answer the questions so the base understands what you really want"
+"gate.clarify.title" = "Answer the questions so the base understands what you really want"
 "gate.clarify.checklist" = "Answer each question (or write 'skip')\nUnsure? write 'you decide'\nThe more specific, the better the PRD/code fits"
 "gate.clarify.next" = "When done, type c to continue (into web research), or describe changes"
-"gate.docs.title" = "docs_confirm — three core docs are ready for review"
+"gate.docs.title" = "Three core docs are ready for review"
 "gate.docs.checklist" = "PRD: do goals / scope / acceptance criteria cover what you actually want?\nArchitecture: are the API, data model and tech choices sound?\nDesign: do colors / fonts / component tokens match expectations, is there dark mode?"
 "gate.docs.next" = "Not sure? press c (or reply \"ok\" / \"approve\") to trust the AI's plan. Typing a revision re-runs the work with your change (minutes; /cancel to stop)."
-"gate.preview.title" = "preview_confirm — frontend preview is ready for review"
+"gate.preview.title" = "Frontend preview is ready for review"
 "gate.preview.checklist" = "Does the frontend follow the UIUX design system (icon lib / tokens / typography)?\nDo the page structure and flows match the PRD user stories?\nDo the fetch URLs match the architecture doc's API?"
 "gate.preview.next" = "Review the runnable frontend preview. Press c to proceed to backend / quality / delivery; typing text re-runs the frontend per your change (minutes; /cancel to undo)."
 "gate.artifacts_header" = "Artifacts:"
@@ -185,7 +185,7 @@
 "gate.action.diff_arch" = "/diff architecture     -> view the architecture"
 "gate.action.diff_uiux" = "/diff uiux             -> view the design system"
 "gate.guide_prefix" = "Guide: {}"
-"gate.auto_approved" = "[auto] Autonomous mode: auto-approved checkpoint `{}`, continuing…  (type /manual to review each step)"
+"gate.auto_approved" = "[auto] Autonomous mode: auto-approved {}, continuing…  (type /manual to review each step)"
 
 # Structured gate picker — a question + 2-4 labeled options (↑↓ / number keys +
 # Enter); free-text stays available (just type), options map onto the existing
@@ -529,7 +529,7 @@
 "run.deferred" = "[queued] This will not interrupt the current task; after the run settles, it will be sent as an ordinary turn for the model to interpret."
 "chat.queued" = "[queued] Queued — the base is still replying; this message will be sent the moment it finishes."
 "chat.queued_preserved" = "[queued] Kept {} unsent message(s); they will resume in their original order after cancellation settles."
-"chat.queued_duplicate_skipped" = "[note] The last route failed, so an identical queued message was skipped instead of being auto-sent again."
+"chat.queued_duplicate_skipped" = "[note] The last turn failed, so an identical queued message was skipped instead of being auto-sent again."
 "chat.turn_failed" = "[warn] Base execution failed this turn (base `{}`): {}\n  You can retry, or use /run <requirement> to start the pipeline explicitly."
 "chat.turn_failed_retrying" = "[note] Base execution errored this turn (base `{}`): {} — retrying once on a fresh session…"
 "chat.interrupted" = " [interrupted] reply incomplete"
@@ -556,9 +556,9 @@
 "run.queued_dropped" = "[note] The run stopped before your queued message \"{}\" could be sent — just send it again."
 "run.classified_build" = "-> Classified as a build task · entering the 9-phase pipeline (/cancel to stop mid-way)"
 "design.suggest_hint" = "Tip: you haven't picked a design system. Use /design <name> to lock the visual direction before the run:\n  {}.\n  Skipping is fine — the worker will auto-pick one based on the requirement."
-"run.preflight_plan" = "Requirement received: \"{}\"\n\nConfig: worker `{}` · design system `{}` · template `{}`\n\n9-phase pipeline:\n  1) research (competitors + discovery) -> 2) docs (PRD + Architecture + UIUX) -> [gate] docs_confirm\n  3) spec -> 4) frontend (built from UIUX tokens) -> [gate] preview_confirm\n  5) backend -> 6) quality (5-dimension review) -> 7) delivery -> proof-pack\n\n{}"
+"run.preflight_plan" = "Requirement received: \"{}\"\n\nConfig: worker `{}` · design system `{}` · template `{}`\n\nThe plan:\n  1) research (competitors + discovery) -> 2) docs (PRD + Architecture + UIUX) -> [pause] confirm the core docs\n  3) spec -> 4) frontend (built from UIUX tokens) -> [pause] confirm the frontend preview\n  5) backend -> 6) quality (5-dimension review) -> 7) delivery -> proof-pack\n\n{}"
 "run.gate_line.auto" = "The two gates auto-approve by default (they show as checkpoints only); press shift+Tab or /manual for per-gate review. Starting the pipeline…"
-"run.gate_line.guarded" = "Guarded mode: the two gates (docs_confirm / preview_confirm) pause for your per-gate approval; press shift+Tab or /auto to auto-approve. Starting the pipeline…"
+"run.gate_line.guarded" = "Guarded mode: the two checkpoints (confirm the core docs / confirm the frontend preview) pause for your approval; press shift+Tab or /auto to auto-approve. Starting now…"
 "run.gate_line.plan" = "Plan mode: read out the plan only, no code written (/mode guarded or auto to execute). Starting the pipeline…"
 "run.cancelled" = "[cancelled] The current run is stopped, back to the prompt. Artifacts from completed phases stay in output/; you can /continue or type a new requirement next time."
 
@@ -578,7 +578,7 @@
 "continue.chat_directive" = "Continue the work from where we left off."
 "continue.resuming_plan" = "team · resuming the saved plan ({}/{} steps already done) — driving only what's left"
 "revise.usage" = "Usage: /revise <revision notes>.\n  Example: /revise drop social login, keep only email + password"
-"revise.no_gate" = "No gate is open, nothing to revise — to change output, wait for the pipeline to pause at a gate (docs_confirm / preview_confirm)."
+"revise.no_gate" = "No checkpoint is open, nothing to revise — to change output, wait for the run to pause at a checkpoint (confirm the core docs / confirm the frontend preview)."
 
 # Pitfalls overlay / cancel / unknown command
 "pitfalls.overlay_title" = " Pitfall knowledge base — Esc to close, ↑↓ to scroll "
@@ -755,7 +755,7 @@
 "setup.more_below" = "↓ {} more below"
 
 # Routing memo (conversation context fed to the base, not shown directly)
-"run.classified_build_memo" = "(entering the 9-phase pipeline, requirement: {})"
+"run.classified_build_memo" = "(setting up the team to build this, requirement: {})"
 
 # File checkpoints / phase labels
 "checkpoint.phase_label" = "phase start: {}"
@@ -784,7 +784,7 @@
 "base.init_failed" = "[warn] Could not initialize base `{}`: {}\n  Check the current base configuration, or use /backend /offline to switch."
 "route.resume_retry" = "[info] Resuming the previous session failed — retried with a fresh session…"
 "base.empty_reply" = "[warn] Base `{}` returned no content."
-"route.failed" = "[warn] Routing failed (base `{}`): {}\n  You can retry, or use /run <requirement> to start the pipeline explicitly."
+"route.failed" = "[warn] Couldn't finish this turn — the AI worker hit an error: {}\n  You can retry, or use /run <requirement> to start a full build explicitly."
 
 # Base-failure classifier — actionable diagnosis (classify -> actionable_message)
 "base.fail.auth.claude" = "Base not logged in — run `claude auth login`, or set CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) for headless use, then /continue"
@@ -1027,7 +1027,7 @@
 "tui.diff.truncated" = "… {} more lines (open the file to view)"
 # Prompt meta-row hints
 "tui.hint.palette" = "↑↓ choose · Tab autocomplete · Enter run"
-"tui.hint.gate_tag" = "[gate] gate `{}`"
+"tui.hint.gate_tag" = "[gate] {}"
 "tui.hint.gate_action" = "· type revision or /continue"
 "tui.hint.multiline" = "multi-line · Ctrl+J newline (Shift+Enter where supported)"
 "tui.hint.typed" = "Ctrl+J / Shift+Enter newline · ↑↓ recall"
@@ -1205,7 +1205,7 @@
 "agentic.done" = "[agentic] done."
 # Slash-command inline pushes (app.rs)
 "slash.history_cleared" = "history cleared."
-"slash.gate_approved" = "[ok] approved gate `{}` — continuing…"
+"slash.gate_approved" = "[ok] approved {} — continuing…"
 "slash.mcp_header" = "[package] MCP Servers:\n\n{}"
 "slash.skill_header" = "[skill] Skills:\n\n{}"
 "slash.mouse_on" = "mouse-wheel scrolling on — Shift+drag for native text selection"
@@ -1247,7 +1247,7 @@
 # --- Continuous long-session run path (CLI prints, TUI block notes, phase + team review notes) ---
 "continuous.session_active" = "Continuous session active ({}) — the default long-session path."
 "continuous.session_unavailable" = "  [continuous] session unavailable ({}); falling back to the single-shot per-phase path."
-"continuous.auto_gate_resumed" = "[auto] gate {} auto-approved — resuming."
+"continuous.auto_gate_resumed" = "[auto] {} auto-approved — resuming."
 "continuous.lean_complete" = "lean task complete (no release proof-pack — this was a small-scope change)"
 "continuous.hardstop_report" = "UmaDev — pipeline stopped before delivery: {}"
 "continuous.tui_session_unavailable" = "continuous session unavailable ({}) — set UMADEV_CONTINUOUS=0 to use the per-phase path."
@@ -1257,9 +1257,12 @@
 "continuous.plan_mode_skip" = "[plan] Plan mode is read-only: this execution request was not started and no workspace changes were made. Switch to guarded or auto to execute."
 "continuous.phase_failed" = "[fail] {} phase failed: {} — continuous session path stopped."
 "continuous.no_source_hardstop" = "[fail] No real source files produced — pipeline stopped, nothing delivered (continuous hard gate)."
-"director.run_done" = "UmaDev — the director finished this build."
-"director.run_paused" = "UmaDev — the run paused at gate `{}`; reopen the TUI (`umadev`) to approve it, or run `umadev continue`."
-"director.no_source_hardstop" = "UmaDev — the director reported a build but the workspace has zero real source files: objectively this build is not done (director-path hard gate)."
+"director.run_done" = "UmaDev — this build is finished."
+"director.run_paused" = "UmaDev — this run is paused at {}; reopen UmaDev (`umadev`) to approve it, or run `umadev continue`."
+"director.no_source_hardstop" = "UmaDev — this build reported done, but the workspace has zero real source files: objectively this build is not finished."
+"gate.name.clarify" = "the clarifying-questions checkpoint"
+"gate.name.docs" = "the core-docs checkpoint"
+"gate.name.preview" = "the frontend-preview checkpoint"
 "continuous.dangerous_action_denied" = "[gate] Irreversible action needs user confirmation; denied this turn: {} -> {} (to relax: /mode auto; for full bypass on the claude base set UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions)"
 "continuous.tool_call_blocked" = "[gov] {} phase: base tool call tripped {} — {} (target: {})"
 "continuous.phase_truncated" = "[warn] {} phase was truncated (base hit its turn limit); keeping what was produced, continuing."

@@ -1702,53 +1702,42 @@ pub fn run_quality_with_kind(
         weight: 1.0,
     });
 
-    // === Ops artifacts check (content-validated) ===
-    // Generate scaffolding before checking so the files exist.
-    let _scaffold =
-        crate::scaffolding::generate_scaffolding(&opts.project_root, &contract_spec, &arch_text);
-    let ops_files: [(&str, &str); 4] = [
-        ("Dockerfile", "FROM"),
-        (".github/workflows/ci.yml", "jobs:"),
-        ("migrations/0001_init.sql", "CREATE TABLE"),
-        (".env.example", "="),
-    ];
-    let mut ops_present = 0usize;
-    let mut ops_detail = Vec::new();
-    for (rel, marker) in &ops_files {
-        let p = opts.project_root.join(rel);
-        match fs::read_to_string(&p) {
-            Ok(content) if !content.trim().is_empty() && content.contains(*marker) => {
-                ops_present += 1;
-            }
-            Ok(_) => ops_detail.push(format!("{rel}: stub")),
-            Err(_) => ops_detail.push(format!("{rel}: missing")),
-        }
-    }
-    let ops_score = i32::try_from(ops_present * 100 / ops_files.len()).unwrap_or(0);
+    // === Ops artifacts audit (base-produced) ===
+    // UmaDev does NOT generate deployment artifacts — the base owns that
+    // engineering seat. This AUDITS whether the base actually shipped real,
+    // non-trivial ops artifacts (a container build, a CI pipeline, DB
+    // migrations) and scores them honestly: presence raises the signal, and
+    // absence is a finding the base should address — never a fabricated pass
+    // and never a hard block (the check is `delivery`, not `artifact`, so it
+    // lowers the mean but is not a critical failure). For a static frontend
+    // with no server surface, the context-aware N/A pass below downgrades a
+    // non-passing result to `n/a`, so a page that correctly ships no Dockerfile
+    // is not penalised. Fail-open: read errors count an artifact as absent and
+    // never crash the gate.
+    let ops_audit = audit_ops_artifacts(&opts.project_root);
+    let ops_total = ops_audit.details.len();
+    let ops_score = i32::try_from(ops_audit.present * 100 / ops_total).unwrap_or(0);
     checks.push(QualityCheck {
         name: "Ops artifacts present".to_string(),
         category: "delivery".to_string(),
-        description: "Dockerfile + CI + migrations + .env generated with real content".to_string(),
-        status: if ops_present == ops_files.len() {
+        description: "Base shipped real container / CI / migration artifacts".to_string(),
+        status: if ops_audit.present == ops_total {
             "passed"
-        } else if ops_present >= 2 {
+        } else if ops_audit.present >= 1 {
             "warning"
         } else {
             "failed"
         }
         .to_string(),
         score: ops_score,
-        details: if ops_detail.is_empty() {
-            format!(
-                "All {} ops artifacts present with valid content",
-                ops_files.len()
-            )
+        details: if ops_audit.present == ops_total {
+            format!("All {ops_total} ops artifacts shipped by the base with real content")
         } else {
             format!(
-                "{}/{} valid; {}",
-                ops_present,
-                ops_files.len(),
-                ops_detail.join(", ")
+                "{}/{} ops artifacts shipped by the base; {}",
+                ops_audit.present,
+                ops_total,
+                ops_audit.details.join(", ")
             )
         },
         weight: 2.0,
@@ -2138,6 +2127,156 @@ fn weighted_avg(checks: &[QualityCheck]) -> f32 {
 
 fn file_line_count(path: &Path) -> usize {
     fs::read_to_string(path).map_or(0, |t| t.lines().filter(|l| !l.trim().is_empty()).count())
+}
+
+/// Verdict of the ops-artifacts audit — what the BASE actually shipped.
+///
+/// UmaDev never writes deployment artifacts (that is the base's devops/backend
+/// seat); this only records what an audit of the project FOUND, so the quality
+/// gate can score the base's ops maturity honestly instead of grading files
+/// UmaDev generated itself.
+struct OpsAudit {
+    /// How many audited ops artifacts the base shipped with real content.
+    present: usize,
+    /// Per-artifact status lines (`"<name>: present"` / `"<name>: absent"`).
+    details: Vec<String>,
+}
+
+/// Read `path` and report whether it holds non-trivial content containing
+/// `needle`. Fail-open: an unreadable or blank file reads as `false`.
+fn ops_file_has(path: &Path, needle: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|c| !c.trim().is_empty() && c.contains(needle))
+}
+
+/// `true` when the base shipped a container build in the project root — a
+/// `Dockerfile`, `Dockerfile.<suffix>`, or `Containerfile` carrying a real
+/// `FROM` stage. Only the root is inspected (the conventional home for a
+/// top-level service image). Fail-open on any read error.
+fn base_has_container_build(project_root: &Path) -> bool {
+    let Ok(rd) = fs::read_dir(project_root) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !matches!(classify_no_follow(&path), EntryKind::File) {
+            continue;
+        }
+        let fname = entry.file_name();
+        let Some(name) = fname.to_str() else { continue };
+        let is_candidate =
+            name == "Dockerfile" || name.starts_with("Dockerfile.") || name == "Containerfile";
+        if is_candidate && ops_file_has(&path, "FROM") {
+            return true;
+        }
+    }
+    false
+}
+
+/// `true` when the base shipped a CI pipeline: any workflow file under
+/// `.github/workflows/` declaring `jobs:`, or a conventional top-level GitLab /
+/// CircleCI config with real content. Fail-open on any read error.
+fn base_has_ci_pipeline(project_root: &Path) -> bool {
+    let wf_dir = project_root.join(".github/workflows");
+    if let Ok(rd) = fs::read_dir(&wf_dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !matches!(classify_no_follow(&path), EntryKind::File) {
+                continue;
+            }
+            let is_yaml = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("yml") || e.eq_ignore_ascii_case("yaml"));
+            if is_yaml && ops_file_has(&path, "jobs:") {
+                return true;
+            }
+        }
+    }
+    ops_file_has(&project_root.join(".gitlab-ci.yml"), "script:")
+        || ops_file_has(&project_root.join(".circleci/config.yml"), "jobs:")
+}
+
+/// `true` when the base shipped database migrations: at least one `.sql` file
+/// carrying real DDL (`CREATE TABLE` / `ALTER TABLE`) under a conventional
+/// migrations directory. Bounded to one level of nesting so Prisma/Flyway
+/// per-migration folders are found. Fail-open on any read error.
+fn base_has_migrations(project_root: &Path) -> bool {
+    const DIRS: [&str; 5] = [
+        "migrations",
+        "migration",
+        "db/migrations",
+        "database/migrations",
+        "prisma/migrations",
+    ];
+    DIRS.iter()
+        .any(|dir| migrations_dir_has_ddl(&project_root.join(dir)))
+}
+
+/// Scan a migrations directory (and its immediate subdirectories) for a `.sql`
+/// file that contains real DDL. Fail-open on any read error.
+fn migrations_dir_has_ddl(dir: &Path) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        match classify_no_follow(&path) {
+            EntryKind::File => {
+                if sql_file_has_ddl(&path) {
+                    return true;
+                }
+            }
+            EntryKind::Dir => {
+                if let Ok(sub) = fs::read_dir(&path) {
+                    for e in sub.flatten() {
+                        let p = e.path();
+                        if matches!(classify_no_follow(&p), EntryKind::File) && sql_file_has_ddl(&p)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            EntryKind::Skip => {}
+        }
+    }
+    false
+}
+
+/// `true` when `path` is a `.sql` file whose content declares a table
+/// (`CREATE TABLE` / `ALTER TABLE`, case-insensitive). Fail-open on read error.
+fn sql_file_has_ddl(path: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+        return false;
+    }
+    fs::read_to_string(path).is_ok_and(|c| {
+        let upper = c.to_ascii_uppercase();
+        upper.contains("CREATE TABLE") || upper.contains("ALTER TABLE")
+    })
+}
+
+/// Audit whether the BASE shipped real, non-trivial ops artifacts — a container
+/// build, a CI pipeline, and DB migrations. UmaDev never generates these (that
+/// is the base's devops/backend seat); this only READS the project so the
+/// quality gate can score the base's ops maturity honestly. Fail-open
+/// throughout: an unreadable candidate counts as absent, never a crash.
+fn audit_ops_artifacts(project_root: &Path) -> OpsAudit {
+    let items = [
+        ("Dockerfile", base_has_container_build(project_root)),
+        ("CI workflow", base_has_ci_pipeline(project_root)),
+        ("DB migrations", base_has_migrations(project_root)),
+    ];
+    let mut present = 0usize;
+    let mut details = Vec::with_capacity(items.len());
+    for (name, found) in items {
+        if found {
+            present += 1;
+            details.push(format!("{name}: present"));
+        } else {
+            details.push(format!("{name}: absent"));
+        }
+    }
+    OpsAudit { present, details }
 }
 
 fn count_code_violations(tool_log: &Path) -> (usize, usize) {
@@ -5122,16 +5261,17 @@ mod tests {
         let out = run_quality(&o).unwrap();
         let json = fs::read_to_string(&out.artifacts[0]).unwrap();
         let report: QualityReport = serde_json::from_str(&json).unwrap();
-        // Ops artifacts check should exist and produce scaffolding.
+        // The ops-artifacts check must exist — but it AUDITS the base's output,
+        // it does not generate anything.
         let ops = report
             .checks
             .iter()
             .find(|c| c.name == "Ops artifacts present");
         assert!(ops.is_some(), "must have ops artifacts check");
-        // Scaffolding files should have been generated by the check.
+        // UmaDev must NOT write ops artifacts into the user's project root.
         assert!(
-            tmp.path().join("Dockerfile").is_file(),
-            "Dockerfile must be generated"
+            !tmp.path().join("Dockerfile").exists(),
+            "quality phase must not generate a Dockerfile"
         );
     }
 
@@ -5282,30 +5422,34 @@ mod tests {
     }
 
     #[test]
-    fn scaffolding_generated_during_quality() {
+    fn quality_phase_writes_nothing_into_project_root() {
+        // UmaDev is a governance shell — the quality phase AUDITS the base's
+        // output and must never fabricate ops artifacts in the user's repo.
         let tmp = TempDir::new().unwrap();
         let o = opts(tmp.path());
         run_research(&o, None).unwrap();
         run_docs(&o, &DocsContent::default()).unwrap();
         run_spec(&o).unwrap();
         run_quality(&o).unwrap();
-        // Quality gate should have generated scaffolding.
-        assert!(
-            tmp.path().join("Dockerfile").is_file(),
-            "Dockerfile generated"
-        );
-        assert!(
-            tmp.path().join(".github/workflows/ci.yml").is_file(),
-            "CI generated"
-        );
-        assert!(
-            tmp.path().join("migrations/0001_init.sql").is_file(),
-            "migration generated"
-        );
+        for rel in [
+            "Dockerfile",
+            "docker-compose.yml",
+            ".env.example",
+            "migrations/0001_init.sql",
+            ".github/workflows/ci.yml",
+        ] {
+            assert!(
+                !tmp.path().join(rel).exists(),
+                "quality phase must not write {rel} into the project root"
+            );
+        }
     }
 
     #[test]
-    fn ops_artifacts_content_validated() {
+    fn ops_audit_reports_absence_honestly() {
+        // A project where the base produced NO ops artifacts: the audit must
+        // report the gap honestly (a finding, score 0) — never fabricate a pass
+        // by generating files, never crash.
         let tmp = TempDir::new().unwrap();
         let o = opts(tmp.path());
         run_research(&o, None).unwrap();
@@ -5319,10 +5463,112 @@ mod tests {
             .iter()
             .find(|c| c.name == "Ops artifacts present")
             .unwrap();
-        // Scaffolding was generated → should pass.
+        assert_eq!(
+            ops.status, "failed",
+            "no base ops artifacts → honest finding, got {ops:?}"
+        );
+        assert_eq!(ops.score, 0, "no ops artifacts → score 0");
+        // It is a `delivery` finding, NOT a critical `artifact` failure — it
+        // lowers the mean but never hard-blocks the gate.
+        assert_eq!(ops.category, "delivery");
+        assert!(
+            !report
+                .critical_failures
+                .contains(&"Ops artifacts present".to_string()),
+            "an absent ops layer must not be a hard block"
+        );
+    }
+
+    #[test]
+    fn ops_audit_recognizes_base_output() {
+        // A project where the base DID produce real ops artifacts: the audit
+        // recognizes them (no false finding) and still writes nothing.
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        run_research(&o, None).unwrap();
+        run_docs(&o, &DocsContent::default()).unwrap();
+        run_spec(&o).unwrap();
+        // Simulate base-produced ops artifacts BEFORE the quality audit runs.
+        fs::write(
+            tmp.path().join("Dockerfile"),
+            "FROM node:20-alpine\nWORKDIR /app\nCMD [\"node\", \"server.js\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join(".github/workflows")).unwrap();
+        fs::write(
+            tmp.path().join(".github/workflows/ci.yml"),
+            "name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("migrations")).unwrap();
+        fs::write(
+            tmp.path().join("migrations/0001_init.sql"),
+            "CREATE TABLE users (id UUID PRIMARY KEY);\n",
+        )
+        .unwrap();
+        let out = run_quality(&o).unwrap();
+        let json = fs::read_to_string(&out.artifacts[0]).unwrap();
+        let report: QualityReport = serde_json::from_str(&json).unwrap();
+        let ops = report
+            .checks
+            .iter()
+            .find(|c| c.name == "Ops artifacts present")
+            .unwrap();
         assert_eq!(
             ops.status, "passed",
-            "ops artifacts should pass after scaffolding gen"
+            "real base ops artifacts must be recognized, got {ops:?}"
+        );
+        assert_eq!(ops.score, 100);
+    }
+
+    #[test]
+    fn audit_ops_artifacts_detects_each_kind() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Empty project → nothing found.
+        assert_eq!(audit_ops_artifacts(root).present, 0);
+
+        // Container build (Dockerfile with a real FROM stage).
+        fs::write(root.join("Dockerfile"), "FROM rust:1.88\n").unwrap();
+        // CI pipeline (GitHub Actions workflow declaring jobs).
+        fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        fs::write(
+            root.join(".github/workflows/ci.yml"),
+            "name: CI\njobs:\n  test: {}\n",
+        )
+        .unwrap();
+        // Migrations nested one level deep (Prisma/Flyway style).
+        fs::create_dir_all(root.join("prisma/migrations/0001_init")).unwrap();
+        fs::write(
+            root.join("prisma/migrations/0001_init/migration.sql"),
+            "CREATE TABLE orders (id UUID);\n",
+        )
+        .unwrap();
+
+        let audit = audit_ops_artifacts(root);
+        assert_eq!(
+            audit.present, 3,
+            "all three kinds detected: {:?}",
+            audit.details
+        );
+        assert!(audit.details.iter().all(|d| d.ends_with("present")));
+    }
+
+    #[test]
+    fn audit_ops_artifacts_ignores_trivial_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // An empty Dockerfile and a workflow file with no `jobs:` are NOT real
+        // ops artifacts — the audit must not count them.
+        fs::write(root.join("Dockerfile"), "\n   \n").unwrap();
+        fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        fs::write(root.join(".github/workflows/empty.yml"), "name: nothing\n").unwrap();
+        fs::create_dir_all(root.join("migrations")).unwrap();
+        fs::write(root.join("migrations/notes.sql"), "-- just a comment\n").unwrap();
+        assert_eq!(
+            audit_ops_artifacts(root).present,
+            0,
+            "trivial/stub files must not count as real ops artifacts"
         );
     }
 

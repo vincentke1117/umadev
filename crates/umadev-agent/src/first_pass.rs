@@ -191,8 +191,8 @@ pub fn low_confidence_nudge(project_root: &Path, kind: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "signal · {kind} 的一次过验收率偏低({:.0}%)— 这一类的轻量路径历史上不太可靠,\
-         建议多借脑校验 / 降低自动化档位(仅建议,确定性底线不变)",
+        "signal · 这一类需求的一次过验收率偏低({:.0}%)— 轻量路径历史上不太可靠,\
+         建议多校验 / 降低自动化档位(仅供参考,确定性底线不变)",
         rate * 100.0
     ))
 }
