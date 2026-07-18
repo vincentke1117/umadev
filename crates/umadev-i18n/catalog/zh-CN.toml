@@ -232,7 +232,6 @@
 "intent.depth.deep" = "深度"
 "intent.budget" = " · 预估 ≤{} 次工具调用"
 "intent.team" = " · 团队:{}"
-"intent.fallback" = "意图 · 大模型预判暂不可用，已使用保守兜底（不会自动升级为完整团队评审）。"
 "intent.writer_lock_blocked" = "[blocked] 意图 · 写入任务无法取得工作区单写者锁：{}"
 "intent.targeted_verification_missing" = "[blocked] 定向代码修改已经落盘，但没有观察到成功的定向测试/构建/lint 证据。本轮不会标记为完成；请运行最小相关校验后重试。"
 

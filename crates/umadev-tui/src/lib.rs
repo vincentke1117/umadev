@@ -5163,7 +5163,6 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         umadev_agent::deterministic_route(&text)
     };
     let mut route_source: Option<umadev_agent::RouteSource> = None;
-    let mut fallback_note_emitted = false;
     let routing_context = if native_command {
         String::new()
     } else {
@@ -5325,14 +5324,6 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             readonly_route_session = readonly_session;
             route = decided.plan;
             route_source = Some(decided.source);
-            if decided.source == umadev_agent::RouteSource::DeterministicFallback
-                && !fallback_note_emitted
-            {
-                fallback_note_emitted = true;
-                sink.emit(EngineEvent::Note(
-                    umadev_i18n::tl("intent.fallback").to_string(),
-                ));
-            }
         }
 
         // A typed clarification is a PAUSE, not permission to start doing work.

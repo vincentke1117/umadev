@@ -862,7 +862,6 @@ async fn resident_chat_uses_fork_model_to_downgrade_build_floor_before_write() {
     while let Ok(event) = engine_rx.try_recv() {
         match event {
             EngineEvent::Note(note) => {
-                assert!(!note.contains(umadev_i18n::tl("intent.fallback")));
                 assert!(
                     !(note.contains("honesty + QC") || note.contains("team ·")),
                     "model-routed QuickEdit must not launch flagship QC: {note}"
