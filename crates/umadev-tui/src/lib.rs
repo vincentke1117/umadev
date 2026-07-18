@@ -30,6 +30,7 @@
 )]
 
 pub mod app;
+mod apple_terminal_theme;
 mod auth_ui;
 mod background_process_control;
 mod base_config;
@@ -8328,7 +8329,7 @@ where
 /// never re-queried by any automatic trigger and never overwritten by a probe
 /// reply, so a live terminal-theme switch can never disturb the user's explicit
 /// choice. `/theme auto` releases the manual pin.
-fn theme_pinned() -> bool {
+pub(crate) fn theme_pinned() -> bool {
     theme_override().is_some() || ui::theme_locked()
 }
 
@@ -9808,17 +9809,33 @@ fn background_reply_should_apply(
     !pinned && reply_is_light != current_is_light
 }
 
+/// Apply a freshly detected background light/dark verdict through the guarded
+/// path shared by the OSC 11 reply ([`apply_background_theme_reply`]) and the
+/// Apple Terminal.app AppleScript probe (see [`apple_terminal_theme`]): honour
+/// the pin ([`theme_pinned`]) and skip an unchanged classification
+/// ([`background_reply_should_apply`]). Returns whether the palette actually
+/// changed, so the caller can request a repaint. A pinned palette (an explicit
+/// `UMADEV_THEME` or a manual `/theme`) is never overridden, and an unchanged
+/// verdict never redraws.
+fn apply_background_theme_verdict(app: &mut App, is_light: bool) -> bool {
+    if background_reply_should_apply(is_light, theme_pinned(), ui::is_light_theme()) {
+        ui::set_light_theme(is_light);
+        app.contaminate_terminal();
+        true
+    } else {
+        false
+    }
+}
+
 fn apply_background_theme_reply(app: &mut App, input: &mut InputSource, draw_now: &mut bool) {
     let Some(is_light) = input.take_background_reply() else {
         return;
     };
     // The reply is ALWAYS drained above (so it never leaks as input); it is only
     // APPLIED when nothing pins the theme AND it actually differs from the
-    // current palette (see `background_reply_should_apply`). The differ-check is
+    // current palette (see `apply_background_theme_verdict`). The differ-check is
     // what keeps the idle re-probe from repainting on every re-confirmed reply.
-    if background_reply_should_apply(is_light, theme_pinned(), ui::is_light_theme()) {
-        ui::set_light_theme(is_light);
-        app.contaminate_terminal();
+    if apply_background_theme_verdict(app, is_light) {
         *draw_now = true;
     }
 }
@@ -9926,6 +9943,12 @@ async fn event_loop(
     // a slow/wedged OS clipboard command can never stall input or rendering.
     let (clipboard_image_tx, mut clipboard_image_rx) =
         tokio::sync::mpsc::unbounded_channel::<clipboard_image::CaptureResult>();
+    // Apple Terminal.app real-background probe (macOS only) reports its light/dark
+    // verdict here. The `osascript` subprocess runs OFF the event loop in a spawned
+    // task (see `apple_terminal_theme::spawn_probe`), so a slow / denied macOS TCC
+    // prompt can never stall startup, focus-in, or any turn — the loop only ever
+    // RECEIVES a bool on this channel.
+    let (apple_theme_tx, mut apple_theme_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
 
     // Probe in the background so the picker labels refresh as data arrives.
     spawn_probe(sink.clone());
@@ -9957,6 +9980,14 @@ async fn event_loop(
             ui::set_light_theme(is_light);
         }
     }
+    // Apple Terminal.app never answers OSC 11, so the prime above always misses
+    // for it and the palette rests on the static default-light heuristic. Kick off
+    // the AppleScript real-background probe at STARTUP to refine that verdict. It
+    // runs fully async (off this path) and its result lands on `apple_theme_rx`
+    // AFTER the first paint — never a blocking wait, so a slow / denied TCC prompt
+    // can't hang launch. The gate inside makes it a no-op for every non-macOS /
+    // non-Terminal.app / pinned case (no process spawned).
+    apple_terminal_theme::spawn_probe(&apple_theme_tx);
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     let mut clipboard_image_in_flight = false;
     let mut clipboard_tool_hint_shown = false;
@@ -11095,6 +11126,19 @@ async fn event_loop(
                     draw_now = true;
                 }
             }
+            maybe_apple_theme = apple_theme_rx.recv() => {
+                // The Apple Terminal.app AppleScript background probe (startup /
+                // focus-in) produced a REAL light/dark verdict. Apply it through the
+                // SAME guarded path as an OSC 11 reply (`apply_background_theme_verdict`):
+                // a `/theme` or `UMADEV_THEME` pin still wins, and an unchanged verdict
+                // never repaints. Fail-open: a `None` (channel closed) does nothing.
+                if maybe_apple_theme
+                    .is_some_and(|is_light| apply_background_theme_verdict(app, is_light))
+                {
+                    needs_redraw = true;
+                    draw_now = true;
+                }
+            }
             maybe_route = route_rx.recv() => {
                 apply_route_decision!(maybe_route);
             }
@@ -11240,6 +11284,16 @@ async fn event_loop(
                         should_reprobe_background(use_owned, theme_pinned()),
                         &mut last_focus_gained_at,
                     );
+                    // Focus return is the dominant live-theme-switch case. For
+                    // Apple Terminal.app the OSC 11 re-probe above is inert (it
+                    // never answers), so ALSO re-run the AppleScript real-background
+                    // probe here to catch a Terminal.app profile change made while
+                    // away. Off the event loop + bounded timeout (see
+                    // `apple_terminal_theme::spawn_probe`); a no-op for every other
+                    // terminal / OS and for a pinned palette. NOT wired to the 3s
+                    // idle tick — spawning a process every tick is too heavy — so
+                    // the AppleScript path fires at startup and focus-in only.
+                    apple_terminal_theme::spawn_probe(&apple_theme_tx);
                 } else if let Some(Ok(Event::Mouse(me))) = &maybe_key {
                     handle_mouse_event(app, terminal, *me);
                 } else if let Some(Ok(Event::Paste(pasted))) = &maybe_key {
