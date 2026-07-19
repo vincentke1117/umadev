@@ -2197,6 +2197,44 @@ static GOAL_MODE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// one could leak into a concurrent sibling reader and flip its verdict.
 static THEME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Serializes the exit-handoff toggle tests: they read/write the process-global
+/// UMADEV_SCROLLBACK_HANDOFF env var, so without this a set_var in one could leak
+/// into a concurrent sibling reader and flip its verdict.
+static SCROLLBACK_HANDOFF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn scrollback_handoff_defaults_off_and_needs_explicit_truthy_opt_in() {
+    let _guard = SCROLLBACK_HANDOFF_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Unset → OFF: the default is a clean exit with the compact footer.
+    {
+        let _env = EnvRestore::remove("UMADEV_SCROLLBACK_HANDOFF");
+        assert!(
+            !scrollback_handoff_enabled(),
+            "unset must default to the clean-exit footer"
+        );
+    }
+    // Empty, explicitly-disabled, and unrecognised values all stay OFF.
+    for value in [
+        "", "   ", "0", "false", "no", "off", "2", "enabled", "truthy",
+    ] {
+        let _env = EnvRestore::set("UMADEV_SCROLLBACK_HANDOFF", value);
+        assert!(
+            !scrollback_handoff_enabled(),
+            "value {value:?} must NOT enable the full handoff"
+        );
+    }
+    // Only the explicit truthy tokens flip it on — case-insensitive, trimmed.
+    for value in ["1", "true", "yes", "TRUE", "Yes", "  1 ", "\ttrue\n", "YES"] {
+        let _env = EnvRestore::set("UMADEV_SCROLLBACK_HANDOFF", value);
+        assert!(
+            scrollback_handoff_enabled(),
+            "value {value:?} must enable the full handoff"
+        );
+    }
+}
+
 #[test]
 fn detect_light_bg_defaults_dark_for_an_unknown_terminal() {
     let _guard = THEME_ENV_LOCK

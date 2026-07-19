@@ -534,6 +534,10 @@
 "resume.usage" = "用法:/resume <id> —— 先用 /sessions 查看可恢復的對話 id。"
 "resume.not_found" = "[會話] 沒找到對話 `{}`(可能已刪除或 id 有誤)。/sessions 看現有清單。"
 "resume.done" = "[會話] 已恢復對話 `{}`({} 則記錄),底座會接上這段上下文。"
+# 離開頁尾 —— 離開程式後預設顯示的簡短提示,取代整段對話回放(完整回放改為
+# 選用,由 UMADEV_SCROLLBACK_HANDOFF 開啟)。第二行的 {} 是工作區路徑。
+"exit.footer.saved" = "工作階段已儲存,輸入 umadev 繼續。"
+"exit.footer.artifacts" = "目前進度已儲存到 {}"
 "compact.too_short" = "[compact] 對話還太短,無需壓縮。"
 "compact.nudge" = "[compact] 上下文已用約 {}% — 執行 /compact 折疊早前對話以在溢出前釋放空間。"
 "compact.summary" = "[早前對話摘要 · 共 {} 則]\n{}"

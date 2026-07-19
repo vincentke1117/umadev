@@ -5921,6 +5921,54 @@ impl App {
         out
     }
 
+    /// Build the compact exit footer shown on a clean quit when the full
+    /// scrollback handoff is disabled (the default). At most two short lines:
+    ///
+    /// 1. A "session saved — run `umadev` to resume" hint.
+    /// 2. When this workspace holds resumable artifacts (a persisted workflow
+    ///    state, or an `output/` directory with content), a second line that
+    ///    points the user at them.
+    ///
+    /// Returns `None` when there is nothing worth resuming (an empty
+    /// conversation), so the caller leaves a fully clean terminal — mirroring the
+    /// scrollback handoff's empty-history no-op. Pure + fail-open: the artifact
+    /// probe swallows IO errors and never panics, and all strings come from the
+    /// i18n catalog.
+    #[must_use]
+    pub fn exit_footer_text(&self) -> Option<String> {
+        // No conversation → nothing to resume → a fully clean exit.
+        if self.transcript_plaintext().trim().is_empty() {
+            return None;
+        }
+        let mut footer = umadev_i18n::t(self.lang, "exit.footer.saved").to_string();
+        if let Some(path) = self.resumable_artifact_path() {
+            footer.push('\n');
+            footer.push_str(&umadev_i18n::tf(
+                self.lang,
+                "exit.footer.artifacts",
+                &[path],
+            ));
+        }
+        Some(footer)
+    }
+
+    /// The workspace-relative location the exit footer points the user at, or
+    /// `None` when this session left no resumable artifacts. Prefers user-facing
+    /// deliverables under `output/`; falls back to the `.umadev/` workflow state a
+    /// prior `/run` persisted. Read-only + fail-open: an unreadable or absent path
+    /// just yields `None`, so the footer never fabricates a location that does not
+    /// exist.
+    fn resumable_artifact_path(&self) -> Option<&'static str> {
+        let output = self.project_root.join("output");
+        if std::fs::read_dir(&output).is_ok_and(|mut entries| entries.next().is_some()) {
+            return Some("output/");
+        }
+        if umadev_agent::read_workflow_state(&self.project_root).is_some() {
+            return Some(".umadev/");
+        }
+        None
+    }
+
     // ---- input editing helpers (char-cursor over a UTF-8 String) ---------
 
     /// Number of characters in the input buffer.

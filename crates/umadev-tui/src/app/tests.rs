@@ -9528,6 +9528,67 @@ fn transcript_plaintext_keeps_multiline_bodies_intact() {
     assert!(dump.ends_with('\n'), "the dump ends on a fresh line");
 }
 
+#[test]
+fn exit_footer_text_is_compact_for_a_stateful_session() {
+    // The DEFAULT clean-exit sign-off: a short footer, NOT the whole transcript.
+    let mut app = fresh_app(Some("offline"));
+    app.history.clear();
+    app.push(ChatRole::You, "build me a landing page");
+    app.push(ChatRole::Host, "done — here is the plan");
+    let footer = app
+        .exit_footer_text()
+        .expect("a session with a conversation gets a footer");
+    // At most two short lines (one here — no artifacts in a fresh workspace).
+    assert!(
+        footer.lines().count() <= 2,
+        "footer stays compact: {footer:?}"
+    );
+    // The resume hint names the command to run again.
+    assert!(
+        footer.to_lowercase().contains("umadev"),
+        "footer carries the resume hint: {footer:?}"
+    );
+    // It is emphatically NOT the transcript dump.
+    assert!(
+        !footer.contains("build me a landing page"),
+        "footer is a sign-off, not the conversation: {footer:?}"
+    );
+}
+
+#[test]
+fn exit_footer_text_points_at_artifacts_when_present() {
+    let mut app = fresh_app(Some("offline"));
+    app.history.clear();
+    app.push(ChatRole::You, "ship it");
+    // An `output/` deliverable adds the footer's optional second line.
+    let output = app.project_root.join("output");
+    std::fs::create_dir_all(&output).expect("create output dir");
+    std::fs::write(output.join("demo-prd.md"), "# PRD").expect("write artifact");
+    let footer = app
+        .exit_footer_text()
+        .expect("a stateful session gets a footer");
+    assert_eq!(
+        footer.lines().count(),
+        2,
+        "two lines once artifacts exist: {footer:?}"
+    );
+    assert!(
+        footer.contains("output/"),
+        "the second line points at the artifacts: {footer:?}"
+    );
+}
+
+#[test]
+fn exit_footer_text_is_none_for_an_empty_session() {
+    // An empty conversation has nothing to resume → fully clean exit, no footer.
+    let mut app = fresh_app(Some("offline"));
+    app.history.clear();
+    assert!(
+        app.exit_footer_text().is_none(),
+        "an empty session prints nothing at all"
+    );
+}
+
 // ── wheel / edge extends a drag-selection past the viewport ───────────
 //
 // Shared geometry: 10 content rows "row0".."row9", a 4-row viewport at the

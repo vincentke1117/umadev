@@ -540,6 +540,11 @@
 "resume.usage" = "Usage: /resume <id> — run /sessions first to see resumable chat ids."
 "resume.not_found" = "[chat] No chat `{}` (it may be deleted, or the id is wrong). /sessions lists what's available."
 "resume.done" = "[chat] Reopened chat `{}` ({} messages); the base will carry on with this context."
+# Clean-exit footer — the compact sign-off shown by default after leaving the
+# app, instead of reprinting the whole conversation (that full reprint is opt-in
+# via UMADEV_SCROLLBACK_HANDOFF). `{}` in the second line is the workspace path.
+"exit.footer.saved" = "Session saved — run `umadev` to resume."
+"exit.footer.artifacts" = "Your work so far is saved in {}"
 "compact.too_short" = "[compact] The conversation is still short — nothing to compact yet."
 # Proactive compaction nudge (Feature: ctx usage). Surfaced ONCE when context
 # occupancy first crosses the high threshold, before the base fails with a

@@ -215,14 +215,21 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
     if let Some(guard) = win_console_guard.as_ref() {
         guard.flush_input_buffer();
     }
-    // Native scrollback handoff: on a CLEAN quit, now that the alt screen is gone
-    // and we're back on the MAIN screen, print the conversation so it lands in the
-    // terminal's real scrollback instead of vanishing with the alt buffer. Only on
-    // a clean exit (an error path already prints its own diagnostics) and only when
-    // there is actually a conversation to hand off. Fail-open: a write error is
-    // ignored — it can never block the exit.
+    // Exit sign-off: on a CLEAN quit, now that the alt screen is gone and we're
+    // back on the MAIN screen, either reprint the whole conversation into the
+    // terminal's real scrollback (the OPT-IN full handoff) or leave a clean
+    // terminal with a compact footer (the DEFAULT). The conversation is already
+    // persisted (see `App::persist_chat`) and rebuilt in-app on the next launch,
+    // so the full scrollback reprint is purely cosmetic and off unless the user
+    // asks for it via `UMADEV_SCROLLBACK_HANDOFF`. Only on a clean exit (an error
+    // path already prints its own diagnostics). Fail-open: every write is
+    // best-effort and can never block the exit.
     if result.is_ok() {
-        print_scrollback_handoff(&app);
+        if scrollback_handoff_enabled() {
+            print_scrollback_handoff(&app);
+        } else {
+            print_exit_footer(&app);
+        }
     }
     // Reset terminal window title on exit.
     {
@@ -248,6 +255,43 @@ fn print_scrollback_handoff(app: &App) {
     // A leading blank row separates the handoff from the shell prompt that the
     // restored primary screen shows; the body already ends in a newline.
     let _ = write!(out, "\n{text}");
+    let _ = out.flush();
+}
+
+/// Whether the exit-time full-transcript scrollback handoff is enabled.
+///
+/// Reads the `UMADEV_SCROLLBACK_HANDOFF` environment variable. The full handoff
+/// is **off by default**: a clean exit leaves the terminal clean plus a compact
+/// footer (see [`print_exit_footer`]). Set `UMADEV_SCROLLBACK_HANDOFF` to `1`,
+/// `true`, or `yes` (case-insensitive, surrounding whitespace ignored) to
+/// restore the previous behaviour of reprinting the whole conversation into the
+/// terminal scrollback. Any other value — unset, empty, `0`, `false`, or an
+/// unrecognised string — keeps it off. Fail-open: reading the env never panics.
+#[must_use]
+fn scrollback_handoff_enabled() -> bool {
+    std::env::var("UMADEV_SCROLLBACK_HANDOFF").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
+/// Print the compact exit footer to the MAIN screen on a clean exit — the
+/// DEFAULT sign-off in place of the full [`print_scrollback_handoff`]. At most
+/// two short lines (a "session saved — run `umadev` to resume" hint plus, when
+/// the workspace holds resumable artifacts, a line pointing at them); see
+/// [`App::exit_footer_text`]. Prints nothing for a session with nothing worth
+/// resuming, leaving a fully clean terminal. Every write is best-effort
+/// (fail-open) and can never block the exit.
+fn print_exit_footer(app: &App) {
+    use std::io::Write;
+    let Some(text) = app.exit_footer_text() else {
+        return;
+    };
+    let mut out = std::io::stdout();
+    // A leading blank row separates the footer from the restored shell prompt.
+    let _ = write!(out, "\n{text}\n");
     let _ = out.flush();
 }
 
