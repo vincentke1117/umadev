@@ -2823,36 +2823,38 @@ mod tests {
         // left the `/rewind` picker showing NOTHING — while every one of the user's
         // checkpoints sat right there in the shadow repo. The display cap must be applied
         // AFTER the internal filter, over a window wide enough to reach real history.
-        if !git_available() {
-            return;
-        }
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        std::fs::write(root.join("a.txt"), "v0").unwrap();
-        create_checkpoint(root, "run-baseline").expect("the user's own checkpoint");
-
-        // Bare empty commits preserve the deep-history shape this test needs without
-        // multiplying git subprocesses through checkpoint staging and HEAD re-reads.
-        for i in 0..(CHECKPOINT_SCAN_WINDOWS[0] + 20) {
-            let label = if i % 2 == 0 {
-                TEMP_REWIND_HEAD_LABEL.to_string()
-            } else {
-                format!("{RED_GREEN_PRE_PREFIX}step {i}")
-            };
-            let out = git(
-                root,
-                &["commit", "-q", "--allow-empty", "--no-verify", "-m", &label],
-            )
-            .expect("git runs");
-            assert!(out.status.success(), "internal snapshot {i}");
-        }
-
-        let list = list_checkpoints(root);
+        // Driven through the `list_user_checkpoints_with` scan seam rather than 200+
+        // real `git commit` subprocesses + a real `git log` read. The behaviour under
+        // test is the DISPLAY logic (cap applied after the internal filter, over a
+        // window wide enough to reach real history) — that is pure and deterministic
+        // here. The real-git read path is covered by the create/list tests; shelling
+        // out hundreds of times made THIS test flake on a loaded CI runner when the
+        // wide-window read was momentarily reported unreadable (a false empty list).
+        let internal_count = CHECKPOINT_SCAN_WINDOWS[0] + 20; // newest 200+ are all internal
+        let internal = |i: usize| Checkpoint {
+            id: format!("internal-{i}"),
+            label: TEMP_REWIND_HEAD_LABEL.to_string(),
+            when: "2026-07-17T00:00:00Z".to_string(),
+        };
+        let baseline = Checkpoint {
+            id: "baseline".to_string(),
+            label: "run-baseline".to_string(),
+            when: "2026-07-16T00:00:00Z".to_string(),
+        };
+        // The newest `window` commits: the internal machinery snapshots are the newest,
+        // the user's baseline is the OLDEST — reached only once the window widens past
+        // the 200-commit floor. This is the exact "a long run buries the baseline under
+        // 200 internal snapshots" shape.
+        let list = list_user_checkpoints_with(|window| {
+            let mut history: Vec<Checkpoint> = (0..internal_count).rev().map(internal).collect();
+            history.push(baseline.clone());
+            history.truncate(window);
+            Some(history)
+        });
         assert_eq!(
             list.len(),
             1,
-            "the user's checkpoint is still listed under {} internal commits",
-            CHECKPOINT_SCAN_WINDOWS[0] + 20
+            "the user's checkpoint is still listed under {internal_count} internal commits",
         );
         assert_eq!(list[0].label, "run-baseline");
         assert!(
