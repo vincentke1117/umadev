@@ -17,13 +17,15 @@
 //!
 //! ## The project's standing rule: judgment is the brain's, not a table's
 //!
-//! UmaDev does not classify intent with keywords — [`crate::router::route_via_brain`] asks
-//! the base's own model whether a turn is chat / edit / build, and
-//! [`crate::color_permission`] asks it whether the requirement authorized a flagged hue.
-//! *"Which archetype fits this product?"* is the same class of question, and it gets the same
-//! answer: **one stateless, structured consult → a typed [`DesignArchetype`]**, an id drawn
-//! from the fixed, known archetype set. No product-type inference engine, and nothing that
-//! grows.
+//! UmaDev does not classify intent with keywords. The resident chat turn opens on a FIXED,
+//! lightweight seed and a build is recognised REACTIVELY — the instant the base writes a
+//! real file, `react_to_first_write` latches it — never by a pre-action word-table verdict.
+//! Where a genuine model judgement is still owed it is ONE stateless, structured consult, and
+//! [`crate::color_permission`] is the sibling example: it asks the base's own model whether
+//! the requirement authorized a flagged hue. *"Which archetype fits this product?"* is the
+//! same class of question, and it gets the same answer: **one stateless, structured consult →
+//! a typed [`DesignArchetype`]**, an id drawn from the fixed, known archetype set. No
+//! product-type inference engine, and nothing that grows.
 //!
 //! Only the *choice of archetype* moves to the brain. The design tokens, the archetype
 //! knowledge packs, and the anti-AI-slop token conformance downstream are UmaDev's core value

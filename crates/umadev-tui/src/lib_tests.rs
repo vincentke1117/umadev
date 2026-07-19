@@ -6410,7 +6410,7 @@ async fn resident_pure_chat_stays_cheap_even_with_the_flag() {
             usage: None,
         },
     ];
-    let (events, _routes) = drive_resident_turn(tmp.path(), "解释一下这段代码", batch, None).await;
+    let (events, routes) = drive_resident_turn(tmp.path(), "解释一下这段代码", batch, None).await;
 
     assert!(
         !ran_governance_qc(&events),
@@ -6425,6 +6425,22 @@ async fn resident_pure_chat_stays_cheap_even_with_the_flag() {
             .iter()
             .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("umadev/"))),
         "a pure-chat turn never isolates: {events:?}"
+    );
+    // The reactive governance cluster (H1a/H2/M4/H3) all key off an OBSERVED write, so a
+    // no-write turn trips NONE of it: it stays a chat (director_build false), begins no
+    // writer ledger, and never fires the source hard-gate.
+    assert_eq!(
+        agentic_done_director_build(&routes),
+        Some(false),
+        "a pure-chat turn stays a chat: {routes:?}"
+    );
+    assert!(
+        !fired_source_hardgate(&events),
+        "a pure-chat turn never fires the source hard-gate: {events:?}"
+    );
+    assert!(
+        umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 1).is_empty(),
+        "a pure-chat turn begins no durable writer ledger"
     );
 }
 
@@ -6451,6 +6467,200 @@ async fn resident_single_doc_write_is_not_a_team_build() {
         !saw_build_intent_card(&events),
         "a doc-only write emits no Build-shaped card: {events:?}"
     );
+}
+
+/// True if the objective source-present HARD-GATE fired this turn — its terminal-abort
+/// note is prefixed with [`ABORT_SENTINEL`], which the advisory fact line never carries,
+/// so this distinguishes "the gate FIRED" from "an advisory line was appended".
+fn fired_source_hardgate(events: &[EngineEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, EngineEvent::Note(note) if note.starts_with(ABORT_SENTINEL)))
+}
+
+/// The terminal `director_build` flag carried on the turn's `AgenticDone`, or `None`
+/// when the turn did not settle a clean `AgenticDone` (e.g. it was blocked / `Failed`).
+fn agentic_done_director_build(routes: &[RouteDecision]) -> Option<bool> {
+    routes.iter().find_map(|route| match route {
+        RouteDecision::AgenticDone { director_build, .. } => Some(*director_build),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn resident_reactive_build_completes_as_director_build_and_settles_ledger() {
+    // H2 + H1a + M4 on the load-bearing implicit-build path: a chat-seeded turn whose base
+    // writes ONE real code file with reactive QC ON must (H1a) run the flagship governance
+    // QC, (M4) begin AND durably settle its writer ledger, and (H2) carry
+    // `director_build: true` so it earns the full-build completion semantics — while the
+    // honesty/source hard-gate stays SATISFIED (real source on disk) and never fires.
+    let _qc = ReactiveQcOverride::force(true);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, routes) = drive_resident_turn(
+        tmp.path(),
+        "做一个登录页",
+        write_tool_turn("src/App.tsx"),
+        Some("src/App.tsx"),
+    )
+    .await;
+
+    assert!(
+        ran_governance_qc(&events),
+        "H1a: the observed build ran the flagship governance QC: {events:?}"
+    );
+    assert_eq!(
+        agentic_done_director_build(&routes),
+        Some(true),
+        "H2: the observed implicit build carries director_build: true: {routes:?}"
+    );
+    assert!(
+        !fired_source_hardgate(&events),
+        "the source hard-gate stays satisfied when real source was written: {events:?}"
+    );
+    let runs = umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 8);
+    assert!(
+        !runs.is_empty(),
+        "M4: the reactive build began a durable writer ledger"
+    );
+    assert!(
+        runs.iter()
+            .any(|run| run.tasks.iter().any(|task| task.state.is_terminal())),
+        "M4: the reactive build's ledger entry durably SETTLED (terminal): {runs:?}"
+    );
+}
+
+#[tokio::test]
+async fn resident_claimed_build_without_write_fires_source_hardgate() {
+    // H3: a base that CLAIMS a full build ("Done — I implemented …") but writes NOTHING
+    // must be caught by the objective source-present hard-gate, not passed on an advisory
+    // line. No write leaves `became_build` false, but the build-SHAPED detection still arms
+    // the gate; with ZERO real source on disk plus a reply that claims code, the
+    // terminal-abort note FIRES.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let batch = vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            "Done — I implemented the full login page and created the components.".into(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ];
+    let (events, routes) = drive_resident_turn(tmp.path(), "帮我把登录页做出来", batch, None).await;
+
+    assert!(
+        fired_source_hardgate(&events),
+        "H3: the source hard-gate fires on a claimed-but-empty build: {events:?}"
+    );
+    assert_eq!(
+        agentic_done_director_build(&routes),
+        Some(false),
+        "a claimed-empty build observed no write, so it is not a director build: {routes:?}"
+    );
+}
+
+#[tokio::test]
+async fn resident_failed_verification_blocks_an_observed_build() {
+    // M5: a base that runs a mechanical verifier which comes back RED, then edits a file,
+    // must be BLOCKED — not settled "successfully done". Reactive QC forced OFF so the
+    // block is isolated to the verification gate.
+    let _qc = ReactiveQcOverride::force(false);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let batch = vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "cargo test" }),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: false,
+            summary: "2 tests failed".into(),
+        },
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Write".into(),
+            input: serde_json::json!({
+                "file_path": "src/App.tsx",
+                "content": "export const A = 1;"
+            }),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "wrote the file".into(),
+        },
+        umadev_runtime::SessionEvent::TextDelta("Done.".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ];
+    let (_events, routes) =
+        drive_resident_turn(tmp.path(), "修一下登录逻辑", batch, Some("src/App.tsx")).await;
+
+    assert!(
+        routes
+            .iter()
+            .any(|route| matches!(route, RouteDecision::Failed(_))),
+        "M5: an observed build whose verification came back RED is blocked, not completed: {routes:?}"
+    );
+    assert!(
+        !routes
+            .iter()
+            .any(|route| matches!(route, RouteDecision::AgenticDone { .. })),
+        "M5: the blocked build must not also settle a clean AgenticDone: {routes:?}"
+    );
+}
+
+/// Serializes the ONE reactive-QC test that mutates the real `UMADEV_REACTIVE_QC`
+/// process env — every other reactive test uses the per-thread override — so it cannot
+/// race a concurrent env read. Poison-robust so a panic in one never cascades.
+static REACTIVE_QC_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn reactive_qc_from_env_value_defaults_on_and_honors_the_kill_switch() {
+    // Pure value-parse: default ON when unset, and only an explicit 0/false/off disables
+    // (case-insensitive + trimmed). Touches no env, so it is leak-free by construction.
+    assert!(reactive_qc_from_env_value(None), "unset defaults ON");
+    assert!(reactive_qc_from_env_value(Some("1")));
+    assert!(reactive_qc_from_env_value(Some("on")));
+    assert!(reactive_qc_from_env_value(Some("true")));
+    assert!(reactive_qc_from_env_value(Some("anything-else")));
+    assert!(!reactive_qc_from_env_value(Some("0")));
+    assert!(!reactive_qc_from_env_value(Some("false")));
+    assert!(!reactive_qc_from_env_value(Some("off")));
+    assert!(
+        !reactive_qc_from_env_value(Some("  OFF ")),
+        "the disable values are trimmed + case-folded"
+    );
+}
+
+#[test]
+fn reactive_qc_enabled_reads_the_env_kill_switch_without_leaking() {
+    // env-serialized: prove the live `reactive_qc_enabled()` wiring reads the kill switch
+    // (0/false/off disable, a truthy value enables), under a lock + restore-on-drop so the
+    // process-global env is never leaked into a concurrent reader.
+    let _lock = REACTIVE_QC_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    {
+        let _env = EnvRestore::set("UMADEV_REACTIVE_QC", "0");
+        assert!(
+            !reactive_qc_enabled(),
+            "an explicit 0 disables via the env read"
+        );
+    }
+    {
+        let _env = EnvRestore::set("UMADEV_REACTIVE_QC", "off");
+        assert!(!reactive_qc_enabled(), "off disables via the env read");
+    }
+    {
+        let _env = EnvRestore::set("UMADEV_REACTIVE_QC", "1");
+        assert!(
+            reactive_qc_enabled(),
+            "a truthy value enables via the env read"
+        );
+    }
+    // Each guard restored the prior state on drop; leave the var explicitly removed so no
+    // trace survives this test.
+    let _env = EnvRestore::remove("UMADEV_REACTIVE_QC");
 }
 
 #[tokio::test]

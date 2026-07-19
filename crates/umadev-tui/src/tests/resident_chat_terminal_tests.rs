@@ -645,11 +645,14 @@ async fn chat_failed_turn_surfaces_api_error_not_a_false_done() {
     }
 }
 
-/// A reactive write is real workspace work for honesty/locking, but it does
-/// not retroactively claim that the Director workflow ran.
+/// H2: an OBSERVED write IS a real build completion. The reactive engine — not a
+/// pre-action verdict — is the governance driver now, so a turn the base answered by
+/// writing real code carries `director_build: true` (the full-build completion card /
+/// task-Done / session hand-back), exactly what `ReactiveBuild::became_build` documents.
 #[tokio::test]
 async fn chat_session_reacts_to_first_write_as_build() {
     let tmp = tempfile::TempDir::new().unwrap();
+    let target = tmp.path().join("src/main.rs");
     let (sink, mut engine_rx) = ChannelSink::new();
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -665,6 +668,12 @@ async fn chat_session_reacts_to_first_write_as_build() {
             usage: None,
         },
     ]]);
+    // The Write tool lands a real file (the send effect), so the source-present honesty
+    // floor sees real code — the observed build is genuine, not a claimed-empty one.
+    let fake = fake.with_send_effect(move || {
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "fn main() {}\n").unwrap();
+    });
     let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
         ResidentChat::Primed(Box::new(fake)),
     )));
@@ -678,12 +687,12 @@ async fn chat_session_reacts_to_first_write_as_build() {
     ))
     .await;
 
-    // The terminal decision is scoped work, not a Director build.
+    // The observed write is a real build completion (H2).
     match route_rx.try_recv() {
         Ok(RouteDecision::AgenticDone { director_build, .. }) => {
             assert!(
-                !director_build,
-                "a write alone must not claim the Director workflow ran"
+                director_build,
+                "an observed write is a real build completion (director_build true)"
             );
         }
         other => panic!("expected AgenticDone, got {other:?}"),
@@ -713,9 +722,10 @@ async fn chat_session_reacts_to_first_write_as_build() {
     assert!(saw_write, "the write tool call streams live");
 }
 
-/// An availability-fallback write is recorded as real work for source truth,
-/// but cannot claim Director/session-handback semantics without a healthy
-/// semantic model verdict.
+/// An observed write records real build truth: it carries `director_build: true` (H2 —
+/// the reactive engine drives completion now), while the flagship team QC stays gated on
+/// the reactive-QC switch (unset here → no QC). Build-completion semantics and the QC
+/// pass are separate facts.
 #[tokio::test]
 async fn fallback_write_records_build_truth_without_flagship_qc() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -751,18 +761,18 @@ async fn fallback_write_records_build_truth_without_flagship_qc() {
     ))
     .await;
 
-    // The terminal decision records a scoped turn, not a Director run.
+    // The observed write is a real build completion (H2).
     match route_rx.try_recv() {
         Ok(RouteDecision::AgenticDone { director_build, .. }) => {
             assert!(
-                !director_build,
-                "fallback write truth must not impersonate Director usage"
+                director_build,
+                "an observed write is a real build completion (director_build true)"
             );
         }
         other => panic!("expected AgenticDone, got {other:?}"),
     }
-    // The write remains honest build work, but the missing intent fork means
-    // no semantic authority exists for broad governance/team review.
+    // The build completion and the flagship QC are separate facts — with the reactive-QC
+    // switch unset, the observed build runs no team review.
     let mut saw_qc = false;
     while let Ok(ev) = engine_rx.try_recv() {
         if let EngineEvent::Note(n) = ev {
@@ -873,11 +883,12 @@ async fn build_shaped_chat_reaches_resident_writer_and_upgrades_on_first_write()
         routes.iter().any(|r| matches!(
             r,
             RouteDecision::AgenticDone {
-                director_build: false,
+                director_build: true,
                 ..
             }
         )),
-        "the reactive build settles as a resident turn, not a Director build: {routes:?}"
+        "the observed build is a real build completion (H2), though it never dispatched \
+         the Director loop from chat: {routes:?}"
     );
     assert!(
         saw_build_intent_card(&events),
@@ -1034,7 +1045,9 @@ async fn find_the_repo_read_only_request_runs_and_is_not_stranded() {
 /// tool event, but a shell `ToolCall` still reads as a potential write, so
 /// `react_to_first_write` fires off it: the turn is promoted to a build and, with the
 /// reactive QC flag on, runs the SAME governance QC a `Write`-driven build does. A
-/// Bash-only build is therefore never left ungoverned.
+/// Bash-only build is therefore never left ungoverned — and (H2) its terminal decision
+/// carries `director_build: true`, so an OBSERVED build earns the full-build completion
+/// semantics rather than reading as a plain streamed chat turn.
 #[tokio::test]
 async fn bash_heredoc_build_is_governed_by_the_reactive_engine() {
     let _qc = ReactiveQcOverride::force(true);
@@ -1081,7 +1094,7 @@ async fn bash_heredoc_build_is_governed_by_the_reactive_engine() {
     assert!(matches!(
         route_rx.try_recv(),
         Ok(RouteDecision::AgenticDone {
-            director_build: false,
+            director_build: true,
             ..
         })
     ));
@@ -1207,10 +1220,12 @@ async fn bash_file_change_is_post_turn_work_but_quick_edit_skips_flagship_qc() {
     ))
     .await;
 
+    // The Bash write is an observed build → a real build completion (H2). The flagship
+    // team QC is a separate fact and stays gated on the reactive-QC switch (unset here).
     assert!(matches!(
         route_rx.try_recv(),
         Ok(RouteDecision::AgenticDone {
-            director_build: false,
+            director_build: true,
             ..
         })
     ));

@@ -2615,17 +2615,56 @@ fn native_command_postcondition_route() -> RoutePlan {
 }
 
 /// Whether the STAGE A reactive governance QC (A2) is enabled for this turn — the
-/// `UMADEV_REACTIVE_QC` kill switch. Reads the process env in production so the
-/// wiring can be disabled without a revert. In test builds a per-thread override
-/// takes precedence ([`set_reactive_qc_override`]), so a test can toggle the flag
-/// deterministically WITHOUT mutating the process-global env — which would otherwise
-/// leak into concurrently-running resident-write tests and flip their verdicts.
+/// `UMADEV_REACTIVE_QC` kill switch.
+///
+/// Now that the pre-action intent barrier is gone, an IMPLICIT build (a "build me X"
+/// typed into chat that the base answers by writing real files) should earn the SAME
+/// flagship team QC an explicit `/run` gets — that governance IS UmaDev's
+/// differentiator — so this defaults **ON**. The kill switch is a VALUE parse
+/// ([`reactive_qc_from_env_value`]) mirroring the shape of
+/// [`umadev_agent::continuous::legacy_pipeline_from_env`]: only an explicit
+/// `0` / `false` / `off` disables it; unset (or anything else) leaves it on. A bare
+/// `UMADEV_REACTIVE_QC=0` therefore DISABLES it, which the previous presence-only
+/// check did not.
+///
+/// Defaulting ON is stall-safe on the resident chat path: `run_post_build_qc` is
+/// bounded (a fixed QC-round cap + the sliding wall-clock `run_budget` deadline + a
+/// hard absolute ceiling + a stuck-loop detector) and fail-open on a dead/hung base,
+/// so it can never wedge the resident chat surface — verified against
+/// `umadev_agent::run_post_build_qc` → `run_final_gate`.
+///
+/// In test builds a per-thread override takes precedence ([`set_reactive_qc_override`])
+/// so a test toggles the flag deterministically WITHOUT mutating the process-global
+/// env (which would leak into concurrently-running resident-write tests). With no
+/// override AND no explicit env value, test builds stay OFF so the large scripted
+/// resident-write suite that never opts in remains cheap and deterministic; an
+/// explicit env value is still honored through the SAME value-parse, so the
+/// kill-switch wiring stays covered.
 fn reactive_qc_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = REACTIVE_QC_OVERRIDE.with(std::cell::Cell::get) {
         return forced;
     }
-    std::env::var_os("UMADEV_REACTIVE_QC").is_some()
+    // Test builds with neither an override nor an explicit env value stay OFF (the
+    // prod default ON is exercised through `reactive_qc_from_env_value` directly).
+    #[cfg(test)]
+    if std::env::var_os("UMADEV_REACTIVE_QC").is_none() {
+        return false;
+    }
+    reactive_qc_from_env_value(std::env::var("UMADEV_REACTIVE_QC").ok().as_deref())
+}
+
+/// Parse the `UMADEV_REACTIVE_QC` kill-switch value into an enabled flag. Default
+/// **ON**: only an explicit `0` / `false` / `off` (case-insensitive, trimmed)
+/// disables the reactive team QC; `None` (unset) or any other value leaves it on.
+/// Mirrors the value shape of [`umadev_agent::continuous::legacy_pipeline_from_env`]
+/// (inverted, since that switch defaults OFF). Pure — reads no env, so the default-ON
+/// and disable-value semantics are testable without touching the process environment.
+fn reactive_qc_from_env_value(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|raw| raw.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "off")
+    )
 }
 
 #[cfg(test)]
@@ -2723,6 +2762,52 @@ fn is_doc_artifact_path(path: &str) -> bool {
 ///
 /// Idempotent + fail-open by contract: any failure leaves the turn running in
 /// place, exactly the pre-change behaviour for a chat-build.
+/// Begin the durable writer ledger for a reactive build on its FIRST observed write
+/// (M4). The up-front [`umadev_agent::task_lifecycle::EntryTaskTracker::begin`] sits
+/// behind `route.class.mutates_workspace()`, which the read-only Explain seed the
+/// resident chat opens on never satisfies — so an implicit build (chat seed, base wrote
+/// real code) would otherwise stay untracked and skip the durable settlement, leaving a
+/// crash mid-write with no in-progress record. This mirrors the mutating-route scope,
+/// keyed off the OBSERVED build (`became_build`, set by [`react_to_first_write`] only for
+/// a real host build), exactly once (`entry_task` still `None`).
+///
+/// **Fail-open by contract**, like the rest of the reaction: a native command, an already
+/// open tracker, a not-yet-observed build, or a ledger that will not open all leave the
+/// tracker untouched and the turn running in place — never the up-front path's hard abort
+/// (a chat-build losing its ledger is better finished than killed). Extracted so the hot
+/// stream loop stays flat (no added control-flow nesting).
+fn maybe_begin_reactive_entry_task(
+    reactive: &ReactiveBuild,
+    native_command: bool,
+    entry_task: &mut Option<umadev_agent::task_lifecycle::EntryTaskTracker>,
+    project_root: &std::path::Path,
+    backend: &str,
+    requirement: &str,
+) {
+    if native_command
+        || entry_task.is_some()
+        || !reactive
+            .became_build
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    let build_route = &reactive.build_card_route;
+    let scope = format!(
+        "resident-v1\0{backend}\0{}\0{}\0{requirement}",
+        build_route.class.as_str(),
+        build_route.depth.as_str()
+    );
+    if let Ok(task) = umadev_agent::task_lifecycle::EntryTaskTracker::begin(
+        project_root,
+        &scope,
+        build_route.class.as_str(),
+        "apply and mechanically verify one resident workspace change",
+    ) {
+        *entry_task = Some(task);
+    }
+}
+
 fn react_to_first_write(
     reactive: Option<&ReactiveBuild>,
     project_root: &std::path::Path,
@@ -5368,6 +5453,12 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
     let mut reactive: Arc<ReactiveBuild>;
     let mut execution_read_only: bool;
     let mut targeted_verification_passed: bool;
+    // M5: whether a mechanical verifier (test/lint/typecheck/build/compile) was
+    // OBSERVED running at all this turn. The verification GATE below fires only when
+    // a build actually ran a verifier that did NOT come back green — never when no
+    // verifier ran (that case is the flagship QC's concern, not this gate's) — so a
+    // failed `cargo test` followed by an edit cannot settle as "successfully done".
+    let mut targeted_verification_observed: bool;
     let mut potential_shell_write: bool;
     let mut entry_task: Option<umadev_agent::task_lifecycle::EntryTaskTracker> = None;
     // A1: whether this turn already persisted its governance context (color / design-
@@ -5793,6 +5884,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         text_acc = String::new();
         reactive = Arc::new(ReactiveBuild::new(!native_command, &text));
         targeted_verification_passed = false;
+        targeted_verification_observed = false;
         potential_shell_write = false;
         if let Some(guard) = prepared_run_lock.take() {
             let mut slot = reactive
@@ -6237,6 +6329,17 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                         targeted_verification_passed = false;
                         potential_shell_write |= !explicit_code_write;
                         react_to_first_write(Some(&reactive), &project_root, &sink);
+                        // M4: durably track the reactive build from its FIRST observed write
+                        // (all guards live inside the helper so this stays a flat call and adds
+                        // no nesting to the hot stream loop).
+                        maybe_begin_reactive_entry_task(
+                            &reactive,
+                            native_command,
+                            &mut entry_task,
+                            &project_root,
+                            &backend,
+                            &text,
+                        );
                     }
                     tool_effects.start(event_tool_call_id.as_deref(), effect);
                     let mut detail = target;
@@ -6409,6 +6512,10 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                         // The most recent completed verifier is authoritative: a
                         // later failed check invalidates an earlier green.
                         targeted_verification_passed = ok;
+                        // M5: a verifier ran this turn — arm the verification gate so an
+                        // observed RED result on a build blocks completion (a later write
+                        // clears `passed` but never `observed`, catching a stale green).
+                        targeted_verification_observed = true;
                     }
                     sink.emit(EngineEvent::WorkerStream {
                         event: umadev_runtime::StreamEvent::ToolResult { ok, summary },
@@ -6429,6 +6536,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                     let effect = tool_effects.finish(Some(&call_id));
                     if matches!(effect, Some(ObservedToolEffect::Verification)) {
                         targeted_verification_passed = ok;
+                        targeted_verification_observed = true;
                     }
                     sink.emit(EngineEvent::WorkerStream {
                         event: umadev_runtime::StreamEvent::ToolResultCorrelated {
@@ -6954,13 +7062,14 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
     };
     let wrote_files = wrote_code_files(explicit_code_write, final_changed.as_deref());
     let became_build = !native_command && (routed_build || wrote_files);
-    let scoped_write_requires_verification = wrote_files
-        && route_source == Some(umadev_agent::RouteSource::Brain)
-        && matches!(
-            route.class,
-            umadev_agent::RouteClass::QuickEdit | umadev_agent::RouteClass::Debug
-        )
-        && route.depth == umadev_agent::Depth::Fast;
+    // M5: rebuilt off the OBSERVED build (`became_build`) + the OBSERVED verification
+    // result, not the dead `route_source == Some(Brain)` provenance (which pinned this
+    // to always-false and let a base run `cargo test` red, then edit, and still settle
+    // "successfully done"). It fires only when a verifier actually RAN this turn
+    // (`targeted_verification_observed`) and did NOT come back green — a build that ran
+    // no verifier at all is not blocked here (the flagship QC owns that), so an implicit
+    // build that simply writes files is never falsely wedged.
+    let scoped_write_requires_verification = became_build && targeted_verification_observed;
     if scoped_write_requires_verification && !targeted_verification_passed {
         let profile = execution_permission_profile(execution_read_only, permissions);
         let resident = primed_resident(session, execution_read_only);
@@ -6977,8 +7086,27 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         let _ = route_tx.send(RouteDecision::Failed(note));
         return;
     }
-    let source_hardgate = became_build
-        .then(|| director_source_hardgate(&project_root, &reply, routed_build))
+    // H3: arm the objective source-present hard-gate for an OBSERVED build
+    // (`became_build`) OR a build-SHAPED turn (`build_card_route.class == Build`) that
+    // wrote NOTHING AT ALL — so a base that CLAIMS "Done, I built your full app" but
+    // produced no file is caught (zero real source + a reply that claims code) rather
+    // than passing on an advisory fact line alone. Gated so it never false-fires on
+    // legitimate non-build work: a read-only / plan turn cannot be a claimed build, and a
+    // turn that DID write (e.g. a docs-only update — not source, but a real write) is not
+    // "absent an observed write". The reactive path passes `build_obligation = false`, so
+    // `director_source_hardgate` keeps its conservative `claims_code_changes` guard and
+    // returns BEFORE the source scan for a plain reply that claims nothing — a pure-chat
+    // turn stays cheap and never fires.
+    let nothing_written = match final_changed.as_deref() {
+        Some(changed) => changed.is_empty(),
+        None => true,
+    };
+    let claimed_empty_build = !native_command
+        && !execution_read_only
+        && reactive.build_card_route.class == umadev_agent::RouteClass::Build
+        && nothing_written;
+    let source_hardgate = (became_build || claimed_empty_build)
+        .then(|| director_source_hardgate(&project_root, &reply, false))
         .flatten();
     if let Some(note) = source_hardgate.as_ref() {
         sink.emit(EngineEvent::Note(note.clone()));
@@ -7047,12 +7175,14 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
 
     let _ = route_tx.send(RouteDecision::AgenticDone {
         reply,
-        // Workspace writes and Director usage are separate facts. A QuickEdit or
-        // fast Debug may write code (and therefore gets honesty/source checks),
-        // but it did not run the Director and must not receive the full-build
-        // completion card, task-Done transition, preview launch, or session
-        // handback semantics.
-        director_build: routed_build,
+        // H2: terminal build-ness follows the OBSERVED write truth (`became_build`),
+        // not the dead pre-action route verdict (`routed_build`, permanently false).
+        // An implicit build — a "build me X" typed in chat that the base answered by
+        // writing real code — is a real build completion, so it earns the full-build
+        // completion card, the task-Done transition, and the run-handed-to-chat session
+        // semantics, exactly as an explicit `/run` build would. A pure-reply turn (no
+        // write) leaves `became_build` false and stays a plain streamed chat.
+        director_build: became_build,
         base_session_id,
         base_resume_identity,
     });

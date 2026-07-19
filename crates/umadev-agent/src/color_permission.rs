@@ -22,13 +22,17 @@
 //! Every fix was another word, and the next phrasing was always outside it. **A prohibition
 //! has unboundedly many phrasings; a word list is the wrong shape of answer.**
 //!
-//! ## The project's standing rule: intent is judged by the brain
+//! ## The project's standing rule: intent is judged, not pattern-matched
 //!
-//! UmaDev does not classify intent with keywords. [`crate::router::route_via_brain`] does
-//! not guess chat-vs-edit-vs-build from a word table — it asks the base's own model, once,
-//! and the model is authoritative. *"Did the user authorize this color family?"* is the
-//! same class of question, and it gets the same answer: **one stateless, structured consult
-//! → a typed [`ColorPermission`]**. No keyword classifier, and nothing that grows.
+//! UmaDev does not classify intent with keywords. The resident chat turn no longer runs a
+//! pre-action word-table (or brain) verdict at all: it opens on a FIXED, lightweight seed,
+//! and a turn is recognised as a build REACTIVELY — the instant the base writes a real file,
+//! `react_to_first_write` latches the build and stands up its governance. Where a genuine
+//! model judgement IS still owed, it is ONE stateless, structured consult, and the model is
+//! authoritative. *"Did the user authorize this color family?"* is exactly that class of
+//! question, and this module is one of the last standing examples of the pattern: **one
+//! stateless, structured consult → a typed [`ColorPermission`]**. No keyword classifier, and
+//! nothing that grows.
 //!
 //! ## Fail direction: STRICT (and why that is not a fail-open violation)
 //!
