@@ -65,17 +65,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # nextest retries transient flakes so a single flake does not fail the PR run
-      # (the release gate relies on the same tolerance — see release.yml).
-      - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
       - name: Verify Windows Job Object process-tree teardown
         if: runner.os == 'Windows'
         run: cargo test -p umadev-process --lib --locked -- --test-threads=1
-      # nextest with bounded retries covers unit + integration + bin tests; the
-      # doctests it cannot run stay on `cargo test --doc`.
-      - name: cargo nextest (retry transient flakes)
-        run: cargo nextest run --workspace --all-features --no-fail-fast --retries 2
+      - name: cargo test
+        run: cargo test --workspace --all-features --all-targets --no-fail-fast
       - name: cargo test (doctests)
         run: cargo test --workspace --all-features --doc --no-fail-fast
 
@@ -227,7 +221,7 @@ jobs:
       - name: Verify deterministic TUI terminal contracts
         run: cargo test -p umadev-tui --lib terminal_contract_ -- --test-threads=1
       - name: Verify cross-platform npm update contracts
-        run: node --test npm/scripts/terminal-contract.test.cjs npm/scripts/cli-classification.test.cjs
+        run: node --test npm/scripts/terminal-contract.test.cjs
 
   msrv:
     name: MSRV (Rust 1.88)

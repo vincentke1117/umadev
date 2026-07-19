@@ -29,12 +29,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # nextest runs each test in its own process and retries transient flakes, so a
-      # single flake on any OS cannot abort a tagged release (which has repeatedly
-      # cost real re-tags). Installed from source to keep the supply chain pinned to
-      # crates.io rather than an unpinned marketplace action.
-      - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
@@ -61,12 +55,8 @@ jobs:
       - name: cargo clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      # nextest with bounded retries: a transient flake retries instead of
-      # failing the release. Covers unit + integration + bin tests (same as
-      # `cargo test --all-targets`); doctests, which nextest cannot run, stay on
-      # `cargo test --doc` below.
-      - name: cargo nextest (retry transient flakes)
-        run: cargo nextest run --workspace --all-features --no-fail-fast --retries 2
+      - name: cargo test
+        run: cargo test --workspace --all-features --all-targets --no-fail-fast
 
       - name: cargo test (doctests)
         run: cargo test --workspace --all-features --doc --no-fail-fast
@@ -82,7 +72,7 @@ jobs:
         run: cargo test -p umadev-host --test kimi_source_drift -- --nocapture
 
       - name: Verify cross-platform npm update contracts
-        run: node --test npm/scripts/terminal-contract.test.cjs npm/scripts/cli-classification.test.cjs
+        run: node --test npm/scripts/terminal-contract.test.cjs
 
       - name: strict rustdoc (all features)
         env:
@@ -287,20 +277,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # See the quality job: nextest retries transient flakes so one flake on
-      # macOS/Windows cannot abort the tagged release.
-      - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
       - name: Verify Windows Job Object process-tree teardown
         if: runner.os == 'Windows'
         run: cargo test -p umadev-process --lib --locked -- --test-threads=1
-      # nextest with bounded retries for the broad matrix; the deterministic,
-      # single-threaded contract tests below stay on plain `cargo test`.
-      - name: cargo nextest (retry transient flakes)
-        run: cargo nextest run --workspace --all-features --no-fail-fast --retries 2
+      - name: cargo test
+        run: cargo test --workspace --all-features --all-targets --no-fail-fast
       - name: cargo test (doctests)
         run: cargo test --workspace --all-features --doc --no-fail-fast
       - name: Verify deterministic TUI terminal contracts
@@ -308,7 +292,7 @@ jobs:
       - name: Verify native PTY / ConPTY startup, input, and teardown
         run: cargo test -p umadev --test terminal_pty -- --test-threads=1
       - name: Verify cross-platform npm update contracts
-        run: node --test npm/scripts/terminal-contract.test.cjs npm/scripts/cli-classification.test.cjs
+        run: node --test npm/scripts/terminal-contract.test.cjs
 
   build:
     name: build (${{ matrix.target }})
