@@ -153,6 +153,30 @@ impl LaunchOptions {
     }
 }
 
+/// Scope guard that kills the preview dev server on EVERY exit path from
+/// [`run`] — a clean return, an error propagated out of the event loop, AND a
+/// panic unwind (`panic = "unwind"` runs destructors). The dev server is
+/// setsid-detached (see [`preview::start_preview_server`]), so the whole
+/// process GROUP is killed — a bare `Child` drop (even with `kill_on_drop`)
+/// would reap only the direct wrapper and LEAK the real node/vite grandchild
+/// holding the port. Fail-open: a poisoned lock / empty handle is a no-op, and
+/// every kill is best-effort. Holds an `Arc` clone of `App::preview_server`, so
+/// draining it here also empties the app's handle (no double-kill).
+struct PreviewServerGuard {
+    handle: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>>,
+}
+
+impl Drop for PreviewServerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.handle.lock() {
+            if let Some(mut child) = g.take() {
+                let _ = umadev_agent::kill_process_group(&child);
+                let _ = child.start_kill();
+            }
+        }
+    }
+}
+
 /// Launch the TUI. Blocks until the user quits.
 pub async fn run(opts: LaunchOptions) -> Result<()> {
     // Best-effort retention sweep for materialised clipboard images. This runs
@@ -167,6 +191,14 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
         .filter(|slug| !slug.trim().is_empty())
         .unwrap_or_else(|| opts.effective_slug());
     let mut app = App::new(startup_slug, cfg, config_path, opts.project_root.clone());
+    // Group-kill the preview dev server on ANY exit — clean return, propagated
+    // error, or panic unwind — so a render-loop panic or a mid-loop draw `Err`
+    // can never orphan it (leaking its port). The happy-path tail kill below
+    // still runs first on a clean exit; this guard is the panic / early-return
+    // safety net (its `take()` then finds an empty handle → no double-kill).
+    let _preview_guard = PreviewServerGuard {
+        handle: std::sync::Arc::clone(&app.preview_server),
+    };
     app.show_retired_backend_migration(retired_backend.as_deref());
     // WORKSPACE INTEGRITY, said to the person it concerns. The startup heal already ran
     // (in `main`, before the terminal was taken over) — it may have put the user's source
@@ -8624,6 +8656,16 @@ struct TermSignals {
     close: Option<tokio::signal::windows::CtrlClose>,
     /// The system is shutting down / the user is logging off.
     shutdown: Option<tokio::signal::windows::CtrlShutdown>,
+    /// Ctrl+Break — ALWAYS delivered as a console control event even in raw
+    /// mode (unlike Ctrl+C, which the raw console reads as ordinary key input),
+    /// so WITHOUT a handler it hits the default `ExitProcess` and skips ALL
+    /// teardown: the alt screen / raw mode stay latched onto the user's shell
+    /// and the preview / background children orphan.
+    break_: Option<tokio::signal::windows::CtrlBreak>,
+    /// Ctrl+C — belt-and-suspenders (mirrors the unix SIGINT slot): the raw
+    /// console normally delivers it as a key event, but a moment where processed
+    /// input is on, or another process signalling this console, still fires it.
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
 }
 /// See [`TermSignals`] — the placeholder for platforms with neither unix
 /// signals nor the Windows console notifications (the arm stays inert).
@@ -8650,6 +8692,8 @@ fn register_termination_signals() -> TermSignals {
         TermSignals {
             close: tokio::signal::windows::ctrl_close().ok(),
             shutdown: tokio::signal::windows::ctrl_shutdown().ok(),
+            break_: tokio::signal::windows::ctrl_break().ok(),
+            ctrl_c: tokio::signal::windows::ctrl_c().ok(),
         }
     }
     #[cfg(not(any(unix, windows)))]
@@ -8700,9 +8744,29 @@ async fn next_termination_signal(sigs: &mut TermSignals) {
                 None => std::future::pending::<()>().await,
             }
         }
+        /// The Ctrl+Break stream: resolve on delivery, pend when absent.
+        async fn recv_break(s: &mut Option<tokio::signal::windows::CtrlBreak>) {
+            match s.as_mut() {
+                Some(sig) => {
+                    let _ = sig.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        /// The Ctrl+C stream: resolve on delivery, pend when absent.
+        async fn recv_ctrl_c(s: &mut Option<tokio::signal::windows::CtrlC>) {
+            match s.as_mut() {
+                Some(sig) => {
+                    let _ = sig.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
         tokio::select! {
             () = recv_close(&mut sigs.close) => {}
             () = recv_shutdown(&mut sigs.shutdown) => {}
+            () = recv_break(&mut sigs.break_) => {}
+            () = recv_ctrl_c(&mut sigs.ctrl_c) => {}
         }
     }
     #[cfg(not(any(unix, windows)))]
@@ -10073,7 +10137,12 @@ fn apply_input_housekeeping(
     if matches!(event, Some(Ok(value)) if input_may_leave_preedit_cells(value)) {
         let now = Instant::now();
         if preedit_cleanup_due(last_preedit_cleanup.map(|last| now.duration_since(last))) {
-            app.contaminate_terminal();
+            // DRIFT, not contamination: the committed IME glyphs are cells WE will
+            // re-emit — repaint them IN PLACE ([`HealMode::Invalidate`]), never an
+            // `ED(2)` erase. An erase here flashed the whole screen up to every
+            // 100ms while typing CJK on terminals without DEC 2026 sync output
+            // (Apple Terminal), because the erase+repaint is non-atomic there.
+            app.request_invalidate();
             *last_preedit_cleanup = Some(now);
         }
     }
@@ -10130,6 +10199,14 @@ async fn event_loop(
 ) -> Result<()> {
     #[cfg(not(windows))]
     let _ = win_console_guard;
+    // Arm the termination signals FIRST — before any other setup — so the window
+    // between `setup_terminal` latching raw mode + the alt screen (in `run`, just
+    // before this call) and the loop being ready is as small as possible. A
+    // SIGTERM / SIGHUP arriving in that gap would otherwise hit the default
+    // disposition and kill the process INSIDE the alt screen with raw mode still
+    // latched onto the user's shell. Registration is independent of the rest of
+    // the loop's setup, so hoisting it here is free.
+    let mut term_sig = register_termination_signals();
     let (sink, mut engine_rx) = ChannelSink::new();
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -10363,9 +10440,10 @@ async fn event_loop(
     // registration failed — the select! arm is then inert (fail-open).
     let mut resume_sig = register_resume_signal();
     // Wave 3 P1 — termination listeners (SIGTERM / SIGHUP / stray SIGINT; the
-    // Windows console-close + shutdown notifications). Any unregistered slot is
-    // inert; the arm persists the chat + restores the terminal, then quits.
-    let mut term_sig = register_termination_signals();
+    // Windows console-close + shutdown + Ctrl+Break / Ctrl+C notifications) are
+    // armed at the TOP of this fn (see `term_sig` above) to minimise the startup
+    // window; any unregistered slot is inert. The arm persists the chat +
+    // restores the terminal, then quits.
 
     // --- R3 event coalescing + frame budget -----------------------------------
     // A burst of streaming engine events (each a token / progress note) must
@@ -11281,6 +11359,14 @@ async fn event_loop(
         // the resume-gap path below, so a terminal that never delivers a DEC-1004
         // focus event still heals on the first interaction after returning.
         if last_focus_gained_at.is_some_and(|t| t.elapsed() < FOCUS_HEAL_WINDOW) {
+            invalidate_due = true;
+        }
+        // Preedit/IME cleanup after non-ASCII input is DRIFT, not contamination
+        // (see `apply_input_housekeeping`): the committed glyphs are cells WE will
+        // re-emit, so repaint IN PLACE with no `ED(2)` erase — flash-free on every
+        // terminal, including those without DEC 2026 sync output. Drained every
+        // iteration; fail-open — a missed flag only forgoes one heal.
+        if app.take_invalidate_requested() {
             invalidate_due = true;
         }
         // This frame's single heal decision.

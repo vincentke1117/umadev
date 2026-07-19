@@ -3021,6 +3021,18 @@ pub struct App {
     /// repaint (P0) and the flag only guarantees the healing frame is drawn.
     /// Defaults `false`.
     pub terminal_contaminated: std::cell::Cell<bool>,
+    /// P3 — the **terminal-invalidate flag**: a one-shot request for a DRIFT
+    /// heal (`HealMode::Invalidate`) on the next frame — repaint every
+    /// cell IN PLACE, with NO `ED(2)` screen erase. Distinct from
+    /// [`Self::terminal_contaminated`] (which erases): raise this when the cells
+    /// on screen are ones WE wrote and merely need re-emitting over drift — the
+    /// preedit/IME cleanup after non-ASCII input is exactly that. Using an erase
+    /// there caused a whole-screen FLASH on terminals without DEC 2026
+    /// synchronized-output (e.g. Apple Terminal), because the erase+repaint is
+    /// non-atomic there; an in-place invalidate is flash-free on every terminal.
+    /// Same interior-mutable `Cell` shape so any `&App` surface can raise it;
+    /// drained by [`Self::take_invalidate_requested`]. Defaults `false`.
+    pub invalidate_requested: std::cell::Cell<bool>,
     /// The maximum the transcript can scroll up (= rows hidden above the
     /// viewport), recomputed by the renderer every frame from the CURRENT
     /// width/height. Interior-mutable so the pure `render` fn can publish it for
@@ -4086,6 +4098,7 @@ impl App {
             transcript_cut: std::cell::Cell::new(0),
             transcript_prev_total: std::cell::Cell::new(0),
             terminal_contaminated: std::cell::Cell::new(false),
+            invalidate_requested: std::cell::Cell::new(false),
             transcript_max_scroll: std::cell::Cell::new(0),
             transcript_viewport_rows: std::cell::Cell::new(0),
             input_text_cols: std::cell::Cell::new(0),
@@ -6519,6 +6532,13 @@ impl App {
         let Some(replacement) = self.kill_ring.get(self.yank_ring_idx).cloned() else {
             return;
         };
+        // Bound the replacement to the remaining room so the raw `replace_range`
+        // below can't overflow INPUT_CAP — it bypasses the cap that
+        // `insert_str_at_cursor` enforces, so cycling to a LONGER older ring entry
+        // (Alt+Y) could otherwise push the box past the limit. Room = the cap
+        // minus everything OUTSIDE the span being replaced.
+        let room = INPUT_CAP.saturating_sub(self.input_len().saturating_sub(len));
+        let replacement: String = replacement.chars().take(room).collect();
         self.snapshot_for_undo();
         let bstart = self.byte_index(start);
         let bend = self.byte_index(start + len);
@@ -6689,6 +6709,25 @@ impl App {
         self.terminal_contaminated.replace(false)
     }
 
+    /// P3 — request a DRIFT heal (`HealMode::Invalidate`) on the next
+    /// frame: repaint every cell IN PLACE with NO `ED(2)` erase. Use for cleanup
+    /// where the screen holds cells WE wrote that merely need re-emitting (the
+    /// preedit/IME cleanup after non-ASCII input) — an erase there flashes the
+    /// whole screen on terminals without DEC 2026 sync output. Idempotent;
+    /// `&self` (interior-mutable `Cell`) so any `&App` surface can raise it.
+    pub fn request_invalidate(&self) {
+        self.invalidate_requested.set(true);
+    }
+
+    /// P3 — drain the invalidate flag. The event loop calls this once per
+    /// iteration and folds `true` into its `invalidate_due` gate (an in-place,
+    /// erase-free repaint). Drains in one shot (a second call returns `false`);
+    /// fail-open — a missed flag only forgoes one heal.
+    #[must_use]
+    pub fn take_invalidate_requested(&self) -> bool {
+        self.invalidate_requested.replace(false)
+    }
+
     /// Request a FULL clear + redraw on the next frame — an alias of
     /// [`Self::contaminate_terminal`] kept for the height-changing operations
     /// that can otherwise leave stale overlapping rows on the Windows console (a
@@ -6850,9 +6889,18 @@ impl App {
         let text = Self::normalize_paste_text(text);
         let lines: Vec<&str> = text.trim().lines().collect();
         let all_images = !lines.is_empty()
-            && lines
-                .iter()
-                .all(|l| is_image_path(&unquote_unescape(l.trim())));
+            && lines.iter().all(|l| {
+                let p = unquote_unescape(l.trim());
+                // Suffix alone is NOT enough to claim a paste is an image: prose
+                // like `see the dashboard.png` or a URL ending `.png` also matches
+                // `is_image_path`, and the old code then took the image branch,
+                // failed to attach the non-file, and `return`ed WITHOUT inserting
+                // anything — silently DISCARDING the pasted text (data loss). A
+                // dragged-in image is always a REAL local file, so require the path
+                // to exist before treating the paste as an attachment; otherwise the
+                // paste falls through to ordinary text insertion below.
+                is_image_path(&p) && std::path::Path::new(&p).exists()
+            });
         if all_images {
             let mut any = false;
             for l in &lines {
@@ -7902,6 +7950,40 @@ impl App {
         // stable sort keeps the canonical verb order within an equal (tier, score).
         out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
         out.into_iter().map(|(_, _, p)| p).collect()
+    }
+
+    /// The verb an Enter press should auto-run for the CURRENT bare-slash input,
+    /// or `None` to submit the input as typed.
+    ///
+    /// Enter on a partial slash verb runs the highlighted command (Tab+Enter
+    /// ergonomics) — but ONLY when the choice is unambiguous: a SINGLE match, or
+    /// one the user EXPLICITLY highlighted with ↑/↓ (`palette_selected > 0`; a
+    /// fresh edit resets the highlight to the default 0). A bare AMBIGUOUS prefix
+    /// left on the DEFAULT top match is NOT auto-run, so Enter can never silently
+    /// fire a side-effecting verb the user didn't pick — e.g. `/co` must not run
+    /// `/codex` (a backend switch) just because it sorts first. To pick one among
+    /// several, Tab-complete or highlight it first.
+    ///
+    /// Returns `None` for non-slash input, input that already has args/whitespace,
+    /// an already-exact verb, or an ambiguous default-highlight prefix.
+    fn palette_enter_completion(&self) -> Option<String> {
+        if !self.input.starts_with('/') || self.input[1..].contains(char::is_whitespace) {
+            return None;
+        }
+        let matches = self.palette_matches();
+        let typed = self.input[1..].to_ascii_lowercase();
+        let is_exact =
+            matches.iter().any(|p| p.verb == typed) || umadev_host::driver_for(&typed).is_some();
+        if matches.is_empty() || is_exact {
+            return None;
+        }
+        if matches.len() > 1 && self.palette_selected == 0 {
+            // Ambiguous bare prefix resting on the default top match — require an
+            // explicit Tab-complete or ↑/↓ highlight before running one.
+            return None;
+        }
+        let sel = self.palette_selected.min(matches.len() - 1);
+        Some(matches[sel].verb.to_string())
     }
 
     /// Replace the input with `/{verb} ` (with trailing space so the
@@ -10243,26 +10325,11 @@ impl App {
                 self.pending_quit_confirm = false;
                 // Command-palette ergonomics: pressing Enter on a PARTIAL slash
                 // verb (e.g. "/dep" while the palette highlights "/deploy")
-                // should RUN the highlighted command — not submit the partial as
-                // an "unknown command". Only when the input is a bare verb (no
-                // args yet) and isn't already an exact command.
-                if self.input.starts_with('/') && !self.input[1..].contains(char::is_whitespace) {
-                    let completion = {
-                        let matches = self.palette_matches();
-                        let typed = self.input[1..].to_ascii_lowercase();
-                        let is_exact = matches.iter().any(|p| p.verb == typed)
-                            || umadev_host::driver_for(&typed).is_some();
-                        if matches.is_empty() || is_exact {
-                            None
-                        } else {
-                            let sel = self.palette_selected.min(matches.len() - 1);
-                            Some(matches[sel].verb.to_string())
-                        }
-                    };
-                    if let Some(verb) = completion {
-                        self.input = format!("/{verb}");
-                        self.input_cursor = self.input_len();
-                    }
+                // should RUN the highlighted command — but only when the choice is
+                // UNAMBIGUOUS (a single match, or one the user explicitly picked).
+                if let Some(verb) = self.palette_enter_completion() {
+                    self.input = format!("/{verb}");
+                    self.input_cursor = self.input_len();
                 }
                 // Snapshot typed blocks BEFORE clearing their chip backing stores.
                 // No attachment path is ever rewritten into prompt text.
@@ -13469,23 +13536,24 @@ impl App {
 
     fn open_design_picker_overlay(&mut self, available: &[String]) {
         let current = self.config.design_system.as_deref().unwrap_or("");
-        let mut body = String::from("Design Systems\n==============\n\n");
+        let mut body = umadev_i18n::t(self.lang, "design.picker.heading").to_string();
         if available.is_empty() {
-            body.push_str("No design systems found.\nRun /init to scaffold them into knowledge/design-systems/\n");
+            body.push_str(umadev_i18n::t(self.lang, "design.picker.none"));
         } else {
-            body.push_str("Usage: /design <name>\n\n");
+            body.push_str(umadev_i18n::t(self.lang, "design.picker.usage"));
+            let pending = umadev_i18n::t(self.lang, "design.picker.pending");
             for name in available {
-                let mark = if name == current { "●" } else { "[pending]" };
+                let mark = if name == current { "●" } else { pending };
                 let path = self
                     .project_root
                     .join("knowledge/design-systems")
                     .join(format!("{name}.md"));
-                let preview = Self::extract_design_preview_static(&path);
+                let preview = Self::extract_design_preview_static(self.lang, &path);
                 body.push_str(&format!("{mark} {name}\n{preview}\n\n"));
             }
         }
         self.overlay = Some(Overlay::from_body(
-            " /design — pick a design system · Esc close ",
+            umadev_i18n::t(self.lang, "design.picker.title"),
             &body,
         ));
     }
@@ -13495,12 +13563,12 @@ impl App {
             .project_root
             .join("knowledge/design-systems")
             .join(format!("{name}.md"));
-        Self::extract_design_preview_static(&path)
+        Self::extract_design_preview_static(self.lang, &path)
     }
 
-    fn extract_design_preview_static(path: &std::path::Path) -> String {
+    fn extract_design_preview_static(lang: umadev_i18n::Lang, path: &std::path::Path) -> String {
         let Ok(content) = std::fs::read_to_string(path) else {
-            return "  (file not readable)".to_string();
+            return umadev_i18n::t(lang, "design.preview.unreadable").to_string();
         };
         let mut preview = String::new();
 
@@ -13524,7 +13592,7 @@ impl App {
                 }
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
-                    preview.push_str(&format!("  Use: {trimmed}\n"));
+                    preview.push_str(&umadev_i18n::tf(lang, "design.preview.use", &[trimmed]));
                     break;
                 }
             }
@@ -13807,15 +13875,26 @@ impl App {
         // unparseable state → in-memory only, no panic, no block).
         let ws = umadev_agent::read_workflow_state(&self.project_root);
 
-        let mut body = String::from("Pipeline Status\n===============\n\n");
-        body.push_str(&format!("worker:        {}\n", self.backend_label));
-        body.push_str(&format!(
-            "design system: {}\n",
-            self.config.design_system.as_deref().unwrap_or("(none)")
+        let lang = self.lang;
+        let tr = |key: &str| umadev_i18n::t(lang, key).to_string();
+        let trf = |key: &str, args: &[&str]| umadev_i18n::tf(lang, key, args);
+        let mut body = tr("status.overlay.heading");
+        body.push_str(&trf("status.overlay.worker", &[&self.backend_label]));
+        body.push_str(&trf(
+            "status.overlay.design",
+            &[self
+                .config
+                .design_system
+                .as_deref()
+                .unwrap_or(&tr("status.overlay.design_none"))],
         ));
-        body.push_str(&format!(
-            "seed template: {}\n",
-            self.config.seed_template.as_deref().unwrap_or("(auto)")
+        body.push_str(&trf(
+            "status.overlay.template",
+            &[self
+                .config
+                .seed_template
+                .as_deref()
+                .unwrap_or(&tr("status.overlay.template_auto"))],
         ));
         // slug / requirement fall back to the persisted state when the in-memory
         // value is empty (e.g. `/status` in a fresh session after a prior run).
@@ -13823,22 +13902,22 @@ impl App {
             ws.as_ref()
                 .map(|s| s.slug.clone())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "(not set)".to_string())
+                .unwrap_or_else(|| tr("status.overlay.slug_unset"))
         } else {
             self.slug.clone()
         };
-        body.push_str(&format!("slug:          {slug_display}\n"));
+        body.push_str(&trf("status.overlay.slug", &[&slug_display]));
         let req_display = if self.requirement.is_empty() {
             ws.as_ref()
                 .map(|s| s.requirement.clone())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "(none yet)".to_string())
+                .unwrap_or_else(|| tr("status.overlay.requirement_none"))
         } else {
             self.requirement.clone()
         };
-        body.push_str(&format!("requirement:   {req_display}\n"));
-        body.push_str("\n## Pipeline phases\n\n");
-        body.push_str("| # | Phase | Status |\n|---|---|---|\n");
+        body.push_str(&trf("status.overlay.requirement", &[&req_display]));
+        body.push_str(&tr("status.overlay.phases_header"));
+        body.push_str(&tr("status.overlay.phases_table_head"));
         // Reconcile the in-memory phase vector with the furthest phase the
         // persisted state recorded — so a plan-path build that reached e.g.
         // `backend` shows research..backend done instead of a frozen all-pending
@@ -13866,25 +13945,24 @@ impl App {
                     .filter(|g| !g.is_empty())
             });
         if let Some(gate) = gate_display {
-            body.push_str(&format!("\n[gate] Active gate: `{gate}`\n"));
+            body.push_str(&trf("status.overlay.gate_active", &[&gate]));
         }
         if self.finished {
-            body.push_str("\n[ok] Pipeline complete — proof-pack in release/\n");
+            body.push_str(&tr("status.overlay.complete"));
         }
         // Artifacts
         let output_dir = self.project_root.join("output");
         if output_dir.is_dir() {
-            body.push_str("\n## Artifacts\n\n");
+            body.push_str(&tr("status.overlay.artifacts_header"));
             if let Ok(rd) = std::fs::read_dir(&output_dir) {
                 let mut entries: Vec<_> = rd.filter_map(Result::ok).collect();
                 entries.sort_by_key(std::fs::DirEntry::file_name);
                 for e in entries.iter().take(20) {
                     let name = e.file_name();
                     let size = std::fs::metadata(e.path()).map_or(0, |m| m.len());
-                    body.push_str(&format!(
-                        "  · {} ({} bytes)\n",
-                        name.to_string_lossy(),
-                        size
+                    body.push_str(&trf(
+                        "status.overlay.artifact_row",
+                        &[&name.to_string_lossy(), &size.to_string()],
                     ));
                 }
             }
@@ -13892,23 +13970,25 @@ impl App {
         // Quality gate results
         let qg_path = output_dir.join(format!("{}-quality-gate.json", self.slug));
         if qg_path.is_file() {
-            body.push_str("\n## Quality gate\n\n");
+            body.push_str(&tr("status.overlay.quality_header"));
             if let Ok(qg_content) = std::fs::read_to_string(&qg_path) {
                 let score = crate::app::extract_json_number(&qg_content, "score");
                 let passed = crate::app::extract_json_bool(&qg_content, "passed");
-                body.push_str(&format!(
-                    "  Score: {}/100 · {}\n",
-                    score.map_or("?".to_string(), |n| n.to_string()),
-                    match passed {
-                        Some(true) => "PASSED [ok]",
-                        Some(false) => "BLOCKED [fail]",
-                        None => "?",
-                    }
+                let verdict = match passed {
+                    Some(true) => tr("status.overlay.quality_passed"),
+                    Some(false) => tr("status.overlay.quality_blocked"),
+                    None => "?".to_string(),
+                };
+                body.push_str(&trf(
+                    "status.overlay.quality_score",
+                    &[&score.map_or("?".to_string(), |n| n.to_string()), &verdict],
                 ));
             }
         }
 
-        // Knowledge RAG info — reflect the configured retrieval engine.
+        // Knowledge RAG info — reflect the configured retrieval engine. The engine
+        // identifiers are stable technical names, not prose, so they stay literal;
+        // only the section heading + column labels localize.
         let project_cfg = umadev_agent::config::load_project_config(&self.project_root);
         let rag_engine =
             if project_cfg.knowledge.enabled && project_cfg.knowledge.engine == "hybrid" {
@@ -13918,8 +13998,8 @@ impl App {
             } else {
                 "keyword-scoring (legacy)"
             };
-        body.push_str(&format!("\n## Knowledge RAG ({rag_engine})\n\n"));
-        body.push_str("| Phase | Knowledge domains |\n|---|---|\n");
+        body.push_str(&trf("status.overlay.rag_header", &[rag_engine]));
+        body.push_str(&tr("status.overlay.rag_table_head"));
         body.push_str("| research | ALL (whole-tree scan) |\n");
         body.push_str("| docs | product, architecture, design, frontend, industries |\n");
         body.push_str("| spec | development, governance, product |\n");
@@ -13928,7 +14008,7 @@ impl App {
         body.push_str("| quality | testing, security, governance |\n");
         body.push_str("| delivery | cicd, operations, governance, security |\n");
 
-        self.overlay = Some(Overlay::from_body(" status — Esc close ", &body));
+        self.overlay = Some(Overlay::from_body(tr("status.overlay.title"), &body));
     }
 
     fn slash_export(&mut self) {
@@ -14900,93 +14980,93 @@ impl App {
     }
 
     fn open_config_overlay(&mut self) {
-        let mut body = String::from("Configuration\n=============\n\n");
-        body.push_str(&format!(
-            "worker:          {}\n",
-            self.config
+        let lang = self.lang;
+        let tr = |key: &str| umadev_i18n::t(lang, key).to_string();
+        let trf = |key: &str, args: &[&str]| umadev_i18n::tf(lang, key, args);
+        let mut body = tr("config.overlay.heading");
+        body.push_str(&trf(
+            "config.overlay.worker",
+            &[self
+                .config
                 .backend
                 .as_deref()
-                .unwrap_or("(use picker to select)")
+                .unwrap_or(&tr("config.overlay.worker_unset"))],
         ));
-        body.push_str("model:           (the base's own — UmaDev never sets one)\n");
-        body.push_str(&format!(
-            "design system:   {}\n",
-            self.config
+        body.push_str(&tr("config.overlay.model"));
+        body.push_str(&trf(
+            "config.overlay.design",
+            &[self
+                .config
                 .design_system
                 .as_deref()
-                .unwrap_or("(none — /design to pick)")
+                .unwrap_or(&tr("config.overlay.design_unset"))],
         ));
-        body.push_str(&format!(
-            "seed template:   {}\n",
-            self.config
+        body.push_str(&trf(
+            "config.overlay.template",
+            &[self
+                .config
                 .seed_template
                 .as_deref()
-                .unwrap_or("(auto-detect)")
+                .unwrap_or(&tr("config.overlay.template_unset"))],
         ));
-        body.push_str(&format!(
-            "slug:            {}\n",
-            if self.slug.is_empty() {
-                "(auto from dir name)"
-            } else {
-                &self.slug
-            }
+        let slug_display = if self.slug.is_empty() {
+            tr("config.overlay.slug_unset")
+        } else {
+            self.slug.clone()
+        };
+        body.push_str(&trf("config.overlay.slug", &[&slug_display]));
+        body.push_str(&trf(
+            "config.overlay.workspace",
+            &[&self.project_root.display().to_string()],
         ));
-        body.push_str(&format!(
-            "workspace:       {}\n",
-            self.project_root.display()
+        body.push_str(&trf(
+            "config.overlay.config_file",
+            &[&self.config_path.display().to_string()],
         ));
-        body.push_str(&format!(
-            "config file:     {}\n",
-            self.config_path.display()
+        body.push_str(&trf(
+            "config.overlay.input_history",
+            &[&self.history_path().display().to_string()],
         ));
-        body.push_str(&format!(
-            "input history:   {}\n",
-            self.history_path().display()
+        body.push_str(&trf(
+            "config.overlay.history_entries",
+            &[&self.input_history.len().to_string()],
         ));
-        body.push_str(&format!("history entries: {}\n", self.input_history.len()));
 
         // .umadevrc project config
         let rc_path = self.project_root.join(".umadevrc");
         if rc_path.is_file() {
             let cfg = umadev_agent::config::load_project_config(&self.project_root);
-            body.push_str("\n## Project Config (.umadevrc)\n\n");
-            body.push_str(&format!("quality threshold:   {}\n", cfg.quality.threshold));
-            body.push_str(&format!(
-                "max review rounds:   {}\n",
-                cfg.pipeline.max_review_rounds
+            body.push_str(&tr("config.overlay.project_rc_header"));
+            body.push_str(&trf(
+                "config.overlay.quality_threshold",
+                &[&cfg.quality.threshold.to_string()],
+            ));
+            body.push_str(&trf(
+                "config.overlay.max_review_rounds",
+                &[&cfg.pipeline.max_review_rounds.to_string()],
             ));
             if !cfg.pipeline.skip_phases.is_empty() {
-                body.push_str(&format!(
-                    "skip phases:         {}\n",
-                    cfg.pipeline.skip_phases.join(", ")
+                body.push_str(&trf(
+                    "config.overlay.skip_phases",
+                    &[&cfg.pipeline.skip_phases.join(", ")],
                 ));
             }
             if !cfg.quality.skip_checks.is_empty() {
-                body.push_str(&format!(
-                    "skip checks:         {}\n",
-                    cfg.quality.skip_checks.join(", ")
+                body.push_str(&trf(
+                    "config.overlay.skip_checks",
+                    &[&cfg.quality.skip_checks.join(", ")],
                 ));
             }
             if let Some(ref ck) = cfg.experts.custom_knowledge {
-                body.push_str(&format!("custom knowledge:    {ck}\n"));
+                body.push_str(&trf("config.overlay.custom_knowledge", &[ck]));
             }
         } else {
-            body.push_str("\n## Project Config\n\n");
-            body.push_str("  no .umadevrc — using defaults (threshold=90, rounds=3)\n");
+            body.push_str(&tr("config.overlay.project_header"));
+            body.push_str(&tr("config.overlay.no_rc"));
         }
 
-        body.push_str("\n## How to change\n\n");
-        body.push_str("  /claude /codex /opencode /grok /kimi\n");
-        body.push_str("                                  switch base CLI (or /offline)\n");
-        body.push_str(
-            "  (model)                       set it in the base — UmaDev never overrides it\n",
-        );
-        body.push_str("  /manual  /auto                review mode: pause vs autonomous\n");
-        body.push_str("  /design <name>                switch design system\n");
-        body.push_str("  /template <name>              switch seed template\n");
-        body.push_str("  /run <slug> <req>             set slug + requirement\n");
-        body.push_str("  edit .umadevrc               project-level overrides\n");
-        self.overlay = Some(Overlay::from_body(" config — Esc close ", &body));
+        body.push_str(&tr("config.overlay.how_to_change"));
+        self.overlay = Some(Overlay::from_body(tr("config.overlay.title"), &body));
     }
 
     fn open_runs_overlay(&mut self) {
@@ -16610,8 +16690,17 @@ impl App {
         let to_text = match arg.as_str() {
             "text" | "prose" | "free" => true,
             "picker" | "menu" | "choice" => false,
-            // No / unknown argument → toggle the current preference.
-            _ => !self.config.prefers_text_questions(),
+            // Empty argument → toggle the current preference.
+            "" => !self.config.prefers_text_questions(),
+            // An UNRECOGNISED argument is a typo, not a toggle request: show usage
+            // instead of silently flipping the mode the user never named.
+            _ => {
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "slash.questions_usage"),
+                );
+                return Action::None;
+            }
         };
         self.config.question_form = Some(if to_text { "text" } else { "picker" }.to_string());
         // Publish the agent-side shared flag live (base AskUserQuestion notes) and

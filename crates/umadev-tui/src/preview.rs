@@ -174,6 +174,18 @@ pub(super) fn start_preview_server(
         match cmd.spawn() {
             Ok(child) => {
                 if let Ok(mut g) = preview_server.lock() {
+                    // Reap any PREVIOUS preview server before overwriting the
+                    // handle. A bare `*g = Some(child)` drops the old `Child`
+                    // without killing its process GROUP — and the dev server forks
+                    // the real node/vite as a setsid-detached grandchild (see
+                    // `detach_from_controlling_terminal` above), so the prior port
+                    // would LEAK across rebuilds. The manual `/preview` path guards
+                    // this upstream; the auto-preview path did not, so centralise
+                    // the reap here where the handle is actually stored.
+                    if let Some(mut old) = g.take() {
+                        let _ = umadev_agent::kill_process_group(&old);
+                        let _ = old.start_kill();
+                    }
                     *g = Some(child);
                 }
                 sink.emit(EngineEvent::Note(

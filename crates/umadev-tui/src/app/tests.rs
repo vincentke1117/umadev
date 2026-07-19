@@ -2251,13 +2251,32 @@ fn pasted_plain_text_with_a_png_word_is_verbatim_not_attached() {
 }
 
 #[test]
-fn a_nonexistent_image_path_is_rejected_without_echoing_the_path() {
+fn a_nonexistent_image_path_pastes_as_text_not_discarded() {
     let mut app = fresh_app(Some("offline"));
+    // A path that merely LOOKS like an image but is NOT a real file is prose (a
+    // filename the user is writing about, a URL, a broken path), not an
+    // attachment. It must paste as TEXT. The old image branch attach-failed on the
+    // non-file then `return`ed without inserting — silently DISCARDING the text.
     app.handle_paste("/no/such/dir/ghost.png");
-    // A path-shaped attachment is intentional input: reject it visibly rather
-    // than silently downgrading a private path into model text.
     assert!(app.attachments.is_empty());
-    assert!(app.input.is_empty());
+    assert_eq!(app.input, "/no/such/dir/ghost.png");
+}
+
+#[test]
+fn a_real_non_image_file_with_image_suffix_is_rejected_without_echoing_its_path() {
+    let mut app = fresh_app(Some("offline"));
+    let dir = tempfile::TempDir::new().unwrap();
+    // A REAL file that ends `.png` but is not actually an image fails validation.
+    // It IS a real local file, so its (possibly private) path must NOT be echoed
+    // as model text — it stays rejected, distinct from a non-existent path above.
+    let fake = dir.path().join("ghost.png");
+    std::fs::write(&fake, b"not really a png").unwrap();
+    app.handle_paste(fake.to_str().unwrap());
+    assert!(app.attachments.is_empty());
+    assert!(
+        app.input.is_empty(),
+        "a real file's path is not downgraded into model text"
+    );
     assert!(app.history.iter().any(|message| {
         let body = message.body();
         (body.contains("未添加") || body.contains("not added")) && !body.contains("ghost.png")
@@ -10443,4 +10462,138 @@ fn frozen_step_status_maps_active_to_paused_only() {
     assert_eq!(frozen_step_status(StepStatus::Done), "done");
     assert_eq!(frozen_step_status(StepStatus::Pending), "pending");
     assert_eq!(frozen_step_status(StepStatus::Blocked), "blocked");
+}
+
+// ── Audit fixes ────────────────────────────────────────────────────────────
+
+#[test]
+fn paste_of_a_nonexistent_image_path_inserts_as_text() {
+    // A single line that merely ENDS in an image suffix but is NOT a real file —
+    // prose, or a URL — must paste as TEXT. The old image branch attach-failed on
+    // the non-file then `return`ed without inserting, silently DISCARDING the text.
+    let mut app = fresh_app(None);
+    app.handle_paste("see the dashboard.png");
+    assert_eq!(app.input, "see the dashboard.png");
+    assert!(
+        app.attachments.is_empty(),
+        "no attachment for a non-file path"
+    );
+
+    let mut app = fresh_app(None);
+    app.handle_paste("https://example.com/pic.png");
+    assert_eq!(app.input, "https://example.com/pic.png");
+    assert!(app.attachments.is_empty());
+}
+
+#[test]
+fn ambiguous_bare_slash_prefix_does_not_autorun() {
+    let mut app = fresh_app(None);
+    // `/co` matches several verbs (codex / config / constitution / …). On the
+    // DEFAULT top match, Enter must NOT auto-run one — that could silently switch
+    // the backend (`/codex`). No completion is offered until the user disambiguates.
+    app.input = "/co".to_string();
+    app.palette_selected = 0;
+    assert!(
+        app.palette_matches().len() > 1,
+        "fixture must be ambiguous for this test to mean anything"
+    );
+    assert_eq!(app.palette_enter_completion(), None);
+
+    // Explicitly highlighting one with ↑/↓ (selection off the default) opts in.
+    app.palette_selected = 1;
+    assert!(app.palette_enter_completion().is_some());
+}
+
+#[test]
+fn yank_pop_respects_input_cap() {
+    // Alt+Y's raw `replace_range` bypasses the cap that `insert_str_at_cursor`
+    // enforces; cycling to a LONGER older ring entry must be bounded so the box
+    // can't overflow INPUT_CAP.
+    let mut app = fresh_app(None);
+    app.input = "x".repeat(INPUT_CAP - 10);
+    app.input_cursor = 3;
+    app.yank_span = Some((0, 3));
+    app.yank_ring_idx = 0;
+    app.kill_ring = std::collections::VecDeque::from(vec![
+        "abc".to_string(),
+        "y".repeat(INPUT_CAP), // a much LONGER older entry
+    ]);
+    app.yank_pop();
+    assert!(
+        app.input_len() <= INPUT_CAP,
+        "yank_pop overflowed the cap: {}",
+        app.input_len()
+    );
+}
+
+#[test]
+fn questions_unknown_arg_shows_usage_instead_of_toggling() {
+    let mut app = fresh_app(None);
+    let before = app.config.prefers_text_questions();
+    let action = app.slash_questions("banana");
+    assert!(matches!(action, Action::None));
+    assert_eq!(
+        app.config.prefers_text_questions(),
+        before,
+        "an unknown arg must not flip the preference"
+    );
+    let last = app
+        .history
+        .back()
+        .map(|m| m.body().to_string())
+        .unwrap_or_default();
+    assert!(last.contains("/questions"), "usage line shown: {last}");
+
+    // An EMPTY arg still TOGGLES (unchanged behaviour).
+    let mut app = fresh_app(None);
+    let before = app.config.prefers_text_questions();
+    app.slash_questions("");
+    assert_eq!(app.config.prefers_text_questions(), !before);
+}
+
+#[test]
+fn config_status_design_overlays_are_localized() {
+    let mut app = fresh_app(None);
+    app.lang = umadev_i18n::Lang::En;
+    app.open_config_overlay();
+    let body = app.overlay.take().unwrap().lines.join("\n");
+    assert!(body.contains("Configuration"), "en config heading: {body}");
+
+    // The SAME overlay must render Chinese, not the English literal.
+    app.lang = umadev_i18n::Lang::ZhCn;
+    app.open_config_overlay();
+    let body = app.overlay.take().unwrap().lines.join("\n");
+    assert!(body.contains("配置"), "zh config heading: {body}");
+    assert!(!body.contains("Configuration"), "no leaked English: {body}");
+
+    app.open_status_overlay();
+    let body = app.overlay.take().unwrap().lines.join("\n");
+    assert!(body.contains("流水线状态"), "zh status heading: {body}");
+
+    app.slash_design("");
+    let body = app.overlay.take().unwrap().lines.join("\n");
+    assert!(
+        body.contains("设计体系"),
+        "zh design picker heading: {body}"
+    );
+}
+
+#[test]
+fn preedit_cleanup_requests_invalidate_not_contamination() {
+    // The IME/preedit cleanup is DRIFT: it routes to the erase-free in-place
+    // repaint (HealMode::Invalidate) so it can't flash the whole screen on a
+    // terminal without DEC 2026 sync output. Lock the one-shot flag machinery +
+    // its heal routing (the event loop folds the flag into `invalidate_due`).
+    let app = fresh_app(None);
+    assert!(!app.take_invalidate_requested());
+    app.request_invalidate();
+    assert!(
+        !app.take_terminal_contaminated(),
+        "invalidate must NOT be contamination (that would erase → flash)"
+    );
+    assert!(app.take_invalidate_requested());
+    assert!(!app.take_invalidate_requested(), "one-shot drain");
+    // The two flags route to different heals.
+    assert_eq!(crate::heal_mode(true, false), crate::HealMode::Invalidate);
+    assert_eq!(crate::heal_mode(false, true), crate::HealMode::Erase);
 }

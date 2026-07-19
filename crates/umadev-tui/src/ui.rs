@@ -6935,6 +6935,16 @@ fn status_text_and_color(app: &App) -> Option<(String, Color)> {
         // run was actually waiting on the user. Checked before `run_started`
         // (both the legacy pipeline and a director pause keep run state around).
         umadev_i18n::t(app.lang, "status.paused").to_string()
+    } else if app.finished {
+        // A CLEANLY DELIVERED run reads as complete. Checked BEFORE `run_started`
+        // because delivery clears `run_started_at` but leaves the `run_started`
+        // BOOL set — so the heartbeat branch below used to shadow this and a
+        // finished run kept painting the last phase's heartbeat instead of the
+        // completion line. `App::run_state` reaches `Delivered` off the CLEARED
+        // `run_started_at`, so this ordering makes the meta row agree with it (the
+        // terminal states — aborted / degraded above — already precede the
+        // heartbeat for the same lingering-`run_started` reason).
+        umadev_i18n::t(app.lang, "tui.status.complete").to_string()
     } else if app.run_started {
         // While a slow phase's heartbeat is live, show its in-place "still
         // working (mm:ss)" reassurance (overwritten each beat) instead of letting
@@ -6951,8 +6961,6 @@ fn status_text_and_color(app: &App) -> Option<(String, Color)> {
             None if app.interrupt_armed() => format!("{} · {esc_hint}", app.status),
             None => app.status.clone(),
         }
-    } else if app.finished {
-        umadev_i18n::t(app.lang, "tui.status.complete").to_string()
     } else {
         umadev_i18n::t(app.lang, "status.ready").to_string()
     };
@@ -9773,7 +9781,7 @@ mod tests {
         // little earlier than the narrow table would suggest.
         let wide = render_chat_to_string(&app, 130, 16);
         assert!(
-            wide.contains("94K tok"),
+            wide.contains("94K tokens"),
             "gauge token count shown on a wide terminal: {wide}"
         );
         assert!(
@@ -9785,7 +9793,7 @@ mod tests {
         // info / hint keep their room.
         let narrow = render_chat_to_string(&app, 50, 16);
         assert!(
-            !narrow.contains("94K tok"),
+            !narrow.contains("94K tokens"),
             "gauge dropped on a too-narrow terminal: {narrow}"
         );
     }
@@ -9817,7 +9825,7 @@ mod tests {
         }));
         assert_eq!(
             token_gauge_text(&app).as_deref(),
-            Some("▍ ≥1.2K tok · cost unknown")
+            Some("▍ ≥1.2K tokens · cost unknown")
         );
 
         app.session_usage.reset();
@@ -9827,15 +9835,40 @@ mod tests {
         }));
         assert_eq!(
             token_gauge_text(&app).as_deref(),
-            Some("▍ 1.2K tok · $0.125")
+            Some("▍ 1.2K tokens · $0.125")
         );
 
         app.session_usage.reset();
         app.session_usage.apply(Some(Usage::exact(1_000, 250)));
         assert_eq!(
             token_gauge_text(&app).as_deref(),
-            Some("▍ 1.2K tok · cost unknown"),
+            Some("▍ 1.2K tokens · cost unknown"),
             "missing source cost is unknown, not a free or estimated bill"
+        );
+    }
+
+    #[test]
+    fn delivered_run_shows_complete_even_with_lingering_run_started() {
+        // A clean delivery clears `run_started_at` but leaves the `run_started`
+        // BOOL set. `status_text_and_color` used to check `run_started` before
+        // `finished`, so the completion line was UNREACHABLE and a delivered run
+        // kept painting the last phase's heartbeat. `finished` now precedes the
+        // heartbeat (matching `App::run_state`, which reaches Delivered off the
+        // cleared `run_started_at`).
+        let mut app = app_with(Some("claude-code"));
+        app.lang = umadev_i18n::Lang::En;
+        app.finished = true;
+        app.run_started = true;
+        app.run_started_at = None;
+        app.thinking = false;
+        app.active_gate = None;
+        app.budget_paused = false;
+        app.aborted = false;
+        app.degraded = false;
+        let (text, _) = status_text_and_color(&app).expect("a settled run has a status");
+        assert_eq!(
+            text,
+            umadev_i18n::t(umadev_i18n::Lang::En, "tui.status.complete")
         );
     }
 

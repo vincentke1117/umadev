@@ -892,10 +892,12 @@ mod tests {
         oi.ingest(b"0000/0000\x1b\\hi");
         assert_eq!(oi.take_background_reply(), Some(false));
         let keys: Vec<Event> = std::mem::take(&mut oi.queue).into();
+        // The two typed-ahead chars coalesce into ONE paste (the O(n²)-avoiding
+        // unframed-bulk path); the OSC reply never leaks into the input stream.
         assert_eq!(
-            keys.len(),
-            2,
-            "exactly the two real keystrokes surface, none of the reply: {keys:?}"
+            keys,
+            vec![Event::Paste("hi".into())],
+            "exactly the real typing surfaces, none of the reply: {keys:?}"
         );
     }
 
@@ -914,7 +916,9 @@ mod tests {
             "a light reply available before the first frame must be captured"
         );
         let keys: Vec<Event> = std::mem::take(&mut oi.queue).into();
-        assert_eq!(keys.len(), 2, "the two typed-ahead keys are preserved");
+        // The typed-ahead chars are preserved — coalesced into one paste on the
+        // unframed-bulk path (see `decode_text`), never lost or surfaced early.
+        assert_eq!(keys, vec![Event::Paste("hi".into())], "typing is preserved");
         let _tx = tx;
     }
 

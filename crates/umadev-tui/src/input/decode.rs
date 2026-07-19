@@ -162,11 +162,52 @@ impl Decoder {
     }
 }
 
-/// Decode a text token into one key event per char.
+/// Decode a text token, coalescing each maximal run of ordinary (non-control)
+/// characters into ONE [`InputEvent::Paste`] instead of one
+/// [`InputEvent::Key`] per char.
+///
+/// A single keystroke arrives as a one-char `Token::Text`; a MULTI-char text
+/// run reaches the UNFRAMED path only from bulk input — a large paste on a
+/// terminal that ignores bracketed paste, or a large IME commit. Exploding that
+/// into N key events made the app insert char-by-char, and
+/// `App::insert_at_cursor` is O(n) with a per-char undo snapshot → O(n²): a
+/// visible hang on a big paste. Coalescing a run into one `Paste` routes it
+/// through the same single `insert_str_at_cursor` (one snapshot) that the framed
+/// `Event::Paste` path already uses.
+///
+/// Control characters (Enter `\r`, Tab `\t`, Backspace, Ctrl-combos) are NOT
+/// coalesced: each stays its own key event so a newline still submits, Tab still
+/// completes, etc. A LONE ordinary char also stays a key event, so ordinary
+/// typing (kill/yank windows, per-key semantics) is unchanged — only a run of
+/// two or more ordinary chars collapses to a paste.
 fn decode_text(text: &str) -> Vec<InputEvent> {
-    text.chars()
-        .map(|c| InputEvent::Key(char_to_key(c)))
-        .collect()
+    let mut events = Vec::new();
+    let mut run = String::new();
+    for c in text.chars() {
+        if c.is_control() {
+            flush_text_run(&mut run, &mut events);
+            events.push(InputEvent::Key(char_to_key(c)));
+        } else {
+            run.push(c);
+        }
+    }
+    flush_text_run(&mut run, &mut events);
+    events
+}
+
+/// Drain a pending ordinary-char run into `events`: a two-or-more-char run
+/// becomes ONE coalesced [`InputEvent::Paste`]; a lone char stays a key press.
+/// Clears `run` either way.
+fn flush_text_run(run: &mut String, events: &mut Vec<InputEvent>) {
+    let mut chars = run.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => {}
+        (Some(only), None) => {
+            events.push(InputEvent::Key(char_to_key(only)));
+            run.clear();
+        }
+        (Some(_), Some(_)) => events.push(InputEvent::Paste(std::mem::take(run))),
+    }
 }
 
 /// Decode a complete escape sequence (always starts with ESC). Fail-open: an
@@ -770,10 +811,46 @@ mod tests {
     }
 
     #[test]
-    fn text_yields_one_key_per_char() {
-        let out = text("ab");
-        assert_eq!(out.len(), 2);
-        assert_eq!(one_key(&out[..1]).code, KeyCode::Char('a'));
+    fn lone_ordinary_char_stays_one_key() {
+        // A single keystroke is a one-char text token — it must stay an ordinary
+        // key press (per-key semantics: kill/yank windows, etc.), never a paste.
+        let out = text("a");
+        assert_eq!(out, vec![InputEvent::Key(char_to_key('a'))]);
+    }
+
+    #[test]
+    fn multi_char_run_coalesces_into_one_paste() {
+        // A multi-char ordinary run reaches the UNFRAMED path only from bulk input
+        // (a paste on a bracketed-paste-blind terminal, or a large IME commit). It
+        // must collapse into ONE Paste so the app inserts it via a single
+        // `insert_str_at_cursor` (one undo snapshot) — not N O(n) per-char inserts
+        // (the O(n²) hang). CJK included, since a large IME commit is the worst case.
+        assert_eq!(text("abc"), vec![InputEvent::Paste("abc".into())]);
+        assert_eq!(text("你好世界"), vec![InputEvent::Paste("你好世界".into())]);
+    }
+
+    #[test]
+    fn control_chars_split_the_coalesced_run() {
+        // A control char (here Enter) is NOT coalesced: the ordinary runs on each
+        // side collapse to pastes, but the `\r` stays its own key so a newline
+        // still submits / inserts per the existing handlers.
+        match text("ab\rcd").as_slice() {
+            [InputEvent::Paste(a), InputEvent::Key(k), InputEvent::Paste(b)] => {
+                assert_eq!(a, "ab");
+                assert_eq!(k.code, KeyCode::Enter);
+                assert_eq!(b, "cd");
+            }
+            other => panic!("expected paste/key/paste, got {other:?}"),
+        }
+        // A lone ordinary char between two controls still stays a single key.
+        match text("\ra\r").as_slice() {
+            [InputEvent::Key(k1), InputEvent::Key(k2), InputEvent::Key(k3)] => {
+                assert_eq!(k1.code, KeyCode::Enter);
+                assert_eq!(k2.code, KeyCode::Char('a'));
+                assert_eq!(k3.code, KeyCode::Enter);
+            }
+            other => panic!("expected three keys, got {other:?}"),
+        }
     }
 
     #[test]
