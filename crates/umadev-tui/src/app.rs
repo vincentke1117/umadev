@@ -16150,24 +16150,22 @@ impl App {
         Action::RunDeploy { command: cmd }
     }
 
-    /// Toggle animations, or cycle the trust tier with Shift+Tab:
-    /// Plan (read-only) → Guarded (approval-gated) → Auto → Plan.
-    /// `/manual` and `/auto` select the corresponding execution tier directly.
+    /// Cycle the trust tier with Shift+Tab. It toggles ONLY the two WRITABLE,
+    /// gate-related tiers — Guarded (per-gate approval, "手动审核") ↔ Auto
+    /// (auto-pass, "自动过门") — exactly matching the footer chips. It deliberately
+    /// NEVER enters read-only Plan: a user in Auto who pressed Shift+Tab expecting
+    /// "手动" used to land in Plan instead, which strips ALL write permission, so the
+    /// base reported "current turn is read-only, cannot write files" and could not
+    /// build. Plan is a deliberate choice reached only via `/mode plan`; Shift+Tab
+    /// from Plan EXITS read-only back to Guarded so a user stuck there can escape.
+    /// `/manual`, `/auto`, `/mode plan` select a tier directly.
     pub fn cycle_approval_mode(&mut self) {
         use umadev_agent::TrustMode;
         let next = match self.effective_trust_mode() {
-            TrustMode::Plan => TrustMode::Guarded,
+            // From read-only Plan, Shift+Tab returns to the writable manual tier.
+            TrustMode::Plan | TrustMode::Auto => TrustMode::Guarded,
             TrustMode::Guarded => TrustMode::Auto,
-            TrustMode::Auto => TrustMode::Plan,
         };
-        // A live writer can lose authority only at a cancel/rebuild boundary.
-        if next == TrustMode::Plan && (self.has_interruptible_work() || self.thinking) {
-            self.push(
-                ChatRole::System,
-                umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
-            );
-            return;
-        }
         self.set_trust_mode(next);
         self.push(
             ChatRole::UmaDev,

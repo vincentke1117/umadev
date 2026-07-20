@@ -2558,9 +2558,12 @@ fn default_trust_mode_is_guarded() {
 }
 
 #[test]
-fn shift_tab_cycles_plan_guarded_auto() {
-    // BackTab/Shift+Tab now cycles the FULL tier Plan → Guarded → Auto → Plan
-    // (was a 2-state Auto<->Guarded flip that could never reach Plan).
+fn shift_tab_toggles_guarded_auto_and_never_enters_read_only_plan() {
+    // BackTab/Shift+Tab toggles ONLY the two WRITABLE tiers (Guarded ↔ Auto),
+    // matching the footer chips. It never ENTERS read-only Plan (the reported bug:
+    // Auto → Plan stranded the base with no write permission); from Plan it EXITS
+    // to Guarded so a `/mode plan` user can escape read-only. Plan stays reachable
+    // only via `/mode plan`.
     let mut a = fresh_app(Some("claude-code"));
     a.set_trust_mode(umadev_agent::TrustMode::Plan);
     a.chat_session_id = Some("plan-session".to_string());
@@ -2570,6 +2573,7 @@ fn shift_tab_cycles_plan_guarded_auto() {
         umadev_runtime::BasePermissionProfile::Plan,
     );
     a.chat_session_dirty = false;
+    // Plan → Guarded (exit read-only). A real tier change rebuilds the session.
     a.cycle_approval_mode();
     assert!(
         a.chat_session_dirty,
@@ -2578,16 +2582,19 @@ fn shift_tab_cycles_plan_guarded_auto() {
     assert_eq!(a.chat_session_id, None);
     assert_eq!(a.chat_resume_identity, None);
     assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
+    // Guarded → Auto.
     a.cycle_approval_mode();
     assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Auto);
+    // Auto → Guarded (NOT Plan): Shift+Tab must never make the base read-only.
     a.cycle_approval_mode();
     assert_eq!(
         a.effective_trust_mode(),
-        umadev_agent::TrustMode::Plan,
-        "cycle must wrap Auto → Plan so Plan is keyboard-reachable"
+        umadev_agent::TrustMode::Guarded,
+        "Auto wraps back to the writable Guarded tier, never read-only Plan"
     );
+    // Same tier (Guarded → Guarded) must NOT rebuild the session.
     a.chat_session_dirty = false;
-    a.set_trust_mode(umadev_agent::TrustMode::Plan);
+    a.set_trust_mode(umadev_agent::TrustMode::Guarded);
     assert!(
         !a.chat_session_dirty,
         "same tier must not rebuild the session"
