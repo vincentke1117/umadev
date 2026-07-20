@@ -314,11 +314,20 @@ impl OpenCodeDriver {
     fn base_args_for(&self, model: &str, no_skip: bool) -> Vec<String> {
         let mut args = vec!["run".to_string()];
         args.push("--agent".to_string());
+        // Plan → read-only `plan` agent. Guarded ALSO uses `plan` on this ONE-SHOT
+        // path: `opencode run` is non-interactive with no permission.asked round-trip
+        // back to UmaDev, so a `build` agent here would collapse to opencode's own
+        // allow/deny default and BYPASS Guarded's ask-before-write contract. The
+        // writable Guarded work runs through OpenCodeSession (serve), which enforces
+        // the ask-by-default ruleset with a real host-mediated approval channel. Only
+        // Auto — explicit full autonomy, paired with `--auto` below — uses the writable
+        // `build` agent here. (Same "can't ask → don't write" fail-closed principle as
+        // the Kimi mode boundary.)
         args.push(
-            if matches!(self.permissions, BasePermissionProfile::Plan) {
-                "plan"
-            } else {
+            if self.permissions.auto_approve() && !no_skip {
                 "build"
+            } else {
+                "plan"
             }
             .to_string(),
         );
@@ -427,15 +436,11 @@ impl Runtime for OpenCodeDriver {
         if let Some(session_id) = extract_opencode_session_id(&out.stdout) {
             self.remember_session_id(&session_id);
         }
-        let extraction = extract_opencode_output(&out.stdout);
-        let text = if extraction.saw_structured_event {
-            extraction.text
-        } else {
-            // Fail open for an older/custom binary that ignores `--format` and
-            // still prints plain text. A valid structured stream with no final
-            // text stays empty instead of leaking raw event JSON to the user.
-            out.stdout
-        };
+        // Robust to a structured stream with a differing text shape (would return
+        // empty) AND an older/custom binary whose JSON lines lack the strict envelope
+        // (would leak raw event JSON); a genuinely plain-text reply still passes
+        // through verbatim.
+        let text = resolve_opencode_answer(&out.stdout);
 
         Ok(crate::redaction::sanitize_completion_response(
             &CompletionResponse {
@@ -507,12 +512,7 @@ impl Runtime for OpenCodeDriver {
                 if let Some(session_id) = extract_opencode_session_id(&out.stdout) {
                     self.remember_session_id(&session_id);
                 }
-                let extraction = extract_opencode_output(&out.stdout);
-                let text = if extraction.saw_structured_event {
-                    extraction.text
-                } else {
-                    out.stdout
-                };
+                let text = resolve_opencode_answer(&out.stdout);
                 Ok(crate::redaction::sanitize_completion_response(
                     &CompletionResponse {
                         text,
@@ -531,12 +531,7 @@ impl Runtime for OpenCodeDriver {
                 // before paying for a full `complete` re-run.
                 tracing::debug!(error = %e, "opencode streaming failed, falling back to non-streaming");
                 let partial = stream_buf.into_inner().unwrap_or_default();
-                let extraction = extract_opencode_output(&partial);
-                let salvaged = if extraction.saw_structured_event {
-                    extraction.text
-                } else {
-                    partial
-                };
+                let salvaged = resolve_opencode_answer(&partial);
                 if !salvaged.trim().is_empty() {
                     return Ok(crate::redaction::sanitize_completion_response(
                         &CompletionResponse {
@@ -624,6 +619,54 @@ fn extract_opencode_output(stdout: &str) -> OpenCodeExtraction {
         output.text.push_str(text);
     }
     output
+}
+
+/// Best-effort text salvage for output the STRICT structured parse could not use: an
+/// older/custom opencode whose JSON lines omit the `timestamp`/`sessionID` envelope
+/// (so [`opencode_event`] rejects every line), OR a structured stream whose text part
+/// sits in a slightly different shape. Pulls the assistant words from any JSON line
+/// that looks like a `text` event (`part.text`, else a top-level `text`). Returns
+/// `None` when the input has no JSON lines or none carry text, so a genuinely
+/// plain-text reply is left to pass through verbatim rather than being mangled.
+fn salvage_opencode_text(stdout: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut saw_json_line = false;
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        saw_json_line = true;
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+            continue;
+        }
+        let text = value
+            .get("part")
+            .and_then(|part| part.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("text").and_then(serde_json::Value::as_str))
+            .filter(|text| !text.is_empty());
+        if let Some(text) = text {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(text);
+        }
+    }
+    (saw_json_line && !out.trim().is_empty()).then_some(out)
+}
+
+/// Resolve the final answer text from an `opencode run` stdout, robust to BOTH an
+/// older/custom binary whose JSON lines lack the strict envelope (which would leak
+/// raw event JSON to the user) AND a structured stream whose text shape differs
+/// (which would return an empty answer). Order: the strict structured text when
+/// present; else a best-effort salvage from any JSON lines; else the verbatim stdout
+/// for a genuinely plain-text reply.
+fn resolve_opencode_answer(stdout: &str) -> String {
+    let extraction = extract_opencode_output(stdout);
+    if extraction.saw_structured_event && !extraction.text.trim().is_empty() {
+        return extraction.text;
+    }
+    salvage_opencode_text(stdout).unwrap_or_else(|| stdout.to_string())
 }
 
 fn opencode_tool_detail(part: &serde_json::Value) -> String {
@@ -1143,9 +1186,12 @@ mod tests {
 
     #[test]
     fn permission_profiles_shape_legacy_args_and_no_skip_only_tightens() {
+        // One-shot `run` has no approval round-trip, so only EFFECTIVE Auto (writable
+        // + `--auto`) gets the writable `build` agent; Plan AND Guarded stay read-only
+        // `plan` so an unapproved write can never slip through the one-shot path.
         let cases = [
             (BasePermissionProfile::Plan, "plan", false),
-            (BasePermissionProfile::Guarded, "build", false),
+            (BasePermissionProfile::Guarded, "plan", false),
             (BasePermissionProfile::Auto, "build", true),
         ];
         for (profile, agent, auto) in cases {
@@ -1159,12 +1205,15 @@ mod tests {
                 .any(|w| { w[0] == "--model" && w[1] == "anthropic/claude-sonnet" }));
         }
 
+        // UMADEV_NO_SKIP_PERMS tightens Auto back to ordinary approvals — which the
+        // one-shot cannot mediate — so it drops to the read-only `plan` agent AND emits
+        // no `--auto`, never a writable-but-unapproved `build`.
         let tightened = OpenCodeDriver::default()
             .with_permissions(BasePermissionProfile::Auto)
             .base_args_for("m", true);
         assert!(tightened
             .windows(2)
-            .any(|w| w[0] == "--agent" && w[1] == "build"));
+            .any(|w| w[0] == "--agent" && w[1] == "plan"));
         assert!(!tightened.iter().any(|a| a == "--auto"));
     }
 
@@ -1381,6 +1430,39 @@ mod tests {
                 Some(umadev_runtime::StreamEvent::Text { .. })
             ));
         }
+    }
+
+    #[test]
+    fn resolve_opencode_answer_never_leaks_raw_json_or_empties() {
+        // Strict structured stream → the parsed text is used verbatim.
+        let strict = r#"{"type":"text","timestamp":124,"sessionID":"ses_abc","part":{"type":"text","text":"the answer"}}"#;
+        assert_eq!(resolve_opencode_answer(strict), "the answer");
+
+        // #12a: an older/custom opencode whose JSON lines OMIT the timestamp/sessionID
+        // envelope — the strict parser rejects every line, so the old code returned the
+        // raw JSONL verbatim (leaking event JSON). Now the words are salvaged instead.
+        let no_envelope = r#"{"type":"text","part":{"type":"text","text":"salvaged words"}}"#;
+        let resolved = resolve_opencode_answer(no_envelope);
+        assert_eq!(resolved, "salvaged words");
+        assert!(
+            !resolved.contains('{'),
+            "must not leak raw event JSON to the user: {resolved}"
+        );
+
+        // #12b: structured events present but the text sits in a shape the strict
+        // extractor misses → best-effort salvage recovers it rather than an empty answer.
+        let differing = r#"{"type":"text","sessionID":"ses_x","text":"top level text"}"#;
+        assert_eq!(resolve_opencode_answer(differing), "top level text");
+
+        // A genuinely plain-text reply (no JSON lines) passes through verbatim.
+        let plain = "just a plain sentence from an old binary";
+        assert_eq!(resolve_opencode_answer(plain), plain);
+
+        // No texty JSON at all (only a tool event, no envelope) → salvage finds nothing,
+        // so we do NOT fabricate; the verbatim stdout is returned (never an empty string
+        // that silently drops the turn's output).
+        let tool_only = r#"{"type":"tool_use","part":{"type":"tool","tool":"read"}}"#;
+        assert_eq!(resolve_opencode_answer(tool_only), tool_only);
     }
 
     #[test]
