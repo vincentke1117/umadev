@@ -24,7 +24,7 @@ pub(crate) const FIRST_CLASS_BACKEND_IDS: [&str; 5] = [
 pub fn detect_base_model(backend_id: &str, project_root: &std::path::Path) -> Option<String> {
     let home = config::home_dir();
     match backend_id {
-        // claude: --model > ANTHROPIC_MODEL > project/user .claude/settings.json.
+        // claude: --model > ANTHROPIC_MODEL > local project > shared project > user.
         "claude-code" => {
             if let Ok(m) = std::env::var("ANTHROPIC_MODEL") {
                 let m = m.trim();
@@ -32,7 +32,7 @@ pub fn detect_base_model(backend_id: &str, project_root: &std::path::Path) -> Op
                     return Some(m.to_string());
                 }
             }
-            json_top_string(&project_root.join(".claude/settings.json"), "model").or_else(|| {
+            claude_project_string(project_root, "model").or_else(|| {
                 home.as_ref()
                     .and_then(|h| json_top_string(&h.join(".claude/settings.json"), "model"))
             })
@@ -145,12 +145,8 @@ pub fn detect_base_context_window_for_model(
 pub fn detect_base_reasoning(backend_id: &str, project_root: &std::path::Path) -> Option<String> {
     let home = config::home_dir();
     match backend_id {
-        // claude: settings.json `effortLevel` (project wins over user).
-        "claude-code" => json_top_string(
-            &project_root.join(".claude/settings.json"),
-            "effortLevel",
-        )
-        .or_else(|| {
+        // claude: machine-local project settings override shared project and user.
+        "claude-code" => claude_project_string(project_root, "effortLevel").or_else(|| {
             home.as_ref()
                 .and_then(|h| json_top_string(&h.join(".claude/settings.json"), "effortLevel"))
         }),
@@ -239,6 +235,11 @@ pub(crate) fn redetect_base_config(
 fn json_top_string(path: &std::path::Path, key: &str) -> Option<String> {
     let v = json_value(path)?;
     v.get(key)?.as_str().map(str::to_string)
+}
+
+fn claude_project_string(project_root: &std::path::Path, key: &str) -> Option<String> {
+    json_top_string(&project_root.join(".claude/settings.local.json"), key)
+        .or_else(|| json_top_string(&project_root.join(".claude/settings.json"), key))
 }
 
 fn opencode_config_paths(
@@ -644,130 +645,4 @@ fn kimi_context_for_model(value: &toml::Value, model: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod reestablish_tests {
-    use super::redetect_base_config;
-
-    #[test]
-    fn redetect_reads_the_base_config_live_not_a_cached_value() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join(".codex")).unwrap();
-        std::fs::write(
-            root.join(".codex/config.toml"),
-            "model = \"gpt-5.6\"\nmodel_reasoning_effort = \"high\"\n",
-        )
-        .unwrap();
-
-        // The cached (start-time) model is deliberately different: a re-establish must
-        // RE-DETECT from the base's own config, not echo the stale cached value.
-        let re = redetect_base_config("codex", root, "stale-cached-model");
-        assert_eq!(re.model, "gpt-5.6");
-        assert_eq!(re.reasoning.as_deref(), Some("high"));
-
-        // The user raises the upstream effort (the reported flow). A fresh re-detect
-        // must pick up the CHANGED value — proving the config is read live, not cached.
-        std::fs::write(
-            root.join(".codex/config.toml"),
-            "model = \"gpt-5.6\"\nmodel_reasoning_effort = \"xhigh\"\n",
-        )
-        .unwrap();
-        let re = redetect_base_config("codex", root, "stale-cached-model");
-        assert_eq!(
-            re.reasoning.as_deref(),
-            Some("xhigh"),
-            "the CHANGED effort is surfaced after re-establish, not the start-time value"
-        );
-    }
-
-    #[test]
-    fn redetect_is_fail_open_when_the_base_pins_no_model_or_effort() {
-        // An unknown/offline base pins nothing and reads no home config: the fallback
-        // model is kept and no effort is shown (never a fabricated/stale one).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let re = redetect_base_config("offline", tmp.path(), "fallback-model");
-        assert_eq!(re.model, "fallback-model");
-        assert_eq!(re.reasoning, None);
-    }
-}
-
-#[cfg(test)]
-mod grok_tests {
-    use super::{detect_base_context_window, detect_base_model, detect_base_reasoning};
-
-    #[test]
-    fn reads_model_effort_and_context_from_grok_config_toml() {
-        // Grok Build's `.grok/config.toml` schema (docs.x.ai/build/settings/reference):
-        // `[models] default` + `default_reasoning_effort`, and a per-model
-        // `[model."<id>"] context_window`. A project-root override is read first, so
-        // this is hermetic regardless of the dev machine's own `~/.grok/config.toml`.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join(".grok")).unwrap();
-        std::fs::write(
-            root.join(".grok/config.toml"),
-            "[models]\ndefault = \"grok-4.5\"\ndefault_reasoning_effort = \"high\"\n\n\
-             [model.\"grok-4.5\"]\ncontext_window = 1000000\n",
-        )
-        .unwrap();
-
-        assert_eq!(
-            detect_base_model("grok-build", root).as_deref(),
-            Some("grok-4.5"),
-            "the [models] default model is surfaced for Grok, like every other base"
-        );
-        assert_eq!(
-            detect_base_reasoning("grok-build", root).as_deref(),
-            Some("high"),
-            "the [models] default_reasoning_effort is surfaced for Grok"
-        );
-        assert_eq!(
-            detect_base_context_window("grok-build", root),
-            Some(1_000_000),
-            "the [model.<id>] context_window is surfaced for Grok"
-        );
-    }
-
-    #[test]
-    fn grok_config_with_only_mcp_servers_is_fail_open_none() {
-        // A real `.grok/config.toml` may hold ONLY `[mcp_servers.*]` (that is all
-        // UmaDev writes into it) with no `[models]` — that must yield None (no
-        // fabricated model / effort / context), never a panic.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join(".grok")).unwrap();
-        std::fs::write(
-            root.join(".grok/config.toml"),
-            "[mcp_servers.example]\ncommand = \"x\"\n",
-        )
-        .unwrap();
-        assert_eq!(detect_base_model("grok-build", root), None);
-        assert_eq!(detect_base_reasoning("grok-build", root), None);
-        assert_eq!(detect_base_context_window("grok-build", root), None);
-    }
-}
-
-#[cfg(test)]
-mod kimi_tests {
-    use super::kimi_context_for_model;
-
-    #[test]
-    fn context_uses_the_selected_alias_and_persistent_override() {
-        let value: toml::Value = toml::from_str(
-            r#"
-default_model = "kimi-code/kimi-for-coding"
-
-[models."kimi-code/kimi-for-coding"]
-max_context_size = 262144
-
-[models."kimi-code/kimi-for-coding".overrides]
-max_context_size = 131072
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            kimi_context_for_model(&value, "kimi-code/kimi-for-coding"),
-            Some(131_072)
-        );
-        assert_eq!(kimi_context_for_model(&value, "missing"), None);
-    }
-}
+mod tests;

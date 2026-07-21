@@ -1,25 +1,9 @@
 import type { Metadata } from "next";
-import { JetBrains_Mono, Manrope, Space_Grotesk } from "next/font/google";
+import "@fontsource-variable/jetbrains-mono/wght.css";
+import "@fontsource-variable/manrope/wght.css";
+import "@fontsource-variable/space-grotesk/wght.css";
 import "./globals.css";
 import { asset } from "./content";
-
-const manrope = Manrope({
-  variable: "--font-manrope",
-  subsets: ["latin"],
-  display: "swap",
-});
-
-const spaceGrotesk = Space_Grotesk({
-  variable: "--font-space",
-  subsets: ["latin"],
-  display: "swap",
-});
-
-const jetBrainsMono = JetBrains_Mono({
-  variable: "--font-mono",
-  subsets: ["latin"],
-  display: "swap",
-});
 
 export const metadata: Metadata = {
   metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "https://umadev.goder.ai"),
@@ -45,11 +29,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html
-      lang="zh-CN"
-      className={`${manrope.variable} ${spaceGrotesk.variable} ${jetBrainsMono.variable}`}
-      suppressHydrationWarning
-    >
+    <html lang="zh-CN" suppressHydrationWarning>
       <body suppressHydrationWarning>{children}</body>
     </html>
   );

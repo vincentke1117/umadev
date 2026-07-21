@@ -1278,7 +1278,10 @@ impl Plan {
                     continue;
                 }
                 // Advance the cursor for this frame before recursing.
-                stack.last_mut().unwrap().1 += 1;
+                let Some(frame) = stack.last_mut() else {
+                    break;
+                };
+                frame.1 += 1;
                 let dep_id = self.steps[node].depends_on[cursor].clone();
                 let Some(&target) = index.get(&dep_id) else {
                     continue; // dangling deps were already stripped; defensive.
@@ -1961,6 +1964,8 @@ pub fn plan_rel_path() -> PathBuf {
     PathBuf::from(".umadev").join("plan.json")
 }
 
+const MAX_PERSISTED_PLAN_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Persist a plan to `.umadev/plan.json` (atomic: write a temp sibling, then
 /// rename). Best-effort + fail-open: any IO error is returned for the caller to
 /// ignore — a failed persist never blocks the build. Returns `Ok(path)` on success.
@@ -1970,10 +1975,7 @@ pub fn save(plan: &Plan, root: &Path) -> std::io::Result<PathBuf> {
     let final_path = dir.join("plan.json");
     let json = serde_json::to_string_pretty(plan)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    // Atomic write: temp sibling on the SAME dir (so rename is atomic), then rename.
-    let tmp = dir.join(format!("plan.json.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, json.as_bytes())?;
-    std::fs::rename(&tmp, &final_path)?;
+    umadev_state::fs::atomic_write(&final_path, json.as_bytes())?;
     Ok(final_path)
 }
 
@@ -1982,7 +1984,9 @@ pub fn save(plan: &Plan, root: &Path) -> std::io::Result<PathBuf> {
 #[must_use]
 pub fn load(root: &Path) -> Option<Plan> {
     let path = root.join(".umadev").join("plan.json");
-    let text = std::fs::read_to_string(path).ok()?;
+    let text =
+        String::from_utf8(umadev_state::fs::read_bounded(&path, MAX_PERSISTED_PLAN_BYTES).ok()?)
+            .ok()?;
     let mut plan = serde_json::from_str::<Plan>(&text).ok()?;
     // Backward-compatible migration for plans written before file surfaces became
     // a hard execution contract. Exact FileExists/FileContains evidence can be
@@ -2780,6 +2784,40 @@ mod tests {
     fn load_missing_is_none() {
         let tmp = tempfile::TempDir::new().unwrap();
         assert!(load(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn load_rejects_an_oversized_plan() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plan.json"),
+            vec![b' '; usize::try_from(MAX_PERSISTED_PLAN_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert!(load(tmp.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_and_load_refuse_symlinked_plan_state() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".umadev")).unwrap();
+        let victim = outside.path().join("victim.json");
+        std::fs::write(&victim, "outside must survive").unwrap();
+        symlink(&victim, tmp.path().join(".umadev/plan.json")).unwrap();
+
+        let p = plan(vec![step("a", &[])]);
+        assert!(save(&p, tmp.path()).is_err());
+        assert!(load(tmp.path()).is_none());
+        assert_eq!(
+            std::fs::read_to_string(victim).unwrap(),
+            "outside must survive"
+        );
     }
 
     // ── drain_plan_turn cleanly handles a mid-turn approval (MEDIUM #3) ──

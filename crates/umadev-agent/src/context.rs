@@ -133,8 +133,9 @@ enum FirmwareTier {
     /// Identity only. Pure conversation / read-only explain — keep it light and
     /// fast, no knowledge/memory retrieval.
     Light,
-    /// Identity + the compact craft law. A small, fast work turn (a quick edit /
-    /// a shallow debug) — the visual + engineering moat, but no retrieval cost.
+    /// Identity + the compact craft law + small local pitfall recall. A quick
+    /// edit or shallow debug must still remember what previously failed here;
+    /// only the heavier curated-corpus retrieval remains disabled.
     Craft,
     /// Every layer: identity + craft + JIT knowledge + JIT pitfall memory. A real
     /// build / a deliberate turn, where the team's full experience earns its keep.
@@ -165,8 +166,15 @@ impl FirmwareTier {
         matches!(self, Self::Craft | Self::Full)
     }
 
-    /// Whether this tier runs the JIT knowledge + pitfall-memory retrieval.
-    fn wants_jit(self) -> bool {
+    /// Whether this tier recalls the project's compact pitfall memory. Every
+    /// work-class turn gets it so repeat defects do not become memory-blind just
+    /// because the requested repair is small.
+    fn wants_pitfall_memory(self) -> bool {
+        matches!(self, Self::Craft | Self::Full)
+    }
+
+    /// Whether this tier runs the heavier curated-knowledge retrieval.
+    fn wants_knowledge(self) -> bool {
         matches!(self, Self::Full)
     }
 }
@@ -442,7 +450,8 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
     // Repo-map is ALWAYS-ON (the greenfield skip is enforced by the slice itself
     // returning empty), so the base is repo-aware on every turn, chat included; only
     // the slow pitfall-memory + curated-knowledge retrieval below stays work-class.
-    let want_jit = tier.wants_jit();
+    let want_memory = tier.wants_pitfall_memory();
+    let want_knowledge = tier.wants_knowledge();
     let root_buf = root.to_path_buf();
     let scope = route.scope.clone();
     let req = requirement.to_string();
@@ -453,12 +462,12 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
     let seat = route.team.first().map(|s| s.role_id().to_string());
     let (repo_map, memory, knowledge) = tokio::task::spawn_blocking(move || {
         let repo_map = repo_map_layer(&root_buf, &scope);
-        let memory = if want_jit {
+        let memory = if want_memory {
             memory_layer(&root_buf, &req, seat.as_deref())
         } else {
             String::new()
         };
-        let knowledge = if want_jit {
+        let knowledge = if want_knowledge {
             knowledge_layer(&root_buf, &req, seat.as_deref())
         } else {
             String::new()
@@ -1211,13 +1220,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quick_edit_carries_the_full_design_system_but_no_slow_retrieval() {
+    async fn quick_edit_carries_design_rules_without_heavy_curated_retrieval() {
         // The design-system / anti-slop law is ALWAYS-ON for any work turn (a
         // quick-edit or a chat-promoted build writes real UI too — its visual
         // quality is the moat the user judges). It's a STATIC string, so it costs
-        // nothing on latency. What stays gated is the SLOW JIT retrieval (repo-map /
-        // knowledge / memory) — those do real I/O, so a fast turn skips them and the
-        // base reads what it needs via its own tools.
+        // nothing on latency. The heavier curated-corpus retrieval stays gated;
+        // compact project pitfall recall remains available when a matching lesson
+        // exists, and the repo map continues to be an objective local context layer.
         let tmp = tempfile::TempDir::new().unwrap();
         let r = route(RouteClass::QuickEdit, Depth::Fast, Vec::new());
         let fw = compose_firmware(tmp.path(), &r, "改个文案").await;
@@ -1229,9 +1238,42 @@ mod tests {
             fw.contains("DESIGN LAW"),
             "the design law is always-on for a work turn (every UI must be exquisite)"
         );
-        // …but the SLOW JIT retrieval (knowledge / memory) stays gated for speed.
+        // No pitfall exists in this fresh project, and curated knowledge stays off.
         assert!(!fw.contains("Lessons from prior runs"));
         assert!(!fw.contains("YOUR TEAM'S EXPERIENCE"));
+    }
+
+    #[tokio::test]
+    async fn fast_repair_recalls_a_corroborated_project_pitfall() {
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let error = "Error: Cannot find module 'react-router-dom'".to_string();
+        // Two independent capture calls corroborate the rule; one observation
+        // alone remains a hypothesis and is intentionally not injected.
+        let _ = crate::lessons::capture_dev_errors_detailed(
+            tmp.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "修复路由依赖",
+        );
+        let _ = crate::lessons::capture_dev_errors_detailed(
+            tmp.path(),
+            std::slice::from_ref(&error),
+            "demo",
+            "修复路由依赖",
+        );
+
+        let r = route(RouteClass::Debug, Depth::Fast, Vec::new());
+        let fw = compose_firmware(tmp.path(), &r, "修复 react-router-dom 路由错误").await;
+        assert!(
+            fw.contains("Lessons from prior runs"),
+            "a small repeat repair must receive matching project experience: {fw}"
+        );
+        assert!(fw.contains("react-router-dom"));
+        assert!(
+            !fw.contains("YOUR TEAM'S EXPERIENCE"),
+            "fast repair still skips the heavier curated corpus"
+        );
     }
 
     #[tokio::test]

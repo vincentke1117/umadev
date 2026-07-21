@@ -6179,7 +6179,7 @@ impl App {
 
     /// Char index of the GRAPHEME-cluster boundary immediately to the LEFT of
     /// `char_pos` — i.e. the start of the user-perceived glyph that ends at
-    /// `char_pos`. A ZWJ emoji (👨‍👩‍👧), a flag / skin-tone sequence, or a
+    /// `char_pos`. A ZWJ emoji sequence, a flag / skin-tone sequence, or a
     /// base char + combining marks is several codepoints but one cluster, so
     /// stepping the caret / backspace over it must move by the whole cluster,
     /// not one codepoint (which would split the glyph and corrupt the render).
@@ -11277,8 +11277,7 @@ impl App {
     /// call flows through here, so this is its terminal cleanup too.
     /// Whether a failed-turn note carries evidence the BASE SESSION itself is dead / gone -
     /// a broken pipe on send (`os error 232` on Windows, `os error 32` on Unix), the base
-    /// process having exited, or a `--resume` that hit "No conversation found" - as opposed to
-    /// a content/tool error on a still-LIVE session. On session-death the stored base session
+    /// process having exited, or a `--resume` that hit "No conversation found". On session-death the stored base session
     /// id is a CORPSE: re-`--resume`-ing it every subsequent turn reproduces the failure
     /// forever (the reported "only the first turn works, then every turn fails"), so it must be
     /// invalidated to force a FRESH session (+ UmaDev own transcript replay) next turn.
@@ -11295,7 +11294,8 @@ impl App {
             "epipe",
         ];
         let hay = note.to_lowercase();
-        MARKERS.iter().any(|m| hay.contains(m))
+        umadev_agent::base_error::session_transport_is_lost(note)
+            || MARKERS.iter().any(|m| hay.contains(m))
     }
 
     pub(crate) fn record_route_failed(&mut self, note: String, origin: FailedRouteOrigin) {
@@ -14041,14 +14041,13 @@ impl App {
             })
             .unwrap_or_default();
         zips.sort_by_key(std::fs::DirEntry::file_name);
-        if zips.is_empty() {
+        let Some(latest) = zips.last() else {
             self.push(
                 ChatRole::System,
                 umadev_i18n::t(self.lang, "export.release_empty"),
             );
             return;
-        }
-        let latest = zips.last().unwrap();
+        };
         let size = std::fs::metadata(latest.path()).map_or(0, |m| m.len() / 1024);
         self.push(
             ChatRole::UmaDev,
@@ -14795,76 +14794,6 @@ impl App {
             ChatRole::System,
             umadev_i18n::tf(self.lang, "constitution.edit_hint", &[&path]),
         );
-        Action::None
-    }
-
-    /// Fold a plan-steering edit (`skip` / `veto` / `add` / `up` / `down`) into
-    /// the next directive via [`queued_steer`], echoing a confirmation. The
-    /// `skip` / `veto` / `up` / `down` forms validate `target` against a live
-    /// step id; `add` takes free text. The edit applies at the next step boundary
-    /// (the same place a queued steer fires), so it shares the run's session.
-    fn steer_plan(&mut self, sub: &str, target: &str) -> Action {
-        // `add` is free text; the rest reference an existing step id.
-        if sub != "add" {
-            if target.is_empty() {
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::t(self.lang, "plan.steer.usage"),
-                );
-                return Action::None;
-            }
-            if !self.plan_steps.iter().any(|s| s.id == target) {
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::tf(self.lang, "plan.steer.unknown_step", &[target]),
-                );
-                return Action::None;
-            }
-        }
-        // Build the directive the director sees, and the user-facing confirmation.
-        let (directive, confirm) = match sub {
-            "skip" => (
-                format!(
-                    "Plan steering: SKIP step `{target}` — do not perform it; proceed with the rest of the plan."
-                ),
-                umadev_i18n::tf(self.lang, "plan.steer.skip", &[target]),
-            ),
-            "veto" => (
-                format!(
-                    "Plan steering: VETO step `{target}` — remove it from the plan entirely and do not perform it."
-                ),
-                umadev_i18n::tf(self.lang, "plan.steer.veto", &[target]),
-            ),
-            "up" => (
-                format!(
-                    "Plan steering: REORDER step `{target}` EARLIER — do it before its current predecessors where dependencies allow."
-                ),
-                umadev_i18n::tf(self.lang, "plan.steer.move", &[target, "↑"]),
-            ),
-            "down" => (
-                format!(
-                    "Plan steering: REORDER step `{target}` LATER — defer it after its current successors where dependencies allow."
-                ),
-                umadev_i18n::tf(self.lang, "plan.steer.move", &[target, "↓"]),
-            ),
-            // `add`
-            _ => (
-                format!("Plan steering: ADD a new step — {target}"),
-                umadev_i18n::tf(self.lang, "plan.steer.add", &[target]),
-            ),
-        };
-        // Fold into the next directive over the SAME session (the queued-steer
-        // mechanism), then confirm to the user.
-        self.queued_steer.push_back(directive);
-        self.push(ChatRole::UmaDev, confirm);
-        // If nothing is mid-run (no gap will come), tell the user the edit is
-        // parked and will apply at the next step boundary — never silently lost.
-        if !self.is_pipeline_active() {
-            self.push(
-                ChatRole::System,
-                umadev_i18n::t(self.lang, "plan.steer.queued"),
-            );
-        }
         Action::None
     }
 
@@ -15764,7 +15693,7 @@ impl App {
     }
 
     /// Synthesize the **build-complete card** shown after EVERY effective build
-    /// (chat / Fast / Delivery): a `✅ done` headline + what changed + the key
+    /// (chat / Fast / Delivery): a `done` headline + what changed + the key
     /// entry point + the run command. Plain markdown (the transcript renderer
     /// formats it) — no new data model. **Fail-open**: every section is
     /// best-effort; a section whose signal is missing is simply omitted, and the

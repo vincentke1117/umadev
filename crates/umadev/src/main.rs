@@ -620,7 +620,7 @@ enum Command {
         long_about = "Install the UmaDev pre-write governance hook into a base CLI.\n\
                       \n\
                       Supported bases:\n  \
-                      claude-code   writes .claude/settings.json PreToolUse hook\n  \
+                      claude-code   writes .claude/settings.local.json PreToolUse hook\n  \
                       kimi-code     merge-writes scoped Pre/PostToolUse hooks into Kimi config.toml\n  \
                       pre-commit    writes .git/hooks/pre-commit (runs `umadev ci --changed-only`)\n\
                       \n\
@@ -637,7 +637,8 @@ enum Command {
         /// Base to install into: `claude-code` (default), `kimi-code`, or `pre-commit`.
         /// (The legacy `--host` spelling still works as an alias.)
         ///
-        /// `claude-code` writes the PreToolUse hook into `.claude/settings.json`.
+        /// `claude-code` writes the PreToolUse hook into machine-local
+        /// `.claude/settings.local.json`.
         /// `kimi-code` installs root-scoped native hooks without replacing user hooks.
         /// `pre-commit` writes a git `pre-commit` hook into `.git/hooks/` that
         /// runs `umadev ci --changed-only` before every commit.
@@ -2275,6 +2276,8 @@ output/
 # Generated when routing a third-party API through opencode (holds an env-var
 # reference, not a raw key, but it's machine-generated routing config).
 opencode.json
+# Machine-local Claude Code hooks contain this installation's executable path.
+.claude/settings.local.json
 ";
         let _ = std::fs::write(&gitignore, content);
         println!("  gitignore: {}", gitignore.display());
@@ -2393,7 +2396,7 @@ async fn cmd_tui() -> Result<()> {
     // the session drives Claude Code (the default/most-common base, and even
     // after an in-session `/claude` switch) its file writes are governed live.
     // Idempotent + merges; inert for codex/opencode/offline (they don't read
-    // `.claude/settings.json`), so it's safe to install unconditionally.
+    // `.claude/settings.local.json`), so it's safe to install unconditionally.
     let _ = hook::install_claude_hook(&project_root);
     // Kimi's registry is user-level rather than project-local, so only touch it
     // when Kimi is the user's selected base. Each installed command still
@@ -2929,7 +2932,7 @@ fn run_outcome_is_failure(outcome: &umadev_agent::RunOutcome) -> bool {
 ///   (`.git` internals / destructive shell / network) is DENIED even headless,
 ///   exactly as the `auto` tier still can't skip it. Everything else is allowed so
 ///   a headless build isn't wedged waiting on a human.
-/// - **governance hook** — already installed in `.claude/settings.json` by the
+/// - **governance hook** — installed in `.claude/settings.local.json` by the
 ///   caller (for claude), so every file write fires the governor in real time (the
 ///   background safety net), independent of this drainer.
 /// - **objective source-present hard-gate** — after the director reports done, the

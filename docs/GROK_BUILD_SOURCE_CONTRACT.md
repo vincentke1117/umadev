@@ -13,12 +13,12 @@
 | Item | Pinned value |
 |---|---|
 | Official repository | <https://github.com/xai-org/grok-build> |
-| Audited commit | `8adf9013a0929e5c7f1d4e849492d2387837a28d` |
-| Grok Build version | `0.2.101` |
+| Audited commit | `a881e6703f46b01d8c7d4a5437683546df30449d` |
+| Grok Build version | `0.2.106` |
 | `agent-client-protocol` | `0.10.4`, with upstream's `unstable` feature |
 | `agent-client-protocol-schema` resolved by upstream | `0.11.4` |
 | ACP wire protocol negotiated by this build | V1 |
-| Audit date | 2026-07-17 |
+| Audit date | 2026-07-21 |
 
 The version is declared by the upstream `xai-grok-pager`,
 `xai-grok-pager-bin`, `xai-grok-shell`, and related crates. The ACP dependency
@@ -34,27 +34,31 @@ mutable installer script at release time:
 
 | Official artifact | SHA-256 |
 |---|---|
-| `grok-0.2.101-linux-x86_64` | `2556299cded37f81e54c02420cfa7f1a2df9feab72a445869a0f5596e143b333` |
-| `grok-0.2.101-linux-aarch64` | `4c2d6e7b310d50dda9f1bb0143f069950dbab68021c38e9022aefb732abd3319` |
-| `grok-0.2.101-macos-aarch64` | `8431538dbd99379240f558b48b779c651d668b06d793c87311ad532c4395a4e2` |
-| `grok-0.2.101-macos-x86_64` | `884aa9e2520d85359027bd75710238165100c88d879046e34931aa703866421d` |
-| `grok-0.2.101-windows-x86_64.exe` | `fc4351df2e13b6bf99534f52296800ab90d09252e028907453d4f1586b2f0991` |
+| `grok-0.2.106-linux-x86_64` | `7180d0e03cc2a496033ff3aae2223ce239446a9827a59faa76091c7edd5e1c38` |
+| `grok-0.2.106-linux-aarch64` | `d12be1698d56d4543f1f1095c2c26cd3d17a64e88772629673740991c188e4ff` |
+| `grok-0.2.106-macos-aarch64` | `7229f5e2a69b05832c86db82bebda541e92b5c24958fbfacf5c8f463394d3027` |
+| `grok-0.2.106-macos-x86_64` | `445d0a211e42e0c7efe888c8c928f1a2f38ea05d4ae8a7069035181f0c371faa` |
+| `grok-0.2.106-windows-x86_64.exe` | `a6a25d55daadca0c2458a5aceb4c1873eb7c76964ef307647d079e344c53969a` |
 
 Ordinary and tag CI download the exact Linux x64, macOS arm64 and Windows x64
 artifacts directly from `https://x.ai/cli/`, verify these digests and the exact
-`grok 0.2.101 (<revision>)` version line, then run an isolated real-process ACP
+`grok 0.2.106 (<revision>)` version line, then run an isolated real-process ACP
 handshake. The test requires the typed authentication offer and proves that no
 browser-capable authentication RPC or project write occurs before explicit
 confirmation. The other two hashes lock the official artifact bytes for the
 architectures UmaDev can encounter even though GitHub-hosted runners cannot
 execute those foreign-architecture binaries.
 
-The previous audit point was `c68e39f60462f28d9be5e683d9cbe2c57b1a5027`
-(`0.1.220-alpha.4`). Its diff to the current pin changes session cleanup,
-plugin-skill command qualification, and internal refactors; it does not change
-the ACP agent, prompt-queue, background-task extension, or their wire DTOs. The
-source-contract suite is nevertheless rerun against the new exact commit rather
-than inheriting compatibility from the unchanged-looking diff.
+The previous audit point was `8adf9013a0929e5c7f1d4e849492d2387837a28d`
+(`0.2.101`). Versions 0.2.102 through 0.2.106 substantially changed
+authentication single-flight/cancellation, prompt admission and background
+wake handling, permission-path normalization, model defaults, MCP setup, and
+session-state transfer. ACP remains `0.10.4` with schema `0.11.4`, but that fact
+alone is not treated as private-wire compatibility. The method inventory,
+source-shaped DTO markers, exact artifacts, and isolated real ACP handshake
+were rerun for this pin. New optional client-driven methods such as
+`x.ai/mcp/setup` and `x.ai/session/import` are not advertised as UmaDev features
+merely because the vendor pager uses them.
 
 ## 2. Contract vocabulary and gates
 
@@ -79,7 +83,7 @@ true:
 2. `initialize._meta.grokShell` is exactly `true`;
 3. `initialize._meta.agentVersion` is a non-empty, parsed version;
 4. that version is in an explicitly audited compatibility set, initially only
-   `0.2.101`, or the individual private method has passed a safe runtime
+   `0.2.106`, or the individual private method has passed a safe runtime
    probe;
 5. the exact method and payload have a typed, bounded parser;
 6. the feature's acceptance tests are green.

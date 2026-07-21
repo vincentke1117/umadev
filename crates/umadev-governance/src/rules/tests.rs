@@ -268,6 +268,12 @@ const x = 1;",
 }
 
 #[test]
+fn emoji_in_rust_doc_comment_not_flagged() {
+    let source = "/// A ZWJ family emoji (👨‍👩‍👧) documents grapheme behavior.\npub fn next() {}";
+    assert!(!check_emoji("src/editor.rs", source).block);
+}
+
+#[test]
 fn emoji_in_jsx_still_flagged_ast() {
     let d = check_emoji("src/Btn.tsx", "<button>🔍 Search</button>");
     assert!(d.block);
@@ -5104,6 +5110,21 @@ fn code_var_allows_few() {
 fn code_var_allows_let_const() {
     let d = check_var_declarations("src/app.ts", "let a = 1;\nconst b = 2;");
     assert!(!d.block);
+}
+
+#[test]
+fn code_var_allows_an_explicit_es5_bootstrap_header() {
+    let code = "// umadev-governance: allow-es5-bootstrap\nvar a;\nvar b;\nvar c;";
+    let d = check_var_declarations("bin/cli.js", code);
+    assert!(!d.block);
+}
+
+#[test]
+fn code_var_rejects_a_late_es5_bootstrap_directive() {
+    let mut code = (0..20).map(|_| "// header").collect::<Vec<_>>().join("\n");
+    code.push_str("\n// umadev-governance: allow-es5-bootstrap\nvar a;\nvar b;\nvar c;");
+    let d = check_var_declarations("bin/cli.js", &code);
+    assert!(d.block);
 }
 
 #[test]

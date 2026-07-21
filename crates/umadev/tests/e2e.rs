@@ -676,7 +676,7 @@ fn hook_pre_write_allows_clean() {
     assert!(s.contains("allow"), "clean code must be allowed: {s}");
 }
 
-/// `umadev install` writes the PreToolUse hook into .claude/settings.json.
+/// `umadev install` writes the PreToolUse hook into machine-local Claude settings.
 #[test]
 fn install_writes_claude_hook() {
     let tmp = TempDir::new().unwrap();
@@ -690,10 +690,10 @@ fn install_writes_claude_hook() {
         "install failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.json"))
-        .expect("settings.json must exist");
+    let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.local.json"))
+        .expect("settings.local.json must exist");
     assert!(
-        settings.contains("hook pre-write"),
+        settings.contains("\"pre-write\""),
         "settings must contain hook: {settings}"
     );
     assert!(
@@ -788,9 +788,9 @@ fn uninstall_removes_claude_hook() {
         .output()
         .expect("uninstall");
     let settings =
-        std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap_or_default();
+        std::fs::read_to_string(tmp.path().join(".claude/settings.local.json")).unwrap_or_default();
     assert!(
-        !settings.contains("hook pre-write"),
+        !settings.contains("\"pre-write\""),
         "hook must be removed: {settings}"
     );
 }

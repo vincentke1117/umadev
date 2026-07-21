@@ -37,7 +37,6 @@
 //! facts" and behaves exactly as before — this module NEVER panics and NEVER
 //! returns an error that could block the base.
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -67,6 +66,7 @@ const MAX_VALUE_CHARS: usize = 400;
 
 /// Per-fact cap on the optional category length (chars).
 const MAX_CATEGORY_CHARS: usize = 32;
+const MAX_FACTS_FILE_BYTES: u64 = 256 * 1024;
 
 /// Character budget for the firmware recall block. Deliberately tight: the facts
 /// block rides in the always-on head on TOP of the identity + craft law, so it
@@ -134,21 +134,22 @@ impl Fact {
 static FACTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn real_dir_no_follow(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+    umadev_state::fs::real_dir(path)
 }
 
 fn ensure_real_child_dir(parent: &Path, child: &Path, create: bool) -> bool {
-    if !real_dir_no_follow(parent) {
+    let Some(name) = child
+        .parent()
+        .filter(|candidate| *candidate == parent)
+        .and_then(|_| child.file_name())
+        .and_then(|name| name.to_str())
+    else {
         return false;
-    }
-    match std::fs::symlink_metadata(child) {
-        Ok(meta) => meta.file_type().is_dir(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
-            std::fs::create_dir(child).is_ok()
-                && real_dir_no_follow(parent)
-                && real_dir_no_follow(child)
-        }
-        Err(_) => false,
+    };
+    if create {
+        umadev_state::fs::ensure_real_child_dir(parent, name).is_ok()
+    } else {
+        real_dir_no_follow(parent) && real_dir_no_follow(child)
     }
 }
 
@@ -168,7 +169,7 @@ fn managed_facts_path(root: &Path, create_parent: bool) -> Option<PathBuf> {
     }
     let path = memory.join("facts.jsonl");
     match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_file() => Some(path),
+        Ok(meta) if umadev_state::fs::metadata_is_real_file(&meta) => Some(path),
         Ok(_) => None,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(path),
         Err(_) => None,
@@ -177,31 +178,7 @@ fn managed_facts_path(root: &Path, create_parent: bool) -> Option<PathBuf> {
 
 fn read_managed_facts(root: &Path) -> Option<String> {
     let path = managed_facts_path(root, false)?;
-    if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
-        return None;
-    }
-
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-
-    let mut file = options.open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text).ok()?;
-    Some(text)
+    String::from_utf8(umadev_state::fs::read_bounded(&path, MAX_FACTS_FILE_BYTES).ok()?).ok()
 }
 
 /// Load the durable, RECALLABLE facts for `root`, newest LAST — the LIVE facts
@@ -271,6 +248,9 @@ pub fn record_facts(root: &Path, incoming: &[Fact]) -> usize {
     let _guard = FACTS_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(_cross_process) = umadev_state::store_lock::acquire(root, MemoryStore::Facts) else {
+        return 0;
+    };
 
     let valid: Vec<Fact> = incoming
         .iter()
@@ -333,6 +313,9 @@ pub fn mark_stale_facts(root: &Path, observed: &[Fact]) -> usize {
     let _guard = FACTS_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(_cross_process) = umadev_state::store_lock::acquire(root, MemoryStore::Facts) else {
+        return 0;
+    };
 
     let mut store = load_facts_raw(root);
     if store.is_empty() {
@@ -578,68 +561,90 @@ fn render_jsonl(facts: &[Fact]) -> String {
 /// temp name carries the pid + a high-resolution timestamp so two writers don't
 /// collide on the temp itself. Best-effort cleanup of the temp on rename failure.
 fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
-    let Some(dir) = path.parent() else {
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_FACTS_FILE_BYTES {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "fact store has no parent",
-        ));
-    };
-    if !real_dir_no_follow(dir) || !safe_final_file_or_absent(path)? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "unsafe fact store path",
+            std::io::ErrorKind::InvalidData,
+            "fact store exceeds its byte limit",
         ));
     }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = dir.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("facts"),
-        std::process::id(),
-        stamp,
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
-    if let Err(error) = file
-        .write_all(body.as_bytes())
-        .and_then(|()| file.sync_all())
-    {
-        drop(file);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
-    }
-    drop(file);
-    if !real_dir_no_follow(dir) || !safe_final_file_or_absent(path)? {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "fact store path changed during write",
-        ));
-    }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
-
-fn safe_final_file_or_absent(path: &Path) -> std::io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => Ok(meta.file_type().is_file()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(error),
-    }
+    umadev_state::fs::atomic_write(path, body.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cross_process_fact_writer_child() {
+        let Some(root) = std::env::var_os("UMADEV_FACTS_MP_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let index = std::env::var("UMADEV_FACTS_MP_INDEX").unwrap();
+        std::fs::write(root.join(format!("facts-ready-{index}")), b"").unwrap();
+        let started = std::time::Instant::now();
+        while !root.join("facts-start").exists()
+            && started.elapsed() < std::time::Duration::from_secs(10)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(record_fact(
+            &root,
+            Fact::new(
+                format!("worker-{index}"),
+                format!("value-{index}"),
+                None::<String>
+            ),
+        ));
+    }
+
+    #[test]
+    fn four_process_fact_writes_have_zero_lost_updates() {
+        const WRITERS: usize = 4;
+        let temp = tempfile::TempDir::new().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for index in 0..WRITERS {
+            children.push(
+                std::process::Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "project_facts::tests::cross_process_fact_writer_child",
+                    ])
+                    .env("UMADEV_FACTS_MP_ROOT", temp.path())
+                    .env("UMADEV_FACTS_MP_INDEX", index.to_string())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let started = std::time::Instant::now();
+        loop {
+            let ready = (0..WRITERS)
+                .filter(|index| temp.path().join(format!("facts-ready-{index}")).exists())
+                .count();
+            if ready == WRITERS || started.elapsed() >= std::time::Duration::from_secs(10) {
+                assert_eq!(
+                    ready, WRITERS,
+                    "not every fact writer reached the start gate"
+                );
+                std::fs::write(temp.path().join("facts-start"), b"").unwrap();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        let facts = load_facts(temp.path());
+        for index in 0..WRITERS {
+            assert!(
+                facts
+                    .iter()
+                    .any(|fact| fact.key == format!("worker-{index}")),
+                "writer {index} was lost"
+            );
+        }
+    }
 
     #[test]
     fn record_then_reload_persists_a_fact() {

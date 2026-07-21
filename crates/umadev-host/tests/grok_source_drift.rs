@@ -76,16 +76,37 @@ fn pinned_grok_source_still_matches_the_audited_wire_contract() {
         &root,
         "crates/codegen/xai-grok-shell/src/extensions/auth.rs",
     );
-    for method in ["x.ai/auth/get_url", "x.ai/auth/submit_code"] {
+    for method in [
+        "x.ai/auth/get_url",
+        "x.ai/auth/submit_code",
+        "x.ai/auth/cancel",
+    ] {
         assert!(
             auth.contains(method),
             "missing audited auth method {method}"
         );
     }
     assert!(
-        auth.contains("let rx = agent.auth_url_rx.borrow_mut().take()"),
-        "auth URL is no longer a one-shot receiver; re-audit the bootstrap poller"
+        auth.contains("let rx = agent.interactive_auth.take_url_rx()"),
+        "auth URL is no longer read from the generation-bound one-shot receiver; re-audit the bootstrap poller"
     );
+
+    let single_flight = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/auth/single_flight.rs",
+    );
+    for marker in [
+        "Single-flight guard for interactive login.",
+        "x.ai/auth/cancel",
+        "pub(crate) fn take_url_rx",
+        "ch.url_rx.take()",
+        "pub(crate) fn cancel_for_client_seq",
+    ] {
+        assert!(
+            single_flight.contains(marker),
+            "missing audited generation-bound authentication marker {marker}"
+        );
+    }
 
     // Interactive auth is explicitly user-authorized in UmaDev because this
     // pinned Grok build opens browsers itself. Lock both the loopback ordering

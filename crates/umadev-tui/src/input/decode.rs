@@ -286,7 +286,9 @@ fn decode_csi(bytes: &[u8]) -> Vec<InputEvent> {
         _ => {}
     }
 
-    let final_byte = *bytes.last().expect("len checked >= 3");
+    let Some(&final_byte) = bytes.last() else {
+        return Vec::new();
+    };
     let params = &bytes[2..bytes.len() - 1];
 
     match final_byte {
@@ -451,8 +453,13 @@ fn parse_modifiers(mask: u8) -> KeyModifiers {
 
 /// Decode an SGR mouse report (`CSI < Cb ; Cx ; Cy (M|m)`).
 fn decode_sgr_mouse(bytes: &[u8]) -> Vec<InputEvent> {
-    let last = *bytes.last().expect("non-empty");
+    let Some(&last) = bytes.last() else {
+        return Vec::new();
+    };
     if last != b'M' && last != b'm' {
+        return Vec::new();
+    }
+    if bytes.len() < 4 {
         return Vec::new();
     }
     // body = between `ESC [ <` and the final M/m

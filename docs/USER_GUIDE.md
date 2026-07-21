@@ -55,7 +55,7 @@ experience.
 | `codex` | Vendor-specific `codex app-server` JSON-RPC | `codex login` or Codex's own supported credential configuration | Plan=`read-only`; Guarded=on-request; Auto=pre-authorized; writable modes use the configured Codex sandbox | Exact `thread/resume` | Use a platform supported by the installed Codex CLI; restrictive Windows sandboxes can block local ports/network |
 | `opencode` | Vendor-specific loopback HTTP + SSE | `opencode auth login` or OpenCode provider configuration | Plan deny-by-default; Guarded ask-by-default; Auto allow, with tool events still audited | Exact persisted-session reattach after permission refresh | Use a platform supported by the installed OpenCode CLI; version must be >= 1.14.31 |
 | `grok-build` | ACP v1 via `grok --no-auto-update … agent stdio`; bounded firmware uses the official `--rules` common flag | Headless ACP reuses an existing cached login token or `XAI_API_KEY`; after `initialize`, UmaDev authenticates only with an explicitly available non-interactive method and never auto-selects OAuth or opens a browser | Plan adds `plan` + read-only sandbox + read-only tools and disables subagents; Guarded uses prompts; Auto explicitly pre-approves | Fresh-session handoff today; negotiated resume/load is used only after effective-sandbox attestation and native preflight can both be proved | Official installers cover macOS/Linux/WSL and native Windows PowerShell |
-| `kimi-code` | Official `kimi acp` v1 JSON-RPC/stdio, exact source-audited 0.26.0 identity | Run `kimi login` yourself first; UmaDev only revalidates the on-disk token through ACP and never runs a login command or opens a browser | Plan=`plan`; Guarded/Auto keep Kimi `default`; UmaDev locally resolves ordinary Auto approvals, retains the irreversible floor, and renders Kimi's question-over-permission bridge as real choices | Standard `session/resume`, with advertised `session/load` fallback; workspace/profile identity mismatch fails closed | macOS/Linux/Windows; Windows tools require Git Bash or `KIMI_SHELL_PATH` |
+| `kimi-code` | Official `kimi acp` v1 JSON-RPC/stdio, exact source-audited 0.28.1 identity | Run `kimi login` yourself first; UmaDev only revalidates the on-disk token through ACP and never runs a login command or opens a browser | Plan=`plan`; Guarded/Auto keep Kimi `default`; UmaDev locally resolves ordinary Auto approvals, retains the irreversible floor, and renders Kimi's question-over-permission bridge as real choices | Standard `session/resume`, with advertised `session/load` fallback; workspace/profile identity mismatch fails closed | macOS/Linux/Windows; Windows tools require Git Bash or `KIMI_SHELL_PATH` |
 
 ACP stabilized `session/resume` in April 2026 and distinguishes it from
 `session/load`: resume reconnects context without replaying history, while load
@@ -108,7 +108,7 @@ UmaDev, or set `XAI_API_KEY` for headless use. UmaDev does not initiate OAuth,
 open a Google/xAI login page, or copy an interactive authorization code.
 
 For Kimi Code, install the source-audited release with
-`npm install -g @moonshot-ai/kimi-code@0.26.0`, run `kimi login` yourself, then
+`npm install -g @moonshot-ai/kimi-code@0.28.1`, run `kimi login` yourself, then
 start UmaDev. On Windows, install Git for Windows or point `KIMI_SHELL_PATH` at
 `bash.exe`. UmaDev sets `KIMI_CODE_NO_AUTO_UPDATE=1` on the ACP child so the
 audited binary cannot replace itself during a session.

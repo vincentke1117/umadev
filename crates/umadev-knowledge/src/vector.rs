@@ -316,11 +316,30 @@ impl VectorStore {
         let Some(cache_dir) = crate::index::existing_managed_cache_dir(project_root) else {
             return Self::disabled();
         };
-        let Some(bytes) = crate::index::read_regular_file_no_follow(&cache_dir.join("vectors.bin"))
-        else {
+        let Some(bytes) = crate::index::read_regular_file_no_follow(
+            &cache_dir.join("vectors.bin"),
+            crate::index::MAX_VECTOR_CACHE_BYTES,
+        ) else {
             return Self::disabled();
         };
-        serde_json::from_slice(&bytes).unwrap_or_else(|_| Self::disabled())
+        let Ok(store) = serde_json::from_slice::<Self>(&bytes) else {
+            return Self::disabled();
+        };
+        if store.vectors.len() > crate::index::MAX_INDEX_CHUNKS
+            || store.dim == 0
+            || store.dim > 65_536
+            || store.model.len() > 512
+            || store.corpus_sig.len() > 512
+            || store.vectors.iter().any(|entry| {
+                entry.path.len() > 16 * 1024
+                    || entry.section.len() > 16 * 1024
+                    || entry.vec.len() != store.dim
+                    || entry.vec.iter().any(|value| !value.is_finite())
+            })
+        {
+            return Self::disabled();
+        }
+        store
     }
 
     /// Persist the store to disk (best-effort; never errors).
@@ -329,7 +348,12 @@ impl VectorStore {
             crate::index::ensure_managed_cache_dir(project_root),
             serde_json::to_vec(self),
         ) {
-            let _ = crate::index::write_atomic_in_real_dir(&cache_dir.join("vectors.bin"), &bytes);
+            if u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+                <= crate::index::MAX_VECTOR_CACHE_BYTES
+            {
+                let _ =
+                    crate::index::write_atomic_in_real_dir(&cache_dir.join("vectors.bin"), &bytes);
+            }
         }
     }
 

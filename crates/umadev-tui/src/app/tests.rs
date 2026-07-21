@@ -317,6 +317,7 @@ fn session_lost_note_detected_across_locales_and_forms() {
         "base session ended mid-turn - base stderr: No conversation found with session ID x",
         "base session ended before send (base exited: exit status: 1)",
         "session send: Broken pipe (os error 32)",
+        "rmcp::transport: worker quit with fatal: Transport channel closed",
     ] {
         assert!(
             App::note_indicates_session_lost(note),
@@ -327,6 +328,7 @@ fn session_lost_note_detected_across_locales_and_forms() {
     for note in [
         "本轮底座执行出错:模型返回了空回复",
         "the build step failed: cargo test exited non-zero",
+        "unexpected status 502 Bad Gateway",
     ] {
         assert!(
             !App::note_indicates_session_lost(note),
@@ -5352,6 +5354,25 @@ fn slash_plan_add_takes_free_text() {
     assert_eq!(app.queued_steer.len(), 1);
     assert!(app.queued_steer[0].contains("write integration tests"));
     assert!(app.queued_steer[0].to_ascii_uppercase().contains("ADD"));
+}
+
+#[test]
+fn slash_plan_add_without_text_shows_usage_and_never_queues_an_empty_task() {
+    let mut app = fresh_app(Some("offline"));
+
+    let action = app.try_slash_command("/plan add").unwrap();
+
+    assert_eq!(action, Action::None);
+    assert!(app.queued_steer.is_empty());
+    let joined: String = app
+        .history
+        .iter()
+        .map(|message| message.body().clone())
+        .collect();
+    assert!(
+        joined.contains("/plan add"),
+        "usage must explain the valid form: {joined}"
+    );
 }
 
 #[test]

@@ -98,7 +98,7 @@ You also need one AI coding CLI installed and logged in — that's the brain uma
 | Codex (`codex`) | `npm i -g @openai/codex` | `codex login` |
 | OpenCode (`opencode`) | `npm i -g opencode-ai` | `opencode auth login` |
 | Grok Build (`grok-build`) | `curl -fsSL https://x.ai/cli/install.sh \| bash` | `grok login`, or set `XAI_API_KEY` for non-browser/headless use |
-| Kimi Code (`kimi-code`) | `npm i -g @moonshot-ai/kimi-code@0.26.0` (Node.js >= 22.19) | `kimi login` |
+| Kimi Code (`kimi-code`) | `npm i -g @moonshot-ai/kimi-code@0.28.1` (Node.js >= 22.19) | `kimi login` |
 
 The `curl | bash/sh` entries are the Unix install hints understood by the current driver. On Windows, use each vendor's official Windows installation instructions; do not paste those Unix commands into PowerShell.
 

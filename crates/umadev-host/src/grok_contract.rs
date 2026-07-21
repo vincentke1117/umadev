@@ -13,10 +13,10 @@ use serde_json::Value;
 pub const GROK_BUILD_SOURCE_REPOSITORY: &str = "https://github.com/xai-org/grok-build";
 
 /// Exact upstream commit audited for this compatibility profile.
-pub const GROK_BUILD_SOURCE_COMMIT: &str = "8adf9013a0929e5c7f1d4e849492d2387837a28d";
+pub const GROK_BUILD_SOURCE_COMMIT: &str = "a881e6703f46b01d8c7d4a5437683546df30449d";
 
 /// Grok Build version declared by the audited upstream commit.
-pub const GROK_BUILD_SOURCE_VERSION: &str = "0.2.101";
+pub const GROK_BUILD_SOURCE_VERSION: &str = "0.2.106";
 
 /// `agent-client-protocol` version used by the audited upstream commit.
 pub const GROK_BUILD_SOURCE_ACP_VERSION: &str = "0.10.4";
@@ -30,7 +30,7 @@ pub const GROK_BUILD_SOURCE_ACP_SCHEMA_VERSION: &str = "0.11.4";
 /// for the same patch may change a private `x.ai` payload without changing ACP
 /// protocol V1. Such a version remains outside the audited range until the drift
 /// audit and acceptance matrix are rerun.
-pub const GROK_BUILD_AUDITED_VERSION_REQUIREMENT: &str = "=0.2.101";
+pub const GROK_BUILD_AUDITED_VERSION_REQUIREMENT: &str = "=0.2.106";
 
 const MAX_AGENT_VERSION_BYTES: usize = 128;
 
@@ -308,8 +308,8 @@ mod tests {
     }
 
     #[test]
-    fn later_same_patch_prerelease_is_outside_exact_audit() {
-        for version in ["0.1.220-alpha.5", "0.1.220-beta.1", "0.1.220-rc.1"] {
+    fn prerelease_labels_for_the_audited_patch_are_outside_exact_audit() {
+        for version in ["0.2.106-alpha.1", "0.2.106-beta.1", "0.2.106-rc.1"] {
             let profile = profile(version);
             assert_eq!(profile.source_match(), GrokSourceMatch::OutsideAuditedRange);
             assert_private_capabilities_disabled(&profile);
@@ -317,21 +317,8 @@ mod tests {
     }
 
     #[test]
-    fn same_patch_stable_release_is_outside_exact_audit() {
-        let profile = profile("0.1.220");
-        assert_eq!(profile.source_match(), GrokSourceMatch::OutsideAuditedRange);
-        assert_private_capabilities_disabled(&profile);
-    }
-
-    #[test]
-    fn older_next_patch_and_next_minor_are_outside_exact_audit() {
-        for version in [
-            "0.1.220-alpha.3",
-            "0.1.219",
-            "0.1.221-alpha.1",
-            "0.1.221",
-            "0.2.0",
-        ] {
+    fn adjacent_patch_minor_and_major_versions_are_outside_exact_audit() {
+        for version in ["0.2.105", "0.2.107", "0.3.0", "1.0.0"] {
             let profile = profile(version);
             assert_eq!(profile.source_match(), GrokSourceMatch::OutsideAuditedRange);
             assert_private_capabilities_disabled(&profile);
@@ -340,7 +327,7 @@ mod tests {
 
     #[test]
     fn build_metadata_is_outside_the_exact_audited_label() {
-        let profile = profile("0.2.101+unverified");
+        let profile = profile("0.2.106+unverified");
         assert_eq!(profile.source_match(), GrokSourceMatch::OutsideAuditedRange);
         assert_private_capabilities_disabled(&profile);
     }

@@ -624,6 +624,23 @@ fn is_home_claude(project_root: &Path) -> bool {
 
 /// The hook subcommands UmaDev registers as a host (Pre/PostToolUse `command`s).
 const HOOK_SUBCOMMANDS: [&str; 3] = ["hook pre-write", "hook pre-bash", "hook tool-audit"];
+const CLAUDE_SHARED_SETTINGS: &str = "settings.json";
+const CLAUDE_LOCAL_SETTINGS: &str = "settings.local.json";
+
+fn is_umadev_program(program: &str, self_bin: Option<&str>) -> bool {
+    let program = program.trim();
+    if program.is_empty() {
+        return false;
+    }
+    if self_bin.is_some_and(|binary| binary.trim() == program) {
+        return true;
+    }
+    // Split both separators explicitly. During migration a Unix build may inspect
+    // a settings file written on Windows (or vice versa), where `Path::file_name`
+    // would otherwise treat the foreign separator as an ordinary character.
+    let name = program.rsplit(['/', '\\']).next().unwrap_or_default();
+    name.eq_ignore_ascii_case("umadev") || name.eq_ignore_ascii_case("umadev.exe")
+}
 
 /// True only when `command` is UmaDev's OWN hook invocation — NOT a user's
 /// custom wrapper that merely ends in the same subcommand.
@@ -644,26 +661,114 @@ pub(crate) fn is_umadev_hook_command(command: &str, self_bin: Option<&str>) -> b
         if prog.is_empty() {
             continue; // no program token — not a real invocation of ours
         }
-        if self_bin.is_some_and(|b| b.trim() == prog) {
-            return true;
-        }
-        // `Path::file_name` splits on the path separator (not whitespace), so a
-        // space-bearing install path keeps its real basename while a wrapper like
-        // `node shim.js hook pre-write` resolves to `shim.js` (correctly NOT ours).
-        let name = std::path::Path::new(prog)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        if name.eq_ignore_ascii_case("umadev") || name.eq_ignore_ascii_case("umadev.exe") {
+        if is_umadev_program(prog, self_bin) {
             return true;
         }
     }
     false
 }
 
-/// Install the PreToolUse hook into `<project_root>/.claude/settings.json`
-/// (workspace-level). Idempotent — if the hook is already registered, does
-/// nothing. Returns the settings path on install, or `None` when the install was
+/// Recognise both the legacy shell form (`"/path/umadev hook pre-write"`) and
+/// Claude Code's safer exec form (`command` + `args`). Exec form is required for
+/// absolute paths containing spaces and avoids shell interpretation entirely.
+pub(crate) fn is_umadev_hook_handler(handler: &serde_json::Value, self_bin: Option<&str>) -> bool {
+    umadev_hook_name(handler, self_bin).is_some()
+}
+
+/// Return the registered UmaDev hook name when this is one of our handlers.
+pub(crate) fn umadev_hook_name(
+    handler: &serde_json::Value,
+    self_bin: Option<&str>,
+) -> Option<&'static str> {
+    let command = handler.get("command").and_then(serde_json::Value::as_str)?;
+    if let Some(args) = handler.get("args").and_then(serde_json::Value::as_array) {
+        let args = args
+            .iter()
+            .map(serde_json::Value::as_str)
+            .collect::<Option<Vec<_>>>();
+        let args = args?;
+        if args.len() != 2 || args[0] != "hook" || !is_umadev_program(command, self_bin) {
+            return None;
+        }
+        return match args[1] {
+            "pre-write" => Some("pre-write"),
+            "pre-bash" => Some("pre-bash"),
+            "tool-audit" => Some("tool-audit"),
+            _ => None,
+        };
+    }
+    HOOK_SUBCOMMANDS.iter().find_map(|subcommand| {
+        let program = command.strip_suffix(subcommand)?.trim_end();
+        is_umadev_program(program, self_bin)
+            .then(|| subcommand.strip_prefix("hook "))
+            .flatten()
+    })
+}
+
+/// Remove only UmaDev handlers from a settings document. A matcher group may
+/// contain several user handlers; retain the group and every non-UmaDev handler
+/// instead of deleting the whole group because one of ours was present.
+fn strip_claude_hooks(settings: &mut serde_json::Value, self_bin: Option<&str>) -> bool {
+    let mut changed = false;
+    for phase in ["PreToolUse", "PostToolUse"] {
+        let Some(matchers) = settings
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.get_mut(phase))
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        matchers.retain_mut(|matcher| {
+            let Some(handlers) = matcher
+                .get_mut("hooks")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                return true;
+            };
+            let before = handlers.len();
+            handlers.retain(|handler| !is_umadev_hook_handler(handler, self_bin));
+            changed |= handlers.len() != before;
+            !handlers.is_empty()
+        });
+    }
+    changed
+}
+
+fn read_claude_settings(path: &Path) -> std::io::Result<serde_json::Value> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is not valid JSON: {error}", path.display()),
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_claude_settings(path: &Path, settings: &serde_json::Value) -> std::io::Result<()> {
+    let mut json = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
+    json.push('\n');
+    umadev_state::fs::atomic_write(path, json.as_bytes())
+}
+
+fn remove_claude_hooks_from_path(path: &Path, self_bin: Option<&str>) -> std::io::Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let mut settings = read_claude_settings(path)?;
+    if !strip_claude_hooks(&mut settings, self_bin) {
+        return Ok(false);
+    }
+    write_claude_settings(path, &settings)?;
+    Ok(true)
+}
+
+/// Install the PreToolUse hook into
+/// `<project_root>/.claude/settings.local.json` (machine-local workspace level).
+/// Idempotent — if the hook is already registered, replaces it in place. Returns
+/// the settings path on install, or `None` when the install was
 /// deliberately SKIPPED because `project_root` is the user's home directory
 /// (writing there would register the hook GLOBALLY and pollute every other
 /// project/tool — see [`is_home_claude`]). Skipping is fail-open: no error, just
@@ -679,24 +784,17 @@ pub fn install_claude_hook(
     }
     let claude_dir = project_root.join(".claude");
     std::fs::create_dir_all(&claude_dir)?;
-    let settings_path = claude_dir.join("settings.json");
+    let settings_path = claude_dir.join(CLAUDE_LOCAL_SETTINGS);
+    let shared_settings_path = claude_dir.join(CLAUDE_SHARED_SETTINGS);
 
     // Resolve the path to this binary so the hook points at it.
     let bin = std::env::current_exe().map_or_else(
         |_| "umadev".to_string(),
         |p| p.to_string_lossy().to_string(),
     );
-    let bash_hook_cmd = format!("{bin} hook pre-bash");
-    // The PostToolUse AUDIT hook (UD-EVID-002, spec §7.3 `tool-audit`). Records
-    // every executed tool call to the audit JSONL — it NEVER blocks (the tool
-    // has already run by the time PostToolUse fires).
-    let post_hook_cmd = format!("{bin} hook tool-audit");
-
-    // Load existing settings (or start fresh) so we don't clobber user config.
-    let mut settings: serde_json::Value = std::fs::read_to_string(&settings_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    // Load existing local settings (or start fresh) so we don't clobber user
+    // config. Invalid JSON is reported instead of silently replacing it.
+    let mut settings = read_claude_settings(&settings_path)?;
 
     // Ensure hooks.PreToolUse exists and contains our matcher — fail-open at
     // every level: a user whose settings.json is valid JSON but not the shape we
@@ -734,17 +832,16 @@ pub fn install_claude_hook(
     // execs a nonexistent binary on every write. A BARE-SUFFIX match would
     // instead delete a user's own `my-wrapper hook pre-write`, so we match the
     // program precisely (see `is_umadev_hook_command`).
-    let is_ours = |c: &str| is_umadev_hook_command(c, Some(&bin));
-    matchers.retain(|m| {
-        m.get("hooks").and_then(|h| h.as_array()).is_none_or(|arr| {
-            !arr.iter().any(|h| {
-                h.get("command")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(is_ours)
-            })
-        })
+    matchers.retain_mut(|matcher| {
+        let Some(handlers) = matcher
+            .get_mut("hooks")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return true;
+        };
+        handlers.retain(|handler| !is_umadev_hook_handler(handler, Some(&bin)));
+        !handlers.is_empty()
     });
-    let hook_cmd = format!("{bin} hook pre-write");
     // NOTE: this matcher MUST stay a superset of `run_pre_write_scoped`'s
     // `is_write` set (Write / Edit / MultiEdit / NotebookEdit) — a tool the
     // hook can govern but that the matcher omits would never fire the hook at
@@ -752,13 +849,13 @@ pub fn install_claude_hook(
     // silently bypass the irreversible floor.
     matchers.push(serde_json::json!({
         "matcher": "Write|Edit|MultiEdit|NotebookEdit",
-        "hooks": [{"type": "command", "command": hook_cmd}]
+        "hooks": [{"type": "command", "command": bin, "args": ["hook", "pre-write"]}]
     }));
     // Also register the Bash guard (UD-SEC-002) so the host's command
     // executions are intercepted, not just its file writes.
     matchers.push(serde_json::json!({
         "matcher": "Bash",
-        "hooks": [{"type": "command", "command": bash_hook_cmd}]
+        "hooks": [{"type": "command", "command": bin, "args": ["hook", "pre-bash"]}]
     }));
     // The PreToolUse `matchers` borrow ends here; reborrow `hooks_obj` for the
     // PostToolUse AUDIT hook (Layer-3 governance: "PostToolUse hooks audit
@@ -776,72 +873,44 @@ pub fn install_claude_hook(
     let Some(post_matchers) = post_use.as_array_mut() else {
         return Ok(Some(settings_path));
     };
-    post_matchers.retain(|m| {
-        m.get("hooks").and_then(|h| h.as_array()).is_none_or(|arr| {
-            !arr.iter().any(|h| {
-                h.get("command")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(is_ours)
-            })
-        })
+    post_matchers.retain_mut(|matcher| {
+        let Some(handlers) = matcher
+            .get_mut("hooks")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return true;
+        };
+        handlers.retain(|handler| !is_umadev_hook_handler(handler, Some(&bin)));
+        !handlers.is_empty()
     });
     // Same superset invariant as the PreToolUse matcher above: audit every
     // write tool the hook understands (Write / Edit / MultiEdit / NotebookEdit)
     // plus Bash, so a NotebookEdit write is recorded to the tool-call JSONL too.
     post_matchers.push(serde_json::json!({
         "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
-        "hooks": [{"type": "command", "command": post_hook_cmd}]
+        "hooks": [{"type": "command", "command": bin, "args": ["hook", "tool-audit"]}]
     }));
 
-    let json = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&settings_path, json + "\n")?;
+    write_claude_settings(&settings_path, &settings)?;
+    // Migrate only after the new hook is durable. A malformed/unwritable local
+    // file must not remove the last working legacy hook first.
+    let _ = remove_claude_hooks_from_path(&shared_settings_path, Some(&bin))?;
     Ok(Some(settings_path))
 }
 
-/// Remove the UmaDev hook from `.claude/settings.json`. Idempotent.
+/// Remove UmaDev hooks from both the current machine-local settings and the
+/// legacy shared settings location. Idempotent; unrelated handlers survive.
 pub fn uninstall_claude_hook(project_root: &std::path::Path) -> std::io::Result<()> {
-    let settings_path = project_root.join(".claude/settings.json");
-    let Ok(content) = std::fs::read_to_string(&settings_path) else {
-        return Ok(()); // nothing to remove
-    };
-    // Fail-OPEN on a malformed settings.json, matching install_claude_hook: a
-    // hand-edited (e.g. comment-bearing) file shouldn't make `umadev uninstall`
-    // error out — there's nothing of ours we can safely remove from unparseable
-    // JSON, so treat it as a no-op.
-    let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Ok(());
-    };
-    // Match by PROGRAM TOKEN so hooks from ANY prior `umadev` path are removed
-    // (an upgrade changes the path — a full-path-only match would orphan the old,
-    // now-dead hook with no CLI way to clean it up) WITHOUT deleting a user's own
-    // `my-wrapper hook pre-write` (a bare-suffix match would). `self_bin` lets us
-    // also recognise this exact install even if renamed.
     let self_bin = std::env::current_exe()
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
-    let is_ours = |c: &str| is_umadev_hook_command(c, self_bin.as_deref());
-
-    // Strip our entries from BOTH lifecycle phases: the PreToolUse guards and the
-    // PostToolUse audit hook. A retain that leaves a user's own hooks untouched.
-    for phase in ["PreToolUse", "PostToolUse"] {
-        if let Some(matchers) = settings
-            .get_mut("hooks")
-            .and_then(|h| h.get_mut(phase))
-            .and_then(|p| p.as_array_mut())
-        {
-            matchers.retain(|m| {
-                m.get("hooks").and_then(|h| h.as_array()).is_none_or(|arr| {
-                    !arr.iter().any(|h| {
-                        h.get("command")
-                            .and_then(|c| c.as_str())
-                            .is_some_and(is_ours)
-                    })
-                })
-            });
-        }
+    let claude_dir = project_root.join(".claude");
+    for name in [CLAUDE_LOCAL_SETTINGS, CLAUDE_SHARED_SETTINGS] {
+        let path = claude_dir.join(name);
+        // A malformed user file cannot be safely edited. Uninstall remains
+        // fail-open for that file and continues cleaning the other location.
+        let _ = remove_claude_hooks_from_path(&path, self_bin.as_deref());
     }
-    let json = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&settings_path, json + "\n")?;
     Ok(())
 }
 
@@ -1264,21 +1333,23 @@ mod tests {
         // Install twice — second should be a no-op.
         install_claude_hook(tmp.path()).unwrap();
         install_claude_hook(tmp.path()).unwrap();
-        let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
-        assert!(settings.contains("hook pre-write"));
+        let settings =
+            std::fs::read_to_string(tmp.path().join(".claude/settings.local.json")).unwrap();
+        assert_eq!(settings.matches("\"pre-write\"").count(), 1);
         // The Bash guard is registered alongside the write guard.
-        assert!(settings.contains("hook pre-bash"));
+        assert_eq!(settings.matches("\"pre-bash\"").count(), 1);
         // The PostToolUse audit hook is registered alongside the PreToolUse
         // guards — and is idempotent: exactly ONE entry after a double install.
         assert!(settings.contains("\"PostToolUse\""));
-        assert_eq!(settings.matches("hook tool-audit").count(), 1);
+        assert_eq!(settings.matches("\"tool-audit\"").count(), 1);
         // Uninstall twice — second should be a no-op.
         uninstall_claude_hook(tmp.path()).unwrap();
         uninstall_claude_hook(tmp.path()).unwrap();
-        let settings2 = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
-        assert!(!settings2.contains("hook pre-write"));
-        assert!(!settings2.contains("hook pre-bash"));
-        assert!(!settings2.contains("hook tool-audit"));
+        let settings2 =
+            std::fs::read_to_string(tmp.path().join(".claude/settings.local.json")).unwrap();
+        assert!(!settings2.contains("\"pre-write\""));
+        assert!(!settings2.contains("\"pre-bash\""));
+        assert!(!settings2.contains("\"tool-audit\""));
     }
 
     #[test]
@@ -1288,11 +1359,12 @@ mod tests {
         // fires the hook and its writes bypass the irreversible floor + audit.
         let tmp = tempfile::TempDir::new().unwrap();
         install_claude_hook(tmp.path()).unwrap();
-        let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
+        let settings =
+            std::fs::read_to_string(tmp.path().join(".claude/settings.local.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&settings).unwrap();
         // The pre-write guard and the post-write audit each carry a matcher that
         // lists NotebookEdit alongside Write/Edit/MultiEdit.
-        let has_notebook = |phase: &str, cmd_suffix: &str| {
+        let has_notebook = |phase: &str, hook_arg: &str| {
             v["hooks"][phase]
                 .as_array()
                 .unwrap()
@@ -1300,9 +1372,9 @@ mod tests {
                 .filter(|m| {
                     m["hooks"].as_array().is_some_and(|hs| {
                         hs.iter().any(|h| {
-                            h["command"]
-                                .as_str()
-                                .is_some_and(|c| c.ends_with(cmd_suffix))
+                            h["args"].as_array().is_some_and(|args| {
+                                args == &[serde_json::json!("hook"), serde_json::json!(hook_arg)]
+                            })
                         })
                     })
                 })
@@ -1313,11 +1385,11 @@ mod tests {
                 })
         };
         assert!(
-            has_notebook("PreToolUse", "hook pre-write"),
+            has_notebook("PreToolUse", "pre-write"),
             "PreToolUse write matcher must cover NotebookEdit"
         );
         assert!(
-            has_notebook("PostToolUse", "hook tool-audit"),
+            has_notebook("PostToolUse", "tool-audit"),
             "PostToolUse audit matcher must cover NotebookEdit"
         );
     }
@@ -1429,14 +1501,21 @@ mod tests {
         )
         .unwrap();
         install_claude_hook(tmp.path()).unwrap();
-        let s = std::fs::read_to_string(claude.join("settings.json")).unwrap();
-        // Stale /old/p hook purged (no dead-binary orphan); exactly one current
-        // pre-write + pre-bash + tool-audit; user's hooks + config survive.
-        assert!(!s.contains("/old/p/umadev"), "stale hook must be purged");
-        assert_eq!(s.matches("hook pre-write").count(), 1);
-        assert_eq!(s.matches("hook pre-bash").count(), 1);
-        assert_eq!(s.matches("hook tool-audit").count(), 1);
-        assert!(s.contains("USERHOOK") && s.contains("USERPOST") && s.contains("\"theme\""));
+        let shared = std::fs::read_to_string(claude.join("settings.json")).unwrap();
+        let local = std::fs::read_to_string(claude.join("settings.local.json")).unwrap();
+        assert!(
+            !shared.contains("/old/p/umadev"),
+            "stale hook must be purged"
+        );
+        assert!(
+            shared.contains("USERHOOK")
+                && shared.contains("USERPOST")
+                && shared.contains("\"theme\"")
+        );
+        assert_eq!(local.matches("\"pre-write\"").count(), 1);
+        assert_eq!(local.matches("\"pre-bash\"").count(), 1);
+        assert_eq!(local.matches("\"tool-audit\"").count(), 1);
+        assert!(local.contains("\"args\""), "hooks must use exec-form args");
     }
 
     #[test]
@@ -1445,10 +1524,58 @@ mod tests {
         let claude = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
         // Valid JSON but NOT an object — install must coerce, not panic.
-        std::fs::write(claude.join("settings.json"), "[1, 2, 3]").unwrap();
+        std::fs::write(claude.join("settings.local.json"), "[1, 2, 3]").unwrap();
         install_claude_hook(tmp.path()).unwrap();
-        let s = std::fs::read_to_string(claude.join("settings.json")).unwrap();
-        assert!(s.contains("hook pre-write"));
+        let s = std::fs::read_to_string(claude.join("settings.local.json")).unwrap();
+        assert!(s.contains("\"pre-write\""));
+    }
+
+    #[test]
+    fn install_rejects_invalid_local_json_without_removing_legacy_hook() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let legacy = r#"{"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"umadev hook pre-write"}]}]}}"#;
+        std::fs::write(claude.join("settings.json"), legacy).unwrap();
+        std::fs::write(claude.join("settings.local.json"), "{broken").unwrap();
+
+        let error = install_claude_hook(tmp.path()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.local.json")).unwrap(),
+            "{broken"
+        );
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            legacy
+        );
+    }
+
+    #[test]
+    fn migration_preserves_user_handler_in_same_matcher_group() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"umadev hook pre-write"},{"type":"command","command":"echo KEEP_ME"}]}]}}"#,
+        )
+        .unwrap();
+
+        install_claude_hook(tmp.path()).unwrap();
+        let shared = std::fs::read_to_string(claude.join("settings.json")).unwrap();
+        assert!(!shared.contains("hook pre-write"));
+        assert!(shared.contains("KEEP_ME"));
+    }
+
+    #[test]
+    fn exec_handler_recognizes_windows_path_with_spaces() {
+        let handler = serde_json::json!({
+            "type": "command",
+            "command": r"C:\Users\Wei You\AppData\Roaming\npm\umadev.exe",
+            "args": ["hook", "pre-write"]
+        });
+        assert!(is_umadev_hook_handler(&handler, None));
     }
 
     #[test]
@@ -1457,7 +1584,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let out = install_claude_hook(tmp.path()).unwrap();
         assert!(out.is_some(), "a project-level install returns the path");
-        assert!(tmp.path().join(".claude/settings.json").is_file());
+        assert!(tmp.path().join(".claude/settings.local.json").is_file());
     }
 
     #[test]
@@ -1490,7 +1617,7 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         let out2 = install_claude_hook(&proj).unwrap();
         assert!(out2.is_some(), "a project under home still installs");
-        assert!(proj.join(".claude/settings.json").is_file());
+        assert!(proj.join(".claude/settings.local.json").is_file());
 
         match prior_home {
             Some(v) => std::env::set_var("HOME", v),

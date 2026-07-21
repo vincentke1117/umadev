@@ -1,4 +1,7 @@
 use super::*;
+use umadev_runtime::{
+    DeliveryReceiptStage, DeliveryReport, InputDelivery, SessionError, TurnInputBlockKind,
+};
 
 /// Safety-net bound for turn/approval/event operations that are EXPECTED TO
 /// COMPLETE.
@@ -3015,6 +3018,16 @@ fn detect_base_model_reads_each_base_config() {
             detect_base_model("claude-code", root).as_deref(),
             Some("claude-opus-4-8")
         );
+        std::fs::write(
+            root.join(".claude/settings.local.json"),
+            "{\"model\":\"claude-sonnet-local\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_base_model("claude-code", root).as_deref(),
+            Some("claude-sonnet-local"),
+            "Claude's machine-local project setting must override shared settings"
+        );
     }
     // Unknown / offline base pins nothing -> base default (None).
     assert_eq!(detect_base_model("offline", root), None);
@@ -3242,6 +3255,16 @@ fn detect_base_reasoning_reads_each_base_config() {
     assert_eq!(
         detect_base_reasoning("claude-code", root).as_deref(),
         Some("xhigh")
+    );
+    std::fs::write(
+        root.join(".claude/settings.local.json"),
+        "{\"effortLevel\":\"medium\"}",
+    )
+    .unwrap();
+    assert_eq!(
+        detect_base_reasoning("claude-code", root).as_deref(),
+        Some("medium"),
+        "Claude's machine-local project setting must override shared settings"
     );
     // opencode encodes effort in the model variant -> no separate field.
     assert_eq!(detect_base_reasoning("opencode", root), None);
@@ -3477,6 +3500,73 @@ async fn route_via_brain_fails_open_to_chat_when_brain_unavailable() {
         !route.class.mutates_workspace(),
         "the fail-open Chat route does not mutate the workspace"
     );
+}
+
+#[test]
+fn resident_route_sandbox_follows_intent_without_recreating_the_plan_mode_trap() {
+    let explain = umadev_agent::RoutePlan {
+        class: umadev_agent::RouteClass::Explain,
+        kind: umadev_agent::TaskKind::Light,
+        depth: umadev_agent::Depth::Fast,
+        team: Vec::new(),
+        scope: Vec::new(),
+        needs_clarify: None,
+        est_budget: umadev_agent::Budget::for_route(
+            umadev_agent::RouteClass::Explain,
+            umadev_agent::Depth::Fast,
+        ),
+        confidence: 0.9,
+    };
+    let debug = umadev_agent::RoutePlan {
+        class: umadev_agent::RouteClass::Debug,
+        kind: umadev_agent::TaskKind::Bugfix,
+        depth: umadev_agent::Depth::Fast,
+        est_budget: umadev_agent::Budget::for_route(
+            umadev_agent::RouteClass::Debug,
+            umadev_agent::Depth::Fast,
+        ),
+        ..explain.clone()
+    };
+
+    assert!(routed_turn_executes_read_only(
+        false,
+        &explain,
+        Some(umadev_agent::RouteSource::Brain),
+        false,
+        umadev_runtime::BasePermissionProfile::Guarded,
+    ));
+    assert!(!routed_turn_executes_read_only(
+        false,
+        &debug,
+        Some(umadev_agent::RouteSource::Brain),
+        false,
+        umadev_runtime::BasePermissionProfile::Guarded,
+    ));
+    assert!(!routed_turn_executes_read_only(
+        false,
+        &explain,
+        Some(umadev_agent::RouteSource::DeterministicFallback),
+        false,
+        umadev_runtime::BasePermissionProfile::Guarded,
+    ));
+    assert!(routed_turn_executes_read_only(
+        false,
+        &debug,
+        Some(umadev_agent::RouteSource::Brain),
+        true,
+        umadev_runtime::BasePermissionProfile::Auto,
+    ));
+    assert!(routed_turn_executes_read_only(
+        false,
+        &debug,
+        Some(umadev_agent::RouteSource::Brain),
+        false,
+        umadev_runtime::BasePermissionProfile::Plan,
+    ));
+
+    let directive = scoped_chat_directive("修复以上发现的问题", &debug);
+    assert!(directive.contains("Diagnose and fix only the reported defect"));
+    assert!(!directive.contains("This is read-only"));
 }
 
 #[tokio::test]
@@ -5491,6 +5581,10 @@ struct FakeChatSession {
     /// lets an integration test model a `Bash` command that really writes after
     /// the production pre-turn git snapshot has been taken.
     send_effects: std::collections::VecDeque<Box<dyn FnOnce() + Send>>,
+    /// Scripted child sessions returned by [`BaseSession::fork`], in FIFO order.
+    /// This lets resident-path tests exercise both the intent probe and the
+    /// read-only execution child without opening a real base process.
+    forks: std::collections::VecDeque<Box<dyn umadev_runtime::BaseSession>>,
 }
 
 impl FakeChatSession {
@@ -5513,6 +5607,7 @@ impl FakeChatSession {
                 exit_status: None,
                 responded: Arc::new(std::sync::Mutex::new(Vec::new())),
                 send_effects: std::collections::VecDeque::new(),
+                forks: std::collections::VecDeque::new(),
             },
             sent,
             ended,
@@ -5541,6 +5636,11 @@ impl FakeChatSession {
         self
     }
 
+    fn with_fork(mut self, child: Box<dyn umadev_runtime::BaseSession>) -> Self {
+        self.forks.push_back(child);
+        self
+    }
+
     /// Mark the fake's base process as DEAD: [`BaseSession::try_exit_status`]
     /// then reports `Some(status)`, so a transient-failure path treats it as a
     /// genuine teardown (end + re-open) rather than a recoverable park.
@@ -5560,11 +5660,11 @@ impl umadev_runtime::BaseSession for FakeChatSession {
     async fn fork(
         &mut self,
     ) -> Result<Box<dyn umadev_runtime::BaseSession>, umadev_runtime::SessionError> {
-        // Stage B removed the pre-action read-only fork consult, so the resident chat
-        // path never forks this fake anymore. Kept as a fail-open trait impl.
-        Err(umadev_runtime::SessionError::ForkUnsupported(
-            "fake has no scripted read-only fork".to_string(),
-        ))
+        self.forks.pop_front().ok_or_else(|| {
+            umadev_runtime::SessionError::ForkUnsupported(
+                "fake has no scripted read-only fork".to_string(),
+            )
+        })
     }
 
     async fn send_turn(&mut self, directive: String) -> Result<(), umadev_runtime::SessionError> {
@@ -5605,6 +5705,269 @@ impl umadev_runtime::BaseSession for FakeChatSession {
     fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
         self.exit_status
     }
+}
+
+#[tokio::test]
+async fn resident_model_fix_intent_reaches_writer_with_mutating_authority() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let (intent, intent_sent, intent_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                // Reproduce the field report exactly: the model incorrectly
+                // claims the explicit repair is an explain/read-only turn. The
+                // user's current request must repair that verdict before the
+                // resident writer receives the directive.
+                "class": "explain",
+                "authorization": "read_only",
+                "kind": "light",
+                "complexity": "simple",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let (writer, writer_sent, _writer_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta("已按要求修复。".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let writer = writer.with_fork(Box::new(intent));
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "修复以上发现的问题",
+        holder,
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::AgenticDone { .. })
+    ));
+    assert_eq!(intent_sent.lock().unwrap().len(), 1, "one intent consult");
+    assert!(
+        intent_ended.load(std::sync::atomic::Ordering::SeqCst),
+        "the read-only intent child closes before mutation"
+    );
+    let directives = writer_sent.lock().unwrap();
+    assert_eq!(directives.len(), 1, "the writer receives exactly one task");
+    assert!(directives[0].contains("Model-decided route: debug / fast"));
+    assert!(directives[0].contains("Diagnose and fix only the reported defect"));
+    assert!(directives[0].contains("Permission is scoped to this turn"));
+    assert!(
+        !directives[0].contains("This is read-only"),
+        "an explicit repair must never be contradicted by a read-only directive"
+    );
+}
+
+#[test]
+fn a_parked_read_only_session_cannot_leak_into_the_next_writable_turn() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (readonly, _sent, _ended) = FakeChatSession::new(Vec::new());
+    let parked = ResidentChat::ReadOnlyPrimed(Box::new(readonly));
+    let readonly_identity = SessionIdentity::for_launch(
+        "claude-code",
+        tmp.path(),
+        umadev_runtime::BasePermissionProfile::Plan,
+    )
+    .unwrap();
+    let writer_identity = SessionIdentity::for_launch(
+        "claude-code",
+        tmp.path(),
+        umadev_runtime::BasePermissionProfile::Guarded,
+    )
+    .unwrap();
+
+    let (usable, stale) = resident_for_turn(
+        Some(parked),
+        Some(&writer_identity),
+        Some(&readonly_identity),
+        0,
+    );
+
+    assert!(
+        usable.is_none(),
+        "a Plan process is never reused as a writer"
+    );
+    assert!(
+        matches!(stale, Some(ResidentChat::ReadOnlyPrimed(_))),
+        "the old read-only process is detached so the caller opens a fresh writer"
+    );
+}
+
+#[tokio::test]
+async fn resident_model_read_only_intent_uses_child_and_never_reaches_writer() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let (readonly, readonly_sent, readonly_ended) = FakeChatSession::new(vec![
+        vec![
+            umadev_runtime::SessionEvent::TextDelta(
+                serde_json::json!({
+                    "class": "explain",
+                    "authorization": "read_only",
+                    "kind": "light",
+                    "complexity": "simple",
+                    "confidence": 0.99
+                })
+                .to_string(),
+            ),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ],
+        vec![
+            umadev_runtime::SessionEvent::TextDelta("当前进度已汇总。".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ],
+    ]);
+    let (writer, writer_sent, writer_ended) = FakeChatSession::new(Vec::new());
+    let writer = writer.with_fork(Box::new(readonly));
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "当前进展到哪里了？",
+        holder.clone(),
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    match route_rx.try_recv() {
+        Ok(RouteDecision::AgenticDone {
+            reply,
+            director_build,
+            ..
+        }) => {
+            assert_eq!(reply, "当前进度已汇总。");
+            assert!(!director_build);
+        }
+        other => panic!("expected read-only answer, got {other:?}"),
+    }
+    assert!(
+        writer_sent.lock().unwrap().is_empty(),
+        "a read-only question never reaches the writer"
+    );
+    for _ in 0..20 {
+        if writer_ended.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(writer_ended.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!readonly_ended.load(std::sync::atomic::Ordering::SeqCst));
+    {
+        let directives = readonly_sent.lock().unwrap();
+        assert_eq!(
+            directives.len(),
+            2,
+            "one intent consult plus one answer turn"
+        );
+        assert!(directives[1].contains("This is read-only"));
+        assert!(directives[1].contains("Permission is scoped to this turn"));
+        assert!(directives[1].contains("later writable request is handled by a writable session"));
+    }
+    assert!(matches!(
+        *holder.lock().await,
+        Some(ResidentChat::ReadOnlyPrimed(_))
+    ));
+}
+
+#[tokio::test]
+async fn resident_failed_work_tools_feed_the_pitfall_recall_loop() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let failed_turn = || {
+        vec![
+            umadev_runtime::SessionEvent::ToolCall {
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "npm test"}),
+            },
+            umadev_runtime::SessionEvent::ToolResult {
+                ok: false,
+                summary: "Error: Cannot find module 'react-router-dom'".into(),
+            },
+            umadev_runtime::SessionEvent::TextDelta("测试仍失败。".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]
+    };
+    let (writer, sent, _ended) = FakeChatSession::new(vec![failed_turn(), failed_turn()]);
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+
+    for _ in 0..2 {
+        drive_chat_session_turn(chat_turn(
+            "修复 react-router-dom 路由错误",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+        assert!(matches!(
+            route_rx.try_recv(),
+            Ok(RouteDecision::AgenticDone { .. })
+        ));
+    }
+
+    assert_eq!(sent.lock().unwrap().len(), 2);
+    let rows =
+        umadev_agent::lessons::read_raw_lessons(tmp.path(), umadev_agent::lessons::DEV_ERRORS_FILE);
+    let pitfall = rows
+        .iter()
+        .find(|lesson| lesson.signature.contains("react-router-dom"))
+        .expect("resident failure was captured");
+    assert_eq!(pitfall.hits(), 2, "each failed execution is one episode");
+    let recall = umadev_agent::lessons::relevant_lessons_for_prompt(
+        tmp.path(),
+        "修复 react-router-dom 路由错误",
+    );
+    assert!(
+        recall.contains("react-router-dom") && recall.contains("已踩 2 次"),
+        "the second independent episode becomes reusable experience: {recall}"
+    );
+    let mut progress_notes = Vec::new();
+    while let Ok(event) = engine_rx.try_recv() {
+        if let EngineEvent::Note(note) = event {
+            progress_notes.push(note);
+        }
+    }
+    assert!(
+        progress_notes
+            .iter()
+            .any(|note| note == &umadev_i18n::tlf("lessons.progress.new_rules", &["1"])),
+        "the user sees when a repeated incident becomes a rule: {progress_notes:?}"
+    );
 }
 
 fn typed_test_report(input: &TurnInput, capabilities: SessionCapabilities) -> DeliveryReport {
@@ -7373,6 +7736,50 @@ async fn chat_failed_turn_on_live_base_parks_and_next_turn_reuses() {
         sent.lock().unwrap().len(),
         2,
         "both turns drove the ONE resident session (no re-open)"
+    );
+}
+
+#[tokio::test]
+async fn fatal_transport_failure_discards_a_process_that_has_not_exited_yet() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, _engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (fake, sent, ended) =
+        FakeChatSession::new(vec![vec![umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Failed(
+                "rmcp::transport: worker quit with fatal: Transport channel closed".into(),
+            ),
+            usage: None,
+        }]]);
+    // The fake intentionally reports `try_exit_status() == None`, reproducing
+    // the race where the worker channel is already dead but process status has
+    // not reached the parent yet.
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "继续",
+        holder.clone(),
+        sink,
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::Failed(note)) if note.contains("Transport channel closed")
+    ));
+    assert_eq!(sent.lock().unwrap().len(), 1);
+    assert!(
+        ended.load(std::sync::atomic::Ordering::SeqCst),
+        "a terminal transport is ended even before process exit is observable"
+    );
+    assert!(
+        holder.lock().await.is_none(),
+        "the dead transport must not be parked for the next explicit retry"
     );
 }
 

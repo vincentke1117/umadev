@@ -15,6 +15,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NPM_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=publish-registry.sh
+source "$SCRIPT_DIR/publish-registry.sh"
 
 DRY_RUN=""
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -46,6 +48,12 @@ for pkg in "${PLATFORM_PACKAGES[@]}"; do
     exit 1
   fi
 done
+
+# A file existing at the right path is not proof that it belongs to that
+# package. This exact mistake can make every non-macOS install fail with
+# "exec format error" while `npm publish` itself reports success. Inspect the
+# executable headers before packing or touching the registry.
+node "$SCRIPT_DIR/verify-platform-binaries.mjs" "$NPM_ROOT"
 
 # Pack every package before the first publish. This catches missing files and
 # freezes the exact tarballs used by every later retry.
@@ -89,7 +97,11 @@ NODE
 }
 
 remote_integrity() {
-  npm view "$1@$2" dist.integrity --json 2>/dev/null | node -e '
+  # A publish can be accepted by the registry before every packument replica
+  # exposes it. Force revalidation on every poll instead of reading npm's local
+  # cache, otherwise a successful first publish can look absent for the whole
+  # retry window.
+  npm view "$1@$2" dist.integrity --json --prefer-online 2>/dev/null | node -e '
     const fs = require("node:fs");
     try {
       const value = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -169,17 +181,27 @@ for tarball in "${TARBALLS[@]}"; do
   fi
 
   echo "▶ publish.sh: npm publish $name@$version..."
-  npm publish "$tarball" --access public --tag staging
-  published=""
-  for _ in 1 2 3 4 5 6; do
-    published="$(remote_integrity "$name" "$version" || true)"
-    [[ "$published" == "$local_integrity" ]] && break
-    sleep 5
-  done
-  [[ "$published" == "$local_integrity" ]] || {
-    echo "publish.sh: registry did not expose the published $name@$version tarball" >&2
+  publish_status=0
+  publish_output="$(npm publish "$tarball" --access public --tag staging 2>&1)" || publish_status=$?
+  printf '%s\n' "$publish_output"
+
+  if ((publish_status != 0)); then
+    # npm can accept a new immutable version, then keep its public packument
+    # stale long enough for a retry to attempt the same publish. That retry gets
+    # E403 even though its exact tarball is already durable. Only this precise
+    # duplicate-version family is recoverable; authentication/authorization and
+    # every other publish failure remain immediate hard failures.
+    if ! recoverable_duplicate_publish "$publish_output"; then
+      echo "publish.sh: npm publish failed for $name@$version" >&2
+      exit "$publish_status"
+    fi
+    echo "▶ publish.sh: registry accepted $name@$version earlier; waiting for public visibility"
+  fi
+
+  if ! wait_for_remote_integrity "$name" "$version" "$local_integrity"; then
+    echo "publish.sh: registry did not expose the published $name@$version tarball after $VISIBILITY_ATTEMPTS checks" >&2
     exit 1
-  }
+  fi
 done
 
 # All exact versions now exist and passed integrity verification. Promote tags
@@ -198,10 +220,12 @@ if [[ -z "$DRY_RUN" ]]; then
     # first stale reply — the exact flake that left 1.0.56 published but with
     # `latest` still pointing at the prior version.
     tagged=""
-    for _ in 1 2 3 4 5 6 7 8; do
+    for ((attempt = 1; attempt <= VISIBILITY_ATTEMPTS; attempt += 1)); do
       tagged="$(remote_version "$name" latest || true)"
       [[ "$tagged" == "$version" ]] && break
-      sleep 5
+      if ((attempt < VISIBILITY_ATTEMPTS)); then
+        sleep "$VISIBILITY_DELAY_SECONDS"
+      fi
     done
     [[ "$tagged" == "$version" ]] || {
       echo "publish.sh: latest for $name is $tagged, expected $version" >&2

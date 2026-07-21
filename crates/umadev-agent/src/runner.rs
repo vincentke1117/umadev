@@ -104,6 +104,18 @@ const DOCS_BUDGET_SECS: u64 = 480;
 /// unbounded auto-run into a bounded one. Default 1 hour. Override via
 /// `UMADEV_RUN_BUDGET_SECS` (>0). See [`run_budget`].
 const RUN_BUDGET_SECS: u64 = 3600;
+const MEMORY_UPKEEP_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+const MEMORY_UPKEEP_CALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn parse_memory_upkeep_decision(reply: &str) -> Option<crate::lessons::ReconcileDecision> {
+    match reply.trim().to_ascii_uppercase().as_str() {
+        "ADD" => Some(crate::lessons::ReconcileDecision::Add),
+        "UPDATE" => Some(crate::lessons::ReconcileDecision::Update),
+        "INVALIDATE" => Some(crate::lessons::ReconcileDecision::Invalidate),
+        "NOOP" => Some(crate::lessons::ReconcileDecision::Noop),
+        _ => None,
+    }
+}
 
 /// Test-only millisecond override for the advisory-consult timeout — lets tests
 /// drive the fail-open path in milliseconds instead of waiting whole seconds,
@@ -175,7 +187,7 @@ where
         }
         if all_done {
             // Every slot resolved — drain the results in order.
-            Poll::Ready(results.iter_mut().map(|o| o.take().unwrap()).collect())
+            Poll::Ready(results.iter_mut().filter_map(Option::take).collect())
         } else {
             Poll::Pending
         }
@@ -750,10 +762,10 @@ fn settle_pipeline_entry(
     };
     let settle = match result {
         Err(error) => task.fail("pipeline block failed", vec![error.to_string()]),
-        Ok(report) if report.paused_at.is_some() => task.wait(&format!(
-            "waiting at {}",
-            report.paused_at.expect("guard checked the gate").id_str()
-        )),
+        Ok(RunReport {
+            paused_at: Some(gate),
+            ..
+        }) => task.wait(&format!("waiting at {}", gate.id_str())),
         Ok(report)
             if matches!(
                 report.final_phase,
@@ -1498,6 +1510,27 @@ impl<R: Runtime> AgentRunner<R> {
         }
     }
 
+    async fn try_memory_upkeep(
+        &self,
+        prompt: Prompt,
+        deadline: tokio::time::Instant,
+    ) -> Option<String> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let request = prompt.into_request(self.options.model.clone(), 1500);
+        let response = tokio::time::timeout(
+            remaining.min(MEMORY_UPKEEP_CALL_BUDGET),
+            self.runtime.complete(request),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        record_runtime_usage(&self.options.backend, Phase::Delivery, response.usage);
+        (!response.text.trim().is_empty()).then_some(response.text)
+    }
+
     /// Self-evolution memory upkeep at delivery, the BASE-driven half of the
     /// learning loop (the template/no-base halves already ran inside
     /// `run_delivery`). Two passes, both fail-open and both skipped when offline:
@@ -1518,12 +1551,13 @@ impl<R: Runtime> AgentRunner<R> {
             return;
         }
         let root = &self.options.project_root;
+        let deadline = tokio::time::Instant::now() + MEMORY_UPKEEP_TOTAL_BUDGET;
 
         // ---- Pass 1: base-judged memory reconcile -------------------------
         // Cap the number of fresh lessons we spend a base call on, so a large
         // corpus stays cheap. Newest candidates first (reconcile_candidates is
         // already newest-first).
-        const MAX_RECONCILE_CALLS: usize = 8;
+        const MAX_RECONCILE_CALLS: usize = 3;
         let candidates = crate::lessons::reconcile_candidates(root);
         if !candidates.is_empty() {
             // Decision map keyed by the fresh lesson's identity triple.
@@ -1552,16 +1586,19 @@ impl<R: Runtime> AgentRunner<R> {
                      inside it. Reply with exactly one word: ADD, UPDATE, INVALIDATE, or NOOP."
                 );
                 if let Some(reply) = self
-                    .try_generate(Phase::Delivery, Prompt { system, user })
+                    .try_memory_upkeep(Prompt { system, user }, deadline)
                     .await
                     .filter(|t| !t.trim().is_empty())
                 {
+                    let Some(decision) = parse_memory_upkeep_decision(&reply) else {
+                        continue;
+                    };
                     let id = (
                         fresh.domain.clone(),
                         fresh.title.clone(),
                         fresh.first_seen.clone(),
                     );
-                    decisions.insert(id, crate::lessons::parse_reconcile_decision(&reply));
+                    decisions.insert(id, decision);
                 }
             }
             if !decisions.is_empty() {
@@ -1588,7 +1625,7 @@ impl<R: Runtime> AgentRunner<R> {
         // ---- Pass 2: base-written reusable skill cards --------------------
         // The freshly-graduated skills carry a template description; upgrade the
         // ones produced this run with a base-written reusable card. Bounded.
-        const MAX_SKILL_CARDS: usize = 6;
+        const MAX_SKILL_CARDS: usize = 1;
         let skills = crate::skills::read_skills_for_automatic_use(root);
         let mut carded = 0usize;
         for s in skills.iter().take(MAX_SKILL_CARDS) {
@@ -1598,7 +1635,7 @@ impl<R: Runtime> AgentRunner<R> {
                 &s.source_requirement,
             );
             if let Some(card) = self
-                .try_generate(Phase::Delivery, Prompt { system, user })
+                .try_memory_upkeep(Prompt { system, user }, deadline)
                 .await
                 .filter(|t| !t.trim().is_empty())
             {
@@ -6526,6 +6563,24 @@ mod tests {
         ApprovalDecision, BaseSession, CompletionRequest, CompletionResponse, Runtime,
         RuntimeError, RuntimeKind, SessionError, SessionEvent, Usage,
     };
+
+    #[test]
+    fn memory_upkeep_accepts_only_an_exact_control_verdict() {
+        assert_eq!(
+            parse_memory_upkeep_decision(" update \n"),
+            Some(crate::lessons::ReconcileDecision::Update)
+        );
+        assert_eq!(
+            parse_memory_upkeep_decision("NOOP"),
+            Some(crate::lessons::ReconcileDecision::Noop)
+        );
+        assert_eq!(
+            parse_memory_upkeep_decision("Do not INVALIDATE this lesson"),
+            None,
+            "reference echo or prose must not mutate memory"
+        );
+        assert_eq!(parse_memory_upkeep_decision(""), None);
+    }
 
     fn set_retry_base_ms_for_tests(ms: u64) {
         RETRY_BASE_MS_TEST_OVERRIDE.store(ms, std::sync::atomic::Ordering::Relaxed);

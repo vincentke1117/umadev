@@ -12,13 +12,13 @@ use serde_json::Value;
 pub const KIMI_CODE_SOURCE_REPOSITORY: &str = "https://github.com/MoonshotAI/kimi-code";
 
 /// Exact upstream commit behind the audited release tag.
-pub const KIMI_CODE_SOURCE_COMMIT: &str = "36b05820cba24e09fdff19a059afc08ccea2c35e";
+pub const KIMI_CODE_SOURCE_COMMIT: &str = "efacf0452d46f5dbd67499eabc053869495d5213";
 
 /// Audited Kimi Code CLI release.
-pub const KIMI_CODE_SOURCE_VERSION: &str = "0.26.0";
+pub const KIMI_CODE_SOURCE_VERSION: &str = "0.28.1";
 
 /// Audited annotated release tag.
-pub const KIMI_CODE_SOURCE_TAG: &str = "@moonshot-ai/kimi-code@0.26.0";
+pub const KIMI_CODE_SOURCE_TAG: &str = "@moonshot-ai/kimi-code@0.28.1";
 
 /// ACP SDK requirement declared by the audited adapter.
 pub const KIMI_CODE_SOURCE_ACP_VERSION: &str = "0.23.0";
@@ -27,7 +27,7 @@ pub const KIMI_CODE_SOURCE_ACP_VERSION: &str = "0.23.0";
 pub const KIMI_CODE_SOURCE_ADAPTER_VERSION: &str = "0.3.4";
 
 /// Source-shaped behavior is exact-version gated until drift tests are rerun.
-pub const KIMI_CODE_AUDITED_VERSION_REQUIREMENT: &str = "=0.26.0";
+pub const KIMI_CODE_AUDITED_VERSION_REQUIREMENT: &str = "=0.28.1";
 
 const MAX_AGENT_VERSION_BYTES: usize = 128;
 
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(audited.source_match(), KimiSourceMatch::AuditedVersion);
         assert!(audited.is_audited_version());
 
-        for version in ["0.25.9", "0.26.1", "0.27.0", "0.26.0+local"] {
+        for version in ["0.28.0", "0.28.2", "0.29.0", "0.28.1+local"] {
             let outside = profile("Kimi Code CLI", Some(version));
             assert_eq!(outside.source_match(), KimiSourceMatch::OutsideAuditedRange);
             assert!(!outside.is_audited_version());
@@ -189,8 +189,8 @@ mod tests {
 
     #[test]
     fn cli_version_gate_matches_the_initialize_source_gate() {
-        assert!(is_audited_cli_version("0.26.0\n"));
-        for version in ["v0.26.0", "0.26.0+local", "0.26.1", "latest", ""] {
+        assert!(is_audited_cli_version("0.28.1\n"));
+        for version in ["v0.28.1", "0.28.1+local", "0.28.2", "latest", ""] {
             assert!(!is_audited_cli_version(version), "{version}");
         }
     }

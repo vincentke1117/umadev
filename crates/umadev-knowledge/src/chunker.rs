@@ -145,7 +145,12 @@ struct ParsedFrontMatter {
 /// Chunk a markdown file from disk. Returns one or more chunks. Empty vec
 /// only when the file is unreadable or completely empty.
 pub fn chunk_file(knowledge_root: &Path, abs_path: &Path) -> Vec<Chunk> {
-    let Ok(body) = std::fs::read_to_string(abs_path) else {
+    let Ok(bytes) =
+        umadev_state::fs::read_bounded(abs_path, crate::index::MAX_KNOWLEDGE_FILE_BYTES)
+    else {
+        return Vec::new();
+    };
+    let Ok(body) = String::from_utf8(bytes) else {
         return Vec::new();
     };
     // Path relative to knowledge/ root (or fall back to the file name).

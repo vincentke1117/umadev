@@ -2,7 +2,7 @@ name: Deploy website to GitHub Pages
 
 on:
   push:
-    branches: [public-main, main]
+    branches: [main]
     paths:
       - "Cargo.toml"
       - "npm/*/package.json"
@@ -47,7 +47,7 @@ jobs:
         run: npm ci
 
       - name: Audit production dependencies
-        run: npm audit --omit=dev --audit-level=moderate
+        run: npm audit --audit-level=moderate
 
       - name: Lint
         run: npm run lint

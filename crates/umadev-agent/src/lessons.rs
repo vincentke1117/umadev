@@ -110,6 +110,7 @@ const MAX_RAW_LEDGER_LINES: usize = 10_000;
 const MAX_REFLECTION_LEDGER_BYTES: u64 = 256 * 1024;
 const MAX_REFLECTION_LINE_BYTES: usize = 64 * 1024;
 const MAX_REFLECTION_LEDGER_LINES: usize = 64;
+static ADR_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The kind of captured experience.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -840,31 +841,39 @@ pub fn capture_gate_revision(
     requirement: &str,
 ) -> PathBuf {
     let now = Utc::now();
-    let ts = now.format("%Y%m%dT%H%M%SZ");
+    let revision_text = umadev_governance::redaction::redact_text(revision_text);
+    let requirement = umadev_governance::redaction::redact_text(requirement);
+    let ts = now.format("%Y%m%dT%H%M%S%.3fZ");
     let date = now.format("%Y-%m-%d");
-    let dec_dir = project_root.join(DECISIONS_DIR);
-    let adr_path = dec_dir.join(format!("{gate}-{ts}.md"));
+    let safe_gate = safe_domain_segment(gate).unwrap_or("gate");
+    let sequence = ADR_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let filename = format!("{safe_gate}-{ts}-{}-{sequence}.md", std::process::id());
+    let mut adr_path = project_root.join(DECISIONS_DIR).join(&filename);
 
     // The proof ADR and the reusable lesson are distinct leaf stores. A user may
     // retain one without authorising the other; neither toggle changes the gate's
     // actual revision flow.
     if project_capture_enabled(project_root, MemoryStore::GateAdrs) {
-        let _ = fs::create_dir_all(&dec_dir);
-        let adr_body = format!(
-            "# ADR: {gate} revision\n\n\
-             **Date:** {date}\n\n\
-             **Status:** Revised\n\n\
-             **Requirement:** {requirement}\n\n\
-             ## Decision\n\n\
-             The user requested the following revision at the {gate} gate:\n\n\
-             > {revision_text}\n\n\
-             ## Context\n\n\
-             This revision feedback is captured as a decision record so future runs \
-             of the pipeline understand why the artifacts changed at this gate. The \
-             underlying worker will regenerate the block with this feedback folded \
-             into the requirement.\n",
-        );
-        let _ = fs::write(&adr_path, adr_body);
+        if let Ok(_guard) = umadev_state::store_lock::acquire(project_root, MemoryStore::GateAdrs) {
+            if let Some(dec_dir) = ensure_managed_project_dir(project_root, "decisions") {
+                adr_path = dec_dir.join(&filename);
+                let adr_body = format!(
+                    "# ADR: {gate} revision\n\n\
+                     **Date:** {date}\n\n\
+                     **Status:** Revised\n\n\
+                     **Requirement:** {requirement}\n\n\
+                     ## Decision\n\n\
+                     The user requested the following revision at the {gate} gate:\n\n\
+                     > {revision_text}\n\n\
+                     ## Context\n\n\
+                     This revision feedback is captured as a decision record so future runs \
+                     of the pipeline understand why the artifacts changed at this gate. The \
+                     underlying worker will regenerate the block with this feedback folded \
+                     into the requirement.\n",
+                );
+                let _ = write_atomic(&adr_path, &adr_body);
+            }
+        }
     }
 
     if !project_capture_enabled(project_root, MemoryStore::GateRevisions) {
@@ -877,11 +886,11 @@ pub fn capture_gate_revision(
     } else {
         "frontend"
     };
-    let keywords = extract_keywords(gate, revision_text, requirement);
+    let keywords = extract_keywords(gate, &revision_text, &requirement);
     let lesson = Lesson {
         kind: LessonKind::Revision,
         domain: domain.to_string(),
-        title: format!("{gate} revision: {}", truncate(revision_text, 80)),
+        title: format!("{gate} revision: {}", truncate(&revision_text, 80)),
         body: format!(
             "At the {gate} gate, the user revised with: \"{revision_text}\".\n\n\
              This indicates the generated artifacts did not meet expectations in \
@@ -892,7 +901,7 @@ pub fn capture_gate_revision(
         root_cause: "The generated artifact did not meet the user's expectations at this gate."
             .to_string(),
         keywords,
-        source_requirement: requirement.to_string(),
+        source_requirement: requirement,
         first_seen: now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         signature: String::new(),
         occurrences: 1,
@@ -2176,7 +2185,7 @@ pub fn record_pitfall_strategy(project_root: &Path, signature: &str, strategy: &
     {
         return false;
     }
-    let strategy = strategy.trim();
+    let strategy = umadev_governance::redaction::redact_text(strategy.trim());
     if strategy.is_empty() {
         return false;
     }
@@ -2196,7 +2205,7 @@ pub fn record_pitfall_strategy(project_root: &Path, signature: &str, strategy: &
                 occ_at_injection: occ,
                 ..PitfallEfficacy::default()
             });
-            eff.next_strategy = truncate(strategy, 600);
+            eff.next_strategy = truncate(&strategy, 600);
             changed = true;
         }
     }
@@ -2209,7 +2218,7 @@ pub fn record_pitfall_strategy(project_root: &Path, signature: &str, strategy: &
         .map(|lesson| Reflection {
             signature: sig.clone(),
             occurrences: lesson.hits(),
-            strategy: truncate(strategy, 600),
+            strategy: truncate(&strategy, 600),
             at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         });
     // Never announce/append a reflection until the authoritative pitfall row
@@ -2242,10 +2251,9 @@ fn append_reflection(project_root: &Path, r: &Reflection) -> bool {
     else {
         return false;
     };
-    let dir = project_root.join(REFLECTIONS_DIR);
-    if fs::create_dir_all(&dir).is_err() || !real_dir_no_follow(&dir) {
+    let Some(dir) = ensure_managed_project_dir(project_root, "reflections") else {
         return false;
-    }
+    };
     // Signature → filesystem-safe slug.
     let slug: String = r
         .signature
@@ -2393,7 +2401,10 @@ fn render_raw_lesson_ledger(
     let max_total = usize::try_from(MAX_RAW_LEDGER_BYTES).unwrap_or(usize::MAX);
     let mut body = String::new();
     for lesson in lessons {
-        let line = serde_json::to_string(lesson)
+        let value = serde_json::to_value(lesson)
+            .map(umadev_governance::redaction::redact_json)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let line = serde_json::to_string(&value)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         if line.len() > MAX_RAW_LINE_BYTES
             || body.len().saturating_add(line.len()).saturating_add(1) > max_total
@@ -2813,22 +2824,29 @@ pub fn global_learned_dir() -> Option<PathBuf> {
 }
 
 fn real_dir_no_follow(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+    umadev_state::fs::real_dir(path)
 }
 
 /// Create one managed directory component without following an existing link.
 fn ensure_real_child_dir(parent: &Path, child: &Path) -> bool {
-    if !real_dir_no_follow(parent) {
+    let Some(name) = child
+        .parent()
+        .filter(|candidate| *candidate == parent)
+        .and_then(|_| child.file_name())
+        .and_then(|name| name.to_str())
+    else {
         return false;
+    };
+    umadev_state::fs::ensure_real_child_dir(parent, name).is_ok()
+}
+
+fn ensure_managed_project_dir(boundary: &Path, name: &str) -> Option<PathBuf> {
+    let boundary = fs::canonicalize(boundary).ok()?;
+    if !real_dir_no_follow(&boundary) {
+        return None;
     }
-    match fs::symlink_metadata(child) {
-        Ok(meta) => meta.file_type().is_dir(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let _ = fs::create_dir(child);
-            real_dir_no_follow(parent) && real_dir_no_follow(child)
-        }
-        Err(_) => false,
-    }
+    let umadev = umadev_state::fs::ensure_real_child_dir(&boundary, ".umadev").ok()?;
+    umadev_state::fs::ensure_real_child_dir(&umadev, name).ok()
 }
 
 /// Resolve a user-selected boundary while refusing links in UmaDev-managed
@@ -8121,6 +8139,76 @@ mod tests {
         assert_eq!(lessons.len(), 1);
         assert_eq!(lessons[0].kind, LessonKind::Revision);
         assert!(lessons[0].body.contains("数据库设计"));
+    }
+
+    #[test]
+    fn persisted_revision_and_reflection_memory_redacts_secret_values() {
+        let tmp = TempDir::new().unwrap();
+        let secret = concat!("sk-", "live-secret-value-1234567890");
+        let adr = capture_gate_revision(
+            tmp.path(),
+            "docs_confirm",
+            &format!("api_key={secret}"),
+            "password=hunter2",
+        );
+        let adr_body = fs::read_to_string(adr).unwrap();
+        let raw_body =
+            fs::read_to_string(tmp.path().join(RAW_DIR).join("gate-revisions.jsonl")).unwrap();
+        assert!(!adr_body.contains(secret));
+        assert!(!adr_body.contains("hunter2"));
+        assert!(!raw_body.contains(secret));
+        assert!(!raw_body.contains("hunter2"));
+
+        let error = "Error: Cannot find module 'safe-memory-example'";
+        capture_dev_errors(tmp.path(), &[error.to_string()], "demo", "requirement");
+        assert!(record_pitfall_strategy(
+            tmp.path(),
+            "dependency/module-not-found/safe-memory-example",
+            &format!("pin dependency with api_key={secret}"),
+        ));
+        let pitfall_body =
+            fs::read_to_string(tmp.path().join(RAW_DIR).join(DEV_ERRORS_FILE)).unwrap();
+        assert!(!pitfall_body.contains(secret));
+        assert!(pitfall_body.contains("[redacted]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_adrs_and_reflections_never_follow_managed_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let project = TempDir::new().unwrap();
+        let outside_decisions = TempDir::new().unwrap();
+        let outside_reflections = TempDir::new().unwrap();
+        fs::create_dir(project.path().join(".umadev")).unwrap();
+        symlink(
+            outside_decisions.path(),
+            project.path().join(".umadev/decisions"),
+        )
+        .unwrap();
+        symlink(
+            outside_reflections.path(),
+            project.path().join(".umadev/reflections"),
+        )
+        .unwrap();
+
+        let adr = capture_gate_revision(
+            project.path(),
+            "../../outside",
+            "keep this inside the project",
+            "requirement",
+        );
+        assert!(!adr.exists());
+        assert_eq!(fs::read_dir(outside_decisions.path()).unwrap().count(), 0);
+
+        let reflection = Reflection {
+            signature: "dependency/module-not-found/example".into(),
+            occurrences: 2,
+            strategy: "pin the exact dependency".into(),
+            at: "2026-07-21T00:00:00Z".into(),
+        };
+        assert!(!append_reflection(project.path(), &reflection));
+        assert_eq!(fs::read_dir(outside_reflections.path()).unwrap().count(), 0);
     }
 
     #[test]

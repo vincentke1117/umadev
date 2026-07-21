@@ -307,79 +307,143 @@ fn check_user_config() -> CheckResult {
     }
 }
 
-/// Check whether the Claude Code PreToolUse governance hook is registered.
-/// Only relevant when `.claude/settings.json` exists (workspace-level Claude
-/// Code config). When the hook is missing, suggests `umadev install`.
+/// Check whether the Claude Code PreToolUse governance hook is registered in the
+/// machine-local project settings. Older UmaDev versions wrote an absolute binary
+/// path into shareable `settings.json`; detect that legacy state and ask the user
+/// to migrate rather than reporting a misleading green result.
 fn check_claude_hook(workspace: &Path) -> CheckResult {
-    let settings_path = workspace.join(".claude/settings.json");
-    if !settings_path.is_file() {
-        // No Claude Code config at all — not an error, just informational.
+    let claude_dir = workspace.join(".claude");
+    let local_path = claude_dir.join("settings.local.json");
+    let shared_path = claude_dir.join("settings.json");
+    if !local_path.is_file() && !shared_path.is_file() {
         return CheckResult {
             name: "Claude Code hook".to_string(),
             status: Status::Passed,
-            detail: "no .claude/settings.json (real-time governance off; quality-gate hard block still active)"
+            detail: "no Claude project settings (real-time governance off; quality-gate hard block still active)"
                 .to_string(),
         };
     }
-    let Ok(content) = fs::read_to_string(&settings_path) else {
-        return CheckResult {
-            name: "Claude Code hook".to_string(),
-            status: Status::Warning,
-            detail: ".claude/settings.json exists but is unreadable".to_string(),
-        };
-    };
-    // PARSE the JSON and confirm a LIVE PreToolUse matcher whose command is
-    // UmaDev's own hook (and ideally resolves to an on-disk binary). A bare
-    // `content.contains("hook pre-write")` substring PASSes even when the string
-    // only appears in a comment, in a user's unrelated wrapper, or in a matcher
-    // pointing at a now-dead binary path — false confidence the user has live
-    // governance when they don't.
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return CheckResult {
-            name: "Claude Code hook".to_string(),
-            status: Status::Warning,
-            detail: ".claude/settings.json exists but is not valid JSON — the PreToolUse hook \
-                     cannot be confirmed. Fix the JSON, then run `umadev install --host claude-code`."
-                .to_string(),
-        };
-    };
-    let umadev_cmd = value
-        .get("hooks")
-        .and_then(|h| h.get("PreToolUse"))
-        .and_then(|p| p.as_array())
-        .and_then(|matchers| {
-            matchers.iter().find_map(|m| {
-                m.get("hooks").and_then(|h| h.as_array()).and_then(|hooks| {
-                    hooks.iter().find_map(|h| {
-                        h.get("command")
-                            .and_then(|c| c.as_str())
-                            .filter(|c| crate::hook::is_umadev_hook_command(c, None))
-                            .map(str::to_string)
+
+    let inspect = |path: &Path| -> Result<Vec<(&'static str, &'static str, String)>, String> {
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let value = serde_json::from_str::<serde_json::Value>(&content)
+            .map_err(|error| format!("invalid JSON: {error}"))?;
+        Ok(value
+            .get("hooks")
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flat_map(|hooks| {
+                ["PreToolUse", "PostToolUse"]
+                    .into_iter()
+                    .filter_map(|phase| {
+                        hooks
+                            .get(phase)
+                            .and_then(serde_json::Value::as_array)
+                            .map(|groups| (phase, groups))
                     })
-                })
             })
-        });
-    match umadev_cmd {
-        Some(cmd) if hook_command_resolves(&cmd) => CheckResult {
-            name: "Claude Code hook".to_string(),
-            status: Status::Passed,
-            detail:
-                "PreToolUse governance hook registered (UD-CODE-001/002/005 enforced at write time)"
-                    .to_string(),
-        },
-        Some(_) => CheckResult {
+            .flat_map(|(phase, groups)| groups.iter().map(move |group| (phase, group)))
+            .filter_map(|(phase, group)| {
+                group
+                    .get("hooks")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|handlers| (phase, handlers))
+            })
+            .flat_map(|(phase, handlers)| handlers.iter().map(move |handler| (phase, handler)))
+            .filter_map(|(phase, handler)| {
+                let name = crate::hook::umadev_hook_name(handler, None)?;
+                let command = handler.get("command")?.as_str()?.to_string();
+                Some((phase, name, command))
+            })
+            .collect())
+    };
+
+    let local = match inspect(&local_path) {
+        Ok(value) => value,
+        Err(error) => {
+            return CheckResult {
+                name: "Claude Code hook".to_string(),
+                status: Status::Warning,
+                detail: format!(
+                    "{} cannot be read safely ({error}). Fix it, then run `umadev install --base claude-code`.",
+                    local_path.display()
+                ),
+            };
+        }
+    };
+    if !local.is_empty() {
+        let missing: Vec<_> = [
+            ("PreToolUse", "pre-write"),
+            ("PreToolUse", "pre-bash"),
+            ("PostToolUse", "tool-audit"),
+        ]
+        .into_iter()
+        .filter(|(expected_phase, expected_name)| {
+            !local
+                .iter()
+                .any(|(phase, name, _)| phase == expected_phase && name == expected_name)
+        })
+        .map(|(phase, name)| format!("{phase}/{name}"))
+        .collect();
+        if !missing.is_empty() {
+            return CheckResult {
+                name: "Claude Code hook".to_string(),
+                status: Status::Warning,
+                detail: format!(
+                    "{} has an incomplete UmaDev hook set (missing {}). Run `umadev install --base claude-code` to repair it.",
+                    local_path.display(),
+                    missing.join(", ")
+                ),
+            };
+        }
+        return if local
+            .iter()
+            .all(|(_, _, command)| hook_command_resolves(command))
+        {
+            CheckResult {
+                name: "Claude Code hook".to_string(),
+                status: Status::Passed,
+                detail: format!(
+                    "machine-local PreToolUse and PostToolUse governance hooks registered: {}",
+                    local_path.display()
+                ),
+            }
+        } else {
+            CheckResult {
+                name: "Claude Code hook".to_string(),
+                status: Status::Warning,
+                detail: format!(
+                    "{} registers UmaDev but its command does not resolve to a live executable. Run `umadev install --base claude-code` to repair it.",
+                    local_path.display()
+                ),
+            }
+        };
+    }
+
+    match inspect(&shared_path) {
+        Err(error) => CheckResult {
             name: "Claude Code hook".to_string(),
             status: Status::Warning,
-            detail: ".claude/settings.json registers the UmaDev PreToolUse hook but its command \
-                     does not resolve to an existing binary (stale path after an upgrade/move). \
-                     Run `umadev install --host claude-code` to repair it."
-                .to_string(),
+            detail: format!(
+                "{} cannot be read safely ({error}). Fix it, then run `umadev install --base claude-code`.",
+                shared_path.display()
+            ),
         },
-        None => CheckResult {
+        Ok(hooks) if !hooks.is_empty() => CheckResult {
             name: "Claude Code hook".to_string(),
             status: Status::Warning,
-            detail: ".claude/settings.json exists but the UmaDev PreToolUse hook is not registered. \
-                     Run `umadev install --host claude-code` for real-time emoji/color/slop interception."
+            detail: format!(
+                "legacy UmaDev hook is stored in shareable {}. Run `umadev install --base claude-code` to migrate it to settings.local.json and safe exec-form arguments.",
+                shared_path.display()
+            ),
+        },
+        Ok(_) => CheckResult {
+            name: "Claude Code hook".to_string(),
+            status: Status::Warning,
+            detail: "Claude project settings exist but the UmaDev PreToolUse hook is not registered (absent). Run `umadev install --base claude-code` for real-time governance."
                 .to_string(),
         },
     }
@@ -1413,8 +1477,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join(".claude")).unwrap();
         fs::write(
-            tmp.path().join(".claude/settings.json"),
-            r#"{"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"command":"umadev hook pre-write"}]}]}}"#,
+            tmp.path().join(".claude/settings.local.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"command":"umadev","args":["hook","pre-write"]}]},{"matcher":"Bash","hooks":[{"command":"umadev","args":["hook","pre-bash"]}]}],"PostToolUse":[{"matcher":"Write|Bash","hooks":[{"command":"umadev","args":["hook","tool-audit"]}]}]}}"#,
         )
         .unwrap();
         let results = run_all(tmp.path(), false).await;
@@ -1432,6 +1496,25 @@ mod tests {
             hook_check.status,
             hook_check.detail
         );
+    }
+
+    #[tokio::test]
+    async fn claude_hook_warns_when_commands_are_registered_in_the_wrong_phase() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        fs::write(
+            tmp.path().join(".claude/settings.local.json"),
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Write|Bash","hooks":[{"command":"umadev","args":["hook","pre-write"]},{"command":"umadev","args":["hook","pre-bash"]},{"command":"umadev","args":["hook","tool-audit"]}]}]}}"#,
+        )
+        .unwrap();
+        let results = run_all(tmp.path(), false).await;
+        let hook_check = results
+            .iter()
+            .find(|r| r.name == "Claude Code hook")
+            .unwrap();
+        assert_eq!(hook_check.status, Status::Warning);
+        assert!(hook_check.detail.contains("PreToolUse/pre-write"));
+        assert!(hook_check.detail.contains("PreToolUse/pre-bash"));
     }
 
     #[tokio::test]
@@ -1672,15 +1755,22 @@ mod tests {
     fn write_claude_settings(tmp: &Path, command: &str) {
         let dir = tmp.join(".claude");
         std::fs::create_dir_all(&dir).unwrap();
+        let program = command
+            .strip_suffix("hook pre-write")
+            .map_or(command, str::trim_end);
         let json = serde_json::json!({
             "hooks": {
-                "PreToolUse": [{
-                    "matcher": "Write|Edit|MultiEdit",
-                    "hooks": [{"type": "command", "command": command}]
+                "PreToolUse": [
+                    {"matcher": "Write|Edit|MultiEdit", "hooks": [{"type": "command", "command": program, "args": ["hook", "pre-write"]}]},
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": program, "args": ["hook", "pre-bash"]}]}
+                ],
+                "PostToolUse": [{
+                    "matcher": "Write|Edit|MultiEdit|Bash",
+                    "hooks": [{"type": "command", "command": program, "args": ["hook", "tool-audit"]}]
                 }]
             }
         });
-        std::fs::write(dir.join("settings.json"), json.to_string()).unwrap();
+        std::fs::write(dir.join("settings.local.json"), json.to_string()).unwrap();
     }
 
     #[test]
@@ -1722,10 +1812,30 @@ mod tests {
         let dir = tmp.path().join(".claude");
         std::fs::create_dir_all(&dir).unwrap();
         // Substring "hook pre-write" present, but the file is not valid JSON.
-        std::fs::write(dir.join("settings.json"), "{ not json: hook pre-write ").unwrap();
+        std::fs::write(
+            dir.join("settings.local.json"),
+            "{ not json: hook pre-write ",
+        )
+        .unwrap();
         let r = check_claude_hook(tmp.path());
         assert_eq!(r.status, Status::Warning);
-        assert!(r.detail.contains("not valid JSON"), "{}", r.detail);
+        assert!(r.detail.contains("invalid JSON"), "{}", r.detail);
+    }
+
+    #[test]
+    fn claude_hook_warns_when_only_legacy_shared_hook_exists() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"command":"umadev hook pre-write"}]}]}}"#,
+        )
+        .unwrap();
+        let r = check_claude_hook(tmp.path());
+        assert_eq!(r.status, Status::Warning);
+        assert!(r.detail.contains("legacy"), "{}", r.detail);
+        assert!(r.detail.contains("settings.local.json"), "{}", r.detail);
     }
 
     #[test]

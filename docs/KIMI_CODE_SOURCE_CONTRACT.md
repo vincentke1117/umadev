@@ -7,9 +7,9 @@ wrapper.
 
 ## Audited source
 
-- package: `@moonshot-ai/kimi-code@0.26.0`
-- release tag: `@moonshot-ai/kimi-code@0.26.0`
-- commit: `36b05820cba24e09fdff19a059afc08ccea2c35e`
+- package: `@moonshot-ai/kimi-code@0.28.1`
+- release tag: `@moonshot-ai/kimi-code@0.28.1`
+- commit: `efacf0452d46f5dbd67499eabc053869495d5213`
 - ACP adapter: `@moonshot-ai/kimi-acp-adapter@0.3.4`
 - ACP SDK declared by upstream: `@agentclientprotocol/sdk@^0.23.0`
 - machine entrypoint: `kimi acp`
@@ -120,9 +120,11 @@ with other tools.
   catalog and refreshes the current model, thinking toggle and audited
   `default`/`plan` mode in UmaDev; unrecognized authority modes are never
   guessed or reclassified.
-- Kimi exposes thinking as its own on/off configuration option. UmaDev retains
-  and displays that live state independently and does not misrepresent the
-  boolean as another base's graded reasoning field. Because each
+- Kimi exposes thinking as an `off`/`on` configuration option. The audited
+  adapter maps `on` to the selected model's default or middle supported effort
+  internally, while an always-thinking model omits `off`. UmaDev retains and
+  displays this enabled/disabled capability independently; the parser also
+  accepts a future advertised non-`off` value without inventing one. Because each
   `configOptions` message is a complete replacement, a model that omits the
   control clears the prior state, while an always-thinking model remains
   visibly locked on instead of showing a switch that cannot work. `/thinking
@@ -164,7 +166,7 @@ with other tools.
 
 - macOS/Linux/Windows executable: `kimi` (Windows npm `.cmd` launch is handled
   by UmaDev's shared process resolver).
-- audited installation: `npm install -g @moonshot-ai/kimi-code@0.26.0`.
+- audited installation: `npm install -g @moonshot-ai/kimi-code@0.28.1`.
 - Windows shell tools require Git for Windows/Git Bash. Upstream probes standard
   Git locations, Scoop/portable installs and `KIMI_SHELL_PATH`, and fails before
   a session when no usable `bash.exe` exists.

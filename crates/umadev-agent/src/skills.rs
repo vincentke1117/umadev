@@ -48,7 +48,6 @@
 //! empty / `false`), never blocking the base or the pipeline.
 
 use std::fs;
-use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -108,9 +107,6 @@ const MAX_SKILL_STORE_BYTES: u64 = 2 * 1024 * 1024;
 /// Version of the immutable skill receipt format.
 const SKILL_RECEIPT_VERSION: u8 = 1;
 
-/// A crashed writer's lease can be reclaimed after this age.
-const STORE_LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
 /// Half-life (days) for a skill's recency weight — same 30-day decay the
 /// pitfall/lesson recency uses, so an unused skill fades from the top-k rather
 /// than clinging forever.
@@ -123,7 +119,6 @@ const MAX_CONTENT_CHARS: usize = 4000;
 const MAX_PROMPT_CONTENT_CHARS: usize = 1600;
 
 static SKILL_KB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RECEIPT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
@@ -1014,12 +1009,12 @@ fn prune_skill_mirrors(project_root: &Path, store: &[Skill]) {
     if let Ok(rd) = fs::read_dir(&dir) {
         for entry in rd.flatten() {
             let p = entry.path();
-            if entry.file_type().is_ok_and(|kind| kind.is_file())
+            if umadev_state::fs::real_file(&p)
                 && p.extension().and_then(|s| s.to_str()) == Some("md")
             {
                 let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
                 if !keep.contains(name) {
-                    let _ = fs::remove_file(&p);
+                    let _ = umadev_state::fs::remove_regular_file(&p);
                 }
             }
         }
@@ -1396,14 +1391,18 @@ fn apply_settled_outcomes(project_root: &Path, skills: &mut [Skill]) {
     };
     let mut paths = entries
         .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .map(|entry| entry.path())
+        .filter(|path| umadev_state::fs::real_file(path))
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.ends_with(".outcome.json"))
         })
+        .take(MAX_SKILL_RECEIPTS.saturating_add(1))
         .collect::<Vec<_>>();
+    if paths.len() > MAX_SKILL_RECEIPTS {
+        return;
+    }
     paths.sort();
     let mut intents = paths
         .into_iter()
@@ -1471,7 +1470,7 @@ fn count_receipts(dir: &Path) -> usize {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter(|entry| umadev_state::fs::real_file(&entry.path()))
         .filter(|entry| {
             entry
                 .file_name()
@@ -1532,82 +1531,24 @@ fn read_json_no_follow<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T>
 }
 
 fn read_text_no_follow(path: &Path, max_bytes: u64) -> Option<String> {
-    if !fs::symlink_metadata(path)
-        .is_ok_and(|meta| meta.file_type().is_file() && meta.len() <= max_bytes)
-    {
-        return None;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path).ok()?;
-    if !file
-        .metadata()
-        .ok()
-        .is_some_and(|meta| meta.is_file() && meta.len() <= max_bytes)
-    {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > max_bytes {
-        return None;
-    }
-    String::from_utf8(bytes).ok()
+    String::from_utf8(umadev_state::fs::read_bounded(path, max_bytes).ok()?).ok()
 }
 
 fn canonical_project_root(project_root: &Path) -> Option<PathBuf> {
     let root = fs::canonicalize(project_root).ok()?;
-    fs::symlink_metadata(&root)
-        .is_ok_and(|meta| meta.file_type().is_dir())
-        .then_some(root)
+    umadev_state::fs::real_dir(&root).then_some(root)
 }
 
 fn existing_real_child(parent: &Path, name: &str) -> Option<PathBuf> {
-    if !fs::symlink_metadata(parent).is_ok_and(|meta| meta.file_type().is_dir()) {
+    if !umadev_state::fs::real_dir(parent) {
         return None;
     }
     let child = parent.join(name);
-    fs::symlink_metadata(&child)
-        .is_ok_and(|meta| meta.file_type().is_dir())
-        .then_some(child)
+    umadev_state::fs::real_dir(&child).then_some(child)
 }
 
 fn ensure_real_child(parent: &Path, name: &str) -> Option<PathBuf> {
-    if !fs::symlink_metadata(parent).is_ok_and(|meta| meta.file_type().is_dir()) {
-        return None;
-    }
-    let child = parent.join(name);
-    match fs::symlink_metadata(&child) {
-        Ok(meta) if meta.file_type().is_dir() => {}
-        Ok(_) => return None,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if fs::create_dir(&child).is_err()
-                && !fs::symlink_metadata(&child).is_ok_and(|meta| meta.file_type().is_dir())
-            {
-                return None;
-            }
-        }
-        Err(_) => return None,
-    }
-    if !fs::symlink_metadata(parent).is_ok_and(|meta| meta.file_type().is_dir())
-        || !fs::symlink_metadata(&child).is_ok_and(|meta| meta.file_type().is_dir())
-    {
-        return None;
-    }
-    Some(child)
+    umadev_state::fs::ensure_real_child_dir(parent, name).ok()
 }
 
 fn existing_skills_dir(project_root: &Path) -> Option<PathBuf> {
@@ -1668,9 +1609,7 @@ fn effective_existing_skills_dir(project_root: &Path) -> Option<PathBuf> {
 }
 
 fn managed_file_or_backup_exists(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
-        || fs::symlink_metadata(replacement_backup_path(path))
-            .is_ok_and(|meta| meta.file_type().is_file())
+    umadev_state::fs::real_file(path) || umadev_state::fs::real_file(&replacement_backup_path(path))
 }
 
 fn existing_mirror_dir(project_root: &Path) -> Option<PathBuf> {
@@ -1813,13 +1752,14 @@ fn read_receipt_artifacts(dir: &Path) -> Option<Vec<(String, Vec<u8>)>> {
     let mut paths = fs::read_dir(dir)
         .ok()?
         .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .map(|entry| entry.path())
+        .filter(|path| umadev_state::fs::real_file(path))
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(is_receipt_artifact_name)
         })
+        .take(MAX_SKILL_RECEIPTS.saturating_mul(2).saturating_add(1))
         .collect::<Vec<_>>();
     paths.sort();
     if paths.len() > MAX_SKILL_RECEIPTS.saturating_mul(2) {
@@ -1857,50 +1797,6 @@ fn valid_receipt_artifact(name: &str, body: &str) -> bool {
     false
 }
 
-fn safe_final_file_or_absent(path: &Path) -> std::io::Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => Ok(meta.file_type().is_file()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(error),
-    }
-}
-
-fn open_temp_file(path: &Path) -> std::io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    options.open(path)
-}
-
-fn unique_temp_path(path: &Path) -> Option<PathBuf> {
-    let parent = path.parent()?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("skill");
-    Some(parent.join(format!(
-        ".{name}.{}.{}.{}.tmp",
-        std::process::id(),
-        stamp,
-        sequence
-    )))
-}
-
 fn replacement_backup_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
@@ -1909,118 +1805,17 @@ fn replacement_backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.replace-pending"))
 }
 
-fn recover_pending_replacement(path: &Path) -> std::io::Result<()> {
-    let backup = replacement_backup_path(path);
-    let backup_meta = match fs::symlink_metadata(&backup) {
-        Ok(meta) if meta.file_type().is_file() => Some(meta),
-        Ok(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "unsafe skill replacement backup",
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
-    if backup_meta.is_none() {
-        return Ok(());
-    }
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_file() => fs::remove_file(backup),
-        Ok(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "unsafe skill replacement target",
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::rename(backup, path),
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(windows)]
-fn replace_file_recoverably(temp_path: &Path, path: &Path) -> std::io::Result<()> {
-    let backup = replacement_backup_path(path);
-    recover_pending_replacement(path)?;
-    if fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
-        return fs::rename(temp_path, path);
-    }
-    if !safe_final_file_or_absent(path)? || !safe_final_file_or_absent(&backup)? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "unsafe skill replacement path",
-        ));
-    }
-    fs::rename(path, &backup)?;
-    match fs::rename(temp_path, path) {
-        Ok(()) => {
-            let _ = fs::remove_file(backup);
-            Ok(())
-        }
-        Err(error) => {
-            let restored = fs::rename(&backup, path);
-            if restored.is_err() {
-                return Err(std::io::Error::new(
-                    error.kind(),
-                    format!("{error}; prior skill data remains in {}", backup.display()),
-                ));
-            }
-            Err(error)
-        }
-    }
-}
-
-#[cfg(windows)]
-fn rename_replacing(temp_path: &Path, path: &Path) -> std::io::Result<()> {
-    fs::rename(temp_path, path).or_else(|_| replace_file_recoverably(temp_path, path))
-}
-
-#[cfg(not(windows))]
-fn rename_replacing(temp_path: &Path, path: &Path) -> std::io::Result<()> {
-    fs::rename(temp_path, path)
-}
-
 fn atomic_write_no_follow(path: &Path, body: &[u8]) -> std::io::Result<()> {
     #[cfg(test)]
     if FORCE_SKILL_WRITE_FAILURE.with(std::cell::Cell::get) {
         return Err(std::io::Error::other("forced skill write failure"));
     }
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "skill path has no parent")
-    })?;
-    if !fs::symlink_metadata(parent).is_ok_and(|meta| meta.file_type().is_dir())
-        || !safe_final_file_or_absent(path)?
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "unsafe skill output path",
-        ));
+    umadev_state::fs::atomic_write(path, body)?;
+    let legacy_backup = replacement_backup_path(path);
+    if umadev_state::fs::real_file(&legacy_backup) {
+        let _ = umadev_state::fs::remove_regular_file(&legacy_backup);
     }
-    recover_pending_replacement(path)?;
-    let temp_path = unique_temp_path(path).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "skill temp has no parent")
-    })?;
-    let mut temp = open_temp_file(&temp_path)?;
-    if let Err(error) = temp.write_all(body).and_then(|()| temp.sync_all()) {
-        drop(temp);
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    drop(temp);
-    if !fs::symlink_metadata(parent).is_ok_and(|meta| meta.file_type().is_dir())
-        || !safe_final_file_or_absent(path)?
-    {
-        let _ = fs::remove_file(&temp_path);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "skill output path changed during write",
-        ));
-    }
-    match rename_replacing(&temp_path, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&temp_path);
-            Err(error)
-        }
-    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2035,39 +1830,12 @@ fn publish_create_new(path: &Path, body: &[u8]) -> PublishResult {
     if FORCE_SKILL_WRITE_FAILURE.with(std::cell::Cell::get) {
         return PublishResult::Unavailable;
     }
-    let Some(parent) = path.parent() else {
-        return PublishResult::Unavailable;
-    };
-    if !fs::symlink_metadata(parent).is_ok_and(|meta| meta.file_type().is_dir()) {
-        return PublishResult::Unavailable;
-    }
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_file() => return PublishResult::AlreadyExists,
-        Ok(_) => return PublishResult::Unavailable,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return PublishResult::Unavailable,
-    }
-    let Some(temp_path) = unique_temp_path(path) else {
-        return PublishResult::Unavailable;
-    };
-    let Ok(mut temp) = open_temp_file(&temp_path) else {
-        return PublishResult::Unavailable;
-    };
-    if temp.write_all(body).is_err() || temp.sync_all().is_err() {
-        drop(temp);
-        let _ = fs::remove_file(&temp_path);
-        return PublishResult::Unavailable;
-    }
-    drop(temp);
-    if !fs::symlink_metadata(parent).is_ok_and(|meta| meta.file_type().is_dir()) {
-        let _ = fs::remove_file(&temp_path);
-        return PublishResult::Unavailable;
-    }
-    let published = fs::hard_link(&temp_path, path);
-    let _ = fs::remove_file(&temp_path);
-    match published {
+    match umadev_state::fs::write_new_private(path, body) {
         Ok(()) => PublishResult::Created,
-        Err(_) if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file()) => {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && umadev_state::fs::real_file(path) =>
+        {
             PublishResult::AlreadyExists
         }
         Err(_) => PublishResult::Unavailable,
@@ -2075,55 +1843,14 @@ fn publish_create_new(path: &Path, body: &[u8]) -> PublishResult {
 }
 
 struct StoreLease {
-    path: PathBuf,
-    token: String,
+    _guard: umadev_state::store_lock::StoreLock,
 }
 
 impl StoreLease {
     fn acquire(project_root: &Path) -> Option<Self> {
-        let dir = ensure_skills_dir(project_root)?;
-        let path = dir.join(".write.lock");
-        let token = next_receipt_nonce(project_root, "store-lock");
-        for _ in 0..50 {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    if file.write_all(token.as_bytes()).is_ok() && file.sync_all().is_ok() {
-                        return Some(Self { path, token });
-                    }
-                    let _ = fs::remove_file(&path);
-                    return None;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = fs::symlink_metadata(&path).is_ok_and(|meta| {
-                        meta.file_type().is_file()
-                            && meta
-                                .modified()
-                                .ok()
-                                .and_then(|modified| modified.elapsed().ok())
-                                .is_some_and(|age| age >= STORE_LOCK_STALE_AFTER)
-                    });
-                    if stale {
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(_) => return None,
-            }
-        }
-        None
-    }
-}
-
-impl Drop for StoreLease {
-    fn drop(&mut self) {
-        if read_text_no_follow(&self.path, 256).as_deref() == Some(self.token.as_str()) {
-            let _ = fs::remove_file(&self.path);
-        }
+        let guard =
+            umadev_state::store_lock::acquire(project_root, MemoryStore::LearnedSkills).ok()?;
+        Some(Self { _guard: guard })
     }
 }
 

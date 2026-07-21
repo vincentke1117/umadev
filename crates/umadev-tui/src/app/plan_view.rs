@@ -1,4 +1,4 @@
-use super::{plan_step_glyph, App, ChatRole};
+use super::{plan_step_glyph, Action, App, ChatRole};
 
 fn queued_text_preview(text: &str) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -115,6 +115,65 @@ impl App {
 
         body.push_str(umadev_i18n::t(self.lang, "plan.steer.usage"));
         self.push(ChatRole::UmaDev, body);
+    }
+
+    /// Fold a plan edit into the next same-session directive. Non-`add` forms
+    /// validate a live step id; every form requires a non-empty payload.
+    pub(super) fn steer_plan(&mut self, sub: &str, target: &str) -> Action {
+        if target.is_empty() {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "plan.steer.usage"),
+            );
+            return Action::None;
+        }
+        if sub != "add" && !self.plan_steps.iter().any(|step| step.id == target) {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(self.lang, "plan.steer.unknown_step", &[target]),
+            );
+            return Action::None;
+        }
+
+        let (directive, confirmation) = match sub {
+            "skip" => (
+                format!(
+                    "Plan steering: SKIP step `{target}` — do not perform it; proceed with the rest of the plan."
+                ),
+                umadev_i18n::tf(self.lang, "plan.steer.skip", &[target]),
+            ),
+            "veto" => (
+                format!(
+                    "Plan steering: VETO step `{target}` — remove it from the plan entirely and do not perform it."
+                ),
+                umadev_i18n::tf(self.lang, "plan.steer.veto", &[target]),
+            ),
+            "up" => (
+                format!(
+                    "Plan steering: REORDER step `{target}` EARLIER — do it before its current predecessors where dependencies allow."
+                ),
+                umadev_i18n::tf(self.lang, "plan.steer.move", &[target, "↑"]),
+            ),
+            "down" => (
+                format!(
+                    "Plan steering: REORDER step `{target}` LATER — defer it after its current successors where dependencies allow."
+                ),
+                umadev_i18n::tf(self.lang, "plan.steer.move", &[target, "↓"]),
+            ),
+            _ => (
+                format!("Plan steering: ADD a new step — {target}"),
+                umadev_i18n::tf(self.lang, "plan.steer.add", &[target]),
+            ),
+        };
+        self.queued_steer.push_back(directive);
+        self.push(ChatRole::UmaDev, confirmation);
+        if !self.is_pipeline_active() {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "plan.steer.queued"),
+            );
+        }
+        Action::None
     }
 }
 

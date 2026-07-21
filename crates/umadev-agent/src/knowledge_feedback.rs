@@ -14,15 +14,22 @@
 //! replay sees the same immutable receipt ID and the global publisher is
 //! idempotent. Every I/O failure stays fail-open and never changes a build verdict.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::lessons::RAW_DIR;
 use crate::memory_control::{capture_enabled, MemoryScope, MemoryStore};
+
+mod storage;
+use storage::{
+    ensure_receipts_dir, existing_receipts_dir, finalize_local_settlement, intent_path,
+    publish_create_new, read_managed_text, read_receipt, receipt_capacity_available, receipt_path,
+    settled_intent_path, valid_receipt_id, PublishResult,
+};
+#[cfg(test)]
+use storage::{prune_settled_receipts_to, receipt_artifact_name, settled_receipt_path};
 
 fn project_receipt_capture_enabled(project_root: &Path) -> bool {
     capture_enabled(
@@ -32,15 +39,15 @@ fn project_receipt_capture_enabled(project_root: &Path) -> bool {
     )
 }
 
-/// Project-local directory containing immutable sent receipts and outcome
-/// intents.
+/// Project-local directory containing active/settled sent receipts and only
+/// crash-recoverable outcome intents. Terminal local outcomes use a distinct
+/// suffix so recovery never replays the full history on every turn.
 pub const RECEIPTS_DIR: &str = "knowledge-receipts";
 
 /// Receipt schema version.
 const RECEIPT_VERSION: u8 = 1;
 
 static RECEIPT_ID_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static RECEIPT_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Compatibility snapshot for explicit experiments/tests. Production prompt
 /// assembly does not write it.
@@ -200,27 +207,27 @@ struct OutcomeIntent {
     publish_utility: bool,
 }
 
-/// Full path to the surfaced-chunks snapshot for a project.
-fn snapshot_path(project_root: &Path) -> std::path::PathBuf {
-    project_root.join(RAW_DIR).join(SURFACED_CHUNKS_FILE)
+fn canonical_project_boundary(project_root: &Path) -> Option<PathBuf> {
+    let root = std::fs::canonicalize(project_root).ok()?;
+    umadev_state::fs::real_dir(&root).then_some(root)
 }
 
-fn receipts_dir(project_root: &Path) -> PathBuf {
-    project_root.join(RAW_DIR).join(RECEIPTS_DIR)
+fn ensure_raw_dir(project_root: &Path) -> Option<PathBuf> {
+    let root = canonical_project_boundary(project_root)?;
+    let state = umadev_state::fs::ensure_real_child_dir(&root, ".umadev").ok()?;
+    let learned = umadev_state::fs::ensure_real_child_dir(&state, "learned").ok()?;
+    umadev_state::fs::ensure_real_child_dir(&learned, "_raw").ok()
 }
 
-fn receipt_path(project_root: &Path, receipt_id: &str) -> PathBuf {
-    receipts_dir(project_root).join(format!("{receipt_id}.receipt.json"))
-}
-
-fn intent_path(project_root: &Path, receipt_id: &str) -> PathBuf {
-    receipts_dir(project_root).join(format!("{receipt_id}.outcome.json"))
-}
-
-fn valid_receipt_id(receipt_id: &str) -> bool {
-    receipt_id.strip_prefix("kr1-").is_some_and(|digest| {
-        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })
+fn existing_raw_dir(project_root: &Path) -> Option<PathBuf> {
+    let root = canonical_project_boundary(project_root)?;
+    let state = root.join(".umadev");
+    let learned = state.join("learned");
+    let raw = learned.join("_raw");
+    let all_components_are_real = [state.as_path(), learned.as_path(), raw.as_path()]
+        .into_iter()
+        .all(umadev_state::fs::real_dir);
+    all_components_are_real.then_some(raw)
 }
 
 fn sha256_hex(value: &str) -> String {
@@ -245,63 +252,6 @@ fn next_receipt_id(prompt_hash: &str) -> String {
         stamp
     ));
     format!("kr1-{digest}")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PublishResult {
-    Created,
-    AlreadyExists,
-    Unavailable,
-}
-
-/// Publish bytes at `path` without ever replacing an existing writer. The temp
-/// is fully written and synced before the atomic hard-link create-new step.
-fn publish_create_new(path: &Path, body: &[u8]) -> PublishResult {
-    let Some(parent) = path.parent() else {
-        return PublishResult::Unavailable;
-    };
-    if std::fs::create_dir_all(parent).is_err()
-        || !std::fs::symlink_metadata(parent).is_ok_and(|meta| meta.file_type().is_dir())
-    {
-        return PublishResult::Unavailable;
-    }
-    if path.exists() {
-        return PublishResult::AlreadyExists;
-    }
-    let sequence = RECEIPT_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("knowledge-receipt");
-    let temp_path = parent.join(format!(
-        ".{name}.{}.{}.{}.tmp",
-        std::process::id(),
-        stamp,
-        sequence
-    ));
-    let Ok(mut temp) = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-    else {
-        return PublishResult::Unavailable;
-    };
-    if temp.write_all(body).is_err() || temp.sync_all().is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-        return PublishResult::Unavailable;
-    }
-    drop(temp);
-    let published = std::fs::hard_link(&temp_path, path);
-    let _ = std::fs::remove_file(&temp_path);
-    match published {
-        Ok(()) => PublishResult::Created,
-        Err(_) if path.exists() => PublishResult::AlreadyExists,
-        Err(_) => PublishResult::Unavailable,
-    }
 }
 
 /// Commit the exact memories present in a final directive after the host has
@@ -345,15 +295,19 @@ pub fn commit_sent_memories(
         memories: sent,
     };
     let body = serde_json::to_vec(&receipt).ok()?;
-    match publish_create_new(&receipt_path(project_root, &receipt_id), &body) {
+    let _store_lock =
+        umadev_state::store_lock::acquire(project_root, MemoryStore::KnowledgeReceipts).ok()?;
+    let dir = ensure_receipts_dir(project_root)?;
+    if !receipt_capacity_available(&dir) {
+        return None;
+    }
+    let path = receipt_path(&dir, &receipt_id);
+    match publish_create_new(&path, &body) {
         PublishResult::Created => Some(receipt_id),
-        PublishResult::AlreadyExists => {
-            std::fs::read_to_string(receipt_path(project_root, &receipt_id))
-                .ok()
-                .and_then(|existing| serde_json::from_str::<SentMemoryReceipt>(&existing).ok())
-                .filter(|existing| existing == &receipt)
-                .map(|_| receipt_id)
-        }
+        PublishResult::AlreadyExists => read_managed_text(&path)
+            .and_then(|existing| serde_json::from_str::<SentMemoryReceipt>(&existing).ok())
+            .filter(|existing| existing == &receipt)
+            .map(|_| receipt_id),
         PublishResult::Unavailable => None,
     }
 }
@@ -394,13 +348,35 @@ fn settle_receipt_with_home(
     if !valid_receipt_id(receipt_id) {
         return ReceiptSettlement::NotFound;
     }
-    let Some(receipt) = std::fs::read_to_string(receipt_path(project_root, receipt_id))
-        .ok()
-        .and_then(|body| serde_json::from_str::<SentMemoryReceipt>(&body).ok())
-        .filter(|receipt| receipt.version == RECEIPT_VERSION && receipt.receipt_id == receipt_id)
+    let Ok(_store_lock) =
+        umadev_state::store_lock::acquire(project_root, MemoryStore::KnowledgeReceipts)
     else {
+        return ReceiptSettlement::Deferred;
+    };
+    let Some(dir) = existing_receipts_dir(project_root) else {
         return ReceiptSettlement::NotFound;
     };
+    let Some(receipt) = read_receipt(&dir, receipt_id) else {
+        return ReceiptSettlement::NotFound;
+    };
+    let terminal_path = settled_intent_path(&dir, receipt_id);
+    if std::fs::symlink_metadata(&terminal_path).is_ok() {
+        let Some(intent) = read_managed_text(&terminal_path)
+            .and_then(|body| serde_json::from_str::<OutcomeIntent>(&body).ok())
+            .filter(|intent| intent.version == RECEIPT_VERSION && intent.receipt_id == receipt_id)
+        else {
+            return ReceiptSettlement::Conflict;
+        };
+        if intent.outcome != outcome {
+            return ReceiptSettlement::Conflict;
+        }
+        let _ = finalize_local_settlement(&dir, &receipt, &intent);
+        return if outcome == TurnOutcome::Unknown || intent.publish_utility {
+            ReceiptSettlement::AlreadySettled
+        } else {
+            ReceiptSettlement::SuppressedByPolicy
+        };
+    }
     // Issuing a receipt is automatic capture and is gated at commit. Settling an
     // already-issued receipt remains allowed after project capture is disabled:
     // it closes causal state rather than opening a new attribution attempt.
@@ -418,25 +394,24 @@ fn settle_receipt_with_home(
     let Some(body) = serde_json::to_vec(&proposed_intent).ok() else {
         return ReceiptSettlement::Deferred;
     };
-    let (newly_recorded, intent) =
-        match publish_create_new(&intent_path(project_root, receipt_id), &body) {
-            PublishResult::Created => (true, proposed_intent),
-            PublishResult::AlreadyExists => {
-                let existing = std::fs::read_to_string(intent_path(project_root, receipt_id))
-                    .ok()
-                    .and_then(|existing| serde_json::from_str::<OutcomeIntent>(&existing).ok());
-                let Some(existing) = existing.filter(|existing| {
-                    existing.version == RECEIPT_VERSION
-                        && existing.receipt_id == receipt_id
-                        && existing.outcome == outcome
-                }) else {
-                    return ReceiptSettlement::Conflict;
-                };
-                (false, existing)
-            }
-            PublishResult::Unavailable => return ReceiptSettlement::Deferred,
-        };
+    let (newly_recorded, intent) = match publish_create_new(&intent_path(&dir, receipt_id), &body) {
+        PublishResult::Created => (true, proposed_intent),
+        PublishResult::AlreadyExists => {
+            let existing = read_managed_text(&intent_path(&dir, receipt_id))
+                .and_then(|existing| serde_json::from_str::<OutcomeIntent>(&existing).ok());
+            let Some(existing) = existing.filter(|existing| {
+                existing.version == RECEIPT_VERSION
+                    && existing.receipt_id == receipt_id
+                    && existing.outcome == outcome
+            }) else {
+                return ReceiptSettlement::Conflict;
+            };
+            (false, existing)
+        }
+        PublishResult::Unavailable => return ReceiptSettlement::Deferred,
+    };
     if outcome == TurnOutcome::Unknown {
+        let _ = finalize_local_settlement(&dir, &receipt, &intent);
         return if newly_recorded {
             ReceiptSettlement::Settled
         } else {
@@ -444,6 +419,7 @@ fn settle_receipt_with_home(
         };
     }
     if !intent.publish_utility {
+        let _ = finalize_local_settlement(&dir, &receipt, &intent);
         return ReceiptSettlement::SuppressedByPolicy;
     }
     let write = match home {
@@ -462,19 +438,33 @@ fn settle_receipt_with_home(
         ),
     };
     match write {
-        umadev_knowledge::ReceiptOutcomeWrite::Recorded => ReceiptSettlement::Settled,
-        umadev_knowledge::ReceiptOutcomeWrite::AlreadyRecorded => ReceiptSettlement::AlreadySettled,
+        umadev_knowledge::ReceiptOutcomeWrite::Recorded => {
+            let _ = finalize_local_settlement(&dir, &receipt, &intent);
+            ReceiptSettlement::Settled
+        }
+        umadev_knowledge::ReceiptOutcomeWrite::AlreadyRecorded => {
+            let _ = finalize_local_settlement(&dir, &receipt, &intent);
+            ReceiptSettlement::AlreadySettled
+        }
         umadev_knowledge::ReceiptOutcomeWrite::SuppressedByPolicy => {
+            let _ = finalize_local_settlement(&dir, &receipt, &intent);
             ReceiptSettlement::SuppressedByPolicy
         }
         umadev_knowledge::ReceiptOutcomeWrite::Unavailable => ReceiptSettlement::Deferred,
-        umadev_knowledge::ReceiptOutcomeWrite::Conflict => ReceiptSettlement::Conflict,
+        umadev_knowledge::ReceiptOutcomeWrite::Conflict => {
+            if newly_recorded {
+                let _ = umadev_state::fs::remove_regular_file(&intent_path(&dir, receipt_id));
+            }
+            ReceiptSettlement::Conflict
+        }
     }
 }
 
-/// Replay durable outcome intents left between local settlement and global
-/// usefulness publication. Returns how many intents are now settled. A corrupt
-/// file or unavailable home is ignored; it never affects the host turn.
+/// Replay only durable, unfinished outcome intents left between local
+/// settlement and global usefulness publication. Terminal outcomes are moved
+/// out of this suffix, so cost follows outstanding crash recovery work rather
+/// than total historical turns. Returns how many intents are now settled. A
+/// corrupt file or unavailable home is ignored; it never affects the host turn.
 pub fn recover_recorded_outcomes(project_root: &Path) -> usize {
     recover_recorded_outcomes_with_home(project_root, None)
 }
@@ -485,7 +475,10 @@ pub fn recover_recorded_outcomes_in(project_root: &Path, home: &Path) -> usize {
 }
 
 fn recover_recorded_outcomes_with_home(project_root: &Path, home: Option<&Path>) -> usize {
-    let Ok(entries) = std::fs::read_dir(receipts_dir(project_root)) else {
+    let Some(dir) = existing_receipts_dir(project_root) else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     let mut intents = entries
@@ -501,7 +494,7 @@ fn recover_recorded_outcomes_with_home(project_root: &Path, home: Option<&Path>)
     intents.sort();
     intents
         .into_iter()
-        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .filter_map(|path| read_managed_text(&path))
         .filter_map(|body| serde_json::from_str::<OutcomeIntent>(&body).ok())
         .filter(|intent| intent.version == RECEIPT_VERSION)
         .filter(|intent| {
@@ -522,11 +515,13 @@ pub fn record_surfaced_chunks(project_root: &Path, keys: &[(String, String)]) {
     if !project_receipt_capture_enabled(project_root) {
         return;
     }
-    let raw_dir = project_root.join(RAW_DIR);
-    let _ = std::fs::create_dir_all(&raw_dir);
+    let Some(raw_dir) = ensure_raw_dir(project_root) else {
+        return;
+    };
     let bounded: Vec<&(String, String)> = keys.iter().take(MAX_TRACKED_CHUNKS).collect();
     if let Ok(json) = serde_json::to_string(&bounded) {
-        let _ = std::fs::write(raw_dir.join(SURFACED_CHUNKS_FILE), json);
+        let _ =
+            umadev_state::fs::atomic_write(&raw_dir.join(SURFACED_CHUNKS_FILE), json.as_bytes());
     }
 }
 
@@ -535,8 +530,8 @@ pub fn record_surfaced_chunks(project_root: &Path, keys: &[(String, String)]) {
 /// empty vec (no feedback), never an error.
 #[must_use]
 pub fn read_surfaced_chunks(project_root: &Path) -> Vec<(String, String)> {
-    std::fs::read_to_string(snapshot_path(project_root))
-        .ok()
+    existing_raw_dir(project_root)
+        .and_then(|raw| read_managed_text(&raw.join(SURFACED_CHUNKS_FILE)))
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default()
 }
@@ -614,10 +609,9 @@ mod tests {
         );
         let token = commit_sent_memories(project.path(), &prompt, &[kept.clone(), dropped])
             .expect("a kept memory creates a receipt");
-        let receipt: SentMemoryReceipt = serde_json::from_str(
-            &std::fs::read_to_string(receipt_path(project.path(), &token)).unwrap(),
-        )
-        .unwrap();
+        let dir = existing_receipts_dir(project.path()).expect("managed receipt directory");
+        let receipt: SentMemoryReceipt =
+            serde_json::from_str(&read_managed_text(&receipt_path(&dir, &token)).unwrap()).unwrap();
         assert_eq!(receipt.sent_prompt_sha256, sha256_hex(&prompt));
         assert_eq!(receipt.memories, vec![kept]);
     }
@@ -755,6 +749,88 @@ mod tests {
     }
 
     #[test]
+    fn settled_outcomes_leave_no_replayable_history() {
+        let project = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        enable_utility_capture(home.path());
+        let m = memory(
+            "backend/http.md",
+            "Retries",
+            "Retry only transient failures.",
+        );
+        let token = commit(project.path(), &m, "settled once");
+        assert_eq!(
+            settle_receipt_in(project.path(), home.path(), &token, TurnOutcome::Pass),
+            ReceiptSettlement::Settled
+        );
+        let dir = existing_receipts_dir(project.path()).unwrap();
+        assert!(!intent_path(&dir, &token).exists());
+        assert!(settled_receipt_path(&dir, &token).is_file());
+        assert_eq!(recover_recorded_outcomes_in(project.path(), home.path()), 0);
+        assert_eq!(
+            settle_receipt_in(project.path(), home.path(), &token, TurnOutcome::Pass),
+            ReceiptSettlement::AlreadySettled
+        );
+        assert_eq!(recover_recorded_outcomes_in(project.path(), home.path()), 0);
+    }
+
+    #[test]
+    fn settled_receipt_retention_is_bounded_without_deleting_active_work() {
+        let project = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let m = memory("runtime/recovery.md", "State", "Retain pending work.");
+        for index in 0..4 {
+            let token = commit(project.path(), &m, &format!("terminal {index}"));
+            assert_eq!(
+                settle_receipt_in(project.path(), home.path(), &token, TurnOutcome::Unknown),
+                ReceiptSettlement::Settled
+            );
+        }
+        let active = commit(project.path(), &m, "still active");
+        let dir = existing_receipts_dir(project.path()).unwrap();
+        prune_settled_receipts_to(&dir, 3, 2);
+        let receipt_count = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(receipt_artifact_name)
+            })
+            .count();
+        assert_eq!(receipt_count, 2, "one settled plus one active receipt");
+        assert!(receipt_path(&dir, &active).is_file());
+    }
+
+    #[test]
+    fn receipt_retention_prunes_when_the_limit_is_exactly_full() {
+        let project = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let m = memory("runtime/recovery.md", "State", "Keep bounded evidence.");
+        for index in 0..3 {
+            let token = commit(project.path(), &m, &format!("terminal {index}"));
+            assert_eq!(
+                settle_receipt_in(project.path(), home.path(), &token, TurnOutcome::Unknown),
+                ReceiptSettlement::Settled
+            );
+        }
+        let dir = existing_receipts_dir(project.path()).unwrap();
+        prune_settled_receipts_to(&dir, 3, 2);
+        let remaining = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(receipt_artifact_name)
+            })
+            .count();
+        assert_eq!(remaining, 2);
+    }
+
+    #[test]
     fn snapshot_round_trips_and_is_bounded() {
         let tmp = tempfile::TempDir::new().unwrap();
         let keys: Vec<(String, String)> = (0..(MAX_TRACKED_CHUNKS + 5))
@@ -834,7 +910,7 @@ mod tests {
         let m = memory("security/login.md", "OAuth", "Use PKCE.");
         let prompt = format!("{}\nUse the memory.", sent_memory_marker(&m.id));
         assert!(commit_sent_memories(project.path(), &prompt, &[m]).is_none());
-        assert!(!receipts_dir(project.path()).exists());
+        assert!(existing_receipts_dir(project.path()).is_none());
 
         record_surfaced_chunks(project.path(), &[key("security/login.md", "OAuth")]);
         assert!(read_surfaced_chunks(project.path()).is_empty());
@@ -871,10 +947,45 @@ mod tests {
             ReceiptSettlement::SuppressedByPolicy
         );
         enable_utility_capture(home.path());
-        assert_eq!(recover_recorded_outcomes_in(project.path(), home.path()), 1);
+        assert_eq!(recover_recorded_outcomes_in(project.path(), home.path()), 0);
         assert!(
             UsefulnessStore::load_from(home.path()).is_empty(),
             "later opt-in must not publish an outcome settled while capture was off"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_and_snapshot_writes_never_follow_managed_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let memory = memory("security/login.md", "OAuth", "Use PKCE.");
+        let prompt = format!("{}\nUse the memory.", sent_memory_marker(&memory.id));
+
+        let project = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".umadev/learned")).unwrap();
+        symlink(outside.path(), project.path().join(".umadev/learned/_raw")).unwrap();
+        assert!(
+            commit_sent_memories(project.path(), &prompt, std::slice::from_ref(&memory)).is_none()
+        );
+        record_surfaced_chunks(project.path(), &[key("security/login.md", "OAuth")]);
+        assert!(read_surfaced_chunks(project.path()).is_empty());
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+
+        let project = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".umadev/learned/_raw")).unwrap();
+        symlink(
+            outside.path(),
+            project
+                .path()
+                .join(".umadev/learned/_raw/knowledge-receipts"),
+        )
+        .unwrap();
+        assert!(
+            commit_sent_memories(project.path(), &prompt, std::slice::from_ref(&memory)).is_none()
+        );
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 }

@@ -7,7 +7,14 @@ fn outcome_bodies(project_root: &std::path::Path) -> Vec<String> {
     std::fs::read_dir(dir)
         .unwrap()
         .filter_map(Result::ok)
-        .filter(|entry| entry.path().to_string_lossy().ends_with(".outcome.json"))
+        .filter(|entry| {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            name.ends_with(".outcome.json") || name.ends_with(".settled-outcome.json")
+        })
         .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
         .collect()
 }

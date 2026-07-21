@@ -29,6 +29,12 @@ use crate::vector;
 /// every major search engine ships with; changing them is rarely warranted.
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
+pub(crate) const MAX_KNOWLEDGE_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_KNOWLEDGE_CORPUS_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_BM25_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SIGNATURE_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_VECTOR_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_INDEX_CHUNKS: usize = 20_000;
 
 /// Schema version of the on-disk BM25 cache. The corpus signature keys on file
 /// CONTENT (machine-independent), but content alone doesn't capture a change to
@@ -38,7 +44,7 @@ const B: f64 = 0.75;
 /// is folded into [`corpus_source_signature`], so an old `.sig` can no longer match).
 /// Bump it whenever `tokenizer::tokenize`, the chunker, or the `Bm25Index`
 /// layout changes in a way that alters indexed tokens.
-const INDEX_SCHEMA_VERSION: u32 = 5;
+const INDEX_SCHEMA_VERSION: u32 = 6;
 
 /// One inverted-index entry: the term, and the chunks that contain it with
 /// per-chunk term frequency.
@@ -131,9 +137,10 @@ impl Bm25Index {
         }
     }
 
-    /// Validate the index's internal cross-references: every `term_map`
-    /// posting index points at a real `Posting`, and every posting's
-    /// `(chunk_idx, _)` points at a real `Chunk`.
+    /// Validate every redundant field and internal cross-reference in a loaded
+    /// cache. This rejects not only out-of-bounds indices, but also mismatched
+    /// document statistics, duplicate/misdirected term mappings, non-finite
+    /// averages, and impossible term frequencies.
     ///
     /// serde validates the SHAPE of a deserialised `bm25.bin`, NOT its internal
     /// consistency — a corrupt-but-shape-valid cache could carry an index past
@@ -145,16 +152,68 @@ impl Bm25Index {
     pub fn is_consistent(&self) -> bool {
         let n_postings = self.postings.len();
         let n_chunks = self.chunks.len();
-        if self
-            .term_map
-            .iter()
-            .any(|(_, idx)| *idx as usize >= n_postings)
+        if n_chunks > MAX_INDEX_CHUNKS
+            || u64::try_from(n_chunks).ok() != Some(self.doc_count)
+            || !self.avg_doc_len.is_finite()
+            || self.avg_doc_len < 0.0
+            || self.term_map.len() != n_postings
         {
             return false;
         }
-        self.postings
+        let total_len = self
+            .chunks
             .iter()
-            .all(|p| p.docs.iter().all(|(c, _)| (*c as usize) < n_chunks))
+            .try_fold(0_usize, |total, chunk| total.checked_add(chunk.bm25_len()));
+        let Some(total_len) = total_len else {
+            return false;
+        };
+        let expected_average = if n_chunks == 0 {
+            0.0
+        } else {
+            total_len as f64 / n_chunks as f64
+        };
+        if (self.avg_doc_len - expected_average).abs()
+            > f64::EPSILON * expected_average.max(1.0) * 4.0
+        {
+            return false;
+        }
+
+        let mut seen_postings = vec![false; n_postings];
+        let mut previous_term: Option<&str> = None;
+        for (term, index) in &self.term_map {
+            if term.is_empty() || previous_term.is_some_and(|previous| previous >= term.as_str()) {
+                return false;
+            }
+            let Some(posting) = self.postings.get(*index as usize) else {
+                return false;
+            };
+            if posting.term != *term || seen_postings[*index as usize] {
+                return false;
+            }
+            seen_postings[*index as usize] = true;
+            previous_term = Some(term);
+        }
+        if seen_postings.iter().any(|seen| !seen) {
+            return false;
+        }
+
+        self.postings.iter().all(|posting| {
+            if posting.term.is_empty() || posting.docs.is_empty() || posting.docs.len() > n_chunks {
+                return false;
+            }
+            let mut previous_chunk = None;
+            posting.docs.iter().all(|(chunk_index, term_frequency)| {
+                let Some(chunk) = self.chunks.get(*chunk_index as usize) else {
+                    return false;
+                };
+                let ordered = previous_chunk.is_none_or(|previous| previous < *chunk_index);
+                previous_chunk = Some(*chunk_index);
+                ordered
+                    && *term_frequency > 0
+                    && usize::try_from(*term_frequency)
+                        .is_ok_and(|frequency| frequency <= chunk.tokens.len())
+            })
+        })
     }
 
     /// HashMap view of `term_map` for query-time lookup. Cheap to build.
@@ -396,11 +455,11 @@ pub fn bm25_search<'a>(index: &'a Bm25Index, query: &str, top_k: usize) -> Vec<(
 }
 
 fn real_dir_no_follow(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+    umadev_state::fs::real_dir(path)
 }
 
 fn real_file_no_follow(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+    umadev_state::fs::real_file(path)
 }
 
 fn canonical_real_boundary(boundary: &Path) -> Option<PathBuf> {
@@ -409,17 +468,15 @@ fn canonical_real_boundary(boundary: &Path) -> Option<PathBuf> {
 }
 
 fn ensure_real_child_dir(parent: &Path, child: &Path) -> bool {
-    if !real_dir_no_follow(parent) {
+    let Some(name) = child
+        .parent()
+        .filter(|candidate| *candidate == parent)
+        .and_then(|_| child.file_name())
+        .and_then(|name| name.to_str())
+    else {
         return false;
-    }
-    match std::fs::symlink_metadata(child) {
-        Ok(meta) => meta.file_type().is_dir(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let _ = std::fs::create_dir(child);
-            real_dir_no_follow(parent) && real_dir_no_follow(child)
-        }
-        Err(_) => false,
-    }
+    };
+    umadev_state::fs::ensure_real_child_dir(parent, name).is_ok()
 }
 
 fn existing_managed_umadev_dir(boundary: &Path) -> Option<PathBuf> {
@@ -461,16 +518,13 @@ pub(crate) fn ensure_managed_cache_dir(project_root: &Path) -> Option<PathBuf> {
     ensure_real_child_dir(&umadev, &cache).then_some(cache)
 }
 
-pub(crate) fn read_regular_file_no_follow(path: &Path) -> Option<Vec<u8>> {
+pub(crate) fn read_regular_file_no_follow(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
     real_file_no_follow(path)
-        .then(|| std::fs::read(path).ok())
+        .then(|| umadev_state::fs::read_bounded(path, max_bytes).ok())
         .flatten()
 }
 
 pub(crate) fn write_atomic_in_real_dir(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let Some(parent) = path.parent() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -483,37 +537,7 @@ pub(crate) fn write_atomic_in_real_dir(path: &Path, bytes: &[u8]) -> std::io::Re
             "cache parent is not a real directory",
         ));
     }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("cache");
-    let temporary = parent.join(format!(
-        ".{name}.{}.{}.{}.tmp",
-        std::process::id(),
-        stamp,
-        sequence
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
-    }
-    drop(file);
-    match std::fs::rename(&temporary, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            Err(error)
-        }
-    }
+    umadev_state::fs::atomic_write(path, bytes)
 }
 
 /// Purge cache artifacts created under an older corpus/privacy schema before
@@ -534,7 +558,7 @@ fn prepare_cache_schema_with_remove(
     };
     let expected = INDEX_SCHEMA_VERSION.to_string();
     let marker = cache_dir.join("schema");
-    if read_regular_file_no_follow(&marker)
+    if read_regular_file_no_follow(&marker, 64)
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .is_some_and(|value| value.trim() == expected)
     {
@@ -587,8 +611,49 @@ struct CorpusSource {
     scope: CorpusScope,
 }
 
+fn read_knowledge_text(path: &Path) -> std::io::Result<String> {
+    let bytes = umadev_state::fs::read_bounded(path, MAX_KNOWLEDGE_FILE_BYTES)?;
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn bounded_corpus_files(files: Vec<CorpusFile>) -> Vec<CorpusFile> {
+    let mut total_bytes = 0u64;
+    let mut bounded = Vec::with_capacity(files.len());
+    let mut skipped = 0usize;
+    for file in files {
+        let Ok(metadata) = std::fs::symlink_metadata(file.path()) else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        let size = metadata.len();
+        let Some(next_total) = total_bytes.checked_add(size) else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        if !umadev_state::fs::metadata_is_real_file(&metadata)
+            || size > MAX_KNOWLEDGE_FILE_BYTES
+            || next_total > MAX_KNOWLEDGE_CORPUS_BYTES
+        {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+        total_bytes = next_total;
+        bounded.push(file);
+    }
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            per_file_bytes = MAX_KNOWLEDGE_FILE_BYTES,
+            corpus_bytes = MAX_KNOWLEDGE_CORPUS_BYTES,
+            "knowledge files outside the bounded local index budget were skipped"
+        );
+    }
+    bounded
+}
+
 fn collect_corpus_sources(files: &[CorpusFile]) -> Vec<CorpusSource> {
-    collect_corpus_sources_with_reader(files, |path| std::fs::read_to_string(path))
+    collect_corpus_sources_with_reader(files, read_knowledge_text)
 }
 
 fn collect_corpus_sources_with_reader(
@@ -628,7 +693,7 @@ fn collect_corpus_sources_with_reader(
 }
 
 fn materialize_corpus_sources(sources: Vec<CorpusSource>) -> Vec<CorpusSource> {
-    materialize_corpus_sources_with_reader(sources, |path| std::fs::read_to_string(path))
+    materialize_corpus_sources_with_reader(sources, read_knowledge_text)
 }
 
 fn materialize_corpus_sources_with_reader(
@@ -649,12 +714,15 @@ fn materialize_corpus_sources_with_reader(
 
 fn load_cached_index(project_root: &Path, signature: &str) -> Option<Bm25Index> {
     let cache_dir = existing_managed_cache_dir(project_root)?;
-    let stored_signature =
-        String::from_utf8(read_regular_file_no_follow(&cache_dir.join("bm25.sig"))?).ok()?;
+    let stored_signature = String::from_utf8(read_regular_file_no_follow(
+        &cache_dir.join("bm25.sig"),
+        MAX_SIGNATURE_BYTES,
+    )?)
+    .ok()?;
     if stored_signature != signature {
         return None;
     }
-    let bytes = read_regular_file_no_follow(&cache_dir.join("bm25.bin"))?;
+    let bytes = read_regular_file_no_follow(&cache_dir.join("bm25.bin"), MAX_BM25_CACHE_BYTES)?;
     let index = serde_json::from_slice::<Bm25Index>(&bytes).ok()?;
     (index.cache_signature == signature && index.is_consistent()).then_some(index)
 }
@@ -676,6 +744,11 @@ fn build_index_from_sources(sources: &[CorpusSource]) -> Bm25Index {
             chunk.meta.corpus_origin = source.origin;
             chunk.meta.corpus_scope = source.scope;
         }
+        let remaining = MAX_INDEX_CHUNKS.saturating_sub(chunks.len());
+        if remaining == 0 {
+            break;
+        }
+        file_chunks.truncate(remaining);
         chunks.extend(file_chunks);
     }
     Bm25Index::from_chunks(chunks)
@@ -706,7 +779,7 @@ pub fn load_or_build_index_multi(project_root: &Path, knowledge_dirs: &[PathBuf]
 #[must_use]
 pub fn load_or_build_index_corpus(project_root: &Path, corpus: &CorpusSet) -> Bm25Index {
     prepare_cache_schema(project_root);
-    let files = corpus.markdown_files();
+    let files = bounded_corpus_files(corpus.markdown_files());
     // Learned files are read and reviewed exactly once here. The reviewed text
     // supplies both its signature and, on a rebuild, every generated chunk.
     // This closes the audit -> hash -> chunk path-reopen race.
@@ -740,6 +813,9 @@ pub fn load_or_build_index_corpus(project_root: &Path, corpus: &CorpusSet) -> Bm
         ensure_managed_cache_dir(project_root),
         serde_json::to_vec(&index),
     ) {
+        if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_BM25_CACHE_BYTES {
+            return index;
+        }
         let sig_path = cache_dir.join("bm25.sig");
         let path = cache_dir.join("bm25.bin");
         // Write the signature ONLY when the index write actually SUCCEEDED. Writing
@@ -957,7 +1033,7 @@ fn file_content_hash(
     // Slow path: memo miss / changed metadata / unstat-able → read + hash once.
     // A read failure short-circuits BEFORE the counter bumps, so `content_reads`
     // counts only files actually read from disk (fail-open: the file is skipped).
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = umadev_state::fs::read_bounded(path, MAX_KNOWLEDGE_FILE_BYTES).ok()?;
     *content_reads += 1;
     let hash_hex = content_hash(&bytes);
     // Only cacheable when we have a `(mtime, size)` to key on; otherwise the next
@@ -2300,6 +2376,61 @@ B: {sb}"
             !idx.is_consistent(),
             "term_map index past postings detected"
         );
+    }
+
+    #[test]
+    fn is_consistent_rejects_corrupt_statistics_and_term_mapping() {
+        let original = idx_from(&[
+            ("a.md", "# A\n\n## S\n\nlogin auth"),
+            ("b.md", "# B\n\n## S\n\nlogin token"),
+        ]);
+
+        let mut wrong_count = original.clone();
+        wrong_count.doc_count = wrong_count.doc_count.saturating_add(1);
+        assert!(!wrong_count.is_consistent());
+
+        let mut non_finite_average = original.clone();
+        non_finite_average.avg_doc_len = f64::NAN;
+        assert!(!non_finite_average.is_consistent());
+
+        let mut wrong_average = original.clone();
+        wrong_average.avg_doc_len += 1.0;
+        assert!(!wrong_average.is_consistent());
+
+        let mut misdirected_term = original.clone();
+        let mapped_index = misdirected_term.term_map[0].1 as usize;
+        misdirected_term.postings[mapped_index].term = "different".into();
+        assert!(!misdirected_term.is_consistent());
+
+        let mut duplicate_mapping = original.clone();
+        duplicate_mapping.term_map[1].1 = duplicate_mapping.term_map[0].1;
+        assert!(!duplicate_mapping.is_consistent());
+    }
+
+    #[test]
+    fn is_consistent_rejects_invalid_posting_payloads() {
+        let original = idx_from(&[
+            ("a.md", "# A\n\n## S\n\nlogin auth"),
+            ("b.md", "# B\n\n## S\n\nlogin token"),
+        ]);
+        let posting_index = original
+            .postings
+            .iter()
+            .position(|posting| posting.docs.len() > 1)
+            .expect("fixture has a shared term");
+
+        let mut zero_frequency = original.clone();
+        zero_frequency.postings[posting_index].docs[0].1 = 0;
+        assert!(!zero_frequency.is_consistent());
+
+        let mut duplicate_document = original.clone();
+        let first = duplicate_document.postings[posting_index].docs[0];
+        duplicate_document.postings[posting_index].docs[1].0 = first.0;
+        assert!(!duplicate_document.is_consistent());
+
+        let mut impossible_frequency = original;
+        impossible_frequency.postings[posting_index].docs[0].1 = u32::MAX;
+        assert!(!impossible_frequency.is_consistent());
     }
 
     #[test]

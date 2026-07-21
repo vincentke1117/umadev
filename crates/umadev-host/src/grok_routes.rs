@@ -159,10 +159,9 @@ impl SessionRouteGraph {
         {
             return Err(RouteError::Unauthorized);
         }
-        let node = self
-            .nodes
-            .remove(&finished.child_session_id)
-            .expect("route checked above");
+        let Some(node) = self.nodes.remove(&finished.child_session_id) else {
+            return Ok(false);
+        };
         self.subagents.remove(&node.subagent_id);
         if let Some(siblings) = self.children.get_mut(&node.current_parent) {
             siblings.remove(&finished.child_session_id);

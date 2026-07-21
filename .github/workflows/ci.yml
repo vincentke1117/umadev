@@ -82,7 +82,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: xai-org/grok-build
-          ref: 8adf9013a0929e5c7f1d4e849492d2387837a28d
+          ref: a881e6703f46b01d8c7d4a5437683546df30449d
           path: _upstream/grok-build
           fetch-depth: 1
       - name: Install Rust toolchain
@@ -101,16 +101,16 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: grok-0.2.101-linux-x86_64
-            sha256: 2556299cded37f81e54c02420cfa7f1a2df9feab72a445869a0f5596e143b333
+            artifact: grok-0.2.106-linux-x86_64
+            sha256: 7180d0e03cc2a496033ff3aae2223ce239446a9827a59faa76091c7edd5e1c38
             binary: grok
           - os: macos-latest
-            artifact: grok-0.2.101-macos-aarch64
-            sha256: 8431538dbd99379240f558b48b779c651d668b06d793c87311ad532c4395a4e2
+            artifact: grok-0.2.106-macos-aarch64
+            sha256: 7229f5e2a69b05832c86db82bebda541e92b5c24958fbfacf5c8f463394d3027
             binary: grok
           - os: windows-latest
-            artifact: grok-0.2.101-windows-x86_64.exe
-            sha256: fc4351df2e13b6bf99534f52296800ab90d09252e028907453d4f1586b2f0991
+            artifact: grok-0.2.106-windows-x86_64.exe
+            sha256: a6a25d55daadca0c2458a5aceb4c1873eb7c76964ef307647d079e344c53969a
             binary: grok.exe
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -133,7 +133,7 @@ jobs:
           printf '%s  %s\n' '${{ matrix.sha256 }}' "$binary" | shasum -a 256 --check
           chmod +x "$binary"
           version=$("$binary" --version)
-          [[ "$version" =~ ^grok\ 0\.2\.101\ \([0-9a-f]+\)$ ]]
+          [[ "$version" =~ ^grok\ 0\.2\.106\ \([0-9a-f]+\)$ ]]
           printf 'UMADEV_GROK_BIN=%s\n' "$binary" >> "$GITHUB_ENV"
       - name: Download and verify the exact official Grok artifact (Windows)
         if: runner.os == 'Windows'
@@ -150,7 +150,7 @@ jobs:
           $actual = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
           if ($actual -ne '${{ matrix.sha256 }}') { throw "Grok artifact SHA-256 mismatch: $actual" }
           $version = (& $binary --version | Out-String).Trim()
-          if ($version -notmatch '^grok 0\.2\.101 \([0-9a-f]+\)$') { throw "Unexpected Grok version: $version" }
+          if ($version -notmatch '^grok 0\.2\.106 \([0-9a-f]+\)$') { throw "Unexpected Grok version: $version" }
           "UMADEV_GROK_BIN=$binary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Verify real ACP identity and explicit authentication boundary
         env:
@@ -166,7 +166,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: MoonshotAI/kimi-code
-          ref: 36b05820cba24e09fdff19a059afc08ccea2c35e
+          ref: efacf0452d46f5dbd67499eabc053869495d5213
           path: _upstream/kimi-code
           fetch-depth: 1
       - name: Install Rust toolchain
@@ -193,13 +193,30 @@ jobs:
         with:
           node-version: "22.19.0"
       - name: Install the exact audited npm package
-        run: npm install -g @moonshot-ai/kimi-code@0.26.0
+        run: npm install -g @moonshot-ai/kimi-code@0.28.1
       - name: Verify real ACP identity and terminal-owned authentication
         env:
           KIMI_CODE_HOME: ${{ runner.temp }}/umadev-kimi-code-home
           UMADEV_KIMI_BIN: kimi
           UMADEV_KIMI_PUBLISHED_CONTRACT: "1"
         run: cargo test -p umadev-host --test kimi_published_contract -- --nocapture
+
+  vendor-cli-published-contract:
+    name: published vendor CLI contract (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.19.0"
+      - name: Install the exact audited Claude Code, Codex, and OpenCode packages
+        run: npm install -g @anthropic-ai/claude-code@2.1.216 @openai/codex@0.144.6 opencode-ai@1.18.4
+      - name: Verify real published command and permission surfaces
+        run: node npm/scripts/vendor-cli-contract.mjs
 
   terminal-contract:
     name: terminal contract (${{ matrix.os }})
@@ -251,13 +268,17 @@ jobs:
           node-version: "20"
       - name: Verify Cargo, npm, and website versions
         run: node npm/scripts/verify-version-lock.mjs
+      - name: Verify npm registry visibility and retry contracts
+        run: node --test npm/scripts/publish-registry.test.cjs
+      - name: Verify platform binary header contracts
+        run: node --test npm/scripts/verify-platform-binaries.test.mjs
       - name: Verify launcher, updater, and split-version repair
         run: ./npm/scripts/smoke.sh
 
   build-release:
     name: build release (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: [fmt, clippy, docs, test, grok-source-contract, grok-published-contract, kimi-source-contract, kimi-published-contract, terminal-contract, msrv, npm-shim]
+    needs: [fmt, clippy, docs, test, grok-source-contract, grok-published-contract, kimi-source-contract, kimi-published-contract, vendor-cli-published-contract, terminal-contract, msrv, npm-shim]
     strategy:
       fail-fast: false
       matrix:

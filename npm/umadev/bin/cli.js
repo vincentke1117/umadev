@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: MIT
+// umadev-governance: allow-es5-bootstrap
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // umadev — ES5-only launch shim. THIS FILE MUST PARSE ON ANCIENT NODE.

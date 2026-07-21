@@ -153,6 +153,25 @@ pub fn is_transient(f: &BaseFailure) -> bool {
     )
 }
 
+/// Whether captured base evidence proves that the resident protocol transport
+/// itself is no longer usable. This is deliberately narrower than a network or
+/// HTTP failure: a bare 502, timeout, rate limit, or request error may leave the
+/// session healthy, while these markers describe the worker/RPC channel having
+/// closed permanently. Callers must discard that session even when process-exit
+/// status has not propagated yet.
+#[must_use]
+pub fn session_transport_is_lost(evidence: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "transport channel closed",
+        "worker quit with fatal",
+        "rpc channel closed",
+        "json-rpc channel closed",
+        "protocol channel closed",
+    ];
+    let hay = evidence.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| hay.contains(marker))
+}
+
 /// Whether a [`BaseFailure`] is **capability-degradable** — the base is ALIVE and
 /// answering, but the gateway refused ONE optional hosted tool it reached for (a
 /// hosted `web_search`). An advisory research/planning turn can DEGRADE past this by
@@ -894,6 +913,26 @@ mod tests {
             classify(None, Some("SSL handshake failed"), None),
             BaseFailure::Network { ssl: true }
         );
+    }
+
+    #[test]
+    fn only_terminal_protocol_markers_invalidate_a_resident_session() {
+        assert!(session_transport_is_lost(
+            "rmcp::transport: worker quit with fatal: Transport channel closed"
+        ));
+        assert!(session_transport_is_lost("JSON-RPC channel closed"));
+        assert!(session_transport_is_lost("protocol channel closed"));
+
+        assert!(!session_transport_is_lost(
+            "unexpected status 502 Bad Gateway"
+        ));
+        assert!(!session_transport_is_lost(
+            "HTTP 502 while handling one request"
+        ));
+        assert!(!session_transport_is_lost(
+            "API Error: Request rejected (429) — usage limit"
+        ));
+        assert!(!session_transport_is_lost("request timed out"));
     }
 
     #[test]

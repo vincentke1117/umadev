@@ -524,9 +524,12 @@ mod codex {
             t.set_implicit(true);
             doc["mcp_servers"] = Item::Table(t);
         }
-        let servers = doc["mcp_servers"]
-            .as_table_like_mut()
-            .expect("just ensured table-like");
+        let Some(servers) = doc["mcp_servers"].as_table_like_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mcp_servers configuration is not table-like",
+            ));
+        };
 
         let mut srv = Table::new();
         if let Some(url) = &entry.url {

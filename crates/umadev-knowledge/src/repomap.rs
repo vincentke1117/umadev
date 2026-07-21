@@ -49,6 +49,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use regex::Regex;
+use sha2::{Digest as _, Sha256};
 
 /// Source extensions we extract symbols from. A subset of the acceptance
 /// crate's `SRC_EXT` (we only map *code*, not styles/markup), kept local so
@@ -1872,6 +1873,12 @@ fn truncate_sig(sig: &str, max: usize) -> String {
 /// Cache directory for the repo map, relative to the project root.
 pub const REPOMAP_CACHE_DIR: &str = ".umadev/repomap-cache";
 
+/// A valid cache can be sizeable in a very large repository (40k bounded
+/// symbols plus import edges), but it must never be an unbounded read from a
+/// workspace-controlled path.
+const MAX_REPOMAP_CACHE_BYTES: u64 = 96 * 1024 * 1024;
+const MAX_REPOMAP_SIGNATURE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Schema version of the repo-map cache. The signature keys on each file's
 /// mtime+size, which captures CONTENT edits but NOT a change to the symbol-scan
 /// regexes / `SymbolKind` set / cache encoding: after such an upgrade the cached
@@ -1881,7 +1888,35 @@ pub const REPOMAP_CACHE_DIR: &str = ".umadev/repomap-cache";
 ///
 /// v2: import edges ([`SymbolIndex::edges`], `E`-lines in the wire form) +
 /// fan-in ranking — v1 caches carry no edges and must rebuild.
-const REPOMAP_SCHEMA_VERSION: u32 = 2;
+///
+/// v3: the index body carries the digest of its signature. This makes the two
+/// atomic cache files one logical generation: racing writers can cause a
+/// harmless miss, but can never pair one writer's signature with another
+/// writer's symbol body and return a false cache hit.
+const REPOMAP_SCHEMA_VERSION: u32 = 3;
+
+fn canonical_real_root(root: &Path) -> Option<PathBuf> {
+    let root = std::fs::canonicalize(root).ok()?;
+    umadev_state::fs::real_dir(&root).then_some(root)
+}
+
+fn existing_repomap_cache_dir(root: &Path) -> Option<PathBuf> {
+    let root = canonical_real_root(root)?;
+    let umadev = root.join(".umadev");
+    let cache = umadev.join("repomap-cache");
+    (umadev_state::fs::real_dir(&umadev) && umadev_state::fs::real_dir(&cache)).then_some(cache)
+}
+
+fn ensure_repomap_cache_dir(root: &Path) -> Option<PathBuf> {
+    let root = canonical_real_root(root)?;
+    let umadev = umadev_state::fs::ensure_real_child_dir(&root, ".umadev").ok()?;
+    umadev_state::fs::ensure_real_child_dir(&umadev, "repomap-cache").ok()
+}
+
+fn read_cache_file(dir: &Path, name: &str, max_bytes: u64) -> Option<Vec<u8>> {
+    let path = dir.join(name);
+    umadev_state::fs::read_bounded(&path, max_bytes).ok()
+}
 
 /// One in-process memo entry: the resolved index plus the cheap freshness keys.
 struct MemoEntry {
@@ -1978,27 +2013,34 @@ fn load_or_scan_full(root: &Path) -> SymbolIndex {
         return SymbolIndex::default();
     }
     let signature = mtime_signature(&files, root);
-    let cache_dir = root.join(REPOMAP_CACHE_DIR);
-    let sig_path = cache_dir.join("signature.txt");
-    let data_path = cache_dir.join("symbols.json");
-
     // Cache hit: signature matches AND the data deserialises.
-    if let Ok(stored_sig) = std::fs::read_to_string(&sig_path) {
-        if stored_sig == signature {
-            if let Ok(bytes) = std::fs::read(&data_path) {
-                if let Some(index) = decode_index(&bytes) {
-                    return index;
-                }
+    if let Some(cache_dir) = existing_repomap_cache_dir(root) {
+        let stored_sig = read_cache_file(&cache_dir, "signature.txt", MAX_REPOMAP_SIGNATURE_BYTES)
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        if stored_sig.as_deref() == Some(signature.as_str()) {
+            if let Some(index) =
+                read_cache_file(&cache_dir, "symbols.json", MAX_REPOMAP_CACHE_BYTES)
+                    .and_then(|bytes| decode_index(&bytes, &signature))
+            {
+                return index;
             }
         }
     }
 
     // Miss → scan and best-effort write the cache.
     let index = scan(root);
-    if let Some(bytes) = encode_index(&index) {
-        let _ = std::fs::create_dir_all(&cache_dir);
-        let _ = std::fs::write(&data_path, bytes);
-        let _ = std::fs::write(&sig_path, &signature);
+    if let (Some(cache_dir), Some(bytes)) = (
+        ensure_repomap_cache_dir(root),
+        encode_index(&index, &signature),
+    ) {
+        // Body first, signature last: the signature is the generation commit
+        // record. The digest inside the body rejects a cross-writer pairing.
+        if umadev_state::fs::atomic_write(&cache_dir.join("symbols.json"), &bytes).is_ok() {
+            let _ = umadev_state::fs::atomic_write(
+                &cache_dir.join("signature.txt"),
+                signature.as_bytes(),
+            );
+        }
     }
     index
 }
@@ -2006,8 +2048,9 @@ fn load_or_scan_full(root: &Path) -> SymbolIndex {
 /// Force the next [`symbol_index`] / [`repo_map`] call to re-scan by deleting
 /// the cache signature. Fail-open (a missing cache is a no-op).
 pub fn invalidate_cache(root: &Path) {
-    let sig_path = root.join(REPOMAP_CACHE_DIR).join("signature.txt");
-    let _ = std::fs::remove_file(sig_path);
+    if let Some(cache_dir) = existing_repomap_cache_dir(root) {
+        let _ = umadev_state::fs::remove_regular_file(&cache_dir.join("signature.txt"));
+    }
     // Also drop the in-process fast-path memo, else the next call would return
     // the still-fresh memoized index instead of truly re-scanning. Fail-open: a
     // poisoned lock leaves the memo (the TTL still expires it shortly).
@@ -2057,9 +2100,14 @@ fn mtime_signature(files: &[PathBuf], root: &Path) -> String {
 /// Encode an index to the private cache wire form. Returns `None` on any
 /// internal write error (never happens for `String`, but keeps the call site
 /// uniformly fail-open).
-fn encode_index(index: &SymbolIndex) -> Option<Vec<u8>> {
+fn signature_digest(signature: &str) -> String {
+    format!("{:x}", Sha256::digest(signature.as_bytes()))
+}
+
+fn encode_index(index: &SymbolIndex, signature: &str) -> Option<Vec<u8>> {
     use std::fmt::Write as _;
     let mut s = String::new();
+    writeln!(s, "H\t{}", signature_digest(signature)).ok()?;
     for f in &index.files {
         // F-line: file path + score.
         writeln!(s, "F\t{}\t{}", escape(&f.rel_path), f.score).ok()?;
@@ -2085,16 +2133,43 @@ fn encode_index(index: &SymbolIndex) -> Option<Vec<u8>> {
 }
 
 /// Decode the private cache wire form. Any malformed line → `None` (cache miss).
-fn decode_index(bytes: &[u8]) -> Option<SymbolIndex> {
+fn decode_index(bytes: &[u8], expected_signature: &str) -> Option<SymbolIndex> {
+    if u64::try_from(bytes.len()).ok()? > MAX_REPOMAP_CACHE_BYTES {
+        return None;
+    }
     let text = std::str::from_utf8(bytes).ok()?;
     let mut files: Vec<FileSymbols> = Vec::new();
     let mut edges: Vec<(usize, usize)> = Vec::new();
-    for line in text.lines() {
+    let mut symbols = 0usize;
+    let max_edges = limits::MAX_FILES.saturating_mul(import_limits::MAX_IMPORTS_PER_FILE);
+    let max_lines = 1usize
+        .saturating_add(limits::MAX_FILES)
+        .saturating_add(limits::MAX_TOTAL_SYMBOLS)
+        .saturating_add(max_edges);
+    for (line_index, line) in text.lines().enumerate() {
+        if line_index >= max_lines {
+            return None;
+        }
         let mut parts = line.split('\t');
         match parts.next()? {
+            "H" if line_index == 0 => {
+                if parts.next()? != signature_digest(expected_signature) || parts.next().is_some() {
+                    return None;
+                }
+            }
             "F" => {
-                let rel_path = unescape(parts.next()?);
+                if line_index == 0 || files.len() >= limits::MAX_FILES {
+                    return None;
+                }
+                let encoded_path = parts.next()?;
+                if encoded_path.len() > limits::MAX_LINE_BYTES.saturating_mul(4) {
+                    return None;
+                }
+                let rel_path = unescape(encoded_path);
                 let score = parts.next()?.parse::<f64>().ok()?;
+                if !score.is_finite() || parts.next().is_some() {
+                    return None;
+                }
                 files.push(FileSymbols {
                     rel_path,
                     symbols: Vec::new(),
@@ -2102,12 +2177,30 @@ fn decode_index(bytes: &[u8]) -> Option<SymbolIndex> {
                 });
             }
             "S" => {
+                if line_index == 0 || symbols >= limits::MAX_TOTAL_SYMBOLS {
+                    return None;
+                }
                 let f = files.last_mut()?;
+                if f.symbols.len() >= limits::MAX_SYMBOLS_PER_FILE {
+                    return None;
+                }
                 let kind = kind_from_code(parts.next()?)?;
-                let exported = parts.next()? == "1";
+                let exported = match parts.next()? {
+                    "0" => false,
+                    "1" => true,
+                    _ => return None,
+                };
                 let lineno = parts.next()?.parse::<usize>().ok()?;
-                let name = unescape(parts.next()?);
-                let signature = unescape(parts.next()?);
+                let encoded_name = parts.next()?;
+                let encoded_signature = parts.next()?;
+                if encoded_name.len() > limits::MAX_LINE_BYTES.saturating_mul(2)
+                    || encoded_signature.len() > limits::MAX_LINE_BYTES.saturating_mul(2)
+                    || parts.next().is_some()
+                {
+                    return None;
+                }
+                let name = unescape(encoded_name);
+                let signature = unescape(encoded_signature);
                 f.symbols.push(Symbol {
                     name,
                     kind,
@@ -2115,14 +2208,24 @@ fn decode_index(bytes: &[u8]) -> Option<SymbolIndex> {
                     line: lineno,
                     exported,
                 });
+                symbols = symbols.saturating_add(1);
             }
             "E" => {
+                if line_index == 0 || edges.len() >= max_edges {
+                    return None;
+                }
                 let from = parts.next()?.parse::<usize>().ok()?;
                 let to = parts.next()?.parse::<usize>().ok()?;
+                if parts.next().is_some() {
+                    return None;
+                }
                 edges.push((from, to));
             }
             _ => return None,
         }
+    }
+    if !text.starts_with("H\t") {
+        return None;
     }
     // An edge pointing outside the file set is corrupt → cache miss.
     if edges
@@ -2755,6 +2858,38 @@ mod tests {
         assert!(sig_path.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cache_read_write_and_invalidation_never_follow_a_managed_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.rs", "pub fn one() {}\n");
+        fs::create_dir(root.join(".umadev")).unwrap();
+        fs::write(outside.path().join("signature.txt"), "outside-signature").unwrap();
+        fs::write(outside.path().join("symbols.json"), "outside-symbols").unwrap();
+        symlink(outside.path(), root.join(".umadev").join("repomap-cache")).unwrap();
+
+        let scanned = load_or_scan_full(root);
+        assert_eq!(
+            scanned.symbol_count(),
+            1,
+            "unsafe cache falls back to a live scan"
+        );
+        invalidate_cache(root);
+
+        assert_eq!(
+            fs::read_to_string(outside.path().join("signature.txt")).unwrap(),
+            "outside-signature"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("symbols.json")).unwrap(),
+            "outside-symbols"
+        );
+    }
+
     #[test]
     fn cache_roundtrip_preserves_index() {
         let index = SymbolIndex {
@@ -2771,15 +2906,21 @@ mod tests {
             }],
             edges: Vec::new(),
         };
-        let bytes = encode_index(&index).unwrap();
-        let back = decode_index(&bytes).unwrap();
+        let bytes = encode_index(&index, "sig-a").unwrap();
+        let back = decode_index(&bytes, "sig-a").unwrap();
         assert_eq!(index, back);
     }
 
     #[test]
     fn decode_rejects_garbage_returns_none() {
-        assert!(decode_index(b"not a valid cache line\n").is_none());
-        assert!(decode_index(b"\xff\xfe\x00").is_none()); // invalid UTF-8
+        assert!(decode_index(b"not a valid cache line\n", "sig-a").is_none());
+        assert!(decode_index(b"\xff\xfe\x00", "sig-a").is_none()); // invalid UTF-8
+    }
+
+    #[test]
+    fn decode_rejects_a_body_from_another_signature_generation() {
+        let bytes = encode_index(&SymbolIndex::default(), "sig-a").unwrap();
+        assert!(decode_index(&bytes, "sig-b").is_none());
     }
 
     // --- (6) fail-open: empty / unreadable / pathological --------------------
@@ -3410,8 +3551,8 @@ mod tests {
             files: vec![one_sym_file("a.ts"), one_sym_file("b.ts")],
             edges: vec![(0, 1)],
         };
-        let bytes = encode_index(&index).unwrap();
-        let back = decode_index(&bytes).unwrap();
+        let bytes = encode_index(&index, "sig-a").unwrap();
+        let back = decode_index(&bytes, "sig-a").unwrap();
         assert_eq!(index, back);
     }
 
@@ -3421,10 +3562,10 @@ mod tests {
             files: vec![one_sym_file("a.ts")],
             edges: Vec::new(),
         };
-        let mut bytes = encode_index(&index).unwrap();
+        let mut bytes = encode_index(&index, "sig-a").unwrap();
         bytes.extend_from_slice(b"E\t0\t5\n");
         assert!(
-            decode_index(&bytes).is_none(),
+            decode_index(&bytes, "sig-a").is_none(),
             "edge past the file set is corrupt"
         );
     }

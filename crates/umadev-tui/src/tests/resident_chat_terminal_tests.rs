@@ -789,11 +789,9 @@ async fn fallback_write_records_build_truth_without_flagship_qc() {
     );
 }
 
-/// Plan trust mode is enforced by the session-permission layer, INDEPENDENT of
-/// routing. Stage B removed the pre-action verdict, so there is no model class to
-/// "cap" — a build-shaped request under Plan simply runs a resident read-only reply
-/// and never enters the Director or writes Director workflow state. This proves the
-/// Plan guardrail still holds without the barrier.
+/// Plan trust mode is a hard execution ceiling independent of the model verdict.
+/// A build-shaped request under Plan stays in a mechanically read-only resident
+/// session and never enters the Director or writes workflow state.
 #[tokio::test]
 async fn plan_mode_build_request_stays_a_resident_read_only_reply() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -855,14 +853,12 @@ async fn plan_mode_build_request_stays_a_resident_read_only_reply() {
     );
 }
 
-/// B1 + B2: a build-shaped request with NO explicit `/run` no longer forks to
-/// `run_director_loop` before acting. It runs on the resident writer session and is
-/// upgraded REACTIVELY the moment the base writes real code — the Build-shaped card,
-/// the reactive governance QC (with the flag on), and the governance context all fire
-/// off the OBSERVED write, not a pre-action verdict, and NO `DirectorStarted`
-/// transition is ever emitted from chat.
+/// Availability-fallback proof: when a scripted base cannot fork for model intent,
+/// a build-shaped request stays on the resident writer and upgrades on the first
+/// observed code write. A healthy model-owned Build takes the Director path; this
+/// fallback never fabricates that authority from deterministic keywords.
 #[tokio::test]
-async fn build_shaped_chat_reaches_resident_writer_and_upgrades_on_first_write() {
+async fn fallback_build_shaped_chat_upgrades_on_first_observed_write() {
     let _qc = ReactiveQcOverride::force(true);
     let tmp = tempfile::TempDir::new().unwrap();
     let (events, routes) = drive_resident_turn(
@@ -904,11 +900,9 @@ async fn build_shaped_chat_reaches_resident_writer_and_upgrades_on_first_write()
     );
 }
 
-/// B4 — the ONE routing rule kept from the removed barrier: an EXPLICIT read-only
-/// request ("只分析，不要修改任何文件") forces a non-mutating, non-isolating turn in EVERY
-/// trust mode (Guarded AND Auto), so the base is jailed read-only and cannot write even
-/// under Auto. Observed via the read-only park disposition plus the absence of any
-/// write-side governance (no writer lock, no persisted governance context).
+/// Explicit read-only wording is a hard authorization ceiling in every writable
+/// trust mode. It forces a non-mutating, non-isolating turn even when model routing
+/// is unavailable, so Auto can never override the user's prohibition.
 #[tokio::test]
 async fn explicit_read_only_request_stays_read_only_in_guarded_and_auto() {
     for (mode, perms) in [
@@ -980,9 +974,9 @@ async fn explicit_read_only_request_stays_read_only_in_guarded_and_auto() {
 
 /// The reported bug: a read-only "find the repo" request used to be stranded — a
 /// low-confidence fallback verdict jailed the base in plan mode, where it could not use
-/// tools and re-planned forever. Under the reactive model the base just ACTS on a
-/// write-capable resident session, so it freely uses read-only tools (no plan-mode jail,
-/// no ExitPlanMode deadlock) and settles as an ordinary resident reply.
+/// tools and re-planned forever. When model routing is unavailable, a low-confidence
+/// deterministic read-only guess deliberately stays on the writable resident sandbox;
+/// the base can use inspection tools without a plan-mode/ExitPlanMode deadlock.
 #[tokio::test]
 async fn find_the_repo_read_only_request_runs_and_is_not_stranded() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1177,9 +1171,9 @@ async fn bash_file_change_is_post_turn_work_but_quick_edit_skips_flagship_qc() {
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // No routing fork under the reactive model: the base just acts. A Bash write is
-    // real work (the post-turn git delta proves it), but with no reactive-QC flag it
-    // never launches the flagship team QC.
+    // The scripted base has no intent fork, so this is the availability fallback.
+    // A Bash write is real work (the post-turn git delta proves it), but with no
+    // reactive-QC flag it never launches flagship team QC.
     let (writer, sent, _ended) = FakeChatSession::new(vec![vec![
         umadev_runtime::SessionEvent::ToolCall {
             name: "Bash".into(),
@@ -1263,9 +1257,9 @@ async fn docs_only_write_does_not_become_code_build_or_run_flagship_qc() {
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // No routing fork under the reactive model. A single doc/markdown write is
-    // legitimate pre-development work: the `is_doc_artifact_path` latch keeps
-    // `react_to_first_write` from firing, so the turn never becomes a code build.
+    // A single doc/markdown write is legitimate scoped work: the
+    // `is_doc_artifact_path` latch keeps `react_to_first_write` from firing, so
+    // the turn never becomes a code build even though its mutation is audited.
     let (writer, sent, _ended) = FakeChatSession::new(vec![vec![
         umadev_runtime::SessionEvent::ToolCall {
             name: "Write".into(),
@@ -1300,12 +1294,15 @@ async fn docs_only_write_does_not_become_code_build_or_run_flagship_qc() {
         })
     ));
     assert_eq!(sent.lock().unwrap().len(), 1, "a doc write has no QC turn");
-    // A doc-only write never latches a build, so — like a pure chat — it opens no
-    // durable writer-ledger run (the up-front entry task was keyed off a mutating seed
-    // route, which no longer exists).
+    // The explicit document mutation is durably auditable, but remains a light
+    // writer task rather than an implicit code build or flagship QC run.
+    let runs = umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 1);
     assert!(
-        umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 1).is_empty(),
-        "a doc-only write does not enter the durable writer ledger"
+        matches!(
+            runs.first().map(|run| &run.readiness),
+            Some(umadev_agent::task_lifecycle::RunReadiness::Succeeded)
+        ),
+        "an explicit doc mutation settles one successful audit entry: {runs:?}"
     );
     while let Ok(event) = engine_rx.try_recv() {
         if let EngineEvent::Note(note) = event {

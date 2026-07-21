@@ -1099,10 +1099,12 @@ async fn triage_once(
     serde_json::from_str::<BrainRoute>(&json).ok()
 }
 
-/// Map the brain's triage verdict into an owned [`RoutePlan`] under the strict,
-/// approval-gated posture (a missing/garbled write authorization is never treated
-/// as permission). This is the [`crate::trust::TrustMode::Guarded`] reading; the
-/// mode-aware [`brain_to_route_in_mode`] is what the live routing surfaces call.
+/// Map the raw brain triage verdict into an owned [`RoutePlan`] under the strict,
+/// approval-gated posture. A missing/garbled model authorization is not itself
+/// permission at this layer. Public routing subsequently reconciles that model
+/// verdict with an unmistakable user-authored edit command before applying the
+/// read-only and mode ceilings. This is the [`crate::trust::TrustMode::Guarded`]
+/// reading; the mode-aware [`brain_to_route_in_mode`] is what live surfaces call.
 /// Test-only: every production caller threads the session's real trust mode.
 #[cfg(test)]
 fn brain_to_route(brain: &BrainRoute, requirement: &str) -> RoutePlan {
@@ -1114,16 +1116,15 @@ fn brain_to_route(brain: &BrainRoute, requirement: &str) -> RoutePlan {
 /// depth (from complexity), the kind, and the implied team. An unparseable field
 /// falls back to the lightest sensible value.
 ///
-/// `mode` gates ONE boundary: whether a brain-classified mutating turn is demoted to
-/// read-only because its separate `authorization` field is not an affirmative
-/// `mutating`. Under the approval-gated tiers (Guarded / Plan) it is — a missing or
-/// non-affirmative verdict is not permission, so their gate is never bypassed. Under
-/// [`crate::trust::TrustMode::Auto`] the user has pre-authorized autonomy, so the
-/// brain's mutating CLASS verdict is authoritative and the auth field alone no longer
-/// vetoes it (genuine read-only is still enforced by the user-wording and mode
-/// ceilings applied afterward). This is the fix for a build under AUTO being trapped
-/// in a read-only planning turn, which forces claude-code into its native plan mode
-/// and can never transition to execution.
+/// `mode` gates ONE model-derived boundary: whether a brain-classified mutating turn
+/// is demoted because its separate `authorization` field is not affirmative. Under
+/// Guarded / Plan it is; under [`crate::trust::TrustMode::Auto`] the mutating CLASS
+/// stands because the user pre-authorized autonomy. This raw mapping does not let a
+/// weak model field overrule an unmistakable user-authored edit command: the public
+/// route restores that explicit intent in Auto and Guarded, then applies the user's
+/// read-only wording and the Plan ceiling afterward. This prevents both the Auto
+/// native-plan deadlock and the Guarded contradiction where “修复” was reported as
+/// read-only while retaining Guarded's real action approval gates.
 fn brain_to_route_in_mode(
     brain: &BrainRoute,
     requirement: &str,
@@ -1154,9 +1155,9 @@ fn brain_to_route_in_mode(
     if kind == TaskKind::DocsOnly && class == RouteClass::Build {
         class = RouteClass::QuickEdit;
     }
-    // Mutation requires an affirmative typed verdict on both brain-routing surfaces;
-    // a missing or malformed authorization field is not permission under the
-    // approval-gated tiers (Guarded / Plan), whose gate must never be bypassed.
+    // Model-derived mutation requires an affirmative typed verdict under Guarded /
+    // Plan at this raw mapping layer. Public routing may still restore an explicit
+    // USER command under Guarded; doing so does not bypass its action approval gates.
     //
     // Under AUTO the user has pre-authorized autonomy, so the brain's mutating CLASS
     // verdict IS the intent and the separate `authorization` field no longer vetoes
@@ -1264,39 +1265,56 @@ fn brain_to_route_in_mode(
     }
 }
 
-/// Apply the deterministic ceilings shared by every model-routed public surface.
-/// Typed write authorization is enforced while mapping the brain verdict in
-/// [`brain_to_route`]; these final boundaries prevent either explicit user wording
-/// or the session mode from restoring mutation authority afterward.
+/// Reconcile and bound every model-routed public surface. An unmistakable user edit
+/// command first repairs a mistaken read-only model verdict in Auto / Guarded; the
+/// user's own explicit read-only wording and the session's Plan ceiling are then
+/// applied last and cannot be bypassed.
 fn apply_route_ceilings(
     plan: RoutePlan,
     requirement: &str,
     mode: crate::trust::TrustMode,
 ) -> RoutePlan {
-    let plan = apply_explicit_auto_mutation_floor(plan, requirement, mode);
+    let plan = apply_explicit_mutation_floor(plan, requirement, mode);
     apply_mode_ceiling(apply_authorization_ceiling(plan, requirement), mode)
 }
 
-/// In Auto, an unmistakable user edit command outranks a mistaken read-only model
-/// class. Ambiguous prose stays model-owned; explicit read-only wording still wins
-/// in the ceilings applied immediately afterward.
-fn apply_explicit_auto_mutation_floor(
+/// Outside Plan mode, an unmistakable user edit command outranks a mistaken
+/// read-only model class. The brain's `authorization` value is a model verdict,
+/// not a replacement for the user's own instruction. Guarded mode remains safe:
+/// it may route the turn as mutating, while consequential actions still pause at
+/// its approval gates. Ambiguous prose stays model-owned; explicit read-only
+/// wording and Plan mode still win in the ceilings applied immediately afterward.
+fn apply_explicit_mutation_floor(
     plan: RoutePlan,
     requirement: &str,
     mode: crate::trust::TrustMode,
 ) -> RoutePlan {
-    if mode != crate::trust::TrustMode::Auto
+    if mode == crate::trust::TrustMode::Plan
         || plan.class.mutates_workspace()
         || !explicit_mutation_command(requirement)
     {
         return plan;
     }
-    let floor = tier0(requirement);
-    if floor.class.mutates_workspace() {
-        floor
-    } else {
-        plan
+    let mut floor = tier0(requirement);
+    if !floor.class.mutates_workspace() {
+        return plan;
     }
+
+    // The deterministic planner can infer a product-shaped kind from the nouns in
+    // a tiny edit (for example “把登录页标题改成 Welcome”). At this repair boundary
+    // it is allowed to restore WRITE intent, not inflate a scoped edit into the full
+    // director workflow. Preserve a genuine Debug classification, and preserve a
+    // Build only for unmistakable create/full-feature wording; everything else is
+    // the resident QuickEdit lane.
+    if floor.class == RouteClass::Build && !clear_build_request(requirement) {
+        floor.class = RouteClass::QuickEdit;
+        floor.kind = TaskKind::Light;
+        floor.depth = Depth::Fast;
+        floor.team.clear();
+        floor.est_budget = Budget::for_route(floor.class, floor.depth);
+    }
+
+    floor
 }
 
 /// Apply user-authored read-only constraints to a route. The base model owns
@@ -1683,8 +1701,8 @@ fn clear_mutation_request(requirement: &str) -> bool {
     .any(|needle| q.contains(needle))
 }
 
-/// Narrow imperative belt for Auto's authority floor. It intentionally excludes
-/// past-work questions, explanations, and quoted/read-only constraints.
+/// Narrow imperative belt for the non-Plan authority floor. It intentionally
+/// excludes past-work questions, explanations, and quoted/read-only constraints.
 fn explicit_mutation_command(requirement: &str) -> bool {
     if explicit_read_only_request(requirement) || explicit_observation_only_request(requirement) {
         return false;
@@ -2162,14 +2180,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_brain_route_requires_typed_write_authorization() {
+    async fn public_brain_route_honours_explicit_user_write_when_brain_auth_is_missing() {
         let brain = TriageBrain(
             "{\"class\":\"quick_edit\",\"kind\":\"light\",\"complexity\":\"simple\",\"confidence\":0.8}",
         );
         let p = route_via_brain(&brain, "把标题改成 Welcome").await;
 
-        assert_eq!(p.class, RouteClass::Explain);
-        assert!(!p.class.mutates_workspace());
+        assert_eq!(p.class, RouteClass::QuickEdit);
+        assert!(p.class.mutates_workspace());
         assert!(!p.uses_director_workflow());
         assert!(p.team.is_empty());
     }
@@ -2820,7 +2838,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_explicit_fix_command_cannot_be_stranded_in_read_only_explain() {
+    fn explicit_fix_command_cannot_be_stranded_in_read_only_explain() {
         let wrong = BrainRoute {
             class: "explain".to_string(),
             authorization: "read_only".to_string(),
@@ -2830,25 +2848,30 @@ mod tests {
             ..Default::default()
         };
 
-        for request in [
-            "修复以上发现的问题",
-            "请你修复这个循环",
-            "把这个权限问题修复掉",
-            "please fix the review loop",
+        for mode in [
+            crate::trust::TrustMode::Guarded,
+            crate::trust::TrustMode::Auto,
         ] {
-            let route = apply_route_ceilings(
-                brain_to_route_in_mode(&wrong, request, crate::trust::TrustMode::Auto),
-                request,
-                crate::trust::TrustMode::Auto,
-            );
-            assert!(route.class.mutates_workspace(), "{request}");
-            assert_eq!(route.depth, Depth::Fast, "{request}");
-            assert!(route.team.is_empty(), "{request}");
+            for request in [
+                "修复以上发现的问题",
+                "请你修复这个循环",
+                "把这个权限问题修复掉",
+                "please fix the review loop",
+            ] {
+                let route = apply_route_ceilings(
+                    brain_to_route_in_mode(&wrong, request, mode),
+                    request,
+                    mode,
+                );
+                assert!(route.class.mutates_workspace(), "{mode:?}: {request}");
+                assert_eq!(route.depth, Depth::Fast, "{mode:?}: {request}");
+                assert!(route.team.is_empty(), "{mode:?}: {request}");
+            }
         }
     }
 
     #[test]
-    fn auto_mutation_floor_does_not_promote_questions_or_read_only_constraints() {
+    fn mutation_floor_does_not_promote_questions_or_read_only_constraints() {
         let wrong = BrainRoute {
             class: "explain".to_string(),
             authorization: "read_only".to_string(),
@@ -2856,18 +2879,23 @@ mod tests {
             complexity: "simple".to_string(),
             ..Default::default()
         };
-        for request in [
-            "为什么还没有修复？",
-            "这个问题修复了吗？",
-            "只分析原因，不要修改任何文件",
-            "目前什么进展了",
+        for mode in [
+            crate::trust::TrustMode::Guarded,
+            crate::trust::TrustMode::Auto,
         ] {
-            let route = apply_route_ceilings(
-                brain_to_route_in_mode(&wrong, request, crate::trust::TrustMode::Auto),
-                request,
-                crate::trust::TrustMode::Auto,
-            );
-            assert!(!route.class.mutates_workspace(), "{request}");
+            for request in [
+                "为什么还没有修复？",
+                "这个问题修复了吗？",
+                "只分析原因，不要修改任何文件",
+                "目前什么进展了",
+            ] {
+                let route = apply_route_ceilings(
+                    brain_to_route_in_mode(&wrong, request, mode),
+                    request,
+                    mode,
+                );
+                assert!(!route.class.mutates_workspace(), "{mode:?}: {request}");
+            }
         }
 
         let planned = apply_route_ceilings(

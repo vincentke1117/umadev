@@ -15,6 +15,8 @@ mod file_safety;
 pub use file_safety::{check_hard_delete, check_insecure_file_perms, check_toctou_race};
 mod security_rules;
 pub use security_rules::{check_command_injection, check_template_injection, check_weak_crypto};
+mod var_declarations;
+pub use var_declarations::check_var_declarations;
 
 /// Outcome of a governance rule.
 ///
@@ -7599,48 +7601,6 @@ pub fn check_wildcard_imports(file_path: &str, content: &str) -> Decision {
                  `{file_path}` has {hits} `import *` statements — this prevents \
                  bundlers from removing unused code, bloating the bundle. Use \
                  named imports: `import {{ formatDate, parseDate }} from './utils'`.",
-            ),
-        )
-    } else {
-        Decision::pass()
-    }
-}
-
-/// **UG-LINT-008**: ban `var` declarations (use `let`/`const`).
-///
-/// `var` has function-scoped hoisting — it causes subtle bugs (temporal dead
-/// zone violations, leaked loop variables). Commercial code must use block-
-/// scoped `let`/`const`. Conservative: only flags when there are more than 2
-/// `var` declarations (a single legacy `var` is tolerable). Runs on JS/TS.
-#[must_use]
-pub fn check_var_declarations(file_path: &str, content: &str) -> Decision {
-    let ext = extension_of(file_path);
-    if !matches!(ext.as_str(), "ts" | "js" | "jsx" | "tsx") {
-        return Decision::pass();
-    }
-    if file_path.contains(".test.") || file_path.contains(".spec.") {
-        return Decision::pass();
-    }
-    let mut hits = 0usize;
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("//") || trimmed.starts_with('*') {
-            continue;
-        }
-        // `var ` at the start of a statement (not inside a word like "variable").
-        if trimmed.starts_with("var ") || trimmed.starts_with("var\t") {
-            hits += 1;
-        }
-    }
-    if hits > 2 {
-        Decision::block(
-            "UG-LINT-008",
-            format!(
-                "UmaDev: var declarations banned (UG-LINT-008). \
-                 `{file_path}` has {hits} `var` declarations — `var` has \
-                 function-scoped hoisting causing subtle bugs. Use `const` for \
-                 values that never change, and `let` for reassignable variables. \
-                 Both are block-scoped.",
             ),
         )
     } else {

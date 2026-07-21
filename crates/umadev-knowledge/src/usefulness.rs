@@ -27,13 +27,16 @@
 //!   `[WEIGHT_MIN, WEIGHT_MAX]` (`0.3..=1.2`) — a proven-helpful chunk lifts, a
 //!   proven-harmful one sinks, but relevance still dominates.
 //! - **Bounded store.** At most [`crate::usefulness::MAX_ENTRIES`] chunk keys are retained
-//!   (least-recently-updated evicted first, deterministically).
+//!   (least-recently-updated evicted first, deterministically), and immutable
+//!   outcome evidence is retained in a bounded newest-first window.
 //! - **Fail-open.** A missing / corrupt / unwritable store degrades to the
 //!   neutral prior (today's static ranking) — never a panic, never an error.
-//! - **Deterministic.** Pure integer bookkeeping + a fixed weight map; no clock
-//!   read decides ranking, no brain consult, reproducible run-to-run.
+//! - **Deterministic scoring.** Pure integer bookkeeping + a fixed weight map;
+//!   no clock enters the weight formula and no brain is consulted. File time is
+//!   used only to retain the newest evidence when the hard history cap is hit.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -81,6 +84,7 @@ const OUTCOME_RECORD_VERSION: u8 = 2;
 const MAX_OUTCOME_BYTES: u64 = 256 * 1024;
 const MAX_LEGACY_STORE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_OUTCOME_RECORDS: usize = 20_000;
+const OUTCOME_PRUNE_TARGET: usize = 18_000;
 
 /// Version tag for exact knowledge-memory identities.
 const MEMORY_ID_VERSION: &str = "km1";
@@ -657,10 +661,82 @@ fn ensure_outcomes_dir(home: &Path) -> Option<PathBuf> {
     umadev_state::fs::ensure_real_child_dir(&state, OUTCOMES_SUBDIR).ok()
 }
 
+fn outcome_record_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "json")
+        && path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(valid_receipt_id)
+}
+
+fn prune_outcome_records_to(dir: &Path, maximum: usize, target: usize) {
+    if maximum == 0 || target >= maximum {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut newest = BinaryHeap::with_capacity(target);
+    let mut total = 0_usize;
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if !outcome_record_path(&path) {
+            continue;
+        }
+        total = total.saturating_add(1);
+        let candidate = (
+            entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH),
+            path,
+        );
+        if target == 0 {
+            continue;
+        }
+        if newest.len() < target {
+            newest.push(Reverse(candidate));
+        } else if newest
+            .peek()
+            .is_some_and(|Reverse(oldest)| &candidate > oldest)
+        {
+            newest.pop();
+            newest.push(Reverse(candidate));
+        }
+    }
+    if total < maximum {
+        return;
+    }
+    let retained = newest
+        .into_iter()
+        .map(|Reverse((_, path))| path)
+        .collect::<HashSet<_>>();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            if outcome_record_path(&path) && !retained.contains(&path) {
+                let _ = umadev_state::fs::remove_regular_file(&path);
+            }
+        }
+    }
+}
+
+fn prune_outcome_records(dir: &Path) {
+    prune_outcome_records_to(dir, MAX_OUTCOME_RECORDS, OUTCOME_PRUNE_TARGET);
+}
+
 /// Publish a PASS/FAIL outcome for one sent-memory receipt under the resolved
-/// user home. The record is immutable and create-new: retrying the same receipt
-/// is idempotent; a different payload with the same id never overwrites the
-/// first writer. Missing home or any I/O problem is fail-open `Unavailable`.
+/// user home. The record is immutable and create-new within the bounded evidence
+/// window: retrying a retained receipt is idempotent; a different payload with
+/// the same id never overwrites the first writer. Missing home or any I/O
+/// problem is fail-open `Unavailable`.
 #[must_use]
 pub fn record_receipt_outcome(
     project_root: &Path,
@@ -713,6 +789,13 @@ pub fn record_receipt_outcome_in(
     let Some(dir) = ensure_outcomes_dir(home) else {
         return ReceiptOutcomeWrite::Unavailable;
     };
+    let Ok(_store_lock) = umadev_state::store_lock::acquire(
+        home,
+        umadev_state::memory::MemoryStore::KnowledgeUtility,
+    ) else {
+        return ReceiptOutcomeWrite::Unavailable;
+    };
+    prune_outcome_records(&dir);
     let final_path = dir.join(format!("{receipt_id}.json"));
     if std::fs::symlink_metadata(&final_path).is_ok() {
         return existing_outcome_result(&final_path, &record);
@@ -762,20 +845,40 @@ fn read_receipt_outcomes(home: &Path) -> Vec<AppliedOutcomeRecord> {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut paths = entries
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
+    let mut newest = BinaryHeap::with_capacity(MAX_OUTCOME_RECORDS);
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if !outcome_record_path(&path) {
+            continue;
+        }
+        let candidate = (
+            entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH),
+            path,
+        );
+        if newest.len() < MAX_OUTCOME_RECORDS {
+            newest.push(Reverse(candidate));
+        } else if newest
+            .peek()
+            .is_some_and(|Reverse(oldest)| &candidate > oldest)
+        {
+            newest.pop();
+            newest.push(Reverse(candidate));
+        }
+    }
+    let mut paths = newest
+        .into_iter()
+        .map(|Reverse(candidate)| candidate)
         .collect::<Vec<_>>();
     paths.sort();
-    paths.truncate(MAX_OUTCOME_RECORDS);
     let mut seen_receipts = HashSet::new();
     let mut records = Vec::new();
-    for path in paths {
+    for (_, path) in paths {
         let Ok(body) = umadev_state::fs::read_bounded(&path, MAX_OUTCOME_BYTES) else {
             continue;
         };
@@ -1052,6 +1155,44 @@ mod tests {
         )));
         let store = UsefulnessStore::load_from(home.path());
         assert_eq!(store.entries[&exact_chunk_key(&memory.id)].helpful, 1);
+    }
+
+    #[test]
+    fn immutable_outcome_retention_prunes_to_a_bounded_window() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("outcomes");
+        std::fs::create_dir(&dir).unwrap();
+        for index in 0..5 {
+            std::fs::write(dir.join(format!("receipt-{index}.json")), b"{}").unwrap();
+        }
+        std::fs::write(dir.join("unmanaged.txt"), b"keep").unwrap();
+        prune_outcome_records_to(&dir, 3, 2);
+        let remaining = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| outcome_record_path(path))
+            .count();
+        assert_eq!(remaining, 2);
+        assert!(dir.join("unmanaged.txt").is_file());
+    }
+
+    #[test]
+    fn immutable_outcome_retention_prunes_at_the_exact_limit() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("outcomes");
+        std::fs::create_dir(&dir).unwrap();
+        for index in 0..3 {
+            std::fs::write(dir.join(format!("receipt-{index}.json")), b"{}").unwrap();
+        }
+        prune_outcome_records_to(&dir, 3, 2);
+        let remaining = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| outcome_record_path(path))
+            .count();
+        assert_eq!(remaining, 2);
     }
 
     #[test]

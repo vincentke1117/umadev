@@ -1,6 +1,9 @@
 @import "../theme/page-colors.css";
 
 :root {
+  --font-manrope: "Manrope Variable";
+  --font-space: "Space Grotesk Variable";
+  --font-mono: "JetBrains Mono Variable";
   --bg: #050508;
   --bg-2: #090a10;
   --panel: rgba(5, 8, 14, 0.88);

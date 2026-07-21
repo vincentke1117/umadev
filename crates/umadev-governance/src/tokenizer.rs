@@ -38,11 +38,18 @@ pub enum Region {
     Comment,
 }
 
-/// A tokenised view of source: each `(start, end, Region)` span. The rules
-/// iterate these to scan only the regions they care about.
+/// A tokenised view of source: each `(start, end, Region)` span uses UTF-8
+/// byte offsets. The rules iterate these to scan only the regions they care
+/// about without rescanning the source to translate character offsets.
 #[derive(Debug, Clone)]
 pub struct Tokenized {
     spans: Vec<(usize, usize, Region)>,
+}
+
+pub(crate) fn allows_es5_bootstrap(src: &str) -> bool {
+    src.lines()
+        .take(20)
+        .any(|line| line.trim() == "// umadev-governance: allow-es5-bootstrap")
 }
 
 impl Tokenized {
@@ -138,7 +145,21 @@ impl Tokenized {
             refine_code_span(s, e, &bytes, &mut refined);
         }
 
-        Self { spans: refined }
+        // Lexing is easiest in character space, while every later slice must
+        // be O(1). Translate the finished spans once instead of walking
+        // `src.char_indices()` again for every comment/string span. The old
+        // per-span translation made a comment-heavy large file quadratic.
+        let byte_offsets = src
+            .char_indices()
+            .map(|(byte, _)| byte)
+            .chain(std::iter::once(src.len()))
+            .collect::<Vec<_>>();
+        let spans = refined
+            .into_iter()
+            .map(|(start, end, region)| (byte_offsets[start], byte_offsets[end], region))
+            .collect();
+
+        Self { spans }
     }
 
     /// Iterate spans matching `filter`, yielding the substring slices. Used
@@ -146,8 +167,7 @@ impl Tokenized {
     pub fn regions<'a>(&'a self, src: &'a str, filter: Region) -> impl Iterator<Item = &'a str> {
         self.spans.iter().filter_map(move |&(s, e, r)| {
             if r == filter {
-                // Convert char indices to byte offsets. spans are char-indexed.
-                Some(char_slice_to_str(src, s, e))
+                Some(byte_slice(src, s, e))
             } else {
                 None
             }
@@ -162,7 +182,7 @@ impl Tokenized {
         let mut out = String::with_capacity(src.len());
         for &(s, e, r) in &self.spans {
             if r != Region::Comment {
-                out.push_str(char_slice_to_str(src, s, e));
+                out.push_str(byte_slice(src, s, e));
             }
         }
         out
@@ -189,10 +209,9 @@ impl Tokenized {
     /// without letting comments, strings, or JSX text influence the result.
     #[must_use]
     pub fn code_only_preserving_lines(&self, src: &str) -> String {
-        let chars: Vec<char> = src.chars().collect();
         let mut out = String::with_capacity(src.len());
         for &(start, end, region) in &self.spans {
-            for &ch in &chars[start..end] {
+            for ch in byte_slice(src, start, end).chars() {
                 if region == Region::Code || ch == '\n' {
                     out.push(ch);
                 } else {
@@ -251,43 +270,14 @@ fn refine_code_span(
     }
 }
 
-/// Convert `(start_char_idx, end_char_idx)` to the source substring.
-///
-/// Correctness note: spans are char-indexed but `src` is UTF-8, so we must
-/// walk `char_indices()` to translate. The previous implementation had a
-/// latent bug where a *leading empty span* (`start == 0 && end == 0`) made
-/// `end_byte` stay `0`, then the `end_byte == 0 && char_idx <= end` guard
-/// fired and set `end_byte = src.len()` — returning the ENTIRE file for an
-/// empty span. The fix tracks whether `end` was actually matched (a found
-/// flag) instead of overloading `end_byte == 0` as the EOF signal.
-fn char_slice_to_str(src: &str, start: usize, end: usize) -> &str {
+/// Slice a span that was translated to UTF-8 byte offsets at tokenization
+/// time. A caller accidentally pairing a tokenization with different source
+/// text fails open to an empty slice rather than panicking on stale offsets.
+fn byte_slice(src: &str, start: usize, end: usize) -> &str {
     if start >= end {
-        // Empty or inverted span — nothing to extract. This includes the
-        // leading-empty-span case (start==0, end==0) that previously
-        // returned the whole file.
         return "";
     }
-    let mut start_byte = None;
-    let mut end_byte = 0usize;
-    let mut end_found = false;
-    for (char_idx, (byte, _)) in src.char_indices().enumerate() {
-        if start_byte.is_none() && char_idx == start {
-            start_byte = Some(byte);
-        }
-        if char_idx == end {
-            end_byte = byte;
-            end_found = true;
-            break;
-        }
-    }
-    let Some(start_byte) = start_byte else {
-        return ""; // start beyond EOF
-    };
-    if !end_found {
-        // end landed at/past EOF — take the rest of the source.
-        return &src[start_byte..];
-    }
-    &src[start_byte..end_byte]
+    src.get(start..end).unwrap_or("")
 }
 
 /// Strip Rust double-quoted string content while leaving apostrophes alone.
@@ -462,29 +452,31 @@ mod tests {
     }
 
     #[test]
-    fn char_slice_to_str_leading_empty_span_returns_empty() {
+    fn byte_slice_leading_empty_span_returns_empty() {
         // Regression: a leading empty span (start==0, end==0) previously
         // made end_byte stay 0, then the EOF guard set end_byte = src.len(),
         // returning the ENTIRE file for an empty span. It must return "".
         let src = "const x = 1;";
-        assert_eq!(char_slice_to_str(src, 0, 0), "");
+        assert_eq!(byte_slice(src, 0, 0), "");
         // Mid-source empty span is also empty, not the rest of the file.
-        assert_eq!(char_slice_to_str(src, 2, 2), "");
+        assert_eq!(byte_slice(src, 2, 2), "");
         // Inverted span (start > end) is empty, not negative-indexed garbage.
-        assert_eq!(char_slice_to_str(src, 5, 2), "");
+        assert_eq!(byte_slice(src, 5, 2), "");
         // Normal spans still work.
-        assert_eq!(char_slice_to_str(src, 0, 5), "const");
+        assert_eq!(byte_slice(src, 0, 5), "const");
         // Span ending exactly at EOF returns the suffix.
-        let n = src.chars().count();
-        assert_eq!(char_slice_to_str(src, n - 2, n), "1;");
+        let n = src.len();
+        assert_eq!(byte_slice(src, n - 2, n), "1;");
     }
 
     #[test]
-    fn char_slice_to_str_multibyte_source() {
-        // Must not panic on multibyte content; byte vs char indices differ.
+    fn byte_slice_multibyte_source() {
+        // Must not panic on valid multibyte byte boundaries or stale offsets.
         let src = "const 标签 = '🔍';";
-        // '标' starts at char index 6.
-        let label = char_slice_to_str(src, 6, 8);
+        let start = src.find('标').unwrap_or(0);
+        let end = start + "标签".len();
+        let label = byte_slice(src, start, end);
         assert_eq!(label, "标签");
+        assert_eq!(byte_slice(src, start + 1, end), "");
     }
 }

@@ -2486,8 +2486,10 @@ impl AcpSession {
                     }
                 }
                 result = async {
-                    let (_, receiver) = submit.as_mut().expect("guarded by select condition");
-                    receiver.await
+                    match submit.as_mut() {
+                        Some((_, receiver)) => receiver.await,
+                        None => std::future::pending().await,
+                    }
                 }, if submit.is_some() => {
                     submit.take();
                     if let Err(error) = pending_response(result) {
@@ -3172,22 +3174,23 @@ fn acp_content_blocks(
                     TurnInputBlockKind::File,
                 )?;
                 let resource = if matches!(vendor, AcpVendor::Kimi) {
-                    if attachment.bytes.contains(&0)
-                        || std::str::from_utf8(&attachment.bytes).is_err()
-                    {
+                    if attachment.bytes.contains(&0) {
                         return Err(crate::turn_input::unsupported(
                             index,
                             TurnInputBlockKind::File,
                             "Kimi Code ACP accepts only UTF-8 text embedded resources; its official adapter drops binary blob resources",
                         ));
                     }
+                    let Ok(text) = std::str::from_utf8(&attachment.bytes) else {
+                        return Err(crate::turn_input::unsupported(
+                            index,
+                            TurnInputBlockKind::File,
+                            "Kimi Code ACP accepts only UTF-8 text embedded resources; its official adapter drops binary blob resources",
+                        ));
+                    };
                     EmbeddedResourceResource::TextResourceContents(
-                        TextResourceContents::new(
-                            std::str::from_utf8(&attachment.bytes)
-                                .expect("Kimi embedded text was validated as UTF-8"),
-                            uri,
-                        )
-                        .mime_type(attachment.media_type.clone()),
+                        TextResourceContents::new(text, uri)
+                            .mime_type(attachment.media_type.clone()),
                     )
                 } else if attachment.bytes.contains(&0) {
                     embedded_blob(attachment, uri)
@@ -6189,8 +6192,10 @@ fn parse_config_option_model_catalog(setup: &Value) -> Option<SessionStateUpdate
                 description: optional_bounded_state_text(option.get("description")).ok()?,
                 total_context_tokens: None,
                 agent_type: None,
-                // Kimi's separate `thinking` select is boolean, not the
-                // runtime's graded reasoning-effort axis; do not mislabel it.
+                // Kimi's separate `thinking` select remains independent from
+                // model selection. The audited adapter exposes a stable on/off
+                // axis and maps `on` to the model's effort internally; do not
+                // attach that control to every model in the catalog.
                 supports_reasoning_effort: false,
                 reasoning_effort: None,
                 reasoning_efforts: Vec::new(),
@@ -6598,32 +6603,41 @@ fn parse_config_option_state_events(update: &Value) -> Vec<SessionEvent> {
 
 fn parse_thinking_state(update: &Value) -> SessionStateUpdate {
     let thinking = config_option(update, "thinking");
-    let enabled = thinking
+    let options = thinking
+        .and_then(|option| option.get("options"))
+        .and_then(Value::as_array);
+    let option_values = || {
+        options.into_iter().flatten().filter_map(|option| {
+            option
+                .get("value")
+                .and_then(Value::as_str)
+                .filter(|value| valid_session_state_id(value))
+        })
+    };
+    let current = thinking
         .and_then(|option| {
             option
                 .get("currentValue")
                 .or_else(|| option.get("current_value"))
         })
         .and_then(Value::as_str)
-        .and_then(|value| match value {
-            "on" => Some(true),
-            "off" => Some(false),
-            _ => None,
-        });
-    let selectable = |wanted: &str| {
-        thinking
-            .and_then(|option| option.get("options"))
-            .and_then(Value::as_array)
-            .is_some_and(|options| {
-                options
-                    .iter()
-                    .any(|option| option.get("value").and_then(Value::as_str) == Some(wanted))
-            })
-    };
+        .filter(|value| valid_session_state_id(value));
+    // The audited Kimi adapter advertises `on` / `off`. Treating any advertised
+    // non-`off` value as enabled also keeps the parser forward-compatible if a
+    // future ACP release exposes its internal effort levels directly. Requiring
+    // the current value to occur in the advertised list prevents an unknown or
+    // drifted value from being guessed into authority-bearing UI state.
+    let enabled = current.and_then(|value| {
+        option_values()
+            .any(|option| option == value)
+            .then_some(value != "off")
+    });
+    let can_enable = option_values().any(|value| value != "off");
+    let can_disable = option_values().any(|value| value == "off");
     SessionStateUpdate::ThinkingChanged {
         enabled,
-        can_enable: selectable("on"),
-        can_disable: selectable("off"),
+        can_enable,
+        can_disable,
     }
 }
 
@@ -11451,6 +11465,59 @@ mod tests {
                 }
             )],
             "an always-thinking model stays visibly locked on"
+        );
+
+        assert_eq!(
+            parse_config_option_state_events(&json!({"configOptions":[
+                {"type":"select","id":"thinking","currentValue":"high","options":[
+                    {"value":"off","name":"Off"},
+                    {"value":"low","name":"Low"},
+                    {"value":"medium","name":"Medium"},
+                    {"value":"high","name":"High"}
+                ]}
+            ]})),
+            vec![SessionEvent::StateUpdate(
+                SessionStateUpdate::ThinkingChanged {
+                    enabled: Some(true),
+                    can_enable: true,
+                    can_disable: true,
+                }
+            )],
+            "advertised graded values remain compatible with the stable on/off control"
+        );
+
+        assert_eq!(
+            parse_config_option_state_events(&json!({"configOptions":[
+                {"type":"select","id":"thinking","currentValue":"high","options":[
+                    {"value":"low","name":"Low"},
+                    {"value":"high","name":"High"}
+                ]}
+            ]})),
+            vec![SessionEvent::StateUpdate(
+                SessionStateUpdate::ThinkingChanged {
+                    enabled: Some(true),
+                    can_enable: true,
+                    can_disable: false,
+                }
+            )],
+            "an always-thinking graded model cannot be presented as switchable off"
+        );
+
+        assert_eq!(
+            parse_config_option_state_events(&json!({"configOptions":[
+                {"type":"select","id":"thinking","currentValue":"future","options":[
+                    {"value":"off","name":"Off"},
+                    {"value":"high","name":"High"}
+                ]}
+            ]})),
+            vec![SessionEvent::StateUpdate(
+                SessionStateUpdate::ThinkingChanged {
+                    enabled: None,
+                    can_enable: true,
+                    can_disable: true,
+                }
+            )],
+            "an unadvertised future value is not guessed into enabled state"
         );
     }
 
