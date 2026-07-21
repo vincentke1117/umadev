@@ -15,8 +15,12 @@ REPO_ROOT="$(cd "$NPM_ROOT/.." && pwd)"
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)   PLATFORM="darwin-arm64" ;;
   Darwin-x86_64)  PLATFORM="darwin-x64" ;;
-  Linux-x86_64)   PLATFORM="linux-x64" ;;
-  Linux-aarch64)  PLATFORM="linux-arm64" ;;
+  Linux-x86_64)
+    if ldd --version 2>&1 | grep -qi musl; then PLATFORM="linux-musl-x64"; else PLATFORM="linux-x64"; fi
+    ;;
+  Linux-aarch64)
+    if ldd --version 2>&1 | grep -qi musl; then PLATFORM="linux-musl-arm64"; else PLATFORM="linux-arm64"; fi
+    ;;
   *)
     echo "smoke.sh: unsupported uname: $(uname -s)-$(uname -m)" >&2
     exit 1

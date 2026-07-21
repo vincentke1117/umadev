@@ -147,8 +147,8 @@ npm tarball 不内含向量模型。第一次执行需要检索的命令时，np
 
 - macOS Apple Silicon
 - macOS Intel
-- Linux x86_64
-- Linux ARM64
+- Linux x86_64（glibc ≥ 2.31 或 musl/Alpine）
+- Linux ARM64（glibc ≥ 2.31 或 musl/Alpine）
 - Windows x86_64
 
 也可以从源码构建：

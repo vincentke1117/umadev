@@ -3063,7 +3063,10 @@ const INDEPENDENT_REVIEW_FIREWALL: &str = "You are opening an INDEPENDENT, clean
      framing would bias your verdict and hide the very gaps you are here to find. Review ONLY \
      the artifact, the acceptance criteria, and the requirement provided below, on their own \
      terms, digging independently from your role's seat. Judge what the artifact ACTUALLY is \
-     and does — not what its author intended, narrated, or claimed.";
+     and does — not what its author intended, narrated, or claimed. The supplied payload is the \
+     COMPLETE review boundary: do NOT call tools, inspect the workspace, read extra files, or \
+     search conversation logs. If the payload is insufficient, report the review as unavailable \
+     or advisory in the requested JSON instead of expanding scope.";
 
 /// Compose the full judge directive sent to a critic's read-only fork: the
 /// maker-checker [`INDEPENDENT_REVIEW_FIREWALL`] FIRST (so the reviewer rejects
@@ -3190,7 +3193,13 @@ async fn drain_review_text(fork: &mut Box<dyn BaseSession>) -> Option<String> {
         match ev {
             SessionEvent::TextDelta(t) => text.push_str(&t),
             SessionEvent::TurnDone { .. } => return Some(text),
-            // A read-only fork should not write; ignore any tool noise.
+            // The artifact payload is the entire review scope. Enforce that
+            // boundary at the host instead of trusting the model prompt alone.
+            SessionEvent::ToolCall { .. } | SessionEvent::ToolCallCorrelated { .. } => {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), fork.interrupt()).await;
+                return None;
+            }
             _ => {}
         }
     }
@@ -3212,7 +3221,40 @@ fn try_parse_verdict(role: &str, text: &str) -> Option<RoleVerdict> {
     let json = extract_json_object(text)?;
     serde_json::from_str::<RoleVerdict>(&json)
         .ok()
-        .map(|v| v.normalized(role))
+        .map(|v| demote_operational_review_failures(v.normalized(role)))
+}
+
+fn demote_operational_review_failures(mut verdict: RoleVerdict) -> RoleVerdict {
+    let engineering_seat = matches!(
+        verdict.role.as_str(),
+        "frontend-engineer"
+            | "backend-engineer"
+            | "qa-engineer"
+            | "security-engineer"
+            | "devops-engineer"
+    );
+    if !engineering_seat {
+        return verdict;
+    }
+
+    let mut blocking = Vec::new();
+    let mut remediation = Vec::new();
+    for (index, item) in verdict.blocking.into_iter().enumerate() {
+        let lower = item.to_lowercase();
+        let operational = lower.contains("no reviewable requirement or acceptance")
+            || lower.contains("no reviewable artifact or acceptance")
+            || lower.contains("没有可评审的需求或验收")
+            || lower.contains("沒有可評審的需求或驗收");
+        if operational {
+            verdict.advisory.push(format!("review unavailable: {item}"));
+        } else {
+            blocking.push(item);
+            remediation.push(verdict.remediation.get(index).cloned().unwrap_or_default());
+        }
+    }
+    verdict.blocking = blocking;
+    verdict.remediation = remediation;
+    verdict
 }
 
 /// Extract the first balanced top-level JSON object from `text` (the judge reply
@@ -4574,6 +4616,43 @@ mod tests {
         assert_eq!(v.status(), ReviewStatus::Fail);
         assert_eq!(v.role, "qa-engineer");
         assert_eq!(v.blocking, vec!["no tests".to_string()]);
+
+        let fenced = parse_verdict(
+            "qa-engineer",
+            "```json\n{\"accepts\":true,\"blocking\":[]}\n```",
+        );
+        assert_eq!(fenced.status(), ReviewStatus::Pass);
+
+        let no_context = parse_verdict(
+            "qa-engineer",
+            r#"{"accepts":false,"blocking":["No reviewable requirement or acceptance criteria were supplied"]}"#,
+        );
+        assert_eq!(no_context.status(), ReviewStatus::Unavailable);
+        assert!(no_context.blocking.is_empty());
+        assert!(no_context
+            .unavailable_reason()
+            .unwrap()
+            .contains("review unavailable"));
+    }
+
+    #[tokio::test]
+    async fn review_drain_interrupts_scope_expanding_tool_calls() {
+        let fake = FakeBaseSession::new(vec![vec![
+            SessionEvent::ToolCall {
+                name: "Read".to_string(),
+                input: serde_json::json!({"path": ".venv"}),
+            },
+            SessionEvent::TextDelta(r#"{"accepts":true}"#.to_string()),
+            done(),
+        ]]);
+        let interrupts = fake.interrupts_handle();
+        let mut fork: Box<dyn BaseSession> = Box::new(fake);
+        fork.send_turn("review supplied artifact".to_string())
+            .await
+            .unwrap();
+
+        assert!(drain_review_text(&mut fork).await.is_none());
+        assert_eq!(*interrupts.lock().unwrap(), 1);
     }
 
     #[tokio::test]
@@ -4891,6 +4970,10 @@ mod tests {
         assert!(
             lower.contains("chain-of-thought") || lower.contains("conversation"),
             "unexpected prior deliberation is explicitly rejected"
+        );
+        assert!(
+            lower.contains("do not call tools") && lower.contains("complete review boundary"),
+            "the critic is confined to the bounded artifact payload"
         );
         assert!(
             d.find(INDEPENDENT_REVIEW_FIREWALL).unwrap() < d.find(system).unwrap(),

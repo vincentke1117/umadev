@@ -183,6 +183,19 @@ pub fn transient_resume_hint(reason: &str, root: &Path) -> Option<String> {
 /// Whether `root` contains any run state that a fresh session can resume.
 #[must_use]
 pub fn has_resumable_run(root: &Path) -> bool {
+    // A clean final workflow state is the canonical terminal receipt. Check it
+    // BEFORE the plan: an interrupted write can leave stale Pending/Active rows in
+    // `.umadev/plan.json` even though finalization already committed delivery. Letting
+    // that stale plan win re-opened the quality/review loop whenever the user merely
+    // asked for progress in a later session.
+    if let Some(state) = crate::state::read_workflow_state(root) {
+        let clean_delivery = state.active_gate.trim().is_empty()
+            && state.phase.eq_ignore_ascii_case(Phase::Delivery.id())
+            && state.note.trim() == super::DIRECTOR_COMPLETE_NOTE;
+        if clean_delivery {
+            return false;
+        }
+    }
     if load_resumable_plan(root).is_some() {
         return true;
     }

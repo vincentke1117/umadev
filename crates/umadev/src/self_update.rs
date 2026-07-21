@@ -115,15 +115,26 @@ fn is_cargo_target_build(parts: &[String]) -> bool {
 /// This MUST stay in lockstep with `.github/workflows/release.yml`, which stages
 /// each build as `dist/umadev-<target-triple><ext>` and uploads `dist/*`.
 pub fn release_asset_name(os: &str, arch: &str) -> Option<String> {
-    let target = match (os, arch) {
-        ("macos", "aarch64") => "aarch64-apple-darwin",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
-        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+    let linux_env = if cfg!(target_env = "musl") {
+        "musl"
+    } else {
+        "gnu"
+    };
+    release_asset_name_for(os, arch, linux_env)
+}
+
+fn release_asset_name_for(os: &str, arch: &str, linux_env: &str) -> Option<String> {
+    let target = match (os, arch, linux_env) {
+        ("macos", "aarch64", _) => "aarch64-apple-darwin",
+        ("macos", "x86_64", _) => "x86_64-apple-darwin",
+        ("linux", "x86_64", "gnu") => "x86_64-unknown-linux-gnu",
+        ("linux", "aarch64", "gnu") => "aarch64-unknown-linux-gnu",
+        ("linux", "x86_64", "musl") => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64", "musl") => "aarch64-unknown-linux-musl",
         // Windows on ARM runs x64 binaries under built-in emulation, and we publish
         // no arm64 Windows build — reuse the x64 asset, exactly as the npm shim's
         // PLATFORM_PACKAGES maps `win32-arm64` to `@umacloud/cli-win32-x64`.
-        ("windows", "x86_64" | "aarch64") => "x86_64-pc-windows-msvc",
+        ("windows", "x86_64" | "aarch64", _) => "x86_64-pc-windows-msvc",
         _ => return None,
     };
     let ext = if os == "windows" { ".exe" } else { "" };
@@ -793,12 +804,20 @@ mod tests {
             "umadev-x86_64-apple-darwin"
         );
         assert_eq!(
-            release_asset_name("linux", "x86_64").unwrap(),
+            release_asset_name_for("linux", "x86_64", "gnu").unwrap(),
             "umadev-x86_64-unknown-linux-gnu"
         );
         assert_eq!(
-            release_asset_name("linux", "aarch64").unwrap(),
+            release_asset_name_for("linux", "aarch64", "gnu").unwrap(),
             "umadev-aarch64-unknown-linux-gnu"
+        );
+        assert_eq!(
+            release_asset_name_for("linux", "x86_64", "musl").unwrap(),
+            "umadev-x86_64-unknown-linux-musl"
+        );
+        assert_eq!(
+            release_asset_name_for("linux", "aarch64", "musl").unwrap(),
+            "umadev-aarch64-unknown-linux-musl"
         );
         assert_eq!(
             release_asset_name("windows", "x86_64").unwrap(),

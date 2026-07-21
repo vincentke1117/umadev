@@ -47,6 +47,7 @@ mod frozen_plan;
 pub(crate) mod host_input;
 mod lessons_view;
 mod memory_view;
+mod plan_view;
 mod read_only_metric;
 mod submission;
 mod task_control;
@@ -1122,6 +1123,12 @@ fn classify_live_meta(text: &str) -> Option<LiveMetaIntent> {
             "到哪",
             "哪一步",
             "多少",
+            "什么进展",
+            "什麼進展",
+            "啥进展",
+            "啥進展",
+            "有什么进展",
+            "有什麼進展",
             "什么情况",
             "什麼情況",
             "啥情况",
@@ -14606,79 +14613,6 @@ impl App {
                 Action::None
             }
         }
-    }
-
-    /// Render the live plan + team review as a chat note (for `/plan` with no
-    /// args). Falls back to a friendly "no active plan" hint.
-    ///
-    /// Unlike the collapsible live panel (which clips the verdict tail to "… +N"),
-    /// this prints the FULL team-review section — every reviewing seat's verdict
-    /// and, for a blocking seat, ALL of its must-fix findings — so the panel's
-    /// "/plan for all" affordance is truthful and nothing is hidden.
-    fn show_plan_status(&mut self) {
-        let has_plan = !self.plan_steps.is_empty();
-        let has_review = !self.critic_verdicts.is_empty();
-        if !has_plan && !has_review {
-            self.push(ChatRole::System, umadev_i18n::t(self.lang, "plan.none"));
-            self.push(
-                ChatRole::System,
-                umadev_i18n::t(self.lang, "plan.steer.usage"),
-            );
-            return;
-        }
-        let mut body = String::new();
-        if has_plan {
-            let (done, total) = (
-                self.plan_steps
-                    .iter()
-                    .filter(|s| s.status == "done")
-                    .count(),
-                self.plan_steps.len(),
-            );
-            body.push_str(&format!(
-                "{} {done}/{total}\n",
-                umadev_i18n::t(self.lang, "plan.panel.title")
-            ));
-            for step in &self.plan_steps {
-                let mark = plan_step_glyph(step.status.as_str());
-                body.push_str(&format!("  {mark} {} · {}\n", step.id, step.title));
-            }
-        }
-        // Full team-review section: EVERY seat's verdict + a blocking seat's
-        // complete findings. Mirrors the live panel's "[seat] accepts / N must-fix"
-        // wording, but never clips the findings list.
-        if has_review {
-            let accepts = self.critic_verdicts.iter().filter(|c| c.accepts).count();
-            let blocking = self.critic_verdicts.len() - accepts;
-            body.push_str(&umadev_i18n::tf(
-                self.lang,
-                "plan.review.section",
-                &[&accepts.to_string(), &blocking.to_string()],
-            ));
-            body.push('\n');
-            for c in &self.critic_verdicts {
-                let verdict = if c.accepts {
-                    umadev_i18n::t(self.lang, "plan.review.accept").to_string()
-                } else {
-                    umadev_i18n::tf(
-                        self.lang,
-                        "plan.review.block",
-                        &[&c.blocking.len().max(1).to_string()],
-                    )
-                };
-                body.push_str(&format!("  [{}] {verdict}\n", c.seat));
-                if !c.accepts {
-                    for b in &c.blocking {
-                        let item = b.trim();
-                        if !item.is_empty() {
-                            body.push_str(&format!("    - {item}\n"));
-                        }
-                    }
-                }
-            }
-        }
-        body.push_str(umadev_i18n::t(self.lang, "plan.steer.usage"));
-        self.push(ChatRole::UmaDev, body);
     }
 
     /// `/team` — surface the AI development team as a first-class concept (Wave C

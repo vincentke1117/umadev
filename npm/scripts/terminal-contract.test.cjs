@@ -14,6 +14,7 @@ const {
   windowsLockRecoveryMessage,
   REPAIR_COMMANDS,
   runSelfUpdate,
+  linuxLibcFromEvidence,
 } = require('../umadev/bin/cli.js');
 
 const PLATFORM_LEAVES = {
@@ -24,6 +25,19 @@ const PLATFORM_LEAVES = {
   'win32-arm64': 'cli-win32-x64',
   'win32-x64': 'cli-win32-x64',
 };
+
+test('terminal contract: Linux libc detection distinguishes glibc from musl', () => {
+  assert.equal(
+    linuxLibcFromEvidence({ header: { glibcVersionRuntime: '2.31' }, sharedObjects: [] }),
+    'gnu',
+  );
+  assert.equal(
+    linuxLibcFromEvidence({ header: {}, sharedObjects: ['/lib/ld-musl-aarch64.so.1'] }),
+    'musl',
+  );
+  assert.equal(linuxLibcFromEvidence(null, 'musl libc (aarch64)'), 'musl');
+  assert.equal(linuxLibcFromEvidence(null, ''), 'gnu');
+});
 
 test('terminal contract: package and executable versions agree through Unicode paths', (t) => {
   const platformLeaf = PLATFORM_LEAVES[`${process.platform}-${process.arch}`];

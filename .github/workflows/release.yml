@@ -323,6 +323,16 @@ jobs:
             ext: ""
             npm_platform: linux-arm64
             cross: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            ext: ""
+            npm_platform: linux-musl-x64
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            ext: ""
+            npm_platform: linux-musl-arm64
+            cross: true
           - target: aarch64-apple-darwin
             os: macos-latest
             ext: ""
@@ -355,11 +365,9 @@ jobs:
           node-version: "20"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      # Both linux-gnu targets build via `cross`: aarch64 needs it for the
-      # sysroot, and x86_64 uses it to link against an old glibc. Pin the
-      # version so the glibc floor is deterministic — cross 0.2.5's linux-gnu
-      # images are Ubuntu 20.04-based (glibc 2.31); an unpinned upgrade could
-      # silently raise that floor and re-break older distros.
+      # Every Linux target builds via `cross`: GNU uses its old glibc sysroot,
+      # while musl produces the Alpine-compatible static-libc variants. Pinning
+      # keeps both toolchains reproducible.
       - name: Install cross
         if: matrix.cross == true
         run: cargo install cross --version 0.2.5 --locked
@@ -489,6 +497,21 @@ jobs:
             exit 1
           fi
 
+      - name: Verify musl binary is libc-self-contained
+        if: contains(matrix.target, 'linux-musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/umadev"
+          if readelf -l "$bin" | grep -q 'Requesting program interpreter'; then
+            echo "::error::$bin is dynamically linked and may not start on a clean Alpine host"
+            readelf -l "$bin" | grep 'Requesting program interpreter' || true
+            exit 1
+          fi
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
+            "$bin" --version
+          fi
+
       - name: Stage binary into dist/ + npm/
         shell: bash
         run: |
@@ -613,9 +636,11 @@ jobs:
           const expected = [
             'umadev-aarch64-apple-darwin',
             'umadev-aarch64-unknown-linux-gnu',
+            'umadev-aarch64-unknown-linux-musl',
             'umadev-x86_64-apple-darwin',
             'umadev-x86_64-pc-windows-msvc.exe',
             'umadev-x86_64-unknown-linux-gnu',
+            'umadev-x86_64-unknown-linux-musl',
           ];
           const binaries = fs.readdirSync('dist')
             .filter((name) => !name.endsWith('.sha256'))
@@ -631,7 +656,7 @@ jobs:
             const actual = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
             if (actual !== expected) throw new Error(`checksum mismatch for ${name}`);
           }
-          console.log('verified 5 release binaries and checksum sidecars');
+          console.log('verified 7 release binaries and checksum sidecars');
           NODE
       # The fp16 embedding model is too large for npm (~224MB > npm's limit), so
       # it ships as a GitHub Release ASSET. The umadev npm wrapper (bin/cli.js)
@@ -687,6 +712,10 @@ jobs:
             dist/umadev-x86_64-unknown-linux-gnu.sha256
             dist/umadev-aarch64-unknown-linux-gnu
             dist/umadev-aarch64-unknown-linux-gnu.sha256
+            dist/umadev-x86_64-unknown-linux-musl
+            dist/umadev-x86_64-unknown-linux-musl.sha256
+            dist/umadev-aarch64-unknown-linux-musl
+            dist/umadev-aarch64-unknown-linux-musl.sha256
             dist/umadev-aarch64-apple-darwin
             dist/umadev-aarch64-apple-darwin.sha256
             dist/umadev-x86_64-apple-darwin
@@ -818,7 +847,7 @@ jobs:
             chmod +x "npm/cli-${platform}/bin/"* 2>/dev/null || true
           done
           # Sanity: every sub-package must have its binary.
-          for plat in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
+          for plat in darwin-arm64 darwin-x64 linux-x64 linux-arm64 linux-musl-x64 linux-musl-arm64 win32-x64; do
             case "$plat" in win32-x64) bin="umadev.exe" ;; *) bin="umadev" ;; esac
             test -f "npm/cli-$plat/bin/$bin" || {
               echo "missing npm/cli-$plat/bin/$bin" >&2; exit 1;

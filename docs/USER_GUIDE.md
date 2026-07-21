@@ -94,7 +94,7 @@ an `@mention` remains plain text and is labelled as a reference, not as an
 uploaded attachment.
 
 UmaDev's own prebuilt binary supports macOS (Apple Silicon/Intel), Linux
-(x86_64/ARM64, glibc >= 2.31), and Windows x86_64; Windows on ARM runs the x64
+(x86_64/ARM64, glibc >= 2.31 or musl/Alpine), and Windows x86_64; Windows on ARM runs the x64
 binary through OS emulation. That does not manufacture support in a vendor CLI:
 both `umadev` and the selected base must be available in the same environment.
 

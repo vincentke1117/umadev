@@ -7330,6 +7330,42 @@ fn has_resumable_run_detects_incomplete_done_and_absent() {
 }
 
 #[test]
+fn clean_delivery_state_wins_over_a_stale_incomplete_plan() {
+    use crate::plan_state::{Plan, StepStatus};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stale = Plan {
+        steps: vec![resume_step("review", "review", &[], StepStatus::Pending)],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    plan_state::save(&stale, tmp.path()).unwrap();
+
+    let mut terminal_state = crate::state::WorkflowState::new(umadev_spec::Phase::Delivery);
+    terminal_state.note = DIRECTOR_COMPLETE_NOTE.to_string();
+    crate::state::write_workflow_state(tmp.path(), &terminal_state).unwrap();
+    assert!(
+        !has_resumable_run(tmp.path()),
+        "a clean terminal receipt must suppress stale review rows"
+    );
+
+    terminal_state.note = "Advanced to delivery (director loop)".to_string();
+    crate::state::write_workflow_state(tmp.path(), &terminal_state).unwrap();
+    assert!(
+        has_resumable_run(tmp.path()),
+        "delivery without the clean sentinel remains resumable"
+    );
+
+    terminal_state.note = DIRECTOR_COMPLETE_NOTE.to_string();
+    terminal_state.active_gate = "preview_confirm".to_string();
+    crate::state::write_workflow_state(tmp.path(), &terminal_state).unwrap();
+    assert!(
+        has_resumable_run(tmp.path()),
+        "an open gate is never hidden by a completion-looking note"
+    );
+}
+
+#[test]
 fn load_resumable_plan_resets_an_interrupted_active_step_to_pending() {
     // A step persisted as Active (the TUI closed mid-step) must be reset to Pending
     // on load so `ready_steps` surfaces it again — otherwise the interrupted step is

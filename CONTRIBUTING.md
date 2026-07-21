@@ -5,9 +5,9 @@ Thank you for contributing to UmaDev! 感谢贡献。
 UmaDev is a **Rust workspace** that ships one native `umadev` binary for
 each supported target. npm is a distribution surface: its small JavaScript
 launcher selects the matching prebuilt Rust binary. There are no per-host SDK
-or provider integrations. Exactly four base CLIs are driven as subprocesses:
+or provider integrations. Exactly five base CLIs are driven as subprocesses:
 Claude Code, Codex, and OpenCode keep vendor-specific transports; Grok Build
-uses a dedicated profile over the hardened ACP v1 core. Contributions can target the specification, governance kernel,
+and Kimi Code use isolated profiles over the hardened ACP v1 core. Contributions can target the specification, governance kernel,
 team runner, host drivers, knowledge layer, CLI, or TUI.
 
 ## How to contribute | 如何贡献
@@ -29,8 +29,8 @@ needed only when changing their corresponding delivery surface:
 
 - Node.js **20+** for the npm launcher, npm package smoke tests, or website.
 - Python 3 for the release-only embedding-model quantisation script.
-- Docker (through `cross`) for reproducing the Linux release builds and their
-  glibc 2.31 compatibility floor.
+- Docker (through `cross`) for reproducing the GNU Linux builds at their glibc
+  2.31 floor and the Alpine-compatible musl builds.
 
 ```bash
 git clone https://github.com/umacloud/umadev.git
@@ -46,7 +46,7 @@ crates/
 ├── umadev-spec/        # UMADEV_HOST_SPEC_V1 as Rust data
 ├── umadev-governance/  # rules / audit / context / compliance kernel
 ├── umadev-agent/       # 9-phase runner + gates + state + experts + coach
-├── umadev-host/        # 3 vendor-specific drivers + 1 Grok Build ACP v1 profile
+├── umadev-host/        # 3 vendor transports + isolated Grok/Kimi ACP v1 profiles
 ├── umadev-runtime/     # Runtime trait + OfflineRuntime (deterministic fallback)
 ├── umadev-contract/    # typed OpenAPI 3.1 contract layer
 ├── umadev-knowledge/   # BM25 + optional vector/hybrid retrieval

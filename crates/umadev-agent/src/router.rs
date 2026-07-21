@@ -1273,7 +1273,30 @@ fn apply_route_ceilings(
     requirement: &str,
     mode: crate::trust::TrustMode,
 ) -> RoutePlan {
+    let plan = apply_explicit_auto_mutation_floor(plan, requirement, mode);
     apply_mode_ceiling(apply_authorization_ceiling(plan, requirement), mode)
+}
+
+/// In Auto, an unmistakable user edit command outranks a mistaken read-only model
+/// class. Ambiguous prose stays model-owned; explicit read-only wording still wins
+/// in the ceilings applied immediately afterward.
+fn apply_explicit_auto_mutation_floor(
+    plan: RoutePlan,
+    requirement: &str,
+    mode: crate::trust::TrustMode,
+) -> RoutePlan {
+    if mode != crate::trust::TrustMode::Auto
+        || plan.class.mutates_workspace()
+        || !explicit_mutation_command(requirement)
+    {
+        return plan;
+    }
+    let floor = tier0(requirement);
+    if floor.class.mutates_workspace() {
+        floor
+    } else {
+        plan
+    }
 }
 
 /// Apply user-authored read-only constraints to a route. The base model owns
@@ -1407,6 +1430,13 @@ fn explicit_observation_only_request(requirement: &str) -> bool {
         "當前進度",
         "目前进度",
         "目前進度",
+        "目前什么进展",
+        "目前什麼進展",
+        "现在什么进展",
+        "現在什麼進展",
+        "现在啥进展",
+        "当前有什么进展",
+        "當前有什麼進展",
         "进展如何",
         "進展如何",
         "汇报进度",
@@ -1651,6 +1681,88 @@ fn clear_mutation_request(requirement: &str) -> bool {
     ]
     .iter()
     .any(|needle| q.contains(needle))
+}
+
+/// Narrow imperative belt for Auto's authority floor. It intentionally excludes
+/// past-work questions, explanations, and quoted/read-only constraints.
+fn explicit_mutation_command(requirement: &str) -> bool {
+    if explicit_read_only_request(requirement) || explicit_observation_only_request(requirement) {
+        return false;
+    }
+    let q = requirement.trim().to_lowercase();
+    if q.is_empty()
+        || [
+            "为什么",
+            "為什麼",
+            "是否修复",
+            "是否修復",
+            "修复了吗",
+            "修復了嗎",
+            "有没有修复",
+            "有沒有修復",
+            "did you fix",
+            "why didn't you fix",
+            "why did you not fix",
+        ]
+        .iter()
+        .any(|needle| q.contains(needle))
+    {
+        return false;
+    }
+
+    let direct_prefix = [
+        "修复",
+        "修復",
+        "修改",
+        "调整",
+        "調整",
+        "优化",
+        "優化",
+        "新增",
+        "删除",
+        "刪除",
+        "替换",
+        "替換",
+        "重构",
+        "重構",
+        "实现",
+        "實現",
+        "请修",
+        "請修",
+        "请改",
+        "請改",
+        "请你修",
+        "請你修",
+        "请你改",
+        "請你改",
+        "帮我修",
+        "幫我修",
+        "帮我改",
+        "幫我改",
+        "直接修",
+        "直接改",
+        "立即修",
+        "立即改",
+        "fix ",
+        "please fix",
+        "change ",
+        "please change",
+        "modify ",
+        "please modify",
+        "update ",
+        "please update",
+        "edit ",
+        "remove ",
+        "delete ",
+        "replace ",
+        "refactor ",
+        "implement ",
+        "apply the fix",
+        "resolve this",
+    ];
+    direct_prefix.iter().any(|prefix| q.starts_with(prefix))
+        || ((q.starts_with('把') || q.starts_with("请把") || q.starts_with("請把"))
+            && clear_mutation_request(&q))
 }
 
 /// The lightest route — used only when the brain can't be reached (no keyword
@@ -2498,6 +2610,7 @@ mod tests {
             "这次改动都做了啥",
             "帮我总结刚才做了什么",
             "目前进度如何？",
+            "目前什么进展了？",
             "what changed in this turn?",
             "summarize the changes",
         ] {
@@ -2704,6 +2817,65 @@ mod tests {
         );
         assert_eq!(capped.class, RouteClass::Explain);
         assert!(!capped.class.mutates_workspace());
+    }
+
+    #[test]
+    fn auto_explicit_fix_command_cannot_be_stranded_in_read_only_explain() {
+        let wrong = BrainRoute {
+            class: "explain".to_string(),
+            authorization: "read_only".to_string(),
+            kind: "light".to_string(),
+            complexity: "simple".to_string(),
+            confidence: 0.99,
+            ..Default::default()
+        };
+
+        for request in [
+            "修复以上发现的问题",
+            "请你修复这个循环",
+            "把这个权限问题修复掉",
+            "please fix the review loop",
+        ] {
+            let route = apply_route_ceilings(
+                brain_to_route_in_mode(&wrong, request, crate::trust::TrustMode::Auto),
+                request,
+                crate::trust::TrustMode::Auto,
+            );
+            assert!(route.class.mutates_workspace(), "{request}");
+            assert_eq!(route.depth, Depth::Fast, "{request}");
+            assert!(route.team.is_empty(), "{request}");
+        }
+    }
+
+    #[test]
+    fn auto_mutation_floor_does_not_promote_questions_or_read_only_constraints() {
+        let wrong = BrainRoute {
+            class: "explain".to_string(),
+            authorization: "read_only".to_string(),
+            kind: "light".to_string(),
+            complexity: "simple".to_string(),
+            ..Default::default()
+        };
+        for request in [
+            "为什么还没有修复？",
+            "这个问题修复了吗？",
+            "只分析原因，不要修改任何文件",
+            "目前什么进展了",
+        ] {
+            let route = apply_route_ceilings(
+                brain_to_route_in_mode(&wrong, request, crate::trust::TrustMode::Auto),
+                request,
+                crate::trust::TrustMode::Auto,
+            );
+            assert!(!route.class.mutates_workspace(), "{request}");
+        }
+
+        let planned = apply_route_ceilings(
+            brain_to_route_in_mode(&wrong, "修复以上发现的问题", crate::trust::TrustMode::Plan),
+            "修复以上发现的问题",
+            crate::trust::TrustMode::Plan,
+        );
+        assert!(!planned.class.mutates_workspace());
     }
 
     #[test]

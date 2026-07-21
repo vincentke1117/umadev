@@ -46,6 +46,8 @@ const publishedDependencies = [
   '@umacloud/cli-darwin-arm64',
   '@umacloud/cli-darwin-x64',
   '@umacloud/cli-linux-arm64',
+  '@umacloud/cli-linux-musl-arm64',
+  '@umacloud/cli-linux-musl-x64',
   '@umacloud/cli-linux-x64',
   '@umacloud/cli-win32-x64',
   '@umacloud/knowledge',
@@ -101,5 +103,5 @@ if (process.env.GITHUB_REF?.startsWith('refs/tags/v')) {
 }
 
 console.log(
-  `version-lock: Cargo, website, tag, seven release packages, and the archived model manifest agree on ${cargoVersion}`,
+  `version-lock: Cargo, website, tag, nine release packages, and the archived model manifest agree on ${cargoVersion}`,
 );

@@ -76,7 +76,7 @@ npm i umadev && npx umadev # or as a project-local dependency
 
 Already hit the sudo trap? `umadev doctor` detects a root-owned install or npm cache and prints the exact repair (`sudo chown -R $(whoami) ~/.npm`, then reinstall under a user-owned prefix).
 
-The npm package is a distribution shim. The actual program is a Rust binary. Prebuilt binaries ship for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64, glibc ≥ 2.31 — musl/Alpine needs a source build), and Windows (x86_64).
+The npm package is a distribution shim. The actual program is a Rust binary. Prebuilt binaries ship for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64, glibc ≥ 2.31 or musl/Alpine), and Windows (x86_64).
 
 The Rust binary and curated corpus need no cloud knowledge service. Real coding still requires an installed, authenticated base CLI. The optional local embedding model (`multilingual-e5-small`, f16, ~224 MB) is **not** inside the npm tarball: the npm launcher fetches the version-matched, checksummed release asset on the first command that needs retrieval and stores it in `~/.umadev/embed-model`. Later local inference needs no API key or network. If the fetch is unavailable, retrieval continues as BM25-only and a later eligible launch retries; a corrupt cache is rejected and re-fetched.
 

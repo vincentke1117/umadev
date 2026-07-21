@@ -5280,6 +5280,33 @@ fn slash_plan_shows_usage_when_no_plan() {
 }
 
 #[test]
+fn slash_plan_lists_queued_work_without_an_active_plan() {
+    let mut app = fresh_app(Some("offline"));
+    app.queue_chat_turn(SubmittedTurn::text("先修复登录页\n并补测试".into()));
+    app.queue_native_command("/compact".into());
+    app.queued_steer.push_back("把按钮改成蓝色".into());
+
+    let action = app.try_slash_command("/plan").unwrap();
+
+    assert_eq!(action, Action::None);
+    let joined = app
+        .history
+        .iter()
+        .map(|message| message.body().clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("排队任务 — 3 条待处理"), "{joined}");
+    assert!(
+        joined.contains("[下一轮] 先修复登录页 并补测试"),
+        "{joined}"
+    );
+    assert!(joined.contains("[下一轮] /compact"), "{joined}");
+    assert!(joined.contains("[当前任务调整] 把按钮改成蓝色"), "{joined}");
+    assert!(!joined.contains("暂无计划"), "{joined}");
+    assert_eq!(app.queued_count(), 3, "/plan must be read-only");
+}
+
+#[test]
 fn slash_plan_skip_folds_into_queued_steer() {
     let mut app = fresh_app(Some("offline"));
     app.apply_engine(EngineEvent::PlanPosted {
@@ -6404,6 +6431,10 @@ fn live_meta_classifier_is_bounded_and_trilingual() {
         ("what files did you change?", LiveMetaIntent::Changes),
         ("当前进度", LiveMetaIntent::Progress),
         ("现在进展到哪一步啦？", LiveMetaIntent::Progress),
+        ("目前什么进展了", LiveMetaIntent::Progress),
+        ("现在啥进展了？", LiveMetaIntent::Progress),
+        ("当前有什么进展", LiveMetaIntent::Progress),
+        ("目前有什麼進展了？", LiveMetaIntent::Progress),
         ("目前進度？", LiveMetaIntent::Progress),
         ("what are you working on?", LiveMetaIntent::Progress),
         ("how far along are you?", LiveMetaIntent::Progress),

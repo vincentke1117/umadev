@@ -31,13 +31,38 @@ const PLATFORM_PACKAGES = {
   'darwin-x64': '@umacloud/cli-darwin-x64',
   'linux-x64': '@umacloud/cli-linux-x64',
   'linux-arm64': '@umacloud/cli-linux-arm64',
+  'linux-musl-x64': '@umacloud/cli-linux-musl-x64',
+  'linux-musl-arm64': '@umacloud/cli-linux-musl-arm64',
   'win32-x64': '@umacloud/cli-win32-x64',
   // Windows on ARM runs x64 binaries via built-in emulation; reuse the x64 build.
   'win32-arm64': '@umacloud/cli-win32-x64',
 };
 
 function platformKey() {
+  if (process.platform === 'linux' && linuxLibc() === 'musl') {
+    return `linux-musl-${process.arch}`;
+  }
   return `${process.platform}-${process.arch}`;
+}
+
+function linuxLibcFromEvidence(report, lddOutput = '') {
+  if (report?.header?.glibcVersionRuntime) return 'gnu';
+  const shared = Array.isArray(report?.sharedObjects) ? report.sharedObjects.join('\n') : '';
+  return /(?:^|[/\\])ld-musl-|\bmusl\b/i.test(`${shared}\n${lddOutput}`) ? 'musl' : 'gnu';
+}
+
+function linuxLibc() {
+  if (process.platform !== 'linux') return 'gnu';
+  let report = null;
+  try {
+    report = process.report?.getReport?.() ?? null;
+  } catch (_) {}
+  let lddOutput = '';
+  try {
+    const probe = spawnSync('ldd', ['--version'], { encoding: 'utf8', timeout: 3000 });
+    lddOutput = `${probe.stdout || ''}\n${probe.stderr || ''}`;
+  } catch (_) {}
+  return linuxLibcFromEvidence(report, lddOutput);
 }
 
 function binaryName() {
@@ -1178,10 +1203,9 @@ async function main() {
 
   if (result.error) {
     console.error(`umadev: failed to exec binary: ${result.error.message}`);
-    // A present-but-unexecutable ELF reports ENOENT — the kernel is reporting the
-    // missing *ELF interpreter*, not the missing binary. On Linux that is almost
-    // always musl (Alpine): we ship glibc builds, and the message as-is reads like
-    // "the file isn't there", which sends people hunting the wrong bug.
+    // A present-but-unexecutable ELF reports ENOENT when its libc interpreter does
+    // not match the host. Both glibc and musl builds are published; this normally
+    // means an old or partially-upgraded platform package is still installed.
     if (
       result.error.code === 'ENOENT' &&
       process.platform === 'linux' &&
@@ -1189,10 +1213,9 @@ async function main() {
     ) {
       console.error(
         '\numadev: the binary IS present, so this is a C-library mismatch —\n' +
-          '  the prebuilt Linux binaries are glibc builds, and this system looks like musl\n' +
-          '  (Alpine). Options: use a glibc image (e.g. node:20-bookworm / debian / ubuntu),\n' +
-          '  add glibc compatibility, or build from source:\n' +
-          '    cargo install --git https://github.com/umacloud/umadev umadev\n',
+          `  detected host libc: ${linuxLibc()}\n` +
+          '  reinstall so npm selects the matching Linux platform package:\n' +
+          '    npm install -g umadev@latest --force\n',
       );
     }
     process.exit(1);
@@ -1227,6 +1250,8 @@ module.exports = {
   sha256File,
   versionAtLeast,
   invocationNeedsModel,
+  platformKey,
+  linuxLibcFromEvidence,
   NEEDS_MODEL,
   UPGRADE_COMMANDS,
   REPAIR_COMMANDS,

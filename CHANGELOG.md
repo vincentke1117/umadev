@@ -2,6 +2,28 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.62] - 2026-07-21
+
+意图与权限收敛 · 评审循环止损 · 排队计划可见 · Alpine 原生发行
+
+### 修复
+
+- 查询“当前进展 / 还剩什么”等状态类问题时，只读取并汇总现状，不再误触发团队评审、自动修复或旧计划续跑；已经完成的 delivery 状态优先于陈旧的 pending 计划，避免同一任务反复启动。
+- Auto 模式下的明确修复请求获得与用户指令一致的可写权限，不再同时向底座注入 `read-only` 自相矛盾；Plan 仍保持不可越权的只读硬边界。
+- 团队评审改为宿主强制的纯评审回合：critic 一旦调用写文件或命令工具，立即按不可用结算；围栏 JSON、前后缀文本及非评审型运行建议不会再被误判为 blocker，也不会触发无限“评审 → 修复 → 再评审”循环。
+- `/plan` 会同时展示当前计划与 FIFO 排队/转向消息；即使没有执行计划但底部显示 `[queued N]`，也不再错误回答“暂无计划”。
+
+### 平台与发布
+
+- 新增 Linux musl x64 / arm64 一等预编译包，npm 依据 `os`、`cpu` 与 `libc` 自动选择 GNU glibc 或 musl 二进制；Alpine x64/arm64 无需源码编译即可安装运行。
+- 发布矩阵扩展为 macOS x64/arm64、Windows x64、Linux GNU x64/arm64 与 Linux musl x64/arm64 七个原生目标；GitHub Release、SHA-256、SBOM、npm 平台包和启动器版本一致性门同步覆盖。
+- 官网、架构文档、安装说明和贡献指南统一为五底座、七原生目标与九个 npm 发布包的当前事实。
+
+### 验证
+
+- 全工作区 all-features/all-targets 测试、doctest、严格 Clippy、最低 Rust 1.88、npm 安装/更新 smoke、官网生产依赖审计、lint 与生产构建通过；Linux musl arm64 在真实 Alpine 容器中完成原生二进制、npm 选择与交互式 TUI 验收。
+- RustSec 无安全漏洞；`paste 1.0.15` 仅为 Candle/Tokenizers 向量特性的上游“停止维护”告警，已由现有审计策略显式允许，不属于漏洞。
+
 ## [1.0.56] - 2026-07-17
 
 团队编排边界收口 · 自进化可审计 · 第五底座适配 · 发布链硬化

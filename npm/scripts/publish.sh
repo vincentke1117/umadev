@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish the entire npm distribution: five cli-* packages and the knowledge
+# Publish the entire npm distribution: seven cli-* packages and the knowledge
 # corpus first, then the main `umadev` package last.
 #
 # Assumes:
@@ -27,6 +27,8 @@ PLATFORM_PACKAGES=(
   "cli-darwin-x64"
   "cli-linux-x64"
   "cli-linux-arm64"
+  "cli-linux-musl-x64"
+  "cli-linux-musl-arm64"
   "cli-win32-x64"
 )
 

@@ -19,7 +19,8 @@ usage() {
   cat <<'USAGE'
 Usage: stage.sh <platform> <binary-path>
 
-  platform     darwin-arm64 | darwin-x64 | linux-x64 | linux-arm64 | win32-x64
+  platform     darwin-arm64 | darwin-x64 | linux-x64 | linux-arm64 |
+               linux-musl-x64 | linux-musl-arm64 | win32-x64
   binary-path  path to the prebuilt umadev[.exe] binary
 
 Examples:
@@ -36,7 +37,7 @@ BINARY="$2"
 [[ -f "$BINARY" ]] || { echo "stage.sh: binary not found: $BINARY" >&2; exit 1; }
 
 case "$PLATFORM" in
-  darwin-arm64|darwin-x64|linux-x64|linux-arm64)
+  darwin-arm64|darwin-x64|linux-x64|linux-arm64|linux-musl-x64|linux-musl-arm64)
     BIN_NAME="umadev"
     ;;
   win32-x64)

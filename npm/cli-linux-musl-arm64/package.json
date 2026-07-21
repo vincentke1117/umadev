@@ -1,7 +1,7 @@
 {
-  "name": "@umacloud/cli-linux-x64",
+  "name": "@umacloud/cli-linux-musl-arm64",
   "version": "1.0.62",
-  "description": "umadev prebuilt binary for Linux (x86_64 / gnu).",
+  "description": "umadev prebuilt binary for Linux (aarch64 / musl).",
   "homepage": "https://github.com/umacloud/umadev",
   "repository": {
     "type": "git",
@@ -15,8 +15,8 @@
     "linux"
   ],
   "cpu": [
-    "x64"
+    "arm64"
   ],
-  "libc": "glibc",
+  "libc": "musl",
   "preferUnplugged": true
 }

@@ -95,8 +95,8 @@ Grok Build 的 headless ACP 只复用已有 cached token 或显式 `XAI_API_KEY`
 认证必须选择已存在的非交互方法。UmaDev 不主动选择 OAuth、不打开浏览器，也不代用户处理中间
 授权码。交互式 `grok login` 必须由用户在 UmaDev 外自行完成。
 
-UmaDev 自身提供 macOS（Apple Silicon/Intel）、Linux（x86_64/ARM64，glibc >= 2.31）和
-Windows x86_64 产物，Windows on ARM 通过系统 x64 仿真运行。底座仍受各厂商平台边界约束；
+UmaDev 自身提供 macOS（Apple Silicon/Intel）、Linux（x86_64/ARM64，glibc >= 2.31 或
+musl/Alpine）和 Windows x86_64 产物，Windows on ARM 通过系统 x64 仿真运行。底座仍受各厂商平台边界约束；
 Grok Build 的官方安装路径覆盖 macOS/Linux/WSL 和原生 Windows PowerShell。UmaDev 不把自身
 可运行的平台冒充成底座支持平台。
 
