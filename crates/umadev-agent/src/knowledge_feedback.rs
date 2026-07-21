@@ -714,12 +714,20 @@ mod tests {
                 .iter()
                 .filter(|result| **result == ReceiptSettlement::Settled)
                 .count(),
-            1
+            1,
+            "exactly one concurrent caller publishes the receipt: {results:?}"
         );
         assert!(results.iter().all(|result| matches!(
             result,
-            ReceiptSettlement::Settled | ReceiptSettlement::AlreadySettled
-        )));
+            ReceiptSettlement::Settled
+                | ReceiptSettlement::AlreadySettled
+                | ReceiptSettlement::Deferred
+        )), "bounded lock contention may defer a caller, but must not produce a conflicting terminal result: {results:?}");
+        assert_eq!(
+            settle_receipt_in(project.path(), home.path(), &token, TurnOutcome::Pass),
+            ReceiptSettlement::AlreadySettled,
+            "a deferred concurrent caller must converge on the durable terminal receipt"
+        );
         let weight = UsefulnessStore::load_from(home.path()).weight_for_memory(&m);
         assert!(
             (weight - NEUTRAL_WEIGHT).abs() < f32::EPSILON,
