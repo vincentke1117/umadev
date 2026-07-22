@@ -13,7 +13,7 @@ fn source_root() -> Option<PathBuf> {
 
 fn read(root: &Path, relative: &str) -> String {
     std::fs::read_to_string(root.join(relative))
-        .unwrap_or_else(|error| panic!("read pinned Grok source {relative}: {error}"))
+        .unwrap_or_else(|error| panic!("read audited Grok source {relative}: {error}"))
 }
 
 fn source_head(root: &Path) -> String {
@@ -22,14 +22,14 @@ fn source_head(root: &Path) -> String {
         .arg(root)
         .args(["rev-parse", "HEAD"])
         .output()
-        .unwrap_or_else(|error| panic!("read pinned Grok source commit: {error}"));
+        .unwrap_or_else(|error| panic!("read audited Grok source commit: {error}"));
     assert!(
         output.status.success(),
-        "git rev-parse failed for pinned Grok source: {}",
+        "git rev-parse failed for audited Grok source: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout)
-        .expect("pinned Grok source commit is UTF-8")
+        .expect("audited Grok source commit is UTF-8")
         .trim()
         .to_string()
 }
@@ -44,7 +44,7 @@ fn assert_markers(source: &str, contract: &str, markers: &[&str]) {
 }
 
 #[test]
-fn pinned_grok_source_still_matches_the_audited_wire_contract() {
+fn audited_grok_baseline_matches_the_wire_contract() {
     let Some(root) = source_root() else {
         eprintln!("skipped: UMADEV_GROK_SOURCE_DIR is set by the source-contract CI job");
         return;
@@ -252,7 +252,7 @@ fn pinned_grok_source_still_matches_the_audited_wire_contract() {
 }
 
 #[test]
-fn pinned_grok_source_still_matches_the_audited_subagent_contract() {
+fn audited_grok_baseline_matches_the_subagent_contract() {
     let Some(root) = source_root() else {
         eprintln!("skipped: UMADEV_GROK_SOURCE_DIR is set by the source-contract CI job");
         return;

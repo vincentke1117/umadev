@@ -226,7 +226,8 @@ pub use router::{
     RoutePlan, RouteSource, RoutedIntent,
 };
 pub use runner::{
-    setup_run_isolation, strict_coverage_from_env, AgentRunner, RunOptions, RunReport,
+    setup_new_run_isolation, setup_run_isolation, strict_coverage_from_env, AgentRunner,
+    RunOptions, RunReport,
 };
 pub use runtime_proof::{
     run_runtime_proof, runtime_proof_rel_path, write_runtime_proof, E2eResult, RouteProbe,

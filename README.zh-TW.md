@@ -111,7 +111,7 @@ cd umadev && cargo build --release --features vector-local
 | Codex（`codex`） | `npm i -g @openai/codex` | `codex login` |
 | OpenCode（`opencode`） | `npm i -g opencode-ai` | `opencode auth login` |
 | Grok Build（`grok-build`） | `curl -fsSL https://x.ai/cli/install.sh \| bash` | `grok login`；無瀏覽器 / 無頭環境可設定 `XAI_API_KEY` |
-| Kimi Code（`kimi-code`） | `npm i -g @moonshot-ai/kimi-code@0.26.0`（Node.js >= 22.19） | `kimi login` |
+| Kimi Code（`kimi-code`） | `npm i -g @moonshot-ai/kimi-code`（Node.js >= 22.19） | `kimi login` |
 
 表中的 `curl | bash/sh` 是目前驅動顯示的 Unix 安裝提示；Windows 請使用各廠商官方 Windows 安裝方式，不要把這些 Unix 指令直接貼進 PowerShell。
 
@@ -385,7 +385,7 @@ flowchart TB
 | `grok-build` | ACP v1 stdio | Plan 增加唯讀 sandbox、停用子 Agent、限制為唯讀工具集 | 協商到 `session/resume` 時優先使用，否則使用已宣告的 `session/load` |
 | `kimi-code` | 官方 `kimi acp` v1 stdio | Plan=`plan`；Guarded/Auto 維持 `default`，由 UmaDev 審批策略與不可逆紅線掌權 | 標準 `session/resume`，並按宣告回退 `session/load`；工作區與權限身分必須一致 |
 
-上表五個底座全部是一等適配。ACP 是 Grok Build 與 Kimi Code 正式提供的機器協定路徑，不是降級模式。Grok Build 在有效沙箱證明與原生恢復預檢尚不完整時使用新工作階段交接。Kimi Code 固定到官方原始碼審計版本，透過 ACP 只複驗既有登入，不自動執行登入命令或開啟瀏覽器，並按宣告使用標準 `session/resume` / `session/load`。評審永遠新開 Plan 子工作階段，不載入可寫主線。
+上表五個底座全部是一等適配，任何一個都不使用 CLI 版本白名單；版本號只用於診斷，能力由即時協定、型別化回應與執行期安全規則決定。ACP 是 Grok Build 與 Kimi Code 正式提供的機器協定路徑，不是降級模式；兩者接受所有官方版本，並持續用各自開源倉庫做原始碼漂移審計。Grok Build 在有效沙箱證明與原生恢復預檢尚不完整時使用新工作階段交接。Kimi Code 透過 ACP 只複驗既有登入，不自動執行登入命令或開啟瀏覽器；模型、模式、思考、恢復等能力以目前工作階段即時宣告為準。評審永遠新開 Plan 子工作階段，不載入可寫主線。
 
 附件走保序的結構化輸入，絕不會靜默退化成隱藏的 `@path` 文字。Claude Code 與 Codex 原生傳送圖片，一般檔案必須由使用者明確選擇有界 UTF-8 文字物化；OpenCode 原生傳送圖片/檔案 part；Grok Build 與 Kimi Code 只有在即時 ACP 握手宣告相應能力後才傳送圖片或資源。TUI 會逐塊顯示實際投遞方式。目前只有 Codex 的 `turn/steer` 被證明具有同輪語義；其他四個底座依真實工作階段能力排到下一輪或明確拒絕，不偽裝成交互能力完全相同。
 

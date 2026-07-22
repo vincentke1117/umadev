@@ -584,8 +584,8 @@ struct NegotiatedCapabilities {
     background_process_control: bool,
     set_model: bool,
     set_mode: bool,
+    set_thinking: bool,
     grok_source_contract: bool,
-    kimi_source_contract: bool,
 }
 
 /// Capabilities implemented by the UmaDev ACP client itself.
@@ -711,10 +711,8 @@ impl AcpVendor {
         match (self, windows) {
             (Self::Grok, true) => "irm https://x.ai/cli/install.ps1 | iex",
             (Self::Grok, false) => "curl -fsSL https://x.ai/cli/install.sh | bash",
-            // Unpinned on purpose: the probe accepts ANY installed Kimi Code that
-            // answers `--version` (the audited version only gates the enhanced
-            // capabilities), so a user who is genuinely missing the CLI should be
-            // sent to the CURRENT release, never a stale pinned one.
+            // Unpinned on purpose: every official version is accepted and live
+            // session capabilities drive the adapter.
             (Self::Kimi, _) => "npm install -g @moonshot-ai/kimi-code",
         }
     }
@@ -1233,10 +1231,9 @@ impl HostDriver for AcpDriver {
                 }
             },
         };
-        // Any installed version that answers `--version` probes Ready — an
-        // unaudited Kimi is no longer marked Unhealthy in the picker. It runs on the
-        // baseline ACP contract (the enhanced source-verified capabilities stay
-        // gated behind the audited version), matching how Grok already degrades.
+        // Any installed version that answers `--version` probes Ready. The value
+        // is diagnostic only; runtime identity and capability negotiation happen
+        // during ACP initialize/session setup.
         match version_output(&program).await {
             Some(version) => ProbeResult::Ready {
                 version,
@@ -1839,7 +1836,7 @@ impl AcpSession {
             AcpVendor::Grok => {
                 if matches!(policy, SessionOpenPolicy::UserAuthorized { .. }) {
                     return Err(SessionError::Start(
-                        "the fresh Grok Build child did not prove the pinned source contract; interactive authentication was not started"
+                        "the selected ACP child did not identify itself as official Grok Build; interactive authentication was not started"
                             .to_string(),
                     )
                     .into());
@@ -2029,9 +2026,18 @@ impl AcpSession {
             self.deferred_events.push_back(event);
         }
 
+        if matches!(self.vendor, AcpVendor::Kimi) {
+            // Kimi's optional controls are session capabilities, not version
+            // capabilities. Discover each one from the live config catalog so old,
+            // current, prerelease, local, and future builds all take the same path.
+            self.negotiated.set_model = config_option(&setup, "model").is_some();
+            self.negotiated.set_mode = config_option(&setup, "mode").is_some();
+            self.negotiated.set_thinking = config_option(&setup, "thinking").is_some();
+        }
         if let Some(update) = parse_setup_model_catalog(&setup) {
-            self.negotiated.set_model =
-                self.negotiated.grok_source_contract || self.negotiated.kimi_source_contract;
+            if matches!(self.vendor, AcpVendor::Grok) {
+                self.negotiated.set_model = self.negotiated.grok_source_contract;
+            }
             let current_model_id = match &update {
                 SessionStateUpdate::ModelCatalogReplaced {
                     current_model_id, ..
@@ -2071,21 +2077,8 @@ impl AcpSession {
             })
         });
         if !login_advertised {
-            // VERSION TOLERANCE (the "any installed version" mandate): only the AUDITED
-            // Kimi contract is held to advertising the exact `login` auth method. A
-            // non-audited / newer Kimi may rename its auth method, or omit `authMethods`
-            // entirely when the user is ALREADY logged in (a plausible ACP-server
-            // behavior) — refusing the session there would break a genuine, logged-in
-            // Kimi Code, which is the single most likely way "any version" breaks in
-            // practice. So for a non-audited Kimi, DEGRADE: skip the explicit `login`
-            // probe and let `session/new`'s own `-32000` auth-required gate surface the
-            // honest "run `kimi login`" message. Fail-open, never a false refusal.
-            if self.negotiated.kimi_source_contract {
-                return Err(SessionError::Start(
-                    "Kimi Code did not advertise its audited terminal login method; update Kimi Code or run `kimi doctor`"
-                        .to_string(),
-                ));
-            }
+            // Auth method names are not a stable cross-version contract. Let the
+            // session/new auth-required response remain the authoritative check.
             return Ok(());
         }
         match self
@@ -2106,29 +2099,25 @@ impl AcpSession {
     }
 
     async fn apply_requested_kimi_model(&mut self, setup: &Value) -> Result<(), SessionError> {
-        if self.negotiated.kimi_source_contract {
-            // AUDITED contract: model selection is a hard guarantee — surface any failure.
-            return self.apply_kimi_model_selection(setup).await;
+        if !matches!(self.vendor, AcpVendor::Kimi) {
+            return Ok(());
         }
-        // NON-AUDITED (the "any installed version" mandate): still honor the user's
-        // requested model when the build advertises the STANDARD `model` config option —
-        // Grok already passes `--model` for any version, and this closes the Kimi
-        // asymmetry so a user on a newer Kimi no longer has their `/model` choice
-        // silently dropped. But a model-selection LIMITATION on an unaudited build must
-        // DEGRADE to the base's own default, never BLOCK startup, so any error here is
-        // swallowed (strictly better than today's unconditional skip).
-        if let Err(_e) = self.apply_kimi_model_selection(setup).await {
-            // Best-effort: the build exposes no model channel or rejected the selection.
-            // Keep the session on the base default rather than failing the open.
+        if !self.negotiated.set_model {
+            if self.model.trim().is_empty() {
+                if let Some(current) = extract_session_model(setup) {
+                    self.model = current;
+                }
+            }
+            return Ok(());
         }
-        Ok(())
+        self.apply_kimi_model_selection(setup).await
     }
 
     /// The core Kimi model-selection contract: adopt the session's current model when
     /// the user pinned none, otherwise validate the requested model against the
     /// advertised catalog and set it via `session/set_config_option`. Returns an error
-    /// when the build exposes no model config option / catalog or rejects the selection.
-    /// The AUDITED path surfaces that error; the non-audited path degrades on it.
+    /// when the live session exposes no model config option/catalog or rejects
+    /// the selection. No CLI version participates in this decision.
     async fn apply_kimi_model_selection(&mut self, setup: &Value) -> Result<(), SessionError> {
         let Some(current) = extract_session_model(setup) else {
             return Err(SessionError::Start(
@@ -2659,23 +2648,21 @@ impl AcpSession {
     }
 
     async fn apply_permission_mode(&mut self, setup: &Value) -> Result<(), SessionError> {
-        let source_contract = match self.vendor {
-            AcpVendor::Grok => self.negotiated.grok_source_contract,
-            AcpVendor::Kimi => self.negotiated.kimi_source_contract,
-        };
+        let source_contract =
+            matches!(self.vendor, AcpVendor::Grok) && self.negotiated.grok_source_contract;
         let Some(mode_id) =
             select_session_mode(setup, self.vendor, self.permissions, source_contract)
         else {
             return if matches!(self.vendor, AcpVendor::Kimi)
-                && kimi_missing_mode_is_fatal(source_contract, self.permissions)
+                && kimi_missing_mode_is_fatal(self.permissions)
             {
                 Err(SessionError::Start(
                     "Kimi Code did not advertise the required mode config option".to_string(),
                 ))
             } else {
-                // Grok (launch-boundary authoritative) OR a non-audited Kimi under
-                // Guarded/Auto whose mode catalog shape differs: DEGRADE on the base's
-                // own default mode instead of blocking a working build.
+                // Grok has an authoritative launch boundary. Kimi Guarded/Auto
+                // permit writes, so a build without a mode control may use its own
+                // default; Plan still fails closed above.
                 Ok(())
             };
         };
@@ -2736,16 +2723,15 @@ impl AcpSession {
         params: Value,
         label: &str,
     ) -> Result<Value, SessionError> {
+        let timeout_message = self.handshake_timeout_message(label);
         match self
-            .request_with_timeout(
-                method,
-                params,
-                handshake_timeout(),
-                &format!("ACP {label} timed out; check login and CLI version"),
-            )
+            .request_with_timeout(method, params, handshake_timeout(), &timeout_message)
             .await
         {
             Ok(value) => Ok(value),
+            Err(SessionError::Send(error)) if error.starts_with("ACP ") => {
+                Err(SessionError::Start(error))
+            }
             Err(SessionError::Send(error)) => {
                 Err(SessionError::Start(format!("ACP {label}: {error}")))
             }
@@ -2779,13 +2765,15 @@ impl AcpSession {
             Err(_) => {
                 self.pending.lock().await.remove(&id);
                 Err((
-                    SessionError::Start(format!(
-                        "ACP {label} timed out; check login and CLI version"
-                    )),
+                    SessionError::Start(self.handshake_timeout_message(label)),
                     None,
                 ))
             }
         }
+    }
+
+    fn handshake_timeout_message(&self, label: &str) -> String {
+        acp_handshake_timeout_message(self.vendor, label)
     }
 
     async fn begin_request(
@@ -3123,6 +3111,15 @@ impl AcpSession {
     }
 }
 
+fn acp_handshake_timeout_message(vendor: AcpVendor, label: &str) -> String {
+    if matches!(vendor, AcpVendor::Grok) && matches!(label, "initialize" | "session/new") {
+        return format!(
+            "ACP {label} timed out. Open `grok` directly from this same workspace first; if Grok cannot enter the folder, fix the folder permission/trust prompt, then finish login and verify the CLI version before retrying UmaDev"
+        );
+    }
+    format!("ACP {label} timed out; check login and CLI version")
+}
+
 fn acp_content_blocks(
     input: &crate::turn_input::PreparedTurnInput,
     capabilities: NegotiatedCapabilities,
@@ -3324,7 +3321,7 @@ impl BaseSession for AcpSession {
             mid_turn_steer: self.negotiated.interject,
             set_model: self.negotiated.set_model,
             set_mode: self.negotiated.set_mode,
-            set_thinking: self.negotiated.kimi_source_contract,
+            set_thinking: self.negotiated.set_thinking,
             text_input: InputDelivery::Native,
             image_input: if self.negotiated.image {
                 InputDelivery::Native
@@ -3477,7 +3474,7 @@ impl BaseSession for AcpSession {
     }
 
     async fn set_thinking(&mut self, enabled: bool) -> Result<SessionStateUpdate, SessionError> {
-        if !self.negotiated.kimi_source_contract || !matches!(self.vendor, AcpVendor::Kimi) {
+        if !self.negotiated.set_thinking || !matches!(self.vendor, AcpVendor::Kimi) {
             return Err(SessionError::CapabilityUnsupported(
                 SessionCapability::SetThinking,
             ));
@@ -8284,10 +8281,8 @@ fn validate_initialize(vendor: AcpVendor, result: &Value) -> Result<(), SessionE
     // clear error. A real Kimi Code is NOT rejected on its version, even when that
     // version is a newer release OR unparseable/missing (a git-describe string, a
     // date, an empty `agentVersion`): it degrades exactly like Grok, running on the
-    // baseline ACP contract with the enhanced source-verified capabilities simply
-    // off (`kimi_source_contract == false` in `negotiated_capabilities`). So a
-    // routine Kimi upgrade — or a dev build with a non-SemVer version — keeps
-    // working ("any installed version, degrade don't block").
+    // baseline ACP contract. Optional controls are discovered from session
+    // configOptions after the session opens; no version string gates startup.
     if matches!(vendor, AcpVendor::Kimi)
         && !kimi_source_profile_from_initialize(result).is_kimi_code_identity()
     {
@@ -8300,16 +8295,17 @@ fn validate_initialize(vendor: AcpVendor, result: &Value) -> Result<(), SessionE
 
 fn negotiated_capabilities(vendor: AcpVendor, result: &Value) -> NegotiatedCapabilities {
     let source_profile = source_profile_from_initialize(result);
-    let kimi_source_profile = kimi_source_profile_from_initialize(result);
+    // Grok's official identity enables the typed source-lineage parsers for every
+    // CLI version. The version label is diagnostic only. Standard methods still
+    // depend on ACP advertisement/session responses and optional private calls
+    // remain response-gated, so this does not invent a capability from SemVer.
     let grok_source_contract =
-        matches!(vendor, AcpVendor::Grok) && source_profile.is_audited_version();
-    let kimi_source_contract =
-        matches!(vendor, AcpVendor::Kimi) && kimi_source_profile.is_audited_version();
+        matches!(vendor, AcpVendor::Grok) && source_profile.is_grok_shell_identity();
     NegotiatedCapabilities {
         // The published Grok agent accepts ContentBlock::Image in its prompt
         // parser but currently omits the standard image flag from initialize.
-        // Recover that vendor-specific capability only behind Grok's own
-        // versioned identity marker; unknown ACP peers remain advertisement-only.
+        // Recover that vendor-specific capability only behind Grok's official
+        // identity marker; unknown ACP peers remain advertisement-only.
         image: advertised_bool(
             result
                 .pointer("/agentCapabilities/promptCapabilities/image")
@@ -8346,9 +8342,9 @@ fn negotiated_capabilities(vendor: AcpVendor, result: &Value) -> NegotiatedCapab
         // session's model switch surface is enabled only after session/new or
         // session/load also returns the source-shaped model catalog.
         set_model: false,
-        set_mode: grok_source_contract || kimi_source_contract,
+        set_mode: grok_source_contract,
+        set_thinking: false,
         grok_source_contract,
-        kimi_source_contract,
     }
 }
 
@@ -8455,20 +8451,14 @@ fn validate_grok_auth_gate(result: &Value) -> Result<(), SessionError> {
     Err(SessionError::Start(detail))
 }
 
-/// Whether a Kimi session whose mode config option is ABSENT (in the shape UmaDev
-/// recognizes) must FAIL rather than degrade. Kimi has no launch-level sandbox — the
-/// ACP session mode is its ONLY permission boundary — so this fails CLOSED exactly
-/// where correctness demands and DEGRADES where the "any installed version" mandate
-/// demands:
-///   - AUDITED contract (`source_contract`): the option MUST be advertised → fatal.
-///   - Plan (read-only): we cannot PROVE a read-only boundary without the mode, so we
-///     refuse rather than run a possibly-writable base under a read-only promise.
-///   - Guarded / Auto on a NON-audited build: those profiles permit writes anyway, so
-///     a newer/renamed mode catalog degrades (proceed on the base's own default mode).
+/// Whether a Kimi session whose mode config option is absent must fail rather
+/// than degrade. Kimi has no launch-level sandbox, so Plan cannot honestly claim
+/// read-only without a live mode control. Writable profiles may use the base's
+/// default. This is capability-driven and independent of CLI version.
 ///
 /// Grok never reaches this — its launch flags are the authoritative boundary.
-fn kimi_missing_mode_is_fatal(source_contract: bool, permissions: BasePermissionProfile) -> bool {
-    source_contract || matches!(permissions, BasePermissionProfile::Plan)
+fn kimi_missing_mode_is_fatal(permissions: BasePermissionProfile) -> bool {
+    matches!(permissions, BasePermissionProfile::Plan)
 }
 
 fn select_session_mode(
@@ -8542,13 +8532,9 @@ async fn require_resolved_vendor_program(
     vendor: AcpVendor,
     program: String,
 ) -> Result<String, SessionError> {
-    // Only require that the program is installed and answers `--version`. A version
-    // UmaDev has not source-audited is NOT refused here: the session runs on the
-    // baseline ACP protocol (protocolVersion 1 is still enforced at
-    // `validate_initialize`), and only the enhanced, source-verified capabilities
-    // stay gated behind the audited version (see `negotiated_capabilities`). This
-    // matches Grok, which already degrades instead of blocking — so a routine
-    // upstream Kimi upgrade no longer makes the base unusable.
+    // Only require that the program is installed and answers `--version`. The
+    // version string never authorizes or refuses a base; ACP identity, live
+    // advertisement, typed responses, and permission policy decide behavior.
     if version_output(&program).await.is_none() {
         return Err(SessionError::Start(format!(
             "{} is not installed or not on PATH",
@@ -9292,8 +9278,8 @@ mod tests {
     fn a_newer_kimi_is_accepted_and_only_a_wrong_identity_is_rejected() {
         // The reported regression: a routine Kimi upgrade (0.26.0 → 0.27.0) must NOT
         // make the base unusable. A newer, correctly-identified Kimi Code passes
-        // validation and runs on the baseline contract (audited enhancements off);
-        // only a genuinely different program on PATH (wrong ACP identity) is refused.
+        // validation; controls are discovered later from the live session catalog.
+        // Only a genuinely different program on PATH is refused.
         let newer = json!({
             "protocolVersion":1,
             "agentInfo":{"name":"Kimi Code CLI","version":"0.27.0"},
@@ -9302,10 +9288,10 @@ mod tests {
             validate_initialize(AcpVendor::Kimi, &newer).is_ok(),
             "a newer Kimi Code release must be accepted, not refused"
         );
-        assert!(
-            !negotiated_capabilities(AcpVendor::Kimi, &newer).kimi_source_contract,
-            "the audited source contract stays gated behind the exact audited version"
-        );
+        let capabilities = negotiated_capabilities(AcpVendor::Kimi, &newer);
+        assert!(!capabilities.set_model);
+        assert!(!capabilities.set_mode);
+        assert!(!capabilities.set_thinking);
 
         let wrong_program = json!({
             "protocolVersion":1,
@@ -9318,37 +9304,31 @@ mod tests {
     }
 
     #[test]
+    fn reported_regression_grok_workspace_timeout_names_the_real_preflight() {
+        let message = acp_handshake_timeout_message(AcpVendor::Grok, "initialize");
+        assert!(message.contains("same workspace"), "{message}");
+        assert!(message.contains("folder permission/trust"), "{message}");
+
+        let kimi = acp_handshake_timeout_message(AcpVendor::Kimi, "initialize");
+        assert!(!kimi.contains("Open `grok`"), "{kimi}");
+    }
+
+    #[test]
     fn kimi_missing_mode_fails_closed_only_where_correctness_requires() {
         // SECURITY INVARIANT: Kimi's ONLY permission boundary is the ACP session mode.
-        // When a non-audited Kimi's mode catalog shape differs, we must still fail CLOSED
-        // for Plan (read-only) and for the audited contract, but DEGRADE for Guarded/Auto
-        // (which permit writes anyway) so a newer Kimi build is not blocked outright.
-
-        // Audited contract: the mode option is a hard guarantee → fatal in every profile.
-        for profile in [
-            BasePermissionProfile::Plan,
-            BasePermissionProfile::Guarded,
-            BasePermissionProfile::Auto,
-        ] {
-            assert!(
-                kimi_missing_mode_is_fatal(true, profile),
-                "the audited Kimi contract must fail closed when its mode option is absent"
-            );
-        }
-
-        // Non-audited: Plan MUST fail closed (read-only can't be proven without the mode)…
+        // Plan MUST fail closed because read-only cannot be proven without mode.
         assert!(
-            kimi_missing_mode_is_fatal(false, BasePermissionProfile::Plan),
-            "Plan (read-only) must fail closed even on a non-audited Kimi build"
+            kimi_missing_mode_is_fatal(BasePermissionProfile::Plan),
+            "Plan must fail closed on every Kimi version without a mode control"
         );
-        // …but Guarded/Auto DEGRADE (those profiles permit writes) rather than block.
+        // Guarded/Auto permit writes, so lack of the optional control degrades.
         assert!(
-            !kimi_missing_mode_is_fatal(false, BasePermissionProfile::Guarded),
-            "Guarded on a non-audited Kimi degrades to the base default, not a hard block"
+            !kimi_missing_mode_is_fatal(BasePermissionProfile::Guarded),
+            "Guarded degrades to the base default"
         );
         assert!(
-            !kimi_missing_mode_is_fatal(false, BasePermissionProfile::Auto),
-            "Auto on a non-audited Kimi degrades to the base default, not a hard block"
+            !kimi_missing_mode_is_fatal(BasePermissionProfile::Auto),
+            "Auto degrades to the base default"
         );
     }
 
@@ -9837,17 +9817,26 @@ mod tests {
             "_meta": {"grokShell": true}
         });
         let capabilities = negotiated_capabilities(AcpVendor::Grok, &unversioned);
-        assert!(!capabilities.grok_source_contract);
-        assert!(!capabilities.image);
+        assert!(capabilities.grok_source_contract);
+        assert!(capabilities.image);
+
+        let future = json!({
+            "agentCapabilities": {"loadSession": true},
+            "_meta": {"grokShell": true, "agentVersion": "99.7.3+future.adapter"}
+        });
+        let capabilities = negotiated_capabilities(AcpVendor::Grok, &future);
+        assert!(capabilities.grok_source_contract);
+        assert!(capabilities.image);
+        assert!(capabilities.load);
     }
 
     #[test]
-    fn published_kimi_initialize_requires_exact_identity_and_uses_only_standard_capabilities() {
+    fn published_kimi_initialize_requires_identity_and_defers_session_controls() {
         let official = json!({
             "protocolVersion":1,
             "agentInfo":{
                 "name":"Kimi Code CLI",
-                "version":crate::kimi_contract::KIMI_CODE_SOURCE_VERSION
+                "version":crate::kimi_contract::KIMI_CODE_AUDITED_BASELINE_VERSION
             },
             "agentCapabilities":{
                 "loadSession":true,
@@ -9858,14 +9847,14 @@ mod tests {
         });
         validate_initialize(AcpVendor::Kimi, &official).unwrap();
         let capabilities = negotiated_capabilities(AcpVendor::Kimi, &official);
-        assert!(capabilities.kimi_source_contract);
         assert!(!capabilities.grok_source_contract);
         assert!(capabilities.image && capabilities.embedded_context);
-        assert!(capabilities.resume && capabilities.load && capabilities.set_mode);
+        assert!(capabilities.resume && capabilities.load);
+        assert!(!capabilities.set_model && !capabilities.set_mode && !capabilities.set_thinking);
         assert!(!capabilities.interject && !capabilities.prompt_queue);
 
-        // A newer Kimi Code (right identity, unaudited version) is accepted and
-        // degrades; only a WRONG identity (a different `kimi`) is rejected.
+        // Every Kimi Code version is accepted; only a WRONG identity (a
+        // different `kimi`) is rejected.
         assert!(
             validate_initialize(
                 AcpVendor::Kimi,
@@ -9877,7 +9866,7 @@ mod tests {
         assert!(
             validate_initialize(
                 AcpVendor::Kimi,
-                &json!({"protocolVersion":1,"agentInfo":{"name":"Kimi CLI","version":crate::kimi_contract::KIMI_CODE_SOURCE_VERSION}})
+                &json!({"protocolVersion":1,"agentInfo":{"name":"Kimi CLI","version":crate::kimi_contract::KIMI_CODE_AUDITED_BASELINE_VERSION}})
             )
             .is_err(),
             "a different `kimi` (wrong ACP identity) is still rejected"
@@ -14195,7 +14184,7 @@ mod tests {
                             "protocolVersion":1,
                             "agentInfo":{
                                 "name":"Kimi Code CLI",
-                                "version":crate::kimi_contract::KIMI_CODE_SOURCE_VERSION
+                                "version":crate::kimi_contract::KIMI_CODE_AUDITED_BASELINE_VERSION
                             },
                             "agentCapabilities":{"loadSession":true},
                             "authMethods":[{"id":"login","type":"terminal","args":["--login"]}]
@@ -14253,9 +14242,9 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn fake_kimi_source_contract_child() {
+    fn fake_kimi_runtime_capabilities_child() {
         let invoked = std::env::args().any(|arg| arg == "--exact")
-            && std::env::args().any(|arg| arg.ends_with("fake_kimi_source_contract_child"));
+            && std::env::args().any(|arg| arg.ends_with("fake_kimi_runtime_capabilities_child"));
         if !invoked {
             return;
         }
@@ -14280,7 +14269,7 @@ mod tests {
                                 "protocolVersion":1,
                                 "agentInfo":{
                                     "name":"Kimi Code CLI",
-                                    "version":crate::kimi_contract::KIMI_CODE_SOURCE_VERSION
+                                    "version":"99.7.3+future.adapter"
                                 },
                                 "agentCapabilities":{
                                     "loadSession":true,
@@ -14592,7 +14581,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let args = vec![
             "--exact".to_string(),
-            "acp::tests::fake_kimi_source_contract_child".to_string(),
+            "acp::tests::fake_kimi_runtime_capabilities_child".to_string(),
             "--nocapture".to_string(),
             "--test-threads=1".to_string(),
         ];
@@ -14607,7 +14596,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(session.negotiated.kimi_source_contract);
         assert!(!session.negotiated.grok_source_contract);
         assert!(session.capabilities().set_model);
         assert!(session.capabilities().set_mode);
@@ -14713,7 +14701,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let args = vec![
             "--exact".to_string(),
-            "acp::tests::fake_kimi_source_contract_child".to_string(),
+            "acp::tests::fake_kimi_runtime_capabilities_child".to_string(),
             "--nocapture".to_string(),
             "--test-threads=1".to_string(),
         ];
@@ -14777,7 +14765,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let args = vec![
             "--exact".to_string(),
-            "acp::tests::fake_kimi_source_contract_child".to_string(),
+            "acp::tests::fake_kimi_runtime_capabilities_child".to_string(),
             "--nocapture".to_string(),
             "--test-threads=1".to_string(),
         ];
@@ -14853,7 +14841,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let args = vec![
             "--exact".to_string(),
-            "acp::tests::fake_kimi_source_contract_child".to_string(),
+            "acp::tests::fake_kimi_runtime_capabilities_child".to_string(),
             "--nocapture".to_string(),
             "--test-threads=1".to_string(),
         ];
@@ -14933,7 +14921,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let args = vec![
             "--exact".to_string(),
-            "acp::tests::fake_kimi_source_contract_child".to_string(),
+            "acp::tests::fake_kimi_runtime_capabilities_child".to_string(),
             "--nocapture".to_string(),
             "--test-threads=1".to_string(),
         ];
@@ -14967,7 +14955,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let args = vec![
             "--exact".to_string(),
-            "acp::tests::fake_kimi_source_contract_child".to_string(),
+            "acp::tests::fake_kimi_runtime_capabilities_child".to_string(),
             "--nocapture".to_string(),
             "--test-threads=1".to_string(),
         ];

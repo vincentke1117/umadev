@@ -37,7 +37,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: xai-org/grok-build
-          ref: a881e6703f46b01d8c7d4a5437683546df30449d
+          ref: 3af4d5d39897855bdcc74f23e690024a5dc05573
           path: _upstream/grok-build
           fetch-depth: 1
 
@@ -45,7 +45,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: MoonshotAI/kimi-code
-          ref: efacf0452d46f5dbd67499eabc053869495d5213
+          ref: 4c763f6763acb67a73d133f7450d092e71d63692
           path: _upstream/kimi-code
           fetch-depth: 1
 
@@ -61,12 +61,12 @@ jobs:
       - name: cargo test (doctests)
         run: cargo test --workspace --all-features --doc --no-fail-fast
 
-      - name: Verify pinned Grok Build source contract
+      - name: Verify audited Grok Build source baseline
         env:
           UMADEV_GROK_SOURCE_DIR: ${{ github.workspace }}/_upstream/grok-build
         run: cargo test -p umadev-host --test grok_source_drift -- --nocapture
 
-      - name: Verify pinned Kimi Code source contract
+      - name: Verify audited Kimi Code source baseline
         env:
           UMADEV_KIMI_SOURCE_DIR: ${{ github.workspace }}/_upstream/kimi-code
         run: cargo test -p umadev-host --test kimi_source_drift -- --nocapture

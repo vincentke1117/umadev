@@ -5657,6 +5657,72 @@ fn picker_blocks_commit_on_not_installed_with_install_cmd() {
 }
 
 #[test]
+fn reported_regression_unavailable_backend_switch_is_rejected_without_claiming_success() {
+    let mut app = fresh_app(Some("claude-code"));
+    app.backends.push(BackendInfo {
+        id: "codex".to_string(),
+        ready: false,
+        detail: "codex not found on PATH".to_string(),
+        auth: AuthMark::NotInstalled,
+        login_cmd: "codex login".to_string(),
+        install_cmd: "npm install -g @openai/codex".to_string(),
+    });
+
+    assert_eq!(app.slash_backend(Some("codex")), Action::None);
+    assert_eq!(app.backend.as_deref(), Some("claude-code"));
+    let last = app
+        .history
+        .back()
+        .map(ChatMessage::body)
+        .unwrap_or_default();
+    assert!(last.contains("npm install -g @openai/codex"), "{last}");
+}
+
+#[test]
+fn reported_regression_run_stops_before_planning_when_active_backend_is_missing() {
+    let mut app = fresh_app(Some("codex"));
+    app.backends.push(BackendInfo {
+        id: "codex".to_string(),
+        ready: false,
+        detail: "codex not found on PATH".to_string(),
+        auth: AuthMark::NotInstalled,
+        login_cmd: "codex login".to_string(),
+        install_cmd: "npm install -g @openai/codex".to_string(),
+    });
+
+    assert_eq!(app.slash_run("build the dashboard"), Action::None);
+    assert!(!app.run_started && !app.director_run_in_flight);
+    assert!(app.tasks.is_empty());
+    assert!(app.requirement.is_empty());
+    let last = app
+        .history
+        .back()
+        .map(ChatMessage::body)
+        .unwrap_or_default();
+    assert!(last.contains("npm install -g @openai/codex"), "{last}");
+
+    // A second attempt remains blocked but does not spam the same diagnosis.
+    let before = app.history.len();
+    assert_eq!(app.slash_run("build the dashboard"), Action::None);
+    assert_eq!(app.history.len(), before);
+}
+
+#[test]
+fn reported_regression_route_failure_does_not_duplicate_visible_abort_reason() {
+    let mut app = fresh_app(Some("codex"));
+    let reason = "persistent session unavailable (codex not found on PATH)";
+    app.push(ChatRole::System, reason.to_string());
+    app.record_route_failed(reason.to_string(), FailedRouteOrigin::Chat);
+    assert_eq!(
+        app.history
+            .iter()
+            .filter(|message| message.body() == reason)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn picker_commits_when_logged_in() {
     let mut app = fresh_app(None);
     probe_and_select(

@@ -1750,9 +1750,12 @@ async fn run_director_loop(
         // and snapshot the run baseline before the base writes anything — never on
         // the user's default/working branch, never auto-merged/pushed. Fail-open:
         // a non-git dir / dirty tree / any error just runs in the working tree.
-        if let Some((branch, from)) =
+        let isolation = if resume {
             umadev_agent::setup_run_isolation(&root, &options.effective_slug())
-        {
+        } else {
+            umadev_agent::setup_new_run_isolation(&root, &options.effective_slug())
+        };
+        if let Some((branch, from)) = isolation {
             sink.emit(EngineEvent::Note(umadev_i18n::tlf(
                 "trust.branch_isolated",
                 &[&branch, &from],
@@ -2950,7 +2953,8 @@ async fn run_agentic(
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("project");
-            if let Some((branch, from)) = umadev_agent::setup_run_isolation(&project_root, slug) {
+            if let Some((branch, from)) = umadev_agent::setup_new_run_isolation(&project_root, slug)
+            {
                 sink.emit(EngineEvent::Note(umadev_i18n::tlf(
                     "trust.branch_isolated",
                     &[&branch, &from],

@@ -81,6 +81,25 @@ const website = fs.readFileSync(
   path.join(repoRoot, 'umadev-website', 'src', 'app', 'content.ts'),
   'utf8',
 );
+
+// Kimi compatibility is runtime capability-driven, never exact-version pinned.
+// Keep current install surfaces on the unversioned package so routine upgrades do
+// not contradict the driver's all-official-versions contract.
+const kimiInstall = '@moonshot-ai/kimi-code';
+for (const relative of [
+  'README.md',
+  'README.zh-CN.md',
+  'README.zh-TW.md',
+  'umadev-website/src/app/content.ts',
+]) {
+  const body = fs.readFileSync(path.join(repoRoot, relative), 'utf8');
+  if (!body.includes(kimiInstall)) {
+    fail(`${relative} does not advertise the version-agnostic Kimi install ${kimiInstall}`);
+  }
+  if (/@moonshot-ai\/kimi-code@(?:v?\d|=|\^|~)/.test(body)) {
+    fail(`${relative} reintroduced a fixed Kimi CLI install version`);
+  }
+}
 // An unreleased entry may lead each locale while a version is being prepared.
 // Lock the first stable changelog entry instead of pretending in-flight work
 // has already shipped under the current Cargo/npm version.
@@ -103,5 +122,5 @@ if (process.env.GITHUB_REF?.startsWith('refs/tags/v')) {
 }
 
 console.log(
-  `version-lock: Cargo, website, tag, nine release packages, and the archived model manifest agree on ${cargoVersion}`,
+  `version-lock: Cargo, website, tag, nine release packages, archived model manifest, and version-agnostic Kimi install surfaces agree on ${cargoVersion}`,
 );

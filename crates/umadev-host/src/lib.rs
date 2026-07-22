@@ -55,12 +55,12 @@ pub mod folder_trust;
 pub mod grok_auth_flow;
 /// Pinned Grok Build background-process list/stop wire contract.
 pub mod grok_background_control;
-/// Pinned source-compatibility contract for Grok Build private ACP extensions.
+/// Version-independent identity and source-backed parsers for Grok Build ACP.
 pub mod grok_contract;
 /// Grok Build's server-authoritative, versioned prompt-queue contract.
 pub mod grok_prompt_queue;
 mod grok_routes;
-/// Pinned source-compatibility contract for Kimi Code's standard ACP surface.
+/// Version-independent identity contract for Kimi Code's standard ACP surface.
 pub mod kimi_contract;
 pub mod opencode;
 /// Continuous-session driver for `opencode` (`opencode serve` HTTP + SSE),

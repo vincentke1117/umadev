@@ -2986,7 +2986,8 @@ async fn drive_director_run(
     } else {
         &options.slug
     };
-    if let Some((branch, from)) = umadev_agent::setup_run_isolation(&options.project_root, slug) {
+    if let Some((branch, from)) = umadev_agent::setup_new_run_isolation(&options.project_root, slug)
+    {
         events.emit(umadev_agent::EngineEvent::Note(umadev_i18n::tlf(
             "trust.branch_isolated",
             &[&branch, &from],

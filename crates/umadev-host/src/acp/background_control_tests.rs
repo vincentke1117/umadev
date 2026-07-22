@@ -259,13 +259,13 @@ async fn grok_background_control_is_owned_authoritative_and_idempotent() {
 }
 
 #[test]
-fn outside_source_version_never_advertises_background_control() {
+fn every_official_grok_version_advertises_background_control() {
     let capabilities = negotiated_capabilities(
         AcpVendor::Grok,
         &json!({
             "protocolVersion":1,
-            "_meta":{"grokShell":true,"agentVersion":"0.1.220-alpha.5"}
+            "_meta":{"grokShell":true,"agentVersion":"99.7.3-future.5+adapter"}
         }),
     );
-    assert!(!capabilities.background_process_control);
+    assert!(capabilities.background_process_control);
 }

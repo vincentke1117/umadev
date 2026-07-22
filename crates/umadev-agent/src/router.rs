@@ -1297,7 +1297,16 @@ fn apply_explicit_mutation_floor(
     }
     let mut floor = tier0(requirement);
     if !floor.class.mutates_workspace() {
-        return plan;
+        // The imperative belt deliberately covers verbs that the cheap fallback
+        // taxonomy may not know yet (for example "登记/保存"). Once the user's
+        // write intent is unambiguous, an outdated Tier-0 noun/verb table must not
+        // strand the turn in read-only. Use the narrow resident edit lane; never
+        // inflate an unknown write verb into a full team build.
+        floor.class = RouteClass::QuickEdit;
+        floor.kind = TaskKind::Light;
+        floor.depth = Depth::Fast;
+        floor.team.clear();
+        floor.est_budget = Budget::for_route(floor.class, floor.depth);
     }
 
     // The deterministic planner can infer a product-shaped kind from the nouns in
@@ -1684,6 +1693,15 @@ fn clear_mutation_request(requirement: &str) -> bool {
         "重構",
         "写入",
         "寫入",
+        "登记",
+        "登記",
+        "记录",
+        "記錄",
+        "保存",
+        "落盘",
+        "落盤",
+        "创建",
+        "建立",
         "implement",
         "fix ",
         "change ",
@@ -1745,6 +1763,22 @@ fn explicit_mutation_command(requirement: &str) -> bool {
         "重構",
         "实现",
         "實現",
+        "登记",
+        "登記",
+        "记录",
+        "記錄",
+        "保存",
+        "写入",
+        "寫入",
+        "创建",
+        "建立",
+        "需要登记",
+        "需要登記",
+        "需要记录",
+        "需要記錄",
+        "需要保存",
+        "需要写入",
+        "需要寫入",
         "请修",
         "請修",
         "请改",
@@ -2838,7 +2872,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_fix_command_cannot_be_stranded_in_read_only_explain() {
+    fn reported_regression_explicit_write_cannot_be_stranded_in_read_only() {
         let wrong = BrainRoute {
             class: "explain".to_string(),
             authorization: "read_only".to_string(),
@@ -2856,6 +2890,8 @@ mod tests {
                 "修复以上发现的问题",
                 "请你修复这个循环",
                 "把这个权限问题修复掉",
+                "需要登记这条踩坑记录",
+                "保存这份配置到项目文件",
                 "please fix the review loop",
             ] {
                 let route = apply_route_ceilings(

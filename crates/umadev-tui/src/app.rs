@@ -9190,6 +9190,15 @@ impl App {
                 if self.mode == AppMode::Picker {
                     refresh_picker_with_probes(&mut self.picker_items, &self.backends);
                 }
+                // A saved backend is only a preference, not proof that its binary is
+                // still reachable in this process. Surface a definite missing/broken
+                // probe immediately instead of letting the first user request spend
+                // time planning before session creation fails.
+                if self.backend.as_deref() == Some(backend_id.as_str())
+                    && self.backend_definitely_unavailable(&backend_id).is_some()
+                {
+                    let _ = self.reject_active_backend_unavailable();
+                }
             }
             EngineEvent::VerifyStarted { phase, command } => {
                 self.push(
@@ -10831,6 +10840,14 @@ impl App {
             self.answer_live_meta(intent, text);
             return Action::None;
         }
+        // Do not accept a real base turn when startup probing has already proved
+        // that the selected executable is unavailable. Preserve the full structured
+        // input (including attachments) so the user can repair PATH/switch base and
+        // submit exactly once; no phantom user turn enters conversation memory.
+        if self.reject_active_backend_unavailable() {
+            self.restore_submitted_turn(turn);
+            return Action::None;
+        }
         // A2#5 — a PAUSED consequential-action approval is live: an exact typed
         // decision (「批准」/"approve"/"y" allows, 「拒绝」/"deny"/"n" denies)
         // resolves the pause instead of queueing as a normal message with no
@@ -11299,6 +11316,14 @@ impl App {
     }
 
     pub(crate) fn record_route_failed(&mut self, note: String, origin: FailedRouteOrigin) {
+        // Several session-open boundaries emit an abort event first (so the run is
+        // marked aborted) and then send the same terminal reason through
+        // `RouteDecision::Failed` (so task/session bookkeeping settles). Keep both
+        // control signals, but render the human reason once.
+        let already_visible = self
+            .history
+            .back()
+            .is_some_and(|message| message.body().trim() == note.trim());
         // Feature A — a turn that ran a while then errored out is still a terminal
         // outcome worth a beep (gated on elapsed, so a fast base-init failure is
         // silent). Arm before clearing the timer.
@@ -11348,7 +11373,9 @@ impl App {
         );
         self.persist_chat();
         self.refresh_status();
-        self.push(ChatRole::System, note);
+        if !already_visible {
+            self.push(ChatRole::System, note);
+        }
         if origin == FailedRouteOrigin::Chat {
             self.drop_failed_route_duplicate_queued_chat();
         }
@@ -13427,6 +13454,53 @@ impl App {
             return Action::None;
         }
         let id = backend.unwrap_or("offline").to_string();
+        if let Some(probe) = backend.and_then(|target| {
+            self.backends
+                .iter()
+                .find(|candidate| candidate.id == target)
+                .cloned()
+        }) {
+            match probe.auth {
+                AuthMark::NotInstalled | AuthMark::Unknown if !probe.ready => {
+                    let fix = if probe.install_cmd.trim().is_empty() {
+                        probe.detail
+                    } else {
+                        probe.install_cmd
+                    };
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::tf(self.lang, "backend.switch_unavailable", &[&id, &fix]),
+                    );
+                    return Action::None;
+                }
+                AuthMark::NotLoggedIn => {
+                    // Mirror the first-run picker's two-step override: local/third-
+                    // party base configurations can make auth probing inconclusive.
+                    // The first invocation warns and does not claim a switch; a
+                    // deliberate second invocation accepts that operator choice.
+                    if self.picker_login_confirm.as_deref() == Some(id.as_str()) {
+                        self.picker_login_confirm = None;
+                    } else {
+                        let fix = if probe.login_cmd.trim().is_empty() {
+                            probe.detail
+                        } else {
+                            probe.login_cmd
+                        };
+                        self.picker_login_confirm = Some(id.clone());
+                        self.push(
+                            ChatRole::System,
+                            umadev_i18n::tf(
+                                self.lang,
+                                "backend.switch_login_unverified",
+                                &[&id, &fix],
+                            ),
+                        );
+                        return Action::None;
+                    }
+                }
+                AuthMark::LoggedIn | AuthMark::Unknown | AuthMark::NotInstalled => {}
+            }
+        }
         // Snapshot the OLD base label BEFORE committing — the context-handoff block
         // below names both sides of the switch.
         let previous = self.backend_label.clone();
@@ -13728,6 +13802,48 @@ impl App {
         true
     }
 
+    /// A conclusive active-backend failure from the asynchronous startup probe.
+    /// `NotLoggedIn` is deliberately not included: the picker supports an explicit
+    /// operator override for local/third-party configurations whose auth probe is a
+    /// false negative. Missing binaries and probe-level unhealthy/unknown failures
+    /// are not usable and must stop before routing.
+    fn backend_definitely_unavailable(&self, backend: &str) -> Option<BackendInfo> {
+        self.backends
+            .iter()
+            .find(|candidate| candidate.id == backend)
+            .filter(|candidate| {
+                candidate.auth == AuthMark::NotInstalled
+                    || (candidate.auth == AuthMark::Unknown && !candidate.ready)
+            })
+            .cloned()
+    }
+
+    fn reject_active_backend_unavailable(&mut self) -> bool {
+        let Some(backend) = self.backend.clone() else {
+            return false;
+        };
+        if backend == "offline" {
+            return false;
+        }
+        let Some(probe) = self.backend_definitely_unavailable(&backend) else {
+            return false;
+        };
+        let fix = if probe.install_cmd.trim().is_empty() {
+            probe.detail
+        } else {
+            probe.install_cmd
+        };
+        let note = umadev_i18n::tf(self.lang, "backend.active_unavailable", &[&backend, &fix]);
+        if self
+            .history
+            .back()
+            .is_none_or(|message| message.body().trim() != note.trim())
+        {
+            self.push(ChatRole::System, note);
+        }
+        true
+    }
+
     fn slash_run(&mut self, arg: &str) -> Action {
         // Single-writer guard: only ONE workspace-mutating run at a time. A second
         // `/run` while one is live is politely rejected (never silently starts a
@@ -13746,6 +13862,9 @@ impl App {
             return Action::None;
         }
         if self.reject_director_execution_in_plan() {
+            return Action::None;
+        }
+        if self.reject_active_backend_unavailable() {
             return Action::None;
         }
         // The first token is the optional run SLUG only when it UNAMBIGUOUSLY looks

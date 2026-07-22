@@ -1,62 +1,48 @@
-//! Pinned, source-audited compatibility classification for Grok Build.
+//! Runtime identity classification for Grok Build.
 //!
-//! This module performs no I/O and no runtime capability probe. It only compares
-//! an ACP `initialize` result with the upstream source baseline that UmaDev has
-//! audited. A positive result means that UmaDev may apply the corresponding
-//! source-shaped parser or attempt an optional private method. It does not replace
-//! standard ACP capability negotiation, a method response, or an end-to-end test.
+//! Grok Build's version is diagnostic evidence, not a compatibility gate. UmaDev
+//! accepts every official Grok ACP peer. Standard features are negotiated from ACP
+//! and Grok-specific messages are accepted only through typed, bounded parsers.
+//! The source metadata below records the baseline used by drift CI; it never
+//! decides whether an installed version may run.
 
-use semver::{Version, VersionReq};
+use semver::Version;
 use serde_json::Value;
 
-/// Official Grok Build source repository used by this compatibility profile.
+/// Official Grok Build source repository.
 pub const GROK_BUILD_SOURCE_REPOSITORY: &str = "https://github.com/xai-org/grok-build";
 
-/// Exact upstream commit audited for this compatibility profile.
-pub const GROK_BUILD_SOURCE_COMMIT: &str = "a881e6703f46b01d8c7d4a5437683546df30449d";
+/// Exact upstream commit used by source-contract drift CI.
+pub const GROK_BUILD_SOURCE_COMMIT: &str = "3af4d5d39897855bdcc74f23e690024a5dc05573";
 
-/// Grok Build version declared by the audited upstream commit.
-pub const GROK_BUILD_SOURCE_VERSION: &str = "0.2.106";
+/// Release used as the current source-audited baseline, never as a runtime pin.
+pub const GROK_BUILD_SOURCE_VERSION: &str = "0.2.109";
 
-/// `agent-client-protocol` version used by the audited upstream commit.
+/// `agent-client-protocol` version used by the audited baseline.
 pub const GROK_BUILD_SOURCE_ACP_VERSION: &str = "0.10.4";
 
-/// `agent-client-protocol-schema` version resolved by the audited upstream lockfile.
+/// `agent-client-protocol-schema` version resolved by the baseline lockfile.
 pub const GROK_BUILD_SOURCE_ACP_SCHEMA_VERSION: &str = "0.11.4";
-
-/// Conservative SemVer requirement for source-specific behavior.
-///
-/// The range is intentionally exact. A later prerelease or the stable release
-/// for the same patch may change a private `x.ai` payload without changing ACP
-/// protocol V1. Such a version remains outside the audited range until the drift
-/// audit and acceptance matrix are rerun.
-pub const GROK_BUILD_AUDITED_VERSION_REQUIREMENT: &str = "=0.2.106";
 
 const MAX_AGENT_VERSION_BYTES: usize = 128;
 
-/// Why an initialize result did or did not enter the audited source profile.
+/// What could be learned about an ACP peer claiming to be Grok Build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrokSourceMatch {
     /// `_meta.grokShell` was not exactly `true`.
     NotGrokShell,
-    /// A Grok shell identity was present, but `agentVersion` was absent or empty.
+    /// The official identity was present but no version was reported.
     MissingAgentVersion,
-    /// `agentVersion` was not a bounded, valid semantic version.
-    MalformedAgentVersion,
-    /// The version parsed, but is outside the exact source-audited range.
-    OutsideAuditedRange,
-    /// The reported version label is inside the source-audited range.
-    ///
-    /// This is a static classification, not proof of the running binary's commit
-    /// and not evidence that an optional method probe succeeded.
-    AuditedVersion,
+    /// The official identity reported a non-SemVer version label.
+    UnparsedAgentVersion,
+    /// The official identity reported a bounded semantic version.
+    VersionReported,
 }
 
-/// One Grok-private behavior whose wire contract is tied to audited source.
+/// One Grok-private behavior with a typed, source-backed UmaDev parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrokSourceCapability {
-    /// Image prompt blocks accepted despite the pinned initialize response omitting
-    /// the standard image flag.
+    /// Image prompt blocks supported despite an omitted standard image flag.
     ImagePromptFallback,
     /// Agent-selected authentication through `_meta.defaultAuthMethodId`.
     DefaultAuthMethod,
@@ -64,27 +50,27 @@ pub enum GrokSourceCapability {
     AskUserQuestion,
     /// Private `x.ai/exit_plan_mode` reverse requests.
     ExitPlanMode,
-    /// Private `x.ai/interject` requests and their queued acknowledgement shape.
+    /// Private `x.ai/interject` requests.
     Interject,
-    /// Server-authoritative `x.ai/queue/*` snapshots and mutations.
+    /// Server-authoritative `x.ai/queue/*` operations.
     PromptQueue,
-    /// Reverse `x.ai/folder_trust/request` with explicit human settlement.
+    /// Reverse `x.ai/folder_trust/request` settlement.
     FolderTrust,
-    /// Rich live and persisted `x.ai/session_*` update rails.
+    /// Rich live and persisted `x.ai/session_*` updates.
     RichSessionUpdates,
-    /// Source-specific replay ordering around advertised standard `session/load`.
+    /// Source-shaped replay ordering around standard `session/load`.
     SessionLoadReplay,
-    /// Whole-prompt `_meta.usage` and durable turn usage semantics.
+    /// Whole-prompt `_meta.usage` semantics.
     PromptUsage,
-    /// Background task lifecycle carried by rich private updates.
+    /// Background task lifecycle carried by rich updates.
     BackgroundTasks,
-    /// Native `x.ai/task/list` and `x.ai/task/kill` background-process control.
+    /// Native `x.ai/task/list` and `x.ai/task/kill` control.
     BackgroundProcessControl,
-    /// Native subagent lifecycle carried by rich private updates.
+    /// Native subagent lifecycle carried by rich updates.
     SubagentLifecycle,
-    /// Source-specific incremental terminal/tool output semantics.
+    /// Source-specific incremental terminal output semantics.
     IncrementalTerminalOutput,
-    /// Model state and available-command metadata plus their private updates.
+    /// Model state, command catalog, and related updates.
     ModelAndCommandCatalog,
 }
 
@@ -129,35 +115,26 @@ impl GrokSourceCapability {
     }
 }
 
-/// Per-capability source contract enabled by a [`GrokSourceProfile`].
-///
-/// This set is deliberately separate from negotiated ACP capabilities. For
-/// example, [`GrokSourceCapability::SessionLoadReplay`] describes how the pinned
-/// source behaves, while `initialize.agentCapabilities.loadSession` still decides
-/// whether the client may send `session/load` at runtime.
+/// Source-shaped parsers available for an official Grok peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GrokSourceCapabilities {
     bits: u16,
 }
 
 impl GrokSourceCapabilities {
-    /// No source-specific behavior is enabled.
+    /// No Grok-specific source parser is enabled.
     pub const NONE: Self = Self { bits: 0 };
-
-    const AUDITED_BASELINE: Self = Self {
+    const OFFICIAL_SOURCE_LINEAGE: Self = Self {
         bits: (1 << 15) - 1,
     };
 
-    /// Whether the pinned source contract covers one private behavior.
-    ///
-    /// A `true` value authorizes source-shaped handling only. It does not claim
-    /// that standard negotiation or an optional runtime method probe occurred.
+    /// Whether a typed parser exists for one Grok-specific behavior.
     #[must_use]
     pub const fn contains(self, capability: GrokSourceCapability) -> bool {
         self.bits & capability.bit() != 0
     }
 
-    /// Whether no source-specific behavior is enabled.
+    /// Whether no Grok-specific parser is enabled.
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.bits == 0
@@ -170,7 +147,7 @@ impl Default for GrokSourceCapabilities {
     }
 }
 
-/// Static source-compatibility profile derived from an ACP initialize result.
+/// Runtime identity profile derived solely from ACP `initialize`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrokSourceProfile {
     source_match: GrokSourceMatch,
@@ -179,61 +156,59 @@ pub struct GrokSourceProfile {
 }
 
 impl GrokSourceProfile {
-    fn disabled(source_match: GrokSourceMatch, reported_version: Option<Version>) -> Self {
+    fn new(
+        source_match: GrokSourceMatch,
+        reported_version: Option<Version>,
+        capabilities: GrokSourceCapabilities,
+    ) -> Self {
         Self {
             source_match,
             reported_version,
-            capabilities: GrokSourceCapabilities::NONE,
+            capabilities,
         }
     }
 
-    fn audited(reported_version: Version) -> Self {
-        Self {
-            source_match: GrokSourceMatch::AuditedVersion,
-            reported_version: Some(reported_version),
-            capabilities: GrokSourceCapabilities::AUDITED_BASELINE,
-        }
+    fn official(source_match: GrokSourceMatch, reported_version: Option<Version>) -> Self {
+        Self::new(
+            source_match,
+            reported_version,
+            GrokSourceCapabilities::OFFICIAL_SOURCE_LINEAGE,
+        )
     }
 
-    /// Source classification for the initialize result.
+    /// Identity classification retained for diagnostics and tests.
     #[must_use]
     pub const fn source_match(&self) -> GrokSourceMatch {
         self.source_match
     }
 
-    /// Parsed version reported by the agent, when it was valid SemVer.
+    /// Parsed reported version, when the peer used SemVer.
     #[must_use]
     pub fn reported_version(&self) -> Option<&Version> {
         self.reported_version.as_ref()
     }
 
-    /// Source-specific capability set selected by the audited version gate.
+    /// Source-shaped parsers enabled for this identity.
     #[must_use]
     pub const fn capabilities(&self) -> GrokSourceCapabilities {
         self.capabilities
     }
 
-    /// Whether one private behavior has an audited source contract.
-    ///
-    /// This does not assert that a runtime probe or standard capability
-    /// negotiation succeeded.
+    /// A source-shaped parser may run for every official Grok version. Standard
+    /// method calls still require ACP advertisement or a successful response.
     #[must_use]
     pub const fn supports(&self, capability: GrokSourceCapability) -> bool {
         self.capabilities.contains(capability)
     }
 
-    /// Whether the reported version label falls in the audited source range.
+    /// Whether this is the official Grok source lineage, independent of version.
     #[must_use]
-    pub const fn is_audited_version(&self) -> bool {
-        matches!(self.source_match, GrokSourceMatch::AuditedVersion)
+    pub const fn is_grok_shell_identity(&self) -> bool {
+        !matches!(self.source_match, GrokSourceMatch::NotGrokShell)
     }
 }
 
-/// Classify a Grok Build ACP initialize result against the pinned source audit.
-///
-/// Only `_meta.grokShell` and `_meta.agentVersion` are read. The function is
-/// deterministic and side-effect free: it does not execute Grok, contact xAI,
-/// authenticate, or probe an extension method.
+/// Classify the official Grok identity in an ACP initialize response.
 #[must_use]
 pub fn source_profile_from_initialize(initialize: &Value) -> GrokSourceProfile {
     if initialize
@@ -241,35 +216,27 @@ pub fn source_profile_from_initialize(initialize: &Value) -> GrokSourceProfile {
         .and_then(Value::as_bool)
         != Some(true)
     {
-        return GrokSourceProfile::disabled(GrokSourceMatch::NotGrokShell, None);
+        return GrokSourceProfile::new(
+            GrokSourceMatch::NotGrokShell,
+            None,
+            GrokSourceCapabilities::NONE,
+        );
     }
 
-    let Some(raw_version_value) = initialize.pointer("/_meta/agentVersion") else {
-        return GrokSourceProfile::disabled(GrokSourceMatch::MissingAgentVersion, None);
+    let Some(raw) = initialize
+        .pointer("/_meta/agentVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+    else {
+        return GrokSourceProfile::official(GrokSourceMatch::MissingAgentVersion, None);
     };
-    let Some(raw_version) = raw_version_value.as_str() else {
-        return GrokSourceProfile::disabled(GrokSourceMatch::MalformedAgentVersion, None);
-    };
-    if raw_version.is_empty() {
-        return GrokSourceProfile::disabled(GrokSourceMatch::MissingAgentVersion, None);
+    if raw.len() > MAX_AGENT_VERSION_BYTES {
+        return GrokSourceProfile::official(GrokSourceMatch::UnparsedAgentVersion, None);
     }
-
-    if raw_version.len() > MAX_AGENT_VERSION_BYTES {
-        return GrokSourceProfile::disabled(GrokSourceMatch::MalformedAgentVersion, None);
-    }
-
-    let Ok(version) = Version::parse(raw_version) else {
-        return GrokSourceProfile::disabled(GrokSourceMatch::MalformedAgentVersion, None);
-    };
-    let in_audited_range = VersionReq::parse(GROK_BUILD_AUDITED_VERSION_REQUIREMENT)
-        .is_ok_and(|requirement| requirement.matches(&version));
-
-    // Build metadata was not present in the audited version label. Reject it
-    // rather than treating an unexamined artifact label as the pinned source.
-    if in_audited_range && version.build.is_empty() {
-        GrokSourceProfile::audited(version)
-    } else {
-        GrokSourceProfile::disabled(GrokSourceMatch::OutsideAuditedRange, Some(version))
+    match Version::parse(raw) {
+        Ok(version) => GrokSourceProfile::official(GrokSourceMatch::VersionReported, Some(version)),
+        Err(_) => GrokSourceProfile::official(GrokSourceMatch::UnparsedAgentVersion, None),
     }
 }
 
@@ -279,98 +246,47 @@ mod tests {
 
     use super::*;
 
-    fn profile(version: &str) -> GrokSourceProfile {
-        source_profile_from_initialize(&json!({
-            "_meta": {"grokShell": true, "agentVersion": version}
-        }))
+    fn profile(version: Option<&str>) -> GrokSourceProfile {
+        let mut initialize = json!({"_meta":{"grokShell":true}});
+        if let Some(version) = version {
+            initialize["_meta"]["agentVersion"] = Value::String(version.to_string());
+        }
+        source_profile_from_initialize(&initialize)
     }
 
-    fn assert_private_capabilities_disabled(profile: &GrokSourceProfile) {
-        assert!(profile.capabilities().is_empty());
-        for capability in GrokSourceCapability::ALL {
-            assert!(!profile.supports(capability), "{capability:?}");
+    #[test]
+    fn every_official_version_enables_typed_source_parsers() {
+        for version in [
+            Some("0.1.0"),
+            Some(GROK_BUILD_SOURCE_VERSION),
+            Some("0.2.109-alpha.1"),
+            Some("0.2.109+local.7"),
+            Some("0.99.0"),
+            Some("1.0.0"),
+            Some("2026-07-22-nightly"),
+            Some(""),
+            None,
+        ] {
+            let profile = profile(version);
+            assert!(profile.is_grok_shell_identity(), "{version:?}");
+            for capability in GrokSourceCapability::ALL {
+                assert!(profile.supports(capability), "{version:?}: {capability:?}");
+            }
         }
     }
 
     #[test]
-    fn exact_audited_version_enables_each_source_contract() {
-        let profile = profile(GROK_BUILD_SOURCE_VERSION);
-
-        assert_eq!(profile.source_match(), GrokSourceMatch::AuditedVersion);
+    fn semantic_versions_are_diagnostic_only() {
+        let profile = profile(Some(GROK_BUILD_SOURCE_VERSION));
+        assert_eq!(profile.source_match(), GrokSourceMatch::VersionReported);
         assert_eq!(
             profile.reported_version(),
             Some(&Version::parse(GROK_BUILD_SOURCE_VERSION).unwrap())
         );
-        assert!(profile.is_audited_version());
-        for capability in GrokSourceCapability::ALL {
-            assert!(profile.supports(capability), "{capability:?}");
-        }
     }
 
     #[test]
-    fn prerelease_labels_for_the_audited_patch_are_outside_exact_audit() {
-        for version in ["0.2.106-alpha.1", "0.2.106-beta.1", "0.2.106-rc.1"] {
-            let profile = profile(version);
-            assert_eq!(profile.source_match(), GrokSourceMatch::OutsideAuditedRange);
-            assert_private_capabilities_disabled(&profile);
-        }
-    }
-
-    #[test]
-    fn adjacent_patch_minor_and_major_versions_are_outside_exact_audit() {
-        for version in ["0.2.105", "0.2.107", "0.3.0", "1.0.0"] {
-            let profile = profile(version);
-            assert_eq!(profile.source_match(), GrokSourceMatch::OutsideAuditedRange);
-            assert_private_capabilities_disabled(&profile);
-        }
-    }
-
-    #[test]
-    fn build_metadata_is_outside_the_exact_audited_label() {
-        let profile = profile("0.2.106+unverified");
-        assert_eq!(profile.source_match(), GrokSourceMatch::OutsideAuditedRange);
-        assert_private_capabilities_disabled(&profile);
-    }
-
-    #[test]
-    fn malformed_non_string_and_oversized_versions_fail_closed() {
-        for initialize in [
-            json!({"_meta":{"grokShell":true,"agentVersion":"source-fixture"}}),
-            json!({"_meta":{"grokShell":true,"agentVersion":220}}),
-            json!({"_meta":{"grokShell":true,"agentVersion":"x".repeat(129)}}),
-        ] {
-            let profile = source_profile_from_initialize(&initialize);
-            assert_eq!(
-                profile.source_match(),
-                GrokSourceMatch::MalformedAgentVersion
-            );
-            assert_private_capabilities_disabled(&profile);
-        }
-    }
-
-    #[test]
-    fn missing_or_empty_version_fails_closed() {
-        for initialize in [
-            json!({"_meta":{"grokShell":true}}),
-            json!({"_meta":{"grokShell":true,"agentVersion":""}}),
-        ] {
-            let profile = source_profile_from_initialize(&initialize);
-            assert_eq!(profile.source_match(), GrokSourceMatch::MissingAgentVersion);
-            assert_private_capabilities_disabled(&profile);
-        }
-
-        let whitespace = source_profile_from_initialize(
-            &json!({"_meta":{"grokShell":true,"agentVersion":"  "}}),
-        );
-        assert_eq!(
-            whitespace.source_match(),
-            GrokSourceMatch::MalformedAgentVersion
-        );
-        assert_private_capabilities_disabled(&whitespace);
-    }
-
-    #[test]
-    fn non_grok_shell_never_enables_private_capabilities() {
+    fn only_a_non_grok_identity_is_rejected() {
         for initialize in [
             json!({"_meta":{"grokShell":false,"agentVersion":GROK_BUILD_SOURCE_VERSION}}),
             json!({"_meta":{"agentVersion":GROK_BUILD_SOURCE_VERSION}}),
@@ -379,7 +295,8 @@ mod tests {
         ] {
             let profile = source_profile_from_initialize(&initialize);
             assert_eq!(profile.source_match(), GrokSourceMatch::NotGrokShell);
-            assert_private_capabilities_disabled(&profile);
+            assert!(!profile.is_grok_shell_identity());
+            assert!(profile.capabilities().is_empty());
         }
     }
 }

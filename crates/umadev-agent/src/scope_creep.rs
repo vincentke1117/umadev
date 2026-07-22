@@ -144,9 +144,25 @@ const IGNORED_DIR_SEGMENTS: &[&str] = &[
     "venv",
     "coverage",
     "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".hypothesis",
+    // Base-owned local state/config is context for the worker, not product source.
+    // It can change independently of the current requirement and may contain local
+    // credentials or permission state, so it must never become a scope-repair target.
+    ".claude",
+    ".codex",
+    ".grok",
+    ".kimi",
+    ".kimi-code",
     ".git",
     ".umadev",
 ];
+
+/// Local machine/framework files that are never a product deliverable. Match by
+/// exact basename at any depth; `.env.example` and real source/config remain visible.
+const IGNORED_FILE_NAMES: &[&str] = &[".ds_store", ".coverage", ".env", ".umadevrc", "umadev.yaml"];
 
 /// Cap on reported findings — a run that went catastrophically off-plan produces a
 /// readable directive, not a wall of text.
@@ -355,6 +371,7 @@ fn is_ignored(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
     LOCKFILES.contains(&name)
+        || IGNORED_FILE_NAMES.contains(&name)
         || IGNORED_PREFIXES.iter().any(|p| lower.starts_with(p))
         || lower
             .split('/')
@@ -794,11 +811,20 @@ mod tests {
     }
 
     #[test]
-    fn umadev_own_artifacts_are_never_scope_creep() {
+    fn reported_regression_local_artifacts_are_never_scope_creep() {
         assert!(is_ignored(".umadev/plan.json"));
         assert!(is_ignored("output/demo-prd.md"));
         assert!(is_ignored("node_modules/react/index.js"));
         assert!(is_ignored("packages/app/node_modules/x/y.js"));
+        assert!(is_ignored(".DS_Store"));
+        assert!(is_ignored("services/api/.pytest_cache/v/cache/nodeids"));
+        assert!(is_ignored(".ruff_cache/0.1/file"));
+        assert!(is_ignored(".claude/settings.json"));
+        assert!(is_ignored("apps/api/.env"));
+        assert!(is_ignored(".umadevrc"));
+        assert!(is_ignored("umadev.yaml"));
+        assert!(!is_ignored(".env.example"));
+        assert!(!is_ignored(".gitignore"));
         assert!(!is_ignored("src/api/login.ts"));
     }
 

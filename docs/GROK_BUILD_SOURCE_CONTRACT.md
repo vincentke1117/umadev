@@ -1,6 +1,6 @@
 # Grok Build source contract
 
-> Status: pinned source audit, not a blanket support claim.
+> Status: rolling source audit plus version-independent runtime adaptation.
 >
 > This document records the source-level contract that UmaDev must satisfy for
 > its Grok Build base. A behavior described in the official source is not
@@ -8,29 +8,30 @@
 > **Implemented**, **Partial**, and **Pending** deliberately; only an acceptance
 > test may move a row to Implemented.
 
-## 1. Pinned upstream baseline
+## 1. Audited upstream baseline
 
-| Item | Pinned value |
+| Item | Audited value |
 |---|---|
 | Official repository | <https://github.com/xai-org/grok-build> |
-| Audited commit | `a881e6703f46b01d8c7d4a5437683546df30449d` |
-| Grok Build version | `0.2.106` |
+| Audited commit | `3af4d5d39897855bdcc74f23e690024a5dc05573` |
+| Grok Build version | `0.2.109` |
 | `agent-client-protocol` | `0.10.4`, with upstream's `unstable` feature |
 | `agent-client-protocol-schema` resolved by upstream | `0.11.4` |
 | ACP wire protocol negotiated by this build | V1 |
-| Audit date | 2026-07-21 |
+| Audit date | 2026-07-22 |
 
 The version is declared by the upstream `xai-grok-pager`,
 `xai-grok-pager-bin`, `xai-grok-shell`, and related crates. The ACP dependency
 is pinned in the upstream workspace `Cargo.toml`; the resolved schema version is
 recorded in its `Cargo.lock`.
 
-This commit is the authority for every `x.ai`-specific statement below. A newer
-installed CLI is not assumed compatible merely because it still reports
-`grokShell: true` or negotiates ACP V1.
+This commit is the latest source snapshot used to detect upstream drift. It is
+not a runtime version gate. Every official peer reporting `grokShell: true` may
+run; standard features come from ACP advertisement/session state, and private
+messages pass only typed, bounded parsers with method-level fallback.
 
-The release artifacts are also pinned by content, rather than trusting the
-mutable installer script at release time:
+The previously audited `0.2.106` release artifacts are also retained by content
+as cross-platform regression fixtures, rather than trusting a mutable installer:
 
 | Official artifact | SHA-256 |
 |---|---|
@@ -73,25 +74,23 @@ merely because the vendor pager uses them.
   capability to false, so Grok must use its own implementation instead of a
   reverse client RPC.
 
-### 2.2 Mandatory capability gate
+### 2.2 Mandatory capability rules
 
-Standard ACP behavior is enabled only from the fields actually returned by
-`initialize`. A private Grok behavior is enabled only when all of these are
-true:
+Standard ACP behavior is enabled only from fields actually returned by
+`initialize` or the live session response. A Grok-specific behavior is handled
+only when all of these are true:
 
 1. the selected base is `grok-build`;
 2. `initialize._meta.grokShell` is exactly `true`;
-3. `initialize._meta.agentVersion` is a non-empty, parsed version;
-4. that version is in an explicitly audited compatibility set, initially only
-   `0.2.106`, or the individual private method has passed a safe runtime
-   probe;
-5. the exact method and payload have a typed, bounded parser;
-6. the feature's acceptance tests are green.
+3. the exact method and payload have a typed, bounded parser;
+4. outbound optional methods either have live advertisement or treat
+   method-not-found as a local capability downgrade;
+5. the feature's acceptance tests are green.
 
-An unknown Grok version retains safe standard ACP behavior and degrades private
-features to Unknown/Pending. It must not inherit all private capabilities from
-the presence of `grokShell` alone. A method-not-found response to an optional
-private method is a capability result, not a fatal session error.
+An old, future, prerelease, build-metadata, missing, or non-SemVer version label
+does not block Grok. Unknown methods or changed payloads degrade only that
+feature. A method-not-found response to an optional private method is a
+capability result, not a fatal session error.
 
 No `x.ai` behavior is described as ACP-standard. ACP is a transport protocol,
 not evidence that one CLI was derived from another product.
@@ -400,8 +399,8 @@ code-executing project configuration until the folder is trusted. A local
 unversioned source build can leave the feature inert, so acceptance requires a
 release-stamped fixture rather than assuming the feature is absent.
 
-UmaDev may advertise the client capability only when the exact source contract
-is active and a live interactive trust surface is wired:
+UmaDev may advertise the client capability only for the official Grok identity
+when a live interactive trust surface is wired:
 
 ```json
 {"x.ai/folderTrust":{"interactive":true}}
@@ -414,8 +413,8 @@ workspace/session, or any unknown outcome stays untrusted. Granting trust can
 hot-reload MCP/plugins/hooks, while the pinned source requires a new session for
 LSP and for sessions created while another trust modal was already open.
 
-Current status: **Implemented for an exact source-gated interactive session**.
-Headless and non-audited sessions still do not advertise the capability. The
+Current status: **Implemented for official Grok interactive sessions without a
+version allowlist**. Headless sessions still do not advertise the capability. The
 resident TUI carries the typed reverse request, displays the bounded workspace
 and gated configuration kinds, and grants only an explicit Trust choice;
 foreign scope, malformed input, close, timeout, cancellation and transport
@@ -777,8 +776,7 @@ changes.
 
 ## 16. Drift audit procedure
 
-Every Grok version bump follows this sequence before the supported version gate
-is widened:
+Every new Grok source snapshot follows this sequence to keep adaptation current:
 
 1. fetch the official repository and record exact commit, tag/version, clean
    worktree status, and remote URL;
@@ -796,11 +794,11 @@ is widened:
    persistence detail—never infer from its name;
 6. update source-shaped JSON fixtures for both direct and wrapped envelopes;
 7. run the complete release matrix below on the candidate binary;
-8. update this document, source line references, and the explicit supported
-   version gate in the same change;
-9. keep the previous version supported until the candidate matrix is green;
-10. if any private contract cannot be verified, leave that capability Pending
-    for the new version while retaining safe standard ACP.
+8. update this document and source line references without creating a runtime
+   version allowlist;
+9. keep all prior versions usable while the candidate matrix runs;
+10. if any private contract cannot be verified, downgrade only that capability
+    while retaining safe standard ACP and the rest of the base.
 
 ## 17. Release acceptance matrix
 
@@ -808,7 +806,7 @@ No Grok adapter release is complete until all applicable rows pass.
 
 | Area | Required acceptance | Status at audit |
 |---|---|---|
-| Source identity | Exact vendor/source/version gate; unknown version degrades private features | Implemented |
+| Source identity | Exact vendor identity; every version accepted; version is diagnostics only | Implemented |
 | argv | Exact layer/order for Plan, Guarded, Auto; `--no-leader` cannot be overridden by user config | Implemented |
 | Initialize | Protocol, auth methods, load capability, model state, commands, and client capabilities round-trip | Implemented in source-shaped fixtures; exact published binary handshake is a Linux/macOS/Windows CI gate |
 | Authentication | default id, API key, cached token, OIDC preference, expired token, no-auth cases; no interactive flow before explicit confirmation; disclose upstream browser open after confirmation | Implemented in hermetic transition tests; cached-token and isolated no-auth release paths passed on macOS, interactive browser completion remains a manual release check |

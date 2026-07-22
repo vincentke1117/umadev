@@ -1,25 +1,26 @@
 # Kimi Code source contract
 
-UmaDev's `kimi-code` base is pinned to the official MIT-licensed
+UmaDev's `kimi-code` base follows the official MIT-licensed
 [`MoonshotAI/kimi-code`](https://github.com/MoonshotAI/kimi-code) source, not to
 the retired `MoonshotAI/kimi-cli` repository and not to a guessed command-line
 wrapper.
 
-## Audited source
+## Audited source baseline
 
 - package: `@moonshot-ai/kimi-code@0.28.1`
 - release tag: `@moonshot-ai/kimi-code@0.28.1`
-- commit: `efacf0452d46f5dbd67499eabc053869495d5213`
+- commit: `4c763f6763acb67a73d133f7450d092e71d63692`
 - ACP adapter: `@moonshot-ai/kimi-acp-adapter@0.3.4`
 - ACP SDK declared by upstream: `@agentclientprotocol/sdk@^0.23.0`
 - machine entrypoint: `kimi acp`
 
 The fixed commit and source markers are checked by
 `crates/umadev-host/tests/kimi_source_drift.rs` locally and by the
-`kimi-source-contract` CI job. UmaDev refuses a different Kimi version until
-that source has been reviewed and the pin deliberately advanced.
+`kimi-source-contract` CI job. This is a drift alarm, not a runtime allowlist:
+every official Kimi Code version is accepted, and optional controls are derived
+from the live session's advertised `configOptions`.
 
-The separate `kimi-published-contract` CI matrix installs that exact npm
+The separate `kimi-published-contract` CI matrix installs that audited npm
 package on Linux, macOS, and Windows, launches its real `kimi acp` entrypoint
 with an isolated `KIMI_CODE_HOME`, and verifies the unauthenticated handshake.
 It must return the audited identity and terminal-owned `kimi login` guidance
@@ -34,7 +35,7 @@ cannot bypass the distribution check.
 UmaDev owns the interactive TUI and starts Kimi as a background ACP v1
 JSON-RPC subprocess. It performs the complete lifecycle:
 
-1. `initialize` and exact official identity/version validation;
+1. `initialize` and official identity validation; the version is diagnostic only;
 2. on-disk login revalidation through `authenticate(methodId="login")`;
 3. `session/new`, or standard `session/resume`/`session/load` for a compatible
    persisted session;
@@ -166,7 +167,7 @@ with other tools.
 
 - macOS/Linux/Windows executable: `kimi` (Windows npm `.cmd` launch is handled
   by UmaDev's shared process resolver).
-- audited installation: `npm install -g @moonshot-ai/kimi-code@0.28.1`.
+- installation: `npm install -g @moonshot-ai/kimi-code` (no UmaDev version pin).
 - Windows shell tools require Git for Windows/Git Bash. Upstream probes standard
   Git locations, Scoop/portable installs and `KIMI_SHELL_PATH`, and fails before
   a session when no usable `bash.exe` exists.

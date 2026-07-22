@@ -460,7 +460,7 @@
 "session.resume_goal" = "[goal] Last time a goal was left unfinished: next step \"{}\" (step {}/{} done). /continue to pick it back up · or just say whether to continue."
 
 # Codex high-risk sandbox liability warning (only shown for danger-full-access on codex)
-"codex.sandbox.danger_warning" = "WARNING: Codex high-risk sandbox (danger-full-access) is ENABLED — you assume all risk to your system environment.\n  To revert: set [codex] sandbox_mode = \"workspace-write\" in .umadevrc, then restart."
+"codex.sandbox.danger_warning" = "WARNING: UmaDev will launch this project's Codex base sessions with danger-full-access — you assume all risk to your system environment. A separately opened Codex window has its own permission setting and may show a different mode.\n  To revert: set [codex] sandbox_mode = \"workspace-write\" in .umadevrc, then restart."
 "codex.sandbox.windows_hint" = "Note (Windows + Codex): the current sandbox BLOCKS the network, local dev ports and git, so a full-stack build (npm install / a dev server / git) cannot complete; and codex\u2019s Windows sandbox helper fails with \u201cmodule not found\u201d on some machines. For full-stack work run /sandbox danger-full-access to open it up (UmaDev still audits everything)."
 
 # /sandbox — view / change the Codex base launch sandbox in-app (no .umadevrc hand-edit)
@@ -653,6 +653,9 @@
 "backend.handoff" = "「backend switched {} → {}: the conversation above is handed over to the new base via the transcript; the previous vendor's internal deep context does not migrate — restate any key background that is missing.」"
 "backend.workflow_handoff" = "Workflow base changed from {} to {}. The requirement, plan, and existing artifacts are preserved, but the previous base's session id will not be reused across vendors; this run starts a fresh vendor session."
 "backend.busy_no_switch" = "A run is in progress on the current base — /cancel it before switching the base, so the run and its session stay coherent."
+"backend.switch_unavailable" = "Did not switch to `{}`: the current probe confirms that it is unavailable. Run `{}` first, then retry the switch."
+"backend.switch_login_unverified" = "Did not switch to `{}` yet: login could not be verified. Run `{}` first; if this is a local/third-party setup that needs no login, enter the same switch command again to continue deliberately."
+"backend.active_unavailable" = "Configured base `{}` is unavailable, so this request was not started. Run `{}` or switch to another ready base; then submit the preserved input again."
 "chat.busy_cancel_first" = "A run or turn is in progress — /cancel it first; resuming or compacting now would corrupt the active session."
 
 

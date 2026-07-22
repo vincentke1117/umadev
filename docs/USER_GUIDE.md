@@ -25,14 +25,11 @@ umadev
 
 On first launch, pick one of the five base CLIs and complete that vendor's own login or provider setup before using it. UmaDev reuses the resulting local configuration; it neither performs the login nor stores the credential. Then type your requirement and press Enter.
 
-OpenCode must be **1.14.31 or newer**. Earlier versions can let a `Task`
-subagent escape a Plan agent's read-only permissions ([upstream issue
-#20549](https://github.com/anomalyco/opencode/issues/20549), fixed by [upstream
-PR #23290](https://github.com/anomalyco/opencode/pull/23290)). UmaDev checks the
-real `opencode --version` before discovery and again before either a one-shot or
-continuous execution. A lower or unparseable version is refused with an upgrade
-diagnostic; run `npm install -g opencode-ai@latest`, confirm `opencode --version`,
-and retry.
+UmaDev does not use a base CLI version allowlist. `--version` proves only that
+the selected program can be launched and supplies diagnostics. Authority comes
+from the live protocol, the selected permission profile, and fail-closed runtime
+rules. Unsupported optional features degrade individually instead of refusing
+the whole base.
 
 ### Base capabilities and platform boundaries
 
@@ -53,9 +50,9 @@ experience.
 |---|---|---|---|---|---|
 | `claude-code` | Vendor-specific bidirectional `stream-json` | Complete Claude Code login/setup in `claude` | Plan=`plan`; Guarded=`default`; Auto=`bypassPermissions`; UmaDev still keeps its irreversible-action floor | Exact `--resume <id>` | Use a platform supported by the installed Claude Code CLI |
 | `codex` | Vendor-specific `codex app-server` JSON-RPC | `codex login` or Codex's own supported credential configuration | Plan=`read-only`; Guarded=on-request; Auto=pre-authorized; writable modes use the configured Codex sandbox | Exact `thread/resume` | Use a platform supported by the installed Codex CLI; restrictive Windows sandboxes can block local ports/network |
-| `opencode` | Vendor-specific loopback HTTP + SSE | `opencode auth login` or OpenCode provider configuration | Plan deny-by-default; Guarded ask-by-default; Auto allow, with tool events still audited | Exact persisted-session reattach after permission refresh | Use a platform supported by the installed OpenCode CLI; version must be >= 1.14.31 |
-| `grok-build` | ACP v1 via `grok --no-auto-update … agent stdio`; bounded firmware uses the official `--rules` common flag | Headless ACP reuses an existing cached login token or `XAI_API_KEY`; after `initialize`, UmaDev authenticates only with an explicitly available non-interactive method and never auto-selects OAuth or opens a browser | Plan adds `plan` + read-only sandbox + read-only tools and disables subagents; Guarded uses prompts; Auto explicitly pre-approves | Fresh-session handoff today; negotiated resume/load is used only after effective-sandbox attestation and native preflight can both be proved | Official installers cover macOS/Linux/WSL and native Windows PowerShell |
-| `kimi-code` | Official `kimi acp` v1 JSON-RPC/stdio, exact source-audited 0.28.1 identity | Run `kimi login` yourself first; UmaDev only revalidates the on-disk token through ACP and never runs a login command or opens a browser | Plan=`plan`; Guarded/Auto keep Kimi `default`; UmaDev locally resolves ordinary Auto approvals, retains the irreversible floor, and renders Kimi's question-over-permission bridge as real choices | Standard `session/resume`, with advertised `session/load` fallback; workspace/profile identity mismatch fails closed | macOS/Linux/Windows; Windows tools require Git Bash or `KIMI_SHELL_PATH` |
+| `opencode` | Vendor-specific loopback HTTP + SSE | `opencode auth login` or OpenCode provider configuration | Plan deny-by-default (including delegation); Guarded ask-by-default; Auto allow, with tool events still audited | Exact persisted-session reattach after permission refresh | Any installed version; use a platform supported by that OpenCode CLI |
+| `grok-build` | ACP v1 via `grok --no-auto-update … agent stdio`; bounded firmware uses the official `--rules` common flag | Headless ACP reuses an existing cached login token or `XAI_API_KEY`; after `initialize`, UmaDev authenticates only with an explicitly available non-interactive method and never auto-selects OAuth or opens a browser | Plan adds `plan` + read-only sandbox + read-only tools and disables subagents; Guarded uses prompts; Auto explicitly pre-approves | Fresh-session handoff today; negotiated resume/load is used only after effective-sandbox attestation and native preflight can both be proved | Any official version; official installers cover macOS/Linux/WSL and native Windows PowerShell |
+| `kimi-code` | Official `kimi acp` v1 JSON-RPC/stdio with live capability negotiation | Run `kimi login` yourself first; UmaDev only revalidates the on-disk token through ACP and never runs a login command or opens a browser | Plan=`plan`; Guarded/Auto keep Kimi `default`; UmaDev locally resolves ordinary Auto approvals, retains the irreversible floor, and renders Kimi's question-over-permission bridge as real choices | Standard `session/resume`, with advertised `session/load` fallback; workspace/profile identity mismatch fails closed | Any official version; Windows tools require Git Bash or `KIMI_SHELL_PATH` |
 
 ACP stabilized `session/resume` in April 2026 and distinguishes it from
 `session/load`: resume reconnects context without replaying history, while load
@@ -107,8 +104,8 @@ For Grok Build, run any interactive `grok login` flow yourself before starting
 UmaDev, or set `XAI_API_KEY` for headless use. UmaDev does not initiate OAuth,
 open a Google/xAI login page, or copy an interactive authorization code.
 
-For Kimi Code, install the source-audited release with
-`npm install -g @moonshot-ai/kimi-code@0.28.1`, run `kimi login` yourself, then
+For Kimi Code, install the official current release with
+`npm install -g @moonshot-ai/kimi-code`, run `kimi login` yourself, then
 start UmaDev. On Windows, install Git for Windows or point `KIMI_SHELL_PATH` at
 `bash.exe`. UmaDev sets `KIMI_CODE_NO_AUTO_UPDATE=1` on the ACP child so the
 audited binary cannot replace itself during a session.
@@ -116,7 +113,7 @@ audited binary cannot replace itself during a session.
 If `kimi --version` prints `kimi, version 0.53` (with a comma), PATH is still
 resolving the retired Python `kimi-cli`, not Kimi Code. Run `which -a kimi` on
 macOS/Linux or `where kimi` on Windows, remove/reorder the legacy entry, or set
-`UMADEV_KIMI_BIN` to the audited executable. UmaDev reports this collision
+`UMADEV_KIMI_BIN` to the official executable. UmaDev reports this collision
 before starting ACP instead of attempting to drive the incompatible command.
 
 The full-screen TUI requires both terminal stdin and terminal stdout. If either

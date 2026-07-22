@@ -170,7 +170,7 @@ cargo build --release --features vector-local
 | Codex（`codex`） | `npm i -g @openai/codex` | `codex login` |
 | OpenCode（`opencode`） | `npm i -g opencode-ai` | `opencode auth login` |
 | Grok Build（`grok-build`） | `curl -fsSL https://x.ai/cli/install.sh \| bash` | `grok login`；无浏览器 / 无头环境可设置 `XAI_API_KEY` |
-| Kimi Code（`kimi-code`） | `npm i -g @moonshot-ai/kimi-code@0.26.0`（Node.js >= 22.19） | `kimi login` |
+| Kimi Code（`kimi-code`） | `npm i -g @moonshot-ai/kimi-code`（Node.js >= 22.19） | `kimi login` |
 
 表中的 `curl | bash/sh` 是当前驱动展示的 Unix 安装提示；Windows 请使用各厂商官方 Windows 安装方式，不要把这些 Unix 命令直接粘进 PowerShell。
 
@@ -396,7 +396,7 @@ umadev 的可信来自把"模型说了什么"和"硬信号是什么"严格分开
 - 底座负责真实读写文件和运行命令。
 - umadev 负责团队调度、流程、规则、质量门和证据链。
 
-> 能力边界：上表五个底座全部是一等适配。ACP 是 Grok Build 与 Kimi Code 正式提供的机器协议路径，不是降级模式。Grok Build 在有效沙箱证明与原生恢复预检尚不完整时使用新会话交接。Kimi Code 固定到官方源码审计版本，通过 ACP 只复验已有登录，不自动运行登录命令或打开浏览器，并按声明使用标准 `session/resume` / `session/load`。评审始终新开 Plan 子会话，不加载可写主线。
+> 能力边界：上表五个底座全部是一等适配，任何一个都不使用 CLI 版本白名单；版本号只用于诊断，能力由实时协议、类型化响应与运行时安全规则决定。ACP 是 Grok Build 与 Kimi Code 正式提供的机器协议路径，不是降级模式；两者接受所有官方版本，并持续用各自开源仓库做源码漂移审计。Grok Build 在有效沙箱证明与原生恢复预检尚不完整时使用新会话交接。Kimi Code 通过 ACP 只复验已有登录，不自动运行登录命令或打开浏览器；模型、模式、思考、恢复等能力以当前会话实时声明为准。评审始终新开 Plan 子会话，不加载可写主线。
 
 附件走保序的结构化输入，绝不会静默退化成隐藏的 `@path` 文本。Claude Code 与 Codex 原生发送图片，普通文件必须由用户明确选择有界 UTF-8 文本物化；OpenCode 原生发送图片/文件 part；Grok Build 与 Kimi Code 只有在实时 ACP 握手声明相应能力后才发送图片或资源。TUI 会逐块显示实际投递方式。当前只有 Codex 的 `turn/steer` 被证明具有同轮语义；其他四个底座按真实会话能力排到下一轮或明确拒绝，不伪装成交互能力完全相同。
 

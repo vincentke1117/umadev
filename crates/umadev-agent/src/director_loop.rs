@@ -7015,32 +7015,44 @@ async fn run_auto_qc(
         }
     }
 
-    // 3. Optional fork review (UmaDev's read-only QC over read-only forks). The team
-    //    scales to the task, so a lean goal convenes no team and this contributes
-    //    nothing. Advisory — the base's body acts on whatever it surfaces. When a
-    //    route is in hand (the deliberate step path's final gate), size the team
-    //    from the ROUTE's seats (deliverable 3); otherwise (the single-turn loop)
-    //    fall back to the kind-derived team — same roster, sized from the same kind.
-    let review = match route_team {
-        Some(seats) => director::review_with_seats(session, options, events, seats).await,
-        None => {
-            director::review(
-                session,
-                options,
-                events,
-                crate::continuous::ReviewKind::Quality,
-            )
-            .await
+    // 3. Optional fork review (UmaDev's read-only QC over read-only forks).
+    // Run critics only over a deterministically viable candidate. If the build/test,
+    // governance, acceptance, or scope floor already found a concrete blocker, a
+    // parallel critic pass cannot make that candidate shippable; it only spends more
+    // base calls, commonly times out over the same broken tree, and then mixes review
+    // noise into the first causal repair. Fix the objective blockers first and review
+    // the resulting candidate on the next bounded round.
+    if should_run_critic_review(&blocking) {
+        let review = match route_team {
+            Some(seats) => director::review_with_seats(session, options, events, seats).await,
+            None => {
+                director::review(
+                    session,
+                    options,
+                    events,
+                    crate::continuous::ReviewKind::Quality,
+                )
+                .await
+            }
+        };
+        for finding in review_blocking(&review) {
+            blocking.push(finding);
         }
-    };
-    for finding in review_blocking(&review) {
-        blocking.push(finding);
+    } else {
+        events.emit(EngineEvent::Note(
+            "team · deterministic blockers found — deferring critic review until the repaired candidate is clean"
+                .to_string(),
+        ));
     }
 
     QcReport {
         blocking,
         raw_failure_log,
     }
+}
+
+fn should_run_critic_review(deterministic_blockers: &[String]) -> bool {
+    deterministic_blockers.is_empty()
 }
 
 /// The REQUIRED acceptance floor for a deliberate build (Wave 4, §L4 / task 2) —

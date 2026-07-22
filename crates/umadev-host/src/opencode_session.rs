@@ -709,13 +709,10 @@ impl OpenCodeSession {
         serve_timeout: Duration,
     ) -> Result<Self, SessionError> {
         // Do not rely on the startup picker having run: configured users and
-        // programmatic callers can open a session directly. The read-only Plan
-        // floor therefore runs here too, immediately before `serve`, scoped to
-        // the posture: a read-only Plan session on a sub-minimum OpenCode is
-        // refused (a Task subagent there can escape Plan's read-only rules and
-        // write files), while Guarded/Auto — already permitted to write — open
-        // on ANY installed version.
-        crate::opencode::ensure_opencode_version_permits(program, workspace, permissions)
+        // programmatic callers can open a session directly. Resolve the program
+        // immediately before `serve`, but never turn its version label into an
+        // allowlist. The runtime ruleset below is the authority boundary.
+        crate::opencode::ensure_opencode_available(program, workspace)
             .await
             .map_err(SessionError::Start)?;
         let spawned = spawn_serve(program, workspace, serve_timeout).await?;
@@ -811,9 +808,9 @@ impl OpenCodeSession {
             ));
         }
         // Same posture-scoped floor as a fresh start: a read-only Plan resume on
-        // a sub-minimum version is refused; Guarded/Auto resume on any installed
-        // version.
-        crate::opencode::ensure_opencode_version_permits(program, workspace, permissions)
+        // every installed version is allowed; the refreshed runtime ruleset is
+        // the authority boundary.
+        crate::opencode::ensure_opencode_available(program, workspace)
             .await
             .map_err(SessionError::Start)
             .map_err(crate::redaction::sanitize_session_error)?;
@@ -5789,11 +5786,10 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn plan_session_start_refuses_a_sub_minimum_version() {
+    async fn every_profile_reaches_serve_on_an_old_version() {
         use std::os::unix::fs::PermissionsExt as _;
-        // The read-only floor is scoped to Plan on the persistent session path
-        // too: a Plan start on a sub-minimum OpenCode is refused BEFORE `serve`
-        // is ever spawned, so no read-only Plan session can open on an old build.
+        // The fake answers an old version and then never announces a serve URL.
+        // Every profile must reach the serve timeout rather than a version gate.
         let dir = tempfile::TempDir::new().unwrap();
         let script = dir.path().join("old-serve");
         std::fs::write(
@@ -5802,57 +5798,27 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let res = OpenCodeSession::start_with_program_timeout_profile(
-            script.to_str().unwrap(),
-            dir.path(),
-            Some("plan"),
-            None,
+        for profile in [
             BasePermissionProfile::Plan,
-            Duration::from_secs(5),
-        )
-        .await;
-        match res {
-            Err(SessionError::Start(e)) => {
-                assert!(e.contains("minimum safe version 1.14.31"), "{e}");
-            }
-            Err(other) => panic!("expected a Start refusal, got a different error: {other}"),
-            Ok(_) => panic!("Plan start on a sub-minimum version must be refused"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn guarded_session_start_passes_the_version_gate_on_an_old_build() {
-        use std::os::unix::fs::PermissionsExt as _;
-        // A Guarded session on a sub-minimum build must NOT be blocked by the
-        // version NUMBER. The fake answers `--version` with an old value and then
-        // never announces a serve URL, so start still fails — but at the serve
-        // stage, NOT with the version-floor refusal. This proves Guarded cleared
-        // the gate that Plan is refused at.
-        let dir = tempfile::TempDir::new().unwrap();
-        let script = dir.path().join("old-guarded-serve");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '1.14.30'; exit 0; fi\nsleep 30\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let res = OpenCodeSession::start_with_program_timeout_profile(
-            script.to_str().unwrap(),
-            dir.path(),
-            Some("build"),
-            None,
             BasePermissionProfile::Guarded,
-            Duration::from_secs(1),
-        )
-        .await;
-        match res {
-            Err(SessionError::Start(e)) => assert!(
-                !e.contains("minimum safe version"),
-                "Guarded must clear the version gate on any installed build: {e}"
-            ),
-            Err(other) => panic!("unexpected non-Start error: {other}"),
-            Ok(_) => panic!("a serve that never announces must fail as a Start error"),
+            BasePermissionProfile::Auto,
+        ] {
+            let res = OpenCodeSession::start_with_program_timeout_profile(
+                script.to_str().unwrap(),
+                dir.path(),
+                None,
+                None,
+                profile,
+                Duration::from_millis(100),
+            )
+            .await;
+            match res {
+                Err(SessionError::Start(e)) => {
+                    assert!(!e.contains("version"), "{profile:?}: {e}");
+                }
+                Err(other) => panic!("expected a Start timeout, got {other:?}"),
+                Ok(_) => panic!("a serve that never announces must time out"),
+            }
         }
     }
 

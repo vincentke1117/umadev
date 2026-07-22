@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use umadev_host::kimi_contract::{
-    KIMI_CODE_SOURCE_ACP_VERSION, KIMI_CODE_SOURCE_ADAPTER_VERSION, KIMI_CODE_SOURCE_COMMIT,
-    KIMI_CODE_SOURCE_VERSION,
+    KIMI_CODE_AUDITED_BASELINE_ACP_VERSION, KIMI_CODE_AUDITED_BASELINE_ADAPTER_VERSION,
+    KIMI_CODE_AUDITED_BASELINE_COMMIT, KIMI_CODE_AUDITED_BASELINE_VERSION,
 };
 
 fn source_root() -> Option<PathBuf> {
@@ -13,7 +13,7 @@ fn source_root() -> Option<PathBuf> {
 
 fn read(root: &Path, relative: &str) -> String {
     std::fs::read_to_string(root.join(relative))
-        .unwrap_or_else(|error| panic!("read pinned Kimi source {relative}: {error}"))
+        .unwrap_or_else(|error| panic!("read audited Kimi source {relative}: {error}"))
 }
 
 fn source_head(root: &Path) -> String {
@@ -22,14 +22,14 @@ fn source_head(root: &Path) -> String {
         .arg(root)
         .args(["rev-parse", "HEAD"])
         .output()
-        .unwrap_or_else(|error| panic!("read pinned Kimi source commit: {error}"));
+        .unwrap_or_else(|error| panic!("read audited Kimi source commit: {error}"));
     assert!(
         output.status.success(),
-        "git rev-parse failed for pinned Kimi source: {}",
+        "git rev-parse failed for audited Kimi source: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout)
-        .expect("pinned Kimi source commit is UTF-8")
+        .expect("audited Kimi source commit is UTF-8")
         .trim()
         .to_string()
 }
@@ -44,21 +44,23 @@ fn assert_markers(source: &str, contract: &str, markers: &[&str]) {
 }
 
 #[test]
-fn pinned_kimi_source_matches_the_standard_acp_contract() {
+fn audited_kimi_baseline_matches_the_standard_acp_contract() {
     let Some(root) = source_root() else {
         eprintln!("skipped: UMADEV_KIMI_SOURCE_DIR is set by the source-contract CI job");
         return;
     };
-    assert_eq!(source_head(&root), KIMI_CODE_SOURCE_COMMIT);
+    assert_eq!(source_head(&root), KIMI_CODE_AUDITED_BASELINE_COMMIT);
 
     let app_manifest = read(&root, "apps/kimi-code/package.json");
-    assert!(app_manifest.contains(&format!("\"version\": \"{KIMI_CODE_SOURCE_VERSION}\"")));
+    assert!(app_manifest.contains(&format!(
+        "\"version\": \"{KIMI_CODE_AUDITED_BASELINE_VERSION}\""
+    )));
     let adapter_manifest = read(&root, "packages/acp-adapter/package.json");
     assert!(adapter_manifest.contains(&format!(
-        "\"version\": \"{KIMI_CODE_SOURCE_ADAPTER_VERSION}\""
+        "\"version\": \"{KIMI_CODE_AUDITED_BASELINE_ADAPTER_VERSION}\""
     )));
     assert!(adapter_manifest.contains(&format!(
-        "\"@agentclientprotocol/sdk\": \"^{KIMI_CODE_SOURCE_ACP_VERSION}\""
+        "\"@agentclientprotocol/sdk\": \"^{KIMI_CODE_AUDITED_BASELINE_ACP_VERSION}\""
     )));
 
     let server = read(&root, "packages/acp-adapter/src/server.ts");
@@ -84,7 +86,7 @@ fn pinned_kimi_source_matches_the_standard_acp_contract() {
             "cwd: summary.workDir",
             "updatedAt",
             "async setSessionConfigOption",
-            "await acpSession.setThinking(value === 'on')",
+            "await acpSession.setThinking(String(value))",
             "async authenticate",
             "async cancel",
             "RequestError.authRequired()",
@@ -99,12 +101,12 @@ fn pinned_kimi_source_matches_the_standard_acp_contract() {
             "id: 'model'",
             "id: 'thinking'",
             "category: 'thought_level'",
-            "currentValue: enabled ? 'on' : 'off'",
+            "currentThinkingEffort: string",
             "export function buildThinkingOption",
-            "if (alwaysThinking)",
-            "options: [{ value: 'on', name: 'Thinking On' }]",
-            "{ value: 'off', name: 'Thinking Off' }",
-            "{ value: 'on', name: 'Thinking On' }",
+            "const efforts = supportEfforts.filter",
+            "currentValue: alwaysThinking || currentEffort !== 'off' ? 'on' : 'off'",
+            "const values = alwaysThinking ? [...efforts] : ['off', ...efforts]",
+            "effortDisplayName(value)",
             "id: 'mode'",
             "buildSessionConfigOptions",
         ],

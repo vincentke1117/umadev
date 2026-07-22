@@ -454,7 +454,7 @@
 "session.resume_goal" = "[目标] 上次有个目标没做完:下一步「{}」(已完成 {}/{} 步)。/continue 续上 · 或直接说要不要继续。"
 
 # Codex 高危沙箱责任警告(仅在 codex 且 danger-full-access 时显示)
-"codex.sandbox.danger_warning" = "警告:Codex 高危沙箱模式(danger-full-access)已开启 —— 请自行承担系统环境风险。\n  关闭:在 .umadevrc 中设置 [codex] sandbox_mode = \"workspace-write\" 后重启。"
+"codex.sandbox.danger_warning" = "警告:UmaDev 将以 danger-full-access 启动本项目中的 Codex 底座会话 —— 请自行承担系统环境风险。单独打开的 Codex 窗口有自己的权限设置，显示可能不同。\n  关闭:在 .umadevrc 中设置 [codex] sandbox_mode = \"workspace-write\" 后重启。"
 "codex.sandbox.windows_hint" = "提示(Windows + Codex):当前沙箱会屏蔽网络、本地 dev 端口和 git,全栈构建(npm install / dev server / git)无法完成;且 codex 的 Windows 沙箱辅助进程在部分机器上会因缺少运行时而报“找不到指定的模块”。做全栈开发请运行 /sandbox danger-full-access 放开(UmaDev 仍全程审计)。"
 
 # /sandbox —— 在应用内查看 / 修改 Codex 底座启动沙箱(无需手改 .umadevrc)
@@ -643,6 +643,9 @@
 "backend.handoff" = "「底座已切换 {} → {}:上文对话已随转录移交给新底座;原厂商底座内部的深层上下文不迁移,关键背景如有缺失请补充说明。」"
 "backend.workflow_handoff" = "工作流底座已从 {} 切换到 {}。需求、计划和已有产物会继续使用，但旧底座的会话 ID 不会跨底座复用；本次将启动新的厂商会话。"
 "backend.busy_no_switch" = "当前底座上有运行进行中 —— 请先 /cancel 再切换底座,以免运行与其会话错配。"
+"backend.switch_unavailable" = "未切换到底座 `{}`:当前探测确认它不可用。请先执行 `{}`，再重试切换。"
+"backend.switch_login_unverified" = "尚未切换到底座 `{}`:无法确认登录状态。请先执行 `{}`；如果这是无需登录的本地/第三方配置，请再次输入同一切换命令确认继续。"
+"backend.active_unavailable" = "当前配置的底座 `{}` 不可用，本次请求尚未启动。请先执行 `{}` 或切换到其他已就绪底座；修复后原输入可直接再次提交。"
 "chat.busy_cancel_first" = "有运行或对话进行中 —— 请先 /cancel;此时切换会话或压缩会破坏当前会话。"
 
 

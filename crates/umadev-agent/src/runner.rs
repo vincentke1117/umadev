@@ -611,6 +611,29 @@ pub fn setup_run_isolation(project_root: &Path, slug: &str) -> Option<(String, S
     announce
 }
 
+/// Start a genuinely new workspace-mutating run with a fresh shadow baseline.
+///
+/// The legacy phased runner deliberately re-enters [`setup_run_isolation`] and
+/// therefore needs that helper's idempotence. A director run has one entry but may
+/// finish without a phase checkpoint; in that case shadow `HEAD` still equals the
+/// previous run baseline and the idempotent helper cannot distinguish a later run
+/// from a duplicate call. Reusing it makes historical files look like edits from the
+/// current run. New director entries call this helper exactly once; resume paths keep
+/// the idempotent helper so rollback still targets the original run start.
+#[must_use]
+pub fn setup_new_run_isolation(project_root: &Path, slug: &str) -> Option<(String, String)> {
+    let announce = match crate::pr::ensure_isolation_branch(project_root, slug) {
+        crate::pr::BranchIsolation::Isolated {
+            branch,
+            from,
+            created: true,
+        } => Some((branch, from)),
+        _ => None,
+    };
+    let _ = crate::checkpoint::create_run_baseline(project_root, slug);
+    announce
+}
+
 /// Reduce a run slug to a filename-safe path component so a hostile or
 /// accidental slug (`../x`, `/tmp/x`, `..\..\x`) can never escape the
 /// `output/` directory or resolve to an absolute path. Every downstream
@@ -6556,6 +6579,40 @@ fn parse_retry_base_ms(raw: Option<&str>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reported_regression_new_run_rebaselines_without_a_phase_checkpoint() {
+        if !std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("existing.rs"), "before run one\n").unwrap();
+        let _ = setup_new_run_isolation(root, "run-one");
+        let first = crate::checkpoint::run_baseline(root).expect("first baseline");
+        std::fs::write(root.join("existing.rs"), "output from run one\n").unwrap();
+
+        // Director run one intentionally creates no phase checkpoint. Run two must
+        // still snapshot the current tree rather than reuse run one's baseline.
+        let _ = setup_new_run_isolation(root, "run-two");
+        let second = crate::checkpoint::run_baseline(root).expect("second baseline");
+        assert_ne!(first.id, second.id);
+        assert!(second.label.contains("run-two"));
+
+        std::fs::write(root.join("run_two.rs"), "only run two changed this\n").unwrap();
+        let changed = crate::checkpoint::changed_since_run_baseline(root).expect("run diff");
+        assert_eq!(
+            changed,
+            vec![crate::checkpoint::ChangedFile {
+                path: "run_two.rs".to_string(),
+                added: true,
+            }]
+        );
+    }
     use async_trait::async_trait;
     use tempfile::TempDir;
 
