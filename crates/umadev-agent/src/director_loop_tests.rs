@@ -1,4 +1,6 @@
 use super::*;
+use crate::critics::ReviewStatus;
+use crate::director::ReviewResult;
 
 /// Serializes tests mutating the process-global idle-timeout env vars, which race
 /// otherwise. Poison-tolerant so one failing test cannot cascade.
@@ -124,14 +126,103 @@ fn recipe_receipts_follow_terminal_director_outcomes() {
 #[test]
 fn unavailable_required_review_is_not_a_clean_qc_result() {
     let review = ReviewResult {
-        seats: 2,
-        blocking: vec!["[qa-engineer] missing regression test".to_string()],
+        seats: 3,
+        blocking: vec![
+            "[qa-engineer] missing regression test".to_string(),
+            "[frontend-engineer] Review payload is truncated mid-file".to_string(),
+        ],
         unavailable: vec!["[security-engineer] review turn timed out".to_string()],
     };
     assert_eq!(review.status(), ReviewStatus::Unavailable);
-    let findings = review_blocking(&review);
-    assert!(findings.iter().any(|f| f.contains("regression test")));
-    assert!(findings.iter().any(|f| f.contains("review unavailable")));
+    let evidence = quality_evidence::split_review_evidence(&review);
+    assert_eq!(evidence.blocking, review.blocking);
+    assert_eq!(evidence.operational.len(), 1);
+    let repair = QcReport {
+        blocking: evidence.blocking.clone(),
+        operational: Vec::new(),
+        raw_failure_log: None,
+    }
+    .fix_directive();
+    assert!(repair.contains("missing regression test"));
+    assert!(repair.contains("truncated"));
+    assert!(!repair.contains("timed out"));
+    let qc = QcReport {
+        blocking: evidence.blocking,
+        operational: evidence.operational,
+        raw_failure_log: None,
+    };
+    assert!(
+        !qc.is_clean(),
+        "an unavailable required review is not clean"
+    );
+    let residual = qc.residual_evidence();
+    assert!(residual.iter().any(|item| item.contains("regression test")));
+    assert!(residual.iter().any(|item| item.contains("timed out")));
+}
+
+#[test]
+fn transport_security_finding_is_semantic_not_operational() {
+    let review = ReviewResult {
+        seats: 1,
+        blocking: vec![
+            "[security-engineer] transport channel lacks authentication".to_string(),
+            "[qa-engineer] worker quit with fatal: Transport channel closed".to_string(),
+        ],
+        unavailable: Vec::new(),
+    };
+    let evidence = quality_evidence::split_review_evidence(&review);
+    assert_eq!(evidence.blocking, review.blocking);
+    assert!(evidence.operational.is_empty());
+    assert!(
+        evidence
+            .blocking
+            .iter()
+            .any(|item| item.contains("lacks authentication")),
+        "a real transport security defect must remain actionable"
+    );
+    assert!(
+        evidence
+            .blocking
+            .iter()
+            .any(|item| item.contains("channel closed")),
+        "even outage-shaped model text is semantic; only typed unavailable is operational"
+    );
+}
+
+#[test]
+fn missing_reviewable_implementation_is_a_semantic_finding() {
+    let review = ReviewResult {
+        seats: 1,
+        blocking: vec![
+            "[backend-engineer] No reviewable artifact or acceptance implementation is present"
+                .to_string(),
+            "[qa-engineer] 没有可评审的需求或验收实现".to_string(),
+            "[qa-engineer] 评审内容不包含登录回归测试实现".to_string(),
+        ],
+        unavailable: Vec::new(),
+    };
+    let evidence = quality_evidence::split_review_evidence(&review);
+    assert_eq!(evidence.blocking, review.blocking);
+    assert!(
+        evidence.operational.is_empty(),
+        "a reviewer-observed missing implementation is a product gap; only typed \
+         unavailable/context failures are operational"
+    );
+}
+
+#[test]
+fn mixed_qc_fix_directive_contains_only_semantic_findings() {
+    let qc = QcReport {
+        blocking: vec!["[qa-engineer] missing regression test".into()],
+        operational: vec!["review unavailable: review turn timed out".into()],
+        raw_failure_log: None,
+    };
+    let directive = qc.fix_directive();
+    assert!(directive.contains("missing regression test"));
+    assert!(
+        !directive.contains("timed out"),
+        "review infrastructure must never become a source-repair instruction"
+    );
 }
 
 #[test]
@@ -217,6 +308,8 @@ struct FakeSession {
     can_fork: bool,
     /// JSON a forked judge turn emits.
     fork_reply: String,
+    /// Optional per-seat/per-pass verdicts, shared by all fork clones.
+    fork_replies: Option<Arc<std::sync::Mutex<std::collections::VecDeque<String>>>>,
     /// `true` once this is a forked (read-only) session.
     is_fork: bool,
     /// Optional deterministic workspace mutation applied when the MAIN fake
@@ -232,6 +325,7 @@ impl FakeSession {
             sent: Arc::new(std::sync::Mutex::new(Vec::new())),
             can_fork,
             fork_reply: fork_reply.to_string(),
+            fork_replies: None,
             is_fork: false,
             write_on_main_send: None,
         }
@@ -243,6 +337,12 @@ impl FakeSession {
         body: impl Into<String>,
     ) -> Self {
         self.write_on_main_send = Some((path.into(), body.into()));
+        self
+    }
+    fn with_fork_replies(mut self, replies: impl IntoIterator<Item = &'static str>) -> Self {
+        self.fork_replies = Some(Arc::new(std::sync::Mutex::new(
+            replies.into_iter().map(str::to_string).collect(),
+        )));
         self
     }
     fn sent_handle(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
@@ -265,8 +365,13 @@ impl BaseSession for FakeSession {
     async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
         if self.is_fork {
             // A forked judge turn emits its JSON verdict then ends.
+            let reply = self
+                .fork_replies
+                .as_ref()
+                .and_then(|replies| replies.lock().unwrap().pop_front())
+                .unwrap_or_else(|| self.fork_reply.clone());
             self.current = [
-                SessionEvent::TextDelta(self.fork_reply.clone()),
+                SessionEvent::TextDelta(reply),
                 SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
                     usage: None,
@@ -1093,6 +1198,46 @@ async fn qc_review_blocking_is_fed_back_as_a_fix_directive() {
             .any(|d| d.contains("登录失败路径无测试") && d.contains("must be fixed")),
         "the review blocking finding was fed back as a fix directive: {sent:?}"
     );
+}
+
+#[tokio::test]
+async fn unavailable_review_stops_incomplete_without_a_source_fix_turn() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let mut sess = FakeSession::new(
+        vec![text_turn("Implemented the login system and verified it.")],
+        false,
+        "",
+    );
+    let sent = sess.sent_handle();
+
+    let outcome =
+        drive_director_loop(&mut sess, &opts(tmp.path()), &events, "GO".to_string()).await;
+    let DirectorLoopOutcome::PausedAtOperational {
+        reason,
+        done,
+        total,
+    } = outcome
+    else {
+        panic!("unavailable required review must park for retry: {outcome:?}");
+    };
+    assert!(reason.contains("review unavailable"), "{reason}");
+    assert_eq!((done, total), (0, 1));
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        1,
+        "review infrastructure failure must not launch a source-repair turn"
+    );
+    assert!(rec.events().iter().any(|event| matches!(
+        event,
+        EngineEvent::Note(note)
+            if note.contains("paused without source rework")
+    )));
+    let saved = plan_state::load(tmp.path()).expect("typed retry plan persisted");
+    assert_eq!(saved.steps.len(), 1);
+    assert_eq!(saved.steps[0].kind, plan_state::StepKind::Review);
+    assert_eq!(saved.steps[0].status, plan_state::StepStatus::Pending);
 }
 
 #[tokio::test]
@@ -2675,6 +2820,7 @@ fn fix_directive_lists_every_blocking_finding() {
             "verify build-test: FAILED — build: FAILED (exit 1)".into(),
             "[security] no input validation".into(),
         ],
+        operational: Vec::new(),
         raw_failure_log: None,
     };
     let d = qc.fix_directive();
@@ -2697,6 +2843,7 @@ fn fix_directive_carries_the_bounded_raw_failure_log_when_captured() {
     // (fenced), after the distilled findings — raw evidence the brain adapts from.
     let qc = QcReport {
             blocking: vec!["verify build-test: FAILED — test: FAILED (exit 101)".into()],
+            operational: Vec::new(),
             raw_failure_log: Some(
                 "$ cargo test   (step `test`, exit 101)\nassertion `left == right` failed\n  left: 2\n right: 3"
                     .to_string(),
@@ -3320,7 +3467,10 @@ async fn budget_stop_with_no_remaining_steps_settles_not_a_pause() {
         open_questions: vec![],
     };
     let turns = vec![text_turn("step only done"), text_turn("final gate ok")];
-    let mut sess = FakeSession::new(turns, true, "");
+    // This test isolates the budget terminal guard. The final required review
+    // must return a valid typed verdict; an empty reply now correctly produces
+    // PausedAtOperational and belongs to the review-outage tests.
+    let mut sess = FakeSession::new(turns, true, r#"{"accepts":true,"blocking":[]}"#);
     let o = opts(tmp.path());
     let route = build_route();
     // The budget is spent, but after the single step drives there is nothing left
@@ -5607,6 +5757,7 @@ fn repair_attempt_pass_requires_a_real_non_skipped_build_test() {
         mechanical_build_test_passed_steps: Vec::new(),
         mechanical_build_test_failed_steps: Vec::new(),
         evidence: Vec::new(),
+        operational_unavailable: Vec::new(),
         raw_log: None,
     };
     assert_eq!(
@@ -5651,6 +5802,7 @@ fn repair_failure_classification_prefers_raw_log_identity() {
         mechanical_build_test_passed_steps: Vec::new(),
         mechanical_build_test_failed_steps: vec!["test".into()],
         evidence: vec!["test: FAILED (exit 101)".into()],
+        operational_unavailable: Vec::new(),
         raw_log: Some(
             "error[E0432]: unresolved import `crate::auth::Session` in src/login.rs".into(),
         ),
@@ -6453,6 +6605,1117 @@ async fn empty_team_review_step_is_a_neutral_skip_not_progress() {
 }
 
 #[tokio::test]
+async fn outage_shaped_model_blocker_remains_semantic_and_gets_reworked() {
+    use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let mut sess = FakeSession::new(
+        vec![text_turn("this source-repair turn must never run")],
+        true,
+        r#"{"accepts":false,"blocking":["Review payload is truncated mid-file"]}"#,
+    );
+    let sent = sess.sent_handle();
+    let route = build_route();
+    let step = PlanStep {
+        files: plan_state::StepFiles::default(),
+        id: "review".into(),
+        title: "Cross-review".into(),
+        seat: crate::critics::Seat::QaEngineer,
+        kind: StepKind::Review,
+        depends_on: vec![],
+        acceptance: AcceptanceSpec::ReviewClean,
+        evidence: Vec::new(),
+        status: StepStatus::Active,
+    };
+    let outcome = drive_review_step(
+        &mut sess,
+        &opts(tmp.path()),
+        &events,
+        &route,
+        &step,
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    assert!(!outcome.unavailable);
+    assert!(
+        sent.lock()
+            .unwrap()
+            .iter()
+            .any(|directive| directive.contains("truncated")),
+        "model-authored blocker text is semantic; only typed host unavailable may pause"
+    );
+}
+
+#[tokio::test]
+async fn large_file_boundary_sample_remains_reviewable_and_model_blocker_is_semantic() {
+    use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/large.rs"),
+        format!("fn large() {{}}\n{}", "let value = 1;\n".repeat(400)),
+    )
+    .unwrap();
+    for index in 0..45 {
+        std::fs::write(
+            tmp.path().join(format!("src/module_{index}.rs")),
+            format!("pub fn module_{index}() -> usize {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    let (events, _rec) = sink();
+    let mut sess = FakeSession::new(
+        vec![text_turn("fixed the real response-validation defect")],
+        true,
+        r#"{"accepts":false,"blocking":["payload incomplete in API response validation"]}"#,
+    );
+    let sent = sess.sent_handle();
+    let step = PlanStep {
+        files: plan_state::StepFiles::default(),
+        id: "review".into(),
+        title: "Cross-review".into(),
+        seat: crate::critics::Seat::QaEngineer,
+        kind: StepKind::Review,
+        depends_on: vec![],
+        acceptance: AcceptanceSpec::ReviewClean,
+        evidence: Vec::new(),
+        status: StepStatus::Active,
+    };
+
+    let outcome = drive_review_step(
+        &mut sess,
+        &opts(tmp.path()),
+        &events,
+        &build_route(),
+        &step,
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+
+    assert!(
+        !outcome.unavailable,
+        "normal large-project sampling is a complete review contract, not an outage"
+    );
+    assert!(
+        sent.lock().unwrap().iter().any(|directive| directive
+            .contains("payload incomplete in API response validation")),
+        "a model-authored product blocker stays semantic even when its prose says payload incomplete"
+    );
+}
+
+#[tokio::test]
+async fn review_clean_acceptance_rejects_an_unavailable_required_review() {
+    use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let mut sess = FakeSession::new(vec![], false, "");
+    let step = PlanStep {
+        files: plan_state::StepFiles::default(),
+        id: "review".into(),
+        title: "Required review".into(),
+        seat: crate::critics::Seat::QaEngineer,
+        kind: StepKind::Review,
+        depends_on: vec![],
+        acceptance: AcceptanceSpec::ReviewClean,
+        evidence: Vec::new(),
+        status: StepStatus::Active,
+    };
+    let verdict = verify_step_acceptance(
+        &mut sess,
+        &opts(tmp.path()),
+        &events,
+        &build_route(),
+        &step,
+        None,
+    )
+    .await;
+    assert!(!verdict.accepted && !verdict.has_positive_evidence);
+    assert!(verdict.evidence.is_empty());
+    assert!(verdict
+        .operational_unavailable
+        .iter()
+        .any(|item| item.contains("review unavailable")));
+}
+
+#[tokio::test]
+async fn build_review_unavailable_returns_before_learning_or_source_rework() {
+    use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let mut sess = FakeSession::new(vec![text_turn("implementation done")], false, "");
+    let sent = sess.sent_handle();
+    let step = PlanStep {
+        files: test_step_files("reviewed-build"),
+        id: "reviewed-build".into(),
+        title: "Build then review".into(),
+        seat: crate::critics::Seat::BackendEngineer,
+        kind: StepKind::Build,
+        depends_on: vec![],
+        acceptance: AcceptanceSpec::ReviewClean,
+        evidence: Vec::new(),
+        status: StepStatus::Active,
+    };
+    let outcome = drive_build_step(
+        &mut sess,
+        &opts(tmp.path()),
+        &events,
+        &build_route(),
+        &step,
+        "",
+        2,
+        std::time::Instant::now() + Duration::from_secs(3_600),
+        &mut std::collections::HashSet::new(),
+    )
+    .await;
+    assert!(outcome.unavailable && !outcome.made_progress);
+    assert_eq!(sent.lock().unwrap().len(), 1, "no source rework turn");
+    assert!(
+        rec.events().iter().all(|event| !matches!(
+            event,
+            EngineEvent::Note(note)
+                if note.contains("blocker ") || note.contains("[learned]")
+        )),
+        "review infrastructure evidence never enters blocker learning"
+    );
+}
+
+#[tokio::test]
+async fn scheduler_parks_operational_review_without_blocking_the_plan() {
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let mut sess = FakeSession::new(vec![text_turn("must never build")], true, "")
+        .with_fork_replies(["not a verdict", r#"{"accepts":true,"blocking":[]}"#]);
+    let remaining_forks = Arc::clone(sess.fork_replies.as_ref().unwrap());
+    let sent = sess.sent_handle();
+    let mut plan = Plan {
+        steps: vec![
+            PlanStep {
+                files: plan_state::StepFiles::default(),
+                id: "review".into(),
+                title: "Required review".into(),
+                seat: crate::critics::Seat::QaEngineer,
+                kind: StepKind::Review,
+                depends_on: vec![],
+                acceptance: AcceptanceSpec::ReviewClean,
+                evidence: Vec::new(),
+                status: StepStatus::Pending,
+            },
+            PlanStep {
+                files: test_step_files("build"),
+                id: "build".into(),
+                title: "Source repair".into(),
+                seat: crate::critics::Seat::BackendEngineer,
+                kind: StepKind::Build,
+                depends_on: vec!["review".into()],
+                acceptance: AcceptanceSpec::SourcePresent,
+                evidence: Vec::new(),
+                status: StepStatus::Pending,
+            },
+        ],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+
+    let outcome = drive_plan_steps(
+        &mut sess,
+        &opts(tmp.path()),
+        &events,
+        &build_route(),
+        &mut plan,
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    assert!(
+        matches!(
+            &outcome,
+            Some(DirectorLoopOutcome::PausedAtOperational { reason, .. })
+                if reason.contains("required review unavailable")
+        ),
+        "the operational-review pause must own the terminal result: {outcome:?}"
+    );
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "operational review failure must not launch a source turn"
+    );
+    assert_eq!(
+        remaining_forks.lock().unwrap().len(),
+        1,
+        "the second scripted fork stays unused: no blocked-subtree replan/final review ran"
+    );
+    assert_eq!(plan.steps[0].status, StepStatus::Active);
+    assert_eq!(plan.steps[1].status, StepStatus::Pending);
+    let persisted = crate::plan_state::load(tmp.path()).expect("paused plan persisted");
+    assert_eq!(persisted.steps[0].status, StepStatus::Active);
+    assert_eq!(persisted.steps[1].status, StepStatus::Pending);
+}
+
+fn step_checkpoint_review_clean_build_plan() -> crate::plan_state::Plan {
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+    Plan {
+        steps: vec![PlanStep {
+            files: test_step_files("reviewed-build"),
+            id: "reviewed-build".into(),
+            title: "Implement reviewed change".into(),
+            seat: crate::critics::Seat::BackendEngineer,
+            kind: StepKind::Build,
+            depends_on: Vec::new(),
+            acceptance: AcceptanceSpec::ReviewClean,
+            evidence: Vec::new(),
+            status: StepStatus::Pending,
+        }],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn step_review_checkpoint_retries_saved_roster_without_replaying_build() {
+    use crate::critics::Seat;
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let options = opts(tmp.path());
+    let mut route = build_route();
+    route.team = vec![Seat::FrontendEngineer, Seat::BackendEngineer];
+    let mut plan = step_checkpoint_review_clean_build_plan();
+
+    let mut first = FakeSession::new(vec![text_turn("implementation complete")], true, "")
+        .with_fork_replies(["not a verdict", r#"{"accepts":true,"blocking":[]}"#]);
+    let first_sent = first.sent_handle();
+    let first_outcome = drive_plan_steps(
+        &mut first,
+        &options,
+        &events,
+        &route,
+        &mut plan,
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    assert!(
+        matches!(
+            first_outcome,
+            Some(DirectorLoopOutcome::PausedAtOperational { .. })
+        ),
+        "the Build reaches its unavailable ReviewClean boundary: {first_outcome:?}"
+    );
+    assert_eq!(
+        first_sent.lock().unwrap().len(),
+        1,
+        "the initial run drives the Build doer exactly once"
+    );
+
+    let first_checkpoint =
+        load_operational_review_checkpoint(tmp.path()).expect("step-review checkpoint");
+    let OperationalReviewCheckpoint::StepReview {
+        step_id,
+        qc_source_fingerprint,
+        required_seats,
+        review_only,
+    } = first_checkpoint
+    else {
+        panic!("expected a step-review checkpoint");
+    };
+    assert_eq!(step_id, "reviewed-build");
+    assert!(review_only);
+    assert!(qc_source_fingerprint.is_some());
+    assert_eq!(required_seats.as_deref(), Some(route.team.as_slice()));
+
+    let mut rerouted = route.clone();
+    rerouted.team = vec![Seat::SecurityEngineer];
+    let mut repeated = FakeSession::new(vec![text_turn("doer must not replay")], true, "")
+        .with_fork_replies([
+            "not a verdict",
+            r#"{"accepts":true,"blocking":[]}"#,
+            "unused sentinel",
+        ]);
+    let repeated_sent = repeated.sent_handle();
+    let repeated_forks = Arc::clone(repeated.fork_replies.as_ref().unwrap());
+    let repeated_outcome =
+        drive_director_loop_resume(&mut repeated, &options, &events, &rerouted).await;
+    assert!(
+        matches!(
+            repeated_outcome,
+            Some(DirectorLoopOutcome::PausedAtOperational { .. })
+        ),
+        "a repeated reviewer outage remains parked: {repeated_outcome:?}"
+    );
+    assert!(
+        repeated_sent.lock().unwrap().is_empty(),
+        "unchanged QC inputs retry only review; the Build doer/main session is not replayed"
+    );
+    assert_eq!(
+        repeated_forks.lock().unwrap().len(),
+        1,
+        "the saved two-seat roster is retried exactly once, ignoring the new one-seat route"
+    );
+    assert!(
+        rec.events().iter().any(|event| matches!(
+            event,
+            EngineEvent::Note(note)
+                if note.contains("retrying only the parked review for `Implement reviewed change`")
+        )),
+        "the continuation surfaces the review-only receipt path"
+    );
+
+    let roles = std::fs::read_to_string(tmp.path().join(".umadev/team-ledger.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|entry| entry["role"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roles[roles.len() - 2..],
+        [
+            Seat::FrontendEngineer.role_id().to_string(),
+            Seat::BackendEngineer.role_id().to_string(),
+        ],
+        "the retry uses the exact saved seat identities, not the freshly routed security seat"
+    );
+
+    assert!(matches!(
+        load_operational_review_checkpoint(tmp.path()),
+        Some(OperationalReviewCheckpoint::StepReview {
+            step_id,
+            qc_source_fingerprint: repeated_fingerprint,
+            required_seats: Some(seats),
+            review_only: true,
+        }) if step_id == "reviewed-build"
+            && repeated_fingerprint == qc_source_fingerprint
+            && seats == route.team
+    ));
+}
+
+#[tokio::test]
+async fn step_review_only_resume_semantic_blocker_never_repairs_or_rereviews() {
+    use crate::critics::Seat;
+    use crate::plan_state::StepStatus;
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let source_path = tmp.path().join("app.ts");
+    let source_before = std::fs::read(&source_path).unwrap();
+    let (events, _rec) = sink();
+    let options = opts(tmp.path());
+    let mut route = build_route();
+    route.team = vec![Seat::FrontendEngineer];
+    let mut plan = step_checkpoint_review_clean_build_plan();
+
+    let mut first = FakeSession::new(vec![text_turn("implementation complete")], true, "")
+        .with_fork_replies(["not a verdict"]);
+    let first_outcome = drive_plan_steps(
+        &mut first,
+        &options,
+        &events,
+        &route,
+        &mut plan,
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    assert!(
+        matches!(
+            first_outcome,
+            Some(DirectorLoopOutcome::PausedAtOperational { .. })
+        ),
+        "the initial reviewer outage establishes a review-only cursor: {first_outcome:?}"
+    );
+    assert!(matches!(
+        load_operational_review_checkpoint(tmp.path()),
+        Some(OperationalReviewCheckpoint::StepReview {
+            review_only: true,
+            ..
+        })
+    ));
+
+    let mut rerouted = route.clone();
+    rerouted.team.clear();
+    let mut resumed = FakeSession::new(vec![text_turn("forbidden repair turn")], true, "")
+        .with_main_send_write(&source_path, "forbidden mutation")
+        .with_fork_replies([
+            r#"{"accepts":false,"blocking":["missing login regression coverage"]}"#,
+            r#"{"accepts":true,"blocking":[]}"#,
+        ]);
+    let resumed_sent = resumed.sent_handle();
+    let resumed_forks = Arc::clone(resumed.fork_replies.as_ref().unwrap());
+    let resumed_outcome =
+        drive_director_loop_resume(&mut resumed, &options, &events, &rerouted).await;
+
+    assert!(
+        matches!(resumed_outcome, Some(DirectorLoopOutcome::Failed(_))),
+        "a semantic verdict at a read-only resume boundary blocks the step instead of \
+         opening a repair loop: {resumed_outcome:?}"
+    );
+    assert!(
+        resumed_sent.lock().unwrap().is_empty(),
+        "the restored review-only boundary must never send a repair/final-report turn \
+         to the writable main session"
+    );
+    assert_eq!(
+        resumed_forks.lock().unwrap().len(),
+        1,
+        "exactly one reviewer verdict is consumed; no automatic second review runs"
+    );
+    assert_eq!(
+        std::fs::read(&source_path).unwrap(),
+        source_before,
+        "a semantic review verdict cannot mutate the workspace"
+    );
+    let persisted = crate::plan_state::load(tmp.path()).expect("blocked plan persisted");
+    assert_eq!(
+        persisted
+            .steps
+            .iter()
+            .find(|step| step.id == "reviewed-build")
+            .map(|step| step.status),
+        Some(StepStatus::Blocked)
+    );
+    assert!(
+        load_operational_review_checkpoint(tmp.path()).is_none(),
+        "a real semantic verdict settles and clears the operational retry cursor"
+    );
+}
+
+enum StepReviewReceiptMutation {
+    Source,
+    Manifest,
+}
+
+async fn assert_step_review_receipt_expires_after(mutation: StepReviewReceiptMutation) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let options = opts(tmp.path());
+    let route = build_route();
+    let mut plan = step_checkpoint_review_clean_build_plan();
+    let mut first = FakeSession::new(vec![text_turn("implementation complete")], true, "")
+        .with_fork_replies(["not a verdict"]);
+    let first_outcome = drive_plan_steps(
+        &mut first,
+        &options,
+        &events,
+        &route,
+        &mut plan,
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    assert!(
+        matches!(
+            first_outcome,
+            Some(DirectorLoopOutcome::PausedAtOperational { .. })
+        ),
+        "the Build reaches its unavailable ReviewClean boundary: {first_outcome:?}"
+    );
+    let before = match load_operational_review_checkpoint(tmp.path()) {
+        Some(OperationalReviewCheckpoint::StepReview {
+            qc_source_fingerprint: Some(fingerprint),
+            ..
+        }) => fingerprint,
+        checkpoint => panic!("expected a fingerprinted step-review checkpoint: {checkpoint:?}"),
+    };
+
+    match mutation {
+        StepReviewReceiptMutation::Source => {
+            std::fs::write(tmp.path().join("app.ts"), "export const x = 2;").unwrap();
+        }
+        StepReviewReceiptMutation::Manifest => {
+            std::fs::write(
+                tmp.path().join("package.json"),
+                r#"{"name":"receipt-expired","private":true}"#,
+            )
+            .unwrap();
+        }
+    }
+
+    let mut rerouted = route.clone();
+    rerouted.team.clear();
+    let mut resumed = FakeSession::new(vec![text_turn("acceptance rerun")], true, "")
+        .with_fork_replies(["not a verdict"]);
+    let resumed_sent = resumed.sent_handle();
+    let resumed_outcome =
+        drive_director_loop_resume(&mut resumed, &options, &events, &rerouted).await;
+    assert!(
+        matches!(
+            resumed_outcome,
+            Some(DirectorLoopOutcome::PausedAtOperational { .. })
+        ),
+        "the re-run reaches the required review and parks again: {resumed_outcome:?}"
+    );
+    let sent = resumed_sent.lock().unwrap();
+    assert_eq!(
+        sent.len(),
+        1,
+        "changed QC inputs invalidate the receipt and re-run the Build doer"
+    );
+    assert!(
+        sent[0].contains("Implement reviewed change"),
+        "the main send is the original Build step, not an unrelated repair: {sent:?}"
+    );
+    drop(sent);
+    assert!(
+        rec.events().iter().any(|event| matches!(
+            event,
+            EngineEvent::Note(note)
+                if note.contains("source/QC inputs changed after the parked review")
+        )),
+        "receipt invalidation is visible"
+    );
+    let after = match load_operational_review_checkpoint(tmp.path()) {
+        Some(OperationalReviewCheckpoint::StepReview {
+            qc_source_fingerprint: Some(fingerprint),
+            ..
+        }) => fingerprint,
+        checkpoint => panic!("expected a refreshed step-review checkpoint: {checkpoint:?}"),
+    };
+    assert_ne!(
+        before, after,
+        "the repeated pause records the new QC-input identity"
+    );
+}
+
+#[tokio::test]
+async fn step_review_receipt_expires_when_source_or_manifest_changes() {
+    assert_step_review_receipt_expires_after(StepReviewReceiptMutation::Source).await;
+    assert_step_review_receipt_expires_after(StepReviewReceiptMutation::Manifest).await;
+}
+
+#[tokio::test]
+async fn final_review_checkpoint_retries_once_without_replaying_step_review() {
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let route = build_route();
+    let options = opts(tmp.path());
+    let mut plan = Plan {
+        steps: vec![PlanStep {
+            files: plan_state::StepFiles::default(),
+            id: "review".into(),
+            title: "Cross-review".into(),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Review,
+            depends_on: Vec::new(),
+            acceptance: AcceptanceSpec::ReviewClean,
+            evidence: Vec::new(),
+            status: StepStatus::Done,
+        }],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+
+    let mut first = FakeSession::new(vec![], true, "")
+        .with_fork_replies(["not a verdict", r#"{"accepts":true,"blocking":[]}"#]);
+    let first_forks = Arc::clone(first.fork_replies.as_ref().unwrap());
+    let first_outcome = drive_plan_steps(
+        &mut first,
+        &options,
+        &events,
+        &route,
+        &mut plan,
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    assert!(matches!(
+        first_outcome,
+        Some(DirectorLoopOutcome::PausedAtOperational { .. })
+    ));
+    assert_eq!(
+        first_forks.lock().unwrap().len(),
+        1,
+        "the initial final gate made exactly one reviewer call"
+    );
+    assert!(matches!(
+        load_operational_review_checkpoint(tmp.path()),
+        Some(OperationalReviewCheckpoint::FinalGateReview { .. })
+    ));
+    let verify_reads_after_pause = rec.count(
+        |event| matches!(event, EngineEvent::Note(note) if note == "team · verify build-test"),
+    );
+    assert_eq!(
+        verify_reads_after_pause, 1,
+        "the initial final gate establishes one deterministic QC receipt"
+    );
+
+    // A resident turn can hand this final-review cursor to `/continue`.
+    // Bind a real parked entry ledger and prove that repeated outages keep the
+    // same run resumable instead of minting or orphaning another writer.
+    let resident_run_id = {
+        let mut task = crate::task_lifecycle::EntryTaskTracker::begin(
+            tmp.path(),
+            "resident\0final-review",
+            "resident-edit",
+            "apply and verify the resident change",
+        )
+        .unwrap();
+        let run_id = task.run_id().to_string();
+        task.wait("required reviewer unavailable").unwrap();
+        run_id
+    };
+    let checkpoint =
+        load_operational_review_checkpoint(tmp.path()).expect("final-review checkpoint");
+    let OperationalReviewCheckpoint::FinalGateReview {
+        qc_source_fingerprint,
+        required_seats,
+        ..
+    } = checkpoint
+    else {
+        panic!("expected final-review checkpoint");
+    };
+    save_operational_review_checkpoint(
+        tmp.path(),
+        &OperationalReviewCheckpoint::FinalGateReview {
+            qc_source_fingerprint,
+            required_seats,
+            entry_task_run_id: Some(resident_run_id.clone()),
+        },
+    )
+    .unwrap();
+
+    let mut repeated_outage =
+        FakeSession::new(vec![], true, "").with_fork_replies(["not a verdict"]);
+    let repeated_forks = Arc::clone(repeated_outage.fork_replies.as_ref().unwrap());
+    let repeated_outcome =
+        drive_director_loop_resume(&mut repeated_outage, &options, &events, &route).await;
+    assert!(
+        matches!(
+            repeated_outcome,
+            Some(DirectorLoopOutcome::PausedAtOperational { .. })
+        ),
+        "a repeated reviewer outage must remain a pause: {repeated_outcome:?}"
+    );
+    assert!(
+        repeated_forks.lock().unwrap().is_empty(),
+        "the repeated outage consumes exactly one final-review attempt"
+    );
+    let resident_ledger =
+        crate::task_lifecycle::AgentTaskLedger::open(tmp.path(), &resident_run_id).unwrap();
+    assert_eq!(
+        resident_ledger.task("entry").map(|task| task.state),
+        Some(crate::task_lifecycle::AgentTaskState::Waiting),
+        "the exact resident run remains parked"
+    );
+    assert!(matches!(
+        load_operational_review_checkpoint(tmp.path()),
+        Some(OperationalReviewCheckpoint::FinalGateReview {
+            entry_task_run_id: Some(run_id),
+            ..
+        }) if run_id == resident_run_id
+    ));
+    assert_eq!(
+        rec.count(
+            |event| matches!(event, EngineEvent::Note(note) if note == "team · verify build-test")
+        ),
+        verify_reads_after_pause,
+        "a repeated outage retries only review, not build/test or Docker"
+    );
+
+    let mut resumed = FakeSession::new(vec![text_turn("final report")], true, "")
+        .with_fork_replies([r#"{"accepts":true,"blocking":[]}"#, "not a verdict"]);
+    let resumed_forks = Arc::clone(resumed.fork_replies.as_ref().unwrap());
+    let mut rerouted = route.clone();
+    rerouted.team.clear();
+    let resumed_outcome =
+        drive_director_loop_resume(&mut resumed, &options, &events, &rerouted).await;
+    assert!(
+        matches!(resumed_outcome, Some(DirectorLoopOutcome::Done { .. })),
+        "the continuation retries the parked final gate and completes: {resumed_outcome:?}"
+    );
+    assert_eq!(
+        resumed_forks.lock().unwrap().len(),
+        1,
+        "resume consumes exactly one reviewer verdict, not a step review plus final review"
+    );
+    assert_eq!(
+        rec.count(
+            |event| matches!(event, EngineEvent::Note(note) if note == "team · verify build-test")
+        ),
+        verify_reads_after_pause,
+        "an unchanged-source continuation must not rerun build/test (or Docker) before retrying review"
+    );
+    assert!(
+        rec.count(|event| matches!(
+            event,
+            EngineEvent::Note(note)
+                if note.contains("retrying only the final review")
+        )) >= 1
+    );
+    assert!(
+        load_operational_review_checkpoint(tmp.path()).is_none(),
+        "a settled final review clears its typed retry cursor"
+    );
+    let resident_ledger =
+        crate::task_lifecycle::AgentTaskLedger::open(tmp.path(), &resident_run_id).unwrap();
+    assert_eq!(
+        resident_ledger.task("entry").map(|task| task.state),
+        Some(crate::task_lifecycle::AgentTaskState::Succeeded),
+        "the original resident run, not a replacement, settles after final review"
+    );
+
+    let mut third = FakeSession::new(vec![], true, "").with_fork_replies(["not a verdict"]);
+    let third_forks = Arc::clone(third.fork_replies.as_ref().unwrap());
+    assert!(
+        drive_director_loop_resume(&mut third, &options, &events, &route)
+            .await
+            .is_none(),
+        "a completed plan has nothing left to continue"
+    );
+    assert_eq!(
+        third_forks.lock().unwrap().len(),
+        1,
+        "a second /continue performs no review after completion"
+    );
+}
+
+#[test]
+fn cancelling_an_operational_pause_settles_the_exact_entry_and_closes_the_plan_cursor() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let options = opts(tmp.path());
+    let route = build_route();
+    let mut entry = crate::task_lifecycle::EntryTaskTracker::begin(
+        tmp.path(),
+        "resident\0cancel-operational-review",
+        "resident-edit",
+        "apply and verify a resident change",
+    )
+    .unwrap();
+    let run_id = entry.run_id().to_string();
+    let qc = PostBuildQcOutcome {
+        reply: String::new(),
+        clean: false,
+        blocking: Vec::new(),
+        operational_unavailable: vec!["review unavailable: timed out".to_string()],
+    };
+    checkpoint_post_build_review_pause(&options, &route, &qc, &events, Some(&run_id), None, None)
+        .unwrap();
+    entry.wait("required reviewer unavailable").unwrap();
+    drop(entry);
+
+    assert!(
+        cancel_operational_review_pause(tmp.path(), "cancelled by user").unwrap(),
+        "the persisted boundary must be consumed"
+    );
+    assert!(
+        !cancel_operational_review_pause(tmp.path(), "already cancelled").unwrap(),
+        "cancellation is idempotent after the cursor is gone"
+    );
+    let ledger = crate::task_lifecycle::AgentTaskLedger::open(tmp.path(), &run_id).unwrap();
+    assert_eq!(
+        ledger.task("entry").map(|task| task.state),
+        Some(crate::task_lifecycle::AgentTaskState::Cancelled)
+    );
+    assert!(load_operational_review_checkpoint(tmp.path()).is_none());
+    assert!(
+        load_resumable_plan(tmp.path()).is_none(),
+        "a cancelled review cannot reappear on a later /continue"
+    );
+}
+
+#[tokio::test]
+async fn resident_final_review_semantic_blocker_fails_same_run_and_closes_resume_boundary() {
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let route = build_route();
+    let options = opts(tmp.path());
+    let mut plan = Plan {
+        steps: vec![PlanStep {
+            files: plan_state::StepFiles::default(),
+            id: "review".into(),
+            title: "Cross-review".into(),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Review,
+            depends_on: Vec::new(),
+            acceptance: AcceptanceSpec::ReviewClean,
+            evidence: Vec::new(),
+            status: StepStatus::Done,
+        }],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+
+    // Establish the same durable final-review cursor a resident chat build hands
+    // to `/continue`: deterministic QC ran once, then the required reviewer was
+    // operationally unavailable.
+    let mut unavailable = FakeSession::new(vec![], true, "").with_fork_replies(["not a verdict"]);
+    let paused = drive_plan_steps(
+        &mut unavailable,
+        &options,
+        &events,
+        &route,
+        &mut plan,
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    assert!(
+        matches!(
+            paused,
+            Some(DirectorLoopOutcome::PausedAtOperational { .. })
+        ),
+        "the fixture must park at the final-review boundary: {paused:?}"
+    );
+    let verify_reads_at_pause = rec.count(
+        |event| matches!(event, EngineEvent::Note(note) if note == "team · verify build-test"),
+    );
+    assert_eq!(
+        verify_reads_at_pause, 1,
+        "the initial final gate establishes one deterministic QC receipt"
+    );
+
+    let resident_run_id = {
+        let mut task = crate::task_lifecycle::EntryTaskTracker::begin(
+            tmp.path(),
+            "resident\0final-review-semantic-blocker",
+            "resident-edit",
+            "apply and verify the resident change",
+        )
+        .unwrap();
+        let run_id = task.run_id().to_string();
+        task.wait("required reviewer unavailable").unwrap();
+        run_id
+    };
+    let checkpoint =
+        load_operational_review_checkpoint(tmp.path()).expect("final-review checkpoint");
+    let OperationalReviewCheckpoint::FinalGateReview {
+        qc_source_fingerprint,
+        required_seats,
+        ..
+    } = checkpoint
+    else {
+        panic!("expected final-review checkpoint");
+    };
+    save_operational_review_checkpoint(
+        tmp.path(),
+        &OperationalReviewCheckpoint::FinalGateReview {
+            qc_source_fingerprint,
+            required_seats,
+            entry_task_run_id: Some(resident_run_id.clone()),
+        },
+    )
+    .unwrap();
+
+    // The retried reviewer is available and returns a real product blocker. That
+    // verdict settles this exact resident run as Failed. It must not be fed back
+    // to the writer for an unsolicited source repair, followed by another review.
+    let unsolicited_repair = tmp.path().join("unsolicited-repair.ts");
+    let mut resumed = FakeSession::new(vec![text_turn("unrequested repair")], true, "")
+        .with_main_send_write(&unsolicited_repair, "export const changed = true;")
+        .with_fork_replies([
+            r#"{"accepts":false,"blocking":["missing committed regression test"]}"#,
+            r#"{"accepts":true,"blocking":[]}"#,
+        ]);
+    let resumed_sent = resumed.sent_handle();
+    let resumed_forks = Arc::clone(resumed.fork_replies.as_ref().unwrap());
+    let resumed_outcome = drive_director_loop_resume(&mut resumed, &options, &events, &route).await;
+    assert!(
+        matches!(
+            &resumed_outcome,
+            Some(DirectorLoopOutcome::Failed(reason))
+                if reason.contains("missing committed regression test")
+        ),
+        "an available semantic verdict must fail, not repair/review-loop or pause: \
+         {resumed_outcome:?}"
+    );
+    assert!(
+        resumed_sent.lock().unwrap().is_empty(),
+        "a final-review continuation is a read-only verdict boundary; no source repair turn"
+    );
+    assert!(
+        !unsolicited_repair.exists(),
+        "the resident writer must remain untouched after the semantic verdict"
+    );
+    assert_eq!(
+        resumed_forks.lock().unwrap().len(),
+        1,
+        "exactly one reviewer verdict is consumed; the queued second verdict proves no re-review"
+    );
+    assert_eq!(
+        rec.count(
+            |event| matches!(event, EngineEvent::Note(note) if note == "team · verify build-test")
+        ),
+        verify_reads_at_pause,
+        "the unchanged-source continuation reuses its QC receipt and never repeats build/test"
+    );
+    assert!(
+        load_operational_review_checkpoint(tmp.path()).is_none(),
+        "a semantic verdict settles and clears the operational retry cursor"
+    );
+    let resident_ledger =
+        crate::task_lifecycle::AgentTaskLedger::open(tmp.path(), &resident_run_id).unwrap();
+    assert_eq!(
+        resident_ledger.task("entry").map(|task| task.state),
+        Some(crate::task_lifecycle::AgentTaskState::Failed),
+        "the exact parked resident run is failed instead of minting a replacement run"
+    );
+
+    let mut later_continue =
+        FakeSession::new(vec![], true, "").with_fork_replies(["not a verdict"]);
+    let later_forks = Arc::clone(later_continue.fork_replies.as_ref().unwrap());
+    assert!(
+        drive_director_loop_resume(&mut later_continue, &options, &events, &route)
+            .await
+            .is_none(),
+        "after semantic settlement there is no final-review boundary left to continue"
+    );
+    assert_eq!(
+        later_forks.lock().unwrap().len(),
+        1,
+        "a later /continue must not convene the reviewer again"
+    );
+}
+
+#[test]
+fn final_review_qc_receipt_expires_when_source_changes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let recorded = crate::freshness::workspace_qc_fingerprint(tmp.path())
+        .expect("small QC input tree has a fingerprint");
+    assert!(final_review_qc_receipt_matches(tmp.path(), Some(&recorded)));
+
+    std::fs::write(tmp.path().join("app.ts"), "export const x = 200;").unwrap();
+    assert!(
+        !final_review_qc_receipt_matches(tmp.path(), Some(&recorded)),
+        "any source movement invalidates review-only resume and forces full QC"
+    );
+
+    let recorded = crate::freshness::workspace_qc_fingerprint(tmp.path()).unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"receipt-test\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    assert!(
+        !final_review_qc_receipt_matches(tmp.path(), Some(&recorded)),
+        "manifest movement invalidates review-only resume and forces full QC"
+    );
+}
+
+#[tokio::test]
+async fn mixed_review_pauses_without_repairing_or_rechecking() {
+    use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let mut route = build_route();
+    route.team.push(crate::critics::Seat::QaEngineer);
+    let mut sess = FakeSession::new(vec![text_turn("fixed regression test")], true, "")
+        .with_fork_replies([
+            r#"{"accepts":false,"blocking":["missing regression test"]}"#,
+            "not a verdict",
+            r#"{"accepts":true,"blocking":[]}"#,
+            r#"{"accepts":true,"blocking":[]}"#,
+        ]);
+    let sent = sess.sent_handle();
+    let step = PlanStep {
+        files: plan_state::StepFiles::default(),
+        id: "review".into(),
+        title: "Cross-review".into(),
+        seat: crate::critics::Seat::QaEngineer,
+        kind: StepKind::Review,
+        depends_on: vec![],
+        acceptance: AcceptanceSpec::ReviewClean,
+        evidence: Vec::new(),
+        status: StepStatus::Active,
+    };
+    let outcome = drive_review_step(
+        &mut sess,
+        &opts(tmp.path()),
+        &events,
+        &route,
+        &step,
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    assert!(!outcome.made_progress && outcome.unavailable);
+    assert!(
+        outcome
+            .gap_evidence
+            .iter()
+            .any(|item| item.contains("missing regression test")),
+        "{:?}",
+        outcome.gap_evidence
+    );
+    assert!(
+        outcome
+            .gap_evidence
+            .iter()
+            .any(|item| item.contains("unavailable") || item.contains("timed out")),
+        "{:?}",
+        outcome.gap_evidence
+    );
+    let sent = sent.lock().unwrap();
+    assert!(
+        sent.is_empty(),
+        "an unavailable required reviewer stops the boundary before any source repair: {sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn unavailable_mixed_review_retains_evidence_without_starting_a_recheck() {
+    use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let mut route = build_route();
+    route.team.push(crate::critics::Seat::QaEngineer);
+    let mut sess = FakeSession::new(vec![text_turn("fixed regression test")], true, "")
+        .with_fork_replies([
+            r#"{"accepts":false,"blocking":["missing regression test"]}"#,
+            "not a verdict",
+            "not a verdict",
+            r#"{"accepts":true,"blocking":[]}"#,
+        ]);
+    let sent = sess.sent_handle();
+    let step = PlanStep {
+        files: plan_state::StepFiles::default(),
+        id: "review".into(),
+        title: "Cross-review".into(),
+        seat: crate::critics::Seat::QaEngineer,
+        kind: StepKind::Review,
+        depends_on: vec![],
+        acceptance: AcceptanceSpec::ReviewClean,
+        evidence: Vec::new(),
+        status: StepStatus::Active,
+    };
+    let outcome = drive_review_step(
+        &mut sess,
+        &opts(tmp.path()),
+        &events,
+        &route,
+        &step,
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    assert!(outcome.unavailable && !outcome.made_progress);
+    assert!(outcome
+        .gap_evidence
+        .iter()
+        .any(|gap| gap.contains("not valid verdict JSON")));
+    assert!(
+        outcome
+            .gap_evidence
+            .iter()
+            .any(|gap| gap.contains("missing regression test")),
+        "the first-pass semantic evidence must remain attached to the paused boundary"
+    );
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "an operational outage must not launch a source repair or a recheck"
+    );
+}
+
+#[tokio::test]
 async fn residual_review_finding_always_marks_the_step_not_clean() {
     // A semantic reviewer is specifically responsible for gaps a deterministic
     // floor may not express. Its residual must survive rework without a second,
@@ -6765,7 +8028,7 @@ async fn post_build_qc_on_a_clean_build_drives_no_fix_turn() {
     o.requirement = "做一个简单的纯前端落地页单页".to_string();
     let route = chat_build_route();
 
-    let reply = run_post_build_qc(
+    let outcome = run_post_build_qc(
         &mut sess,
         &o,
         &events,
@@ -6774,13 +8037,81 @@ async fn post_build_qc_on_a_clean_build_drives_no_fix_turn() {
     )
     .await;
     assert!(
-        reply.trim().is_empty(),
-        "a clean post-build QC returns an empty reply (no fix turn ran): {reply:?}"
+        outcome.reply.trim().is_empty(),
+        "a clean post-build QC returns an empty reply (no fix turn ran): {outcome:?}"
     );
+    assert!(outcome.clean, "{outcome:?}");
     assert_eq!(
         sent.lock().unwrap().len(),
         0,
         "a clean chat-build drives no fix turn — chat stays fast"
+    );
+}
+
+#[tokio::test]
+async fn post_build_qc_returns_required_reviewer_outage_without_a_fix_turn() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let mut session = FakeSession::new(Vec::new(), false, "");
+    let sent = session.sent_handle();
+    let outcome = run_post_build_qc(
+        &mut session,
+        &opts(tmp.path()),
+        &events,
+        &build_route(),
+        "Implemented the requested source.",
+    )
+    .await;
+
+    assert!(!outcome.clean, "{outcome:?}");
+    assert!(!outcome.operational_unavailable.is_empty(), "{outcome:?}");
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "review transport failures never become source repair directives"
+    );
+}
+
+#[tokio::test]
+async fn post_build_qc_mixed_review_retains_semantic_evidence_without_repair_or_rereview() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let mut route = build_route();
+    route.team.push(crate::critics::Seat::QaEngineer);
+    let mut session = FakeSession::new(Vec::new(), true, "").with_fork_replies([
+        r#"{"accepts":false,"blocking":["missing regression test"]}"#,
+        "not a verdict",
+        r#"{"accepts":true,"blocking":[]}"#,
+    ]);
+    let remaining = Arc::clone(session.fork_replies.as_ref().unwrap());
+    let sent = session.sent_handle();
+    let outcome = run_post_build_qc(
+        &mut session,
+        &opts(tmp.path()),
+        &events,
+        &route,
+        "Implemented the requested source.",
+    )
+    .await;
+
+    assert!(!outcome.clean, "{outcome:?}");
+    assert!(
+        outcome
+            .blocking
+            .iter()
+            .any(|item| item.contains("missing regression test")),
+        "{outcome:?}"
+    );
+    assert!(!outcome.operational_unavailable.is_empty(), "{outcome:?}");
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "a partial reviewer panel must not authorize source repair"
+    );
+    assert_eq!(
+        remaining.lock().unwrap().len(),
+        1,
+        "no automatic second review starts after the operational pause"
     );
 }
 

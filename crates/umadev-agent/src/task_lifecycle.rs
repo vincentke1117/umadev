@@ -1009,6 +1009,73 @@ impl EntryTaskTracker {
         })
     }
 
+    /// Reattach to the exact durable entry run that owns a persisted execution
+    /// boundary.
+    ///
+    /// This is intentionally run-id based instead of scope based. A resident
+    /// turn can park at a final-review outage and then hand execution to the
+    /// director's `/continue` path; reopening by a freshly classified scope
+    /// could mint or select a different ledger and leave the original writer
+    /// permanently `Waiting`.
+    pub fn resume_exact(project_root: &Path, run_id: &str) -> Result<Self, TaskLifecycleError> {
+        let mut ledger = AgentTaskLedger::open(project_root, run_id)?;
+        ledger.recover_interrupted()?;
+        let entry_state = ledger
+            .task(ENTRY_TASK_ID)
+            .map(|task| task.state)
+            .ok_or_else(|| {
+                TaskLifecycleError::CorruptJournal(format!(
+                    "entry task is missing from persisted run {run_id}"
+                ))
+            })?;
+        match entry_state {
+            AgentTaskState::Queued => {
+                ledger.start(ENTRY_TASK_ID)?;
+            }
+            AgentTaskState::Waiting | AgentTaskState::Interrupted => {
+                ledger.resume(ENTRY_TASK_ID)?;
+            }
+            AgentTaskState::Running => {}
+            state => {
+                return Err(TaskLifecycleError::CorruptJournal(format!(
+                    "persisted entry task is unexpectedly terminal: {state:?}"
+                )));
+            }
+        }
+        Ok(Self {
+            ledger,
+            parked: false,
+            settled: false,
+        })
+    }
+
+    /// Cancel the exact persisted entry run if it is still live.
+    ///
+    /// A fresh run or explicit user cancellation must settle the resident writer
+    /// that owns an operational-review checkpoint before erasing that pointer.
+    /// Terminal runs are already settled and therefore make this idempotent.
+    pub fn cancel_exact(
+        project_root: &Path,
+        run_id: &str,
+        detail: &str,
+    ) -> Result<(), TaskLifecycleError> {
+        let mut ledger = AgentTaskLedger::open(project_root, run_id)?;
+        ledger.recover_interrupted()?;
+        let state = ledger
+            .task(ENTRY_TASK_ID)
+            .map(|task| task.state)
+            .ok_or_else(|| {
+                TaskLifecycleError::CorruptJournal(format!(
+                    "entry task is missing from persisted run {run_id}"
+                ))
+            })?;
+        if state.is_terminal() {
+            return Ok(());
+        }
+        ledger.cancel(ENTRY_TASK_ID, detail)?;
+        Ok(())
+    }
+
     /// Stable run id shown by `/tasks`.
     #[must_use]
     pub fn run_id(&self) -> &str {
@@ -1780,6 +1847,61 @@ mod tests {
         )
         .unwrap();
         assert_ne!(next.run_id(), first_run);
+    }
+
+    #[test]
+    fn entry_tracker_resumes_and_settles_the_exact_parked_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_id = {
+            let mut tracker = EntryTaskTracker::begin(
+                temp.path(),
+                "resident\0review-outage",
+                "resident-edit",
+                "apply a scoped edit",
+            )
+            .unwrap();
+            let run_id = tracker.run_id().to_string();
+            tracker.wait("required reviewer unavailable").unwrap();
+            run_id
+        };
+
+        let mut resumed = EntryTaskTracker::resume_exact(temp.path(), &run_id).unwrap();
+        assert_eq!(resumed.run_id(), run_id);
+        assert_eq!(resumed.state(), AgentTaskState::Running);
+        resumed.succeed("final review passed", Vec::new()).unwrap();
+        drop(resumed);
+
+        let ledger = AgentTaskLedger::open(temp.path(), &run_id).unwrap();
+        assert_eq!(
+            ledger.task(ENTRY_TASK_ID).map(|task| task.state),
+            Some(AgentTaskState::Succeeded)
+        );
+        assert!(EntryTaskTracker::resume_exact(temp.path(), &run_id).is_err());
+    }
+
+    #[test]
+    fn entry_tracker_cancels_the_exact_parked_run_idempotently() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_id = {
+            let mut tracker = EntryTaskTracker::begin(
+                temp.path(),
+                "resident\0cancelled-review",
+                "resident-edit",
+                "apply a scoped edit",
+            )
+            .unwrap();
+            let run_id = tracker.run_id().to_string();
+            tracker.wait("required reviewer unavailable").unwrap();
+            run_id
+        };
+
+        EntryTaskTracker::cancel_exact(temp.path(), &run_id, "user cancelled").unwrap();
+        EntryTaskTracker::cancel_exact(temp.path(), &run_id, "already cancelled").unwrap();
+        let ledger = AgentTaskLedger::open(temp.path(), &run_id).unwrap();
+        assert_eq!(
+            ledger.task(ENTRY_TASK_ID).map(|task| task.state),
+            Some(AgentTaskState::Cancelled)
+        );
     }
 
     #[test]

@@ -567,10 +567,9 @@ enum Command {
         /// Workspace root; defaults to current directory.
         #[arg(long)]
         project_root: Option<PathBuf>,
-        /// Repair what can be repaired safely. Today: clear a STALE rewind marker that is
-        /// permanently halting every run (a marker whose snapshot this workspace can no
-        /// longer identify — its shadow checkpoint repo was deleted). Touches no file in
-        /// your work-tree. A marker the automatic repair can still act on is left alone.
+        /// Apply narrowly-scoped repairs: migrate a legacy/incomplete run-lock fence
+        /// after every older UmaDev process has been stopped, and clear a STALE rewind
+        /// marker whose snapshot no longer exists. Neither repair edits source files.
         #[arg(long)]
         fix: bool,
     },
@@ -2484,6 +2483,13 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
         EngineEvent::BlockCompleted { final_phase, .. } => {
             eprintln!("[ok] Block complete at {}", final_phase.id());
         }
+        EngineEvent::OperationalPaused {
+            reason,
+            done,
+            total,
+        } => {
+            eprintln!("[paused] {reason} ({done}/{total}) — run `umadev continue` to retry");
+        }
         EngineEvent::VerifyPassed { phase, duration_ms } => {
             eprintln!("  [ok] {} verify OK ({}ms)", phase.id(), duration_ms);
         }
@@ -2694,10 +2700,10 @@ fn continuous_report(outcome: &umadev_agent::RunOutcome, requirement: &str) -> R
             paused_at: None,
             completed: Vec::new(),
         },
-        // A hard stop did NOT reach delivery and is NOT a gate pause — report the
-        // last code-ish phase with no gate so `print_report` prints the honest
-        // "stopped before delivery" line rather than "complete".
-        RunOutcome::HardStop(_) => RunReport {
+        // An operational pause or hard stop did NOT reach delivery and is NOT a
+        // gate pause — report Quality with no gate so `print_report` cannot claim
+        // that the pipeline completed.
+        RunOutcome::PausedAtOperational { .. } | RunOutcome::HardStop(_) => RunReport {
             final_phase: umadev_spec::Phase::Quality,
             paused_at: None,
             completed: Vec::new(),
@@ -2743,6 +2749,21 @@ fn print_continuous_report(
             println!(
                 "{}",
                 umadev_i18n::tlf("continuous.hardstop_report", &[reason])
+            );
+            println!("  workspace: {}", project_root.display());
+            println!("  runtime: {label}");
+        }
+        RunOutcome::PausedAtOperational {
+            reason,
+            done,
+            total,
+        } => {
+            println!(
+                "{}",
+                umadev_i18n::tlf(
+                    "run.operational_pause_resume_hint",
+                    &[reason, &done.to_string(), &total.to_string()],
+                )
             );
             println!("  workspace: {}", project_root.display());
             println!("  runtime: {label}");
@@ -2851,6 +2872,13 @@ enum DirectorOutcome {
         /// Total steps in the plan.
         total: usize,
     },
+    /// A required reviewer/host was unavailable and the plan was checkpointed
+    /// for `/continue`.
+    PausedAtOperational {
+        reason: String,
+        done: usize,
+        total: usize,
+    },
     /// The director finished its turn cleanly and every applicable mechanical
     /// completion gate passed.
     Done,
@@ -2861,11 +2889,15 @@ enum DirectorOutcome {
 }
 
 /// Whether a director `/run` outcome must map to a **non-zero process exit**.
-/// `run` / `quick` are documented for scripting/CI, so a `HardStop` (dead
-/// session / a claimed build with zero real source) must NOT exit 0 — otherwise
-/// `umadev run … && next` proceeds as if the build succeeded. `Done` is success.
+/// `run` / `quick` are documented for scripting/CI, so a `HardStop` or an
+/// operational review outage must NOT exit 0 — otherwise `umadev run … && next`
+/// proceeds as if an incomplete build succeeded. Human and budget pauses remain
+/// successful resumable settles; `Done` is success.
 fn director_outcome_is_failure(outcome: &DirectorOutcome) -> bool {
-    matches!(outcome, DirectorOutcome::HardStop(_))
+    matches!(
+        outcome,
+        DirectorOutcome::HardStop(_) | DirectorOutcome::PausedAtOperational { .. }
+    )
 }
 
 /// Honest terminal line for a CLI Director outcome.
@@ -2887,6 +2919,14 @@ fn director_outcome_report(outcome: &DirectorOutcome) -> String {
             "run.budget_pause_resume_hint",
             &[&done.to_string(), &total.to_string()],
         ),
+        DirectorOutcome::PausedAtOperational {
+            reason,
+            done,
+            total,
+        } => umadev_i18n::tlf(
+            "run.operational_pause_resume_hint",
+            &[reason, &done.to_string(), &total.to_string()],
+        ),
         DirectorOutcome::Done => umadev_i18n::tl("director.run_done").to_string(),
         DirectorOutcome::HardStop(reason) => {
             umadev_i18n::tlf("continuous.hardstop_report", &[reason])
@@ -2904,13 +2944,18 @@ fn run_report_is_failure(report: &RunReport) -> bool {
 }
 
 /// Whether a legacy continuous [`umadev_agent::RunOutcome`] must map to a
-/// non-zero process exit. Only a `HardStop` is a failure; a `Completed` (heavy
-/// OR lean) and a `PausedAtGate` are both successes. (Distinct from
+/// non-zero process exit. A `HardStop` or operational review outage is a
+/// failure; a `Completed` (heavy OR lean), human gate, and budget pause are
+/// successes. (Distinct from
 /// [`run_report_is_failure`], which cannot be reused here: a LEAN `Completed`
 /// reports its final phase as `Quality`, not `Delivery`, and must NOT be a
 /// failure.)
 fn run_outcome_is_failure(outcome: &umadev_agent::RunOutcome) -> bool {
-    matches!(outcome, umadev_agent::RunOutcome::HardStop(_))
+    matches!(
+        outcome,
+        umadev_agent::RunOutcome::HardStop(_)
+            | umadev_agent::RunOutcome::PausedAtOperational { .. }
+    )
 }
 
 /// Drive an explicit `/run` (full product build) through the **director build loop**
@@ -2949,6 +2994,15 @@ async fn drive_director_run(
     firmware: Option<&str>,
 ) -> Result<DirectorOutcome> {
     use umadev_agent::DirectorLoopOutcome;
+
+    // Public CLI boundaries execute a valid ordinary commit in the host before
+    // opening a session. Keep the same firewall here for programmatic callers:
+    // this Director function must never reinterpret a Git mutation as Build.
+    if umadev_agent::request_has_git_commit_operation(&options.requirement) {
+        let note = umadev_i18n::tl("intent.git_commit_host_boundary").to_string();
+        events.emit(umadev_agent::EngineEvent::Note(note.clone()));
+        return Ok(DirectorOutcome::HardStop(note));
+    }
 
     // Defensive no-write ceiling for direct callers. `cmd_run` rejects Plan
     // before opening a backend session; this inner boundary additionally proves
@@ -3049,6 +3103,17 @@ async fn drive_director_run(
         DirectorLoopOutcome::PausedAtBudget { done, total } => {
             return Ok(DirectorOutcome::PausedAtBudget { done, total });
         }
+        DirectorLoopOutcome::PausedAtOperational {
+            reason,
+            done,
+            total,
+        } => {
+            return Ok(DirectorOutcome::PausedAtOperational {
+                reason,
+                done,
+                total,
+            });
+        }
     };
 
     // Objective source-present hard-gate (the deterministic reality floor): the
@@ -3135,6 +3200,46 @@ fn warn_if_model_provider_ignored(project_root: &std::path::Path) {
     }
 }
 
+/// Handle a CLI requirement that names a Git commit before any runner, base
+/// session, hook, workflow state, or review can start.
+///
+/// Returns `Ok(true)` when the request was a Git operation and has been fully
+/// handled (executed or intentionally stopped in Plan). Unsafe compounds fail
+/// closed. Guarded asks one current-process confirmation; Auto executes directly.
+async fn handle_cli_git_operation(
+    requirement: &str,
+    project_root: &Path,
+    mode: umadev_agent::TrustMode,
+) -> Result<bool> {
+    if !umadev_agent::request_has_git_commit_operation(requirement) {
+        return Ok(false);
+    }
+    let Some(request) = umadev_agent::parse_host_git_commit_request(requirement) else {
+        anyhow::bail!("{}", umadev_i18n::tl("intent.git_commit_host_boundary"));
+    };
+    if request.verifier.is_some() {
+        anyhow::bail!("{}", umadev_i18n::tl("intent.git_commit_host_boundary"));
+    }
+    if !mode.executes() {
+        println!("{}", umadev_i18n::tl("continuous.plan_mode_skip"));
+        println!("{}", umadev_i18n::tl("mode.plan.gate"));
+        return Ok(true);
+    }
+    if mode == umadev_agent::TrustMode::Guarded
+        && !umadev_agent::request_explicitly_confirms_git_commit(&request.commit_text)
+        && !confirm("Create one local Git commit for the current requested scope?")
+    {
+        anyhow::bail!(
+            "Git commit cancelled before execution; no AI base, review, or workspace mutation was started"
+        );
+    }
+    let reply = umadev_tui::execute_host_git_commit(project_root, &request.commit_text)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    println!("{reply}");
+    Ok(true)
+}
+
 async fn cmd_run(args: RunArgs) -> Result<()> {
     // Reject an empty / whitespace-only requirement up front with a helpful
     // message, rather than running the whole pipeline on nothing.
@@ -3146,6 +3251,9 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     }
     let project_root = resolve_root(args.project_root)?;
     let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
+    if handle_cli_git_operation(&args.requirement, &project_root, mode).await? {
+        return Ok(());
+    }
     // The director `/run` surface is an execution command. In Plan mode it must
     // settle before hook installation, backend probing/session creation,
     // `runner.start()`, run-lock/branch setup, or any `.umadev/*` persistence.
@@ -3466,9 +3574,17 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
+    let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
+    if handle_cli_git_operation(&args.requirement, &project_root, mode).await? {
+        return Ok(());
+    }
+    if !mode.executes() {
+        println!("{}", umadev_i18n::tl("continuous.plan_mode_skip"));
+        println!("{}", umadev_i18n::tl("mode.plan.gate"));
+        return Ok(());
+    }
     // A dead `[model] provider` fails LOUD, not silent (UmaDev routes no models).
     warn_if_model_provider_ignored(&project_root);
-    let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
     let opts = RunOptions {
         project_root: project_root.clone(),
         requirement: args.requirement,
@@ -3578,6 +3694,20 @@ fn require_recorded_requirement(state: &umadev_agent::WorkflowState) -> Result<S
     Ok(state.requirement.clone())
 }
 
+/// Refuse to replay a persisted/effective Git commit request through a base.
+///
+/// Fresh `run` / `quick` requests are handled by the host-owned Git transaction
+/// before any model is opened. Resume verbs are different: their requirement
+/// comes from mutable on-disk workflow state (and `revise` may compose a new
+/// effective requirement). A stale pre-firewall state must never turn
+/// `continue`, `redo`, or `revise` into an AI task, review, or runner start.
+fn reject_replayed_git_requirement(requirement: &str) -> Result<()> {
+    if umadev_agent::request_has_git_commit_operation(requirement) {
+        anyhow::bail!("{}", umadev_i18n::tl("intent.git_commit_host_boundary"));
+    }
+    Ok(())
+}
+
 /// Permission tier inherited by CLI continuation surfaces. The state owns the
 /// original run's posture; states written before the field existed resolve to
 /// Guarded through `resolved_permission_profile`.
@@ -3623,6 +3753,7 @@ async fn cmd_redo(
         state.slug.clone()
     };
     let requirement = require_recorded_requirement(&state)?;
+    reject_replayed_git_requirement(&requirement)?;
     let trust = trust_for_resume(&state);
     // backend: explicit flag > persisted state > offline. Retired/unknown state
     // never silently changes brains.
@@ -3962,6 +4093,7 @@ async fn drive_gate_block(
         Some(r) => r,
         None => require_recorded_requirement(state)?,
     };
+    reject_replayed_git_requirement(&requirement)?;
     let trust = trust_for_resume(state);
 
     // Resolve backend: explicit flag > persisted state > offline. A retired or
@@ -4207,6 +4339,7 @@ async fn cmd_continue(
             path.display()
         ),
     };
+    reject_replayed_git_requirement(&state.requirement)?;
 
     // Director runs persist a typed plan whose Done/Pending statuses are the
     // authoritative resume point. Route these runs back into the Director
@@ -4256,6 +4389,7 @@ async fn drive_director_continue(
     backend_override: Option<BackendArg>,
 ) -> Result<()> {
     let requirement = require_recorded_requirement(state)?;
+    reject_replayed_git_requirement(&requirement)?;
     let slug = if state.slug.trim().is_empty() {
         infer_slug(project_root)
     } else {
@@ -4424,6 +4558,15 @@ async fn drive_director_continue(
         umadev_agent::DirectorLoopOutcome::PausedAtBudget { done, total } => {
             DirectorOutcome::PausedAtBudget { done, total }
         }
+        umadev_agent::DirectorLoopOutcome::PausedAtOperational {
+            reason,
+            done,
+            total,
+        } => DirectorOutcome::PausedAtOperational {
+            reason,
+            done,
+            total,
+        },
     };
     println!("{}", director_outcome_report(&settled));
     println!("  workspace: {}", project_root.display());
@@ -4440,6 +4583,7 @@ async fn cmd_revise(
     backend_override: Option<BackendArg>,
 ) -> Result<()> {
     let project_root = resolve_root(project_root)?;
+    reject_replayed_git_requirement(&text)?;
     let state = match umadev_agent::read_workflow_state_diagnostic(&project_root) {
         umadev_agent::ReadState::Ok(s) => s,
         umadev_agent::ReadState::Missing => {
@@ -4451,10 +4595,18 @@ async fn cmd_revise(
             path.display()
         ),
     };
+    reject_replayed_git_requirement(&state.requirement)?;
     let gate = resolve_active_gate(&state)?;
     let outcome = classify_reply(&text);
     match outcome {
         GateOutcome::Revise(notes) => {
+            // Build and validate the effective requirement before recording an
+            // approval, writing an ADR/lesson, probing a base, or starting a
+            // runner. This closes the old-state replay path as well as a future
+            // composition regression.
+            let base_req = require_recorded_requirement(&state)?;
+            let revised = format!("{base_req}\n\n## Revision request\n{notes}");
+            reject_replayed_git_requirement(&revised)?;
             let _ = record_tool_call(
                 &project_root,
                 "umadev/cli.revise",
@@ -4483,8 +4635,6 @@ async fn cmd_revise(
             // Recover the recorded goal to fold the feedback into — NEVER scrape
             // `note`; refuse if no requirement was recorded rather than revise a
             // base driven with a scraped non-requirement.
-            let base_req = require_recorded_requirement(&state)?;
-            let revised = format!("{base_req}\n\n## Revision request\n{notes}");
             drive_gate_block(
                 &project_root,
                 &state,
@@ -7470,6 +7620,269 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn director_inner_boundary_never_reinterprets_git_commit_as_build() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut opts = director_test_opts(tmp.path());
+        opts.requirement = "提交git记录".to_string();
+        opts.mode = umadev_agent::TrustMode::Auto;
+        let sink: Arc<dyn umadev_agent::EventSink> =
+            Arc::new(umadev_agent::RecordingSink::default());
+        let mut session = FakeDirectorSession::new(std::collections::VecDeque::new());
+
+        let outcome = Box::pin(drive_director_run(&sink, &mut session, &opts, None))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, DirectorOutcome::HardStop(ref note) if note.contains("Git")),
+            "{outcome:?}"
+        );
+        assert!(
+            session.sent.lock().unwrap().is_empty(),
+            "the defensive boundary must run before any base turn"
+        );
+        assert!(
+            !tmp.path().join(".umadev").exists(),
+            "no lock, plan, governance, or workflow state may be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_run_quick_and_revise_reject_git_compounds_before_runner_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let run_error = cmd_run(RunArgs {
+            requirement: "提交git记录，然后推送".to_string(),
+            backend: None,
+            project_root: Some(tmp.path().to_path_buf()),
+            slug: String::new(),
+            mode: "auto".to_string(),
+            continuous: false,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(run_error.contains("Git"), "{run_error}");
+
+        let quick_error = cmd_quick(RunArgs {
+            requirement: "git commit -m sync && cargo test".to_string(),
+            backend: None,
+            project_root: Some(tmp.path().to_path_buf()),
+            slug: String::new(),
+            mode: "auto".to_string(),
+            continuous: false,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(quick_error.contains("Git"), "{quick_error}");
+
+        let revise_error = cmd_revise(
+            "提交git记录".to_string(),
+            Some(tmp.path().to_path_buf()),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            revise_error.contains("Git") && !revise_error.contains("workflow-state"),
+            "{revise_error}"
+        );
+        assert!(
+            !tmp.path().join(".umadev").exists(),
+            "all three public CLI firewalls must settle before runner persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_git_commit_is_blocked_at_every_cli_replay_boundary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Docs);
+        state.requirement = "提交git记录".to_string();
+        state.slug = "legacy-pre-firewall-state".to_string();
+        state.active_gate = Gate::DocsConfirm.id_str().to_string();
+        // If any boundary is ordered after backend resolution, the test fails
+        // with an unknown-backend error instead of the host Git boundary.
+        state.backend = "definitely-not-a-backend".to_string();
+        state.permission_profile = Some(umadev_runtime::BasePermissionProfile::Auto);
+        umadev_agent::write_workflow_state(root, &state).unwrap();
+        let state_path = root.join(".umadev/workflow-state.json");
+        let state_before = std::fs::read(&state_path).unwrap();
+
+        let assert_blocked = |surface: &str, result: Result<()>| {
+            let error = result
+                .expect_err("persisted Git work must not enter a replay surface")
+                .to_string();
+            assert!(
+                error.contains("Git") && !error.contains("definitely-not-a-backend"),
+                "{surface} crossed the host Git firewall: {error}"
+            );
+        };
+
+        assert_blocked(
+            "continue",
+            Box::pin(cmd_continue(Some(root.to_path_buf()), None)).await,
+        );
+        assert_blocked(
+            "redo",
+            Box::pin(cmd_redo(
+                "frontend".to_string(),
+                None,
+                Some(root.to_path_buf()),
+            ))
+            .await,
+        );
+        assert_blocked(
+            "revise",
+            Box::pin(cmd_revise(
+                "把说明写得更清楚".to_string(),
+                Some(root.to_path_buf()),
+                None,
+            ))
+            .await,
+        );
+        assert_blocked(
+            "legacy gate driver",
+            Box::pin(drive_gate_block(
+                root,
+                &state,
+                Gate::DocsConfirm,
+                None,
+                None,
+                GateBlock::Continue,
+            ))
+            .await,
+        );
+        assert_blocked(
+            "director resume driver",
+            Box::pin(drive_director_continue(root, &state, None)).await,
+        );
+
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            state_before,
+            "replay rejection must not rewrite or snapshot workflow state"
+        );
+        for forbidden in [
+            ".umadev/audit/tool-calls.jsonl",
+            ".umadev/history",
+            ".umadev/run.lock",
+            ".umadev/run.lock.guard",
+            ".umadev/decisions",
+            ".umadev/governance-context.json",
+            ".umadev/team-ledger.jsonl",
+            ".umadev/operational-review-checkpoint.json",
+            "output",
+            "release",
+        ] {
+            assert!(
+                !root.join(forbidden).exists(),
+                "replay rejection created forbidden base/review/runner state: {forbidden}"
+            );
+        }
+        reject_replayed_git_requirement("把登录页标题改清楚").unwrap();
+    }
+
+    #[tokio::test]
+    async fn cli_plan_git_commit_stops_before_host_transaction_or_runner_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(
+            handle_cli_git_operation("提交git记录", tmp.path(), umadev_agent::TrustMode::Plan,)
+                .await
+                .unwrap()
+        );
+        assert!(!tmp.path().join(".git").exists());
+        assert!(!tmp.path().join(".umadev").exists());
+    }
+
+    #[tokio::test]
+    async fn cli_run_and_quick_plain_commit_each_execute_one_host_transaction_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "umadev-test@example.invalid"]);
+        git(&["config", "user.name", "UmaDev Test"]);
+        std::fs::write(root.join("tracked.txt"), "initial\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-m", "initial"]);
+        let initial_count = git(&["rev-list", "--count", "HEAD"])
+            .parse::<u32>()
+            .unwrap();
+
+        std::fs::write(root.join("tracked.txt"), "run commit\n").unwrap();
+        cmd_run(RunArgs {
+            requirement: "提交git记录".to_string(),
+            backend: None,
+            project_root: Some(root.to_path_buf()),
+            slug: String::new(),
+            mode: "auto".to_string(),
+            continuous: false,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            git(&["rev-list", "--count", "HEAD"])
+                .parse::<u32>()
+                .unwrap(),
+            initial_count + 1
+        );
+        for forbidden in [
+            ".umadev/plan.json",
+            ".umadev/workflow-state.json",
+            ".umadev/governance-context.json",
+            ".umadev/team-ledger.jsonl",
+            ".umadev/operational-review-checkpoint.json",
+        ] {
+            assert!(!root.join(forbidden).exists(), "{forbidden}");
+        }
+
+        std::fs::write(root.join("tracked.txt"), "quick commit\n").unwrap();
+        cmd_quick(RunArgs {
+            requirement: "提交git记录".to_string(),
+            backend: None,
+            project_root: Some(root.to_path_buf()),
+            slug: String::new(),
+            mode: "auto".to_string(),
+            continuous: false,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            git(&["rev-list", "--count", "HEAD"])
+                .parse::<u32>()
+                .unwrap(),
+            initial_count + 2
+        );
+        for forbidden in [
+            ".umadev/plan.json",
+            ".umadev/workflow-state.json",
+            ".umadev/governance-context.json",
+            ".umadev/team-ledger.jsonl",
+            ".umadev/operational-review-checkpoint.json",
+        ] {
+            assert!(
+                !root.join(forbidden).exists(),
+                "host commits never create runner/review state: {forbidden}"
+            );
+        }
+    }
+
     #[test]
     fn prepend_firmware_fences_firmware_then_goal_and_is_fail_open() {
         // The firmware leads, fenced from the goal with a separator; an empty /
@@ -8207,7 +8620,8 @@ mod tests {
     #[test]
     fn director_outcome_exit_mapping() {
         // `Done` succeeds, `Planned` is an honest no-op success, a confirmation
-        // pause is an honest resumable success, and only HardStop exits non-zero.
+        // pause is an honest resumable success. Operational outage and HardStop
+        // exit non-zero so scripts cannot mistake an incomplete run for success.
         assert!(!director_outcome_is_failure(&DirectorOutcome::Done));
         assert!(!director_outcome_is_failure(&DirectorOutcome::Planned));
         assert!(!director_outcome_is_failure(&DirectorOutcome::Paused {
@@ -8221,6 +8635,13 @@ mod tests {
         let report =
             director_outcome_report(&DirectorOutcome::PausedAtBudget { done: 2, total: 6 });
         assert_ne!(report, umadev_i18n::tl("director.run_done"));
+        assert!(director_outcome_is_failure(
+            &DirectorOutcome::PausedAtOperational {
+                reason: "reviewer timed out".into(),
+                done: 2,
+                total: 6,
+            }
+        ));
         assert!(director_outcome_is_failure(&DirectorOutcome::HardStop(
             "session died".into()
         )));
@@ -8281,6 +8702,11 @@ mod tests {
         assert!(!run_outcome_is_failure(&RunOutcome::PausedAtBudget {
             done: 2,
             total: 6
+        }));
+        assert!(run_outcome_is_failure(&RunOutcome::PausedAtOperational {
+            reason: "reviewer timed out".into(),
+            done: 2,
+            total: 6,
         }));
         assert!(!run_outcome_is_failure(&RunOutcome::Completed));
         assert!(run_outcome_is_failure(&RunOutcome::HardStop(

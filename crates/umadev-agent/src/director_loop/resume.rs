@@ -7,9 +7,97 @@
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use umadev_spec::Phase;
 
 use crate::plan_state::{self, Plan, StepStatus};
+
+const OPERATIONAL_REVIEW_CHECKPOINT_FILE: &str = "director-operational-review.json";
+const MAX_OPERATIONAL_REVIEW_CHECKPOINT_BYTES: u64 = 16 * 1024;
+
+/// The exact review boundary a recoverable host outage parked.
+///
+/// A step review and the final whole-build review are deliberately distinct:
+/// retrying the latter by reopening an ordinary review step would review once in
+/// the scheduler and then immediately review a second time in the final gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(super) enum OperationalReviewCheckpoint {
+    /// Retry the named plan review step through the normal scheduler.
+    StepReview {
+        /// Stable persisted plan-step id.
+        step_id: String,
+        /// QC-input identity for which the build step's deterministic
+        /// acceptance already passed before its reviewer became unavailable.
+        #[serde(default)]
+        qc_source_fingerprint: Option<String>,
+        /// Exact reviewer roster for this boundary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        required_seats: Option<Vec<crate::critics::Seat>>,
+        /// A Build step already ran its doer and reached only its
+        /// `ReviewClean` acceptance boundary. When the fingerprint still
+        /// matches, resume must retry that review rather than re-run the doer.
+        #[serde(default)]
+        review_only: bool,
+    },
+    /// Skip already-settled plan steps and retry the final whole-build gate.
+    FinalGateReview {
+        /// QC-input identity (source/tests plus manifests, lockfiles, build
+        /// config, and CI) for which every deterministic floor already passed.
+        /// When it still matches, resume retries only the unavailable reviewer;
+        /// a missing/mismatched fingerprint conservatively re-runs QC.
+        #[serde(default)]
+        qc_source_fingerprint: Option<String>,
+        /// Exact required reviewer roster that was convened at the parked
+        /// boundary. A continuation must not silently resize the gate by
+        /// re-routing the requirement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        required_seats: Option<Vec<crate::critics::Seat>>,
+        /// Resident task-ledger run that owns this paused boundary. Older
+        /// checkpoints omit it and resume conservatively without ledger reuse.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_task_run_id: Option<String>,
+    },
+}
+
+/// In-band plan marker for a final-review retry.
+///
+/// The checkpoint and plan are separate atomically-written files, so a process can
+/// die between their renames. Keeping a distinctive cursor in the plan lets the
+/// loader reconstruct a missing checkpoint without scheduling an ordinary review
+/// and then immediately reviewing again in the final gate.
+pub(super) const FINAL_REVIEW_RETRY_STEP_ID: &str = "umadev-final-review-retry";
+
+fn operational_review_checkpoint_path(root: &Path) -> std::path::PathBuf {
+    root.join(".umadev")
+        .join(OPERATIONAL_REVIEW_CHECKPOINT_FILE)
+}
+
+pub(super) fn save_operational_review_checkpoint(
+    root: &Path,
+    checkpoint: &OperationalReviewCheckpoint,
+) -> std::io::Result<()> {
+    let dir = root.join(".umadev");
+    std::fs::create_dir_all(&dir)?;
+    let body = serde_json::to_vec_pretty(checkpoint)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    umadev_state::fs::atomic_write(&operational_review_checkpoint_path(root), body.as_slice())
+}
+
+pub(super) fn load_operational_review_checkpoint(
+    root: &Path,
+) -> Option<OperationalReviewCheckpoint> {
+    let body = umadev_state::fs::read_bounded(
+        &operational_review_checkpoint_path(root),
+        MAX_OPERATIONAL_REVIEW_CHECKPOINT_BYTES,
+    )
+    .ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
+pub(super) fn clear_operational_review_checkpoint(root: &Path) {
+    let _ = std::fs::remove_file(operational_review_checkpoint_path(root));
+}
 
 /// Whether `plan` still has work left to drive — at least one non-terminal step.
 fn plan_has_incomplete_step(plan: &Plan) -> bool {
@@ -27,10 +115,105 @@ fn reset_active_to_pending(plan: &mut Plan) {
     }
 }
 
+fn final_review_retry_step(depends_on: Vec<String>) -> plan_state::PlanStep {
+    plan_state::PlanStep {
+        id: FINAL_REVIEW_RETRY_STEP_ID.to_string(),
+        title: "Retry final whole-build review".to_string(),
+        seat: crate::critics::Seat::QaEngineer,
+        kind: plan_state::StepKind::Review,
+        depends_on,
+        acceptance: plan_state::AcceptanceSpec::ReviewClean,
+        evidence: Vec::new(),
+        files: plan_state::StepFiles::default(),
+        status: StepStatus::Pending,
+    }
+}
+
+fn reconcile_plan_with_operational_checkpoint(
+    plan: &mut Plan,
+    checkpoint: &OperationalReviewCheckpoint,
+) {
+    match checkpoint {
+        OperationalReviewCheckpoint::StepReview { step_id, .. } => {
+            if let Some(step) = plan.steps.iter_mut().find(|step| step.id == *step_id) {
+                if matches!(step.status, StepStatus::Done | StepStatus::Blocked) {
+                    step.status = StepStatus::Pending;
+                }
+            } else {
+                let mut step = final_review_retry_step(Vec::new());
+                step.id.clone_from(step_id);
+                step.title = format!("Retry interrupted review `{step_id}`");
+                plan.steps.push(step);
+            }
+        }
+        OperationalReviewCheckpoint::FinalGateReview { .. } => {
+            let dependencies = plan
+                .steps
+                .iter()
+                .filter(|step| step.kind != plan_state::StepKind::Review)
+                .map(|step| step.id.clone())
+                .collect::<Vec<_>>();
+            if let Some(step) = plan
+                .steps
+                .iter_mut()
+                .find(|step| step.id == FINAL_REVIEW_RETRY_STEP_ID)
+            {
+                step.status = StepStatus::Pending;
+                step.depends_on = dependencies;
+            } else {
+                plan.steps.push(final_review_retry_step(dependencies));
+            }
+        }
+    }
+}
+
+/// Resolve the logical review checkpoint from either transaction half.
+///
+/// This is read-only: an in-band final cursor is sufficient to recover a lost
+/// checkpoint file, so status/resume probes never rewrite project state.
+pub(super) fn operational_review_checkpoint_for_plan(
+    root: &Path,
+    plan: &Plan,
+) -> Option<OperationalReviewCheckpoint> {
+    load_operational_review_checkpoint(root).or_else(|| {
+        plan.steps
+            .iter()
+            .any(|step| {
+                step.id == FINAL_REVIEW_RETRY_STEP_ID
+                    && matches!(step.status, StepStatus::Pending | StepStatus::Active)
+            })
+            .then_some(OperationalReviewCheckpoint::FinalGateReview {
+                // The crash lost the verified-tree receipt. Reconstruct only the
+                // boundary; the resume conservatively re-runs deterministic QC.
+                qc_source_fingerprint: None,
+                required_seats: None,
+                entry_task_run_id: None,
+            })
+    })
+}
+
 /// Load a persisted plan only when it still contains resumable work.
+///
+/// The plan and operational-review checkpoint are reconciled as one logical
+/// transaction. Either file may be the one whose atomic rename landed before a
+/// crash: a checkpoint can recreate its missing plan cursor, while the distinctive
+/// final-review cursor can recreate a missing checkpoint.
 pub(super) fn load_resumable_plan(root: &Path) -> Option<Plan> {
-    let mut plan = plan_state::load(root)?;
+    let mut checkpoint = load_operational_review_checkpoint(root);
+    let mut plan = match plan_state::load(root) {
+        Some(plan) => plan,
+        None if checkpoint.is_some() => Plan {
+            steps: Vec::new(),
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        },
+        None => return None,
+    };
     invalidate_stale_steps(root, &mut plan);
+    checkpoint = operational_review_checkpoint_for_plan(root, &plan);
+    if let Some(checkpoint) = checkpoint.as_ref() {
+        reconcile_plan_with_operational_checkpoint(&mut plan, checkpoint);
+    }
     if !plan_has_incomplete_step(&plan) {
         return None;
     }
@@ -330,5 +513,86 @@ mod tests {
             transient_resume_hint("run time budget exhausted", root).is_none(),
             "a budget reason with no saved plan surfaces no hint"
         );
+    }
+
+    #[test]
+    fn final_checkpoint_reopens_a_fully_done_plan_after_a_crash_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        save_plan(root, StepStatus::Done);
+        save_operational_review_checkpoint(
+            root,
+            &OperationalReviewCheckpoint::FinalGateReview {
+                qc_source_fingerprint: Some("tree-a".to_string()),
+                required_seats: None,
+                entry_task_run_id: None,
+            },
+        )
+        .unwrap();
+
+        let plan = load_resumable_plan(root)
+            .expect("the checkpoint half of the transaction recreates a resume cursor");
+        assert!(plan.steps.iter().any(|step| {
+            step.id == FINAL_REVIEW_RETRY_STEP_ID && step.status == StepStatus::Pending
+        }));
+    }
+
+    #[test]
+    fn in_band_final_cursor_recovers_a_missing_checkpoint_without_rewriting_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let plan = Plan {
+            steps: vec![final_review_retry_step(Vec::new())],
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        };
+        plan_state::save(&plan, root).unwrap();
+
+        assert!(load_operational_review_checkpoint(root).is_none());
+        let loaded = load_resumable_plan(root).expect("the in-band cursor is resumable");
+        assert!(matches!(
+            operational_review_checkpoint_for_plan(root, &loaded),
+            Some(OperationalReviewCheckpoint::FinalGateReview {
+                qc_source_fingerprint: None,
+                ..
+            })
+        ));
+        assert!(
+            load_operational_review_checkpoint(root).is_none(),
+            "a read-only resume/status probe does not rewrite project state"
+        );
+    }
+
+    #[test]
+    fn final_checkpoint_without_a_plan_still_has_a_safe_resume_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        save_operational_review_checkpoint(
+            root,
+            &OperationalReviewCheckpoint::FinalGateReview {
+                qc_source_fingerprint: None,
+                required_seats: None,
+                entry_task_run_id: None,
+            },
+        )
+        .unwrap();
+
+        let plan = load_resumable_plan(root).expect("a checkpoint-only crash remains resumable");
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].id, FINAL_REVIEW_RETRY_STEP_ID);
+        assert_eq!(plan.steps[0].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn old_unit_final_checkpoint_deserializes_conservatively() {
+        let checkpoint: OperationalReviewCheckpoint =
+            serde_json::from_str(r#"{"kind":"final-gate-review"}"#).unwrap();
+        assert!(matches!(
+            checkpoint,
+            OperationalReviewCheckpoint::FinalGateReview {
+                qc_source_fingerprint: None,
+                ..
+            }
+        ));
     }
 }

@@ -43,6 +43,19 @@ use crate::critics::Seat;
 use crate::planner::{classify, TaskKind};
 use crate::runner::RunOptions;
 
+mod git_commit;
+use git_commit::{
+    git_commit_control_text, git_commit_request_has_additional_work,
+    git_commit_request_is_question_or_negated, git_commit_scope_text,
+    request_is_git_commit_diagnostic,
+};
+pub use git_commit::{
+    parse_git_commit_intent, parse_host_git_commit_request, request_explicitly_confirms_git_commit,
+    request_has_git_commit_operation, request_is_git_commit, request_is_unsupported_git_commit,
+    request_uses_literal_git_commit_command, GitCommitIntent, GitVerifier, HostGitCommitRequest,
+    LiteralGitCommitSpec,
+};
+
 /// How a turn should be handled — the top-level routing decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteClass {
@@ -337,7 +350,11 @@ pub fn for_run(requirement: &str) -> RoutePlan {
 /// authority. [`route_with_source`] asks the configured model before execution.
 #[must_use]
 pub fn deterministic_route(requirement: &str) -> RoutePlan {
-    tier0(requirement)
+    apply_route_ceilings(
+        tier0(requirement),
+        requirement,
+        crate::trust::TrustMode::Auto,
+    )
 }
 
 /// Route a turn and return only its plan. Use [`route_with_source`] when the caller
@@ -459,6 +476,21 @@ async fn close_readonly_session(session: Option<Box<dyn BaseSession>>) {
 /// to a class + depth, and size a team. Always complete, always safe — this is what
 /// the router returns when there's no brain or the brain consult fails.
 fn tier0(requirement: &str) -> RoutePlan {
+    if request_is_unsupported_git_commit(requirement) {
+        return unsupported_git_commit_route(requirement);
+    }
+    if invalid_git_commit_intent_without_compound(requirement) {
+        return unsupported_git_commit_route(requirement);
+    }
+    if request_is_git_commit_question_or_negated(requirement) {
+        return diagnostic_git_commit_route(requirement);
+    }
+    if request_is_git_commit_diagnostic(requirement) {
+        return diagnostic_git_commit_route(requirement);
+    }
+    if request_is_git_commit(requirement) {
+        return git_commit_route(requirement);
+    }
     let kind = classify(requirement);
     let is_work = looks_like_work_request(requirement);
 
@@ -521,7 +553,23 @@ fn is_create_request(requirement: &str) -> bool {
     // A bare "做/建/写 + a noun-ish thing" also counts, but keep the floor cautious:
     // require one of the explicit create phrases. An edit ("改/修改/调整/rename/把…改成")
     // has none of these → QuickEdit.
-    CREATE.iter().any(|v| q.contains(v))
+    CREATE.iter().any(|v| q.contains(v)) || resultative_create_command(&q)
+}
+
+fn resultative_create_command(requirement: &str) -> bool {
+    let q = requirement.trim().to_lowercase();
+    let imperative = [
+        "把",
+        "请把",
+        "請把",
+        "帮我把",
+        "幫我把",
+        "请帮我把",
+        "請幫我把",
+    ]
+    .iter()
+    .any(|prefix| q.starts_with(prefix));
+    imperative && (q.contains("做出来") || q.contains("做出來"))
 }
 
 /// Map the planner's [`TaskKind`] + a work-class signal to the conservative
@@ -779,16 +827,25 @@ pub fn looks_like_work_request(text: &str) -> bool {
 fn path_hints_from_text(text: &str) -> Vec<String> {
     const EXTS: &[&str] = &[
         ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".css", ".html", ".json",
-        ".toml", ".md", ".vue", ".svelte", ".sql",
+        ".toml", ".yaml", ".yml", ".md", ".vue", ".svelte", ".sql",
     ];
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
-    for raw in text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '`')) {
-        let tok = raw.trim_matches(|c: char| matches!(c, '"' | '\'' | ':' | '.' | '!' | '?'));
+    for raw in text.split(|c: char| {
+        c.is_whitespace() || matches!(c, ',' | '，' | '、' | ';' | '；' | '(' | ')' | '`')
+    }) {
+        let tok = raw
+            .trim_matches(|c: char| {
+                matches!(c, '"' | '\'' | ':' | '：' | '!' | '！' | '?' | '？' | '。')
+            })
+            .trim_end_matches('.');
         if tok.is_empty() {
             continue;
         }
-        let looks_pathy = tok.contains('/') || EXTS.iter().any(|e| tok.to_lowercase().ends_with(e));
+        let lower = tok.to_lowercase();
+        let looks_pathy = tok.contains('/')
+            || EXTS.iter().any(|e| lower.ends_with(e))
+            || matches!(lower.as_str(), ".gitignore" | ".umadevrc");
         if looks_pathy && seen.insert(tok.to_string()) {
             out.push(tok.to_string());
             if out.len() >= 8 {
@@ -926,7 +983,10 @@ const ROUTER_TRIAGE_SYSTEM: &str =
      request actually authorizes changing the workspace. Always emit this field; a missing or \
      invalid value cannot authorize mutation. A phrase quoted as text, negated \
      (for example '不要只分析'), or scoped to 'other files' is not a blanket read-only \
-     instruction. `kind`: greenfield | frontend_only | backend_only | bugfix | refactor | \
+     instruction. A direct request to stage or Git-commit existing changes is mutating \
+     `class:quick_edit`, `kind:light`, `complexity:simple`: it is VCS-only work, never a \
+     product build, team review, or permission to edit unrelated file contents. \
+     `kind`: greenfield | frontend_only | backend_only | bugfix | refactor | \
      docs_only | light. `complexity`: simple | medium | complex. Only set \
      `clarify_question` when the \
      request is genuinely ambiguous in a way you could NOT resolve by reading the code — \
@@ -1266,16 +1326,201 @@ fn brain_to_route_in_mode(
 }
 
 /// Reconcile and bound every model-routed public surface. An unmistakable user edit
-/// command first repairs a mistaken read-only model verdict in Auto / Guarded; the
-/// user's own explicit read-only wording and the session's Plan ceiling are then
-/// applied last and cannot be bypassed.
+/// command first repairs a mistaken read-only model verdict in Auto / Guarded.
+/// Unsupported commit forms, the user's explicit read-only wording, and Plan mode
+/// are then applied as ceilings and cannot be bypassed.
 fn apply_route_ceilings(
     plan: RoutePlan,
     requirement: &str,
     mode: crate::trust::TrustMode,
 ) -> RoutePlan {
+    let plan = apply_git_commit_lane(plan, requirement, mode);
     let plan = apply_explicit_mutation_floor(plan, requirement, mode);
+    let plan = apply_git_commit_verification_lane(plan, requirement, mode);
+    let plan = apply_unsupported_git_commit_ceiling(plan, requirement);
+    let plan = apply_diagnostic_git_commit_ceiling(plan, requirement);
+    let plan = apply_invalid_git_commit_ceiling(plan, requirement);
+    let plan = apply_git_question_negation_ceiling(plan, requirement);
     apply_mode_ceiling(apply_authorization_ceiling(plan, requirement), mode)
+}
+
+/// A commit followed only by a mechanical verifier is still one small VCS
+/// operation. It needs a writer but has no product deliverable, Director plan,
+/// review team, or whole-product QC to run.
+fn apply_git_commit_verification_lane(
+    plan: RoutePlan,
+    requirement: &str,
+    mode: crate::trust::TrustMode,
+) -> RoutePlan {
+    let Some(request) = parse_host_git_commit_request(requirement) else {
+        return plan;
+    };
+    if request.verifier.is_none() {
+        return plan;
+    }
+    let class = if mode == crate::trust::TrustMode::Plan {
+        RouteClass::Explain
+    } else {
+        RouteClass::QuickEdit
+    };
+    RoutePlan {
+        class,
+        kind: TaskKind::Light,
+        depth: Depth::Fast,
+        team: Vec::new(),
+        scope: git_commit_scope(&request.commit_text),
+        needs_clarify: None,
+        est_budget: Budget::for_route(class, Depth::Fast),
+        confidence: 0.98,
+    }
+}
+
+fn git_commit_route(requirement: &str) -> RoutePlan {
+    RoutePlan {
+        class: RouteClass::QuickEdit,
+        kind: TaskKind::Light,
+        depth: Depth::Fast,
+        team: Vec::new(),
+        scope: git_commit_scope(requirement),
+        needs_clarify: None,
+        est_budget: Budget::for_route(RouteClass::QuickEdit, Depth::Fast),
+        confidence: 0.98,
+    }
+}
+
+fn git_commit_scope(requirement: &str) -> Vec<String> {
+    match parse_git_commit_intent(requirement) {
+        GitCommitIntent::NaturalPaths(paths) => paths,
+        GitCommitIntent::LiteralCommand(_)
+        | GitCommitIntent::UnsupportedLiteralCommand
+        | GitCommitIntent::NaturalAllDirty
+        | GitCommitIntent::NotCommit
+        | GitCommitIntent::InvalidNaturalScope => Vec::new(),
+    }
+}
+
+fn unsupported_git_commit_route(requirement: &str) -> RoutePlan {
+    let q = git_commit_control_text(requirement);
+    let compact: String = q.chars().filter(|c| !c.is_whitespace()).collect();
+    let needs_clarify =
+        (!git_commit_request_is_question_or_negated(&q, &compact)).then(|| ClarifyQuestion {
+            question: "该操作会改写提交历史或不产生一个普通新提交，UmaDev 本轮不会执行。"
+                .to_string(),
+            options: vec!["创建一个提交".to_string(), "取消".to_string()],
+        });
+    RoutePlan {
+        class: RouteClass::Explain,
+        kind: TaskKind::Light,
+        depth: Depth::Fast,
+        team: Vec::new(),
+        scope: if matches!(
+            parse_git_commit_intent(requirement),
+            GitCommitIntent::UnsupportedLiteralCommand
+        ) {
+            Vec::new()
+        } else {
+            path_hints_from_text(requirement)
+        },
+        needs_clarify,
+        est_budget: Budget::for_route(RouteClass::Explain, Depth::Fast),
+        confidence: 0.99,
+    }
+}
+
+fn diagnostic_git_commit_route(requirement: &str) -> RoutePlan {
+    RoutePlan {
+        class: RouteClass::Explain,
+        kind: TaskKind::Light,
+        depth: Depth::Fast,
+        team: Vec::new(),
+        scope: path_hints_from_text(requirement),
+        needs_clarify: None,
+        est_budget: Budget::for_route(RouteClass::Explain, Depth::Fast),
+        confidence: 0.99,
+    }
+}
+
+fn apply_unsupported_git_commit_ceiling(plan: RoutePlan, requirement: &str) -> RoutePlan {
+    if request_is_unsupported_git_commit(requirement) {
+        unsupported_git_commit_route(requirement)
+    } else {
+        plan
+    }
+}
+
+fn apply_diagnostic_git_commit_ceiling(plan: RoutePlan, requirement: &str) -> RoutePlan {
+    if request_is_git_commit_diagnostic(requirement) {
+        diagnostic_git_commit_route(requirement)
+    } else {
+        plan
+    }
+}
+
+fn apply_invalid_git_commit_ceiling(plan: RoutePlan, requirement: &str) -> RoutePlan {
+    if matches!(
+        parse_git_commit_intent(requirement),
+        GitCommitIntent::UnsupportedLiteralCommand
+    ) || invalid_git_commit_intent_without_compound(requirement)
+    {
+        unsupported_git_commit_route(requirement)
+    } else {
+        plan
+    }
+}
+
+fn invalid_git_commit_intent_without_compound(requirement: &str) -> bool {
+    if !matches!(
+        parse_git_commit_intent(requirement),
+        GitCommitIntent::InvalidNaturalScope
+    ) {
+        return false;
+    }
+    let control = git_commit_control_text(requirement);
+    let compact: String = control
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    !git_commit_request_has_additional_work(&control, &compact)
+}
+
+fn request_is_git_commit_question_or_negated(requirement: &str) -> bool {
+    let intent = parse_git_commit_intent(requirement);
+    if matches!(intent, GitCommitIntent::NotCommit) {
+        return false;
+    }
+    let q = git_commit_control_text(requirement);
+    let compact: String = q
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    git_commit_request_is_question_or_negated(&q, &compact)
+}
+
+fn apply_git_question_negation_ceiling(plan: RoutePlan, requirement: &str) -> RoutePlan {
+    if request_is_git_commit_question_or_negated(requirement) {
+        diagnostic_git_commit_route(requirement)
+    } else {
+        plan
+    }
+}
+
+/// A direct commit command is always the bounded resident VCS lane. The model may
+/// not inflate it into Build/team QC or demote it to read-only; only the explicit
+/// session-wide Plan mode keeps it non-mutating.
+fn apply_git_commit_lane(
+    plan: RoutePlan,
+    requirement: &str,
+    mode: crate::trust::TrustMode,
+) -> RoutePlan {
+    if !request_is_git_commit(requirement) {
+        return plan;
+    }
+    let mut lane = git_commit_route(requirement);
+    if mode == crate::trust::TrustMode::Plan {
+        lane.class = RouteClass::Explain;
+        lane.est_budget = Budget::for_route(lane.class, lane.depth);
+    }
+    lane
 }
 
 /// Outside Plan mode, an unmistakable user edit command outranks a mistaken
@@ -1341,9 +1586,23 @@ fn apply_explicit_mutation_floor(
 /// every ambiguous case.
 #[must_use]
 pub fn apply_authorization_ceiling(mut plan: RoutePlan, requirement: &str) -> RoutePlan {
-    if (explicit_read_only_request(requirement) || explicit_observation_only_request(requirement))
+    let host_owned_git_commit = request_is_git_commit(requirement);
+    if !host_owned_git_commit
+        && (explicit_read_only_request(requirement)
+            || explicit_observation_only_request(requirement))
         && plan.class.mutates_workspace()
     {
+        plan.class = RouteClass::Explain;
+        plan.kind = TaskKind::Light;
+        plan.depth = Depth::Fast;
+        plan.team.clear();
+        plan.est_budget = Budget::for_route(plan.class, plan.depth);
+    }
+    let q = git_commit_control_text(requirement);
+    let compact: String = q.chars().filter(|c| !c.is_whitespace()).collect();
+    let commit_question = (q.contains("commit") || compact.contains("提交"))
+        && git_commit_request_is_question_or_negated(&q, &compact);
+    if commit_question && plan.class.mutates_workspace() {
         plan.class = RouteClass::Explain;
         plan.kind = TaskKind::Light;
         plan.depth = Depth::Fast;
@@ -1430,6 +1689,69 @@ fn explicit_read_only_request(requirement: &str) -> bool {
 /// "summarize, then fix the tests" can still execute.
 fn explicit_observation_only_request(requirement: &str) -> bool {
     let q = requirement.trim().to_lowercase();
+    let utterance = q
+        .trim_matches(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '?' | '？' | ',' | '，' | ';' | '；' | '.' | '。' | '!' | '！' | ':' | '：'
+                )
+        })
+        .trim();
+    let utterance = [
+        "麻烦帮我",
+        "麻煩幫我",
+        "请帮我",
+        "請幫我",
+        "请你",
+        "請你",
+        "帮我",
+        "幫我",
+        "麻烦",
+        "麻煩",
+        "请",
+        "請",
+        "please ",
+        "could you ",
+        "can you ",
+    ]
+    .iter()
+    .find_map(|prefix| utterance.strip_prefix(prefix))
+    .map(str::trim)
+    .unwrap_or(utterance);
+    let compact: String = utterance
+        .chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !matches!(
+                    ch,
+                    '?' | '？' | ',' | '，' | ';' | '；' | '.' | '。' | '!' | '！' | ':' | '：'
+                )
+        })
+        .collect();
+    let single_clause = !utterance.chars().any(|ch| {
+        matches!(
+            ch,
+            '?' | '？' | ',' | '，' | ';' | '；' | '.' | '。' | '!' | '！' | '\n'
+        )
+    });
+    let asks_about_mutation = single_clause
+        && clear_mutation_request(utterance)
+        && ([
+            "了吗", "了嗎", "过吗", "過嗎", "没有", "沒有", "了没", "了沒",
+        ]
+        .iter()
+        .any(|suffix| compact.ends_with(suffix))
+            || [
+                "是否需要",
+                "要不要",
+                "有没有修复",
+                "有沒有修復",
+                "是否修复",
+                "是否修復",
+            ]
+            .iter()
+            .any(|needle| compact.contains(needle)));
     let observes_existing_work = [
         "刚才做了什么",
         "剛才做了什麼",
@@ -1441,24 +1763,22 @@ fn explicit_observation_only_request(requirement: &str) -> bool {
         "這次修改了什麼",
         "这次改动都做了啥",
         "這次改動都做了啥",
-        "本次改动",
-        "本次改動",
         "做了哪些改动",
         "做了哪些改動",
         "改了哪些内容",
         "改了哪些內容",
         "总结刚才",
         "總結剛才",
+        "总结刚才做了什么",
+        "總結剛才做了什麼",
         "总结这次",
         "總結這次",
         "总结本次",
         "總結本次",
-        "当前进度",
-        "當前進度",
-        "目前进度",
-        "目前進度",
         "目前什么进展",
         "目前什麼進展",
+        "目前什么进展了",
+        "目前什麼進展了",
         "现在什么进展",
         "現在什麼進展",
         "现在啥进展",
@@ -1468,71 +1788,71 @@ fn explicit_observation_only_request(requirement: &str) -> bool {
         "進展如何",
         "汇报进度",
         "匯報進度",
-        "当前状态",
-        "當前狀態",
         "what changed",
+        "what changed in this turn",
         "what did you change",
         "what did you do",
         "summarize the changes",
         "summarise the changes",
-        "summarize what you",
-        "summarise what you",
+        "summarize what you changed",
+        "summarise what you changed",
+        "summarize what you did",
+        "summarise what you did",
+        "report progress",
+        "report current progress",
+        "report current status",
         "current progress",
         "current status",
-        "report progress",
+        "what is the current progress",
+        "what's the current progress",
+        "what is the current status",
+        "what's the current status",
     ]
-    .iter()
-    .any(|needle| q.contains(needle));
+    .contains(&utterance)
+        || [
+            "本次改动做了什么",
+            "本次改動做了什麼",
+            "本次改动都做了什么",
+            "本次改動都做了什麼",
+            "本次改动都做了啥",
+            "本次改動都做了啥",
+            "本次改动修复了哪些问题",
+            "本次改動修復了哪些問題",
+            "当前进度是什么",
+            "當前進度是什麼",
+            "当前进度如何",
+            "當前進度如何",
+            "当前进度怎么样",
+            "當前進度怎麼樣",
+            "当前进度怎样",
+            "當前進度怎樣",
+            "当前进度到哪",
+            "當前進度到哪",
+            "目前进度是什么",
+            "目前進度是什麼",
+            "目前进度如何",
+            "目前進度如何",
+            "当前状态是什么",
+            "當前狀態是什麼",
+            "当前状态如何",
+            "當前狀態如何",
+            "当前状态怎么样",
+            "當前狀態怎麼樣",
+            "汇报当前进度",
+            "匯報當前進度",
+            "汇报当前状态",
+            "匯報當前狀態",
+        ]
+        .contains(&compact.as_str())
+        || asks_about_mutation;
     if !observes_existing_work {
         return false;
     }
 
-    // A combined request may first ask for a status and then explicitly resume
-    // work. Keep that second clause executable instead of treating the whole
-    // turn as read-only merely because it contains a status phrase.
-    let has_follow_on_work = [
-        "并修复",
-        "並修復",
-        "然后修复",
-        "然後修復",
-        "同时修复",
-        "同時修復",
-        "顺便修复",
-        "順便修復",
-        "并修改",
-        "並修改",
-        "然后修改",
-        "然後修改",
-        "并更新",
-        "並更新",
-        "然后更新",
-        "然後更新",
-        "并补",
-        "並補",
-        "然后补",
-        "然後補",
-        "继续完成",
-        "繼續完成",
-        "继续做",
-        "繼續做",
-        "接着做",
-        "接著做",
-        "and fix",
-        "then fix",
-        "also fix",
-        "and change",
-        "then change",
-        "and update",
-        "then update",
-        "and add",
-        "then add",
-        "continue the work",
-        "continue working",
-    ]
-    .iter()
-    .any(|needle| q.contains(needle));
-
-    !has_follow_on_work
+    // A status phrase can also be part of the object being edited ("修复当前进度条")
+    // or precede a second imperative clause. Reuse the positive imperative parser
+    // so an observation keyword can never override an explicit write instruction.
+    !explicit_mutation_command(requirement)
 }
 
 /// Whether the user's own wording explicitly constrains this turn to read-only or
@@ -1544,11 +1864,10 @@ fn explicit_observation_only_request(requirement: &str) -> bool {
 /// still owns every ambiguous semantic case, so their keyword lists stay narrow and
 /// are not changed here.
 ///
-/// The chat driver consults this before honoring a read-only verdict that came from
-/// the DETERMINISTIC FALLBACK (an unreliable keyword guess made when the brain
-/// consult timed out or was unavailable): an EXPLICIT user request to stay read-only
-/// is the user's own choice and safe to honor, whereas a bare fallback guess is not
-/// and must never jail the base in claude's plan mode.
+/// The chat driver uses this as the user-authored authorization ceiling. Session
+/// mutability is enforced separately from the final typed route: every non-mutating
+/// route executes in a mechanically read-only session regardless of whether the
+/// brain or deterministic fallback supplied it.
 #[must_use]
 pub fn requirement_demands_read_only(requirement: &str) -> bool {
     explicit_read_only_request(requirement) || explicit_observation_only_request(requirement)
@@ -1682,6 +2001,7 @@ fn clear_mutation_request(requirement: &str) -> bool {
         "調整",
         "优化",
         "優化",
+        "更新",
         "修复",
         "修復",
         "新增",
@@ -1722,29 +2042,41 @@ fn clear_mutation_request(requirement: &str) -> bool {
 /// Narrow imperative belt for the non-Plan authority floor. It intentionally
 /// excludes past-work questions, explanations, and quoted/read-only constraints.
 fn explicit_mutation_command(requirement: &str) -> bool {
-    if explicit_read_only_request(requirement) || explicit_observation_only_request(requirement) {
+    if explicit_read_only_request(requirement) {
         return false;
     }
     let q = requirement.trim().to_lowercase();
-    if q.is_empty()
-        || [
-            "为什么",
-            "為什麼",
-            "是否修复",
-            "是否修復",
-            "修复了吗",
-            "修復了嗎",
-            "有没有修复",
-            "有沒有修復",
-            "did you fix",
-            "why didn't you fix",
-            "why did you not fix",
-        ]
-        .iter()
-        .any(|needle| q.contains(needle))
-    {
+    if q.is_empty() {
         return false;
     }
+
+    if request_has_git_commit_plus_additional_work(requirement) {
+        return true;
+    }
+
+    let mutation_question = |clause: &str| {
+        let completion_question = [
+            "了吗", "了嗎", "过吗", "過嗎", "没有", "沒有", "了没", "了沒",
+        ]
+        .iter()
+        .any(|suffix| clause.trim_end().ends_with(suffix));
+        completion_question
+            || [
+                "为什么",
+                "為什麼",
+                "是否修复",
+                "是否修復",
+                "修复了吗",
+                "修復了嗎",
+                "有没有修复",
+                "有沒有修復",
+                "did you fix",
+                "why didn't you fix",
+                "why did you not fix",
+            ]
+            .iter()
+            .any(|needle| clause.contains(needle))
+    };
 
     let direct_prefix = [
         "修复",
@@ -1754,6 +2086,7 @@ fn explicit_mutation_command(requirement: &str) -> bool {
         "調整",
         "优化",
         "優化",
+        "更新",
         "新增",
         "删除",
         "刪除",
@@ -1779,6 +2112,7 @@ fn explicit_mutation_command(requirement: &str) -> bool {
         "需要保存",
         "需要写入",
         "需要寫入",
+        "需要更新",
         "请修",
         "請修",
         "请改",
@@ -1787,6 +2121,8 @@ fn explicit_mutation_command(requirement: &str) -> bool {
         "請你修",
         "请你改",
         "請你改",
+        "请更新",
+        "請更新",
         "帮我修",
         "幫我修",
         "帮我改",
@@ -1795,6 +2131,40 @@ fn explicit_mutation_command(requirement: &str) -> bool {
         "直接改",
         "立即修",
         "立即改",
+        "继续修复",
+        "繼續修復",
+        "继续修改",
+        "繼續修改",
+        "继续更新",
+        "繼續更新",
+        "继续补充",
+        "繼續補充",
+        "继续完成",
+        "繼續完成",
+        "继续做",
+        "繼續做",
+        "接着做",
+        "接著做",
+        "并修复",
+        "並修復",
+        "然后修复",
+        "然後修復",
+        "同时修复",
+        "同時修復",
+        "顺便修复",
+        "順便修復",
+        "并修改",
+        "並修改",
+        "然后修改",
+        "然後修改",
+        "并更新",
+        "並更新",
+        "然后更新",
+        "然後更新",
+        "并补",
+        "並補",
+        "然后补",
+        "然後補",
         "fix ",
         "please fix",
         "change ",
@@ -1811,10 +2181,99 @@ fn explicit_mutation_command(requirement: &str) -> bool {
         "implement ",
         "apply the fix",
         "resolve this",
+        "and fix",
+        "then fix",
+        "also fix",
+        "and change",
+        "then change",
+        "and update",
+        "then update",
+        "and add",
+        "then add",
+        "continue the work",
+        "continue working",
     ];
-    direct_prefix.iter().any(|prefix| q.starts_with(prefix))
-        || ((q.starts_with('把') || q.starts_with("请把") || q.starts_with("請把"))
-            && clear_mutation_request(&q))
+    let past_tense_prefix = [
+        "修复了",
+        "修復了",
+        "修改了",
+        "更新了",
+        "新增了",
+        "删除了",
+        "刪除了",
+        "完成了",
+    ];
+    let command_lead = [
+        "请帮我",
+        "請幫我",
+        "请你",
+        "請你",
+        "帮我",
+        "幫我",
+        "请",
+        "請",
+        "直接",
+        "立即",
+    ];
+    let object_first_prefix = ["把", "将", "將"];
+
+    // Inspect clause starts, not arbitrary substrings. This recognizes a direct
+    // command after a status question while avoiding past-tense summaries such as
+    // "本次改动，修复了三个问题".
+    q.split(['?', '？', ',', '，', ';', '；', '.', '。', '!', '！', '\n'])
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .any(|clause| {
+            if mutation_question(clause)
+                || past_tense_prefix
+                    .iter()
+                    .any(|prefix| clause.starts_with(prefix))
+            {
+                return false;
+            }
+            let command = command_lead
+                .iter()
+                .find_map(|prefix| clause.strip_prefix(prefix))
+                .map(str::trim_start)
+                .unwrap_or(clause);
+            direct_prefix
+                .iter()
+                .any(|prefix| command.starts_with(prefix))
+                || (object_first_prefix
+                    .iter()
+                    .any(|prefix| command.starts_with(prefix))
+                    && clear_mutation_request(command))
+                || resultative_create_command(clause)
+        })
+}
+
+fn request_has_git_commit_plus_additional_work(requirement: &str) -> bool {
+    let control = git_commit_control_text(requirement);
+    let compact: String = control.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if !git_commit_request_has_additional_work(&control, &compact) {
+        return false;
+    }
+    if !matches!(
+        parse_git_commit_intent(requirement),
+        GitCommitIntent::NotCommit
+    ) {
+        return true;
+    }
+    let lower = git_commit_scope_text(requirement).to_lowercase();
+    lower.contains("git commit")
+        || [
+            "提交git记录",
+            "提交git紀錄",
+            "提交git纪录",
+            "创建一个git提交",
+            "建立一個git提交",
+            "做一次git提交",
+            "执行git提交",
+            "執行git提交",
+            "git提交",
+        ]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
 }
 
 /// The lightest route — used only when the brain can't be reached (no keyword
@@ -1916,1089 +2375,4 @@ fn parse_kind(s: &str) -> Option<TaskKind> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use umadev_runtime::{
-        CompletionRequest, CompletionResponse, Runtime, RuntimeError, RuntimeKind, Usage,
-    };
-
-    /// A one-shot brain that always returns the given triage JSON — exercises
-    /// `route_via_brain` (the chat surface's brain-driven router).
-    struct TriageBrain(&'static str);
-    #[async_trait]
-    impl Runtime for TriageBrain {
-        fn kind(&self) -> RuntimeKind {
-            RuntimeKind::Anthropic
-        }
-        async fn complete(
-            &self,
-            _req: CompletionRequest,
-        ) -> Result<CompletionResponse, RuntimeError> {
-            Ok(CompletionResponse {
-                text: self.0.to_string(),
-                id: "t".into(),
-                model: "t".into(),
-                usage: Usage::default(),
-            })
-        }
-    }
-
-    #[test]
-    fn triage_prompt_sizes_a_document_as_docs_only_simple() {
-        // The PRIMARY brain-first fix: the triage prompt must instruct the borrowed
-        // brain to size a request to WRITE a document (the deliverable IS the document)
-        // as `docs_only` / `simple` — distinct from building the product the document
-        // describes. So the AUTHORITATIVE brain sizes a document light on the route
-        // surface; the deterministic keyword tables are only the fail-open floor.
-        let p = ROUTER_TRIAGE_SYSTEM;
-        assert!(p.contains("docs_only"), "prompt names the docs_only kind");
-        assert!(
-            p.contains("WRITE / PRODUCE a DOCUMENT") || p.contains("WRITE a document"),
-            "prompt distinguishes WRITING a document as the deliverable"
-        );
-        assert!(
-            p.contains("complexity:simple") || p.contains("`complexity:simple`"),
-            "a document is sized simple"
-        );
-        // It is framed as the OPPOSITE of building the product the document describes.
-        assert!(
-            p.to_lowercase().contains("opposite") && p.to_lowercase().contains("describes"),
-            "the docs clause contrasts writing the spec vs. implementing it"
-        );
-    }
-
-    #[tokio::test]
-    async fn brain_sizes_a_document_write_light_no_team() {
-        // End-to-end: when the brain returns `kind:docs_only, complexity:simple` for a
-        // document write, the route is a light one — DocsOnly kind, Fast depth, and
-        // ZERO team (a document does not convene a delivery roster).
-        let brain = TriageBrain(
-            "{\"class\":\"build\",\"authorization\":\"mutating\",\"kind\":\"docs_only\",\"complexity\":\"simple\",\"confidence\":0.9}",
-        );
-        let p = route_via_brain(&brain, "帮我写一份产品需求文档(PRD)").await;
-        assert_eq!(p.kind, TaskKind::DocsOnly);
-        assert_eq!(p.depth, Depth::Fast);
-        assert!(p.team.is_empty(), "a document write convenes no team");
-    }
-
-    #[tokio::test]
-    async fn brain_classifies_a_greeting_as_chat_not_build() {
-        // The brain — not a keyword table — judges intent. A greeting is chat.
-        let brain = TriageBrain(
-            "{\"class\":\"chat\",\"kind\":\"light\",\"complexity\":\"simple\",\"confidence\":0.95}",
-        );
-        let p = route_via_brain(&brain, "你好,你是谁?能帮我做什么?").await;
-        assert_eq!(p.class, RouteClass::Chat);
-        assert!(p.team.is_empty());
-    }
-
-    #[tokio::test]
-    async fn brain_classifies_a_real_build_as_build_with_team() {
-        let brain = TriageBrain(
-            "```json\n{\"class\":\"build\",\"authorization\":\"mutating\",\"kind\":\"greenfield\",\"complexity\":\"complex\",\
-             \"needs\":[\"frontend\",\"backend\"],\"confidence\":0.9}\n```",
-        );
-        let p = route_via_brain(&brain, "做一个带登录的 SaaS 仪表盘").await;
-        assert_eq!(p.class, RouteClass::Build);
-        assert_eq!(p.depth, Depth::Deep);
-        assert!(!p.team.is_empty(), "a complex build convenes a team");
-    }
-
-    #[tokio::test]
-    async fn brain_build_with_unparseable_kind_still_convenes_a_team() {
-        // MEDIUM #1: the brain says "build, complex" but garbles `kind` ("widget").
-        // `parse_kind` fails → it must NOT fall back to `Light` (zero team). A
-        // mutating class defaults to a build-shaped kind (Greenfield) so a deliberate
-        // build always has a delivery roster.
-        let brain = TriageBrain(
-            "{\"class\":\"build\",\"authorization\":\"mutating\",\"kind\":\"widget\",\"complexity\":\"complex\",\"confidence\":0.9}",
-        );
-        let p = route_via_brain(&brain, "做一个完整的后台系统").await;
-        assert_eq!(p.class, RouteClass::Build);
-        assert_eq!(
-            p.kind,
-            TaskKind::Greenfield,
-            "bad kind on a build → Greenfield"
-        );
-        assert!(
-            !p.team.is_empty(),
-            "a deliberate build with a bad kind must still convene a team"
-        );
-    }
-
-    #[tokio::test]
-    async fn brain_greenfield_narrows_to_backend_for_a_pure_backend_task() {
-        // A weaker brain sizes a PURE backend task ("优化后端代码") as the broad greenfield;
-        // the deterministic domain floor scopes the team to BackendOnly so it convenes no UI
-        // reviewers (the reported "backend task pulls in a uiux-designer + frontend-engineer").
-        let brain = TriageBrain(
-            "{\"class\":\"build\",\"authorization\":\"mutating\",\"kind\":\"greenfield\",\"complexity\":\"medium\"}",
-        );
-        let p = route_via_brain(&brain, "优化后端代码,提升接口性能").await;
-        assert_eq!(p.class, RouteClass::Build);
-        assert_eq!(
-            p.kind,
-            TaskKind::BackendOnly,
-            "a clearly backend build the brain called greenfield narrows to BackendOnly"
-        );
-        assert!(
-            !p.team.contains(&Seat::UiuxDesigner) && !p.team.contains(&Seat::FrontendEngineer),
-            "a pure-backend build convenes NO UI reviewers: {:?}",
-            p.team
-        );
-    }
-
-    #[tokio::test]
-    async fn brain_greenfield_stays_greenfield_for_a_page_described_fullstack_build() {
-        // HIGH #4: a full-stack app described purely by its PAGES ("博客系统,有文章列表和文章
-        // 详情页面") has a frontend keyword (页面) and NO backend keyword, so the deterministic
-        // classifier reads FrontendOnly. The brain authoritatively called it greenfield — the
-        // domain floor must NOT narrow it to FrontendOnly and DROP the backend phase; a blog
-        // needs persistence. It stays Greenfield with the full roster (incl. the backend seat).
-        let brain = TriageBrain(
-            "{\"class\":\"build\",\"authorization\":\"mutating\",\"kind\":\"greenfield\",\"complexity\":\"complex\"}",
-        );
-        let p = route_via_brain(&brain, "做一个博客系统,有文章列表和文章详情页面").await;
-        assert_eq!(p.class, RouteClass::Build);
-        assert_eq!(
-            p.kind,
-            TaskKind::Greenfield,
-            "a page-described full-stack build must NOT be narrowed to frontend-only"
-        );
-        assert!(
-            p.team.contains(&Seat::BackendEngineer),
-            "the backend seat must survive: {:?}",
-            p.team
-        );
-    }
-
-    #[tokio::test]
-    async fn brain_chat_with_unparseable_kind_keeps_light_no_team() {
-        // The flip side: a read-only class (chat) with a bad kind keeps the light
-        // `Light` default — no team is wanted on a chat turn regardless.
-        let brain = TriageBrain(
-            "{\"class\":\"chat\",\"kind\":\"widget\",\"complexity\":\"simple\",\"confidence\":0.9}",
-        );
-        let p = route_via_brain(&brain, "你好").await;
-        assert_eq!(p.class, RouteClass::Chat);
-        assert_eq!(p.kind, TaskKind::Light);
-        assert!(p.team.is_empty());
-    }
-
-    #[test]
-    fn brain_garbled_class_defaults_to_explain_not_chat() {
-        // A reply that parses as JSON but whose `class` field is UNRECOGNIZED ("mystery")
-        // is a FALLBACK, not a verdict: it defaults to the read-only Explain lane, never a
-        // toolless Chat — a degraded reply must not forbid read/search tools the base
-        // could use to answer. No `authorization` → still read-only, no team.
-        let garbled = brain_to_route(
-            &BrainRoute {
-                class: "mystery".to_string(),
-                kind: "light".to_string(),
-                complexity: "simple".to_string(),
-                ..Default::default()
-            },
-            "找 tm 的源码在哪里",
-        );
-        assert_eq!(garbled.class, RouteClass::Explain);
-        assert!(!garbled.class.mutates_workspace());
-        assert!(garbled.team.is_empty());
-
-        // The flip side stays Chat: a CONFIDENTLY parsed "chat" verdict is an explicit
-        // brain decision, not a fallback guess, so it is honored as a toolless Chat.
-        let confident_chat = brain_to_route(
-            &BrainRoute {
-                class: "chat".to_string(),
-                kind: "light".to_string(),
-                complexity: "simple".to_string(),
-                ..Default::default()
-            },
-            "你好",
-        );
-        assert_eq!(confident_chat.class, RouteClass::Chat);
-    }
-
-    #[tokio::test]
-    async fn brain_prose_then_json_retry_recovers_a_build() {
-        // LOW #1: the brain narrates intent on the FIRST reply (no JSON) — a real
-        // build would otherwise degrade to Chat. The stricter JSON-only retry on the
-        // second call recovers it. This brain returns prose first, JSON second.
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct ProseThenJson(AtomicUsize);
-        #[async_trait]
-        impl Runtime for ProseThenJson {
-            fn kind(&self) -> RuntimeKind {
-                RuntimeKind::Anthropic
-            }
-            async fn complete(
-                &self,
-                _req: CompletionRequest,
-            ) -> Result<CompletionResponse, RuntimeError> {
-                let n = self.0.fetch_add(1, Ordering::SeqCst);
-                let text = if n == 0 {
-                    "Sure, this looks like a real build — I'd start by scaffolding the app."
-                        .to_string()
-                } else {
-                    "{\"class\":\"build\",\"authorization\":\"mutating\",\"kind\":\"greenfield\",\"complexity\":\"complex\",\"confidence\":0.9}"
-                        .to_string()
-                };
-                Ok(CompletionResponse {
-                    text,
-                    id: "t".into(),
-                    model: "t".into(),
-                    usage: Usage::default(),
-                })
-            }
-        }
-        let brain = ProseThenJson(AtomicUsize::new(0));
-        let p = route_via_brain(&brain, "做一个完整的 SaaS 产品").await;
-        assert_eq!(
-            p.class,
-            RouteClass::Build,
-            "the JSON-only retry recovered the build"
-        );
-        assert!(!p.team.is_empty());
-    }
-
-    #[tokio::test]
-    async fn brain_build_with_blank_complexity_floors_to_deliberate_with_ui_team() {
-        // HIGH H1: a brain reply `{class:build, kind:frontend_only}` whose `complexity`
-        // is blank/garbled must NOT degrade to a Fast build with an EMPTY team that
-        // skips the plan+acceptance floor — the chat surface must get the SAME
-        // treatment `/run` gives the same input (a UI review team + the deliberate
-        // gate). The depth floors to at least Standard (deliberate) and the team is the
-        // kind-sized UI roster.
-        let brain = TriageBrain(
-            "{\"class\":\"build\",\"authorization\":\"mutating\",\"kind\":\"frontend_only\",\"complexity\":\"\",\"confidence\":0.7}",
-        );
-        let p = route_via_brain(&brain, "做一个落地页").await;
-        assert_eq!(p.class, RouteClass::Build);
-        assert!(
-            p.depth.is_deliberate(),
-            "a product build with blank complexity floors to a deliberate depth, got {:?}",
-            p.depth
-        );
-        assert!(
-            !p.team.is_empty(),
-            "a chat-surface UI build must convene a review team, not ship un-reviewed"
-        );
-        assert!(
-            p.team.contains(&Seat::UiuxDesigner) && p.team.contains(&Seat::FrontendEngineer),
-            "the team is the UI review roster: {:?}",
-            p.team
-        );
-    }
-
-    #[tokio::test]
-    async fn brain_classifies_a_tweak_as_quick_edit() {
-        let brain = TriageBrain(
-            "{\"class\":\"quick_edit\",\"authorization\":\"mutating\",\"kind\":\"light\",\"complexity\":\"simple\",\"confidence\":0.8}",
-        );
-        let p = route_via_brain(&brain, "把标题改成 Welcome").await;
-        assert_eq!(p.class, RouteClass::QuickEdit);
-    }
-
-    #[tokio::test]
-    async fn public_brain_route_applies_the_explicit_read_only_ceiling() {
-        let brain = TriageBrain(
-            "{\"class\":\"build\",\"authorization\":\"mutating\",\"kind\":\"greenfield\",\"complexity\":\"complex\",\"confidence\":0.9}",
-        );
-        let p = route_via_brain(&brain, "只分析 SEO，不要修改任何文件").await;
-
-        assert_eq!(p.class, RouteClass::Explain);
-        assert!(!p.class.mutates_workspace());
-        assert!(!p.uses_director_workflow());
-        assert!(p.team.is_empty());
-    }
-
-    #[tokio::test]
-    async fn public_brain_route_honours_explicit_user_write_when_brain_auth_is_missing() {
-        let brain = TriageBrain(
-            "{\"class\":\"quick_edit\",\"kind\":\"light\",\"complexity\":\"simple\",\"confidence\":0.8}",
-        );
-        let p = route_via_brain(&brain, "把标题改成 Welcome").await;
-
-        assert_eq!(p.class, RouteClass::QuickEdit);
-        assert!(p.class.mutates_workspace());
-        assert!(!p.uses_director_workflow());
-        assert!(p.team.is_empty());
-    }
-
-    #[tokio::test]
-    async fn public_brain_route_applies_the_session_mode_ceiling() {
-        let brain = TriageBrain(
-            "{\"class\":\"quick_edit\",\"authorization\":\"mutating\",\"kind\":\"light\",\"complexity\":\"simple\",\"confidence\":0.8}",
-        );
-
-        let guarded = route_via_brain(&brain, "把标题改成 Welcome").await;
-        assert_eq!(guarded.class, RouteClass::QuickEdit);
-        assert!(guarded.class.mutates_workspace());
-
-        let plan =
-            route_via_brain_in_mode(&brain, "把标题改成 Welcome", crate::trust::TrustMode::Plan)
-                .await;
-        assert_eq!(plan.class, RouteClass::Explain);
-        assert!(!plan.class.mutates_workspace());
-        assert!(!plan.uses_director_workflow());
-        assert!(plan.team.is_empty());
-    }
-
-    #[tokio::test]
-    async fn brain_unavailable_degrades_to_chat_not_a_keyword_guess() {
-        // A fully OFFLINE / unreachable brain → the base can't act at all this turn, so
-        // the lightest pass-through (Chat) is fine and we still avoid a keyword
-        // classifier. This is DISTINCT from a REACHABLE brain whose reply garbles
-        // `class` — that defaults to read-only Explain (see
-        // `brain_garbled_class_defaults_to_explain_not_chat`), because there the base CAN
-        // look and a fallback must never forbid read-only tools.
-        let offline = umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic);
-        let p = route_via_brain(&offline, "做一个待办应用").await;
-        assert_eq!(
-            p.class,
-            RouteClass::Chat,
-            "unreachable brain → pass-through chat"
-        );
-    }
-
-    #[test]
-    fn depth_turn_caps_are_ordered_generous_backstops() {
-        // Item 1 tiers: deeper work earns more turns. The caps are a RUNAWAY BACKSTOP,
-        // so each is comfortably above 1 (never a tight leash) and strictly ordered
-        // Fast < Standard < Deep.
-        assert!(Depth::Fast.max_turns() >= 1);
-        assert!(
-            Depth::Standard.max_turns() > Depth::Fast.max_turns(),
-            "a deliberate build earns more turns than a chat/quick-edit"
-        );
-        assert!(
-            Depth::Deep.max_turns() > Depth::Standard.max_turns(),
-            "the deepest play earns the most turns"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_deliberate_build_gets_a_higher_turn_cap_than_a_chat() {
-        // The route's turn cap is derived from its depth: a real build (Standard/Deep)
-        // sits well above a chat/quick-edit (Fast). Proven end-to-end off the routed
-        // RoutePlan, not just the raw Depth mapping.
-        let build = route(None, &opts(), "做一个待办事项 SaaS 产品").await;
-        let chat = route(None, &opts(), "你好,在吗?").await;
-        assert!(build.depth.is_deliberate());
-        assert_eq!(chat.depth, Depth::Fast);
-        assert!(
-            build.max_turns() > chat.max_turns(),
-            "a deliberate build ({}) must out-budget a chat turn ({})",
-            build.max_turns(),
-            chat.max_turns()
-        );
-    }
-
-    fn opts() -> RunOptions {
-        RunOptions {
-            project_root: std::env::temp_dir(),
-            requirement: String::new(),
-            slug: "demo".to_string(),
-            model: String::new(),
-            backend: String::new(),
-            design_system: String::new(),
-            seed_template: String::new(),
-            mode: crate::trust::TrustMode::Guarded,
-            strict_coverage: false,
-        }
-    }
-
-    // ── Tier-0 deterministic classification ──
-
-    #[tokio::test]
-    async fn tier0_non_work_fallback_is_read_only_explain_no_session() {
-        // No brain: a message the keyword table can't read as work ("你好,在吗?") must NOT
-        // fall through to a toolless Chat. A deterministic fallback is an "I can't
-        // classify" guess, and read-only tools can't harm the workspace, so the safe
-        // floor is Explain (read/search allowed), not Chat. Still Fast, still no team.
-        let p = route(None, &opts(), "你好,在吗?").await;
-        assert_eq!(p.class, RouteClass::Explain);
-        assert_eq!(p.depth, Depth::Fast);
-        assert!(p.team.is_empty());
-        assert!(p.needs_clarify.is_none());
-    }
-
-    #[tokio::test]
-    async fn reported_find_source_request_floors_to_explain_not_chat() {
-        // Regression for the reported mis-route: "找 tm 的源码在哪里" (find where tm's
-        // source is) is a READ-ONLY inspection, but the keyword table doesn't cover
-        // "找/源码/在哪里", so is_work=false. Before the fix it fell to a toolless Chat and
-        // the base was told "I can't use tools this turn" and looped. With the read-only
-        // fallback floor the deterministic route is Explain, so the base can actually go
-        // look — and NO keyword was added to make this happen.
-        for req in ["找 tm 的源码在哪里", "where is the repo"] {
-            let p = route(None, &opts(), req).await;
-            assert_eq!(p.class, RouteClass::Explain, "{req}");
-            assert!(!p.class.mutates_workspace(), "{req}");
-            assert!(p.team.is_empty(), "{req}");
-        }
-    }
-
-    #[tokio::test]
-    async fn tier0_greenfield_is_deliberate_build() {
-        let p = route(None, &opts(), "做一个待办事项 SaaS 产品").await;
-        assert_eq!(p.class, RouteClass::Build);
-        assert!(p.depth.is_deliberate());
-        assert!(!p.team.is_empty(), "a real build convenes a team");
-        assert!(p.class.mutates_workspace());
-    }
-
-    #[tokio::test]
-    async fn tier0_quick_edit_is_fast_single_writer() {
-        let p = route(None, &opts(), "改个文案,把标题改成 Welcome").await;
-        // "改" is a work verb and the goal classifies Light/QuickEdit-ish → fast.
-        assert_eq!(p.depth, Depth::Fast);
-        assert!(matches!(p.class, RouteClass::QuickEdit | RouteClass::Debug));
-        assert!(p.team.is_empty(), "a fast turn convenes no team");
-    }
-
-    #[test]
-    fn no_model_fallback_is_topic_agnostic_and_conservative() {
-        // SEO is deliberately only a regression fixture here: no SEO keyword has
-        // production authority. Generic mutation wording earns a bounded edit;
-        // ambiguous wording stays read-only until the model is available.
-        for requirement in [
-            "优化现有站点的搜索引擎表现",
-            "update the meta title and meta description",
-            "优化现有站点的缓存策略",
-        ] {
-            let p = safe_fallback_route(requirement);
-            assert_eq!(p.class, RouteClass::QuickEdit, "{requirement}");
-            assert_eq!(p.depth, Depth::Fast, "{requirement}");
-            assert!(p.team.is_empty(), "a fallback edit never convenes a team");
-        }
-
-        let ambiguous = safe_fallback_route("帮我搞一下 SEO");
-        assert_eq!(ambiguous.class, RouteClass::Explain);
-        let create = safe_fallback_route("做一个 SEO 分析平台");
-        assert_eq!(create.class, RouteClass::Build);
-    }
-
-    #[tokio::test]
-    async fn tier0_bugfix_is_debug() {
-        let p = route(None, &opts(), "登录一直报错,帮我修一下").await;
-        assert_eq!(p.class, RouteClass::Debug);
-    }
-
-    #[tokio::test]
-    async fn small_create_request_is_a_build_not_a_quick_edit() {
-        // "做一个待办单页" CREATES a new thing -> a (fast) Build that gets a visible
-        // plan, NOT a QuickEdit. This is what the /run smoke mis-routed before.
-        let p = route(
-            None,
-            &opts(),
-            "做一个待办清单单页应用,纯前端,添加/完成/删除",
-        )
-        .await;
-        assert_eq!(
-            p.class,
-            RouteClass::Build,
-            "a create request must be a Build"
-        );
-    }
-
-    #[tokio::test]
-    async fn doc_request_is_a_light_quick_edit_with_no_team() {
-        // The user-reported case: "generate a README" must NOT route to a heavyweight
-        // build with a review team. A doc artifact is a quick file write — QuickEdit
-        // (no plan synth, no team), and the lean QC short-circuit fires.
-        for r in [
-            "生成一个 README.md",
-            "帮我写个 README 文件",
-            "generate a README.md for this repo",
-            "生成更新日志",
-        ] {
-            let p = route(None, &opts(), r).await;
-            assert_eq!(p.depth, Depth::Fast, "a doc is fast: {r}");
-            assert!(
-                matches!(p.class, RouteClass::QuickEdit),
-                "a doc artifact is a QuickEdit, not a Build: {r} (got {:?})",
-                p.class
-            );
-            assert!(p.team.is_empty(), "a doc convenes NO review team: {r}");
-        }
-    }
-
-    #[test]
-    fn run_on_a_doc_forces_build_but_still_convenes_no_team() {
-        // `/run` always forces a Build (the explicit-run contract), but the SIZING must
-        // still scale a doc down: a Fast doc build ships no UI, so it convenes NO review
-        // team — belt against a mis-classification exploding into a full review.
-        for r in [
-            "生成一个 README.md",
-            "/run 生成 README",
-            "write a CHANGELOG file",
-        ] {
-            let p = for_run(r);
-            assert_eq!(p.class, RouteClass::Build, "/run forces Build: {r}");
-            assert!(
-                p.team.is_empty(),
-                "a doc build convenes NO review team even under /run: {r} (team {:?})",
-                p.team
-            );
-        }
-    }
-
-    #[test]
-    fn ui_light_build_keeps_its_minimal_review_team() {
-        // The guardrail must NOT regress: a genuine (small) UI page still earns the
-        // minimal UI review core (designer + frontend + QA) — only non-UI docs/scripts
-        // lose the team.
-        let p = for_run("做一个简单的待办单页应用,纯前端,添加/删除");
-        assert_eq!(p.class, RouteClass::Build);
-        assert!(
-            p.team.contains(&Seat::FrontendEngineer) && p.team.contains(&Seat::UiuxDesigner),
-            "a UI page keeps the minimal UI review team (got {:?})",
-            p.team
-        );
-    }
-
-    #[test]
-    fn genuine_full_build_still_convenes_the_full_team() {
-        // The heavyweight path is INTACT: a real product build convenes the full
-        // kind-sized roster (the review/quality machinery the task must not degrade).
-        let p = for_run("做一个完整的电商网站,带账号、商品、购物车、支付和后台管理");
-        assert_eq!(p.class, RouteClass::Build);
-        assert!(
-            p.depth.is_deliberate(),
-            "a real product is a deliberate build"
-        );
-        assert!(
-            p.team.len() >= 5,
-            "a greenfield product convenes the full roster (got {:?})",
-            p.team
-        );
-    }
-
-    #[test]
-    fn for_run_always_forces_build_even_for_a_terse_goal() {
-        // The explicit /run command KNOWS the intent is a build — it must never
-        // second-guess a clear/terse build into a quick-edit, so a plan always shows.
-        // (A Fast single-page build legitimately convenes no critic team — only the
-        // class is the invariant here.)
-        for goal in ["做一个待办应用", "改个东西", "x", "a tiny thing"] {
-            let p = for_run(goal);
-            assert_eq!(p.class, RouteClass::Build, "/run forces Build for: {goal}");
-        }
-    }
-
-    #[test]
-    fn is_create_request_splits_create_from_edit() {
-        assert!(is_create_request("做一个待办应用"));
-        assert!(is_create_request("build me a landing page"));
-        assert!(!is_create_request("改个文案,把标题改成 Welcome"));
-        assert!(!is_create_request("rename this variable"));
-    }
-
-    #[tokio::test]
-    async fn tier0_empty_requirement_is_chat() {
-        // Empty/whitespace is the ONE deterministic case that still forbids tools: there
-        // is genuinely nothing to inspect or do, so a toolless Chat is correct (a
-        // non-empty non-work message instead floors to read-only Explain — see
-        // `tier0_non_work_fallback_is_read_only_explain_no_session`).
-        let p = route(None, &opts(), "   ").await;
-        assert_eq!(p.class, RouteClass::Chat);
-    }
-
-    // ── Budget + scope are deterministic ──
-
-    #[test]
-    fn budget_scales_with_class_and_depth() {
-        let chat = Budget::for_route(RouteClass::Chat, Depth::Fast);
-        let deep = Budget::for_route(RouteClass::Build, Depth::Deep);
-        assert!(deep.max_tool_calls > chat.max_tool_calls);
-        assert!(deep.max_tokens > chat.max_tokens);
-    }
-
-    #[test]
-    fn scope_hints_extract_pathy_tokens() {
-        let hints = path_hints_from_text("fix the bug in src/app.rs and styles.css");
-        assert!(hints.iter().any(|h| h == "src/app.rs"));
-        assert!(hints.iter().any(|h| h == "styles.css"));
-    }
-
-    // ── Model-first routing + deterministic authorization ceiling ──
-
-    #[test]
-    fn brain_may_escalate_to_a_deep_build() {
-        let brain = BrainRoute {
-            class: "build".to_string(),
-            authorization: "mutating".to_string(),
-            kind: "greenfield".to_string(),
-            complexity: "complex".to_string(),
-            confidence: 0.9,
-            ..Default::default()
-        };
-        let out = brain_to_route(&brain, "请处理这个跨端需求");
-        assert_eq!(out.class, RouteClass::Build);
-        assert_eq!(out.depth, Depth::Deep);
-        assert!(!out.team.is_empty());
-    }
-
-    #[test]
-    fn brain_may_correct_a_keyword_floor_down_to_explain() {
-        let floor = tier0("做一个完整的电商网站");
-        assert_eq!(floor.class, RouteClass::Build);
-        let brain = BrainRoute {
-            class: "explain".to_string(),
-            kind: "light".to_string(),
-            complexity: "simple".to_string(),
-            confidence: 0.95,
-            ..Default::default()
-        };
-        let out = brain_to_route(&brain, "解释‘做一个完整的电商网站’这句话是什么意思");
-        assert_eq!(out.class, RouteClass::Explain);
-        assert_eq!(out.depth, Depth::Fast);
-        assert!(out.team.is_empty());
-    }
-
-    #[test]
-    fn class_semantics_normalize_inconsistent_model_complexity() {
-        for class in ["chat", "explain", "quick_edit"] {
-            let brain = BrainRoute {
-                class: class.to_string(),
-                kind: if class == "quick_edit" {
-                    "light".to_string()
-                } else {
-                    String::new()
-                },
-                complexity: "complex".to_string(),
-                authorization: if class == "quick_edit" {
-                    "mutating".to_string()
-                } else {
-                    "read_only".to_string()
-                },
-                ..Default::default()
-            };
-            let route = brain_to_route(&brain, "one turn");
-            assert_eq!(route.depth, Depth::Fast, "{class}");
-            assert!(!route.uses_director_workflow(), "{class}");
-        }
-
-        let debug = brain_to_route(
-            &BrainRoute {
-                class: "debug".to_string(),
-                kind: "bugfix".to_string(),
-                complexity: "complex".to_string(),
-                authorization: "mutating".to_string(),
-                ..Default::default()
-            },
-            "定位并修复跨服务数据丢失",
-        );
-        assert_eq!(debug.depth, Depth::Deep);
-        assert!(debug.uses_director_workflow());
-
-        let lean_build = brain_to_route(
-            &BrainRoute {
-                class: "build".to_string(),
-                kind: "light".to_string(),
-                complexity: "simple".to_string(),
-                authorization: "mutating".to_string(),
-                ..Default::default()
-            },
-            "创建一个小的独立脚本",
-        );
-        assert_eq!(lean_build.depth, Depth::Fast);
-        assert!(lean_build.uses_director_workflow());
-    }
-
-    #[test]
-    fn brain_route_honours_clarification() {
-        let brain = BrainRoute {
-            class: "build".to_string(),
-            authorization: "mutating".to_string(),
-            clarify_question: "前端还是后端功能?".to_string(),
-            clarify_options: vec!["前端".to_string(), "后端".to_string()],
-            ..Default::default()
-        };
-        let out = brain_to_route(&brain, "加个功能");
-        let c = out.needs_clarify.expect("clarify present");
-        assert_eq!(c.options.len(), 2);
-        assert!(c.question.contains("前端"));
-    }
-
-    #[test]
-    fn explicit_read_only_is_a_hard_ceiling_and_fallback_is_conservative() {
-        let brain = BrainRoute {
-            class: "build".to_string(),
-            authorization: "mutating".to_string(),
-            kind: "greenfield".to_string(),
-            complexity: "complex".to_string(),
-            ..Default::default()
-        };
-        let capped = apply_authorization_ceiling(
-            brain_to_route(&brain, "只分析 SEO，不要修改任何文件"),
-            "只分析 SEO，不要修改任何文件",
-        );
-        assert_eq!(capped.class, RouteClass::Explain);
-        assert!(capped.team.is_empty());
-
-        let summary = safe_fallback_route("帮我总结刚才做了什么");
-        assert_eq!(summary.class, RouteClass::Explain);
-        assert!(summary.team.is_empty());
-        let scoped = safe_fallback_route("把标题改成 Welcome");
-        assert_eq!(scoped.class, RouteClass::QuickEdit);
-        assert!(scoped.team.is_empty());
-    }
-
-    #[test]
-    fn past_work_and_status_queries_stay_read_only_even_when_the_model_misroutes_them() {
-        let wrong = BrainRoute {
-            class: "build".to_string(),
-            authorization: "mutating".to_string(),
-            kind: "greenfield".to_string(),
-            complexity: "complex".to_string(),
-            confidence: 0.99,
-            ..Default::default()
-        };
-
-        for request in [
-            "这次改动都做了啥",
-            "帮我总结刚才做了什么",
-            "目前进度如何？",
-            "目前什么进展了？",
-            "what changed in this turn?",
-            "summarize the changes",
-        ] {
-            let route = apply_route_ceilings(
-                brain_to_route(&wrong, request),
-                request,
-                crate::trust::TrustMode::Guarded,
-            );
-            assert_eq!(route.class, RouteClass::Explain, "{request}");
-            assert_eq!(route.kind, TaskKind::Light, "{request}");
-            assert_eq!(route.depth, Depth::Fast, "{request}");
-            assert!(route.team.is_empty(), "{request}");
-        }
-    }
-
-    #[test]
-    fn status_then_continue_is_not_mistaken_for_an_observation_only_turn() {
-        let build = BrainRoute {
-            class: "build".to_string(),
-            authorization: "mutating".to_string(),
-            kind: "bugfix".to_string(),
-            complexity: "medium".to_string(),
-            ..Default::default()
-        };
-        for request in [
-            "先总结这次改动，然后修复剩余测试",
-            "告诉我当前进度，继续完成剩余任务",
-            "summarize the changes, then fix the failing tests",
-        ] {
-            let route = apply_route_ceilings(
-                brain_to_route(&build, request),
-                request,
-                crate::trust::TrustMode::Guarded,
-            );
-            assert!(route.class.mutates_workspace(), "{request}");
-        }
-    }
-
-    #[test]
-    fn semantic_authorization_and_narrow_text_ceiling_do_not_misread_negation_or_quotes() {
-        let read_only = BrainRoute {
-            class: "build".to_string(),
-            authorization: "read_only".to_string(),
-            kind: "greenfield".to_string(),
-            complexity: "complex".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            brain_to_route(&read_only, "解释‘做一个完整网站’是什么意思").class,
-            RouteClass::Explain
-        );
-
-        for request in [
-            "不要只分析，直接修复",
-            "删除页面里的‘不要修改文件’提示",
-            "不是让你不要修改，直接改",
-            "只改 app.rs，不要修改其他文件",
-        ] {
-            assert!(
-                !explicit_read_only_request(request),
-                "scoped/quoted/negated wording is not a whole-turn ceiling: {request}"
-            );
-        }
-        assert!(explicit_read_only_request("只分析原因，不要修改任何文件"));
-    }
-
-    #[test]
-    fn requirement_demands_read_only_only_for_explicit_read_only_or_observation() {
-        // Explicit whole-turn read-only wording and pure past-work/status queries are
-        // the user's own choice — the chat driver may honor them even on a fallback route.
-        for explicit in [
-            "只分析，不要修改任何文件",
-            "do not modify any file",
-            "read-only analysis",
-            "刚才做了什么",
-            "what changed",
-            "current progress",
-        ] {
-            assert!(
-                requirement_demands_read_only(explicit),
-                "explicit read-only / observation wording is a user request: {explicit}"
-            );
-        }
-        // Ordinary work requests (including a keyword-miss build) never look like an
-        // explicit read-only demand, so a fallback route on them must not be jailed.
-        for ordinary in [
-            "做一个登录页",
-            "帮我优化后端代码",
-            "build a dashboard",
-            "把这个按钮改成蓝色",
-            "只改 app.rs，不要修改其他文件",
-        ] {
-            assert!(
-                !requirement_demands_read_only(ordinary),
-                "ordinary work is not an explicit read-only demand: {ordinary}"
-            );
-        }
-    }
-
-    #[test]
-    fn missing_or_invalid_brain_authorization_never_grants_a_writer_or_director() {
-        for (class, kind) in [
-            ("quick_edit", "light"),
-            ("debug", "bugfix"),
-            ("build", "greenfield"),
-        ] {
-            for authorization in [None, Some("unexpected_value")] {
-                let authorization_field = authorization
-                    .map(|value| format!(",\"authorization\":\"{value}\""))
-                    .unwrap_or_default();
-                let json = format!(
-                    r#"{{"class":"{class}"{authorization_field},"kind":"{kind}","complexity":"complex"}}"#
-                );
-                let brain: BrainRoute =
-                    serde_json::from_str(&json).expect("partial brain route still parses");
-                let route = brain_to_route(&brain, "current request");
-
-                assert_eq!(
-                    route.class,
-                    RouteClass::Explain,
-                    "{class} with {authorization:?} authorization must be read-only"
-                );
-                assert!(!route.class.mutates_workspace(), "{class}");
-                assert!(!route.uses_director_workflow(), "{class}");
-                assert_eq!(route.kind, TaskKind::Light, "{class}");
-                assert_eq!(route.depth, Depth::Fast, "{class}");
-                assert!(route.team.is_empty(), "{class}");
-            }
-        }
-    }
-
-    #[test]
-    fn auto_honours_a_brain_build_class_when_authorization_field_is_weak() {
-        // The reported deadlock: a build under AUTO whose reply carried a
-        // missing/garbled authorization field was demoted to a read-only Explain
-        // turn, which opens claude-code in its native plan mode and can never
-        // transition to execution. Under AUTO the brain's mutating CLASS verdict
-        // must stand so the build flows straight to a write-capable execute turn.
-        for (class, kind) in [
-            ("quick_edit", "light"),
-            ("debug", "bugfix"),
-            ("build", "greenfield"),
-        ] {
-            for authorization in ["", "unexpected_value"] {
-                let brain = BrainRoute {
-                    class: class.to_string(),
-                    authorization: authorization.to_string(),
-                    kind: kind.to_string(),
-                    complexity: "complex".to_string(),
-                    ..Default::default()
-                };
-                let auto = brain_to_route_in_mode(
-                    &brain,
-                    "做一个能上架的产品落地页",
-                    crate::trust::TrustMode::Auto,
-                );
-                assert!(
-                    auto.class.mutates_workspace(),
-                    "AUTO must keep {class} / {authorization:?} write-capable"
-                );
-
-                // Guarded / Plan keep the strict floor: a weak authorization is not
-                // permission there, so the approval gate is never bypassed.
-                for strict in [
-                    crate::trust::TrustMode::Guarded,
-                    crate::trust::TrustMode::Plan,
-                ] {
-                    let route = brain_to_route_in_mode(&brain, "current request", strict);
-                    assert_eq!(
-                        route.class,
-                        RouteClass::Explain,
-                        "{strict:?} must demote {class} / {authorization:?} to read-only"
-                    );
-                    assert!(!route.class.mutates_workspace(), "{strict:?} / {class}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn auto_reads_the_class_over_the_auth_field_but_honours_explicit_read_only_wording() {
-        // Under AUTO the brain's CLASS is authoritative, so a bare `read_only`
-        // authorization FIELD (which a plan-mode fork can emit even for a real build)
-        // no longer vetoes the build. Genuine read-only intent must come from the
-        // user's own wording, which the explicit read-only ceiling still enforces in
-        // every mode — including AUTO.
-        let brain = BrainRoute {
-            class: "build".to_string(),
-            authorization: "read_only".to_string(),
-            kind: "greenfield".to_string(),
-            complexity: "complex".to_string(),
-            ..Default::default()
-        };
-        // A bare auth field is not a veto under AUTO: the build stands.
-        let build = brain_to_route_in_mode(&brain, "做一个落地页", crate::trust::TrustMode::Auto);
-        assert!(build.class.mutates_workspace());
-
-        // Explicit read-only USER WORDING is a hard ceiling, even under AUTO.
-        let request = "只分析 SEO，不要修改任何文件";
-        let capped = apply_route_ceilings(
-            brain_to_route_in_mode(&brain, request, crate::trust::TrustMode::Auto),
-            request,
-            crate::trust::TrustMode::Auto,
-        );
-        assert_eq!(capped.class, RouteClass::Explain);
-        assert!(!capped.class.mutates_workspace());
-    }
-
-    #[test]
-    fn reported_regression_explicit_write_cannot_be_stranded_in_read_only() {
-        let wrong = BrainRoute {
-            class: "explain".to_string(),
-            authorization: "read_only".to_string(),
-            kind: "light".to_string(),
-            complexity: "simple".to_string(),
-            confidence: 0.99,
-            ..Default::default()
-        };
-
-        for mode in [
-            crate::trust::TrustMode::Guarded,
-            crate::trust::TrustMode::Auto,
-        ] {
-            for request in [
-                "修复以上发现的问题",
-                "请你修复这个循环",
-                "把这个权限问题修复掉",
-                "需要登记这条踩坑记录",
-                "保存这份配置到项目文件",
-                "please fix the review loop",
-            ] {
-                let route = apply_route_ceilings(
-                    brain_to_route_in_mode(&wrong, request, mode),
-                    request,
-                    mode,
-                );
-                assert!(route.class.mutates_workspace(), "{mode:?}: {request}");
-                assert_eq!(route.depth, Depth::Fast, "{mode:?}: {request}");
-                assert!(route.team.is_empty(), "{mode:?}: {request}");
-            }
-        }
-    }
-
-    #[test]
-    fn mutation_floor_does_not_promote_questions_or_read_only_constraints() {
-        let wrong = BrainRoute {
-            class: "explain".to_string(),
-            authorization: "read_only".to_string(),
-            kind: "light".to_string(),
-            complexity: "simple".to_string(),
-            ..Default::default()
-        };
-        for mode in [
-            crate::trust::TrustMode::Guarded,
-            crate::trust::TrustMode::Auto,
-        ] {
-            for request in [
-                "为什么还没有修复？",
-                "这个问题修复了吗？",
-                "只分析原因，不要修改任何文件",
-                "目前什么进展了",
-            ] {
-                let route = apply_route_ceilings(
-                    brain_to_route_in_mode(&wrong, request, mode),
-                    request,
-                    mode,
-                );
-                assert!(!route.class.mutates_workspace(), "{mode:?}: {request}");
-            }
-        }
-
-        let planned = apply_route_ceilings(
-            brain_to_route_in_mode(&wrong, "修复以上发现的问题", crate::trust::TrustMode::Plan),
-            "修复以上发现的问题",
-            crate::trust::TrustMode::Plan,
-        );
-        assert!(!planned.class.mutates_workspace());
-    }
-
-    #[test]
-    fn read_only_brain_classes_remain_valid_without_write_authorization() {
-        for (class, expected) in [("chat", RouteClass::Chat), ("explain", RouteClass::Explain)] {
-            for authorization in ["", "unexpected_value", "read_only"] {
-                let route = brain_to_route(
-                    &BrainRoute {
-                        class: class.to_string(),
-                        authorization: authorization.to_string(),
-                        kind: "light".to_string(),
-                        complexity: "complex".to_string(),
-                        ..Default::default()
-                    },
-                    "current request",
-                );
-                assert_eq!(route.class, expected, "{class} / {authorization:?}");
-                assert!(!route.class.mutates_workspace());
-                assert!(!route.uses_director_workflow());
-            }
-        }
-    }
-
-    #[test]
-    fn fallback_never_grants_write_from_create_words_inside_a_question_or_negation() {
-        for request in [
-            "如何做一个完整网站？",
-            "解释‘做一个完整网站’是什么意思",
-            "我不是让你做一个网站，只是问为什么会这样",
-        ] {
-            let plan = safe_fallback_route(request);
-            assert_eq!(plan.class, RouteClass::Explain, "{request}");
-            assert!(plan.team.is_empty(), "{request}");
-        }
-    }
-
-    #[test]
-    fn triage_prompt_firewalls_inherited_plans_and_separates_authorization() {
-        assert!(ROUTER_TRIAGE_SYSTEM.contains("ONLY the text inside the final `Request:` block"));
-        assert!(ROUTER_TRIAGE_SYSTEM.contains("context only"));
-        assert!(ROUTER_TRIAGE_SYSTEM.contains("authorization"));
-        assert!(ROUTER_TRIAGE_SYSTEM.contains("read_only|mutating"));
-    }
-
-    #[test]
-    fn parse_helpers_are_tolerant() {
-        assert_eq!(parse_class("Build"), Some(RouteClass::Build));
-        assert_eq!(parse_class("quick-edit"), Some(RouteClass::QuickEdit));
-        assert_eq!(parse_class("garbage"), None);
-        assert_eq!(parse_depth("complex"), Some(Depth::Deep));
-        assert_eq!(parse_depth("nope"), None);
-        assert_eq!(parse_kind("frontend"), Some(TaskKind::FrontendOnly));
-    }
-
-    #[test]
-    fn work_request_detector_is_bilingual() {
-        assert!(looks_like_work_request("build me a login page"));
-        assert!(looks_like_work_request("帮我做一个登录页"));
-        assert!(!looks_like_work_request("你好啊"));
-        assert!(!looks_like_work_request("nice, thanks"));
-    }
-}
+include!("router/tests.rs");

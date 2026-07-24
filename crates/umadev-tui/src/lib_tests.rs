@@ -1770,7 +1770,7 @@ async fn cancel_drain_honors_absolute_deadline_despite_recreation() {
             tokio::time::Instant::now() + Duration::from_secs(1)
         )
         .await,
-        CancelDrainOutcome::Finished,
+        CancelDrainOutcome::Cancelled,
         "the writer barrier may reopen only after the handle really finishes"
     );
 }
@@ -1794,6 +1794,70 @@ async fn cancel_drain_returns_when_handle_resolves_early() {
         elapsed < Duration::from_secs(1),
         "drain should return when the handle resolves, not wait the full budget: {elapsed:?}"
     );
+}
+
+#[tokio::test]
+async fn cancel_drain_distinguishes_panicked_workers_from_cancelled_or_completed() {
+    let mut panicked = tokio::spawn(async { panic!("host transaction worker panic") });
+    assert_eq!(
+        drain_cancelled_task(
+            &mut panicked,
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        )
+        .await,
+        CancelDrainOutcome::Panicked
+    );
+    let mut cancelled = tokio::spawn(std::future::pending::<()>());
+    cancelled.abort();
+    assert_eq!(
+        drain_cancelled_task(
+            &mut cancelled,
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        )
+        .await,
+        CancelDrainOutcome::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn terminal_route_join_waits_for_writer_resources_before_fifo_replacement() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let project_root = tmp.path().to_path_buf();
+    let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let mut run_task = Some(tokio::spawn(async move {
+        let run_lock = umadev_agent::run_lock::RunLock::acquire_for_run(&project_root).unwrap();
+        assert!(run_lock.is_owned());
+        let _ = published_tx.send(());
+        let _ = release_rx.await;
+    }));
+
+    published_rx.await.unwrap();
+    let mut settle = Box::pin(settle_terminal_run_task(&mut run_task));
+    let settle_is_pending = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(matches!(
+            std::future::Future::poll(settle.as_mut(), cx),
+            std::task::Poll::Pending
+        ))
+    })
+    .await;
+    assert!(
+        settle_is_pending,
+        "the terminal join must remain pending while the old task owns the writer lock"
+    );
+
+    let blocked = umadev_agent::run_lock::RunLock::acquire_for_run(tmp.path())
+        .expect_err("the FIFO replacement must not acquire before terminal settlement");
+    assert_eq!(blocked.kind(), std::io::ErrorKind::WouldBlock);
+
+    release_tx.send(()).unwrap();
+    settle.as_mut().await;
+    drop(settle);
+    assert!(run_task.is_none());
+
+    let replacement = umadev_agent::run_lock::RunLock::acquire_for_run(tmp.path())
+        .expect("the FIFO replacement may acquire after terminal settlement");
+    assert!(replacement.is_owned());
 }
 
 /// A base session whose `end()` HANGS forever (a wedged/slow base that never
@@ -3503,7 +3567,7 @@ async fn route_via_brain_fails_open_to_chat_when_brain_unavailable() {
 }
 
 #[test]
-fn resident_route_sandbox_follows_intent_without_recreating_the_plan_mode_trap() {
+fn resident_route_sandbox_mechanically_follows_final_route_mutability() {
     let explain = umadev_agent::RoutePlan {
         class: umadev_agent::RouteClass::Explain,
         kind: umadev_agent::TaskKind::Light,
@@ -3527,28 +3591,48 @@ fn resident_route_sandbox_follows_intent_without_recreating_the_plan_mode_trap()
         ),
         ..explain.clone()
     };
+    let chat = umadev_agent::RoutePlan {
+        class: umadev_agent::RouteClass::Chat,
+        est_budget: umadev_agent::Budget::for_route(
+            umadev_agent::RouteClass::Chat,
+            umadev_agent::Depth::Fast,
+        ),
+        ..explain.clone()
+    };
 
-    assert!(routed_turn_executes_read_only(
-        false,
-        &explain,
+    for route in [&chat, &explain] {
+        for source in [
+            Some(umadev_agent::RouteSource::Brain),
+            Some(umadev_agent::RouteSource::DeterministicFallback),
+            None,
+        ] {
+            for permissions in [
+                umadev_runtime::BasePermissionProfile::Guarded,
+                umadev_runtime::BasePermissionProfile::Auto,
+            ] {
+                assert!(routed_turn_executes_read_only(
+                    false,
+                    route,
+                    source,
+                    false,
+                    permissions,
+                ));
+            }
+        }
+    }
+    for source in [
         Some(umadev_agent::RouteSource::Brain),
-        false,
-        umadev_runtime::BasePermissionProfile::Guarded,
-    ));
-    assert!(!routed_turn_executes_read_only(
-        false,
-        &debug,
-        Some(umadev_agent::RouteSource::Brain),
-        false,
-        umadev_runtime::BasePermissionProfile::Guarded,
-    ));
-    assert!(!routed_turn_executes_read_only(
-        false,
-        &explain,
         Some(umadev_agent::RouteSource::DeterministicFallback),
-        false,
-        umadev_runtime::BasePermissionProfile::Guarded,
-    ));
+        None,
+    ] {
+        assert!(!routed_turn_executes_read_only(
+            false,
+            &debug,
+            source,
+            false,
+            umadev_runtime::BasePermissionProfile::Guarded,
+        ));
+    }
     assert!(routed_turn_executes_read_only(
         false,
         &debug,
@@ -3562,6 +3646,13 @@ fn resident_route_sandbox_follows_intent_without_recreating_the_plan_mode_trap()
         Some(umadev_agent::RouteSource::Brain),
         false,
         umadev_runtime::BasePermissionProfile::Plan,
+    ));
+    assert!(!routed_turn_executes_read_only(
+        true,
+        &explain,
+        Some(umadev_agent::RouteSource::DeterministicFallback),
+        false,
+        umadev_runtime::BasePermissionProfile::Guarded,
     ));
 
     let directive = scoped_chat_directive("修复以上发现的问题", &debug);
@@ -3617,7 +3708,7 @@ fn scaffold_injects_git_state_and_unlocks_tools() {
     // (identity / craft / knowledge) is composed SEPARATELY by `compose_firmware`
     // and prepended in `drive_agentic_stream`.
     let status = concat!(" M crates/umadev-tui/src/lib.rs\n", "?? new.rs\n");
-    let p = agentic_reality_scaffold(Some(status), Some("1 file changed"));
+    let p = agentic_reality_scaffold(Some(status), Some("1 file changed"), true);
     // Tools stay unlocked (the whole point of the agentic path).
     assert!(p.contains("FULL tool access"));
     assert!(p.to_lowercase().contains("edit files"));
@@ -3636,7 +3727,7 @@ fn scaffold_lets_the_brain_decide_chat_vs_act() {
     // up front, the scaffold hands that judgement to the base — reply to small
     // talk without tools, do the work when it needs tools. This is what makes
     // a greeting not waste tool calls and a real task actually get done.
-    let p = agentic_reality_scaffold(None, None);
+    let p = agentic_reality_scaffold(None, None, true);
     let lower = p.to_lowercase();
     assert!(lower.contains("decide for yourself"));
     // It must cover BOTH arms: just reply to conversation, and do the work.
@@ -3650,6 +3741,16 @@ fn scaffold_lets_the_brain_decide_chat_vs_act() {
         !lower.contains("anti-ai-slop") && !p.contains("Lucide"),
         "the scaffold is the reality contract only — no firmware craft block"
     );
+}
+
+#[test]
+fn readonly_scaffold_never_advertises_writer_authority() {
+    let p = agentic_reality_scaffold(None, None, false);
+    let lower = p.to_lowercase();
+    assert!(lower.contains("read-only"));
+    assert!(!p.contains("FULL tool access"));
+    assert!(lower.contains("must not edit files"));
+    assert!(lower.contains("no authority to edit, commit, or start governance/qc"));
 }
 
 /// Drive the light path against a [`CapturingSpy`] and return the assembled
@@ -3696,8 +3797,10 @@ async fn light_path_firmware_is_route_tiered_via_compose_firmware() {
         chat.contains("emoji"),
         "a chat turn now carries the engineering craft block (always-on standards)"
     );
-    // The reality scaffold is still appended on every light turn.
-    assert!(chat.contains("FULL tool access"));
+    // The reality scaffold is still appended on every light turn, but a Chat
+    // route is mechanically Plan and must never advertise writer authority.
+    assert!(chat.contains("READ-ONLY"));
+    assert!(!chat.contains("FULL tool access"));
     assert!(chat.contains("REALITY CONTRACT"));
 
     // (2) A BUILD-class turn (a non-host would-be build on the light path) gets
@@ -3852,6 +3955,28 @@ fn init_git_repo() -> tempfile::TempDir {
     run(&["config", "user.email", "t@t.t"]);
     run(&["config", "user.name", "t"]);
     tmp
+}
+
+fn git_rev_parse(root: &std::path::Path, rev: &str) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", rev])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn git_commit_count(root: &std::path::Path, range: &str) -> usize {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-list", "--count", range])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
 }
 
 #[tokio::test]
@@ -4726,6 +4851,7 @@ async fn tui_director_build_writes_workflow_state_baseline() {
         options,
         sink,
         route_tx,
+        Arc::new(tokio::sync::Mutex::new(None)),
         umadev_runtime::BasePermissionProfile::Guarded,
         Vec::new(),
         None,
@@ -4888,6 +5014,7 @@ async fn tui_director_plan_boundary_precedes_lock_state_and_session_open() {
         options,
         sink,
         route_tx,
+        Arc::new(tokio::sync::Mutex::new(None)),
         umadev_runtime::BasePermissionProfile::Plan,
         Vec::new(),
         None,
@@ -4928,7 +5055,7 @@ async fn build_turn_isolated(root: &std::path::Path, host_cli: bool) -> bool {
             session_id: None,
             fallback_model: "offline".into(),
             project_root: root.to_path_buf(),
-            permissions: umadev_runtime::BasePermissionProfile::Plan,
+            permissions: umadev_runtime::BasePermissionProfile::Auto,
             director_build: true,
             host_cli,
             route: Some(test_route(umadev_agent::RouteClass::Build)),
@@ -4997,17 +5124,58 @@ async fn non_host_build_does_not_lock_or_isolate_on_the_light_path() {
     );
 }
 
+#[test]
+fn legacy_routes_use_a_mechanical_plan_boundary_or_a_pre_send_writer_lock() {
+    let chat = test_route(umadev_agent::RouteClass::Chat);
+    let edit = test_route(umadev_agent::RouteClass::QuickEdit);
+    assert_eq!(
+        legacy_effective_permissions(&chat, umadev_runtime::BasePermissionProfile::Auto),
+        umadev_runtime::BasePermissionProfile::Plan,
+        "a non-mutating legacy route cannot reactively upgrade itself into a writer"
+    );
+    assert_eq!(
+        legacy_effective_permissions(&edit, umadev_runtime::BasePermissionProfile::Auto),
+        umadev_runtime::BasePermissionProfile::Auto
+    );
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let target = tmp.path().join("must-stay-unchanged.txt");
+    std::fs::write(&target, "before\n").unwrap();
+    let _writer_a =
+        umadev_agent::run_lock::RunLock::acquire_for_run(tmp.path()).expect("writer A owns lock");
+
+    let writer_b_reached_runtime = std::sync::atomic::AtomicBool::new(false);
+    let writer_b = acquire_legacy_pre_send_writer_lock(
+        tmp.path(),
+        true,
+        umadev_runtime::BasePermissionProfile::Auto,
+        &edit,
+    )
+    .map(|_guard| {
+        writer_b_reached_runtime.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(&target, "written by B\n").unwrap();
+    });
+
+    assert!(
+        writer_b.is_err(),
+        "writer B must fail before its legacy runtime receives a writable request"
+    );
+    assert!(
+        !writer_b_reached_runtime.load(std::sync::atomic::Ordering::SeqCst),
+        "the losing legacy turn never reaches its first write"
+    );
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "before\n");
+}
+
 // ── Reactive write-truth backstop ───────────────────────────────────────
 //
 // Model routing happens first. These tests lock the defensive observer that
 // still catches a real write and applies lock/isolation/honesty when a fallback
 // or misbehaving base crosses its scoped lane.
 
-/// A streaming spy that emits a caller-chosen tool call (so the reactive write
-/// detector can be exercised) and OPTIONALLY runs a side effect AFTER emitting
-/// it (e.g. writes a file — mirroring how a real base writes a file when its
-/// `Write` tool executes, just AFTER announcing the `tool_use`). Not offline,
-/// so it drives the host-CLI code paths. A fixed reply closes the turn.
+/// A streaming spy that emits a caller-chosen tool event and optionally performs
+/// a matching side effect. Writable tests must establish the writer barrier
+/// before invoking it; the callback itself is observational.
 struct WriteSpy {
     tool_name: &'static str,
     reply: &'static str,
@@ -5031,9 +5199,6 @@ impl Runtime for WriteSpy {
         _req: CompletionRequest,
         on_event: &(dyn Fn(umadev_runtime::StreamEvent) + Send + Sync),
     ) -> Result<umadev_runtime::CompletionResponse, umadev_runtime::RuntimeError> {
-        // Announce the tool call FIRST (clean tree → `setup_run_isolation` can
-        // switch onto a fresh branch), THEN perform the write so the change is
-        // carried onto the isolation branch — the real `switch -c` semantics.
         on_event(umadev_runtime::StreamEvent::ToolUse {
             name: self.tool_name.to_string(),
             detail: "src/App.tsx".to_string(),
@@ -5052,6 +5217,21 @@ impl Runtime for WriteSpy {
     }
 }
 
+/// Run one Git command in `root` and fail the test with its stderr.
+fn git_ok(root: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Read the current git branch of `root` (empty on failure).
 fn git_branch(root: &std::path::Path) -> String {
     let out = std::process::Command::new("git")
@@ -5063,13 +5243,11 @@ fn git_branch(root: &std::path::Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Reactive build, the load-bearing case: a HOST chat turn whose base writes its
-/// first real file is promoted to a build — it isolates onto `umadev/<slug>`
-/// (carrying the just-written file) and the user's branch is left untouched,
-/// AND the terminal decision carries `director_build: true` (so the Wave-5
-/// hand-back + source hard-gate fire). The intent card + the build note surface.
+/// A writable legacy route is locked and isolated before streaming. Its first
+/// real file write may then record build truth, but the tool callback never owns
+/// permission or lock acquisition.
 #[tokio::test]
-async fn reactive_first_write_isolates_and_keeps_branch_clean() {
+async fn prepared_legacy_write_uses_pre_send_isolation_and_records_build_truth() {
     // A committed repo on its default branch — the only state in which
     // `setup_run_isolation` will create + switch to an isolation branch.
     let tmp = init_git_repo();
@@ -5090,7 +5268,31 @@ async fn reactive_first_write_isolates_and_keeps_branch_clean() {
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
     let target = tmp.path().join("src");
+    let route = light_default_route();
     let reactive = Arc::new(ReactiveBuild::new(true, "做一个登录页"));
+    let guard = acquire_legacy_pre_send_writer_lock(
+        tmp.path(),
+        true,
+        umadev_runtime::BasePermissionProfile::Auto,
+        &route,
+    )
+    .unwrap()
+    .expect("writable host route owns its pre-send lock");
+    let slug = tmp
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap();
+    assert!(
+        umadev_agent::setup_new_run_isolation(tmp.path(), slug).is_some(),
+        "isolation happens before the legacy runtime is called"
+    );
+    {
+        *reactive.lock.lock().unwrap() = Some(guard);
+        reactive
+            .prepared
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     let spy = WriteSpy {
         tool_name: "Write",
         reply: "Created src/App.tsx",
@@ -5105,8 +5307,8 @@ async fn reactive_first_write_isolates_and_keeps_branch_clean() {
         "m",
         "claude-code",
         tmp.path(),
-        false, // dispatched as CHAT (not a pre-classified build)
-        &light_default_route(),
+        false,
+        &route,
         &[],
         &sink,
         &route_tx,
@@ -5122,8 +5324,7 @@ async fn reactive_first_write_isolates_and_keeps_branch_clean() {
         ),
         other => panic!("expected AgenticDone, got {other:?}"),
     }
-    // It isolated onto a fresh `umadev/<slug>` branch (carrying the write) and
-    // surfaced both the build note and the trust/isolation note.
+    // It was already isolated before streaming; the write lands on that branch.
     let now_branch = git_branch(tmp.path());
     assert_ne!(
         now_branch, start_branch,
@@ -5135,19 +5336,14 @@ async fn reactive_first_write_isolates_and_keeps_branch_clean() {
     );
     // The user's original branch has NO new commit — UmaDev never auto-commits
     // / merges; the work sits uncommitted on the isolation branch.
-    let mut saw_isolated = false;
     let mut saw_build_note = false;
     while let Ok(ev) = rx.try_recv() {
         if let EngineEvent::Note(n) = ev {
-            if n.contains("umadev/") {
-                saw_isolated = true;
-            }
             if n.contains("[work]") {
                 saw_build_note = true;
             }
         }
     }
-    assert!(saw_isolated, "the trust/isolation note was surfaced");
     assert!(saw_build_note, "the reactive build note was surfaced");
 }
 
@@ -5173,7 +5369,6 @@ async fn pure_chat_reply_does_not_isolate_or_lock() {
     let (sink, mut rx) = ChannelSink::new();
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    let reactive = Arc::new(ReactiveBuild::new(true, "解释一下这段代码"));
     // A spy that only READS + replies (no write tool, no effect).
     let spy = WriteSpy {
         tool_name: "Read",
@@ -5187,11 +5382,11 @@ async fn pure_chat_reply_does_not_isolate_or_lock() {
         "claude-code",
         tmp.path(),
         false,
-        &light_default_route(),
+        &chat_route(),
         &[],
         &sink,
         &route_tx,
-        Some(&reactive),
+        None,
     )
     .await;
 
@@ -5241,7 +5436,6 @@ async fn chat_first_reply_is_one_streaming_call_no_triage() {
         streaming_calls: Arc::clone(&streaming_calls),
         fail: false,
     };
-    let reactive = Arc::new(ReactiveBuild::new(true, "你好，能帮我做什么？"));
     let tmp = tempfile::TempDir::new().unwrap();
     drive_agentic_stream(
         &spy,
@@ -5250,11 +5444,11 @@ async fn chat_first_reply_is_one_streaming_call_no_triage() {
         "claude-code",
         tmp.path(),
         false,
-        &light_default_route(),
+        &chat_route(),
         &[],
         &sink,
         &route_tx,
-        Some(&reactive),
+        None,
     )
     .await;
     assert_eq!(
@@ -5387,6 +5581,38 @@ fn arbitrary_shell_is_a_possible_write_but_strict_reads_are_neutral() {
         ),
         ObservedToolEffect::Neutral
     );
+    for command in [
+        "git add .gitignore",
+        "git add -- .gitignore umadev.yaml .umadevrc",
+        r#"git commit -m "chore: record config""#,
+        r#"C:\Git\cmd\git.exe commit --message="fix #123""#,
+    ] {
+        assert_eq!(
+            observed_tool_effect("Bash", &serde_json::json!({ "command": command })),
+            ObservedToolEffect::Neutral,
+            "bounded Git metadata is not a workspace-file write: {command}"
+        );
+    }
+    for command in [
+        "git reset --hard",
+        "git clean -fd",
+        "git push",
+        "git add -A | tee x",
+        "git add -f .env",
+        "git commit",
+        "git commit --amend -m nope",
+        "git commit -a -m nope",
+        "git commit --no-verify -m nope",
+        r#"git commit -m "ok" && rm -rf src"#,
+        r#"git commit -m "$(touch owned)""#,
+        r#"git commit -m "unterminated"#,
+    ] {
+        assert_eq!(
+            observed_tool_effect("Bash", &serde_json::json!({ "command": command })),
+            ObservedToolEffect::PotentialWrite,
+            "{command}"
+        );
+    }
     assert_eq!(
         observed_tool_effect("Bash", &serde_json::json!({ "command": "cargo test -q" })),
         ObservedToolEffect::Verification
@@ -5585,6 +5811,8 @@ struct FakeChatSession {
     /// This lets resident-path tests exercise both the intent probe and the
     /// read-only execution child without opening a real base process.
     forks: std::collections::VecDeque<Box<dyn umadev_runtime::BaseSession>>,
+    /// Test probe for proving a host-owned operation never consults the base.
+    forked: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FakeChatSession {
@@ -5608,6 +5836,7 @@ impl FakeChatSession {
                 responded: Arc::new(std::sync::Mutex::new(Vec::new())),
                 send_effects: std::collections::VecDeque::new(),
                 forks: std::collections::VecDeque::new(),
+                forked: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
             sent,
             ended,
@@ -5641,6 +5870,11 @@ impl FakeChatSession {
         self
     }
 
+    fn with_fork_probe(mut self, probe: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.forked = probe;
+        self
+    }
+
     /// Mark the fake's base process as DEAD: [`BaseSession::try_exit_status`]
     /// then reports `Some(status)`, so a transient-failure path treats it as a
     /// genuine teardown (end + re-open) rather than a recoverable park.
@@ -5660,6 +5894,8 @@ impl umadev_runtime::BaseSession for FakeChatSession {
     async fn fork(
         &mut self,
     ) -> Result<Box<dyn umadev_runtime::BaseSession>, umadev_runtime::SessionError> {
+        self.forked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.forks.pop_front().ok_or_else(|| {
             umadev_runtime::SessionError::ForkUnsupported(
                 "fake has no scripted read-only fork".to_string(),
@@ -5705,6 +5941,61 @@ impl umadev_runtime::BaseSession for FakeChatSession {
     fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
         self.exit_status
     }
+}
+
+#[tokio::test]
+async fn director_operational_pause_parks_the_live_session_for_exact_resume() {
+    use std::sync::atomic::Ordering;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let holder: SessionHolder = Arc::new(tokio::sync::Mutex::new(None));
+    let identity = SessionIdentity::for_launch(
+        "claude-code",
+        tmp.path(),
+        umadev_runtime::BasePermissionProfile::Guarded,
+    )
+    .unwrap();
+    let (session, _sent, ended) = FakeChatSession::new(Vec::new());
+
+    settle_director_session(Box::new(session), &holder, Some(identity.clone()), true).await;
+
+    assert!(
+        !ended.load(Ordering::SeqCst),
+        "an operational review outage must not end the live Director brain"
+    );
+    let parked = holder
+        .lock()
+        .await
+        .take()
+        .expect("operational pause parks the session");
+    let Ok(mut resumed) = parked.into_matching(&identity) else {
+        panic!("the exact backend/workspace/permission identity resumes");
+    };
+    assert!(!ended.load(Ordering::SeqCst));
+    resumed.end().await.unwrap();
+}
+
+#[tokio::test]
+async fn director_non_operational_outcome_still_ends_the_session() {
+    use std::sync::atomic::Ordering;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let holder: SessionHolder = Arc::new(tokio::sync::Mutex::new(None));
+    let identity = SessionIdentity::for_launch(
+        "claude-code",
+        tmp.path(),
+        umadev_runtime::BasePermissionProfile::Guarded,
+    )
+    .unwrap();
+    let (session, _sent, ended) = FakeChatSession::new(Vec::new());
+
+    settle_director_session(Box::new(session), &holder, Some(identity), false).await;
+
+    assert!(
+        ended.load(Ordering::SeqCst),
+        "done/failed/gate/budget outcomes keep their historical teardown"
+    );
+    assert!(holder.lock().await.is_none());
 }
 
 #[tokio::test]
@@ -5775,6 +6066,1058 @@ async fn resident_model_fix_intent_reaches_writer_with_mutating_authority() {
     );
 }
 
+#[tokio::test]
+async fn compound_git_commit_and_test_is_never_delegated_to_a_model_or_review_team() {
+    let _qc = ReactiveQcOverride::force(true);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (intent, intent_sent, _intent_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "explain",
+                "authorization": "read_only",
+                "kind": "light",
+                "complexity": "simple",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let (writer, writer_sent, _writer_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "git add -- .gitignore umadev.yaml .umadevrc"}),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "staged".into(),
+        },
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "git commit -m \"chore: record config\""}),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "committed".into(),
+        },
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "cargo test -q"}),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "tests passed".into(),
+        },
+        umadev_runtime::SessionEvent::TextDelta("已提交并完成测试。".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer.with_fork(Box::new(intent)))),
+    )));
+
+    drive_chat_session_turn(chat_turn(
+        "提交git记录，然后运行测试",
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(
+        intent_sent.lock().unwrap().is_empty(),
+        "the host rejects the unsafely coupled operation before an intent consult"
+    );
+    assert!(
+        writer_sent.lock().unwrap().is_empty(),
+        "neither Git nor tests are delegated to the writable model"
+    );
+    let note = match route_rx.try_recv() {
+        Ok(RouteDecision::HostGitDone { result: Err(note) }) => note,
+        other => panic!("expected a local fail-closed result, got {other:?}"),
+    };
+    assert!(
+        note.contains("宿主独占事务")
+            && note.contains("绝不交给 AI 底座执行")
+            && note.contains("提交git记录"),
+        "{note}"
+    );
+    let events = std::iter::from_fn(|| engine_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        !saw_build_intent_card(&events),
+        "a host-rejected compound Git turn must not promote to Build: {events:?}"
+    );
+    assert!(
+        !ran_governance_qc(&events),
+        "a proportional commit+test turn must not convene team QC: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn plan_plain_git_commit_is_rejected_without_base_review_or_commit() {
+    let tmp = init_git_repo();
+    std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+    git_ok(tmp.path(), &["add", "tracked.txt"]);
+    git_ok(tmp.path(), &["commit", "-q", "-m", "seed"]);
+    std::fs::write(tmp.path().join("tracked.txt"), "after\n").unwrap();
+    let start_head = git_rev_parse(tmp.path(), "HEAD");
+    let start_status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["status", "--short"])
+        .output()
+        .unwrap()
+        .stdout;
+
+    let forks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (base, sent, ended) = FakeChatSession::new(Vec::new());
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(base.with_fork_probe(Arc::clone(&forks)))),
+    )));
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut turn = chat_turn(
+        "提交git记录",
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    );
+    turn.mode = umadev_agent::TrustMode::Plan;
+    turn.permissions = umadev_runtime::BasePermissionProfile::Plan;
+
+    drive_chat_session_turn(turn).await;
+
+    assert!(
+        matches!(
+            route_rx.try_recv(),
+            Ok(RouteDecision::HostGitDone { result: Err(_) })
+        ),
+        "Plan must reject the exact commit request locally"
+    );
+    assert!(
+        route_rx.try_recv().is_err(),
+        "the local rejection emits exactly one terminal decision"
+    );
+    assert_eq!(
+        forks.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "Plan rejection must happen before an intent/review fork"
+    );
+    assert!(sent.lock().unwrap().is_empty(), "the base receives no turn");
+    assert!(
+        !ended.load(std::sync::atomic::Ordering::SeqCst),
+        "the parked base remains untouched"
+    );
+    assert_eq!(git_rev_parse(tmp.path(), "HEAD"), start_head);
+    let end_status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["status", "--short"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(
+        end_status, start_status,
+        "the rejected turn must neither commit nor alter the dirty set"
+    );
+    let events = std::iter::from_fn(|| engine_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(!saw_build_intent_card(&events), "{events:?}");
+    assert!(!ran_governance_qc(&events), "{events:?}");
+}
+
+#[tokio::test]
+async fn auto_compound_git_requests_are_rejected_without_base_or_workspace_write() {
+    for request in ["git commit -m sync && cargo test", "提交后推送"] {
+        let tmp = init_git_repo();
+        std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+        git_ok(tmp.path(), &["add", "tracked.txt"]);
+        git_ok(tmp.path(), &["commit", "-q", "-m", "seed"]);
+        std::fs::write(tmp.path().join("tracked.txt"), "after\n").unwrap();
+        let start_head = git_rev_parse(tmp.path(), "HEAD");
+        let start_status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["status", "--short"])
+            .output()
+            .unwrap()
+            .stdout;
+        let forbidden_write = tmp.path().join("model-wrote.txt");
+
+        let forks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (base, sent, ended) = FakeChatSession::new(Vec::new());
+        let base = base.with_fork_probe(Arc::clone(&forks)).with_send_effect({
+            let forbidden_write = forbidden_write.clone();
+            move || std::fs::write(forbidden_write, "must not run\n").unwrap()
+        });
+        let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(base)),
+        )));
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        drive_chat_session_turn(auto_chat_turn(
+            request,
+            holder,
+            Arc::new(sink),
+            route_tx,
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        assert!(
+            matches!(
+                route_rx.try_recv(),
+                Ok(RouteDecision::HostGitDone { result: Err(_) })
+            ),
+            "compound request must fail closed locally: {request}"
+        );
+        assert!(
+            route_rx.try_recv().is_err(),
+            "one local terminal decision: {request}"
+        );
+        assert_eq!(
+            forks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no intent/review fork: {request}"
+        );
+        assert!(sent.lock().unwrap().is_empty(), "no base turn: {request}");
+        assert!(
+            !ended.load(std::sync::atomic::Ordering::SeqCst),
+            "the parked base remains untouched: {request}"
+        );
+        assert!(
+            !forbidden_write.exists(),
+            "the model-backed write effect must never run: {request}"
+        );
+        assert_eq!(git_rev_parse(tmp.path(), "HEAD"), start_head, "{request}");
+        let end_status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["status", "--short"])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(
+            end_status, start_status,
+            "the dirty set must remain byte-for-byte unchanged: {request}"
+        );
+        let events = std::iter::from_fn(|| engine_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(!saw_build_intent_card(&events), "{request}: {events:?}");
+        assert!(!ran_governance_qc(&events), "{request}: {events:?}");
+    }
+}
+
+#[tokio::test]
+async fn resident_git_commit_is_host_owned_without_opening_or_consulting_a_base() {
+    let tmp = init_git_repo();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let paths = [
+        ".gitignore",
+        "umadev.yaml",
+        ".umadevrc",
+        "package.json",
+        "README.md",
+        "notes.txt",
+    ];
+    for path in paths {
+        std::fs::write(tmp.path().join(path), "before\n").unwrap();
+    }
+    git(&[
+        "add",
+        ".gitignore",
+        "umadev.yaml",
+        ".umadevrc",
+        "package.json",
+        "README.md",
+        "notes.txt",
+    ]);
+    git(&["commit", "-q", "-m", "seed"]);
+    let start_branch = git_branch(tmp.path());
+    let start_head = git_rev_parse(tmp.path(), "HEAD");
+    for path in paths {
+        std::fs::write(tmp.path().join(path), format!("changed {path}\n")).unwrap();
+    }
+
+    // Deliberately provide no resident base at all. A local Git transaction must
+    // not depend on Claude/Codex/Grok being installed, logged in, forkable, or
+    // willing to classify the turn as writable.
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(None));
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    drive_chat_session_turn(auto_chat_turn(
+        "提交git记录",
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::HostGitDone { result: Ok(_) })
+    ));
+    assert!(
+        route_rx.try_recv().is_err(),
+        "success emits exactly one HostGitDone terminal"
+    );
+    let events = std::iter::from_fn(|| engine_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(!saw_build_intent_card(&events), "{events:?}");
+    assert!(!ran_governance_qc(&events), "{events:?}");
+    assert_eq!(git_branch(tmp.path()), start_branch);
+    assert!(!tmp.path().join(".umadev/governance-context.json").exists());
+    assert!(umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 1).is_empty());
+    assert_eq!(
+        git_commit_count(tmp.path(), &format!("{start_head}..HEAD")),
+        1
+    );
+    let committed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args([
+            "-c",
+            "core.quotepath=false",
+            "show",
+            "--pretty=",
+            "--name-only",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    let committed = String::from_utf8_lossy(&committed.stdout);
+    for path in paths {
+        assert!(committed.lines().any(|line| line == path), "{committed}");
+    }
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(status.stdout.is_empty(), "{:?}", status.stdout);
+}
+
+#[tokio::test]
+async fn guarded_git_commit_waits_for_exactly_one_current_turn_approval() {
+    let tmp = init_git_repo();
+    std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+    git_ok(tmp.path(), &["add", "tracked.txt"]);
+    git_ok(tmp.path(), &["commit", "-q", "-m", "seed"]);
+    std::fs::write(tmp.path().join("tracked.txt"), "after\n").unwrap();
+    let start_head = git_rev_parse(tmp.path(), "HEAD");
+
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(None));
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let turn = chat_turn(
+        "提交 Git 记录，不要跑评审",
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    );
+    let approval_holder = turn.approval_holder.clone();
+    let task = tokio::spawn(drive_chat_session_turn(turn));
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if approval_holder.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Guarded commit must expose one approval pause");
+    assert_eq!(
+        git_rev_parse(tmp.path(), "HEAD"),
+        start_head,
+        "the host transaction must not start before the current approval"
+    );
+    {
+        let approval = approval_holder.lock().unwrap();
+        let approval = approval.as_ref().expect("approval remains pending");
+        assert_eq!(approval.action, "git commit");
+        assert_eq!(approval.target, tmp.path().display().to_string());
+    }
+    allow_pending_approval(&approval_holder);
+    task.await.unwrap();
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::HostGitDone { result: Ok(_) })
+    ));
+    assert!(
+        route_rx.try_recv().is_err(),
+        "approved success emits no AgenticDone/Failed tail"
+    );
+    assert_ne!(git_rev_parse(tmp.path(), "HEAD"), start_head);
+    let events = std::iter::from_fn(|| engine_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event, EngineEvent::Note(note) if note.contains("git commit")
+                    && note.contains(&tmp.path().display().to_string()))
+            })
+            .count(),
+        1,
+        "one Guarded turn must request approval exactly once: {events:?}"
+    );
+    assert!(!ran_governance_qc(&events), "{events:?}");
+}
+
+#[tokio::test]
+async fn guarded_git_commit_without_an_interactive_approval_has_one_host_terminal() {
+    let tmp = init_git_repo();
+    std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+    git_ok(tmp.path(), &["add", "tracked.txt"]);
+    git_ok(tmp.path(), &["commit", "-q", "-m", "seed"]);
+    std::fs::write(tmp.path().join("tracked.txt"), "after\n").unwrap();
+    let start_head = git_rev_parse(tmp.path(), "HEAD");
+    let (sink, _engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut turn = chat_turn(
+        "提交git记录",
+        ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(None)),
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    );
+    turn.interactive = false;
+    drive_chat_session_turn(turn).await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::HostGitDone { result: Err(_) })
+    ));
+    assert!(
+        route_rx.try_recv().is_err(),
+        "denial emits no generic AgenticDone/Failed tail"
+    );
+    assert_eq!(git_rev_parse(tmp.path(), "HEAD"), start_head);
+}
+
+#[tokio::test]
+async fn explicit_current_turn_commit_confirmation_needs_no_second_approval() {
+    let tmp = init_git_repo();
+    std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+    git_ok(tmp.path(), &["add", "tracked.txt"]);
+    git_ok(tmp.path(), &["commit", "-q", "-m", "seed"]);
+    std::fs::write(tmp.path().join("tracked.txt"), "after\n").unwrap();
+    let start_head = git_rev_parse(tmp.path(), "HEAD");
+
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(None));
+    let (sink, _engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let turn = chat_turn(
+        "确定提交",
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    );
+    let approval_holder = turn.approval_holder.clone();
+    drive_chat_session_turn(turn).await;
+
+    assert!(approval_holder.lock().unwrap().is_none());
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::HostGitDone { result: Ok(_) })
+    ));
+    assert_ne!(git_rev_parse(tmp.path(), "HEAD"), start_head);
+}
+
+#[tokio::test]
+async fn resident_git_commit_preserves_an_existing_parked_base_without_touching_it() {
+    let tmp = init_git_repo();
+    std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    std::fs::write(tmp.path().join("tracked.txt"), "after\n").unwrap();
+
+    let forks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (base, sent, ended) = FakeChatSession::new(Vec::new());
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(
+            base.with_id("parked-before-commit")
+                .with_fork_probe(Arc::clone(&forks)),
+        )),
+    )));
+    let identity = SessionIdentity::for_launch(
+        "claude-code",
+        tmp.path(),
+        umadev_runtime::BasePermissionProfile::Guarded,
+    )
+    .unwrap();
+    *holder.identity.write().unwrap() = Some(identity.clone());
+
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    drive_chat_session_turn(auto_chat_turn(
+        "提交git记录",
+        holder.clone(),
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::HostGitDone { result: Ok(_) })
+    ));
+    assert_eq!(forks.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(sent.lock().unwrap().is_empty(), "base received no turn");
+    assert!(
+        !ended.load(std::sync::atomic::Ordering::SeqCst),
+        "host Git must not end the parked base"
+    );
+    assert_eq!(*holder.identity.read().unwrap(), Some(identity));
+    let guard = holder.lock().await;
+    let Some(ResidentChat::Primed(session)) = guard.as_ref() else {
+        panic!("the exact parked resident was not preserved");
+    };
+    assert_eq!(session.session_id(), Some("parked-before-commit"));
+
+    let events = std::iter::from_fn(|| engine_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(!saw_build_intent_card(&events), "{events:?}");
+    assert!(!ran_governance_qc(&events), "{events:?}");
+}
+
+#[tokio::test]
+async fn resident_git_commit_bypasses_a_prior_base_question_without_consuming_it() {
+    let tmp = init_git_repo();
+    std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    std::fs::write(tmp.path().join("tracked.txt"), "after\n").unwrap();
+    let start_head = git_rev_parse(tmp.path(), "HEAD");
+
+    let (fake, sent, ended) = FakeChatSession::new(Vec::new());
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(fake)),
+    )));
+    let pending: PendingAskHolder = Arc::new(tokio::sync::Mutex::new(
+        umadev_runtime::AskUserQuestion::from_tool_input(
+            "AskUserQuestion",
+            &serde_json::json!({
+                "questions": [{
+                    "header": "Old",
+                    "question": "Choose a prior option?",
+                    "options": [{"label": "A"}, {"label": "B"}]
+                }]
+            }),
+        ),
+    ));
+    let (sink, _engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    drive_chat_session_turn(auto_chat_turn_with_pending(
+        "提交git记录",
+        holder,
+        pending.clone(),
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::HostGitDone { result: Ok(_) })
+    ));
+    assert_ne!(git_rev_parse(tmp.path(), "HEAD"), start_head);
+    assert!(sent.lock().unwrap().is_empty(), "the base receives no turn");
+    assert!(
+        !ended.load(std::sync::atomic::Ordering::SeqCst),
+        "the parked base is not ended"
+    );
+    assert!(
+        pending.lock().await.is_some(),
+        "an unrelated prior question is not consumed as the commit command's answer"
+    );
+}
+
+#[tokio::test]
+async fn resident_git_commit_preserves_a_quoted_multibyte_exact_scope() {
+    let tmp = init_git_repo();
+    std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+    let selected = "docs/中文 文件.md";
+    let other = "other.txt";
+    std::fs::write(tmp.path().join(selected), "before\n").unwrap();
+    std::fs::write(tmp.path().join(other), "before\n").unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["add", selected, other]);
+    git(&["commit", "-q", "-m", "seed"]);
+    std::fs::write(tmp.path().join(selected), "selected\n").unwrap();
+    std::fs::write(tmp.path().join(other), "must stay dirty\n").unwrap();
+
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(None));
+    let (sink, _engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let input = r#"提交git记录 "docs/中文 文件.md""#;
+    assert_eq!(
+        umadev_agent::deterministic_route(input).scope,
+        vec![selected.to_string()],
+        "the host transaction must receive the exact quoted scope"
+    );
+    drive_chat_session_turn(auto_chat_turn(
+        input,
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::HostGitDone { result: Ok(_) })
+    ));
+    let committed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args([
+            "-c",
+            "core.quotepath=false",
+            "show",
+            "--pretty=",
+            "--name-only",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&committed.stdout).trim(), selected);
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["status", "--porcelain", "--", other])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout).trim(),
+        "M other.txt"
+    );
+}
+
+#[tokio::test]
+async fn resident_literal_git_commit_preserves_native_staged_only_semantics() {
+    let tmp = init_git_repo();
+    for path in ["staged.txt", "unstaged.txt"] {
+        std::fs::write(tmp.path().join(path), "before\n").unwrap();
+    }
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["add", "staged.txt", "unstaged.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    std::fs::write(tmp.path().join("staged.txt"), "staged\n").unwrap();
+    std::fs::write(tmp.path().join("unstaged.txt"), "stay dirty\n").unwrap();
+    git(&["add", "staged.txt"]);
+
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(None));
+    let (sink, _engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    drive_chat_session_turn(auto_chat_turn(
+        r#"git commit -m "document --amend behavior; only staged""#,
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::HostGitDone { result: Ok(_) })
+    ));
+    let committed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["show", "--pretty=", "--name-only", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&committed.stdout).trim(),
+        "staged.txt"
+    );
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["status", "--porcelain", "--", "unstaged.txt"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout).trim(),
+        "M unstaged.txt"
+    );
+}
+
+#[tokio::test]
+async fn resident_forbidden_literal_commit_flag_never_reaches_the_host_transaction() {
+    let tmp = init_git_repo();
+    std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    let start_head = git_rev_parse(tmp.path(), "HEAD");
+    std::fs::write(tmp.path().join("tracked.txt"), "after\n").unwrap();
+
+    let (readonly, readonly_sent, _readonly_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "build",
+                "authorization": "mutating",
+                "kind": "greenfield",
+                "complexity": "complex",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let forks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (parent, parent_sent, _parent_ended) = FakeChatSession::new(Vec::new());
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(
+            parent
+                .with_fork(Box::new(readonly))
+                .with_fork_probe(Arc::clone(&forks)),
+        )),
+    )));
+    let (sink, _engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    drive_chat_session_turn(chat_turn(
+        r#"git commit --no-verify -m "must not run""#,
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    let note = match route_rx.try_recv() {
+        Ok(RouteDecision::HostGitDone { result: Err(note) }) => note,
+        other => panic!("expected the local host-operation firewall, got {other:?}"),
+    };
+    assert_eq!(
+        note,
+        umadev_i18n::tl("intent.git_commit_host_boundary"),
+        "{note}"
+    );
+    assert!(
+        route_rx.try_recv().is_err(),
+        "local error emits exactly one HostGitDone terminal"
+    );
+    assert!(
+        parent_sent.lock().unwrap().is_empty(),
+        "the writable parent never receives an unsupported literal command"
+    );
+    assert!(
+        readonly_sent.lock().unwrap().is_empty(),
+        "the read-only intent child is never consulted"
+    );
+    assert_eq!(
+        forks.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the host firewall rejects the unsupported Git command before any model fork"
+    );
+    assert_eq!(git_rev_parse(tmp.path(), "HEAD"), start_head);
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["status", "--porcelain", "--", "tracked.txt"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout).trim(),
+        "M tracked.txt"
+    );
+}
+
+#[tokio::test]
+async fn resident_git_commit_holds_the_workspace_writer_lock_before_capture() {
+    let tmp = init_git_repo();
+    std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    let start_head = git_rev_parse(tmp.path(), "HEAD");
+    std::fs::write(tmp.path().join("tracked.txt"), "after\n").unwrap();
+
+    // Model another live UmaDev writer in this process. The host-only commit
+    // must fail before its filesystem baseline and before invoking Git.
+    let _other_writer = umadev_agent::run_lock::RunLock::acquire(tmp.path()).unwrap();
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(None));
+    let (sink, _engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    drive_chat_session_turn(auto_chat_turn(
+        "提交git记录",
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::HostGitDone { result: Err(note) })
+            if note.contains("lock") || note.contains("运行")
+    ));
+    assert!(route_rx.try_recv().is_err());
+    assert_eq!(git_rev_parse(tmp.path(), "HEAD"), start_head);
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["status", "--porcelain", "--", "tracked.txt"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout).trim(),
+        "M tracked.txt"
+    );
+}
+
+#[tokio::test]
+async fn resident_git_commit_fails_closed_when_the_writer_lock_is_unowned() {
+    let tmp = init_git_repo();
+    std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    let start_head = git_rev_parse(tmp.path(), "HEAD");
+    std::fs::write(tmp.path().join("tracked.txt"), "after\n").unwrap();
+
+    // A non-directory runtime path makes the historical RunLock API fail open
+    // with an unowned guard. The host transaction must inspect that ownership
+    // bit and refuse the mutation.
+    std::fs::write(tmp.path().join(".umadev"), "not a directory").unwrap();
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(None));
+    let (sink, _engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    drive_chat_session_turn(auto_chat_turn(
+        "提交git记录",
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::HostGitDone { result: Err(note) })
+            if note.contains("writer") || note.contains("独占")
+    ));
+    assert!(route_rx.try_recv().is_err());
+    assert_eq!(git_rev_parse(tmp.path(), "HEAD"), start_head);
+    assert_eq!(
+        String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["status", "--porcelain", "--", "tracked.txt"])
+                .output()
+                .unwrap()
+                .stdout
+        )
+        .trim(),
+        "M tracked.txt"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resident_git_commit_rejects_active_hooks_without_running_or_entering_review() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = init_git_repo();
+    std::fs::write(tmp.path().join("tracked.txt"), "before\n").unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    std::fs::write(tmp.path().join("tracked.txt"), "after\n").unwrap();
+    let start_head = git_rev_parse(tmp.path(), "HEAD");
+    let status_before = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .unwrap()
+        .stdout;
+
+    let counter = tempfile::NamedTempFile::new().unwrap();
+    let counter_path = counter.path().to_string_lossy();
+    let hook = tmp.path().join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nprintf x >> '{}'\nprintf '\\033[31mblocked once\\033[0m' >&2\nexit 1\n",
+            counter_path.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(None));
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    drive_chat_session_turn(auto_chat_turn(
+        "提交git记录",
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::HostGitDone { result: Err(note) })
+            if note.contains("git-active-hooks-require-native-git")
+    ));
+    assert!(route_rx.try_recv().is_err());
+    assert_eq!(
+        std::fs::read(counter.path()).unwrap(),
+        b"",
+        "host-owned commit preflight must never execute repository hooks"
+    );
+    assert_eq!(git_rev_parse(tmp.path(), "HEAD"), start_head);
+    let status_after = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(status_after, status_before, "index and worktree stay exact");
+    let events = std::iter::from_fn(|| engine_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(!saw_build_intent_card(&events), "{events:?}");
+    assert!(!ran_governance_qc(&events), "{events:?}");
+}
+
 #[test]
 fn a_parked_read_only_session_cannot_leak_into_the_next_writable_turn() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -5801,12 +7144,12 @@ fn a_parked_read_only_session_cannot_leak_into_the_next_writable_turn() {
     );
 
     assert!(
-        usable.is_none(),
-        "a Plan process is never reused as a writer"
+        matches!(usable, Some(ResidentChat::ReadOnlyPrimed(_))),
+        "a Plan process may be reused only as the mechanically read-only routing parent"
     );
     assert!(
-        matches!(stale, Some(ResidentChat::ReadOnlyPrimed(_))),
-        "the old read-only process is detached so the caller opens a fresh writer"
+        stale.is_none(),
+        "the caller closes this Plan parent and opens a fresh writer only after a mutating route"
     );
 }
 
@@ -5895,6 +7238,88 @@ async fn resident_model_read_only_intent_uses_child_and_never_reaches_writer() {
         *holder.lock().await,
         Some(ResidentChat::ReadOnlyPrimed(_))
     ));
+    for sentinel in [
+        ".umadev/run.lock",
+        ".umadev/run.lock.guard",
+        ".umadev/run.owner",
+    ] {
+        assert!(
+            !tmp.path().join(sentinel).exists(),
+            "a mechanically read-only chat must not create `{sentinel}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resident_writable_fallback_fails_before_send_when_another_writer_holds_the_lock() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let target = tmp.path().join("answer.txt");
+    std::fs::write(&target, "before\n").unwrap();
+    let other_writer = umadev_agent::run_lock::RunLock::acquire(tmp.path()).unwrap();
+    assert!(other_writer.is_owned());
+
+    // No fork is available, so the deterministic fallback classifies the explicit
+    // edit as QuickEdit. The send effect models a base that mutates immediately,
+    // before UmaDev receives its ToolCall event.
+    let events = vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Edit".into(),
+            input: serde_json::json!({
+                "file_path": "answer.txt",
+                "old_string": "before",
+                "new_string": "after"
+            }),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "edited".into(),
+        },
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ];
+    let effect_target = target.clone();
+    let (writer, sent, _ended) = FakeChatSession::new(vec![events]);
+    let writer = writer.with_send_effect(move || {
+        std::fs::write(effect_target, "after\n").unwrap();
+    });
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    drive_chat_session_turn(chat_turn(
+        "把 answer.txt 里的 before 改成 after",
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    let failure = route_rx.try_recv();
+    assert!(
+        matches!(&failure, Ok(RouteDecision::Failed(note))
+            if note.contains("单写者锁") || note.contains("workspace writer lock")),
+        "lock conflict must be an explicit terminal failure: {failure:?}"
+    );
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "the writable base must receive no turn before writer-lock ownership"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "before\n",
+        "the base send effect must never get an opportunity to mutate"
+    );
+    assert!(
+        std::iter::from_fn(|| engine_rx.try_recv().ok())
+            .any(|event| matches!(event, EngineEvent::Note(note)
+                if note.contains("单写者锁") || note.contains("workspace writer lock"))),
+        "the lock failure must be visible in the transcript"
+    );
 }
 
 #[tokio::test]
@@ -6771,11 +8196,45 @@ fn write_tool_turn(rel: &str) -> Vec<umadev_runtime::SessionEvent> {
     ]
 }
 
+/// Give a resident writer the same child-session surfaces a healthy base exposes
+/// in production: one bounded intent probe followed by enough independent,
+/// read-only reviewers for the largest quality roster.
+///
+/// The intent response is deliberately unusable so these availability-fallback
+/// tests continue to exercise the deterministic resident route. The later
+/// children return clean, typed review verdicts; a healthy review fixture must
+/// not accidentally model reviewer transport failure.
+fn with_fallback_intent_and_clean_reviewers(mut writer: FakeChatSession) -> FakeChatSession {
+    let (intent, _sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta("intent unavailable".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    writer = writer.with_fork(Box::new(intent));
+
+    // The quality roster is capped at eight seats. Each seat receives its own
+    // fresh child and exactly one strict-JSON verdict turn.
+    for _ in 0..8 {
+        let (reviewer, _sent, _ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::TextDelta(r#"{"accepts":true,"blocking":[]}"#.into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]]);
+        writer = writer.with_fork(Box::new(reviewer));
+    }
+    writer
+}
+
 /// Drive ONE resident chat turn on a scripted base (a `FakeChatSession` pre-loaded
-/// `Primed`, so the intent consult falls open to the DETERMINISTIC route — never
-/// `Brain` — hence `routed_build` is always false and only the REACTIVE path can
-/// trip governance QC). `write` optionally names a file the base's tool actually
-/// creates on disk (the send effect), so the honesty floor sees real source.
+/// `Primed`; its scripted intent child returns no usable typed route, so the consult
+/// falls open to the DETERMINISTIC route — never `Brain` — hence `routed_build` is
+/// always false and only the REACTIVE path can trip governance QC). `write`
+/// optionally names a file the base's tool actually creates on disk (the send
+/// effect), so the honesty floor sees real source.
 /// Returns every engine event + terminal route decision the turn emitted.
 async fn drive_resident_turn(
     root: &std::path::Path,
@@ -6796,6 +8255,7 @@ async fn drive_resident_turn(
         }
         None => writer,
     };
+    let writer = with_fallback_intent_and_clean_reviewers(writer);
     let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
         ResidentChat::Primed(Box::new(writer)),
     )));
@@ -6821,12 +8281,57 @@ async fn drive_resident_turn(
     (engine, routes)
 }
 
+/// Drive a mechanically read-only resident answer. The writable parent is used
+/// only to fork the Plan child; the child performs both intent classification and
+/// the answer, matching the production Chat/Explain path that needs no writer lock.
+async fn drive_resident_readonly_turn(
+    root: &std::path::Path,
+    requirement: &str,
+    answer: Vec<umadev_runtime::SessionEvent>,
+) -> (Vec<EngineEvent>, Vec<RouteDecision>) {
+    let route = vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "explain",
+                "authorization": "read_only",
+                "kind": "light",
+                "complexity": "simple",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ];
+    let (readonly, _readonly_sent, _readonly_ended) = FakeChatSession::new(vec![route, answer]);
+    let (parent, _parent_sent, _parent_ended) = FakeChatSession::new(Vec::new());
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(parent.with_fork(Box::new(readonly)))),
+    )));
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut turn = chat_turn(
+        requirement,
+        holder,
+        Arc::new(sink),
+        route_tx,
+        root.to_path_buf(),
+    );
+    turn.interactive = false;
+    drive_chat_session_turn(turn).await;
+    let engine = std::iter::from_fn(|| engine_rx.try_recv().ok()).collect();
+    let routes = std::iter::from_fn(|| route_rx.try_recv().ok()).collect();
+    (engine, routes)
+}
+
 /// True if the events carry `run_post_build_qc`'s opening note (the flagship QC
 /// pass actually ran on this turn).
 fn ran_governance_qc(events: &[EngineEvent]) -> bool {
     events
         .iter()
-        .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("构建完成")))
+        .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("构建执行已结束，尚未验收")))
 }
 
 /// True if a BUILD-shaped intent card was emitted (`react_to_first_write` promoted
@@ -6911,7 +8416,8 @@ async fn resident_pure_chat_stays_cheap_even_with_the_flag() {
             usage: None,
         },
     ];
-    let (events, routes) = drive_resident_turn(tmp.path(), "解释一下这段代码", batch, None).await;
+    let (events, routes) =
+        drive_resident_readonly_turn(tmp.path(), "解释一下这段代码", batch).await;
 
     assert!(
         !ran_governance_qc(&events),
@@ -6920,6 +8426,11 @@ async fn resident_pure_chat_stays_cheap_even_with_the_flag() {
     assert!(
         !tmp.path().join(".umadev/run.lock").exists(),
         "a pure-chat turn takes no run-lock"
+    );
+    assert!(
+        !tmp.path().join(".umadev/run.lock.guard").exists()
+            && !tmp.path().join(".umadev/run.owner").exists(),
+        "a pure-chat turn leaves no writer-lock sentinel or owner metadata"
     );
     assert!(
         !events
@@ -7027,6 +8538,106 @@ async fn resident_reactive_build_completes_as_director_build_and_settles_ledger(
         runs.iter()
             .any(|run| run.tasks.iter().any(|task| task.state.is_terminal())),
         "M4: the reactive build's ledger entry durably SETTLED (terminal): {runs:?}"
+    );
+}
+
+#[tokio::test]
+async fn resident_required_review_outage_pauses_without_success_repair_or_repeat() {
+    let _qc = ReactiveQcOverride::force(true);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let requirement = "完善大型企业级 SaaS 登录系统，包含前后端、安全校验和自动化测试".to_string();
+    let route_reply = vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "quick_edit",
+                "authorization": "mutating",
+                "kind": "light",
+                "complexity": "simple",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ];
+    let (intent, intent_sent, _intent_ended) = FakeChatSession::new(vec![route_reply]);
+    let (writer, writer_sent, writer_ended) =
+        FakeChatSession::new(vec![write_tool_turn("src/lib.rs")]);
+    let target = tmp.path().join("src/lib.rs");
+    let writer = writer
+        .with_fork(Box::new(intent))
+        .with_send_effect(move || {
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, "pub fn login() -> bool { true }\n").unwrap();
+        });
+    let chat_holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let turn = chat_turn(
+        &requirement,
+        chat_holder.clone(),
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    );
+    let director_holder = turn.director_session_holder.clone();
+
+    drive_chat_session_turn(turn).await;
+
+    let routes = std::iter::from_fn(|| route_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        routes
+            .iter()
+            .any(|route| matches!(route, RouteDecision::RunPausedAtOperational { .. })),
+        "required reviewer transport failure must become a resumable pause: {routes:?}"
+    );
+    assert!(
+        !routes
+            .iter()
+            .any(|route| matches!(route, RouteDecision::AgenticDone { .. })),
+        "an unavailable required reviewer must never publish build success: {routes:?}"
+    );
+    assert_eq!(intent_sent.lock().unwrap().len(), 1, "one intent consult");
+    assert_eq!(
+        writer_sent.lock().unwrap().len(),
+        1,
+        "only the user's source turn runs; no outage-driven repair or repeat review"
+    );
+    assert!(
+        !writer_ended.load(std::sync::atomic::Ordering::SeqCst),
+        "the live base is preserved at the operational boundary"
+    );
+    assert!(
+        chat_holder.lock().await.is_none(),
+        "the paused run no longer masquerades as an ordinary chat session"
+    );
+    assert!(
+        director_holder.lock().await.is_some(),
+        "the exact live base is parked for /continue"
+    );
+    let state = umadev_agent::read_workflow_state(tmp.path())
+        .expect("the operational pause persists fresh-process resume context");
+    assert_eq!(state.requirement, requirement);
+    assert_eq!(state.phase, "quality");
+    assert!(umadev_agent::has_resumable_director_plan(tmp.path()));
+    let runs = umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 8);
+    assert!(
+        runs.iter()
+            .any(|run| run.tasks.iter().any(|task| {
+                task.state == umadev_agent::task_lifecycle::AgentTaskState::Waiting
+            })),
+        "the resident writer ledger remains waiting rather than succeeded: {runs:?}"
+    );
+    let events = std::iter::from_fn(|| engine_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::Note(note) if note.contains("/continue"))),
+        "{events:?}"
     );
 }
 
@@ -7200,10 +8811,12 @@ async fn cancel_terminal_immediately_dispatches_oldest_preserved_chat() {
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
     let live_input_hub = LiveInputHub::default();
+    let director_session_holder: SessionHolder = Arc::new(tokio::sync::Mutex::new(None));
 
     let handle = settle_cancel_and_drain_next(
         &mut app,
         &chat_holder,
+        &director_session_holder,
         &pending,
         &approval,
         &host_input,
@@ -7625,6 +9238,7 @@ fn chat_turn(
         permissions: umadev_runtime::BasePermissionProfile::Guarded,
         resume_session_id: None,
         chat_session,
+        director_session_holder: Arc::new(tokio::sync::Mutex::new(None)),
         pending_ask: Arc::new(tokio::sync::Mutex::new(None)),
         sink,
         route_tx,
@@ -7637,6 +9251,19 @@ fn chat_turn(
         steer_holder: Arc::new(std::sync::Mutex::new(Vec::new())),
         live_input_hub: LiveInputHub::default(),
     }
+}
+
+fn auto_chat_turn(
+    text: &str,
+    chat_session: ChatSessionHolder,
+    sink: Arc<ChannelSink>,
+    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    project_root: std::path::PathBuf,
+) -> ChatSessionTurn {
+    let mut turn = chat_turn(text, chat_session, sink, route_tx, project_root);
+    turn.mode = umadev_agent::TrustMode::Auto;
+    turn.permissions = umadev_runtime::BasePermissionProfile::Auto;
+    turn
 }
 
 /// Like [`chat_turn`] but pins the turn to a CALLER-OWNED `pending_ask` holder so
@@ -7654,6 +9281,27 @@ fn chat_turn_with_pending(
         pending_ask,
         ..chat_turn(text, chat_session, sink, route_tx, project_root)
     }
+}
+
+fn auto_chat_turn_with_pending(
+    text: &str,
+    chat_session: ChatSessionHolder,
+    pending_ask: PendingAskHolder,
+    sink: Arc<ChannelSink>,
+    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    project_root: std::path::PathBuf,
+) -> ChatSessionTurn {
+    let mut turn = chat_turn_with_pending(
+        text,
+        chat_session,
+        pending_ask,
+        sink,
+        route_tx,
+        project_root,
+    );
+    turn.mode = umadev_agent::TrustMode::Auto;
+    turn.permissions = umadev_runtime::BasePermissionProfile::Auto;
+    turn
 }
 
 /// Fix A: a base-reported `TurnStatus::Failed` (a 429 / overloaded blip) on a

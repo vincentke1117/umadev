@@ -44,17 +44,21 @@ use crate::prompt_queue_ui::PromptQueueUi;
 
 mod backend;
 mod frozen_plan;
+mod host_git;
 pub(crate) mod host_input;
 mod lessons_view;
 mod memory_view;
 mod plan_view;
 mod read_only_metric;
+mod run_pause;
 mod submission;
 mod task_control;
 mod usage_meter;
 
 pub(crate) use backend::{parse_probe_detail, PROBE_AUTH_SENTINEL};
 use backend::{refresh_picker_with_probes, step_items};
+use host_git::QueuedResidentKind;
+pub(crate) use host_git::ResidentDispatch;
 use lessons_view::{format_lessons_report, format_pitfalls_report};
 use memory_view::{compact_audit_id, MemoryParseError, MemoryTuiCommand, MemoryViewScope};
 use read_only_metric::read_only_metric;
@@ -525,23 +529,6 @@ fn parse_memory_command(input: &str) -> Result<MemoryTuiCommand, MemoryParseErro
 pub struct SubmittedTurn {
     pub(crate) text: String,
     pub(crate) input: TurnInput,
-}
-
-/// One serialized resident-session input waiting for the sole base writer.
-/// Native commands stay typed while queued so they can never be reclassified as
-/// chat, live steering, or a Director request when the preceding turn settles.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum ResidentDispatch {
-    /// A normal natural-language turn that must go through model-first routing.
-    RoutedChat(String),
-    /// An advertised or explicitly wrapped base command sent byte-for-byte.
-    NativeCommand(String),
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum QueuedResidentKind {
-    RoutedChat,
-    NativeCommand,
 }
 
 impl SubmittedTurn {
@@ -1233,6 +1220,9 @@ pub enum RunState {
     /// `/continue`. Distinct from [`Self::PausedAtGate`]: there is no gate card, just
     /// a resumable plan on disk.
     PausedAtBudget,
+    /// Parked because a required reviewer/host was operationally unavailable.
+    /// The plan is intact and `/continue` retries the same step.
+    PausedAtOperational,
     /// A full run reached delivery cleanly (`[ok] delivered`).
     Delivered,
     /// A block ended TERMINALLY short of delivery because the base degraded to
@@ -3331,6 +3321,9 @@ pub struct App {
     /// points at `/continue`; there is NO gate to approve, so it does not set
     /// `active_gate` or `director_gate_paused`.
     pub(crate) budget_paused: bool,
+    /// Host-owned reason for a resumable operational pause. `Some` implies
+    /// `budget_paused` is also true so existing resume routing remains shared.
+    pub(crate) operational_pause_reason: Option<String>,
     /// A Director `GateOpened` event that arrived before the Director session was
     /// fully ended. The gate is staged here and becomes interactive only when the
     /// matching terminal `RunPausedAtGate` decision lands, preventing approval or
@@ -3514,6 +3507,10 @@ pub struct App {
     /// (fire-and-forget) chat-route spinner. Cleared on every terminal agentic
     /// outcome (done / failed / cancel).
     pub agentic_in_flight: bool,
+    /// A host-owned Git transaction is the sole task in the event-loop slot.
+    /// Its settle/cancel path must never reset a parked Director run or consume
+    /// any resident base-session identity.
+    pub(crate) host_git_in_flight: bool,
     /// Session-level override for `auto_approve_gates` set via `/manual`
     /// (`Some(false)`) or `/auto` (`Some(true)`). `None` → use the project's
     /// `.umadevrc` value. Lets the user flip review mode mid-session without
@@ -4150,6 +4147,7 @@ impl App {
             director_run_in_flight: false,
             director_gate_paused: false,
             budget_paused: false,
+            operational_pause_reason: None,
             pending_director_gate: None,
             gate_query_in_flight: false,
             gate_query_epoch: 0,
@@ -4196,6 +4194,7 @@ impl App {
             thinking_block_start: None,
             thinking_block_idx: None,
             agentic_in_flight: false,
+            host_git_in_flight: false,
             auto_approve_override: None,
             trust_mode_override: None,
             config_trust_cache: std::cell::Cell::new(None),
@@ -5392,6 +5391,12 @@ impl App {
                     umadev_i18n::t(self.lang, "status.budget_paused")
                 )
             }
+            RunState::PausedAtOperational => {
+                format!(
+                    " · [paused] {}",
+                    umadev_i18n::t(self.lang, "status.operational_paused")
+                )
+            }
             RunState::Running | RunState::PausedAtGate | RunState::Idle => String::new(),
         };
         let ds_short = self
@@ -5434,6 +5439,8 @@ impl App {
             RunState::Running
         } else if self.active_gate.is_some() {
             RunState::PausedAtGate
+        } else if self.operational_pause_reason.is_some() {
+            RunState::PausedAtOperational
         } else if self.budget_paused {
             // A budget pause reads as a PAUSE (timer stopped, not aborted). Checked
             // before the `run_started_at` Running fallback so a parked run whose
@@ -5467,6 +5474,7 @@ impl App {
         // A resumed / fresh working turn clears a prior budget pause too, so its
         // `[paused]` label / hint can't paint over a turn that is demonstrably working.
         self.budget_paused = false;
+        self.operational_pause_reason = None;
     }
 
     /// `true` while the user has started a run that hasn't reached
@@ -8776,6 +8784,7 @@ impl App {
                 self.aborted = false;
                 self.degraded = false;
                 self.budget_paused = false;
+                self.operational_pause_reason = None;
                 self.run_degraded_seen = false;
                 self.run_started_at = Some(std::time::Instant::now());
                 self.push(
@@ -9022,6 +9031,11 @@ impl App {
                     self.maybe_announce_preview();
                 }
             }
+            EngineEvent::OperationalPaused {
+                reason,
+                done,
+                total,
+            } => self.record_run_paused_at_operational(reason, done, total),
             EngineEvent::BlockCompleted {
                 final_phase,
                 paused_at,
@@ -10840,6 +10854,9 @@ impl App {
             self.answer_live_meta(intent, text);
             return Action::None;
         }
+        if umadev_agent::request_has_git_commit_operation(&text) {
+            return self.submit_host_git_operation(turn);
+        }
         // Do not accept a real base turn when startup probing has already proved
         // that the selected executable is unavailable. Preserve the full structured
         // input (including attachments) so the user can repair PATH/switch base and
@@ -11553,76 +11570,6 @@ impl App {
         self.refresh_status();
     }
 
-    /// A DIRECTOR build parked because its wall-clock budget was exhausted while
-    /// resumable steps remained (Stage 1/2) — the terminal `RunPausedAtBudget`
-    /// decision's recorder. Mirrors [`Self::record_run_paused_at_gate`] but for a
-    /// PAUSE with no gate: it clears the in-flight "thinking…" state and the live
-    /// counters (so the timer stops and the status reads `[paused]`, NEVER
-    /// `[aborted]`), arms [`Self::budget_paused`] so `run_state` reads
-    /// [`RunState::PausedAtBudget`], keeps the plan panel visible in a FROZEN
-    /// (interrupted) form so the user can see what was saved, and pushes the
-    /// `/continue` resume hint carrying `done/total`.
-    ///
-    /// This deliberately does NOT route through [`Self::mark_block_aborted`]: a budget
-    /// pause is a resumable settle, not an honest hard abort — the plan is intact on
-    /// disk and `/continue` re-drives only the remaining steps.
-    pub(crate) fn record_run_paused_at_budget(&mut self, done: usize, total: usize) {
-        // An away user should hear that the run parked (same as the abort/deliver
-        // paths). Arm before the timers are cleared, gated on how long it had run.
-        self.arm_completion_bell(self.run_started_at.or(self.thinking_started));
-        self.thinking = false;
-        self.thinking_started = None;
-        self.agentic_in_flight = false;
-        self.tool_in_progress = false;
-        self.long_op_in_progress = false;
-        self.stream_text_active = false;
-        self.stream_tool_batch = None;
-        self.collapse_thinking_block();
-        self.reset_stream_md_cache();
-        // The writer session is gone; what remains is the parked plan on disk.
-        self.director_run_in_flight = false;
-        self.budget_paused = true;
-        // Clear the pipeline-live flag AND settle the run's registry task so it is no
-        // longer `Running`. A leftover `run_started`/`Running` task keeps
-        // `has_active_run()` — hence `has_interruptible_work()` — TRUE on a run that has
-        // actually PARKED, which made `/continue` answer "a run is still in flight" and
-        // do nothing, ESC arm a phantom interrupt, and `/codex` refuse as busy. Settle
-        // it `Stopped` (a resumable pause, not `Failed`/`Done`); a `/continue`
-        // re-registers the resumed run. (`is_pipeline_active()` already excludes a
-        // budget pause; this also frees `active_task()`.)
-        self.run_started = false;
-        self.mark_active_task(TaskStatus::Stopped);
-        // Stop every live counter so the status bar reflects a real paused state.
-        self.run_started_at = None;
-        self.phase_started_at = None;
-        self.last_output_at = None;
-        self.transient_status = None;
-        // Keep the plan panel: drop the LIVE panel, then bring the saved plan back in
-        // a FROZEN (interrupted) form so the user sees the completed / remaining steps
-        // and that `/continue` resumes them. Fail-open (no readable plan → empty).
-        self.clear_live_panels();
-        self.rehydrate_frozen_plan_now();
-        // The one-line resume hint carrying where the run parked (done/total steps).
-        self.push(
-            ChatRole::System,
-            umadev_i18n::tf(
-                self.lang,
-                "run.budget_pause_resume_hint",
-                &[&done.to_string(), &total.to_string()],
-            ),
-        );
-        // A parked run fires no gate/completion, so drain any queued steer (same as
-        // the abort path) so its "queued N" chip can't stay falsely lit forever.
-        if !self.queued_steer.is_empty() {
-            let text = self.queued_steer.drain(..).collect::<Vec<_>>().join("\n");
-            self.push(
-                ChatRole::System,
-                umadev_i18n::tf(self.lang, "run.queued_dropped", &[&text]),
-            );
-        }
-        self.refresh_status();
-    }
-
     /// Settle a read-only answer asked while a gate remains open. The streamed
     /// body is already visible; this records it in durable model memory and clears
     /// only the query spinner — never the gate or its Director pause marker.
@@ -11911,6 +11858,11 @@ impl App {
                 self.last_dispatched_chat = None;
                 Some(ResidentDispatch::NativeCommand(text))
             }
+            QueuedResidentKind::HostGitCommit => {
+                self.pending_route_input = input;
+                self.last_dispatched_chat = Some(text.clone());
+                Some(ResidentDispatch::HostGitCommit(text))
+            }
         }
     }
 
@@ -11918,9 +11870,9 @@ impl App {
     #[cfg(test)]
     pub(crate) fn take_next_queued_chat(&mut self) -> Option<String> {
         match self.take_next_queued_dispatch()? {
-            ResidentDispatch::RoutedChat(text) | ResidentDispatch::NativeCommand(text) => {
-                Some(text)
-            }
+            ResidentDispatch::RoutedChat(text)
+            | ResidentDispatch::NativeCommand(text)
+            | ResidentDispatch::HostGitCommit(text) => Some(text),
         }
     }
 
@@ -12358,6 +12310,8 @@ impl App {
         self.run_started = false;
         self.active_gate = None;
         self.gate_choice = None;
+        self.budget_paused = false;
+        self.operational_pause_reason = None;
         // A fresh run supersedes any parked director gate (its plan is being
         // replaced) — the stale pause marker must not hijack the next approval.
         self.director_gate_paused = false;
@@ -12606,6 +12560,15 @@ impl App {
         // Seal any half-streamed reply BEFORE the reset clears the stream flag, so
         // the user sees the partial answer is incomplete (not the whole reply).
         self.seal_interrupted_stream();
+        if let Err(error) = umadev_agent::cancel_operational_review_pause(
+            &self.project_root,
+            "cancelled explicitly by the user",
+        ) {
+            self.push(
+                ChatRole::System,
+                format!("无法完整取消已暂停的评审任务，恢复指针已保留：{error}"),
+            );
+        }
         self.reset_for_new_run();
         self.run_started_at = None;
         self.phase_started_at = None;
@@ -12993,6 +12956,15 @@ impl App {
                 Action::None
             }
             "continue" => {
+                // A durable/in-memory requirement is context, never fresh
+                // authority to repeat a Git commit. Refuse before consuming a
+                // gate, registering a task, or constructing any resumed base
+                // session. This covers every `/continue` branch, including the
+                // chat-resume fallback when an obsolete workflow file remains.
+                let replay_requirement = self.resume_run_requirement();
+                if self.reject_replayed_host_git_operation(&replay_requirement) {
+                    return Some(Action::None);
+                }
                 // Plan may collect clarification, but it must never approve the
                 // docs/preview execution boundary or resume a mutating Director.
                 // Check before `take()` so the gate remains open and recoverable
@@ -13032,7 +13004,7 @@ impl App {
                     if self.reject_director_execution_in_plan() {
                         return Some(Action::None);
                     }
-                    let req = self.resume_run_requirement();
+                    let req = replay_requirement.clone();
                     self.push_resume_separator();
                     self.push(
                         ChatRole::UmaDev,
@@ -13058,7 +13030,7 @@ impl App {
                     // rather than telling the user to restart the whole pipeline. The
                     // requirement is read back from `.umadev/workflow-state.json` when
                     // the in-memory one is empty (a reopened TUI has none).
-                    let req = self.resume_run_requirement();
+                    let req = replay_requirement;
                     // Divider BEFORE the resuming note: the earlier steps stay in
                     // scrollback (the block never cleared the transcript) and the
                     // resumed run appends below this, so the whole run reads as one
@@ -13103,6 +13075,15 @@ impl App {
             "revise" => {
                 if rest.is_empty() {
                     self.push(ChatRole::System, umadev_i18n::t(self.lang, "revise.usage"));
+                    Action::None
+                } else if umadev_agent::request_has_git_commit_operation(rest) {
+                    // `/revise` is scoped to the artifact behind the open gate.
+                    // A commit is a separate host transaction, never revision
+                    // feedback to feed through the base/review pipeline.
+                    self.push(
+                        ChatRole::UmaDev,
+                        umadev_i18n::t(self.lang, "intent.git_commit_host_boundary"),
+                    );
                     Action::None
                 } else if let Some(gate) = self.active_gate {
                     self.record_trust_revision(gate.id_str());
@@ -13679,27 +13660,6 @@ impl App {
         }
     }
 
-    /// Refuse an explicit Director execution command while the session is in
-    /// Plan mode. Returns `true` when the command was consumed. This check lives
-    /// on the UI thread so `/run`, `/goal`, and cross-session resume settle before
-    /// task registration, run-lock/branch setup, workflow persistence, or host
-    /// session creation. Ordinary conversation remains available for read-only
-    /// research and planning.
-    fn reject_director_execution_in_plan(&mut self) -> bool {
-        if self.effective_trust_mode() != umadev_agent::TrustMode::Plan {
-            return false;
-        }
-        self.push(
-            ChatRole::UmaDev,
-            umadev_i18n::t(self.lang, "continuous.plan_mode_skip").to_string(),
-        );
-        self.push(
-            ChatRole::UmaDev,
-            umadev_i18n::t(self.lang, "mode.plan.gate").to_string(),
-        );
-        true
-    }
-
     fn slash_run(&mut self, arg: &str) -> Action {
         // Single-writer guard: only ONE workspace-mutating run at a time. A second
         // `/run` while one is live is politely rejected (never silently starts a
@@ -13718,9 +13678,6 @@ impl App {
             return Action::None;
         }
         if self.reject_director_execution_in_plan() {
-            return Action::None;
-        }
-        if self.reject_active_backend_unavailable() {
             return Action::None;
         }
         // The first token is the optional run SLUG only when it UNAMBIGUOUSLY looks
@@ -13750,6 +13707,17 @@ impl App {
                 return Action::None;
             }
             self.slug = slug;
+        }
+        // `/run` normally opts into the full Director workflow, but an ordinary
+        // Git-only transaction has no product phases to plan or review. Route it
+        // through the same host-owned resident lane as plain `提交git记录`; this
+        // also means it needs no installed/logged-in AI base. Plan was rejected
+        // above, while Guarded/Auto are enforced at the transaction boundary.
+        if let Some(action) = self.route_host_git_operation(&req) {
+            return action;
+        }
+        if self.reject_active_backend_unavailable() {
+            return Action::None;
         }
         if self.run_started {
             self.reset_for_new_run();
@@ -13785,6 +13753,9 @@ impl App {
         }
         if self.reject_director_execution_in_plan() {
             return Action::None;
+        }
+        if let Some(action) = self.route_host_git_operation(objective) {
+            return action;
         }
         let objective = objective.to_string();
         if self.run_started {
@@ -14537,6 +14508,12 @@ impl App {
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "quick.usage"));
             return Action::None;
         }
+        if self.reject_director_execution_in_plan() {
+            return Action::None;
+        }
+        if let Some(action) = self.route_host_git_operation(task) {
+            return action;
+        }
         if self.run_started {
             self.reset_for_new_run();
         }
@@ -14778,6 +14755,10 @@ impl App {
     fn slash_redo(&mut self, arg: &str) -> Action {
         if self.has_interruptible_work() || self.thinking {
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "redo.busy"));
+            return Action::None;
+        }
+        let replay_requirement = self.resume_run_requirement();
+        if self.reject_replayed_host_git_operation(&replay_requirement) {
             return Action::None;
         }
         let arg = arg.trim();

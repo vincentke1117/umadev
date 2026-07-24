@@ -227,7 +227,7 @@ flowchart LR
 
 ## How It Works
 
-A turn flows through up to five layers. Retrieval, governance helpers, and advisory critics have bounded safe degradation. Authentication, transport, hard-gate, and verification failures are surfaced honestly as degraded, blocked, incompatible, or failed work; they are never converted into success just to keep the flow moving.
+A turn flows through up to five layers. Retrieval and governance helpers have bounded safe degradation, and critic opinions never replace the deterministic floor. Once a critic is required at a review boundary, however, its transport or parse failure parks the run as operationally unavailable rather than fabricating acceptance. Authentication, transport, hard-gate, and verification failures are surfaced honestly as degraded, paused, blocked, incompatible, or failed work; they are never converted into success just to keep the flow moving.
 
 ```mermaid
 flowchart TB
@@ -317,8 +317,10 @@ flowchart TB
 How the team ships without stepping on itself:
 
 - **Doer roles** drive the main session serially to produce their deliverable. Only one writer touches source at a time (single-writer).
+- **Deployment boundary for the writer lock.** Cooperating UmaDev processes must use the same OS identity and stable per-user lock namespace, and the filesystem must provide coherent advisory-lock semantics. Cross-identity use is unsupported and its safety is not guaranteed. The workspace root path and every alias used to reach it must remain stable for the lifetime of a run: do not rename or replace the root, or retarget an entry symlink/junction. NFS/SMB also requires a verified cross-client lock manager and an invariant `.umadev` namespace for the lifetime of a run (the outer namespace guard is host-local); a single-machine test cannot certify either property.
 - **Reviewing roles** each run on a fresh independent Plan-profile child, in parallel, and return a `RoleVerdict` — `accepts`, `blocking` findings with evidence, and `advisory` notes. Read-only enforcement is vendor-specific; see the runtime matrix below.
 - **The coordinator aggregates deterministically.** The deterministic floor governs loop control; critic opinions are advisory only. Blocking findings are folded into one rework directive injected back into the main session, along with the evidence.
+- **A missing required review is an operational pause, not a pass or a code defect.** A reviewer timeout, startup failure, or unparseable/empty reply becomes `Unavailable`; it never fabricates acceptance and never asks the writer to repair source, run Docker, or repeat an automatic review loop. UmaDev checkpoints the live run without rendering completion or ending it. `/continue` retries the parked review boundary; when the source fingerprint is unchanged, already-passed source work and deterministic build/test checks are not replayed.
 - **Roles never chat to each other.** The shared blackboard is the output artifact files and the source tree. The only communication channel between roles is the verdict.
 - **The team scales with the task.** A bugfix convenes no team. A greenfield build convenes the full roster. Complexity determines the seats.
 
@@ -616,7 +618,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `/goal <objective>` | Keep working until the objective is met (same entry on all five; vendor-specific goal capability where exposed, coordinator persistence over ACP; `UMADEV_NO_GOAL_MODE=1` opts out) |
 | `/quick <task>` | Force the light path for a trivial one-off change |
 | `/plan [skip\|add\|veto\|up\|down <id>]` | View or steer the live dependency plan |
-| `/continue` (or `c` at a gate) | Approve the current gate and advance |
+| `/continue` (or `c` at a gate) | Approve the current confirmation gate, or retry a parked operational review without replaying unchanged source work |
 | `/revise <feedback>` | Stay at the gate, redo the current phase with feedback |
 | `/redo [phase]` | Re-run a phase block |
 | `/mode <plan\|guarded\|auto>` | Set the trust / autonomy tier |
@@ -709,7 +711,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 |---|---|
 | `umadev run "<requirement>" --backend <id>` | Run a pipeline, pausing at the `docs_confirm` gate (`--mode plan\|guarded\|auto` sets the trust tier) |
 | `umadev quick "<task>" --backend <id>` | Lean fast track for a trivial change (skips the heavy phases + gates) |
-| `umadev continue [--backend <id>]` | Approve the current gate |
+| `umadev continue [--backend <id>]` | Approve the current gate, or retry a parked operational review (reuses the previous backend) |
 | `umadev revise "<feedback>"` | Stay at the gate, record a revision, rerun the block |
 | `umadev redo <phase> [--backend <id>]` | Re-run one phase, reusing the prior run's context |
 | `umadev spec [--clauses]` | Print the spec (`--clauses` for the clause table) |

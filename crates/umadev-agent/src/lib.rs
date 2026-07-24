@@ -149,9 +149,10 @@ pub use director::{
     VerifyKind, VerifyResult,
 };
 pub use director_loop::{
-    drive_director_loop, drive_director_loop_resume, drive_director_loop_routed,
-    has_resumable_director_plan, has_resumable_run, is_budget_pause_reason,
-    persist_run_governance_context, run_post_build_qc, transient_resume_hint, DirectorLoopOutcome,
+    cancel_operational_review_pause, checkpoint_post_build_review_pause, drive_director_loop,
+    drive_director_loop_resume, drive_director_loop_routed, has_resumable_director_plan,
+    has_resumable_run, is_budget_pause_reason, persist_run_governance_context, run_post_build_qc,
+    transient_resume_hint, DirectorLoopOutcome, PostBuildOperationalPause, PostBuildQcOutcome,
 };
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use execution_contract::{ContractViolation, ExecutionContract};
@@ -221,9 +222,12 @@ pub use review::{
 };
 pub use router::{
     apply_authorization_ceiling, deterministic_route, looks_like_work_request,
-    requirement_demands_read_only, route, route_with_context_and_readonly_session,
-    route_with_context_and_source, route_with_source, Budget, ClarifyQuestion, Depth, RouteClass,
-    RoutePlan, RouteSource, RoutedIntent,
+    parse_git_commit_intent, parse_host_git_commit_request, request_explicitly_confirms_git_commit,
+    request_has_git_commit_operation, request_is_git_commit, request_is_unsupported_git_commit,
+    request_uses_literal_git_commit_command, requirement_demands_read_only, route,
+    route_with_context_and_readonly_session, route_with_context_and_source, route_with_source,
+    Budget, ClarifyQuestion, Depth, GitCommitIntent, GitVerifier, HostGitCommitRequest,
+    LiteralGitCommitSpec, RouteClass, RoutePlan, RouteSource, RoutedIntent,
 };
 pub use runner::{
     setup_new_run_isolation, setup_run_isolation, strict_coverage_from_env, AgentRunner,

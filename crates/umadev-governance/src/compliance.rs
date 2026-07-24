@@ -132,6 +132,13 @@ pub fn framework_for(clause_id: &str) -> ComplianceFrameworks {
             iso27001_annex_a: s(&["A.5.18", "A.8.2"]),
             eu_ai_act_article: s(&["Article 14"]),
         },
+        // Host-owned ordinary Git commits: current-turn authorization, an
+        // atomic and auditable change transaction, and guarded human approval.
+        "UD-FLOW-009" => ComplianceFrameworks {
+            soc2_cc: s(&["CC6.1", "CC8.1"]),
+            iso27001_annex_a: s(&["A.5.18", "A.8.32"]),
+            eu_ai_act_article: s(&["Article 12", "Article 14"]),
+        },
         // Layer 3 — artifacts
         "UD-ART-001" => ComplianceFrameworks {
             soc2_cc: s(&["CC2.2"]),

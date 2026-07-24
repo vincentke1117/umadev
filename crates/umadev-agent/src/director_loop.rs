@@ -96,8 +96,7 @@ use umadev_runtime::{
     HostResponse, SessionEvent, StreamEvent, ToolActivity, TurnStatus, Usage,
 };
 
-use crate::critics::ReviewStatus;
-use crate::director::{self, ReviewResult, VerifyKind, VerifyResult};
+use crate::director::{self, VerifyKind, VerifyResult};
 use crate::events::{EngineEvent, EventSink};
 use crate::knowledge_feedback::{commit_sent_memories, SentReceiptGuard, TurnOutcome};
 use crate::phases::KnowledgeDigest;
@@ -107,14 +106,36 @@ use crate::runner::RunOptions;
 use crate::trust::requires_confirmation_with_ledger;
 use umadev_spec::Phase;
 
+mod operational_review;
 mod quality_evidence;
 mod resume;
+mod review_checkpoint;
+mod step_metrics;
+mod step_review;
 
-use quality_evidence::{has_reproduction_test, runtime_proof_blocking};
+#[cfg(test)]
+use operational_review::post_build_rework_context;
+use operational_review::run_final_gate;
+pub use operational_review::{
+    cancel_operational_review_pause, checkpoint_post_build_review_pause, run_post_build_qc,
+    PostBuildOperationalPause, PostBuildQcOutcome,
+};
+use quality_evidence::{has_reproduction_test, runtime_proof_blocking, QcReport};
+use resume::{
+    clear_operational_review_checkpoint, load_operational_review_checkpoint,
+    operational_review_checkpoint_for_plan, save_operational_review_checkpoint,
+    OperationalReviewCheckpoint, FINAL_REVIEW_RETRY_STEP_ID,
+};
 pub use resume::{
     has_resumable_director_plan, has_resumable_run, is_budget_pause_reason, transient_resume_hint,
 };
 use resume::{load_resumable_plan, record_artifact_versions};
+use review_checkpoint::{
+    ensure_final_review_retry_step, ensure_final_review_retry_step_in_plan,
+    final_review_qc_receipt_matches,
+};
+use step_metrics::{record_run_sizing, record_step_first_pass};
+use step_review::{drive_review_step, retry_review_step_once};
 
 /// The hard ceiling on auto-QC feedback-fix rounds in one `/run`. One round is: the
 /// base builds (or fixes) end to end, then UmaDev runs its objective QC pass. A
@@ -720,6 +741,18 @@ pub enum DirectorLoopOutcome {
         /// Total steps in the plan (`plan.progress().1`).
         total: usize,
     },
+    /// A required reviewer or host capability was operationally unavailable.
+    /// The current plan step remains `Active` on disk (and is reset to `Pending`
+    /// by resume), the task ledger is parked, and `/continue` retries from that
+    /// exact boundary. This is not a code failure and never enters source rework.
+    PausedAtOperational {
+        /// Bounded host-owned evidence explaining why the review could not finish.
+        reason: String,
+        /// Completed steps at the pause.
+        done: usize,
+        /// Total steps in the plan.
+        total: usize,
+    },
 }
 
 /// Persist this run's derived governance context to `.umadev/governance-context.json`,
@@ -838,6 +871,18 @@ pub async fn drive_director_loop_routed(
         return DirectorLoopOutcome::Planned {
             reply: umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
         };
+    }
+
+    // This is an explicitly fresh run, not `/continue`. Settle the exact writer
+    // and plan ledger owned by a parked operational review before replacing its
+    // cursor; simply deleting the checkpoint strands a `Waiting` task forever.
+    if let Err(error) = cancel_operational_review_pause(
+        &options.project_root,
+        "superseded by an explicitly fresh run",
+    ) {
+        let reason = format!("parked operational review could not be superseded: {error}");
+        events.emit(EngineEvent::Note(format!("team · {reason}")));
+        return DirectorLoopOutcome::Failed(reason);
     }
 
     // 0. ONE RULE BOOK. Persist the derived governance context BEFORE anything is written.
@@ -976,13 +1021,43 @@ pub async fn drive_director_loop_resume(
         });
     }
 
-    // ONE RULE BOOK, on the resume door too (see `persist_run_governance_context`): a
-    // `/continue` drives the remaining steps and writes real code, so it must leave the
-    // same context on disk that the PreToolUse hook and `umadev ci` will judge by. A
-    // resumed run is still a run.
-    persist_run_governance_context(session, options).await;
-
     let mut plan = load_resumable_plan(&options.project_root)?;
+    let review_checkpoint = operational_review_checkpoint_for_plan(&options.project_root, &plan);
+    let exact_review_only_resume = match review_checkpoint.as_ref() {
+        Some(OperationalReviewCheckpoint::FinalGateReview {
+            qc_source_fingerprint,
+            ..
+        }) => {
+            final_review_qc_receipt_matches(&options.project_root, qc_source_fingerprint.as_deref())
+        }
+        Some(OperationalReviewCheckpoint::StepReview {
+            qc_source_fingerprint,
+            review_only,
+            ..
+        }) if *review_only => {
+            final_review_qc_receipt_matches(&options.project_root, qc_source_fingerprint.as_deref())
+        }
+        Some(OperationalReviewCheckpoint::StepReview {
+            step_id,
+            review_only: false,
+            ..
+        }) => plan
+            .steps
+            .iter()
+            .find(|step| step.id == *step_id)
+            .is_some_and(|step| step.kind == plan_state::StepKind::Review),
+        _ => false,
+    };
+
+    // ONE RULE BOOK, on the resume door too (see
+    // `persist_run_governance_context`): a continuation that can write real code
+    // refreshes the same context the hooks and CI judge by. The exact-review-only
+    // cursor is different: deterministic QC already passed for an unchanged input
+    // tree, so consulting governance again would add an unrelated reviewer fork
+    // and write before the one boundary `/continue` promised to retry.
+    if !exact_review_only_resume {
+        persist_run_governance_context(session, options).await;
+    }
 
     // The resume CLOSES any door the previous pause left open: re-sync the phase
     // state (its writes always clear `active_gate`), so `/status` stops reporting
@@ -1108,9 +1183,9 @@ fn settle_recipe_for_outcome(
         DirectorLoopOutcome::Planned { .. } => crate::recipes::RecipeOutcome::Unknown,
         // A gate OR budget pause is not terminal. The active marker carries this exact
         // receipt into `drive_director_loop_resume`, where it will settle once.
-        DirectorLoopOutcome::PausedAtGate { .. } | DirectorLoopOutcome::PausedAtBudget { .. } => {
-            return
-        }
+        DirectorLoopOutcome::PausedAtGate { .. }
+        | DirectorLoopOutcome::PausedAtBudget { .. }
+        | DirectorLoopOutcome::PausedAtOperational { .. } => return,
     };
     let _ = crate::recipes::settle_recipe_receipt(dir, receipt, outcome);
 }
@@ -1307,6 +1382,7 @@ async fn drive_director_loop_with_idle(
 
         // 4. Clean QC → the build is genuinely done. Settle and report honestly.
         if qc.is_clean() {
+            clear_operational_review_checkpoint(&options.project_root);
             // Plan visibility (Wave 1): a clean pass means the work the plan
             // describes landed — tick its steps Done + persist the final plan.
             complete_plan(&mut plan, options, events);
@@ -1358,7 +1434,71 @@ async fn drive_director_loop_with_idle(
             };
         }
 
-        residual_qc = qc.blocking.clone();
+        if qc.has_operational_failure() {
+            residual_qc = qc.residual_evidence();
+            events.emit(EngineEvent::Note(if qc.blocking.is_empty() {
+                quality_evidence::operational_stop_note(&qc.operational)
+            } else {
+                quality_evidence::operational_mixed_note(&qc.operational)
+            }));
+            let reason = qc_incomplete_reason(
+                "required review was operationally unavailable; no source repair turn was started",
+                &residual_qc,
+            );
+            // Preserve any real plan and create a minimal review cursor when
+            // synthesis had failed open. Reaching the critic means deterministic
+            // QC already passed, even when the reviewer panel returned mixed
+            // semantic + operational evidence, so both shapes carry the exact
+            // QC-input receipt and retry only the unavailable panel while inputs
+            // remain unchanged.
+            if let Some(p) = plan.as_mut() {
+                for step in &mut p.steps {
+                    if step.kind != plan_state::StepKind::Review && step.status != StepStatus::Done
+                    {
+                        step.status = StepStatus::Done;
+                        events.emit(EngineEvent::plan_step_status(
+                            step.id.clone(),
+                            step.title.clone(),
+                            StepStatus::Done,
+                        ));
+                    }
+                }
+            }
+            ensure_final_review_retry_step(&mut plan, route, events);
+            let saved_plan = plan
+                .as_ref()
+                .is_some_and(|plan| plan_state::save(plan, &options.project_root).is_ok());
+            let saved_checkpoint = save_operational_review_checkpoint(
+                &options.project_root,
+                &OperationalReviewCheckpoint::FinalGateReview {
+                    qc_source_fingerprint: crate::freshness::workspace_qc_fingerprint(
+                        &options.project_root,
+                    ),
+                    required_seats: route.map(|route| route.team.clone()),
+                    entry_task_run_id: None,
+                },
+            )
+            .is_ok();
+            if saved_plan && saved_checkpoint {
+                record_artifact_versions(&options.project_root);
+                let (done, total) = plan.as_ref().map_or((0, 0), Plan::progress);
+                events.emit(EngineEvent::Note(format!(
+                    "team · {reason} — plan paused without source rework; \
+                     type /continue to retry the final review"
+                )));
+                return DirectorLoopOutcome::PausedAtOperational {
+                    reason,
+                    done,
+                    total,
+                };
+            }
+            clear_operational_review_checkpoint(&options.project_root);
+            return DirectorLoopOutcome::Failed(format!(
+                "{reason}; the typed review checkpoint could not be persisted"
+            ));
+        }
+
+        residual_qc = qc.residual_evidence();
         let current_qc_snapshot = source_tree_snapshot(&options.project_root);
         let workspace_progress = last_qc_snapshot
             .as_ref()
@@ -1555,6 +1695,70 @@ async fn drive_plan_steps(
     if let Some(halt) = halt_if_workspace_in_past(options, events) {
         return Some(halt);
     }
+    let checkpoint = operational_review_checkpoint_for_plan(&options.project_root, plan);
+    let final_gate_fingerprint = match checkpoint.as_ref() {
+        Some(OperationalReviewCheckpoint::FinalGateReview {
+            qc_source_fingerprint,
+            ..
+        }) => qc_source_fingerprint.as_deref(),
+        _ => None,
+    };
+    let checkpoint_review_seats = match checkpoint.as_ref() {
+        Some(OperationalReviewCheckpoint::FinalGateReview {
+            required_seats: Some(seats),
+            ..
+        }) => Some(seats.clone()),
+        _ => None,
+    };
+    let checkpoint_entry_task_run_id = match checkpoint.as_ref() {
+        Some(OperationalReviewCheckpoint::FinalGateReview {
+            entry_task_run_id, ..
+        }) => entry_task_run_id.clone(),
+        _ => None,
+    };
+    let resume_final_gate = matches!(
+        checkpoint.as_ref(),
+        Some(OperationalReviewCheckpoint::FinalGateReview { .. })
+    ) && plan
+        .steps
+        .iter()
+        .filter(|step| step.kind != plan_state::StepKind::Review)
+        .all(|step| step.status == StepStatus::Done);
+    let mut final_review_route = route.clone();
+    if resume_final_gate {
+        if let Some(seats) = checkpoint_review_seats {
+            final_review_route.team = seats;
+        }
+    }
+    if resume_final_gate {
+        // The ordinary review step already passed before the final gate parked.
+        // Restore that persisted truth and skip the scheduler below; the final
+        // whole-build review is the single retry owned by this continuation.
+        for step in plan
+            .steps
+            .iter_mut()
+            .filter(|step| step.kind == plan_state::StepKind::Review)
+        {
+            if step.status != StepStatus::Done {
+                step.status = StepStatus::Done;
+                events.emit(EngineEvent::plan_step_status(
+                    step.id.clone(),
+                    step.title.clone(),
+                    StepStatus::Done,
+                ));
+            }
+        }
+        events.emit(EngineEvent::Note(
+            "team · resuming directly at the parked final quality review".to_string(),
+        ));
+    } else if matches!(
+        checkpoint.as_ref(),
+        Some(OperationalReviewCheckpoint::FinalGateReview { .. })
+    ) {
+        // A source/doc edit reopened real plan work after the pause. That work owns
+        // scheduling now; the old final-gate cursor must not skip it.
+        clear_operational_review_checkpoint(&options.project_root);
+    }
     // P0 EXECUTION CONTRACT — intent classification is not a write boundary. Every
     // mutating plan step must name its create/modify surface before the first doer
     // runs; otherwise the scope denominator is unknowable and the old scope floor
@@ -1597,6 +1801,27 @@ async fn drive_plan_steps(
             events.emit(EngineEvent::Note(format!("team · {reason}")));
             return Some(DirectorLoopOutcome::Failed(reason));
         }
+    };
+    let mut resumed_entry_task = if resume_final_gate {
+        match checkpoint_entry_task_run_id.as_deref() {
+            Some(run_id) => {
+                match crate::task_lifecycle::EntryTaskTracker::resume_exact(
+                    &options.project_root,
+                    run_id,
+                ) {
+                    Ok(task) => Some(task),
+                    Err(error) => {
+                        let reason =
+                            format!("paused resident task ledger could not resume: {error}");
+                        events.emit(EngineEvent::Note(format!("team · {reason}")));
+                        return Some(DirectorLoopOutcome::Failed(reason));
+                    }
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
     };
     events.emit(EngineEvent::Note(format!(
         "team · agent run {} · {} durable task(s)",
@@ -1657,7 +1882,7 @@ async fn drive_plan_steps(
     // can't be accepted (after its bounded fix budget) is marked Blocked so it stops
     // gating its dependents — readiness then drains the remaining independent steps
     // rather than deadlocking. The transition ceiling is the final hard stop.
-    while transitions < MAX_STEP_TRANSITIONS {
+    while !resume_final_gate && transitions < MAX_STEP_TRANSITIONS {
         // Snapshot the next ready step's id (ready_steps borrows the plan immutably;
         // we drop the borrow before mutating). Drive ONE step per outer iteration so
         // dependents become ready only after their prerequisite actually accepted.
@@ -1737,13 +1962,53 @@ async fn drive_plan_steps(
         // PLAN RECITATION (bounded): a compact "where we are in the plan" line so the
         // base stays anchored to the whole plan over a long step-by-step run.
         let plan_progress = plan_progress_recitation(plan, &step_id);
+        let mut step_review_route = route.clone();
+        let mut retry_parked_review_once = false;
+        if let Some(OperationalReviewCheckpoint::StepReview {
+            step_id: parked_step_id,
+            qc_source_fingerprint,
+            required_seats,
+            review_only,
+        }) = checkpoint.as_ref()
+        {
+            if parked_step_id == &step.id {
+                if let Some(seats) = required_seats {
+                    step_review_route.team.clone_from(seats);
+                }
+                let resume_review_only = *review_only
+                    && final_review_qc_receipt_matches(
+                        &options.project_root,
+                        qc_source_fingerprint.as_deref(),
+                    );
+                // Every operational checkpoint resumes as one read-only verdict.
+                // For a Build step that is safe only while the QC-input receipt
+                // still matches; otherwise its deterministic acceptance must run
+                // again before any review. A native Review step has no doer phase
+                // to replay, so its exact retry is always one-shot.
+                retry_parked_review_once = !*review_only || resume_review_only;
+                if retry_parked_review_once {
+                    events.emit(EngineEvent::Note(format!(
+                        "team · source/QC inputs unchanged — retrying only the parked review for `{}`",
+                        step.title
+                    )));
+                } else if *review_only {
+                    events.emit(EngineEvent::Note(format!(
+                        "team · source/QC inputs changed after the parked review for `{}` — re-running its acceptance",
+                        step.title
+                    )));
+                }
+            }
+        }
         let outcome = match step.kind {
+            plan_state::StepKind::Build if retry_parked_review_once => {
+                retry_review_step_once(session, options, events, &step_review_route).await
+            }
             plan_state::StepKind::Build => {
                 drive_build_step(
                     session,
                     options,
                     events,
-                    route,
+                    &step_review_route,
                     &step,
                     &plan_progress,
                     blast_radius,
@@ -1752,8 +2017,19 @@ async fn drive_plan_steps(
                 )
                 .await
             }
+            plan_state::StepKind::Review if retry_parked_review_once => {
+                retry_review_step_once(session, options, events, &step_review_route).await
+            }
             plan_state::StepKind::Review => {
-                drive_review_step(session, options, events, route, &step, deadline).await
+                drive_review_step(
+                    session,
+                    options,
+                    events,
+                    &step_review_route,
+                    &step,
+                    deadline,
+                )
+                .await
             }
         };
         // A WORKSPACE IN THE PAST MUST NOT ACCUMULATE MORE WRITES. A step's evidence check
@@ -1796,6 +2072,67 @@ async fn drive_plan_steps(
         } = outcome;
         if !reply.is_empty() {
             last_reply = reply;
+        }
+
+        // A required host/reviewer outage is a resumable execution boundary, not
+        // a product verdict. Park before settling this step: it stays Active on
+        // disk (resume resets it to Pending), no dependent is marked Blocked, and
+        // no planner, repair turn, final gate, or lesson learner sees the outage.
+        if unavailable {
+            let evidence = if gap_evidence.is_empty() {
+                "required host/review did not return a trustworthy result".to_string()
+            } else {
+                gap_evidence
+                    .iter()
+                    .take(4)
+                    .map(|item| item.chars().take(240).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let reason = format!("required review unavailable at step `{step_title}`: {evidence}");
+            let saved_checkpoint = save_operational_review_checkpoint(
+                &options.project_root,
+                &OperationalReviewCheckpoint::StepReview {
+                    step_id: step.id.clone(),
+                    qc_source_fingerprint: crate::freshness::workspace_qc_fingerprint(
+                        &options.project_root,
+                    ),
+                    required_seats: Some(step_review_route.team.clone()),
+                    review_only: step.kind == plan_state::StepKind::Build,
+                },
+            )
+            .is_ok();
+            if saved_checkpoint && plan_state::save(plan, &options.project_root).is_ok() {
+                match task_tracker.wait_for_user(&reason) {
+                    Ok(()) => {
+                        record_artifact_versions(&options.project_root);
+                        let (done, total) = plan.progress();
+                        events.emit(EngineEvent::Note(format!(
+                            "team · {reason} — plan paused without source rework; \
+                             type /continue to retry this step"
+                        )));
+                        return Some(DirectorLoopOutcome::PausedAtOperational {
+                            reason,
+                            done,
+                            total,
+                        });
+                    }
+                    Err(error) => events.emit(EngineEvent::Note(format!(
+                        "team · could not park the agent ledger after review outage: {error}"
+                    ))),
+                }
+            }
+            clear_operational_review_checkpoint(&options.project_root);
+            return Some(DirectorLoopOutcome::Failed(format!(
+                "{reason}; the resumable checkpoint could not be persisted"
+            )));
+        }
+        if matches!(
+            load_operational_review_checkpoint(&options.project_root),
+            Some(OperationalReviewCheckpoint::StepReview { step_id, .. })
+                if step_id == step.id
+        ) {
+            clear_operational_review_checkpoint(&options.project_root);
         }
 
         // MEDIUM #2 (first-step bail) — FIX: reset the just-marked Active step BEFORE
@@ -1867,11 +2204,6 @@ async fn drive_plan_steps(
         };
         let task_summary = if status == StepStatus::Done {
             format!("step `{}` passed its deterministic acceptance", step.title)
-        } else if unavailable {
-            format!(
-                "step `{}` could not obtain a required host/review",
-                step.title
-            )
         } else {
             format!(
                 "step `{}` did not pass its deterministic acceptance",
@@ -2139,19 +2471,116 @@ async fn drive_plan_steps(
     // rather than trusting the last step's prose (a safe tightening — each step was
     // already verified; this only re-checks once). Fix rounds re-derive it per turn.
     let no_fix_context = KnowledgeDigest::default();
-    let final_gate = run_final_gate(
-        session,
-        options,
-        events,
-        route,
-        &last_reply,
-        deadline,
-        &no_fix_context,
-        false,
-    )
-    .await;
+    let review_only_resume = resume_final_gate
+        && final_review_qc_receipt_matches(&options.project_root, final_gate_fingerprint);
+    let plan_already_blocked = plan
+        .steps
+        .iter()
+        .any(|step| step.status == StepStatus::Blocked);
+    let final_gate = if plan_already_blocked {
+        // A failed execution step is already a semantic product failure. Do not
+        // convene the final reviewer roster merely to rediscover it: an outage
+        // there would mask the causal blocker and create a pointless retry loop.
+        events.emit(EngineEvent::Note(
+            "team · skipped final review because the execution plan already has a blocked step"
+                .to_string(),
+        ));
+        PostBuildQcOutcome {
+            reply: String::new(),
+            clean: false,
+            blocking: plan
+                .steps
+                .iter()
+                .filter(|step| step.status == StepStatus::Blocked)
+                .map(|step| format!("blocked plan step `{}`: {}", step.id, step.title))
+                .collect(),
+            operational_unavailable: Vec::new(),
+        }
+    } else {
+        run_final_gate(
+            session,
+            options,
+            events,
+            &final_review_route,
+            &last_reply,
+            deadline,
+            &no_fix_context,
+            false,
+            review_only_resume,
+        )
+        .await
+    };
     if !final_gate.reply.is_empty() {
         last_reply = final_gate.reply;
+    }
+
+    // A final whole-build review outage is the same recoverable execution
+    // boundary as an unavailable step-level review. Re-open the last review
+    // step so `/continue` has a concrete unit to retry, persist before parking
+    // the ledger, and return without finalizing the run or teaching a blocker.
+    // Any required reviewer outage pauses this exact boundary. Mixed semantic
+    // evidence remains attached, but no source repair or second review starts
+    // until the unavailable reviewer can actually run.
+    if !final_gate.operational_unavailable.is_empty() {
+        let evidence = final_gate
+            .operational_unavailable
+            .iter()
+            .take(4)
+            .map(|item| item.chars().take(240).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let reason = format!("final quality review unavailable: {evidence}");
+        ensure_final_review_retry_step_in_plan(plan, Some(&final_review_route), events);
+        let saved_checkpoint = save_operational_review_checkpoint(
+            &options.project_root,
+            &OperationalReviewCheckpoint::FinalGateReview {
+                qc_source_fingerprint: crate::freshness::workspace_qc_fingerprint(
+                    &options.project_root,
+                ),
+                required_seats: Some(final_review_route.team.clone()),
+                entry_task_run_id: resumed_entry_task
+                    .as_ref()
+                    .map(|task| task.run_id().to_string())
+                    .or_else(|| checkpoint_entry_task_run_id.clone()),
+            },
+        )
+        .is_ok();
+        if saved_checkpoint && plan_state::save(plan, &options.project_root).is_ok() {
+            if let Some(task) = resumed_entry_task.as_mut() {
+                if let Err(error) = task.wait(&reason) {
+                    // The checkpoint still owns the exact run id. Drop will
+                    // interrupt a still-running task and `resume_exact` can
+                    // recover it on the next continuation.
+                    events.emit(EngineEvent::Note(format!(
+                        "team · resident task ledger could not append its pause ({error}); \
+                         the typed review checkpoint remains resumable"
+                    )));
+                }
+            }
+            if let Err(error) = task_tracker.wait_for_user(&reason) {
+                // The plan plus typed checkpoint are already durable. A status
+                // append failure must not erase that recovery boundary.
+                events.emit(EngineEvent::Note(format!(
+                    "team · plan task ledger could not append its pause ({error}); \
+                     the typed review checkpoint remains resumable"
+                )));
+            }
+            record_artifact_versions(&options.project_root);
+            let (done, total) = plan.progress();
+            events.emit(EngineEvent::Note(format!(
+                "team · {reason} — plan paused without source rework; \
+                 type /continue to retry the final review"
+            )));
+            return Some(DirectorLoopOutcome::PausedAtOperational {
+                reason,
+                done,
+                total,
+            });
+        }
+        clear_operational_review_checkpoint(&options.project_root);
+        return Some(DirectorLoopOutcome::Failed(format!(
+            "{reason}; the typed review checkpoint could not be persisted"
+        )));
     }
 
     // HONEST clean signal (used for the report below AND finalize): every step
@@ -2164,15 +2593,17 @@ async fn drive_plan_steps(
     // incomplete build can never be disguised as a clean delivery. This makes the
     // step path's gate never weaker than the single-turn loop (which already gates
     // finalize INSIDE `qc.is_clean()`). Fail-open: a dirty gate just means "not clean".
-    let mut clean = plan.steps.iter().all(|s| s.status == StepStatus::Done) && final_gate.clean;
+    let preliminary_clean =
+        plan.steps.iter().all(|s| s.status == StepStatus::Done) && final_gate.clean;
+    let mut clean = preliminary_clean;
     let mut task_failure_reason = None;
-    let task_finish_summary = if clean {
+    let task_finish_summary = if preliminary_clean {
         "all agent tasks passed their deterministic acceptance"
     } else {
         "one or more agent tasks did not reach verified success"
     };
     match task_tracker.finish(
-        clean,
+        preliminary_clean,
         task_finish_summary,
         incomplete_evidence
             .iter()
@@ -2189,6 +2620,46 @@ async fn drive_plan_steps(
             clean = false;
             task_failure_reason = Some(format!("agent task ledger could not settle: {error}"));
         }
+    }
+    let mut entry_task_settled = true;
+    if let Some(task) = resumed_entry_task.as_mut() {
+        let settlement = if clean {
+            task.succeed(
+                "resident change passed the resumed final review",
+                Vec::new(),
+            )
+        } else {
+            let mut blockers = incomplete_evidence
+                .iter()
+                .map(|(step_id, evidence)| format!("{step_id}: {evidence}"))
+                .chain(final_gate.blocking.iter().cloned())
+                .collect::<Vec<_>>();
+            if let Some(reason) = task_failure_reason.as_ref() {
+                blockers.push(reason.clone());
+            }
+            if blockers.is_empty() {
+                blockers.push("final quality review did not settle cleanly".to_string());
+            }
+            task.fail("resident change failed the resumed final review", blockers)
+        };
+        if let Err(error) = settlement {
+            clean = false;
+            entry_task_settled = false;
+            let reason = format!("resident task ledger could not settle: {error}");
+            if let Some(existing) = task_failure_reason.as_mut() {
+                existing.push_str("; ");
+                existing.push_str(&reason);
+            } else {
+                task_failure_reason = Some(reason);
+            }
+        }
+    }
+    // The final boundary has settled (clean or semantic failure). A prior
+    // operational cursor must not survive into a later `/continue`. If the
+    // owning resident ledger could not settle, retain the cursor so recovery
+    // remains possible instead of stranding that writer forever.
+    if entry_task_settled {
+        clear_operational_review_checkpoint(&options.project_root);
     }
 
     // Only a CLEAN plan-driven convergence earns the integrated final report. Every
@@ -2978,7 +3449,12 @@ async fn drive_build_step(
                 reply: last_reply,
                 drove,
                 made_progress: false,
-                unavailable: true,
+                // The writer process is dead: this is not the resumable
+                // read-only REVIEW outage represented by `unavailable`.
+                // Let the scheduler mark this doer step and its dependants
+                // Blocked/Failed instead of parking a checkpoint that cannot
+                // reuse the dead session.
+                unavailable: false,
                 base_agents,
                 gap_evidence: vec![
                     "base session unreachable — the step's doer directive could not be \
@@ -3011,6 +3487,20 @@ async fn drive_build_step(
             red_green_pre.as_deref(),
         )
         .await;
+        if !verdict.operational_unavailable.is_empty() {
+            events.emit(EngineEvent::Note(quality_evidence::operational_stop_note(
+                &verdict.operational_unavailable,
+            )));
+            return StepOutcome {
+                accepted: false,
+                reply: last_reply,
+                drove,
+                made_progress: false,
+                unavailable: true,
+                base_agents,
+                gap_evidence: verdict.operational_unavailable,
+            };
+        }
         // TEST-INTEGRITY FLOOR (UD-QA-001). Compare the test surface to the
         // pre-step baseline. If the doer gamed the tests to fake a pass (deleted a
         // test, stripped assertions, added a skip/xfail/ignore marker, baked the
@@ -3257,212 +3747,6 @@ async fn drive_build_step(
     }
 }
 
-/// Record this build step's FIRST-PASS acceptance outcome into UmaDev's measured
-/// engineering-doctrine signal ([`crate::first_pass`]) and surface the running
-/// rate as a visible advisory [`EngineEvent::Note`].
-///
-/// `first_pass` is `true` iff the step's deterministic acceptance passed on the
-/// FIRST attempt (round 0, ZERO rework rounds). The outcome is recorded under BOTH
-/// the doer-seat kind (the step-kind dimension) AND the route-class kind (the
-/// route-class dimension), so both accumulate from one call. ADVISORY + FAIL-OPEN:
-/// recording never changes the step's pass/fail outcome, the loop, or any gate —
-/// it only feeds the visible metric + later nudges.
-fn record_step_first_pass(
-    options: &RunOptions,
-    events: &Arc<dyn EventSink>,
-    route: &RoutePlan,
-    step: &plan_state::PlanStep,
-    first_pass: bool,
-) {
-    for kind in [
-        crate::first_pass::seat_kind(step.seat.role_id()),
-        crate::first_pass::class_kind(route.class.as_str()),
-    ] {
-        crate::first_pass::record(&options.project_root, &kind, first_pass);
-        // Surface the running rate so the signal is visible (only once a kind has
-        // crossed the trusted min-sample threshold). Pure observation.
-        if let Some(rate) = crate::first_pass::first_pass_rate(&options.project_root, &kind) {
-            events.emit(EngineEvent::Note(format!(
-                "signal · first-pass acceptance {kind}: {:.0}% (advisory; the floor still governs)",
-                rate * 100.0
-            )));
-        }
-    }
-}
-
-/// Record this run's SIZING-calibration outcome (the single-turn loop's entry point):
-/// the router's PREDICTED size for `route` vs. the `actual` size the run settled at,
-/// keyed by route-class ([`crate::sizing_calibration`]). A `None` route (the
-/// backward-compatible no-route entry) records nothing.
-///
-/// ADVISORY + FAIL-OPEN: recording never changes the run's route, plan, the
-/// deterministic floor, loop termination, or any gate — by the time the actual size is
-/// known the route is long-decided. It only feeds the per-class calibration that informs
-/// a FUTURE default (see [`crate::sizing_calibration::calibrated_default`]).
-fn record_run_sizing(
-    options: &RunOptions,
-    route: Option<&RoutePlan>,
-    actual: crate::sizing_calibration::SizeRank,
-) {
-    if let Some(r) = route {
-        crate::sizing_calibration::record_route(&options.project_root, r, actual);
-    }
-}
-
-/// Drive ONE Review step: fork the cross-review team (read-only) over the current
-/// blackboard. A review step is clean only when every convened seat returns pass;
-/// blocking findings fold into ONE bounded fix turn on the MAIN session (the doer
-/// repairs), then we re-read. Returns a [`StepOutcome`].
-///
-/// HIGH #1 / MEDIUM #3: an EMPTY-team review (the route convened no seats — 0 actually
-/// reviewed) is a NEUTRAL SKIP, NOT real progress: `made_progress == false`, so the
-/// scheduler does NOT tick it `Done` over a review that never happened. A team that
-/// actually convened (`seats > 0`) and accepted is real progress.
-///
-/// Wall-clock ceiling (graceful): the read-only fork review ALWAYS runs (it's cheap
-/// and surfaces honest findings), but the minute-level main-session FIX turn it would
-/// trigger is skipped once the budget is spent — the findings are then surfaced as an
-/// honest note and left for the final gate / hard-gate, never silently grinding past
-/// the deadline.
-async fn drive_review_step(
-    session: &mut dyn BaseSession,
-    options: &RunOptions,
-    events: &Arc<dyn EventSink>,
-    route: &RoutePlan,
-    step: &plan_state::PlanStep,
-    deadline: std::time::Instant,
-) -> StepOutcome {
-    let _ = step;
-    // Wave 2 deliverable 3: size the review team from the ROUTE's seats (the seats
-    // the router already chose for this turn), not from a re-derived requirement
-    // classification. An empty route team → no cross-review (the floor stands).
-    let review = director::review_with_seats(session, options, events, &route.team).await;
-    if review.status() == ReviewStatus::Unavailable {
-        let mut gaps = review.blocking;
-        gaps.extend(
-            review
-                .unavailable
-                .iter()
-                .map(|item| format!("review unavailable: {item}")),
-        );
-        events.emit(EngineEvent::Note(
-            "team · required review unavailable — the step cannot be marked clean".to_string(),
-        ));
-        return StepOutcome {
-            accepted: true,
-            reply: String::new(),
-            drove: review.seats > 0,
-            made_progress: false,
-            unavailable: true,
-            base_agents: crate::bg_agents::BaseAgentObservation::default(),
-            gap_evidence: gaps,
-        };
-    }
-    if review.status() == ReviewStatus::Pass {
-        // A team actually convened (seats > 0) ⇒ real review progress; an empty team
-        // (seats == 0) is a neutral skip that must NOT advance the done count.
-        let reviewed = review.seats > 0;
-        return StepOutcome {
-            accepted: true,
-            reply: String::new(),
-            drove: reviewed,
-            made_progress: reviewed,
-            unavailable: false,
-            base_agents: crate::bg_agents::BaseAgentObservation::default(),
-            gap_evidence: Vec::new(), // review accepted → no gap
-        };
-    }
-    // The team found blockers after the fix budget ended. Preserve those blockers
-    // on the step instead of accepting an empty result and hoping a later pass finds
-    // them again.
-    if std::time::Instant::now() >= deadline {
-        events.emit(EngineEvent::Note(
-            "team · time budget reached — review findings left for the final gate \
-             (raise UMADEV_RUN_BUDGET_SECS to repair them in this run)"
-                .to_string(),
-        ));
-        return StepOutcome {
-            accepted: true,
-            reply: String::new(),
-            drove: review.seats > 0,
-            made_progress: false,
-            unavailable: false,
-            base_agents: crate::bg_agents::BaseAgentObservation::default(),
-            gap_evidence: review.blocking,
-        };
-    }
-    // The team found blocking issues — fold them into ONE bounded fix turn on the
-    // main session, then require a clean re-review before marking the step clean.
-    let mut body = String::new();
-    for b in &review.blocking {
-        body.push_str("- ");
-        body.push_str(b);
-        body.push('\n');
-    }
-    let directive = format!(
-        "The review team flagged MUST-FIX issues in what was built so far. Fix EVERY one \
-         now by editing the files directly — do not narrate, just apply the fixes and \
-         re-run any build/test you already ran. Issues:\n{body}\n{}\nWhen all are fixed, end \
-         your turn.",
-        diagnosed_blockers_for_prompt(&review.blocking, "team review")
-    );
-    let rework = crate::continuous::drive_rework_turn_capturing(
-        session, options, events, directive, deadline,
-    )
-    .await;
-    let drove = rework.done;
-    let base_agents = rework.base_agents;
-    // Re-run the same required review after the fix. A failed review transport is
-    // unavailable, and a residual semantic blocker remains a blocker; neither may
-    // be rewritten into a clean pass.
-    let recheck = director::review_with_seats(session, options, events, &route.team).await;
-    if recheck.status() == ReviewStatus::Unavailable {
-        let mut gaps = review.blocking;
-        gaps.extend(recheck.blocking);
-        gaps.extend(
-            recheck
-                .unavailable
-                .into_iter()
-                .map(|item| format!("review unavailable after rework: {item}")),
-        );
-        return StepOutcome {
-            accepted: true,
-            reply: String::new(),
-            drove,
-            made_progress: false,
-            unavailable: true,
-            base_agents,
-            gap_evidence: gaps,
-        };
-    }
-    if recheck.status() == ReviewStatus::Fail {
-        events.emit(EngineEvent::Note(format!(
-            "team · review step still has {} must-fix finding(s) after rework — preserving them as blockers",
-            recheck.blocking.len()
-        )));
-        return StepOutcome {
-            accepted: true,
-            reply: String::new(),
-            drove,
-            made_progress: false,
-            unavailable: false,
-            base_agents,
-            gap_evidence: recheck.blocking,
-        };
-    }
-    // A team convened, raised findings, and a repair turn ran — real review progress
-    // regardless of whether the repair turn fully settled (`drove`).
-    StepOutcome {
-        accepted: true,
-        reply: String::new(),
-        drove,
-        made_progress: true,
-        unavailable: false,
-        base_agents,
-        gap_evidence: Vec::new(),
-    }
-}
-
 /// A bounded snapshot of the project's source tree — path → (byte size, mtime) —
 /// taken at a build step's START (see [`source_tree_snapshot`]). The comparison
 /// basis for the step-attributable-evidence check ([`step_attributable_evidence`]).
@@ -3544,6 +3828,9 @@ struct StepVerdict {
     mechanical_build_test_failed_steps: Vec<String>,
     /// Concrete evidence lines from the check (failed-step names / drift / count).
     evidence: Vec<String>,
+    /// Host-owned evidence that a required reviewer could not produce a
+    /// trustworthy verdict. It must never enter blocker learning or source rework.
+    operational_unavailable: Vec<String>,
     /// B1#2 — a BOUNDED verbatim tail of the failing build/test output (last ~60
     /// lines, char-capped; see [`director::verify_build_test_raw`]), captured only
     /// when the verdict REJECTED on a real build/test failure. Threaded into the
@@ -3712,6 +3999,7 @@ async fn verify_step_acceptance(
             mechanical_build_test_passed_steps: Vec::new(),
             mechanical_build_test_failed_steps: Vec::new(),
             evidence: Vec::new(),
+            operational_unavailable: Vec::new(),
             raw_log: None,
         },
         A::SourcePresent => acceptance_from_verify(
@@ -3795,19 +4083,22 @@ async fn verify_step_acceptance(
             };
             // Route-team-aware (deliverable 3): the review seats come from the route.
             let review = director::review_with_seats(session, options, events, &route.team).await;
+            let seats = review.seats;
+            let review = quality_evidence::split_review_evidence(&review);
+            let clean = review.blocking.is_empty() && review.operational.is_empty();
             StepVerdict {
-                // Advisory: a review-clean step is accepted unless a seat blocks —
-                // and even then the final deterministic gate, not this verdict, owns
-                // overall termination. No team convened ⇒ accept (nothing to review).
-                accepted: !review.has_blocking(),
+                // A required review is clean only when it has neither semantic
+                // blockers nor unavailable/operational seats.
+                accepted: clean,
                 // HIGH #1: positive evidence only when a seat ACTUALLY reviewed and
                 // accepted (seats > 0), or a Build step's source floor positively
                 // passed. An EMPTY-team ReviewClean (0 seats) is a NEUTRAL SKIP — it
                 // must not count as real progress that marks a step Done over no work.
-                has_positive_evidence: src_positive || (review.seats > 0 && !review.has_blocking()),
+                has_positive_evidence: src_positive || (seats > 0 && clean),
                 mechanical_build_test_passed_steps: Vec::new(),
                 mechanical_build_test_failed_steps: Vec::new(),
-                evidence: review.blocking.clone(),
+                evidence: review.blocking,
+                operational_unavailable: review.operational,
                 raw_log: None,
             }
         }
@@ -3829,6 +4120,7 @@ async fn verify_step_acceptance(
                 mechanical_build_test_passed_steps: Vec::new(),
                 mechanical_build_test_failed_steps: Vec::new(),
                 evidence: Vec::new(),
+                operational_unavailable: Vec::new(),
                 raw_log: None,
             }
         }
@@ -3861,6 +4153,7 @@ fn acceptance_from_verify(r: VerifyResult) -> StepVerdict {
         } else {
             Vec::new()
         },
+        operational_unavailable: Vec::new(),
         raw_log: None,
     }
 }
@@ -4036,6 +4329,7 @@ async fn verify_step_evidence(
         mechanical_build_test_passed_steps,
         mechanical_build_test_failed_steps,
         evidence: gaps,
+        operational_unavailable: Vec::new(),
         // The raw build/test tail rides only a REJECTING verdict (a failed build that
         // produced gaps); a clean/neutral verdict carries no log.
         raw_log: if accepted { None } else { build_raw },
@@ -4466,287 +4760,6 @@ fn source_mentions(root: &std::path::Path, needle: &str) -> bool {
     crate::acceptance::source_files(root)
         .iter()
         .any(|f| std::fs::read_to_string(f).is_ok_and(|c| c.contains(needle)))
-}
-
-/// The final whole-build QC gate run once a step-driven plan has walked its DAG —
-/// the SAME [`run_auto_qc`] pass the single-turn loop ends on, folded into ONE
-/// bounded fix turn so a step-driven build is held to the identical objective floor.
-/// Returns the fix turn's reply (empty when QC was already clean). Bounded by
-/// [`MAX_QC_ROUNDS`]; fail-open throughout.
-///
-/// Wall-clock ceiling (graceful): the read-only QC READ ALWAYS runs (every iteration),
-/// so the build is ALWAYS held to the objective floor even at the budget; only the
-/// minute-level FIX TURN it would trigger is skipped once the deadline is spent (the
-/// doc'd "hard ceiling" — the build could otherwise run several fix turns over budget
-/// here). A residual finding is returned as a dirty outcome and becomes an honest
-/// director failure; it is never delegated to a narrower source-only caller check.
-/// The outcome of [`run_final_gate`]: the final fix-turn reply PLUS whether the gate
-/// settled CLEAN. H1: the step-driven caller must AND `clean` into its finalize
-/// decision — a build whose steps all ticked Done but whose final cross-cutting gate
-/// (coverage / contract / runtime-proof / governance / fork review) stayed DIRTY must
-/// NOT be finalized as a clean delivery (which would ship a full proof-pack/scorecard
-/// disguising an incomplete build as success).
-struct FinalGateOutcome {
-    /// The last fix-turn's reply (empty when QC was already clean / no fix ran).
-    reply: String,
-    /// `true` only when the QC read came back clean within the bounded rounds;
-    /// `false` when the gate settled with residual blocking findings (budget /
-    /// deadline / dead session).
-    clean: bool,
-    /// The last objective blocking findings. Empty on a clean gate; retained on
-    /// every dirty settle so the director's terminal failure carries evidence.
-    blocking: Vec<String>,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_final_gate(
-    session: &mut dyn BaseSession,
-    options: &RunOptions,
-    events: &Arc<dyn EventSink>,
-    route: &RoutePlan,
-    seed_reply: &str,
-    deadline: std::time::Instant,
-    // Optional structured CONTEXT front-loaded onto every fix directive. The
-    // chat-build entry passes recalled knowledge text + exact memory identities;
-    // `/run` passes an empty digest and creates no receipt.
-    fix_context: &KnowledgeDigest,
-    // OBSERVED-tool corroboration for the SEED reply: did a real build/test/lint runner
-    // run producing `seed_reply`? Callers that can't observe it pass `false` (conservative
-    // — round 0 then runs UmaDev's own read rather than trusting the seed's prose). Each
-    // fix round below re-derives it from its OWN turn's observed tool calls.
-    seed_ran_build_tool: bool,
-) -> FinalGateOutcome {
-    let mut last_reply = String::new();
-    let mut last_blocking = Vec::new();
-    // The incremental-verify signal seeds from the LAST step's reply (the steps just
-    // ran the build/test); each fix round below then carries its own turn's reply.
-    let mut verify_signal = seed_reply.to_string();
-    // The observed-tool corroboration paired with `verify_signal`: seeds from the caller,
-    // then tracks each fix turn's OWN observed run — so a fix turn's green claim can only
-    // skip the read when THAT turn actually ran a runner.
-    let mut verify_ran_build_tool = seed_ran_build_tool;
-    // A fix turn's knowledge can be judged only by the NEXT QC read. Holding the
-    // guard here makes cancellation, panic, or an absent next read settle Unknown.
-    let mut pending_memory_receipt: Option<SentReceiptGuard> = None;
-    let mut qc_blockers = crate::blocker::BlockerSetTracker::default();
-    let mut last_qc_snapshot: Option<SourceTreeSnapshot> = None;
-    for round in 0..MAX_QC_ROUNDS {
-        // The QC read ALWAYS runs (it is read-only + cheap), so the build is held to
-        // the objective floor every iteration — even at the budget. The final gate
-        // sizes its review team from the ROUTE (deliverable 3). Pass the freshest reply
-        // so the build/test read is skipped when the base already ran it green.
-        let qc = run_auto_qc(
-            session,
-            options,
-            events,
-            Some(route),
-            Some(verify_signal.as_str()),
-            verify_ran_build_tool,
-        )
-        .await;
-        if let Some(receipt) = pending_memory_receipt.take() {
-            let outcome = if qc.is_clean() {
-                TurnOutcome::Pass
-            } else {
-                TurnOutcome::Fail
-            };
-            let _ = receipt.settle(outcome);
-        }
-        if qc.is_clean() {
-            return FinalGateOutcome {
-                reply: last_reply,
-                clean: true,
-                blocking: Vec::new(),
-            };
-        }
-        last_blocking = qc.blocking.clone();
-        let current_qc_snapshot = source_tree_snapshot(&options.project_root);
-        let workspace_progress = last_qc_snapshot
-            .as_ref()
-            .is_some_and(|previous| previous != &current_qc_snapshot);
-        last_qc_snapshot = Some(current_qc_snapshot);
-        let assessments = qc.assess_blockers(&mut qc_blockers, workspace_progress);
-        emit_blocker_assessments(events, &assessments);
-        if let Some(stuck) = assessments
-            .iter()
-            .find(|item| item.disposition == crate::blocker::BlockerDisposition::Escalate)
-        {
-            last_blocking.push(format!(
-                "stuck detector: blocker `{}` repeated {} times without a source-tree change",
-                stuck.diagnosis.fingerprint, stuck.repeat_count
-            ));
-            events.emit(EngineEvent::Note(
-                "team · final QC stopped an unchanged repair loop and retained the evidence"
-                    .to_string(),
-            ));
-            return FinalGateOutcome {
-                reply: last_reply,
-                clean: false,
-                blocking: last_blocking,
-            };
-        }
-        if round + 1 >= MAX_QC_ROUNDS {
-            events.emit(EngineEvent::Note(
-                "team · final QC reached its fix-round budget — stopping incomplete with residual evidence"
-                    .to_string(),
-            ));
-            return FinalGateOutcome {
-                reply: last_reply,
-                clean: false,
-                blocking: last_blocking,
-            };
-        }
-        // Wall-clock ceiling (graceful): the QC READ above ran (the floor still bites),
-        // but the minute-level FIX TURN it would trigger is skipped once the budget is
-        // spent — the residual findings are retained in the dirty outcome rather than
-        // driving more over-budget fix turns. This is
-        // the doc'd "hard ceiling": the build can't keep grinding fix turns past it.
-        if std::time::Instant::now() >= deadline {
-            events.emit(EngineEvent::Note(
-                "team · time budget reached — final QC findings retained as incomplete \
-                 evidence (raise UMADEV_RUN_BUDGET_SECS for more fix rounds)"
-                    .to_string(),
-            ));
-            return FinalGateOutcome {
-                reply: last_reply,
-                clean: false,
-                blocking: last_blocking,
-            };
-        }
-        // Fold the residual findings into ONE fix turn on the main session — with the
-        // optional context prefix (knowledge + pitfalls) front-loaded for a chat-build.
-        match drive_one_turn_with_memories(
-            session,
-            options,
-            events,
-            qc.fix_directive_with_assessments(&fix_context.text, &assessments),
-            fix_context.memories.clone(),
-            IdleBudget::from_env(),
-            deadline,
-        )
-        .await
-        {
-            Ok(t) => {
-                pending_memory_receipt = t.memory_receipt;
-                verify_signal = t.text.clone();
-                verify_ran_build_tool = t.ran_build_tool;
-                last_reply = t.text;
-            }
-            // A dead/hung session → settle (fail-open). The gate did NOT clear, so the
-            // residual findings stand and the caller must not finalize as clean.
-            Err(_) => {
-                return FinalGateOutcome {
-                    reply: last_reply,
-                    clean: false,
-                    blocking: last_blocking,
-                }
-            }
-        }
-    }
-    FinalGateOutcome {
-        reply: last_reply,
-        clean: false,
-        blocking: last_blocking,
-    }
-}
-
-/// **The full post-build QC pass for a CHAT-ORIGINATED build** — the architecture
-/// unification (`became_build` chat surface earns the SAME flagship QC the explicit
-/// `/run` path runs). A plain "做个落地页" typed in chat, whose base reacted by
-/// writing files (`react_to_first_write` flipped it to a build), now gets:
-///
-/// 1. **governance / design-slop scan** (`run_auto_qc` runs `continuous::governance_scan`,
-///    which is the same emoji-as-icon / hardcoded-color / AI-slop / purple-gradient
-///    detection the `/run` path uses) + the build/test fact read + the deliberate
-///    acceptance floor,
-/// 2. **critic team review** (`run_auto_qc` → `review_with_seats` sized from
-///    `route.team`, fork-based read-only critics),
-/// 3. **bounded evidence-bearing rework** — blocking findings fold into ONE fix
-///    directive per round, bounded by the internal QC-round limit + the wall-clock deadline,
-///    fed back over the SAME continuous session (single-writer preserved), with the
-///    recalled **knowledge digest + prior pitfalls** front-loaded (`post_build_rework_context`)
-///    so the fix carries the team's commercial standards + memory,
-/// 4. **usage + lessons capture** — every fix turn runs through the internal turn pump,
-///    which records the token estimate (`/usage`) and distils failed-tool pitfalls
-///    into the lessons KB (`/lessons`), so the chat build self-evolves like a `/run`.
-///
-/// Delegates the actual gate to the internal final-gate routine (the exact same bounded pass the
-/// `/run` step-driver ends on) with the route's seats + the knowledge/lessons prefix,
-/// so a chat build is held to the IDENTICAL floor as `/run` — not a re-implementation
-/// that could drift. Returns the final fix-turn reply (empty when QC was already
-/// clean). **Fail-open throughout**: a scan / fork / rework that can't run contributes
-/// nothing and the build settles (a chat turn is never wedged by QC). The wall-clock
-/// budget bounds the extra fix turns exactly like `/run`.
-///
-/// `seed_reply` is the build turn's own reply (so the incremental build/test read can
-/// trust a green result the base already reported). Pure chat (no `became_build`) must
-/// NOT call this — it stays on the light streaming path, fast.
-pub async fn run_post_build_qc(
-    session: &mut dyn BaseSession,
-    options: &RunOptions,
-    events: &Arc<dyn EventSink>,
-    route: &RoutePlan,
-    seed_reply: &str,
-) -> String {
-    // The wall-clock budget bounds the EXTRA fix turns (graceful ceiling), exactly as
-    // the `/run` loop reads it — a chat-build's post-QC rework can never run unbounded.
-    let deadline = std::time::Instant::now() + run_budget();
-    events.emit(EngineEvent::Note(
-        "team · 构建完成 — 自动上设计/质量扫描 + 团队评审(和 /run 同一套验收)".to_string(),
-    ));
-    // Recall the commercial-engineering knowledge digest + the project's prior pitfalls
-    // ONCE, to front-load onto every fix directive (deliverable 3). The chat session
-    // opened firmware-light (no JIT knowledge), so this is where a chat-build's fix gets
-    // the standards + memory. Fail-open: empty recall = the byte-for-byte plain directive.
-    let context = post_build_rework_context(options);
-    // The chat-build surface only needs the fix-turn reply; its caller does not gate a
-    // finalize on the gate's clean-ness (the `/run` step path does — see H1). Seed
-    // corroboration `false`: this entry has only the seed REPLY text, not an observed
-    // run, so round 0 runs UmaDev's own build/test read rather than trusting the seed's
-    // prose "it's green" — narration alone must not skip. Fix rounds re-derive per turn.
-    run_final_gate(
-        session, options, events, route, seed_reply, deadline, &context, false,
-    )
-    .await
-    .reply
-}
-
-/// Build the CONTEXT prefix front-loaded onto a chat-build's post-QC fix directives —
-/// the recalled commercial-engineering knowledge digest (`agentic_knowledge_digest`)
-/// plus the project's prior pitfalls (`relevant_lessons_for_prompt`). The chat session
-/// opens firmware-LIGHT (no JIT knowledge layer — that's the latency-saving default),
-/// so a fix turn would otherwise repair blind; this restores the standards + memory at
-/// the one point it matters (fixing real findings), without paying the full firmware
-/// cost on every chat message. Pure + fully fail-open: each contributor swallows its
-/// own errors into an empty string (the plain directive), never a panic or a block.
-fn post_build_rework_context(options: &RunOptions) -> KnowledgeDigest {
-    // Knowledge digest — small budget (3 chunks), matching the agentic light-turn size.
-    // Keep retrieval pure while carrying exact identities through prompt
-    // assembly. Receipt commit still happens only after a real host send.
-    let mut digest = crate::phases::agentic_knowledge_digest_with_memories(
-        &options.project_root,
-        &options.requirement,
-        3,
-        false,
-    );
-    if !digest.text.trim().is_empty() {
-        digest.text = digest.text.trim().to_string();
-    }
-    // Prior pitfalls on this project (recalled lessons) — what already bit us before.
-    let lessons =
-        crate::lessons::relevant_lessons_for_prompt(&options.project_root, &options.requirement);
-    if !lessons.trim().is_empty() {
-        if !digest.text.is_empty() {
-            digest.text.push_str("\n\n");
-        }
-        digest.text.push_str(&render_project_learned_reference(
-            umadev_knowledge::PromptReferenceKind::Lesson,
-            ".umadev/learned/_raw",
-            "post_build_rework",
-            lessons.trim(),
-        ));
-    }
-    digest
 }
 
 /// Distil a turn's failed-tool summaries into the lessons KB on the DEFAULT loop —
@@ -6628,24 +6641,6 @@ fn tool_call_target(input: &serde_json::Value) -> String {
 // Auto-QC — UmaDev's objective quality pass (NOT the base summoning a team)
 // ───────────────────────────────────────────────────────────────────────────
 
-/// What one auto-QC pass found. Empty `blocking` = clean (the build is genuinely
-/// done). Non-empty = the factual problems UmaDev folds into ONE fix directive for
-/// the base. Built fail-open: any QC step that can't run contributes nothing (a
-/// neutral skip), never a false blocking finding.
-#[derive(Debug, Clone, Default)]
-struct QcReport {
-    /// The deduped, source-tagged union of blocking problems (e.g. `verify build:
-    /// FAILED …`, `[security] no input validation`). Empty = clean.
-    blocking: Vec<String>,
-    /// B1#2 — a BOUNDED verbatim tail of the failing build/test output (last ~60
-    /// lines, char-capped; see [`director::verify_build_test_raw`]), captured when
-    /// the build/test fact read FAILED. Folded into the fix directive as raw
-    /// evidence the brain adapts from — never a substitute for the one-line
-    /// distillation in `blocking`. `None` when no raw log exists (clean build,
-    /// skipped read, or a non-build finding) — the directive skips it cleanly.
-    raw_failure_log: Option<String>,
-}
-
 /// Build a bounded, machine-true terminal diagnosis from residual QC findings.
 /// The outcome text is rendered directly by CLI/TUI failure surfaces, so it must
 /// carry useful evidence without dumping an unbounded governance/build log.
@@ -6687,98 +6682,6 @@ fn qc_incomplete_reason(reason: &str, blocking: &[String]) -> String {
     }
 }
 
-impl QcReport {
-    /// Whether the build passed QC clean (no blocking problem found).
-    fn is_clean(&self) -> bool {
-        self.blocking.is_empty()
-    }
-
-    /// Fold the QC findings into ONE fix directive fed back to the base over the
-    /// same session. The BASE'S BODY does the fixing (and the build/test) with its
-    /// own tools — UmaDev only hands it the facts and asks it to act. Lean +
-    /// command-style so the base fixes rather than narrates; it already holds the
-    /// full build context in this one continuous session, so no role re-priming.
-    #[cfg(test)]
-    fn fix_directive(&self) -> String {
-        self.fix_directive_with_context("")
-    }
-
-    /// [`Self::fix_directive`] with an optional CONTEXT prefix front-loaded before
-    /// the findings — used by the chat-build post-QC entry to inject the recalled
-    /// commercial-engineering knowledge digest plus the project's prior pitfalls
-    /// (`post_build_rework_context`) so the fix turn fixes WITH the team's standards
-    /// and memory, not blind. An empty prefix yields the byte-for-byte original
-    /// directive, so the `/run` callers are unchanged. Fail-open by construction.
-    #[cfg(test)]
-    fn fix_directive_with_context(&self, prefix: &str) -> String {
-        let mut tracker = crate::blocker::BlockerSetTracker::default();
-        let assessments = self.assess_blockers(&mut tracker, false);
-        self.fix_directive_with_assessments(prefix, &assessments)
-    }
-
-    /// Diagnose the current set with classifier-owned playbooks while preserving
-    /// recurrence state in `tracker` across QC rounds.
-    fn assess_blockers(
-        &self,
-        tracker: &mut crate::blocker::BlockerSetTracker,
-        workspace_progress: bool,
-    ) -> Vec<crate::blocker::BlockerAssessment> {
-        let mut evidence = self.blocking.clone();
-        if let Some(raw) = self
-            .raw_failure_log
-            .as_ref()
-            .filter(|raw| !raw.trim().is_empty())
-        {
-            evidence.push(raw.clone());
-        }
-        tracker.assess_all(&evidence, "objective QC", true, workspace_progress)
-    }
-
-    /// Render a directive from assessments already computed by the run-local
-    /// tracker, so the prompt and the visible loop decision cannot disagree.
-    fn fix_directive_with_assessments(
-        &self,
-        prefix: &str,
-        assessments: &[crate::blocker::BlockerAssessment],
-    ) -> String {
-        let mut body = String::new();
-        for b in &self.blocking {
-            body.push_str("- ");
-            body.push_str(b);
-            body.push('\n');
-        }
-        let lead = if prefix.trim().is_empty() {
-            String::new()
-        } else {
-            format!("{}\n\n", prefix.trim_end())
-        };
-        // B1#2: when the build/test fact read captured the failing output, append its
-        // bounded verbatim tail so the fix turn works from the RAW compiler/test
-        // evidence too (adaptable), not only the one-line distillation above. Absent
-        // raw log (clean build / non-build findings) → byte-for-byte the plain form.
-        let raw = match self.raw_failure_log.as_deref().map(str::trim) {
-            Some(t) if !t.is_empty() => {
-                format!("\n\n## Raw failing build/test output (verbatim tail)\n```text\n{t}\n```")
-            }
-            _ => String::new(),
-        };
-        let diagnosis = assessments
-            .iter()
-            .take(8)
-            .map(crate::blocker::BlockerAssessment::prompt_block)
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        format!(
-            "{lead}An objective check of what you just built surfaced problems that must be \
-             fixed (these are real facts read from disk / review, not your memory):\n\
-             {body}\n{diagnosis}\n\nFix the cause of each one yourself with your tools — edit/create \
-             the real files — then RUN the project's own build and tests to confirm \
-             they pass. When it is genuinely clean, end your turn and report honestly \
-             what you fixed.{raw}"
-        )
-    }
-}
-
 fn diagnosed_blockers_for_prompt(findings: &[String], criterion: &str) -> String {
     let mut tracker = crate::blocker::BlockerSetTracker::default();
     tracker
@@ -6802,6 +6705,39 @@ fn emit_blocker_assessments(
             item.disposition.as_str(),
             item.repeat_count,
         )));
+    }
+}
+
+/// Retry only the required critic team after a persisted final-gate outage.
+///
+/// The caller may use this only when the checkpoint's QC-input fingerprint still
+/// matches the workspace. It intentionally performs no build/test, governance,
+/// scope, or acceptance work: those exact deterministic floors already passed for
+/// this tree, and repeating them (especially Docker/full-suite verification) is
+/// unrelated to repairing reviewer transport.
+async fn run_critic_review_only(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    route: Option<&RoutePlan>,
+) -> QcReport {
+    let review = match route.map(|route| route.team.as_slice()) {
+        Some(seats) => director::review_with_seats(session, options, events, seats).await,
+        None => {
+            director::review(
+                session,
+                options,
+                events,
+                crate::continuous::ReviewKind::Quality,
+            )
+            .await
+        }
+    };
+    let review = quality_evidence::split_review_evidence(&review);
+    QcReport {
+        blocking: review.blocking,
+        operational: review.operational,
+        raw_failure_log: None,
     }
 }
 
@@ -6838,8 +6774,8 @@ async fn run_auto_qc(
     ran_build_tool: bool,
 ) -> QcReport {
     events.emit(EngineEvent::Note("team · honesty + QC read".to_string()));
-    let route_team = route.map(|r| r.team.as_slice());
     let mut blocking: Vec<String> = Vec::new();
+    let mut operational: Vec<String> = Vec::new();
     // B1#2: the failing build/test output's bounded raw tail (when the fact read
     // below fails) — threaded into the fix directive as adaptable raw evidence.
     let mut raw_failure_log: Option<String> = None;
@@ -6860,6 +6796,7 @@ async fn run_auto_qc(
         // decisive finding rather than reading over an empty tree.
         return QcReport {
             blocking,
+            operational,
             raw_failure_log: None,
         };
     }
@@ -6941,6 +6878,7 @@ async fn run_auto_qc(
         ));
         return QcReport {
             blocking,
+            operational,
             raw_failure_log: None,
         };
     }
@@ -7018,19 +6956,9 @@ async fn run_auto_qc(
     // Run fork critics only over a deterministically viable candidate; otherwise
     // repair the objective blockers first and review the next bounded round.
     if quality_evidence::should_run_critic_review(&blocking) {
-        let review = match route_team {
-            Some(seats) => director::review_with_seats(session, options, events, seats).await,
-            None => {
-                director::review(
-                    session,
-                    options,
-                    events,
-                    crate::continuous::ReviewKind::Quality,
-                )
-                .await
-            }
-        };
-        blocking.extend(review_blocking(&review));
+        let review = run_critic_review_only(session, options, events, route).await;
+        blocking.extend(review.blocking);
+        operational.extend(review.operational);
     } else {
         events.emit(EngineEvent::Note(
             quality_evidence::DEFERRED_CRITIC_REVIEW_NOTE.to_string(),
@@ -7039,6 +6967,7 @@ async fn run_auto_qc(
 
     QcReport {
         blocking,
+        operational,
         raw_failure_log,
     }
 }
@@ -7223,19 +7152,6 @@ fn build_test_blocking(r: &VerifyResult) -> Option<String> {
         format!(" — {}", r.evidence.join("; "))
     };
     Some(format!("verify build-test: FAILED{detail}"))
-}
-
-/// Pull every reason a required review is not clean. Operational unavailability is
-/// distinct in [`ReviewResult`] but blocks commercial completion just like a
-/// residual must-fix finding; it must never disappear as an empty pass.
-fn review_blocking(r: &ReviewResult) -> Vec<String> {
-    let mut findings = r.blocking.clone();
-    findings.extend(
-        r.unavailable
-            .iter()
-            .map(|item| format!("review unavailable: {item}")),
-    );
-    findings
 }
 
 #[cfg(test)]

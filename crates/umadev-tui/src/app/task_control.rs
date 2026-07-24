@@ -261,6 +261,9 @@ impl App {
                     return Action::None;
                 }
                 let requirement = self.resume_run_requirement();
+                if self.reject_replayed_host_git_operation(&requirement) {
+                    return Action::None;
+                }
                 self.push_resume_separator();
                 self.push(
                     ChatRole::UmaDev,

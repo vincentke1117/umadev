@@ -21,10 +21,12 @@
 //!    non-root npm operation on that prefix, including the user's *other* global
 //!    packages — and the "installed locally, so the command is not on PATH"
 //!    confusion (`npm i umadev` without `-g` → run it via `npx umadev`).
-//! 10. Stale temp-rewind marker (`check_workspace_rewind_marker`) — the ONE condition
-//!     that can wedge UmaDev permanently: a marker naming a snapshot the workspace can no
-//!     longer identify makes every `umadev run` abort on every start, forever. This is the
-//!     only check that can REPAIR (with `--fix`), and it repairs only that.
+//! 10. Workspace run-lock compatibility fence (`check_run_lock_fence`) — diagnoses
+//!     a legacy/incomplete fence and, with `--fix`, performs an explicit offline
+//!     migration after the user has stopped every older UmaDev process.
+//! 11. Stale temp-rewind marker (`check_workspace_rewind_marker`) — a marker naming
+//!     a snapshot the workspace can no longer identify makes every `umadev run`
+//!     abort on every start; `--fix` can clear only that unrecoverable marker.
 //!
 //! The hook checks never rely on substring matches: they parse the vendor's
 //! native configuration and validate the exact rows UmaDev owns.
@@ -69,10 +71,10 @@ impl Status {
 
 /// Run every doctor check, returning the rows in a stable order.
 ///
-/// `fix` lets the checks that CAN repair themselves do so. Today that is exactly one — the
-/// stale rewind marker ([`check_workspace_rewind_marker`]), which is the only condition that
-/// can permanently wedge the product with no way out. Every other check is read-only, with
-/// or without the flag.
+/// `fix` lets the two narrowly-scoped repair checks act: the explicit offline
+/// run-lock fence migration ([`check_run_lock_fence`]) and an unrecoverable stale
+/// rewind marker ([`check_workspace_rewind_marker`]). Every other check remains
+/// read-only.
 ///
 /// Async because the backend check now spawns a real `<base> --version` probe
 /// (via `umadev_host::probe_all`) so it agrees with the run path instead of a
@@ -83,6 +85,7 @@ pub async fn run_all(workspace: &Path, fix: bool) -> Vec<CheckResult> {
         check_binary_identity(),
         check_embedded_spec(),
         check_workspace_writable(workspace),
+        check_run_lock_fence(workspace, fix),
         check_workspace_rewind_marker(workspace, fix),
         check_spec_manifest(workspace),
     ];
@@ -107,6 +110,77 @@ pub async fn run_all(workspace: &Path, fix: bool) -> Vec<CheckResult> {
     results.push(check_embed_model());
     results.push(check_node_version());
     results
+}
+
+/// Diagnose and explicitly migrate the one-way v2 run-lock compatibility fence.
+///
+/// This is intentionally an **offline** repair. Released legacy clients do not
+/// share the v2 kernel guard, so no new binary can prove that a legacy process
+/// has not already entered its old check→unlink takeover window. `--fix` is the
+/// user's explicit assertion that every older UmaDev process has been stopped
+/// and will remain stopped during migration. The agent layer still refuses a
+/// live/unattributable recorded owner and rewrites only a provably-dead legacy
+/// row or a non-empty prefix of the exact v2 fence.
+fn check_run_lock_fence(workspace: &Path, fix: bool) -> CheckResult {
+    use umadev_agent::run_lock::{
+        RunLockFenceMigration as Migration, RunLockFenceStatus as FenceStatus,
+    };
+
+    let name = umadev_i18n::tl("doctor.run_lock_fence_name").to_string();
+    match umadev_agent::run_lock::inspect_fence(workspace) {
+        Ok(FenceStatus::Absent) => CheckResult {
+            name,
+            status: Status::Passed,
+            detail: umadev_i18n::tl("doctor.run_lock_fence_absent").to_string(),
+        },
+        Ok(FenceStatus::Current) => CheckResult {
+            name,
+            status: Status::Passed,
+            detail: umadev_i18n::tl("doctor.run_lock_fence_current").to_string(),
+        },
+        Ok(FenceStatus::LegacyOrIncomplete) if !fix => CheckResult {
+            name,
+            status: Status::Failed,
+            detail: umadev_i18n::tl("doctor.run_lock_fence_needs_fix").to_string(),
+        },
+        Ok(FenceStatus::LegacyOrIncomplete) => {
+            match umadev_agent::run_lock::migrate_fence(workspace) {
+                Ok(Migration::MigratedLegacy) => CheckResult {
+                    name,
+                    status: Status::Warning,
+                    detail: umadev_i18n::tl("doctor.run_lock_fence_migrated").to_string(),
+                },
+                Ok(Migration::RepairedPartial) => CheckResult {
+                    name,
+                    status: Status::Warning,
+                    detail: umadev_i18n::tl("doctor.run_lock_fence_repaired").to_string(),
+                },
+                Ok(Migration::AlreadyCurrent) => CheckResult {
+                    name,
+                    status: Status::Passed,
+                    detail: umadev_i18n::tl("doctor.run_lock_fence_current").to_string(),
+                },
+                Ok(Migration::Absent) => CheckResult {
+                    name,
+                    status: Status::Passed,
+                    detail: umadev_i18n::tl("doctor.run_lock_fence_absent").to_string(),
+                },
+                Err(error) => CheckResult {
+                    name,
+                    status: Status::Failed,
+                    detail: umadev_i18n::tlf(
+                        "doctor.run_lock_fence_refused",
+                        &[&error.to_string()],
+                    ),
+                },
+            }
+        }
+        Err(error) => CheckResult {
+            name,
+            status: Status::Failed,
+            detail: umadev_i18n::tlf("doctor.run_lock_fence_refused", &[&error.to_string()]),
+        },
+    }
 }
 
 /// Doctor row name for the local embedding-model presence check.
@@ -1346,7 +1420,33 @@ mod tests {
     async fn run_all_returns_all_checks_on_empty_workspace() {
         let tmp = TempDir::new().unwrap();
         let results = run_all(tmp.path(), false).await;
-        assert_eq!(results.len(), 17);
+        let names = results
+            .iter()
+            .map(|result| result.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "binary identity",
+                "embedded spec markdown",
+                "workspace writable",
+                umadev_i18n::tl("doctor.run_lock_fence_name"),
+                umadev_i18n::tl("doctor.rewind_marker_name"),
+                "spec manifest (UD-META-001)",
+                "AI host backends",
+                "Claude non-interactive auth",
+                "git (file checkpoints)",
+                "user config",
+                "Claude Code hook",
+                "Kimi Code hooks",
+                "Kimi Code shell",
+                "Deployment readiness",
+                "Ecosystem (MCP/Skill/Knowledge)",
+                NPM_CHECK,
+                EMBED_MODEL_CHECK,
+                NODE_CHECK,
+            ]
+        );
         // No FAILs on a clean workspace — only a manifest WARN.
         assert!(results.iter().all(|r| r.status != Status::Failed));
         // The "AI host backends" check warns iff no base CLI is on PATH, and the
@@ -1874,6 +1974,42 @@ mod tests {
         assert_eq!(
             check_workspace_rewind_marker(root, true).status,
             Status::Passed
+        );
+    }
+
+    #[test]
+    fn run_lock_fence_check_requires_explicit_offline_fix() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let dir = root.join(".umadev");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("run.lock"),
+            format!(
+                "pid=4000000 host={} ts=1\n",
+                std::env::var("HOSTNAME").unwrap_or_default()
+            ),
+        )
+        .unwrap();
+
+        let report_only = check_run_lock_fence(root, false);
+        assert_eq!(report_only.status, Status::Failed);
+        assert!(
+            report_only.detail.contains("doctor --fix"),
+            "{}",
+            report_only.detail
+        );
+        assert_ne!(
+            std::fs::read(dir.join("run.lock")).unwrap(),
+            b"pid=0 host=__umadev_v2__ ts=18446744073709551615 boot=__v2__ protocol=2\n"
+        );
+
+        let fixed = check_run_lock_fence(root, true);
+        assert_eq!(fixed.status, Status::Warning, "{}", fixed.detail);
+        assert_eq!(
+            check_run_lock_fence(root, false).status,
+            Status::Passed,
+            "the exact v2 fence is accepted after migration"
         );
     }
 }

@@ -316,6 +316,13 @@ pub const CLAUSES: &[Clause] = &[
         level: ClauseLevel::Must,
         section: "4.8",
     },
+    Clause {
+        id: "UD-FLOW-009",
+        layer: Layer::Flow,
+        title: "Host-owned ordinary Git commit",
+        level: ClauseLevel::Must,
+        section: "4.9",
+    },
     // --- Layer 3 — delivery artifacts (UD-ART-*) ---
     Clause {
         id: "UD-ART-001",
@@ -517,7 +524,7 @@ mod tests {
     fn clause_ids_are_unique() {
         let ids: HashSet<_> = CLAUSES.iter().map(|c| c.id).collect();
         assert_eq!(ids.len(), CLAUSES.len(), "duplicate clause IDs");
-        assert_eq!(CLAUSES.len(), 34, "V1 clause count drifted");
+        assert_eq!(CLAUSES.len(), 35, "V1 clause count drifted");
     }
 
     #[test]
@@ -571,6 +578,15 @@ mod tests {
         let c = get_clause("UD-CODE-001").expect("UD-CODE-001 should exist");
         assert_eq!(c.layer, Layer::Code);
         assert_eq!(c.level, ClauseLevel::Must);
+    }
+
+    #[test]
+    fn host_owned_git_commit_clause_is_normative_flow() {
+        let c = get_clause("UD-FLOW-009").expect("UD-FLOW-009 should exist");
+        assert_eq!(c.layer, Layer::Flow);
+        assert_eq!(c.level, ClauseLevel::Must);
+        assert_eq!(c.section, "4.9");
+        assert_eq!(c.title, "Host-owned ordinary Git commit");
     }
 
     #[test]

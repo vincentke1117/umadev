@@ -273,13 +273,149 @@ pub(super) fn observed_tool_effect(name: &str, input: &serde_json::Value) -> Obs
         .get("command")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    if is_strict_read_only_command(command) {
+    if is_strict_read_only_command(command) || is_bounded_git_metadata_command(command) {
         ObservedToolEffect::Neutral
     } else {
         // With no call id or filesystem journal, an arbitrary shell command must
         // be treated as possibly mutating. This is conservative by design.
         ObservedToolEffect::PotentialWrite
     }
+}
+
+/// Recognize the narrow Git operations that mutate only the index/HEAD, not
+/// workspace file contents. A turn such as "commit the current changes, then run
+/// tests" is already mutating by route authority; treating its `git add` or
+/// ordinary new `git commit` as a *code write* would incorrectly widen it into a
+/// product build and arm team QC.
+///
+/// This deliberately does not attempt to be a shell parser. It accepts one plain
+/// command with balanced quotes and rejects every shell control/substitution
+/// surface. History-rewriting, hook-bypassing, implicit-staging, and interactive
+/// commit forms remain conservative `PotentialWrite` operations.
+fn is_bounded_git_metadata_command(command: &str) -> bool {
+    let Some(tokens) = single_shell_command_tokens(command) else {
+        return false;
+    };
+    let Some(program) = tokens.first() else {
+        return false;
+    };
+    let program = program.replace('\\', "/").to_ascii_lowercase();
+    if portable_executable_name(&program) != "git" {
+        return false;
+    }
+
+    match tokens.get(1).map(|token| token.to_ascii_lowercase()) {
+        Some(subcommand) if subcommand == "add" => !tokens.iter().skip(2).any(|token| {
+            matches!(
+                token.to_ascii_lowercase().as_str(),
+                "-f" | "--force" | "-p" | "--patch" | "-i" | "--interactive" | "-e" | "--edit"
+            )
+        }),
+        Some(subcommand) if subcommand == "commit" => {
+            let lower = tokens
+                .iter()
+                .skip(2)
+                .map(|token| token.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            let has_inline_message = lower.iter().any(|token| {
+                matches!(token.as_str(), "-m" | "--message") || token.starts_with("--message=")
+            });
+            has_inline_message
+                && !lower.iter().any(|token| {
+                    matches!(
+                        token.as_str(),
+                        "--amend"
+                            | "-a"
+                            | "--all"
+                            | "--no-verify"
+                            | "--allow-empty"
+                            | "--allow-empty-message"
+                            | "--fixup"
+                            | "--squash"
+                            | "-c"
+                            | "--reuse-message"
+                            | "--reedit-message"
+                            | "-f"
+                            | "--file"
+                    ) || token.starts_with("--fixup=")
+                        || token.starts_with("--squash=")
+                        || token.starts_with("--reuse-message=")
+                        || token.starts_with("--reedit-message=")
+                        || token.starts_with("--file=")
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Tokenize one shell command while rejecting syntax that could append another
+/// operation or execute a substitution. This is intentionally small and
+/// fail-closed; it only exists to recognize the bounded Git metadata lane above.
+fn single_shell_command_tokens(command: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut token = String::new();
+    let mut tokens = Vec::new();
+    let mut chars = command.trim().chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            token.push(ch);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                } else if matches!(ch, '\n' | '\r') {
+                    return None;
+                } else {
+                    token.push(ch);
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => escaped = true,
+                '`' | '\n' | '\r' => return None,
+                '$' if chars.peek() == Some(&'(') => return None,
+                _ => token.push(ch),
+            },
+            Quote::None => match ch {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                // Preserve Windows executable paths (`C:\...\git.exe`). The
+                // bounded lane rejects every shell control character anyway,
+                // so no backslash escape is needed to decide command safety.
+                '\\' => token.push(ch),
+                ch if ch.is_whitespace() => {
+                    if !token.is_empty() {
+                        tokens.push(std::mem::take(&mut token));
+                    }
+                }
+                ';' | '&' | '|' | '<' | '>' | '`' | '#' | '(' | ')' | '\n' | '\r' => {
+                    return None;
+                }
+                '$' if chars.peek() == Some(&'(') => return None,
+                _ => token.push(ch),
+            },
+        }
+    }
+
+    if escaped || quote != Quote::None {
+        return None;
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    (!tokens.is_empty()).then_some(tokens)
 }
 
 pub(super) fn is_strict_read_only_command(command: &str) -> bool {

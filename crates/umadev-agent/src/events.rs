@@ -61,6 +61,16 @@ pub enum EngineEvent {
         /// The gate it paused at, or `None` when delivery completed.
         paused_at: Option<Gate>,
     },
+    /// A required reviewer/host was operationally unavailable. The workflow
+    /// remains checkpointed and `/continue` retries the review boundary.
+    OperationalPaused {
+        /// Bounded host-owned evidence for the outage.
+        reason: String,
+        /// Completed phases/steps at the pause.
+        done: usize,
+        /// Total phases/steps in the persisted workflow.
+        total: usize,
+    },
     /// A host backend was probed for availability (TUI startup).
     BackendProbed {
         /// Stable id of one of five bases: three native (`claude-code`, `codex`,

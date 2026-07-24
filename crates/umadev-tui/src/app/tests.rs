@@ -3,6 +3,9 @@ use crate::config::UserConfig;
 use umadev_agent::config::CodexSandbox;
 use umadev_runtime::Usage;
 
+#[path = "tests/git_host_firewall_tests.rs"]
+mod git_host_firewall_tests;
+
 fn sample_curated_lesson(
     title: &str,
     status: umadev_agent::CuratedLessonStatus,
@@ -6132,6 +6135,48 @@ fn slash_revise_without_args_is_noop_with_usage_hint() {
 }
 
 #[test]
+fn commit_text_at_an_active_gate_routes_to_host_instead_of_gate_model_or_revision() {
+    let mut app = fresh_app(Some("offline"));
+    app.set_trust_mode(umadev_agent::TrustMode::Auto);
+    app.apply_engine(EngineEvent::GateOpened {
+        gate: Gate::DocsConfirm,
+        choice: None,
+    });
+
+    let action = app.submit_text("提交git记录".to_string());
+
+    assert_eq!(action, Action::Route("提交git记录".to_string()));
+    assert_eq!(app.active_gate, Some(Gate::DocsConfirm));
+    assert!(!app.gate_query_in_flight);
+    assert!(app.tasks.is_empty());
+    assert_eq!(app.last_dispatched_chat.as_deref(), Some("提交git记录"));
+}
+
+#[test]
+fn slash_revise_git_operation_is_rejected_without_driving_the_gate_block() {
+    let mut app = fresh_app(Some("offline"));
+    app.set_trust_mode(umadev_agent::TrustMode::Auto);
+    app.apply_engine(EngineEvent::GateOpened {
+        gate: Gate::PreviewConfirm,
+        choice: None,
+    });
+    for ch in "/revise 提交git记录".chars() {
+        let _ = app.apply_key(KeyCode::Char(ch));
+    }
+
+    let action = app.apply_key(KeyCode::Enter);
+
+    assert_eq!(action, Action::None);
+    assert_eq!(app.active_gate, Some(Gate::PreviewConfirm));
+    assert!(!app.gate_query_in_flight);
+    assert!(app.tasks.is_empty());
+    assert!(app.history.iter().any(|message| {
+        let body = message.body();
+        body.contains("宿主") || body.contains("host")
+    }));
+}
+
+#[test]
 fn slash_goal_with_objective_starts_a_goal_driven_build() {
     // `/goal <objective>` → a goal-driven director build (StartGoal), carrying
     // the whole arg as the objective (no slug parsing — a goal is a sentence).
@@ -7123,6 +7168,40 @@ fn budget_pause_presents_as_paused_not_aborted() {
     // A fresh live turn clears the pause so its label can't paint over live work.
     app.thinking = true;
     app.clear_stale_terminal_on_live_turn();
+    assert!(!app.budget_paused);
+    assert_eq!(app.run_state(), RunState::Running);
+}
+
+#[test]
+fn operational_review_pause_is_resumable_and_never_aborted() {
+    let mut app = fresh_app(Some("offline"));
+    app.run_started = true;
+    app.run_started_at = Some(std::time::Instant::now());
+    app.thinking = true;
+    app.agentic_in_flight = true;
+    app.director_run_in_flight = true;
+
+    app.record_run_paused_at_operational("qa reviewer timed out".to_string(), 2, 6);
+
+    assert_eq!(app.run_state(), RunState::PausedAtOperational);
+    assert!(app.budget_paused);
+    assert_eq!(
+        app.operational_pause_reason.as_deref(),
+        Some("qa reviewer timed out")
+    );
+    assert!(!app.aborted && !app.degraded && !app.finished);
+    assert!(!app.is_pipeline_active());
+    app.refresh_status();
+    assert!(app.status.contains("[paused]"));
+    assert!(!app.status.contains("[aborted]"));
+    assert!(app.history.back().is_some_and(|message| {
+        let body = message.body();
+        body.contains("/continue") && body.contains("2/6") && body.contains("qa reviewer timed out")
+    }));
+
+    app.thinking = true;
+    app.clear_stale_terminal_on_live_turn();
+    assert!(app.operational_pause_reason.is_none());
     assert!(!app.budget_paused);
     assert_eq!(app.run_state(), RunState::Running);
 }
@@ -9405,6 +9484,120 @@ fn plan_mode_slash_run_settles_before_any_run_state_or_task_is_created() {
         .history
         .iter()
         .any(|m| m.body().contains("计划模式") || m.body().contains("Plan mode")));
+}
+
+#[test]
+fn slash_run_git_commit_routes_to_the_host_transaction_without_director_state() {
+    let mut app = fresh_app(Some("offline"));
+    app.set_trust_mode(umadev_agent::TrustMode::Auto);
+    let request = "提交 Git 记录，不要跑评审";
+
+    let action = app.slash_run(request);
+
+    assert_eq!(action, Action::Route(request.to_string()));
+    assert!(!app.run_started && !app.director_run_in_flight);
+    assert!(
+        app.tasks.is_empty(),
+        "Git-only work creates no Director task"
+    );
+    assert!(
+        app.requirement.is_empty(),
+        "Git-only work never becomes a product requirement"
+    );
+    assert_eq!(app.last_dispatched_chat.as_deref(), Some(request));
+    assert_eq!(
+        app.pending_route_input
+            .as_ref()
+            .and_then(|turn| turn.input.sole_text()),
+        Some(request)
+    );
+}
+
+#[test]
+fn slash_run_compound_git_requests_fail_closed_at_the_app_boundary() {
+    for request in ["git commit -m sync && cargo test", "提交git记录，然后推送"] {
+        let mut app = fresh_app(Some("offline"));
+        app.set_trust_mode(umadev_agent::TrustMode::Auto);
+        let root = app.project_root.clone();
+
+        let action = app.slash_run(request);
+
+        assert_eq!(action, Action::None, "{request}");
+        assert!(
+            !app.run_started && !app.director_run_in_flight,
+            "a rejected compound must not start any run: {request}"
+        );
+        assert!(app.tasks.is_empty(), "{request}");
+        assert!(app.requirement.is_empty(), "{request}");
+        assert!(app.last_dispatched_chat.is_none(), "{request}");
+        assert!(app.pending_route_input.is_none(), "{request}");
+        assert!(
+            !root.join(".umadev/run.lock").exists()
+                && !root.join(".umadev/workflow-state.json").exists()
+                && !root.join(".umadev/governance-context.json").exists(),
+            "App rejection must happen before any run persistence: {request}"
+        );
+        assert!(
+            app.history.iter().any(|message| {
+                let body = message.body();
+                body.contains("提交git记录") || body.contains("Git")
+            }),
+            "the local rejection must explain the host boundary: {request}"
+        );
+    }
+}
+
+#[test]
+fn slash_goal_and_quick_git_commit_route_only_to_the_host_transaction() {
+    for command in ["/goal 提交git记录", "/quick 提交git记录"] {
+        let mut app = fresh_app(Some("offline"));
+        app.set_trust_mode(umadev_agent::TrustMode::Auto);
+
+        for ch in command.chars() {
+            let _ = app.apply_key(KeyCode::Char(ch));
+        }
+        let action = app.apply_key(KeyCode::Enter);
+
+        assert_eq!(
+            action,
+            Action::Route("提交git记录".to_string()),
+            "{command}"
+        );
+        assert!(!app.run_started && !app.director_run_in_flight, "{command}");
+        assert!(app.tasks.is_empty(), "{command}");
+        assert!(app.requirement.is_empty(), "{command}");
+        assert_eq!(app.last_dispatched_chat.as_deref(), Some("提交git记录"));
+    }
+}
+
+#[test]
+fn slash_goal_and_quick_compound_git_requests_fail_before_any_run_state() {
+    for command in [
+        "/goal 提交git记录，然后推送",
+        "/quick git commit -m sync && cargo test",
+    ] {
+        let mut app = fresh_app(Some("offline"));
+        app.set_trust_mode(umadev_agent::TrustMode::Auto);
+        let root = app.project_root.clone();
+
+        for ch in command.chars() {
+            let _ = app.apply_key(KeyCode::Char(ch));
+        }
+        let action = app.apply_key(KeyCode::Enter);
+
+        assert_eq!(action, Action::None, "{command}");
+        assert!(!app.run_started && !app.director_run_in_flight, "{command}");
+        assert!(app.tasks.is_empty(), "{command}");
+        assert!(app.requirement.is_empty(), "{command}");
+        assert!(app.last_dispatched_chat.is_none(), "{command}");
+        assert!(app.pending_route_input.is_none(), "{command}");
+        assert!(
+            !root.join(".umadev/run.lock").exists()
+                && !root.join(".umadev/workflow-state.json").exists()
+                && !root.join(".umadev/governance-context.json").exists(),
+            "{command}"
+        );
+    }
 }
 
 #[test]

@@ -40,13 +40,17 @@ mod clipboard_image;
 pub mod config;
 #[cfg(test)]
 mod cross_platform_terminal_tests;
+mod director_run;
 mod execution_postcondition;
+mod host_git;
 pub mod input;
 mod interaction_bridge;
 pub mod link;
 mod preview;
 mod prompt_queue_ui;
+mod resident_host_git;
 mod resident_turn_support;
+mod route_decision;
 pub mod selection;
 mod session_slot;
 mod tool_effects;
@@ -58,6 +62,10 @@ pub use base_config::{
     detect_base_context_window, detect_base_context_window_for_model, detect_base_model,
     detect_base_reasoning,
 };
+#[cfg(test)]
+use director_run::resolve_workflow_resume_identity;
+use director_run::{run_director_loop, settle_director_session};
+pub use host_git::execute_host_git_commit;
 
 use std::fmt::Write as _;
 use std::io::Stdout;
@@ -100,12 +108,12 @@ use crate::execution_postcondition::{
 };
 use crate::input::InputSource;
 use crate::interaction_bridge::{
-    allow_pending_approval, await_host_input, await_user_approval, clear_pending_approval,
-    clear_pending_host_input, deny_pending_approval, interactive_user_present,
-    pending_approval_item, pending_host_input_item, publish_live_trust,
-    release_pending_approval_on_auto_switch, resolve_pending_approval,
-    resolve_pending_host_input_key, resolve_resident_host_request, should_pause_for_user,
-    trust_for_resident_turn, ApprovalHolder, ApprovalReply, HostInputHolder, PendingAskHolder,
+    allow_pending_approval, await_user_approval, clear_pending_approval, clear_pending_host_input,
+    deny_pending_approval, interactive_user_present, pending_approval_item,
+    pending_host_input_item, publish_live_trust, release_pending_approval_on_auto_switch,
+    resolve_pending_approval, resolve_pending_host_input_key, resolve_resident_host_request,
+    should_pause_for_user, trust_for_resident_turn, ApprovalHolder, ApprovalReply, HostInputHolder,
+    PendingAskHolder,
 };
 #[cfg(test)]
 use crate::interaction_bridge::{
@@ -118,8 +126,9 @@ use crate::preview::{parse_run_command, port_is_free, url_host_port, wait_for_po
 use crate::resident_turn_support::{
     capture_resident_tool_pitfall, delivery_report_status, directive_turn_input,
     input_failure_decision, input_failure_note, route_clarification_reply,
-    routed_turn_executes_read_only,
+    routed_turn_executes_read_only, select_resident_turn_payload,
 };
+use crate::route_decision::RouteDecision;
 use crate::session_slot::{
     build_cold_judge_driver, build_host_driver, PermissionedSession, SessionHolder, SessionIdentity,
 };
@@ -561,140 +570,6 @@ pub fn cold_judge_surface(
     })
 }
 
-/// Terminal signal from a model-routed turn back to the event loop. Classification
-/// and any director hand-off run in the spawned task, keeping the render loop
-/// responsive; the terminal message carries the effective outcome back.
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum RouteDecision {
-    /// Complete native queue replacement from the base. This is the only event
-    /// allowed to change the visible queue mirror.
-    PromptQueueSnapshot(PromptQueueSnapshot),
-    /// A queued input frame reached the transport. The subsequent queue snapshot
-    /// remains the commit signal; this only records the user's submitted turn.
-    PromptQueueInputWritten { text: String },
-    /// Native queue delivery failed before a snapshot could accept it.
-    PromptQueueInputRejected { turn: SubmittedTurn, note: String },
-    /// A versioned queue mutation failed. The visible server mirror is retained.
-    PromptQueueMutationRejected {
-        mutation: PromptQueueMutation,
-        note: String,
-    },
-    /// A live steering method returned its delivery receipt. This is
-    /// non-terminal: record the input into conversation memory while the
-    /// resident session continues streaming. The receipt proves queuing, not
-    /// that the model has observed the input; `semantics` controls the honest UI
-    /// wording for the vendor's advertised behavior.
-    LiveInputAccepted {
-        /// Path-free text shown in the user's bubble.
-        text: String,
-        /// Exact semantics advertised by the session that accepted the input.
-        semantics: SteerSemantics,
-    },
-    /// A live typed input failed validation or protocol delivery. The
-    /// original turn remains live; restore the exact snapshot for correction.
-    LiveInputRejected { turn: SubmittedTurn, note: String },
-    /// An initial typed turn failed structured-input validation or transport
-    /// negotiation. This is terminal for the active turn, but carries the exact
-    /// snapshot back so the editor can restore it for correction.
-    InputRejected { turn: SubmittedTurn, note: String },
-    /// The user cancelled a pre-session authentication flow. The original typed
-    /// turn is carried back intact and merged with any newer ordinary draft;
-    /// unlike a normal base failure it is never silently re-driven.
-    AuthCancelled { turn: SubmittedTurn, note: String },
-    /// A natural-language turn was semantically promoted into the director
-    /// workflow. This is a non-terminal state transition: it lets the UI route
-    /// input typed while the build is running into the director's live steering
-    /// intake (or the deferred-chat queue) before the terminal outcome arrives.
-    DirectorStarted {
-        /// The current request, used to register the live task on the UI thread.
-        requirement: String,
-    },
-    /// A brain-driven streaming turn finished. Carries the final assembled text so
-    /// the event loop records it as the assistant turn (chat memory continuity);
-    /// the body was ALREADY streamed live via `WorkerStream`, so it is NOT
-    /// re-rendered. A terminal outcome → clears the "thinking…" status.
-    ///
-    /// `director_build` carries whether THIS turn was a Build-class director build
-    /// (run-lock + branch isolation + finalize). The chat surface now classifies
-    /// INSIDE the spawned task (the brain-router consult is 1-3s, so it cannot run
-    /// inline on the UI thread), which means the event loop no longer knows the
-    /// class before dispatch — so the build-ness is carried back HERE and drives
-    /// the Wave-5 session hand-back (`record_agentic_done`) instead of the
-    /// pre-spawn `director_run_in_flight` flag.
-    AgenticDone {
-        /// The final assembled assistant text (already streamed live).
-        reply: String,
-        /// `true` when this was a director build → hand the session back to chat.
-        director_build: bool,
-        /// The base's OWN resumable session id, captured off the LIVE resident chat
-        /// session before it is parked (claude's pinned `--session-id` / codex's
-        /// `thread.id`; `None` for opencode / offline / the non-resident paths). The
-        /// event loop stores it onto `App` (`record_agentic_done`) so the saved chat
-        /// points at the real base conversation a relaunch can `--resume` — the deep
-        /// cross-session memory fix. `None` is fail-open (degrades to a fresh session
-        /// + the replayed transcript).
-        base_session_id: Option<String>,
-        /// Immutable authority identity under which `base_session_id` was
-        /// created. A missing identity is never sufficient to resume Grok Build;
-        /// the transcript remains the fail-safe handoff.
-        base_resume_identity: Option<umadev_runtime::BaseResumeIdentity>,
-    },
-    /// An explicit Director entry reached the Plan/read-only ceiling before any
-    /// execution setup. It is a terminal no-op, not a successful build and not a
-    /// failure; the app clears any defensive task bookkeeping without showing a
-    /// completion card.
-    RunNotExecuted,
-    /// The turn produced no usable reply (base init failed, an empty reply, or a
-    /// hard error). Carries the human-readable reason, routed through the same
-    /// channel so the event loop clears the "thinking…" status on EVERY terminal
-    /// outcome, and a plain progress Note never has to.
-    Failed(String),
-    /// A director build PAUSED at a spec-MUST confirmation gate (`docs_confirm` /
-    /// `preview_confirm`) awaiting the user. The agent already persisted the plan
-    /// and emitted `GateOpened`, but the TUI stages that event until this terminal
-    /// decision proves the writer session has ended. It then renders the gate and
-    /// arms the pause marker so approval (`c` / `/continue`) or a typed revision
-    /// resumes through `drive_director_loop_resume`.
-    RunPausedAtGate {
-        /// The gate the run parked at.
-        gate: Gate,
-    },
-    /// A director build PAUSED because its wall-clock budget was exhausted while
-    /// resumable work remained. The agent checkpointed the plan (completed steps
-    /// `Done`, the rest `Pending`); this terminal decision clears "thinking", keeps
-    /// the plan panel visible (frozen), and arms the budget-pause marker so
-    /// `/continue` re-drives ONLY the remaining steps. Unlike a gate pause it renders
-    /// NO gate card — just the resume hint carrying `done/total`.
-    RunPausedAtBudget {
-        /// Completed steps at the pause.
-        done: usize,
-        /// Total steps in the plan.
-        total: usize,
-    },
-    /// A read-only question asked while a confirmation gate remains open was
-    /// answered. The app validates the generation before atomically displaying
-    /// and recording the body; unlike AgenticDone, this must not clear or advance
-    /// the parked gate.
-    GateQueryDone {
-        /// App-local generation of the query that produced this answer.
-        epoch: u64,
-        /// The complete answer recorded into durable conversation memory.
-        reply: String,
-    },
-    /// The read-only gate-question surface failed. The gate remains open so the
-    /// user can retry, approve, revise, or cancel.
-    GateQueryFailed {
-        /// App-local generation of the query that failed.
-        epoch: u64,
-        note: String,
-    },
-    /// A tracked `/deploy` task settled and released the single-task slot.
-    DeployDone {
-        /// Whether the deploy adapter reported a live deployment.
-        succeeded: bool,
-    },
-}
-
 enum LiveInputRequest {
     Steer { turn: SubmittedTurn },
     PromptQueue { request: PromptQueueRequest },
@@ -1032,6 +907,10 @@ fn spawn_block(
     block: Block,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        if let Some(note) = resident_host_git::replay_note(&options.requirement) {
+            sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{note}")));
+            return;
+        }
         let label = spec.label();
         // The pipeline drives its own multi-phase prompts; it does not share
         // the chat session, so it never resumes (continue_session = false,
@@ -1494,6 +1373,10 @@ fn spawn_continuous_block(
     permissions: umadev_runtime::BasePermissionProfile,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        if let Some(note) = resident_host_git::replay_note(&options.requirement) {
+            sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{note}")));
+            return;
+        }
         let backend = options.backend.clone();
         let model = options.model.clone();
         let root = options.project_root.clone();
@@ -1583,6 +1466,21 @@ fn spawn_continuous_block(
                 // `/continue` block resumes it with context retained.
                 *holder.lock().await = Some(PermissionedSession::new(session, session_identity));
             }
+            Ok(umadev_agent::RunOutcome::PausedAtOperational {
+                reason,
+                done,
+                total,
+            }) => {
+                // Preserve the live base context, then publish a typed pause only
+                // after ownership is safely back in the holder. The UI must never
+                // paint this host outage as an abort or completion.
+                *holder.lock().await = Some(PermissionedSession::new(session, session_identity));
+                sink.emit(EngineEvent::OperationalPaused {
+                    reason,
+                    done,
+                    total,
+                });
+            }
             Ok(umadev_agent::RunOutcome::Completed) => {
                 // Run settled — close the session and clear the holder.
                 let _ = session.end().await;
@@ -1625,8 +1523,8 @@ fn spawn_continuous_block(
 /// [`RouteDecision::AgenticDone`] / [`RouteDecision::Failed`] clears `thinking` and
 /// records the assistant turn for chat-memory continuity — identical to
 /// [`spawn_agentic`]. A NEW base session is opened per `/run` (a director build is
-/// a standalone, run-to-settle orchestration, not a gate-anchored block sequence),
-/// and `end()`-ed when the loop settles.
+/// a standalone, run-to-settle orchestration, not a gate-anchored block sequence).
+/// Terminal outcomes end it; an operational-review pause parks it for `/continue`.
 ///
 /// **Fail-open:** a session that can't open / the run-lock held by a DIFFERENT live
 /// run emits the honest `ABORT_SENTINEL` note and a terminal `Failed`; a session
@@ -1650,6 +1548,7 @@ fn spawn_director_loop(
     options: RunOptions,
     sink: Arc<ChannelSink>,
     route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    session_holder: SessionHolder,
     permissions: umadev_runtime::BasePermissionProfile,
     conversation: Vec<Message>,
     route_override: Option<RoutePlan>,
@@ -1663,6 +1562,7 @@ fn spawn_director_loop(
         options,
         sink,
         route_tx,
+        session_holder,
         permissions,
         conversation,
         route_override,
@@ -1673,509 +1573,6 @@ fn spawn_director_loop(
         host_input,
         None,
     ))
-}
-
-/// The director build loop body — the non-spawning core of [`spawn_director_loop`].
-///
-/// Split out so the brain-routed chat dispatcher ([`run_routed_turn`]) can drive
-/// the director build INLINE from inside its OWN already-spawned classification
-/// task (a chat message classified `Build` must reuse this exact path — run-lock,
-/// branch isolation, firmware, the routed plan/step/finalize loop, source hard-gate
-/// — not a second copy). The `/run` entry + the queued-chat drain keep calling the
-/// spawning wrapper. The body is byte-for-byte the original; only the outer
-/// `tokio::spawn(async move { … })` moved up into the wrapper.
-#[allow(clippy::too_many_arguments)]
-async fn run_director_loop(
-    options: RunOptions,
-    sink: Arc<ChannelSink>,
-    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
-    permissions: umadev_runtime::BasePermissionProfile,
-    conversation: Vec<Message>,
-    route_override: Option<RoutePlan>,
-    goal_mode: bool,
-    resume: bool,
-    // A2#3/#4: the hosting UI's live hooks — the shared mid-run steering intake
-    // and the y/n approval pause holder. Scoped into the agent's task-local
-    // `RunInteraction` around the drive below, so the director loop can pause at
-    // the spec-MUST gates, ask the live user to approve an escalated action, and
-    // fold queued steering into the next step — all fail-open (a CLI drive that
-    // never scopes them keeps headless behaviour byte-for-byte).
-    steer: umadev_agent::SteerIntake,
-    approval: ApprovalHolder,
-    host_input: HostInputHolder,
-    // A natural-language turn is classified only after its resident writer has
-    // been acquired. Reuse that already-open, correctly permissioned session for
-    // the director drive; explicit `/run` passes `None` and opens/resumes normally.
-    resident_session: Option<Box<dyn umadev_runtime::BaseSession>>,
-) {
-    // Defensive no-write ceiling. Normal explicit entries reject Plan mode on
-    // the UI thread, but this boundary also protects programmatic/direct callers
-    // before they acquire a run lock, create a branch, persist workflow state, or
-    // open a writable host session.
-    if !options.mode.executes() {
-        sink.emit(EngineEvent::Note(
-            umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
-        ));
-        sink.emit(EngineEvent::Note(
-            umadev_i18n::tl("mode.plan.gate").to_string(),
-        ));
-        let _ = route_tx.send(RouteDecision::RunNotExecuted);
-        return;
-    }
-
-    {
-        let backend = options.backend.clone();
-        let model = options.model.clone();
-        let root = options.project_root.clone();
-
-        // Single-writer run-lock for the whole director loop — the SAME guard the
-        // CLI `drive_director_run` + the legacy pipeline hold, so a director build
-        // serializes with any other workspace-mutating run. A lock held by a
-        // DIFFERENT live run is an honest terminal abort; any other lock IO fails
-        // open inside `acquire_for_run` to an un-owned guard (a lock bug never
-        // blocks a legitimate build). The guard lives for the task's scope.
-        let _run_lock = match umadev_agent::run_lock::RunLock::acquire_for_run(&root) {
-            Ok(g) => g,
-            Err(e) => {
-                sink.emit(EngineEvent::Note(format!(
-                    "{ABORT_SENTINEL}{}",
-                    block_abort_note(&e, &backend)
-                )));
-                let _ = route_tx.send(RouteDecision::Failed(start_failed_note(&e)));
-                return;
-            }
-        };
-
-        // Isolate the build and snapshot its baseline before writes. Fail open when
-        // isolation is unavailable; never auto-merge or push the resulting branch.
-        let isolation = if resume {
-            umadev_agent::setup_run_isolation(&root, &options.effective_slug())
-        } else {
-            umadev_agent::setup_new_run_isolation(&root, &options.effective_slug())
-        };
-        if let Some((branch, from)) = isolation {
-            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                "trust.branch_isolated",
-                &[&branch, &from],
-            )));
-        }
-
-        // MEDIUM #7: write the WorkflowState baseline, exactly like the CLI's
-        // `AgentRunner::start` does (`.umadev/workflow-state.json`, phase `research`,
-        // slug + requirement + backend). Without this a TUI-originated director build
-        // left no state on disk, so `umadev status` / `umadev continue` against a
-        // build STARTED in the chat TUI read `Missing` and bailed — the run was
-        // invisible to the CLI surfaces. Written here (after the run-lock + isolation,
-        // before the base writes anything) so the baseline reflects this run. Fail-open
-        // by contract: a disk/permission error is swallowed (`let _ =`) — a state-write
-        // bug must NEVER block an otherwise-healthy build.
-        // P0 (full-context resume): a vendor session id is owned by the exact base
-        // that persisted it. A `/continue` may carry it only when that owner matches
-        // the currently selected base byte-for-byte. Retired/unknown workflows and
-        // explicit formal→formal switches keep the requirement, plan, and artifacts,
-        // but start a fresh vendor session; an id must never cross that boundary.
-        let persisted_state = resume
-            .then(|| umadev_agent::read_workflow_state(&root))
-            .flatten();
-        let resume_identity = resolve_workflow_resume_identity(
-            resume,
-            persisted_state.as_ref(),
-            backend.as_str(),
-            &root,
-            permissions,
-        );
-        let prior_base_session_id = resume_identity.base_session_id.clone();
-        if let Some(previous_backend) = resume_identity.handoff_from {
-            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                "backend.workflow_handoff",
-                &[&previous_backend, &backend],
-            )));
-        }
-        let mut baseline = {
-            // `WorkflowState::new` fills `last_transition_at` (now) + `spec_version`;
-            // override the run-specific carry-through fields the CLI's `start` sets.
-            let mut s = umadev_agent::WorkflowState::new(umadev_spec::Phase::Research);
-            s.slug = options.effective_slug();
-            s.requirement.clone_from(&options.requirement);
-            s.backend.clone_from(&backend);
-            s.note = format!("Started director build (TUI) with {backend}");
-            // Preserve the prior resume pointer across the baseline write so the
-            // resume id survives (the LIVE id is re-persisted right after the session
-            // opens; a failed owned resume aborts instead of changing conversations).
-            s.base_session_id = prior_base_session_id.clone();
-            s.base_resume_identity = resume_identity.base_resume_identity.clone();
-            s.permission_profile = Some(options.mode.base_permissions());
-            s
-        };
-        let _ = umadev_agent::write_workflow_state(&root, &baseline);
-
-        // Wave 2 (firmware): compose UmaDev's identity + craft + JIT knowledge +
-        // pitfall memory once (the `/run` route is deterministic, no session needed)
-        // so claude can take it NATIVELY as a system prompt via `session_for`'s
-        // `--append-system-prompt`. Fail-open: an empty firmware just leaves the base
-        // un-primed beyond the directive, exactly as before.
-        //
-        // Route source: an explicit `/run` passes `None` → `for_run` FORCES a Build
-        // (a bare goal still builds). A natural-language build passes the healthy
-        // model verdict already produced on the read-only intent child, so Director
-        // drives the exact class/kind/depth/team the selected brain chose. The
-        // deterministic availability fallback never reaches this entry.
-        let route =
-            route_override.unwrap_or_else(|| umadev_agent::router::for_run(&options.requirement));
-        let firmware = umadev_agent::compose_firmware(&root, &route, &options.requirement).await;
-        let firmware = (!firmware.trim().is_empty()).then_some(firmware);
-
-        // Reuse the resident writer for a model-routed natural-language build. It
-        // already carries the selected base/model, permission profile and native
-        // dialogue, avoiding a third process after the read-only intent fork. An
-        // explicit `/run` or `/continue` has no resident writer here and opens or
-        // resumes through the normal director path.
-        let reused_resident = resident_session.is_some();
-        let mut session = if let Some(session) = resident_session {
-            session
-        } else {
-            match open_director_session(
-                &backend,
-                &root,
-                &model,
-                permissions,
-                firmware.as_deref(),
-                prior_base_session_id.as_deref(),
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    sink.emit(EngineEvent::Note(format!(
-                        "{ABORT_SENTINEL}{}",
-                        umadev_i18n::tlf("continuous.tui_session_unavailable", &[&e.to_string()],)
-                    )));
-                    let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
-                        "continuous.tui_session_unavailable",
-                        &[&e.to_string()],
-                    )));
-                    return;
-                }
-            }
-        };
-
-        // P0 (full-context resume): persist the LIVE base session id so a later
-        // `/continue` can resume THIS conversation. On a successful claude/codex
-        // resume the id is unchanged (idempotent); when no eligible prior id exists,
-        // a genuinely fresh open captures the NEW conversation's id. A same-base
-        // resume failure never reaches this point: it is surfaced instead of silently
-        // changing brains. Fail-open: a base with no resumable id or a write error
-        // just leaves the baseline as-is.
-        if let Some(id) = session.session_id() {
-            let id = id.to_string();
-            if !id.trim().is_empty() {
-                baseline.base_session_id = Some(id);
-                baseline.base_resume_identity = session.resume_identity().cloned().or_else(|| {
-                    crate::session_slot::requested_resume_identity(&backend, &root, permissions)
-                });
-                let _ = umadev_agent::write_workflow_state(&root, &baseline);
-            }
-        }
-
-        // Frame the goal for the director (the firmware framing), then drive the
-        // build loop: the base builds end to end, UmaDev runs its honesty/QC read.
-        // A newly-opened Claude director already took the firmware natively as its
-        // system prompt. A reused resident was pre-warmed with identity only, so it
-        // receives the full route-sized firmware in-band like every non-Claude base.
-        // Fail-open: no firmware leaves the goal unchanged.
-        let goal = umadev_agent::experts::director_build_directive(&options.requirement);
-        // Chat-originated build (Blocker #2): front-load UmaDev's OWN bounded
-        // conversation transcript so the director's brain inherits the prior dialogue
-        // — the SAME Wave 5 / G11 memory `drive_agentic_stream` threads for a light
-        // chat turn, so a build promoted out of a conversation keeps that context
-        // instead of starting cold. Empty for an explicit `/run` (no prior chat) →
-        // the directive is unchanged. See `director_directive_with_history`.
-        let goal = director_directive_with_history(&conversation, &options.requirement, goal);
-        let directive = match firmware.as_deref() {
-            Some(fw) if backend != "claude-code" || reused_resident => {
-                format!("{fw}\n\n---\n\n{goal}")
-            }
-            _ => goal,
-        };
-        // GOAL MODE (mirrors the legacy pipeline's `with_goal_mode`): front-load a
-        // persistent-`/goal` framing so the base keeps working until the objective is
-        // met instead of stopping early. `goal_mode` is set by the `/goal` command
-        // (and defaulted on for every director build — Claude Code's native persistent
-        // mode is strictly stronger than a plain prompt loop). The ENCODING follows the
-        // borrowed brain's CAPABILITY: a native-`/goal` base gets a real `/goal`
-        // command; every base without that capability gets the same intent as a
-        // prompt fallback
-        // (the director loop drives them to completion regardless). It MUST be the very
-        // first thing the base reads, so it prepends ahead of the firmware block too.
-        // Fail-open: `UMADEV_NO_GOAL_MODE=1`, or a backend whose capabilities can't be
-        // read, leaves the directive exactly as before.
-        let directive = match resolve_goal_mode(&backend, goal_mode) {
-            Some(persistent_goal) => format!(
-                "{}{directive}",
-                umadev_agent::experts::goal_mode_prefix(&options.requirement, persistent_goal)
-            ),
-            None => directive,
-        };
-        let sink_dyn: Arc<dyn EventSink> = sink.clone();
-        // Drive the loop ROUTED (Blocker #1 fix): pass the route computed at the top
-        // of this task so the director loop emits the visible intent card, synthesises
-        // + posts the owned plan (`PlanPosted`), drives the plan step-by-step
-        // (`PlanStepStatus`), runs per-step acceptance on the deterministic floor, and
-        // finalizes — exactly as the CLI `umadev run` path does. The unrouted entry
-        // (route=None) skipped `synthesize_and_post_plan` and step scheduling, which is
-        // why the flagship plan/schedule/finalize/acceptance machinery was DEAD on the
-        // TUI `/run`. Fail-open: an unparseable/empty plan inside the routed entry just
-        // degrades to the single-turn loop, so this never loses a build.
-        // Cross-session RESUME (`/continue` on a fresh session): try to re-attach to
-        // the persisted plan and drive ONLY the remaining steps. `drive_director_loop_resume`
-        // returns `None` when there is nothing resumable (absent / corrupt / fully-done
-        // plan) OR the first remaining step can't drive on this fresh session — in both
-        // cases we fail open to a fresh routed run, so a resume never loses the build.
-        // A non-resume `/run` / `/goal` skips straight to the fresh routed run.
-        // A2#3/#4 + A1-GAP1: scope the hosting UI's interaction hooks around the
-        // WHOLE drive (a tokio task-local — everything awaited inside inherits it):
-        //  - `confirm_gates: true` revives the two spec-MUST gates on this default
-        //    path (a guarded run pauses at docs_confirm / preview_confirm);
-        //  - `approval` backs an escalated base action with the SAME y/n
-        //    `await_user_approval` pause the chat drain uses (bounded, fail-open
-        //    deny) instead of a silent headless auto-deny;
-        //  - `steer` lets the loop fold queued user steering into the next step.
-        // The CLI drive never scopes this, so headless behaviour is unchanged.
-        let interaction = {
-            let holder = approval.clone();
-            let cb_sink = sink.clone();
-            let approval_cb: umadev_agent::ApprovalFn =
-                Arc::new(move |action: String, target: String| {
-                    let holder = holder.clone();
-                    let cb_sink = cb_sink.clone();
-                    Box::pin(async move {
-                        matches!(
-                            await_user_approval(&holder, &cb_sink, &action, &target).await,
-                            ApprovalReply::Allow
-                        )
-                    }) as umadev_agent::ApprovalFuture
-                });
-            let input_holder = host_input.clone();
-            let input_sink = sink.clone();
-            let host_request_cb: umadev_agent::HostRequestFn = Arc::new(
-                move |_req_id: String, request: umadev_runtime::HostRequest| {
-                    let input_holder = input_holder.clone();
-                    let input_sink = input_sink.clone();
-                    Box::pin(async move {
-                        Some(await_host_input(&input_holder, &input_sink, &request).await)
-                    }) as umadev_agent::HostRequestFuture
-                },
-            );
-            umadev_agent::RunInteraction {
-                steer: Some(steer),
-                approval: Some(approval_cb),
-                host_request: Some(host_request_cb),
-                confirm_gates: true,
-            }
-        };
-        // COLD-context critics (B2#1): scope a fresh stateless one-shot judge
-        // surface over the whole drive so the adversarial seats (QA + security)
-        // review with NO doer context. Fail-open: a surface that can't serve makes
-        // those seats fall back to their read-only fork, exactly today's path.
-        let cold_surface = cold_judge_surface(&backend, &model, &root);
-        // Box::pin the (large) drive future: the task-local scope wrapper would
-        // otherwise hold it inline and trip `clippy::large_futures`.
-        let outcome = umadev_agent::critics::with_cold_surface(
-            cold_surface,
-            Box::pin(umadev_agent::hosted_interaction(interaction, async {
-                let resumed = if resume {
-                    umadev_agent::drive_director_loop_resume(
-                        session.as_mut(),
-                        &options,
-                        &sink_dyn,
-                        &route,
-                    )
-                    .await
-                } else {
-                    None
-                };
-                match resumed {
-                    Some(o) => o,
-                    None => {
-                        umadev_agent::drive_director_loop_routed(
-                            session.as_mut(),
-                            &options,
-                            &sink_dyn,
-                            directive,
-                            Some(&route),
-                        )
-                        .await
-                    }
-                }
-            })),
-        )
-        .await;
-        // Capture the director's native conversation id before ending its live
-        // process. A clean hand-back must resume THIS build conversation on the
-        // next ordinary chat turn; relying on `--continue`/"most recent" is racy
-        // when another base session exists in the same workspace. Bases without a
-        // resumable id remain fail-open on UmaDev's bounded transcript replay.
-        let settled_base_session_id = session.session_id().map(str::to_string);
-        let settled_base_resume_identity = settled_base_session_id.as_ref().and_then(|_| {
-            session.resume_identity().cloned().or_else(|| {
-                crate::session_slot::requested_resume_identity(&backend, &root, permissions)
-            })
-        });
-        // Always end the session (release the process / server).
-        let _ = session.end().await;
-
-        match outcome {
-            umadev_agent::DirectorLoopOutcome::Planned { .. } => {
-                // Defensive only: the mode ceiling above normally makes this
-                // unreachable. Preserve the typed non-build meaning if another
-                // caller reaches the shared loop without executing anything.
-                let _ = route_tx.send(RouteDecision::RunNotExecuted);
-            }
-            umadev_agent::DirectorLoopOutcome::Done { reply } => {
-                // Objective source-present hard-gate (the deterministic reality
-                // floor) — the SAME check the free-text agentic path + the CLI run
-                // apply. A `/run` that CLAIMED a build but produced zero real source
-                // is reported honestly (an `ABORT_SENTINEL` note), never celebrated.
-                let source_obligation = route.uses_director_workflow()
-                    && route.kind != umadev_agent::TaskKind::DocsOnly;
-                if let Some(note) = director_source_hardgate(&root, &reply, source_obligation) {
-                    // This is an objective terminal rejection, not an advisory.
-                    // Emitting AgenticDone after the abort note would let the event
-                    // loop mark the same task Failed and then overwrite it to Done,
-                    // hand back a failed session, and show a completion card. Keep
-                    // the sentinel event for the aborted UI state, then settle the
-                    // route honestly as Failed.
-                    sink.emit(EngineEvent::Note(note.clone()));
-                    let reason = note
-                        .strip_prefix(ABORT_SENTINEL)
-                        .unwrap_or(note.as_str())
-                        .to_string();
-                    let _ = route_tx.send(RouteDecision::Failed(reason));
-                    return;
-                }
-                // The body already streamed live; hand the assembled text to the
-                // event loop to record as the assistant turn + clear `thinking`. A
-                // director loop is ALWAYS a Build → the hand-back fires.
-                let _ = route_tx.send(RouteDecision::AgenticDone {
-                    reply,
-                    director_build: true,
-                    // Pin the hand-back to the director's exact native session.
-                    // `record_agentic_done` stores it on App, and the resident
-                    // pre-loader resumes that id before the next chat turn.
-                    base_session_id: settled_base_session_id,
-                    base_resume_identity: settled_base_resume_identity,
-                });
-            }
-            umadev_agent::DirectorLoopOutcome::Failed(reason) => {
-                // An honest terminal abort (session died / a turn failed). Flag the
-                // terminal state (so the bar shows a real aborted state) + clear
-                // `thinking` via the terminal Failed decision.
-                sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{reason}")));
-                // Discoverability: on a TRANSIENT abort with a plan still resumable
-                // on disk, point the user at `/continue`. A plain Note (no sentinel),
-                // so it lands AFTER the abort note above. Fail-open (no plan → skip).
-                if let Some(hint) = umadev_agent::transient_resume_hint(&reason, &root) {
-                    sink.emit(EngineEvent::Note(hint));
-                }
-                let _ = route_tx.send(RouteDecision::Failed(reason));
-            }
-            umadev_agent::DirectorLoopOutcome::PausedAtGate { gate } => {
-                // Spec-MUST gate pause (A1-GAP1): the loop already persisted the
-                // plan + open door and emitted `GateOpened` (the gate card renders
-                // through the engine stream). NO source hard-gate here — the build
-                // is parked mid-flight, not settled. The session was ended above;
-                // the resume re-attaches via the persisted base session id +
-                // plan.json. This terminal decision clears `thinking` and arms the
-                // app's director-pause marker so approval / a revision resume the
-                // director loop instead of the legacy gate blocks.
-                let _ = route_tx.send(RouteDecision::RunPausedAtGate { gate });
-            }
-            umadev_agent::DirectorLoopOutcome::PausedAtBudget { done, total } => {
-                // RESUMABLE budget pause (Stage 1/2): the run stopped only because its
-                // wall-clock budget was exhausted while resumable steps remained. The
-                // loop already checkpointed the plan; present this as a PAUSE, never an
-                // abort — NO ABORT_SENTINEL, no gate card. The terminal decision keeps
-                // the plan panel (frozen), pushes the resume hint carrying done/total,
-                // and arms the budget-pause marker so `/continue` finishes the rest.
-                let _ = route_tx.send(RouteDecision::RunPausedAtBudget { done, total });
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WorkflowResumeIdentity {
-    base_session_id: Option<String>,
-    base_resume_identity: Option<umadev_runtime::BaseResumeIdentity>,
-    handoff_from: Option<String>,
-}
-
-/// Resolve the vendor-session pointer for a TUI workflow resume.
-///
-/// Session ids are meaningful only inside the exact base that minted them. The
-/// workflow's requirement, plan, and artifacts may cross a base handoff, but its
-/// opaque vendor id may not. Keeping this decision pure makes the ownership rule
-/// directly regression-testable without launching any vendor CLI.
-fn resolve_workflow_resume_identity(
-    resume: bool,
-    persisted: Option<&umadev_agent::WorkflowState>,
-    current_backend: &str,
-    current_workspace: &std::path::Path,
-    current_permissions: umadev_runtime::BasePermissionProfile,
-) -> WorkflowResumeIdentity {
-    if !resume {
-        return WorkflowResumeIdentity {
-            base_session_id: None,
-            base_resume_identity: None,
-            handoff_from: None,
-        };
-    }
-    let Some(state) = persisted else {
-        return WorkflowResumeIdentity {
-            base_session_id: None,
-            base_resume_identity: None,
-            handoff_from: None,
-        };
-    };
-    if state.backend == current_backend {
-        let id = state
-            .base_session_id
-            .clone()
-            .filter(|id| !id.trim().is_empty());
-        let requested = crate::session_slot::requested_resume_identity(
-            current_backend,
-            current_workspace,
-            current_permissions,
-        );
-        let identity_matches = match (state.base_resume_identity.as_ref(), requested.as_ref()) {
-            (Some(saved), Some(requested)) => saved.permits_resume_as(requested, false),
-            // Legacy identity-free ids remain compatible on the three native
-            // transports only when their stored permission profile also matches.
-            // Grok ACP load is too late to enforce its immutable process sandbox,
-            // so missing identity/preflight always opens a fresh process.
-            (None, Some(_)) => {
-                current_backend != "grok-build"
-                    && state.resolved_permission_profile() == current_permissions
-            }
-            _ => false,
-        };
-        return WorkflowResumeIdentity {
-            base_session_id: identity_matches.then_some(id).flatten(),
-            base_resume_identity: identity_matches
-                .then(|| state.base_resume_identity.clone())
-                .flatten(),
-            handoff_from: None,
-        };
-    }
-    WorkflowResumeIdentity {
-        base_session_id: None,
-        base_resume_identity: None,
-        handoff_from: Some(if state.backend.is_empty() {
-            "offline".to_string()
-        } else {
-            state.backend.clone()
-        }),
-    }
 }
 
 /// Drain any steering left in the shared intake when a director run settles and
@@ -2210,11 +1607,16 @@ fn resume_director_after_gate(
     opts: &LaunchOptions,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    session_holder: &SessionHolder,
     steer_holder: &umadev_agent::SteerIntake,
     approval_holder: &ApprovalHolder,
     host_input_holder: &HostInputHolder,
     gate_revision: Option<(Gate, String)>,
 ) -> tokio::task::JoinHandle<()> {
+    let replay_requirement = app.resume_run_requirement();
+    if app.reject_replayed_host_git_operation(&replay_requirement) {
+        return tokio::spawn(async {});
+    }
     if let Some((gate, text)) = gate_revision {
         // A gate revision changes the artifacts produced by the resumed run and
         // therefore belongs in durable conversation memory, not just the visible
@@ -2252,6 +1654,7 @@ fn resume_director_after_gate(
         run_opts,
         sink.clone(),
         route_tx.clone(),
+        session_holder.clone(),
         permissions,
         // A gate resume inherits no chat transcript (the plan + artifacts are the
         // continuity), same as the `/continue` cross-session resume.
@@ -2479,19 +1882,13 @@ fn route_floor_options(
 /// signal when a base writes despite a lighter route or when the model consult was
 /// unavailable. `None` disables the reaction on explicit director paths.
 ///
-/// The first `Write`/`Edit`-family tool call (see
-/// [`is_workspace_write_tool`]) flips the turn into a build — grab the
-/// single-writer run-lock (if not already held), isolate onto `umadev/<slug>`
-/// (`setup_run_isolation`: a `switch -c` carries the just-written change onto the
-/// branch and leaves the user's branch alone — best-effort; a tree already dirty
-/// from the write fails open to running in place), and surface the `Build` intent
-/// card + the trust note. A pure-reply turn never trips it and stays a fast chat.
-///
-/// **Fail-open throughout:** a lock that can't be taken / an isolation that skips
-/// just leaves the turn running in place (it never aborts a turn the way the
-/// director `/run` lock does — a fallback write that loses the race to a concurrent
-/// run is still better completed than killed). Idempotent: it fires its reaction
-/// exactly once (`reacted` latches), so a 200-file build isolates one time.
+/// Resident sessions that are actually write-capable acquire the writer lock and
+/// isolate before their input is sent; mechanically read-only Chat/Explain sessions
+/// do neither. A writable legacy streaming turn follows the same pre-send
+/// barrier; its callback only records an already-authorized write and never
+/// attempts late lock acquisition. The first observed `Write`/`Edit` then only
+/// flips the turn into a build and surfaces the intent card.
+/// Idempotent: `reacted` latches after the first write.
 struct ReactiveBuild {
     /// Whether a real **host CLI** drives this turn — only a host build mutates a
     /// workspace the lock/isolation protect (an offline turn writes nothing real).
@@ -2508,20 +1905,19 @@ struct ReactiveBuild {
     /// a QuickEdit that writes still does not receive the full-build completion card.
     /// Deterministic + cheap (no fork, no I/O).
     build_card_route: RoutePlan,
-    /// Latched the first time a write tool is seen, so the lock + isolation + intent
-    /// card fire exactly once for the rest of the (possibly hundreds-of-write) turn.
+    /// Latched the first time a write tool is seen, so the build fact and intent
+    /// card fire exactly once for the rest of the turn.
     reacted: std::sync::atomic::AtomicBool,
     /// Set true once a write was observed — read after the stream to carry
     /// `director_build: true` on the terminal `AgenticDone` (drives the Wave-5
     /// session hand-back + the objective source-present hard-gate, exactly as a
     /// pre-classified build would).
     became_build: std::sync::atomic::AtomicBool,
-    /// The model classified this as a mutating lane before execution, so the
-    /// run-lock and isolation baseline were established before `send_turn`.
+    /// The actual resident session is write-capable and its run-lock, isolation,
+    /// and filesystem baseline were established before `send_turn`.
     prepared: std::sync::atomic::AtomicBool,
-    /// Holds the run-lock guard for the rest of the turn once the reaction grabs it
-    /// (dropped when the `Arc` is dropped at the end of [`drive_agentic_stream`]).
-    /// `Mutex` for interior mutability from the shared `Fn` stream closure.
+    /// Holds the run-lock guard for the turn. Both resident and writable legacy
+    /// code fill it before the base receives the request.
     lock: std::sync::Mutex<Option<umadev_agent::run_lock::RunLock>>,
 }
 
@@ -2679,12 +2075,8 @@ fn set_reactive_qc_override(value: Option<bool>) {
 
 /// Whether the model-routed turn owes the flagship governance/team QC pass.
 ///
-/// A `Build` owes that pass because of the user's requested outcome, even when a
-/// base forgets to emit a `Write`/`Edit` tool event (for example it writes through
-/// `Bash`, or merely *claims* completion without writing anything). Conversely,
-/// observing a write never widens a `QuickEdit` or `Debug` into a broad review.
-/// `DocsOnly` is a defensive exception for an internally inconsistent route: a
-/// documentation deliverable has no source-code/team-QC obligation.
+/// Build owes this pass even without an observed write. QuickEdit/Debug never do;
+/// DocsOnly is the defensive exception for an inconsistent internal route.
 fn should_run_flagship_qc(route: &RoutePlan) -> bool {
     route.class == umadev_agent::RouteClass::Build && route.kind != umadev_agent::TaskKind::DocsOnly
 }
@@ -2732,29 +2124,10 @@ fn is_doc_artifact_path(path: &str) -> bool {
         .is_some_and(|e| matches!(e, "md" | "markdown"))
 }
 
-/// React to the FIRST workspace write on the resident path: record mutation truth
-/// and prepare single-writer isolation. Called from the stream closure the instant
-/// a `Write`/`Edit`-family tool call is seen. Fires its side-effects exactly ONCE
-/// (the `reacted` latch), so a turn that writes 200 files isolates one time.
-/// **Returns immediately + no-ops**
-/// when reactive build is disabled (`None`), when the brain is not a host CLI
-/// (nothing real to lock/isolate), or when it has already reacted this turn.
-///
-/// On the first real write it, in order and all **fail-open**:
-/// 1. marks `became_build` as a workspace-write fact. This drives source honesty,
-///    but does not upgrade QuickEdit/Debug into Director or a full completion card;
-/// 2. surfaces a BUILD-shaped intent card (`build_card_route`, derived at construction)
-///    and a one-line mutation note (`chat.build_detected`) — a write means the turn IS
-///    a build, so the card reflects that rather than the QuickEdit/Chat seed;
-/// 3. takes the single-writer run-lock (a chat-build serializes with other
-///    workspace-mutating runs); a lock that can't be taken is swallowed (NOT the
-///    `/run` hard-abort: a chat-build losing the race to another run is better
-///    finished than killed — fail-open), the guard parks in `reactive.lock`;
-/// 4. isolates onto `umadev/<slug>` + run-baseline (`setup_run_isolation`), emitting
-///    the trust note ONLY when a fresh isolation branch was actually created.
-///
-/// Idempotent + fail-open by contract: any failure leaves the turn running in
-/// place, exactly the pre-change behaviour for a chat-build.
+/// Resident write observation is deliberately separate from the writer barrier.
+/// Writable resident sessions acquire and park their guard before `send_input`;
+/// this observer only records the first write and rejects an impossible unprepared
+/// event. Legacy streaming callbacks have a distinct pre-action helper below.
 /// Begin the durable writer ledger for a reactive build on its FIRST observed write
 /// (M4). The up-front [`umadev_agent::task_lifecycle::EntryTaskTracker::begin`] sits
 /// behind `route.class.mutates_workspace()`, which the read-only Explain seed the
@@ -2801,62 +2174,100 @@ fn maybe_begin_reactive_entry_task(
     }
 }
 
-fn react_to_first_write(
-    reactive: Option<&ReactiveBuild>,
-    project_root: &std::path::Path,
-    sink: &Arc<ChannelSink>,
-) {
+fn mark_reactive_write(reactive: &ReactiveBuild, sink: &Arc<ChannelSink>) -> bool {
     use std::sync::atomic::Ordering;
-    let Some(reactive) = reactive else { return };
-    // Only a real HOST build mutates a workspace the lock/isolation protect.
-    if !reactive.host_cli {
-        return;
-    }
-    // One-shot: `swap` returns the PREVIOUS value — if it was already `true`, a
-    // prior write already reacted, so bail (no second lock / isolation / card).
     if reactive.reacted.swap(true, Ordering::SeqCst) {
-        return;
+        return false;
     }
-    // (1) Record mutation truth; Director ownership remains a separate route fact.
     reactive.became_build.store(true, Ordering::SeqCst);
-    // (2) Surface a BUILD-shaped intent card (A3): the base just wrote real files, so
-    // the turn IS a build — the card, the source hard-gate, and the reactive governance
-    // QC must reflect that, not the QuickEdit/Chat seed the turn opened on. The
-    // Build-shaped route was derived once at construction (`for_run`), so this is a pure
-    // event emission (no fork, no I/O).
     sink.emit(EngineEvent::intent_decided(&reactive.build_card_route));
     sink.emit(EngineEvent::Note(
         umadev_i18n::tl("chat.build_detected").to_string(),
     ));
-    // A model-routed mutating turn established the lock + branch before the
-    // writer started. The write still emits its intent card, but must not repeat
-    // the pre-action preparation.
-    if reactive.prepared.load(Ordering::SeqCst) {
-        return;
+    true
+}
+
+/// Record the first resident write only after the pre-action writer barrier.
+///
+/// A resident tool event is observational: the base may already have executed it,
+/// so this function never attempts a late lock acquisition. Writable sessions are
+/// required to set `prepared` before `send_input`; violating that invariant is a
+/// terminal error handled by the event loop.
+fn react_to_first_write(
+    reactive: Option<&ReactiveBuild>,
+    sink: &Arc<ChannelSink>,
+) -> Result<(), &'static str> {
+    use std::sync::atomic::Ordering;
+    let Some(reactive) = reactive else {
+        return Ok(());
+    };
+    if !reactive.host_cli {
+        return Ok(());
     }
-    // (3) Single-writer run-lock for the rest of the turn — fail-open: a lock held
-    // by a DIFFERENT live run is swallowed (the chat-build proceeds in place rather
-    // than hard-aborting); any other IO fails open inside `acquire_for_run` to an
-    // un-owned guard. The guard parks in `reactive.lock` for the turn's lifetime.
-    if let Ok(guard) = umadev_agent::run_lock::RunLock::acquire_for_run(project_root) {
-        if let Ok(mut slot) = reactive.lock.lock() {
-            *slot = Some(guard);
-        }
+    if !reactive.prepared.load(Ordering::SeqCst) {
+        return Err(
+            "[blocked] resident 写入缺少执行前 writer lock，已终止本轮 / resident write observed without a pre-action writer lock; the turn was stopped",
+        );
     }
-    // (4) Branch isolation: `switch -c umadev/<slug>` carries the just-written change
-    // onto the isolation branch and leaves the user's branch untouched (fail-open: a
-    // non-git dir / a tree already dirty from the write / any error skips silently
-    // and the turn runs in place). Emit the trust note only on a fresh isolation.
-    let slug = project_root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("project");
-    if let Some((branch, from)) = umadev_agent::setup_run_isolation(project_root, slug) {
-        sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-            "trust.branch_isolated",
-            &[&branch, &from],
-        )));
+    mark_reactive_write(reactive, sink);
+    Ok(())
+}
+
+/// Record a legacy-stream write only after the pre-send writer barrier.
+///
+/// A `Runtime::complete_streaming` callback is observational and cannot reject a
+/// tool. Therefore it must never acquire the lock here: every writable host
+/// legacy turn is prepared before `complete_streaming`, while a non-mutating
+/// Chat/Explain turn is launched with a mechanically read-only permission
+/// profile and has no reactive-write path.
+fn react_to_legacy_first_write(
+    reactive: Option<&ReactiveBuild>,
+    sink: &Arc<ChannelSink>,
+) -> Result<(), &'static str> {
+    use std::sync::atomic::Ordering;
+    let Some(reactive) = reactive else {
+        return Ok(());
+    };
+    if !reactive.host_cli {
+        return Ok(());
     }
+    if !reactive.prepared.load(Ordering::SeqCst) {
+        return Err(
+            "[blocked] legacy 写入缺少执行前 writer lock，已终止本轮 / legacy write observed without a pre-action writer lock; the turn was stopped",
+        );
+    }
+    mark_reactive_write(reactive, sink);
+    Ok(())
+}
+
+fn legacy_effective_permissions(
+    route: &RoutePlan,
+    requested: umadev_runtime::BasePermissionProfile,
+) -> umadev_runtime::BasePermissionProfile {
+    if route.class.mutates_workspace() {
+        requested
+    } else {
+        umadev_runtime::BasePermissionProfile::Plan
+    }
+}
+
+fn acquire_legacy_pre_send_writer_lock(
+    project_root: &std::path::Path,
+    host_cli: bool,
+    permissions: umadev_runtime::BasePermissionProfile,
+    route: &RoutePlan,
+) -> std::io::Result<Option<umadev_agent::run_lock::RunLock>> {
+    if !host_cli || !permissions.requests_full_access() || !route.class.mutates_workspace() {
+        return Ok(None);
+    }
+    let guard = umadev_agent::run_lock::RunLock::acquire_for_run(project_root)?;
+    if !guard.is_owned() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "exclusive writer-lock ownership could not be proven",
+        ));
+    }
+    Ok(Some(guard))
 }
 
 /// The light agentic turn body — the non-spawning core of [`spawn_agentic`].
@@ -2910,41 +2321,39 @@ async fn run_agentic(
                 .await
             }
         };
-        // A workspace-mutating director build (`/run` or a chat 'build me X') that is
-        // really driven by a HOST CLI: take the single-writer run-lock for the whole
-        // turn so a full product build serializes with any other workspace-mutating
-        // run, exactly like the legacy pipeline does (`run_continuous_block` /
-        // `run_initial_block` both hold it). The guard lives for the task's scope
-        // and drops on return. Fail-open: a lock held by a DIFFERENT live run is an
-        // honest terminal abort (the same `ABORT_SENTINEL` the pipeline uses); any
-        // other lock IO fails open inside `acquire_for_run` to an un-owned guard, so
-        // a lock bug never blocks a legitimate build.
-        //
-        // LOW fix (tui-dispatch): the gate is `director_build && host_cli`, NOT
-        // `director_build` alone. A `Build`-class verdict against a NON-host brain
-        // (offline) stays on THIS light streaming path — it writes nothing the lock
-        // protects, so grabbing the workspace lock / isolating a branch was pure
-        // overhead (and could spuriously serialize against a real host run). A
-        // normal free-text turn (chat / explain / quick-edit) takes NO lock either.
-        let lock_and_isolate = director_build && host_cli;
-        let _run_lock = if lock_and_isolate {
-            match umadev_agent::run_lock::RunLock::acquire_for_run(&project_root) {
-                Ok(g) => Some(g),
-                Err(e) => {
-                    sink.emit(EngineEvent::Note(format!(
-                        "{ABORT_SENTINEL}{}",
-                        block_abort_note(&e, &label)
-                    )));
-                    let _ = route_tx.send(RouteDecision::Failed(start_failed_note(&e)));
-                    return;
-                }
+        // The final typed route is also the legacy session's mechanical authority.
+        // A non-mutating Chat/Explain route is forced to Plan even when the global
+        // mode is Guarded/Auto, so it cannot "reactively" turn into a writer after
+        // the request was sent. A mutating route retains the selected writable
+        // profile.
+        let effective_permissions = legacy_effective_permissions(&route, permissions);
+
+        // Every writable HOST legacy turn takes and PROVES ownership of the
+        // single-writer lock before the base is opened or receives a prompt. The
+        // callback below is observational, so acquiring after a tool event would
+        // already be too late. Non-host/offline turns and mechanically read-only
+        // Plan turns take no lock.
+        let writable_host = host_cli
+            && effective_permissions.requests_full_access()
+            && route.class.mutates_workspace();
+        let mut preflight_run_lock = match acquire_legacy_pre_send_writer_lock(
+            &project_root,
+            host_cli,
+            effective_permissions,
+            &route,
+        ) {
+            Ok(guard) => guard,
+            Err(error) => {
+                sink.emit(EngineEvent::Note(format!(
+                    "{ABORT_SENTINEL}{}",
+                    block_abort_note(&error, &label)
+                )));
+                let _ = route_tx.send(RouteDecision::Failed(start_failed_note(&error)));
+                return;
             }
-        } else {
-            None
         };
-        // Isolate only the lock-holding host director path before it writes.
-        // Free-text turns remain in place; isolation is fail-open and idempotent.
-        if lock_and_isolate {
+        // Isolate only after the lock is owned, still before the base can write.
+        if writable_host {
             let slug = project_root
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -2965,7 +2374,7 @@ async fn run_agentic(
             continue_session,
             session_id,
             &project_root,
-            permissions,
+            effective_permissions,
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -2976,15 +2385,29 @@ async fn run_agentic(
                 return;
             }
         };
-        // Reactive build for the light chat path: a chat turn that was NOT
-        // dispatched as a build can still BECOME one if the base writes a file —
-        // enable the reactive detector so the first write grabs the lock + isolates
-        // + shows the `Build` intent card (see [`ReactiveBuild`] /
-        // [`react_to_first_write`]). Disabled when the turn was ALREADY dispatched
-        // as a build (`director_build` true) — that path grabbed the lock + isolated
-        // up-front above, so a second reaction would be redundant. The context
-        // internally no-ops for a non-host brain, so passing it is always safe.
-        let reactive = (!director_build).then(|| Arc::new(ReactiveBuild::new(host_cli, &task)));
+        // Legacy reactive bookkeeping exists only for an already-authorized
+        // mutating route. Chat/Explain is mechanically Plan and cannot upgrade
+        // itself into a writer after dispatch.
+        let reactive = (!director_build
+            && route.class.mutates_workspace()
+            && effective_permissions.requests_full_access())
+        .then(|| {
+            let reactive = Arc::new(ReactiveBuild::new(host_cli, &task));
+            if let Some(guard) = preflight_run_lock.take() {
+                let mut slot = reactive
+                    .lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *slot = Some(guard);
+                reactive
+                    .prepared
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            reactive
+        });
+        // A director turn has no reactive context, so retain its preflight guard
+        // directly for the full streaming call.
+        let _director_run_lock = preflight_run_lock;
         drive_agentic_stream(
             brain.as_ref(),
             &task,
@@ -3079,11 +2502,10 @@ fn director_source_hardgate(
 }
 
 /// The **reality scaffold** for an agentic turn — the part of the system prompt
-/// that is NOT firmware: it UNLOCKS tools (read/edit files, run commands — the
-/// whole point of the agentic path), hands the chat-vs-act judgement to the base
-/// itself, injects the live git state, and hard-constrains the base to verify any
-/// "what did I change" claim against the real disk/git state rather than reciting
-/// unverified session intent.
+/// that is NOT firmware. Writable routes unlock edit/run tools; non-mutating
+/// routes explicitly describe the same mechanical Plan boundary used to launch
+/// the base. Both inject live Git state and hard-constrain every "what did I
+/// change" claim to real disk evidence rather than remembered intent.
 ///
 /// **Why this is split from the firmware (HIGH #3 / MEDIUM #6):** the team
 /// IDENTITY + craft/taste + JIT knowledge + pitfall memory + the repo-map slice
@@ -3093,14 +2515,33 @@ fn director_source_hardgate(
 /// firmware, then appends THIS scaffold — so "固件每路径 + 大脑判档" holds without
 /// the old `looks_like_work_request` keyword table deciding firmware richness.
 ///
-/// `status`/`diff_stat` are the live git snapshots (either may be `None`). The
-/// scaffold itself is constant (no work-class branch): the firmware above already
-/// carries (or omits) the craft/knowledge by tier. Fail-open: a missing git state
-/// just renders the "clean" line; never errors.
-fn agentic_reality_scaffold(status: Option<&str>, diff_stat: Option<&str>) -> String {
-    let mut p = String::from(
-        "You are running inside the project's working \
-         directory with FULL tool access.\n\n\
+/// `status`/`diff_stat` are the live git snapshots (either may be `None`).
+/// `writable` is the final typed route authority, not a keyword guess. Fail-open:
+/// a missing git state just renders the "clean" line; never errors.
+fn agentic_reality_scaffold(
+    status: Option<&str>,
+    diff_stat: Option<&str>,
+    writable: bool,
+) -> String {
+    let access = if writable {
+        "You are running inside the project's working directory with FULL tool access.\n\n"
+    } else {
+        "You are running inside the project's working directory in a mechanically READ-ONLY \
+         session. You may read/search files and run non-mutating inspection commands, but you \
+         must not edit files, mutate Git state, run governance/QC, or claim that you changed \
+         anything.\n\n"
+    };
+    let action_contract = if writable {
+        "- If it asks you to look at, inspect, explain, debug, review, change, or BUILD \
+         something — actually DO it: read files, edit files, run commands. Do not refuse \
+         to use your tools, and do not just describe what you would do — do the work.\n"
+    } else {
+        "- If it asks you to look at, inspect, explain, debug, or review something — use only \
+         read/search and non-mutating inspection tools, then answer. This route carries no \
+         authority to edit, commit, or start governance/QC.\n"
+    };
+    let mut p = format!(
+        "{access}\
          CURRENT-TURN AUTHORITY (mandatory): the latest user request is the sole \
          authorization for work in this turn. Prior conversation, native-session \
          memory, AGENTS/project guidance, skills/plugins, plans, TODOs, documents, \
@@ -3112,9 +2553,7 @@ fn agentic_reality_scaffold(status: Option<&str>, diff_stat: Option<&str>) -> St
          - If it is just conversation (a greeting, an opinion, a question you can answer \
            by talking, a follow-up) — simply REPLY, naturally, in the user's language. Do \
            NOT use tools or touch files for small talk.\n\
-         - If it asks you to look at, inspect, explain, debug, review, change, or BUILD \
-           something — actually DO it: read files, edit files, run commands. Do not refuse \
-           to use your tools, and do not just describe what you would do — do the work.\n\
+         {action_contract}\
          You are one continuous session: keep the context of the whole conversation.\n\n\
          REALITY CONTRACT (mandatory): every statement you make about WHICH FILES YOU \
          CHANGED or WHAT EDITS YOU MADE must be grounded in the real files on disk and \
@@ -3122,7 +2561,7 @@ fn agentic_reality_scaffold(status: Option<&str>, diff_stat: Option<&str>) -> St
          `git status` or by reading the file. NEVER recite intended or remembered \
          changes from earlier in the conversation as if they were already done — if you \
          did not just verify it on disk, do not claim it. If you did not actually write \
-         a file this turn, say so plainly.\n",
+         a file this turn, say so plainly.\n"
     );
     match status {
         Some(s) if !s.trim().is_empty() => {
@@ -3385,7 +2824,11 @@ async fn drive_agentic_stream(
     // firmware always leads, and the scaffold's reality contract follows.
     // Fail-open: an empty firmware leaves
     // just the scaffold, exactly the pre-firmware light-path behaviour.
-    let scaffold = agentic_reality_scaffold(before.as_deref(), diff_stat.as_deref());
+    let scaffold = agentic_reality_scaffold(
+        before.as_deref(),
+        diff_stat.as_deref(),
+        route.class.mutates_workspace(),
+    );
     let system = if firmware.trim().is_empty() {
         scaffold
     } else {
@@ -3439,28 +2882,45 @@ async fn drive_agentic_stream(
     // is `'static + Send + Sync`, as `complete_streaming` requires). `None` when
     // reactive build is disabled (non-chat path) — the write check then no-ops.
     let reactive_ctx = reactive.cloned();
-    let reactive_root = project_root.to_path_buf();
     let reactive_sink = Arc::clone(sink);
+    let legacy_barrier_failure = Arc::new(std::sync::Mutex::new(None::<String>));
+    let legacy_barrier_failure_callback = Arc::clone(&legacy_barrier_failure);
     let on_event = move |ev: umadev_runtime::StreamEvent| {
         if matches!(ev, umadev_runtime::StreamEvent::Warning { .. }) {
             truncated_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        // Reactive build: the FIRST `Write`/`Edit`-family tool call flips this chat
-        // turn into a build (lock + isolate + a `Build` intent card). `react_to_
-        // first_write` is one-shot + fail-open, so this is cheap on every later
-        // write and a no-op when reactive build is disabled / already triggered.
+        // Reactive bookkeeping: on an already-authorized writable legacy route,
+        // the first `Write`/`Edit` event records the build fact and intent card.
+        // Lock/isolation were completed before `complete_streaming`; this callback
+        // never attempts a late permission or writer-lock upgrade.
         if let umadev_runtime::StreamEvent::ToolUse { name, detail, .. } = &ev {
             // Only a CODE write flips the turn to a build; writing a docs/spec artifact
             // (PRD / architecture / UIUX / SRS / any markdown) is legitimate pre-
             // development work and must NOT trigger the source-present code floor.
             if is_workspace_write_tool(name) && !is_doc_artifact_path(detail) {
-                react_to_first_write(reactive_ctx.as_deref(), &reactive_root, &reactive_sink);
+                if let Err(reason) =
+                    react_to_legacy_first_write(reactive_ctx.as_deref(), &reactive_sink)
+                {
+                    let reason = reason.to_string();
+                    reactive_sink.emit(EngineEvent::Note(reason.clone()));
+                    *legacy_barrier_failure_callback
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+                }
             }
         }
         stream_sink.emit(EngineEvent::WorkerStream { event: ev });
     };
     match brain.complete_streaming(request, &on_event).await {
         Ok(resp) => {
+            if let Some(reason) = legacy_barrier_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = route_tx.send(RouteDecision::Failed(reason));
+                return;
+            }
             // (0) Surface the base's REAL token usage for this turn so the UI's live
             // session total reflects true consumption (the base's own numbers). A
             // deterministic chars/4 estimate of prompt + reply rides alongside so the
@@ -3589,6 +3049,7 @@ async fn drive_agentic_stream(
 fn fire_agentic(
     app: &mut App,
     chat_session: &ChatSessionHolder,
+    director_session_holder: &SessionHolder,
     pending_ask: &PendingAskHolder,
     approval_holder: &ApprovalHolder,
     host_input_holder: &HostInputHolder,
@@ -3640,7 +3101,8 @@ fn fire_agentic(
     // fix) — `send_turn` into the already-loaded process, no cold start. The session
     // is already primed (a queued turn always follows at least one prior turn), so
     // the transcript is belt-and-suspenders only. Offline: the legacy light path.
-    if host_cli {
+    let git_commit_operation = umadev_agent::request_has_git_commit_operation(&task);
+    if host_cli || git_commit_operation {
         let permissions = mode.base_permissions();
         tokio::spawn(drive_chat_session_turn(ChatSessionTurn {
             dispatch: ResidentTurnKind::RoutedChat,
@@ -3657,6 +3119,7 @@ fn fire_agentic(
             permissions,
             resume_session_id,
             chat_session: chat_session.clone(),
+            director_session_holder: director_session_holder.clone(),
             pending_ask: pending_ask.clone(),
             sink: sink.clone(),
             route_tx: route_tx.clone(),
@@ -3748,6 +3211,7 @@ fn fire_native_command(
         permissions,
         resume_session_id,
         chat_session: chat_session.clone(),
+        director_session_holder: Arc::new(tokio::sync::Mutex::new(None)),
         pending_ask: pending_ask.clone(),
         sink: sink.clone(),
         route_tx: route_tx.clone(),
@@ -3920,6 +3384,7 @@ struct RoutedTurnInputs {
 async fn run_routed_turn(
     inputs: RoutedTurnInputs,
     chat_session: ChatSessionHolder,
+    director_session_holder: SessionHolder,
     pending_ask: PendingAskHolder,
     approval_holder: ApprovalHolder,
     host_input_holder: HostInputHolder,
@@ -3952,7 +3417,8 @@ async fn run_routed_turn(
     // chat message only feeds `send_turn` + drains the stream — no per-message
     // `claude --print` cold start (which re-loaded all MCP servers each time and
     // was the ~30-60s first-reply latency). See [`drive_chat_session_turn`].
-    if host_cli {
+    let git_commit_operation = umadev_agent::request_has_git_commit_operation(&text);
+    if host_cli || git_commit_operation {
         let permissions = mode.base_permissions();
         drive_chat_session_turn(ChatSessionTurn {
             dispatch: ResidentTurnKind::RoutedChat,
@@ -3969,6 +3435,7 @@ async fn run_routed_turn(
             permissions,
             resume_session_id,
             chat_session,
+            director_session_holder,
             pending_ask,
             sink,
             route_tx,
@@ -4061,6 +3528,8 @@ struct ChatSessionTurn {
     /// the pre-load (or the first turn's lazy-open) lands it; parked back after each
     /// `TurnDone`.
     chat_session: ChatSessionHolder,
+    /// Live Director session parked across an operational-review pause.
+    director_session_holder: SessionHolder,
     /// The base's pending `AskUserQuestion` (set by a PRIOR turn's drain). Taken +
     /// cleared at the start of THIS turn so the user's reply is relayed back as a
     /// resolved, framed answer; re-set if THIS turn surfaces a new question.
@@ -4711,15 +4180,8 @@ async fn open_warm_chat_session_for_turn(
     }
 }
 
-/// Build the FIRST directive sent into a freshly-opened warm session: front-load
-/// UmaDev's bounded conversation transcript so the new session inherits the prior
-/// dialogue (across a restart / switched base), and for every non-Claude base
-/// prefix the firmware onto this first directive too (the universal fail-open
-/// path). For Claude the firmware is already native, so the directive carries
-/// only the history, never restating it.
-///
-/// `firmware` is the warm session's firmware (the same value `open_warm_chat_session`
-/// returned); `None` / claude → history only.
+/// Build the first warm-session directive with bounded history and, for
+/// non-Claude bases, the resident firmware.
 fn first_chat_directive(
     firmware: Option<&str>,
     backend: &str,
@@ -4753,21 +4215,21 @@ fn scoped_chat_directive(text: &str, route: &RoutePlan) -> String {
     use umadev_agent::RouteClass;
 
     let lane = match route.class {
-        RouteClass::Chat => {
-            "This is a read-only answer. Respond from current context without tools, commands, file writes, reviews, or QC."
-        }
-        RouteClass::Explain => {
-            "This is read-only. You may use only the necessary read/search tools to inspect the requested project files; do not run mutating commands, write files, launch reviews, or run QC."
-        }
-        RouteClass::QuickEdit => {
-            "Make the smallest necessary edit and only a targeted verification. Do not launch a team or broad review."
-        }
-        RouteClass::Debug => {
-            "Diagnose and fix only the reported defect with the smallest justified blast radius and a targeted regression check. Do not launch a team or broad review."
-        }
-        RouteClass::Build => {
-            "Implement only the requested feature/product. Adjacent work is allowed only when required for that request; state why it is required."
-        }
+            RouteClass::Chat => {
+                "This is a read-only answer. Respond from current context without tools, commands, file writes, reviews, or QC."
+            }
+            RouteClass::Explain => {
+                "This is read-only. You may use only the necessary read/search tools to inspect the requested project files; do not run mutating commands, write files, launch reviews, or run QC."
+            }
+            RouteClass::QuickEdit => {
+                "Make the smallest necessary edit and only a targeted verification. Do not launch a team or broad review."
+            }
+            RouteClass::Debug => {
+                "Diagnose and fix only the reported defect with the smallest justified blast radius and a targeted regression check. Do not launch a team or broad review."
+            }
+            RouteClass::Build => {
+                "Implement only the requested feature/product. Adjacent work is allowed only when required for that request; state why it is required."
+            }
     };
     let hinted_scope = if route.scope.is_empty() {
         "Use only files strictly necessary for the latest request.".to_string()
@@ -4803,11 +4265,10 @@ fn scoped_chat_directive(text: &str, route: &RoutePlan) -> String {
 /// the caller closes it off the render path and lazily opens the RIGHT base, whose
 /// first directive front-loads the conversation transcript, so no context is lost.
 ///
-/// A `Primed` session carries no duplicate metadata, so it is usable only when the
-/// holder's permission profile exactly matches this turn. Backend/context changes
-/// invalidate the holder generation before closing; stale producers then fail
-/// `park_if_current`, which is what proves a surviving Primed value belongs to the
-/// current generation. Pure + total.
+/// A writable `Primed` session is usable only under an exact launch identity.
+/// `ReadOnlyPrimed` may also serve as a lower-authority routing parent for the same
+/// backend/workspace; the caller must reopen a writer if routing later authorizes a
+/// mutation. Backend/context changes remain exact stale boundaries. Pure + total.
 fn resident_for_turn(
     parked: Option<ResidentChat>,
     requested_identity: Option<&SessionIdentity>,
@@ -4815,17 +4276,39 @@ fn resident_for_turn(
     current_generation: u64,
 ) -> (Option<ResidentChat>, Option<ResidentChat>) {
     let exact_identity = requested_identity.is_some() && requested_identity == parked_identity;
+    // A Plan process may safely survive into a writable-mode turn only as the
+    // routing/answer parent. The caller keeps `parent_read_only=true`; if the
+    // resulting route mutates, it closes this process and opens a fresh writer
+    // before any input is sent. This preserves low-latency read-only conversation
+    // continuity without ever upgrading a process's launch authority.
+    let resident_is_plan_parent = match parked.as_ref() {
+        Some(ResidentChat::ReadOnlyPrimed(_)) => true,
+        Some(ResidentChat::Warm(warm)) => {
+            warm.permissions == umadev_runtime::BasePermissionProfile::Plan
+                && warm.generation == current_generation
+        }
+        _ => false,
+    };
+    let compatible_plan_parent = resident_is_plan_parent
+        && requested_identity
+            .zip(parked_identity)
+            .is_some_and(|(requested, parked)| {
+                parked.permissions == umadev_runtime::BasePermissionProfile::Plan
+                    && requested.backend == parked.backend
+                    && requested.canonical_workspace == parked.canonical_workspace
+            });
     match parked {
         Some(ResidentChat::Warm(w))
-            if !exact_identity
+            if (!exact_identity && !compatible_plan_parent)
                 || requested_identity.is_none_or(|requested| {
-                    w.backend != requested.backend || w.permissions != requested.permissions
+                    w.backend != requested.backend
+                        || (!compatible_plan_parent && w.permissions != requested.permissions)
                 })
                 || w.generation != current_generation =>
         {
             (None, Some(ResidentChat::Warm(w)))
         }
-        Some(resident) if !exact_identity => (None, Some(resident)),
+        Some(resident) if !exact_identity && !compatible_plan_parent => (None, Some(resident)),
         other => (other, None),
     }
 }
@@ -4877,7 +4360,18 @@ fn park_after_chat_failure(
     generation: u64,
 ) -> ResidentChat {
     if read_only {
-        ResidentChat::ReadOnlyPrimed(session)
+        match attempt {
+            AttemptDirective::FrontLoaded { firmware } if !saw_stream => {
+                ResidentChat::Warm(WarmChatSession {
+                    session,
+                    firmware: firmware.clone(),
+                    backend: backend.to_string(),
+                    permissions,
+                    generation,
+                })
+            }
+            _ => ResidentChat::ReadOnlyPrimed(session),
+        }
     } else {
         park_after_transient_failure(
             session,
@@ -5209,6 +4703,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         permissions,
         mut resume_session_id,
         chat_session,
+        director_session_holder,
         pending_ask,
         sink,
         route_tx,
@@ -5254,27 +4749,29 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         return;
     }
 
-    // RELAY a pending base `AskUserQuestion`: if a PRIOR turn surfaced a structured
-    // question, the user's reply this turn is their ANSWER — resolve a bare option
-    // number to its label and frame it as the explicit choice so the base continues
-    // with it instead of misreading the raw index. Taken + cleared here (one-shot);
-    // a fresh question THIS turn re-sets it below. Fail-open: no pending question →
-    // the line is sent verbatim.
     let original_text = text;
-    let (text, input) = if native_command {
-        (original_text, input)
-    } else {
-        let text = {
-            let pending = pending_ask.lock().await.take();
-            umadev_agent::ask_question_relay_or_passthrough(pending.as_ref(), &original_text)
-        };
-        let input = if input.sole_text() == Some(original_text.as_str()) && text != original_text {
-            TurnInput::text(text.clone())
-        } else {
-            input
-        };
-        (text, input)
-    };
+    // A fresh Git imperative is never an answer to a prior model question and
+    // never reaches resident transport. The adapter enforces shape/approval and
+    // calls the canonical host transaction.
+    if !native_command && umadev_agent::request_has_git_commit_operation(&original_text) {
+        resident_host_git::execute(
+            &original_text,
+            mode,
+            interactive,
+            &project_root,
+            &approval_holder,
+            &sink,
+            &route_tx,
+        )
+        .await;
+        return;
+    }
+    // A base-native command is an out-of-band control frame, not an answer to the
+    // model's pending question. Preserve both its exact bytes and the pending ask
+    // for the next ordinary chat turn. Only routed chat may consume and frame that
+    // answer.
+    let (text, input) =
+        select_resident_turn_payload(native_command, original_text, input, &pending_ask).await;
     // Start from the bounded deterministic fallback. Before the writer sees this
     // turn, a read-only fork of the selected base gets one small typed intent
     // consult. A valid model decision replaces this plan in either direction; the
@@ -5290,26 +4787,12 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
     } else {
         bounded_route_context(&conversation, &text)
     };
-
-    // Legacy/read-only fact snapshot (git missing → fact omitted). Mutating
-    // resident turns use the stronger content post-condition captured after route.
+    // Read-only fact snapshot; writers use the routed post-condition below.
     let before = git_status_porcelain(&project_root);
 
     // ── Bounded first-turn auto-recovery ─────────────────────────────────────────
-    // A resident chat session that sat IDLE through a multi-minute run (or a long
-    // pause) can go stale: its FIRST turn afterwards comes back as an UNCLASSIFIABLE
-    // base error (claude's `error_during_execution` -> `BaseFailure::Unknown`) even
-    // though the process is still alive. Dead-ending that first message -- then
-    // auto-replaying the queued duplicate -- is the reported bug. So on a CLEAN
-    // first-attempt `Unknown` failure on a STILL-ALIVE base we RE-DRIVE the turn ONCE
-    // on a guaranteed-fresh session before surfacing anything (mirrors the /run
-    // watchdog's single re-drive). `attempt` is the hard bound: 0 = the resident try,
-    // 1 = the one retry. The retry REUSES this turn's UI (no re-emitted user bubble or
-    // assistant row) and only fires when the first attempt failed CLEAN -- nothing
-    // streamed, no reactive build -- so it can never double-render or re-run a side
-    // effect. A KNOWN-transient failure (429 / overloaded / network) is NOT retried:
-    // an immediate fresh session cannot clear a rate limit, so those keep the
-    // park-the-live-session-and-surface path below.
+    // One clean, mechanically read-only Unknown failure may retry on a fresh session.
+    // `attempt` hard-bounds that recovery; known transient failures are surfaced.
     //
     // `text_acc` / `reactive` live across attempts (reset at the top of each) so the
     // post-turn code reads the LAST attempt's stream + build-ness; `session` is carried
@@ -5375,8 +4858,14 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             if let Some(s) = stale {
                 detach_resident_close(s);
             }
+            let parked_read_only = parked_identity.as_ref().is_some_and(|identity| {
+                identity.permissions == umadev_runtime::BasePermissionProfile::Plan
+            });
             let acquired = match taken {
-                Some(ResidentChat::Primed(s)) => (s, AttemptDirective::Bare, false),
+                // The launch identity is authoritative even if an older/test
+                // fixture used the untagged Primed variant. A process launched
+                // under Plan must never be treated as a writer.
+                Some(ResidentChat::Primed(s)) => (s, AttemptDirective::Bare, parked_read_only),
                 Some(ResidentChat::ReadOnlyPrimed(s)) => (s, AttemptDirective::Bare, true),
                 Some(ResidentChat::Warm(w)) => {
                     let read_only = w.permissions == umadev_runtime::BasePermissionProfile::Plan;
@@ -5400,13 +4889,17 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                 )
                 .await
                 {
-                    Ok(w) => (
-                        w.session,
-                        AttemptDirective::FrontLoaded {
-                            firmware: w.firmware,
-                        },
-                        false,
-                    ),
+                    Ok(w) => {
+                        let read_only =
+                            w.permissions == umadev_runtime::BasePermissionProfile::Plan;
+                        (
+                            w.session,
+                            AttemptDirective::FrontLoaded {
+                                firmware: w.firmware,
+                            },
+                            read_only,
+                        )
+                    }
                     Err(TurnSessionOpenError::Cancelled) => {
                         drop(guard);
                         let _ = route_tx.send(RouteDecision::AuthCancelled {
@@ -5519,11 +5012,20 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                 session = readonly;
                 attempt_directive = AttemptDirective::Bare;
             } else if !parent_read_only {
-                // Unit fakes that cannot fork stay local. Production reopens a
-                // mechanically read-only session rather than relying on prose.
+                // A writable production parent without a reusable read-only fork
+                // is never an acceptable fallback for Chat/Explain. Reopen with
+                // Plan permissions before sending the request.
+                //
+                // Unit sessions are inert event scripts rather than real base
+                // processes and cannot be reopened through the host registry.
+                // Reusing one under `cfg(test)` preserves the same *logical*
+                // read-only boundary (`execution_read_only` remains true), so it
+                // still takes no writer lock and can emit no real filesystem
+                // effect. This is deliberately different from the removed legacy
+                // shortcut, which changed `execution_read_only` to false.
                 #[cfg(test)]
                 {
-                    execution_read_only = false;
+                    debug_assert!(execution_read_only);
                 }
                 #[cfg(not(test))]
                 {
@@ -5648,6 +5150,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                 options,
                 sink.clone(),
                 route_tx.clone(),
+                director_session_holder.clone(),
                 permissions,
                 conversation.clone(),
                 Some(route),
@@ -5667,14 +5170,49 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             ));
         }
 
-        // Acquire the cross-entry writer lock before branch isolation and before
-        // freezing filesystem truth. Otherwise a second process could finish a
-        // write between the snapshot and the later lock acquisition, and this turn
-        // would incorrectly claim that external diff as its own.
+        // The selected session, not merely the predicted route, is the authority
+        // boundary. A writable resident base can still issue Edit/Bash after a
+        // mistaken Chat/Explain verdict, so it must own the cross-entry writer lock
+        // before `send_input`. Mechanically read-only/Plan sessions remain lock-free.
+        //
+        // This also puts branch isolation and filesystem-baseline capture behind the
+        // same lock. No first tool event is used as a late lock trigger: by then a
+        // resident base may already have changed the workspace.
         let mut prepared_run_lock = None;
-        if route.class.mutates_workspace() {
+        if !execution_read_only {
             let guard = match umadev_agent::run_lock::RunLock::acquire_for_run(&project_root) {
-                Ok(guard) => guard,
+                Ok(guard) if guard.is_owned() => guard,
+                Ok(_) => {
+                    let detail =
+                        "无法证明独占工作区 writer lock / exclusive writer-lock ownership could not be proven";
+                    fail_entry_task(
+                        &mut entry_task,
+                        "resident writer lock ownership could not be proven",
+                        detail.to_string(),
+                    );
+                    let resident = park_after_chat_failure(
+                        session,
+                        &attempt_directive,
+                        false,
+                        &backend,
+                        execution_read_only,
+                        permissions,
+                        turn_generation,
+                    );
+                    let _ = chat_session
+                        .park_for_launch(
+                            turn_generation,
+                            &backend,
+                            &project_root,
+                            permissions,
+                            resident,
+                        )
+                        .await;
+                    let note = umadev_i18n::tlf("intent.writer_lock_blocked", &[detail]);
+                    sink.emit(EngineEvent::Note(note.clone()));
+                    let _ = route_tx.send(RouteDecision::Failed(note));
+                    return;
+                }
                 Err(error) => {
                     fail_entry_task(
                         &mut entry_task,
@@ -5699,10 +5237,10 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                             resident,
                         )
                         .await;
-                    let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
-                        "intent.writer_lock_blocked",
-                        &[&error.to_string()],
-                    )));
+                    let note =
+                        umadev_i18n::tlf("intent.writer_lock_blocked", &[&error.to_string()]);
+                    sink.emit(EngineEvent::Note(note.clone()));
+                    let _ = route_tx.send(RouteDecision::Failed(note));
                     return;
                 }
             };
@@ -5763,11 +5301,9 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             prepared_run_lock = Some(guard);
         }
 
-        // Freeze filesystem truth after routing and isolation but before any
-        // resident writer can act. Snapshot failure is an unverified turn, never
-        // permission to publish success. The baseline travels through base
-        // execution and post-build QC.
-        let postcondition = if route.class.mutates_workspace() {
+        let postcondition = if execution_read_only {
+            None
+        } else {
             match ResidentExecutionPostcondition::capture(&project_root, &route, &text) {
                 Ok(postcondition) => Some(postcondition),
                 Err(blocked) => {
@@ -5801,18 +5337,8 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                     return;
                 }
             }
-        } else {
-            None
         };
-
-        // The resident process was pre-warmed with identity only. Now that the
-        // model has decided this turn, compose exactly the route-sized overlay:
-        // Explain gets read context, QuickEdit/Debug get craft, Build gets the full
-        // repo + pitfall + JIT layers. Pure Chat stays identity-only.
         let first_input = if native_command {
-            // This is the defining native-command invariant: no firmware,
-            // transcript, authority wrapper, scoped directive, or placeholder
-            // substitution may alter the exact user payload.
             input.clone()
         } else {
             let turn_firmware = if route.class == umadev_agent::RouteClass::Chat {
@@ -5857,8 +5383,6 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             }
         };
 
-        // Fresh per-attempt accumulators (a retry restarts stream + build detection;
-        // safe because a retry only follows a CLEAN first-attempt failure).
         text_acc = String::new();
         reactive = Arc::new(ReactiveBuild::new(!native_command, &text));
         targeted_verification_passed = false;
@@ -5903,17 +5427,6 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             Option<umadev_runtime::Usage>,
         )> = None;
 
-        // A1: persist the governance context (the color / design-token rule book) BEFORE
-        // the first write, so a chat turn the base then promotes to a build reads the
-        // SAME rulebook a `/run` would — the PreToolUse hook + `umadev ci` + the design
-        // floor are other processes that consult the persisted decision, and a reactive
-        // build previously left them reading `ProjectContext::unknown()`. Decoupled from
-        // any intent classification (the user's decision), and gated to the paths where a
-        // write is even possible: a native command carries its own contract, and a
-        // read-only turn writes nothing. Cheap + fail-open: the color consult short-
-        // circuits unless the requirement names a flagged hue, and any failure is
-        // swallowed inside `persist_run_governance_context`. Its own base permit is scoped
-        // to this block so it drops before the turn's `_base_permit` below (deadlock-free).
         if !native_command && !execution_read_only && !governance_context_persisted {
             let gov_opts = RunOptions {
                 project_root: project_root.clone(),
@@ -6285,12 +5798,6 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                 }
                 umadev_runtime::SessionEvent::ToolCall { name, input }
                 | umadev_runtime::SessionEvent::ToolCallCorrelated { name, input, .. } => {
-                    // The FIRST workspace write flips the turn into a build (one-shot,
-                    // fail-open). This is a reality backstop after model routing. A
-                    // docs/spec artifact write (PRD / architecture / UIUX / SRS / any
-                    // markdown) is legitimate pre-development work — it must NOT flip to
-                    // a build, or the source-present CODE floor falsely fails a
-                    // deliberately code-free docs turn with "claimed done but no source".
                     let target = session_tool_target(&input);
                     let explicit_code_write =
                         is_workspace_write_tool(&name) && !is_doc_artifact_path(&target);
@@ -6306,7 +5813,26 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                         // shell edit after tests cannot retain a stale green.
                         targeted_verification_passed = false;
                         potential_shell_write |= !explicit_code_write;
-                        react_to_first_write(Some(&reactive), &project_root, &sink);
+                        let write_barrier_failure = if execution_read_only {
+                            explicit_code_write.then_some(
+                                "[blocked] read-only resident 会话尝试显式编辑工作区，已终止本轮 / read-only resident session attempted an explicit workspace edit",
+                            )
+                        } else {
+                            react_to_first_write(Some(&reactive), &sink).err()
+                        };
+                        if let Some(note) = write_barrier_failure {
+                            let note = note.to_string();
+                            fail_entry_task(
+                                &mut entry_task,
+                                "resident pre-action writer barrier was violated",
+                                note.clone(),
+                            );
+                            sink.emit(EngineEvent::Note(note.clone()));
+                            let _ = session.interrupt().await;
+                            let _ = session.end().await;
+                            let _ = route_tx.send(RouteDecision::Failed(note));
+                            return;
+                        }
                         // M4: durably track the reactive build from its FIRST observed write
                         // (all guards live inside the helper so this stays a flat call and adds
                         // no nesting to the hot stream loop).
@@ -6861,6 +6387,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                             // Retry exactly once only for a silent, side-effect-free first failure
                             // on a live base. Known transient failures and dead bases terminate.
                             if !native_command
+                                && !transport_lost
                                 && chat_turn_should_auto_redrive(
                                     attempt,
                                     &reason,
@@ -6994,6 +6521,8 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             .became_build
             .load(std::sync::atomic::Ordering::SeqCst)
         && reactive_qc_enabled();
+    let sink_dyn: Arc<dyn EventSink> = sink.clone();
+    let mut post_build_qc_outcome = None;
     if routed_build || reactive_qc {
         let qc_opts = RunOptions {
             project_root: project_root.clone(),
@@ -7019,8 +6548,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         if produced_no_source || umadev_agent::planner::is_document_task(&text) {
             qc_route.team = Vec::new();
         }
-        let sink_dyn: Arc<dyn EventSink> = sink.clone();
-        let qc_reply = umadev_agent::run_post_build_qc(
+        let qc_outcome = umadev_agent::run_post_build_qc(
             session.as_mut(),
             &qc_opts,
             &sink_dyn,
@@ -7028,9 +6556,10 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             &reply,
         )
         .await;
-        if !qc_reply.trim().is_empty() {
-            reply = qc_reply;
+        if !qc_outcome.reply.trim().is_empty() {
+            reply.clone_from(&qc_outcome.reply);
         }
+        post_build_qc_outcome = Some((qc_outcome, qc_route, qc_opts));
     }
 
     // Re-snapshot only after every base and UmaDev-owned execution turn has
@@ -7062,6 +6591,122 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             _ => None,
         }
     };
+
+    // A required-review transport outage is a resumable operational boundary,
+    // never a source defect and never a success. Persist the exact reviewer
+    // cursor only after the execution postcondition above proves this turn
+    // stayed within its write contract. Mixed semantic evidence is retained in
+    // the checkpoint, but no unrelated fix turn or repeated review starts.
+    if let Some((qc, qc_route, qc_opts)) = post_build_qc_outcome.as_ref() {
+        if !qc.operational_unavailable.is_empty() {
+            let base_session_id = session.session_id().map(str::to_string);
+            let profile = execution_permission_profile(execution_read_only, permissions);
+            let base_resume_identity = base_session_id.as_ref().and_then(|_| {
+                session.resume_identity().cloned().or_else(|| {
+                    crate::session_slot::requested_resume_identity(&backend, &project_root, profile)
+                })
+            });
+            let entry_run_id = entry_task.as_ref().map(|task| task.run_id().to_string());
+            let pause = umadev_agent::checkpoint_post_build_review_pause(
+                qc_opts,
+                qc_route,
+                qc,
+                &sink_dyn,
+                entry_run_id.as_deref(),
+                base_session_id.as_deref(),
+                base_resume_identity.as_ref(),
+            );
+            let pause = match pause {
+                Ok(pause) => pause,
+                Err(error) => {
+                    fail_entry_task(
+                        &mut entry_task,
+                        "resident review checkpoint failed",
+                        error.clone(),
+                    );
+                    let resident = primed_resident(session, execution_read_only);
+                    let _ = chat_session
+                        .park_for_launch(
+                            turn_generation,
+                            &backend,
+                            &project_root,
+                            profile,
+                            resident,
+                        )
+                        .await;
+                    let note = format!(
+                        "required review was unavailable and its resume checkpoint failed: {error}"
+                    );
+                    sink.emit(EngineEvent::Note(note.clone()));
+                    let _ = route_tx.send(RouteDecision::Failed(note));
+                    return;
+                }
+            };
+            if let Some(task) = entry_task.as_mut() {
+                if let Err(error) = task.wait(&pause.reason) {
+                    // The exact run id is already in the typed checkpoint. If
+                    // this append fails, dropping the still-running tracker
+                    // records an interruption and `/continue` can recover that
+                    // same run; surfacing a terminal failure here would hide a
+                    // genuinely resumable review boundary.
+                    sink.emit(EngineEvent::Note(format!(
+                        "required review was unavailable and the task ledger could not append \
+                         its pause ({error}); the typed checkpoint remains resumable"
+                    )));
+                }
+            }
+            sink.emit(EngineEvent::Note(format!(
+                "team · {} — source repair stopped; type /continue to retry the same review",
+                pause.reason
+            )));
+            settle_director_session(
+                session,
+                &director_session_holder,
+                requested_session_identity.clone(),
+                true,
+            )
+            .await;
+            let _ = route_tx.send(RouteDecision::RunPausedAtOperational {
+                reason: pause.reason,
+                done: pause.done,
+                total: pause.total,
+            });
+            return;
+        }
+
+        // A bounded semantic QC that remains dirty is also not a successful
+        // build. Surface its concrete residual evidence and keep the resident
+        // session available for an explicit follow-up instead of emitting an
+        // `AgenticDone` completion card.
+        if !qc.clean {
+            let evidence = qc
+                .blocking
+                .iter()
+                .take(6)
+                .map(|item| item.chars().take(240).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let note = if evidence.is_empty() {
+                "post-build quality gate did not settle cleanly".to_string()
+            } else {
+                format!("post-build quality gate did not settle cleanly: {evidence}")
+            };
+            fail_entry_task(
+                &mut entry_task,
+                "resident post-build quality gate failed",
+                note.clone(),
+            );
+            let profile = execution_permission_profile(execution_read_only, permissions);
+            let resident = primed_resident(session, execution_read_only);
+            let _ = chat_session
+                .park_for_launch(turn_generation, &backend, &project_root, profile, resident)
+                .await;
+            sink.emit(EngineEvent::Note(note.clone()));
+            let _ = route_tx.send(RouteDecision::Failed(note));
+            return;
+        }
+    }
+
     let wrote_files = wrote_code_files(explicit_code_write, final_changed.as_deref());
     let became_build = !native_command && (routed_build || wrote_files);
     // M5: rebuilt off the OBSERVED build (`became_build`) + the OBSERVED verification
@@ -7199,6 +6844,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
 fn drain_next_queued_chat(
     app: &mut App,
     chat_session: &ChatSessionHolder,
+    director_session_holder: &SessionHolder,
     pending_ask: &PendingAskHolder,
     approval_holder: &ApprovalHolder,
     host_input_holder: &HostInputHolder,
@@ -7211,6 +6857,7 @@ fn drain_next_queued_chat(
         ResidentDispatch::RoutedChat(text) => Some(fire_agentic(
             app,
             chat_session,
+            director_session_holder,
             pending_ask,
             approval_holder,
             host_input_holder,
@@ -7232,6 +6879,19 @@ fn drain_next_queued_chat(
             route_tx,
             payload,
         )),
+        ResidentDispatch::HostGitCommit(text) => Some(resident_host_git::spawn(
+            app,
+            approval_holder,
+            sink,
+            route_tx,
+            text,
+        )),
+    }
+}
+
+async fn settle_terminal_run_task(run_task: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = run_task.take() {
+        let _ = task.await;
     }
 }
 
@@ -7242,6 +6902,7 @@ fn drain_next_queued_chat(
 fn settle_cancel_and_drain_next(
     app: &mut App,
     chat_session: &ChatSessionHolder,
+    director_session_holder: &SessionHolder,
     pending_ask: &PendingAskHolder,
     approval_holder: &ApprovalHolder,
     host_input_holder: &HostInputHolder,
@@ -7254,6 +6915,7 @@ fn settle_cancel_and_drain_next(
     drain_next_queued_chat(
         app,
         chat_session,
+        director_session_holder,
         pending_ask,
         approval_holder,
         host_input_holder,
@@ -8855,6 +8517,8 @@ const SESSION_CLOSE_BUDGET: Duration = Duration::from_secs(14);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CancelDrainOutcome {
     Finished,
+    Cancelled,
+    Panicked,
     TimedOut,
 }
 
@@ -8870,6 +8534,9 @@ fn prepare_cancel_request(
         return false;
     }
     clear_pending_approval(approval_holder);
+    if app.host_git_in_flight {
+        return true;
+    }
     clear_pending_host_input(host_input_holder);
     app.auth_ui = None;
     if let Ok(mut queued) = steer_holder.lock() {
@@ -8878,6 +8545,27 @@ fn prepare_cancel_request(
     app.director_gate_paused = false;
     chat_session_holder.invalidate();
     true
+}
+
+fn begin_cancel_drain(
+    app: &mut App,
+    handle: tokio::task::JoinHandle<()>,
+    host_git: bool,
+    cancel_drain: &mut Option<tokio::task::JoinHandle<()>>,
+    cancel_drain_timed_out: &mut bool,
+    cancel_deadline: &mut Option<tokio::time::Instant>,
+) {
+    if !host_git || !handle.is_finished() {
+        handle.abort();
+    }
+    *cancel_drain = Some(handle);
+    *cancel_drain_timed_out = false;
+    *cancel_deadline = Some(tokio::time::Instant::now() + CANCEL_DRAIN_BUDGET);
+    if host_git {
+        app.begin_host_git_cancelling();
+    } else {
+        app.begin_cancelling();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8900,12 +8588,42 @@ fn handle_prepared_cancel(
     engine_rx: &mut tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
     route_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RouteDecision>,
 ) {
+    if app.host_git_in_flight {
+        if let Some(handle) = run_task.take() {
+            begin_cancel_drain(
+                app,
+                handle,
+                true,
+                cancel_drain,
+                cancel_drain_timed_out,
+                cancel_deadline,
+            );
+        } else {
+            app.record_host_git_cancelled();
+            *run_task = resident_host_git::drain_after_settle(
+                app,
+                chat_session_holder,
+                session_holder,
+                pending_ask_holder,
+                approval_holder,
+                host_input_holder,
+                steer_holder,
+                live_input_hub,
+                sink,
+                route_tx,
+            );
+        }
+        return;
+    }
     if let Some(handle) = run_task.take() {
-        handle.abort();
-        *cancel_drain = Some(handle);
-        *cancel_drain_timed_out = false;
-        *cancel_deadline = Some(tokio::time::Instant::now() + CANCEL_DRAIN_BUDGET);
-        app.begin_cancelling();
+        begin_cancel_drain(
+            app,
+            handle,
+            false,
+            cancel_drain,
+            cancel_drain_timed_out,
+            cancel_deadline,
+        );
         return;
     }
 
@@ -8919,6 +8637,7 @@ fn handle_prepared_cancel(
     *run_task = settle_cancel_and_drain_next(
         app,
         chat_session_holder,
+        session_holder,
         pending_ask_holder,
         approval_holder,
         host_input_holder,
@@ -9189,6 +8908,7 @@ fn handle_tick_flush_key(
     cancel_drain: &mut Option<tokio::task::JoinHandle<()>>,
     cancel_drain_timed_out: &mut bool,
     cancel_deadline: &mut Option<tokio::time::Instant>,
+    session_holder: &SessionHolder,
     chat_session_holder: &ChatSessionHolder,
     pending_ask_holder: &PendingAskHolder,
     approval_holder: &ApprovalHolder,
@@ -9214,16 +8934,35 @@ fn handle_tick_flush_key(
     {
         return;
     }
+    let host_git = app.host_git_in_flight;
     if let Some(handle) = run_task.take() {
-        handle.abort();
-        *cancel_drain = Some(handle);
-        *cancel_drain_timed_out = false;
-        *cancel_deadline = Some(tokio::time::Instant::now() + CANCEL_DRAIN_BUDGET);
-        app.begin_cancelling();
+        begin_cancel_drain(
+            app,
+            handle,
+            host_git,
+            cancel_drain,
+            cancel_drain_timed_out,
+            cancel_deadline,
+        );
+    } else if host_git {
+        app.record_host_git_cancelled();
+        *run_task = resident_host_git::drain_after_settle(
+            app,
+            chat_session_holder,
+            session_holder,
+            pending_ask_holder,
+            approval_holder,
+            host_input_holder,
+            steer_holder,
+            live_input_hub,
+            sink,
+            route_tx,
+        );
     } else {
         *run_task = settle_cancel_and_drain_next(
             app,
             chat_session_holder,
+            session_holder,
             pending_ask_holder,
             approval_holder,
             host_input_holder,
@@ -9242,16 +8981,17 @@ fn reset_idle_cancel_sessions(
     engine_rx: &mut tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
     route_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RouteDecision>,
 ) {
-    if *continuous_run_active {
-        let parked = session_holder
-            .try_lock()
-            .ok()
-            .and_then(|mut holder| holder.take());
-        if let Some(session) = parked {
-            detach_session_close(session.into_inner());
-        }
-        *continuous_run_active = false;
+    // This slot is shared by the legacy continuous path and by a Director parked
+    // at an operational-review boundary. Cancel must close either kind even though
+    // the latter deliberately leaves `continuous_run_active == false`.
+    let parked = session_holder
+        .try_lock()
+        .ok()
+        .and_then(|mut holder| holder.take());
+    if let Some(session) = parked {
+        detach_session_close(session.into_inner());
     }
+    *continuous_run_active = false;
     let parked = chat_session_holder
         .try_lock()
         .ok()
@@ -9311,6 +9051,10 @@ fn apply_pending_auto_continue(
     continuous_run_active: bool,
     run_task: &mut Option<tokio::task::JoinHandle<()>>,
 ) {
+    if app.reject_replayed_host_git_operation(&app.requirement.clone()) {
+        app.pending_auto_continue = None;
+        return;
+    }
     let Some(gate) = app.pending_auto_continue.take() else {
         return;
     };
@@ -9338,6 +9082,10 @@ fn apply_pending_steer(
     continuous_run_active: bool,
     run_task: &mut Option<tokio::task::JoinHandle<()>>,
 ) {
+    if app.reject_replayed_host_git_operation(&app.requirement.clone()) {
+        app.pending_steer = None;
+        return;
+    }
     let Some(text) = app.pending_steer.take() else {
         return;
     };
@@ -9350,6 +9098,7 @@ fn apply_pending_steer(
             opts,
             sink,
             route_tx,
+            session_holder,
             steer_holder,
             approval_holder,
             host_input_holder,
@@ -9433,12 +9182,17 @@ fn start_gate_continue(
     gate: Gate,
     continuous_run_active: bool,
 ) -> tokio::task::JoinHandle<()> {
+    let requirement = app.resume_run_requirement();
+    if app.reject_replayed_host_git_operation(&requirement) {
+        return tokio::spawn(async {});
+    }
     if !continuous_run_active && app.director_gate_paused {
         resume_director_after_gate(
             app,
             opts,
             sink,
             route_tx,
+            session_holder,
             steer_holder,
             approval_holder,
             host_input_holder,
@@ -9462,6 +9216,9 @@ fn start_requested_run(
     requirement: String,
     resume: bool,
 ) -> (tokio::task::JoinHandle<()>, bool) {
+    if app.reject_replayed_host_git_operation(&requirement) {
+        return (tokio::spawn(async {}), false);
+    }
     let host_cli = matches!(app.brain_spec(), BrainSpec::HostCli(_));
     if host_cli && !umadev_agent::legacy_pipeline_from_env() {
         app.thinking = true;
@@ -9484,6 +9241,7 @@ fn start_requested_run(
             run_opts,
             sink.clone(),
             route_tx.clone(),
+            session_holder.clone(),
             permissions,
             Vec::new(),
             None,
@@ -9574,6 +9332,9 @@ fn start_revision(
     text: String,
     continuous_run_active: bool,
 ) -> tokio::task::JoinHandle<()> {
+    if app.reject_replayed_host_git_operation(&app.requirement.clone()) {
+        return tokio::spawn(async {});
+    }
     sink.emit(EngineEvent::Note(format!("user revision: {text}")));
     if !continuous_run_active && app.director_gate_paused {
         let gate = app.active_gate.take().unwrap_or(Gate::DocsConfirm);
@@ -9583,6 +9344,7 @@ fn start_revision(
             opts,
             sink,
             route_tx,
+            session_holder,
             steer_holder,
             approval_holder,
             host_input_holder,
@@ -9686,12 +9448,19 @@ async fn drain_cancelled_task(
     // already-expired deadline; this consumes the JoinHandle and proves all task
     // locals (session/run lock/child guards) have dropped.
     if handle.is_finished() {
-        let _ = handle.await;
-        return CancelDrainOutcome::Finished;
+        return classify_cancel_join(handle.await);
     }
     match tokio::time::timeout_at(deadline, handle).await {
-        Ok(_) => CancelDrainOutcome::Finished,
+        Ok(joined) => classify_cancel_join(joined),
         Err(_) => CancelDrainOutcome::TimedOut,
+    }
+}
+
+fn classify_cancel_join(joined: Result<(), tokio::task::JoinError>) -> CancelDrainOutcome {
+    match joined {
+        Ok(()) => CancelDrainOutcome::Finished,
+        Err(error) if error.is_cancelled() => CancelDrainOutcome::Cancelled,
+        Err(_) => CancelDrainOutcome::Panicked,
     }
 }
 
@@ -10149,25 +9918,25 @@ async fn cleanup_active_run_on_quit(
     chat_session_holder: &ChatSessionHolder,
     session_holder: &SessionHolder,
 ) {
-    if !quit_needs_active_cleanup(run_task.is_some(), continuous_run_active) {
-        return;
-    }
-    clear_pending_approval(approval_holder);
-    clear_pending_host_input(host_input_holder);
-    let _ = chat_session_holder.cancel_auth_interaction();
-    if let Some(handle) = run_task.take() {
-        handle.abort();
-        let deadline = tokio::time::Instant::now() + CANCEL_DRAIN_BUDGET;
-        let _ = tokio::time::timeout_at(deadline, handle).await;
-    }
-    if continuous_run_active {
-        let run_session = session_holder
-            .try_lock()
-            .ok()
-            .and_then(|mut holder| holder.take());
-        if let Some(session) = run_session {
-            bounded_session_close(session.into_inner()).await;
+    if quit_needs_active_cleanup(run_task.is_some(), continuous_run_active) {
+        clear_pending_approval(approval_holder);
+        clear_pending_host_input(host_input_holder);
+        let _ = chat_session_holder.cancel_auth_interaction();
+        if let Some(handle) = run_task.take() {
+            handle.abort();
+            let deadline = tokio::time::Instant::now() + CANCEL_DRAIN_BUDGET;
+            let _ = tokio::time::timeout_at(deadline, handle).await;
         }
+    }
+    // A completed operational pause has no in-flight task and is not the legacy
+    // `continuous_run_active` path, but it still owns a live Director process.
+    // Always drain the shared run slot on quit.
+    let run_session = session_holder
+        .try_lock()
+        .ok()
+        .and_then(|mut holder| holder.take());
+    if let Some(session) = run_session {
+        bounded_session_close(session.into_inner()).await;
     }
 }
 
@@ -10288,6 +10057,10 @@ async fn event_loop(
     // the zombie handle owned and keep the single-writer barrier closed. The branch
     // re-arms only once `is_finished()` proves teardown completed.
     let mut cancel_drain_timed_out = false;
+    // A host Git terminal result that raced an Esc/Ctrl-C drain. The result is
+    // authoritative: a transaction that already committed must never be
+    // reported as cancelled merely because its event had not yet been applied.
+    let mut pending_host_git_result: Option<std::result::Result<String, String>> = None;
     // The director's persistent base session for the continuous run path — ONE
     // brain held across the whole TUI session so context flows across gate
     // blocks (see `spawn_continuous_block`). Always empty unless the continuous
@@ -10653,6 +10426,11 @@ async fn event_loop(
                     continuous_run_active = continuous;
                 }
                 Action::StartQuick(task) => {
+                    if app.reject_replayed_host_git_operation(&task) {
+                        run_task = None;
+                        continuous_run_active = false;
+                        continue;
+                    }
                     // Lightweight fast track — same RunOptions as a
                     // normal start, but driven through the lean
                     // single-shot Light block (no gates). P1-E note:
@@ -10694,6 +10472,12 @@ async fn event_loop(
                     // Re-run a single phase with the prior run's
                     // context (current_run_options carries the
                     // persisted requirement / slug / backend).
+                    let replay_requirement = app.resume_run_requirement();
+                    if app.reject_replayed_host_git_operation(&replay_requirement) {
+                        run_task = None;
+                        continuous_run_active = false;
+                        continue;
+                    }
                     let run_opts = resume_run_options(app, &opts);
                     run_task = Some(spawn_block(
                         run_opts,
@@ -10762,6 +10546,16 @@ async fn event_loop(
                     );
                 }
                 Action::Route(text) => {
+                    if umadev_agent::request_has_git_commit_operation(&text) {
+                        run_task = Some(resident_host_git::spawn(
+                            app,
+                            &approval_holder,
+                            &sink,
+                            &route_tx,
+                            text,
+                        ));
+                        continue;
+                    }
                     // Chat dispatch is model-first off the render thread. The
                     // resident writer opens once; a fresh read-only child returns
                     // the typed route, then the same turn either answers read-only,
@@ -10833,6 +10627,7 @@ async fn event_loop(
                     run_task = Some(tokio::spawn(run_routed_turn(
                         inputs,
                         chat_session_holder.clone(),
+                        session_holder.clone(),
                         pending_ask_holder.clone(),
                         approval_holder.clone(),
                         host_input_holder.clone(),
@@ -10927,6 +10722,9 @@ async fn event_loop(
             // Cancellation owns the sole terminal transition. Consume but do
             // not apply old route outcomes while its task is draining.
             if app.cancelling {
+                if let Some(RouteDecision::HostGitDone { result }) = maybe_route {
+                    pending_host_git_result = Some(result);
+                }
                 continue;
             }
             // R3 — a turn-completion decision changes the transcript; mark it
@@ -10940,6 +10738,14 @@ async fn event_loop(
             // (engine arm wins before this route arm).
             if matches!(&maybe_route, Some(RouteDecision::DirectorStarted { .. })) {
                 app.director_run_in_flight = true;
+            }
+            // A terminal decision is only the task's published result; Rust
+            // resources owned by that task (notably the workspace writer lock)
+            // are released when the task actually returns. Join it before
+            // rendering completion or spawning the next FIFO turn so a queued
+            // writer cannot race the previous task's destructor.
+            if maybe_route.as_ref().is_some_and(RouteDecision::is_terminal) {
+                settle_terminal_run_task(&mut run_task).await;
             }
             // Route terminal decisions and streamed/plan events are sent over
             // separate channels. A terminal Done/Failed can therefore win this
@@ -11003,6 +10809,7 @@ async fn event_loop(
                     run_task = drain_next_queued_chat(
                         app,
                         &chat_session_holder,
+                        &session_holder,
                         &pending_ask_holder,
                         &approval_holder,
                         &host_input_holder,
@@ -11018,6 +10825,7 @@ async fn event_loop(
                     run_task = drain_next_queued_chat(
                         app,
                         &chat_session_holder,
+                        &session_holder,
                         &pending_ask_holder,
                         &approval_holder,
                         &host_input_holder,
@@ -11098,6 +10906,7 @@ async fn event_loop(
                     run_task = drain_next_queued_chat(
                         app,
                         &chat_session_holder,
+                        &session_holder,
                         &pending_ask_holder,
                         &approval_holder,
                         &host_input_holder,
@@ -11111,6 +10920,21 @@ async fn event_loop(
                     // structured summary on a forked base (the recent tail stays
                     // verbatim). Deterministic trigger; fail-open to FIFO.
                     maybe_spawn_auto_compaction(app, &compaction_tx);
+                }
+                Some(RouteDecision::HostGitDone { result }) => {
+                    app.record_host_git_done(result);
+                    run_task = resident_host_git::drain_after_settle(
+                        app,
+                        &chat_session_holder,
+                        &session_holder,
+                        &pending_ask_holder,
+                        &approval_holder,
+                        &host_input_holder,
+                        &steer_holder,
+                        &live_input_hub,
+                        &sink,
+                        &route_tx,
+                    );
                 }
                 Some(RouteDecision::RunNotExecuted) => {
                     let was_run = app.director_run_in_flight;
@@ -11127,6 +10951,7 @@ async fn event_loop(
                     run_task = drain_next_queued_chat(
                         app,
                         &chat_session_holder,
+                        &session_holder,
                         &pending_ask_holder,
                         &approval_holder,
                         &host_input_holder,
@@ -11169,6 +10994,7 @@ async fn event_loop(
                     run_task = drain_next_queued_chat(
                         app,
                         &chat_session_holder,
+                        &session_holder,
                         &pending_ask_holder,
                         &approval_holder,
                         &host_input_holder,
@@ -11185,6 +11011,8 @@ async fn event_loop(
                 // drained — the gate awaits the user's answer.
                 Some(RouteDecision::RunPausedAtGate { gate }) => {
                     app.record_run_paused_at_gate(gate);
+                    run_task =
+                        resident_host_git::drain_front(app, &approval_holder, &sink, &route_tx);
                 }
                 // A director build parked at the wall-clock budget (Stage 1/2).
                 // Resumable, not aborted: keep the plan panel, arm the budget-pause
@@ -11192,22 +11020,44 @@ async fn event_loop(
                 // run is parked awaiting the user's `/continue`.
                 Some(RouteDecision::RunPausedAtBudget { done, total }) => {
                     app.record_run_paused_at_budget(done, total);
+                    run_task =
+                        resident_host_git::drain_front(app, &approval_holder, &sink, &route_tx);
+                }
+                Some(RouteDecision::RunPausedAtOperational {
+                    reason,
+                    done,
+                    total,
+                }) => {
+                    app.record_run_paused_at_operational(reason, done, total);
+                    run_task =
+                        resident_host_git::drain_front(app, &approval_holder, &sink, &route_tx);
                 }
                 Some(RouteDecision::GateQueryDone { epoch, reply }) => {
-                    if app.record_gate_query_done(epoch, reply) {
-                        run_task = None;
-                    }
+                    let accepted = app.record_gate_query_done(epoch, reply);
+                    run_task = resident_host_git::drain_after_gate_query(
+                        app,
+                        accepted,
+                        &approval_holder,
+                        &sink,
+                        &route_tx,
+                    );
                 }
                 Some(RouteDecision::GateQueryFailed { epoch, note }) => {
-                    if app.record_gate_query_failed(epoch, note) {
-                        run_task = None;
-                    }
+                    let accepted = app.record_gate_query_failed(epoch, note);
+                    run_task = resident_host_git::drain_after_gate_query(
+                        app,
+                        accepted,
+                        &approval_holder,
+                        &sink,
+                        &route_tx,
+                    );
                 }
                 Some(RouteDecision::DeployDone { succeeded }) => {
                     app.record_deploy_done(succeeded);
                     run_task = drain_next_queued_chat(
                         app,
                         &chat_session_holder,
+                        &session_holder,
                         &pending_ask_holder,
                         &approval_holder,
                         &host_input_holder,
@@ -11668,6 +11518,23 @@ async fn event_loop(
                 cancel_drain = None;
                 cancel_deadline = None;
                 cancel_drain_timed_out = false;
+                if app.host_git_in_flight {
+                    run_task = resident_host_git::settle_cancel_and_drain(
+                        app,
+                        cancel_outcome,
+                        pending_host_git_result.take(),
+                        &chat_session_holder,
+                        &session_holder,
+                        &pending_ask_holder,
+                        &approval_holder,
+                        &host_input_holder,
+                        &steer_holder,
+                        &live_input_hub,
+                        &sink,
+                        &route_tx,
+                    );
+                    continue;
+                }
                 // The aborted task has actually wound down — only this condition,
                 // never the elapsed UI budget alone, proves its locks are released.
                 // A continuous run was cancelled: close + drop the parked director
@@ -11689,6 +11556,7 @@ async fn event_loop(
                 run_task = settle_cancel_and_drain_next(
                     app,
                     &chat_session_holder,
+                    &session_holder,
                     &pending_ask_holder,
                     &approval_holder,
                     &host_input_holder,
@@ -11794,6 +11662,7 @@ async fn event_loop(
                         &mut cancel_drain,
                         &mut cancel_drain_timed_out,
                         &mut cancel_deadline,
+                        &session_holder,
                         &chat_session_holder,
                         &pending_ask_holder,
                         &approval_holder,

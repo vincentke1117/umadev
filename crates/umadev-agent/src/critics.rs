@@ -638,6 +638,83 @@ impl std::ops::Deref for TeamReviewResult {
 /// QUALITY-stage team. Each stage fills only the fields it has — the unused ones
 /// stay empty (`Default`), so the same struct serves both stages without forcing
 /// a critic to read something that isn't there.
+/// Host-computed completeness of the bounded artifact surface supplied to a
+/// reviewer. This metadata is authoritative; model prose never changes it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReviewPayloadCoverage {
+    /// Character count declared by the host-side bundle builder.
+    pub declared_chars: usize,
+    /// Character count actually supplied to the critic.
+    pub supplied_chars: usize,
+    /// The bundle failed a host-side structural/file-boundary check.
+    pub malformed: bool,
+    /// Whether this review surface is required to carry implementation source.
+    ///
+    /// Document-review payloads legitimately leave `code` empty. Quality/preview
+    /// payloads do not: a manifest that says every source file was omitted is not
+    /// enough evidence for a required code review.
+    pub requires_source: bool,
+    /// Non-whitespace source characters actually supplied by the host.
+    ///
+    /// Manifest/header text is deliberately excluded. This prevents a
+    /// manifest-only bundle from satisfying the coverage contract.
+    pub substantive_source_chars: usize,
+}
+
+impl ReviewPayloadCoverage {
+    /// Record an intact host-built payload.
+    #[must_use]
+    pub fn intact(payload: &str) -> Self {
+        let chars = payload.chars().count();
+        Self {
+            declared_chars: chars,
+            supplied_chars: chars,
+            malformed: false,
+            requires_source: false,
+            substantive_source_chars: 0,
+        }
+    }
+
+    /// Record a bounded implementation bundle with its real source-content count.
+    #[must_use]
+    pub fn source_bundle(payload: &str, substantive_source_chars: usize) -> Self {
+        let mut coverage = Self::intact(payload);
+        coverage.requires_source = true;
+        coverage.substantive_source_chars = substantive_source_chars;
+        coverage
+    }
+
+    /// Whether the host supplied an internally-complete payload and, when this is
+    /// a code review, at least one substantive source character.
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        !self.malformed
+            && self.declared_chars == self.supplied_chars
+            && (!self.requires_source || self.substantive_source_chars > 0)
+    }
+
+    /// Stable host-owned diagnosis for an incomplete review surface.
+    #[must_use]
+    pub fn unavailable_reason(self) -> Option<String> {
+        if self.is_complete() {
+            return None;
+        }
+        let cause = if self.malformed {
+            "host bundle failed its structural/file-boundary check".to_string()
+        } else if self.requires_source && self.substantive_source_chars == 0 {
+            "host bundle contained no substantive source content".to_string()
+        } else {
+            format!(
+                "host supplied {} of {} declared characters",
+                self.supplied_chars, self.declared_chars
+            )
+        };
+        Some(format!("review payload incomplete: {cause}"))
+    }
+}
+
+/// Borrowed requirement, documents, source digest, deterministic floors, and
+/// host-owned coverage metadata supplied to one critic.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CriticArtifacts<'a> {
     /// The original requirement (always present).
@@ -660,6 +737,9 @@ pub struct CriticArtifacts<'a> {
     /// runs (governance scan / any `security-scan.json`). Same role as
     /// `qa_floor` for the security-critic.
     pub security_floor: &'a str,
+    /// Host-computed coverage of the supplied artifact payload. An incomplete
+    /// surface makes the seat unavailable before any model verdict is requested.
+    pub coverage: ReviewPayloadCoverage,
 }
 
 impl CriticArtifacts<'_> {

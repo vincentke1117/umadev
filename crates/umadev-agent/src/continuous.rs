@@ -47,7 +47,8 @@ use umadev_runtime::{
 use umadev_spec::Phase;
 
 use crate::critics::{
-    CriticArtifacts, CriticConsult, ReviewStatus, RoleCritic, RoleVerdict, TeamReviewResult,
+    CriticArtifacts, CriticConsult, ReviewPayloadCoverage, ReviewStatus, RoleCritic, RoleVerdict,
+    TeamReviewResult,
 };
 use crate::events::{EngineEvent, EventSink};
 use crate::gates::Gate;
@@ -154,6 +155,17 @@ pub enum RunOutcome {
         /// Total steps in the plan.
         total: usize,
     },
+    /// A required reviewer/host was operationally unavailable. The workflow
+    /// checkpoint and writer task are parked, so `/continue` retries exactly the
+    /// review boundary instead of ending the session or re-running source work.
+    PausedAtOperational {
+        /// Bounded host-owned evidence for the unavailable review.
+        reason: String,
+        /// Completed phases at the pause.
+        done: usize,
+        /// Total phases in the selected phase plan.
+        total: usize,
+    },
     /// The run drove all the way through delivery.
     Completed,
     /// The run stopped on a HARD signal (zero real source produced when the
@@ -188,6 +200,57 @@ fn persist_state(options: &RunOptions, phase: Phase, active_gate: &str) {
 /// "Advanced to ...", never mistaken for done). Mirrors the director loop H1 fix.
 fn persist_state_complete(options: &RunOptions, phase: Phase) {
     persist_state_impl(options, phase, "", Some("Pipeline complete."));
+}
+
+const OPERATIONAL_REVIEW_DOCS: &str = "operational-review-pause:v1:docs";
+const OPERATIONAL_REVIEW_PREVIEW: &str = "operational-review-pause:v1:preview";
+const OPERATIONAL_REVIEW_QUALITY: &str = "operational-review-pause:v1:quality";
+
+fn operational_review_marker(kind: ReviewKind) -> &'static str {
+    match kind {
+        ReviewKind::Docs => OPERATIONAL_REVIEW_DOCS,
+        ReviewKind::Preview => OPERATIONAL_REVIEW_PREVIEW,
+        ReviewKind::Quality => OPERATIONAL_REVIEW_QUALITY,
+    }
+}
+
+fn pending_operational_review(options: &RunOptions) -> Option<ReviewKind> {
+    let state = crate::state::read_workflow_state(&options.project_root)?;
+    match state.note.as_str() {
+        OPERATIONAL_REVIEW_DOCS => Some(ReviewKind::Docs),
+        OPERATIONAL_REVIEW_PREVIEW => Some(ReviewKind::Preview),
+        OPERATIONAL_REVIEW_QUALITY => Some(ReviewKind::Quality),
+        _ => None,
+    }
+}
+
+fn operational_checkpoint_phase(kind: ReviewKind) -> Phase {
+    match kind {
+        ReviewKind::Docs => Phase::Docs,
+        ReviewKind::Preview => Phase::Frontend,
+        ReviewKind::Quality => Phase::Quality,
+    }
+}
+
+fn pause_at_operational_review(
+    options: &RunOptions,
+    plan: &crate::planner::PhasePlan,
+    kind: ReviewKind,
+    review: &TeamReviewResult,
+) -> RunOutcome {
+    let phase = operational_checkpoint_phase(kind);
+    persist_state_impl(options, phase, "", Some(operational_review_marker(kind)));
+    let reason = review_incomplete_reason(kind, review);
+    let done = plan
+        .phases
+        .iter()
+        .filter(|candidate| phase_order(**candidate) < phase_order(phase))
+        .count();
+    RunOutcome::PausedAtOperational {
+        reason,
+        done,
+        total: plan.phases.len(),
+    }
 }
 
 fn persist_state_impl(
@@ -300,6 +363,69 @@ pub async fn run_block(
     // for the director path (and a future legacy wiring); this path deliberately does
     // not fabricate one.
     let deadline = std::time::Instant::now() + crate::director_loop::run_budget_absolute();
+    let mut phases = block_phases(start_after, &plan);
+    let mut resumed_operational_review = false;
+
+    // A typed operational checkpoint is resumed before any colour/design consult
+    // or phase directive. `/continue` therefore retries only the unavailable
+    // read-only review; it cannot accidentally re-run research, rewrite source,
+    // consume a fix round, or teach an outage as a product pitfall.
+    if let Some(kind) = pending_operational_review(options) {
+        resumed_operational_review = true;
+        let team = team_for(kind, &options.requirement, &options.project_root);
+        let review = if team.is_empty() {
+            TeamReviewResult::default()
+        } else {
+            // A continuation owns exactly the missing read-only verdict. It must
+            // never reopen the main writer or enter review-and-rework merely
+            // because a previously unavailable reviewer now reports a semantic
+            // finding.
+            run_review_team(session, options, events, kind, &team, 0).await
+        };
+        if review.status() == ReviewStatus::Unavailable {
+            let outcome = pause_at_operational_review(options, &plan, kind, &review);
+            if let RunOutcome::PausedAtOperational { reason, .. } = &outcome {
+                events.emit(EngineEvent::Note(format!(
+                    "{reason} — workflow remains paused; retry with /continue"
+                )));
+            }
+            return outcome;
+        }
+        match kind {
+            ReviewKind::Docs | ReviewKind::Preview => {
+                // Gate reviews remain advisory for semantic findings on this
+                // legacy path, exactly as on their first pass. A completed retry
+                // opens the real confirmation gate; only an unavailable retry
+                // stays parked above.
+                let gate = match kind {
+                    ReviewKind::Docs => Gate::DocsConfirm,
+                    ReviewKind::Preview => Gate::PreviewConfirm,
+                    ReviewKind::Quality => unreachable!(),
+                };
+                let phase = match kind {
+                    ReviewKind::Docs => Phase::DocsConfirm,
+                    ReviewKind::Preview => Phase::PreviewConfirm,
+                    ReviewKind::Quality => unreachable!(),
+                };
+                persist_state(options, phase, gate.id_str());
+                events.emit(EngineEvent::gate_opened(gate));
+                events.emit(EngineEvent::BlockCompleted {
+                    final_phase: phase,
+                    paused_at: Some(gate),
+                });
+                return RunOutcome::PausedAtGate(gate);
+            }
+            ReviewKind::Quality => {
+                if let Some(reason) = required_review_failure(kind, &review) {
+                    events.emit(EngineEvent::Note(reason.clone()));
+                    return RunOutcome::HardStop(reason);
+                }
+                // Quality itself already ran before the outage. Continue only
+                // with phases strictly after it (normally Delivery).
+                phases.retain(|phase| phase_order(*phase) > phase_order(Phase::Quality));
+            }
+        }
+    }
 
     // Persist the project's governance context BEFORE any phase writes a file, so
     // the out-of-process PreToolUse hook (which reads `.umadev/governance-context.
@@ -313,14 +439,16 @@ pub async fn run_block(
     // the banned-hue default-reject would never be recorded on this path and a user who
     // asked for a violet brand could not write it. The per-tool-call refresh below carries
     // the verdict forward; it never re-derives one (it has no brain, and must not spawn one).
-    let permission =
-        crate::color_permission::consult_color_permission(session, &options.requirement).await;
-    let _ = crate::planner::persist_project_context_with_color(
-        &options.requirement,
-        &options.project_root,
-        &options.effective_slug(),
-        permission.purple_allowed,
-    );
+    if !resumed_operational_review {
+        let permission =
+            crate::color_permission::consult_color_permission(session, &options.requirement).await;
+        let _ = crate::planner::persist_project_context_with_color(
+            &options.requirement,
+            &options.project_root,
+            &options.effective_slug(),
+            permission.purple_allowed,
+        );
+    }
 
     // This run door also owns the design archetype: default-on means an archetype is bound even
     // when the UIUX doc declares none, and which one fits is a designer's judgment. Ask the brain
@@ -329,7 +457,10 @@ pub async fn run_block(
     // (bugfix / refactor / trivial) — those seat no team and open no forks, and a small code tweak
     // does not warrant a design consult. Fail-open: an undetermined verdict persists nothing and
     // the renderer takes the deterministic fallback.
-    if options.design_system.is_empty() && !crate::planner::is_lean_build(&options.requirement) {
+    if !resumed_operational_review
+        && options.design_system.is_empty()
+        && !crate::planner::is_lean_build(&options.requirement)
+    {
         let archetype =
             crate::design_archetype::consult_design_archetype(session, &options.requirement).await;
         crate::design_archetype::persist_design_archetype(
@@ -350,7 +481,6 @@ pub async fn run_block(
     // nothing left to do. This is what makes a simple "做一个待办单页应用" skip the
     // research + three-doc + gate ceremony and head straight for spec → implement
     // → verify (the 24-min → minutes fix), while a real product still pays for it.
-    let phases = block_phases(start_after, &plan);
     if phases.is_empty() {
         // Nothing to drive (e.g. a docs-only plan resumed past its last phase, or
         // a Light plan whose initial block was all research/docs — the next block
@@ -358,7 +488,7 @@ pub async fn run_block(
         return RunOutcome::Completed;
     }
 
-    if start_after == Phase::Research {
+    if start_after == Phase::Research && !resumed_operational_review {
         events.emit(EngineEvent::PipelineStarted {
             slug: options.effective_slug(),
             requirement: options.requirement.clone(),
@@ -371,7 +501,7 @@ pub async fn run_block(
     // Spec for a Light plan) must carry that priming instead — otherwise the base
     // implements with no role/spec context. Keyed off the fresh-run start_after so
     // a resumed block (Spec/Backend after a gate) stays lean as before.
-    let mut first_directive = start_after == Phase::Research;
+    let mut first_directive = start_after == Phase::Research && !resumed_operational_review;
     for &phase in &phases {
         // A gate is a pause point, not a base turn: stop here, let the caller
         // wait for the user, and resume on the next block.
@@ -385,9 +515,18 @@ pub async fn run_block(
             // rework loop on the MAIN session (see §3.6). The gate still pauses for
             // the user, while unresolved or unavailable review state remains visible.
             let gate = gate_for_phase(phase);
-            let _review =
+            let review =
                 review_and_rework(session, options, events, gate_review_kind(phase), deadline)
                     .await;
+            if review.status() == ReviewStatus::Unavailable {
+                let kind = gate_review_kind(phase);
+                let outcome = pause_at_operational_review(options, &plan, kind, &review);
+                let reason = review_incomplete_reason(kind, &review);
+                events.emit(EngineEvent::Note(format!(
+                    "{reason} — workflow paused before the gate; retry the review with /continue"
+                )));
+                return outcome;
+            }
             // P0-A: persist the OPEN-GATE state (phase = the gate phase, active_gate
             // = its id) so `umadev continue` / the TUI gate resume read the real door
             // and resume the continuous run from THIS gate — exactly the state shape
@@ -510,6 +649,15 @@ pub async fn run_block(
         if phase == Phase::Quality {
             let review =
                 review_and_rework(session, options, events, ReviewKind::Quality, deadline).await;
+            if review.status() == ReviewStatus::Unavailable {
+                let outcome =
+                    pause_at_operational_review(options, &plan, ReviewKind::Quality, &review);
+                events.emit(EngineEvent::Note(format!(
+                    "{} — workflow paused; retry the review with /continue",
+                    review_incomplete_reason(ReviewKind::Quality, &review)
+                )));
+                return outcome;
+            }
             if let Some(reason) = required_review_failure(ReviewKind::Quality, &review) {
                 events.emit(EngineEvent::Note(reason.clone()));
                 return RunOutcome::HardStop(reason);
@@ -1884,8 +2032,10 @@ async fn review_and_rework(
         //    it) and run the team in parallel on read-only forks.
         let review = run_review_team(session, options, events, kind, &team, round).await;
 
-        // An unavailable required seat is not a pass and cannot be repaired by
-        // rewriting product files. Surface the operationally incomplete review.
+        // Any unavailable required seat makes this review incomplete. Even when
+        // another seat also reported a semantic blocker, do not edit product
+        // files from a partial panel: park this exact review boundary and let a
+        // complete reviewer set re-establish authoritative evidence on resume.
         if review.status() == ReviewStatus::Unavailable {
             events.emit(EngineEvent::Note(format!(
                 "team · {} review unavailable: {}",
@@ -2016,6 +2166,31 @@ pub(crate) async fn run_review_team(
         &[kind_label(kind), &team.len().to_string()],
     )));
 
+    // The host, not the model, owns payload completeness. Stop before opening a
+    // fork when the bounded source digest cut a file or omitted scope: every
+    // required seat is typed unavailable, so no reviewer can turn framework
+    // truncation into a source blocker and no repair/Docker turn can follow.
+    if let Some(reason) = arts.coverage.unavailable_reason() {
+        let phase_label = kind_phase_label(kind);
+        let mut result = TeamReviewResult::default();
+        for critic in team {
+            let verdict = RoleVerdict::unavailable(critic.role(), reason.clone());
+            crate::critics::append_team_ledger(
+                &options.project_root,
+                phase_label,
+                round + 1,
+                &verdict,
+            );
+            events.emit(EngineEvent::critic_verdict(&verdict));
+            let item = format!("[{}] {reason}", critic.role());
+            events.emit(EngineEvent::Note(format!(
+                "team · review unavailable · {item}"
+            )));
+            result.unavailable.push(item);
+        }
+        return result;
+    }
+
     // Fork one read-only session per seat up front. `fork()` takes `&mut self`, so
     // the N establishments are necessarily SERIAL (you can't hold N `&mut` borrows
     // of the main session at once) — but each returns an OWNED, independent session,
@@ -2129,6 +2304,12 @@ async fn review_one(
     // and abort the entire /run. The review already isolates value errors; this
     // extends that to a panic on the flagship director path too.
     let role = critic.role().to_string();
+    if let Some(reason) = arts.coverage.unavailable_reason() {
+        if let Ok(mut session) = fork {
+            let _ = session.end().await;
+        }
+        return RoleVerdict::unavailable(&role, reason);
+    }
     if let Some(surface) = cold {
         let consult = ColdConsult::new(surface, ForkConsult::new(fork));
         let verdict = crate::runner::catch_unwind_future(critic.review(&consult, arts), || {
@@ -2713,6 +2894,7 @@ pub(crate) struct Blackboard {
     code: String,
     qa_floor: String,
     security_floor: String,
+    coverage: ReviewPayloadCoverage,
 }
 
 impl Blackboard {
@@ -2727,29 +2909,22 @@ impl Blackboard {
                 .unwrap_or_default()
         };
         let (prd, architecture, uiux) = (doc("prd"), doc("architecture"), doc("uiux"));
-        let code = if matches!(kind, ReviewKind::Preview | ReviewKind::Quality) {
-            let digest = source_digest(options);
-            if matches!(kind, ReviewKind::Quality) {
-                // The Quality critics judge a FORKED session whose context is the
-                // blackboard (the `output/*.md` docs + this source DIGEST), not the
-                // full file tree — so a critic can hallucinate "no tests / no backend
-                // / no source exist" and raise a spurious blocking finding. GROUND
-                // them with a bounded listing of the REAL workspace files so they SEE
-                // what exists and judge it, instead of filtering the hallucination out
-                // after the fact. Fail-open: an empty listing (unreadable/empty tree)
-                // contributes nothing and the digest stands alone.
-                let listing = WorkspaceEvidence::read(root).to_review_context();
-                if listing.is_empty() {
-                    digest
-                } else {
-                    format!("{listing}\n{digest}")
-                }
-            } else {
-                digest
-            }
+        let code_review = matches!(kind, ReviewKind::Preview | ReviewKind::Quality);
+        let (code, substantive_source_chars) = if code_review {
+            // One host-built file-boundary bundle is shared by every code critic.
+            // It is below the smallest downstream critic limit, so no role applies
+            // a hidden second mid-file truncation. Its manifest carries both
+            // included and normally sampled-out paths.
+            source_digest(options)
         } else {
-            String::new()
+            (String::new(), 0)
         };
+        let mut coverage = if code_review {
+            ReviewPayloadCoverage::source_bundle(&code, substantive_source_chars)
+        } else {
+            ReviewPayloadCoverage::intact(&code)
+        };
+        coverage.malformed = coverage.supplied_chars > REVIEW_BUNDLE_MAX_CHARS;
         // The deterministic floors are surfaced as CONTEXT to the QA / security
         // seats (so their semantic pass focuses on what a static check can't see).
         // At the QUALITY node these are the REAL deterministic findings — coverage
@@ -2768,6 +2943,7 @@ impl Blackboard {
             code,
             qa_floor,
             security_floor,
+            coverage,
         }
     }
 
@@ -2781,172 +2957,185 @@ impl Blackboard {
             code: &self.code,
             qa_floor: &self.qa_floor,
             security_floor: &self.security_floor,
+            coverage: self.coverage,
         }
     }
 }
 
-/// A bounded, newest-first digest of the real source files for the code-review
-/// seats — the same blackboard the QA / frontend / backend / DevOps critics read.
-/// Capped so a large tree can't blow the judge prompt (the critics also excerpt).
-fn source_digest(options: &RunOptions) -> String {
-    let files = crate::acceptance::source_files(&options.project_root);
-    let mut out = String::new();
-    for f in files.iter().take(40) {
-        let Ok(content) = std::fs::read_to_string(f) else {
-            continue;
-        };
-        let rel = f
+/// A bounded file-boundary bundle of real source for code-review seats.
+///
+/// Files are included whole when they fit. A large file contributes a bounded
+/// prefix cut on a Unicode scalar boundary, rather than leaving a required code
+/// review with a manifest but zero code. The builder owns both a character budget
+/// and a global byte-read ceiling, so a huge file/tree cannot cause unbounded I/O
+/// or allocation before the review starts.
+const REVIEW_BUNDLE_MAX_CHARS: usize = 11_000;
+const REVIEW_BUNDLE_MAX_READ_BYTES: usize = REVIEW_BUNDLE_MAX_CHARS * 4 + 16 * 1024;
+
+fn source_digest(options: &RunOptions) -> (String, usize) {
+    let (bundle, _bytes_read, substantive_source_chars) = source_digest_with_stats(options);
+    (bundle, substantive_source_chars)
+}
+
+/// Build the review bundle and return the exact number of source bytes read.
+///
+/// The statistic makes the I/O ceiling mechanically testable; production callers
+/// use [`source_digest`] and discard it.
+fn source_digest_with_stats(options: &RunOptions) -> (String, usize, usize) {
+    use std::io::Read;
+
+    const BUNDLE_CHARS: usize = 10_500;
+    const MANIFEST_CHARS: usize = 1_500;
+    const CONTENT_CHARS: usize = BUNDLE_CHARS - MANIFEST_CHARS;
+
+    let mut files = crate::acceptance::source_file_candidates(&options.project_root);
+    files.sort_by(|left, right| {
+        left.strip_prefix(&options.project_root)
+            .unwrap_or(left)
+            .cmp(right.strip_prefix(&options.project_root).unwrap_or(right))
+    });
+    let mut included: Vec<(String, Option<(usize, u64)>)> = Vec::new();
+    let mut omitted = Vec::new();
+    let mut sections = String::new();
+    let mut used = 0usize;
+    let mut bytes_read = 0usize;
+    let mut substantive_source_chars = 0usize;
+    const SAMPLE_MARKER: &str = "\n// … bounded prefix; remainder omitted …\n";
+
+    for file in &files {
+        let rel = file
             .strip_prefix(&options.project_root)
-            .unwrap_or(f)
+            .unwrap_or(file)
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
-        out.push_str("\n// ===== ");
-        out.push_str(&rel);
-        out.push_str(" =====\n");
-        out.push_str(&crate::experts::excerpt(&content, 4000));
-        out.push('\n');
-        if out.len() >= 60_000 {
+        let header = format!("\n// ===== {rel} =====\n");
+        let framing_chars = header.chars().count() + 1;
+        let remaining_chars = CONTENT_CHARS.saturating_sub(used);
+        if framing_chars >= remaining_chars {
+            omitted.push((rel, "sampled out; bundle budget exhausted"));
+            continue;
+        }
+        let content_char_budget = remaining_chars - framing_chars;
+        // UTF-8 uses at most four bytes per scalar. Read only enough bytes to
+        // supply this section's character budget, even when the file is huge.
+        // A later `chars().take(...)` establishes the exact scalar boundary.
+        let candidate_byte_budget = content_char_budget.saturating_mul(4);
+        let remaining_read_budget = REVIEW_BUNDLE_MAX_READ_BYTES.saturating_sub(bytes_read);
+        let Ok(metadata) = std::fs::metadata(file) else {
+            omitted.push((rel, "unreadable"));
+            continue;
+        };
+        let file_bytes = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        let read_limit = file_bytes
+            .min(candidate_byte_budget)
+            .min(remaining_read_budget);
+        if read_limit == 0 {
+            omitted.push((rel, "sampled out; read budget exhausted"));
+            continue;
+        }
+
+        let Ok(file_handle) = std::fs::File::open(file) else {
+            omitted.push((rel, "unreadable"));
+            continue;
+        };
+        // `take` protects against a file growing between metadata and open. The
+        // global read budget is therefore a hard ceiling even under a racing
+        // workspace writer.
+        let mut bytes = Vec::with_capacity(read_limit);
+        let mut bounded = file_handle.take(read_limit as u64);
+        if bounded.read_to_end(&mut bytes).is_err() {
+            omitted.push((rel, "unreadable"));
+            continue;
+        }
+        bytes_read = bytes_read.saturating_add(bytes.len());
+        let file_was_byte_sampled = bytes.len() < file_bytes;
+        let (content, boundary_was_sampled) = match std::str::from_utf8(&bytes) {
+            Ok(content) => (content, false),
+            Err(error)
+                if file_was_byte_sampled
+                    && error.error_len().is_none()
+                    && error.valid_up_to() > 0 =>
+            {
+                // The byte ceiling landed inside one UTF-8 scalar. Keep only the
+                // valid prefix; never inject U+FFFD or cut a scalar mid-content.
+                (
+                    std::str::from_utf8(&bytes[..error.valid_up_to()])
+                        .expect("valid_up_to always names a valid UTF-8 prefix"),
+                    true,
+                )
+            }
+            Err(_) => {
+                omitted.push((rel, "unreadable text"));
+                continue;
+            }
+        };
+        let content_chars = content.chars().count();
+        let sampled =
+            file_was_byte_sampled || boundary_was_sampled || content_chars > content_char_budget;
+        let marker_chars = usize::from(sampled) * SAMPLE_MARKER.chars().count();
+        let sample_char_budget = content_char_budget.saturating_sub(marker_chars);
+        let selected = content.chars().take(sample_char_budget).collect::<String>();
+        if selected.is_empty() {
+            omitted.push((rel, "sampled out; no text fit in bundle"));
+            continue;
+        }
+        let selected_chars = selected.chars().count();
+        substantive_source_chars = substantive_source_chars.saturating_add(
+            selected
+                .chars()
+                .filter(|ch| !ch.is_whitespace() && !ch.is_control())
+                .count(),
+        );
+        used += framing_chars + selected_chars + marker_chars;
+        sections.push_str(&header);
+        sections.push_str(&selected);
+        if sampled {
+            sections.push_str(SAMPLE_MARKER);
+        }
+        sections.push('\n');
+        included.push((rel, sampled.then_some((selected_chars, metadata.len()))));
+    }
+
+    let mut manifest = format!(
+        "# Review bundle manifest\nsampling: bounded-character-boundary\nincluded: {}\nomitted: {}\n",
+        included.len(),
+        omitted.len()
+    );
+    for (path, sample) in &included {
+        let line = match sample {
+            Some((chars, bytes)) => {
+                format!("~ {path} (prefix {chars} chars sampled from {bytes} bytes)\n")
+            }
+            None => format!("+ {path}\n"),
+        };
+        if manifest.chars().count() + line.chars().count() > MANIFEST_CHARS {
             break;
         }
+        manifest.push_str(&line);
     }
-    out
-}
-
-/// Max file paths listed in a single workspace-evidence grounding block — keeps
-/// the forked judge prompt bounded even on a large tree.
-const MAX_LISTED_PATHS: usize = 40;
-/// Max bytes of joined relative paths in a workspace-evidence grounding block.
-const MAX_LISTING_BYTES: usize = 4096;
-
-/// A bounded, deterministic listing of the REAL workspace files, handed to the
-/// Quality-review critics as GROUNDING.
-///
-/// The Quality critics review a `fork()`ed read-only session whose context is
-/// the blackboard (the `output/*.md` docs + a source *digest*), NOT the full
-/// file tree — so a critic can hallucinate "no tests / no backend / no source
-/// exist" and raise a spurious blocking finding. Injecting the ACTUAL relative
-/// paths lets a critic SEE what exists and judge it, killing the hallucination
-/// at the source. Because the grounding prevents the false claim up front, there
-/// is no post-hoc verdict surgery: critic verdicts stay advisory (invariant 2)
-/// and the deterministic floor (coverage / contract / verify) governs loop
-/// termination.
-///
-/// The listing is bounded ([`MAX_LISTED_PATHS`] paths / [`MAX_LISTING_BYTES`]
-/// bytes), deterministic (paths sorted), and fail-open: an unreadable / empty
-/// tree yields an empty listing that injects NOTHING — never a panic, and never
-/// a fabricated claim that files exist when they don't.
-#[derive(Debug, Default)]
-struct WorkspaceEvidence {
-    /// Relative paths of the real test files (accurate [`is_test_file`] split).
-    tests: Vec<String>,
-    /// Relative paths of the real non-test source files (backend + everything else).
-    source: Vec<String>,
-    /// How many additional files existed beyond the listing cap (the "(+N more)").
-    overflow: usize,
-}
-
-impl WorkspaceEvidence {
-    /// Scan the workspace once and collect a bounded, sorted listing of the real
-    /// source + test files. Fail-open: an unreadable tree yields empty vecs.
-    fn read(project_root: &std::path::Path) -> Self {
-        let files = crate::acceptance::source_files(project_root);
-        let total = files.len();
-        // `source_files` walks the tree in OS-defined `read_dir` order; sort by
-        // relative path so the injected listing is DETERMINISTIC.
-        let mut rels: Vec<(bool, String)> = files
-            .iter()
-            .map(|f| (is_test_file(f), rel_path(project_root, f)))
-            .collect();
-        rels.sort_by(|a, b| a.1.cmp(&b.1));
-
-        let mut evidence = Self::default();
-        let mut bytes = 0usize;
-        for (is_test, rel) in rels {
-            let listed = evidence.tests.len() + evidence.source.len();
-            if listed >= MAX_LISTED_PATHS || bytes + rel.len() + 1 > MAX_LISTING_BYTES {
-                break;
-            }
-            bytes += rel.len() + 1;
-            if is_test {
-                evidence.tests.push(rel);
-            } else {
-                evidence.source.push(rel);
-            }
+    for (path, reason) in &omitted {
+        let line = format!("- {path} ({reason})\n");
+        if manifest.chars().count() + line.chars().count() > MANIFEST_CHARS {
+            let remaining = omitted.len().saturating_sub(
+                manifest
+                    .lines()
+                    .filter(|line| line.starts_with("- "))
+                    .count(),
+            );
+            manifest.push_str(&format!("- … {remaining} more omitted file(s)\n"));
+            break;
         }
-        evidence.overflow = total.saturating_sub(evidence.tests.len() + evidence.source.len());
-        evidence
+        manifest.push_str(&line);
     }
-
-    /// Render the grounding block for the critic review context. Empty when the
-    /// scan found nothing (fail-open: nothing real to ground → inject nothing).
-    fn to_review_context(&self) -> String {
-        if self.tests.is_empty() && self.source.is_empty() {
-            return String::new();
-        }
-        let mut out = String::new();
-        out.push_str(
-            "## Current workspace files (fresh filesystem listing)\n\
-             The files below REALLY EXIST in the workspace right now. Do NOT claim tests, \
-             backend, or source are absent when the matching files appear here — review the \
-             files that exist for specific, evidence-backed gaps instead.\n",
-        );
-        render_listing(&mut out, "Test files", &self.tests);
-        render_listing(
-            &mut out,
-            "Source files (backend + everything else)",
-            &self.source,
-        );
-        if self.overflow > 0 {
-            out.push_str(&format!("(+{} more file(s) not listed)\n", self.overflow));
-        }
-        out
-    }
-}
-
-/// Append a labelled, one-path-per-line block. Skips an EMPTY bucket so the
-/// listing never implies files exist that don't: if there are genuinely no test
-/// files, no "Test files" block appears, and a critic's legitimate "no tests"
-/// finding is neither contradicted nor suppressed.
-fn render_listing(out: &mut String, label: &str, files: &[String]) {
-    if files.is_empty() {
-        return;
-    }
-    out.push_str("### ");
-    out.push_str(label);
-    out.push('\n');
-    for f in files {
-        out.push_str("- ");
-        out.push_str(f);
-        out.push('\n');
-    }
-}
-
-fn rel_path(root: &std::path::Path, file: &std::path::Path) -> String {
-    file.strip_prefix(root)
-        .unwrap_or(file)
-        .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/")
-}
-
-fn is_test_file(path: &std::path::Path) -> bool {
-    let rel = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    rel.contains("/tests/")
-        || rel.contains("/test/")
-        || rel.contains("/__tests__/")
-        || name.contains(".test.")
-        || name.contains(".spec.")
-        || name.ends_with("_test.rs")
-        || name.ends_with("_test.go")
-        || name.starts_with("test_")
-        || name.ends_with("_test.py")
+    manifest.push_str(
+        "Omission is normal bounded sampling, not a product defect. Prefixes end on character \
+         boundaries. Judge only supplied source; deterministic floors cover the full workspace.\n",
+    );
+    (
+        format!("{manifest}{sections}"),
+        bytes_read,
+        substantive_source_chars,
+    )
 }
 
 /// An owner for the fresh READ-ONLY child returned by `BaseSession::fork()`.
@@ -3192,7 +3381,14 @@ async fn drain_review_text(fork: &mut Box<dyn BaseSession>) -> Option<String> {
     while let Some(ev) = fork.next_event().await {
         match ev {
             SessionEvent::TextDelta(t) => text.push_str(&t),
-            SessionEvent::TurnDone { .. } => return Some(text),
+            SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                ..
+            } => return Some(text),
+            // Text emitted before a failed/truncated/interrupted terminal event is
+            // not a verdict. In particular, a syntactically valid JSON prefix must
+            // never turn a transport failure into an accepted review.
+            SessionEvent::TurnDone { .. } => return None,
             // The artifact payload is the entire review scope. Enforce that
             // boundary at the host instead of trusting the model prompt alone.
             SessionEvent::ToolCall { .. } | SessionEvent::ToolCallCorrelated { .. } => {
@@ -3221,40 +3417,7 @@ fn try_parse_verdict(role: &str, text: &str) -> Option<RoleVerdict> {
     let json = extract_json_object(text)?;
     serde_json::from_str::<RoleVerdict>(&json)
         .ok()
-        .map(|v| demote_operational_review_failures(v.normalized(role)))
-}
-
-fn demote_operational_review_failures(mut verdict: RoleVerdict) -> RoleVerdict {
-    let engineering_seat = matches!(
-        verdict.role.as_str(),
-        "frontend-engineer"
-            | "backend-engineer"
-            | "qa-engineer"
-            | "security-engineer"
-            | "devops-engineer"
-    );
-    if !engineering_seat {
-        return verdict;
-    }
-
-    let mut blocking = Vec::new();
-    let mut remediation = Vec::new();
-    for (index, item) in verdict.blocking.into_iter().enumerate() {
-        let lower = item.to_lowercase();
-        let operational = lower.contains("no reviewable requirement or acceptance")
-            || lower.contains("no reviewable artifact or acceptance")
-            || lower.contains("没有可评审的需求或验收")
-            || lower.contains("沒有可評審的需求或驗收");
-        if operational {
-            verdict.advisory.push(format!("review unavailable: {item}"));
-        } else {
-            blocking.push(item);
-            remediation.push(verdict.remediation.get(index).cloned().unwrap_or_default());
-        }
-    }
-    verdict.blocking = blocking;
-    verdict.remediation = remediation;
-    verdict
+        .map(|v| v.normalized(role))
 }
 
 /// Extract the first balanced top-level JSON object from `text` (the judge reply
@@ -4627,12 +4790,22 @@ mod tests {
             "qa-engineer",
             r#"{"accepts":false,"blocking":["No reviewable requirement or acceptance criteria were supplied"]}"#,
         );
-        assert_eq!(no_context.status(), ReviewStatus::Unavailable);
-        assert!(no_context.blocking.is_empty());
-        assert!(no_context
-            .unavailable_reason()
-            .unwrap()
-            .contains("review unavailable"));
+        assert_eq!(no_context.status(), ReviewStatus::Fail);
+        assert_eq!(no_context.blocking.len(), 1);
+    }
+
+    #[test]
+    fn missing_reviewable_artifact_verdict_remains_semantic() {
+        let verdict = parse_verdict(
+            "backend-engineer",
+            r#"{"accepts":false,"blocking":["No reviewable artifact or acceptance implementation is present"]}"#,
+        );
+        assert_eq!(verdict.status(), ReviewStatus::Fail);
+        assert_eq!(verdict.blocking.len(), 1);
+        assert!(verdict
+            .blocking
+            .iter()
+            .any(|item| item.contains("implementation")));
     }
 
     #[tokio::test]
@@ -4656,6 +4829,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_review_turn_cannot_promote_buffered_json_to_a_verdict() {
+        let fake = FakeBaseSession::new(vec![vec![
+            SessionEvent::TextDelta(r#"{"accepts":true,"blocking":[]}"#.to_string()),
+            SessionEvent::TurnDone {
+                status: TurnStatus::Failed("transport closed".to_string()),
+                usage: None,
+            },
+        ]]);
+        let mut fork: Box<dyn BaseSession> = Box::new(fake);
+        fork.send_turn("review supplied artifact".to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            drain_review_text(&mut fork).await.is_none(),
+            "only TurnStatus::Completed may make buffered reviewer text authoritative"
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_review_preserves_blockers_alongside_unavailable_seats() {
         let tmp = tempfile::tempdir().unwrap();
         seed_source(tmp.path());
@@ -4670,7 +4863,11 @@ mod tests {
         let mut script = vec![Some(r#"{"accepts":true}"#.to_string()); seats];
         script[0] = Some(r#"{"accepts":false,"blocking":["missing regression test"]}"#.to_string());
         script[1] = None;
-        let mut session = FakeBaseSession::new(vec![]).with_fork_script(script);
+        let mut session = FakeBaseSession::new(vec![vec![SessionEvent::TurnDone {
+            status: TurnStatus::Failed("scripted rework failure".to_string()),
+            usage: None,
+        }]])
+        .with_fork_script(script);
 
         let review = review_and_rework(
             &mut session,
@@ -4691,6 +4888,46 @@ mod tests {
             .expect("required mixed review cannot complete");
         assert!(reason.contains("regression test"));
         assert!(reason.contains("review unavailable"));
+    }
+
+    #[tokio::test]
+    async fn mixed_legacy_review_pauses_without_source_repair_or_rereview() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_source(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Auto,
+        );
+        let (events, _rec) = sink();
+        let seats = team_for(ReviewKind::Quality, &options.requirement, tmp.path()).len();
+        assert!(seats >= 2);
+        let mut script = vec![Some(r#"{"accepts":true}"#.to_string()); seats * 2];
+        script[0] = Some(r#"{"accepts":false,"blocking":["missing regression test"]}"#.into());
+        script[1] = None;
+        let mut session = FakeBaseSession::new(vec![vec![done()]]).with_fork_script(script);
+        let sent = session.sent_handle();
+
+        let review = review_and_rework(
+            &mut session,
+            &options,
+            &events,
+            ReviewKind::Quality,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        assert_eq!(review.status(), ReviewStatus::Unavailable);
+        assert!(review
+            .blocking
+            .iter()
+            .any(|item| item.contains("missing regression test")));
+        assert!(!review.unavailable.is_empty());
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.is_empty(),
+            "an unavailable required reviewer stops before semantic source repair: {sent:?}"
+        );
     }
 
     #[test]
@@ -4866,14 +5103,19 @@ mod tests {
         );
         let (events, rec) = sink();
         // EVERY fork FAILS (`None`) → the run-door archetype consult AND each docs seat are
-        // unavailable. The legacy gate remains live, but it must not claim that the review passed.
+        // unavailable. The legacy gate must not open as if the review passed.
         let mut session = FakeBaseSession::new(vec![vec![done()], vec![done()]])
             .with_fork_script(vec![None, None, None, None]);
         let forks = session.forks_handle();
         let sent = session.sent_handle();
 
         let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
-        assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
+        assert!(matches!(
+            outcome,
+            RunOutcome::PausedAtOperational { ref reason, .. }
+                if reason.contains("docs review incomplete")
+                    && reason.contains("review unavailable")
+        ));
         assert_eq!(
             *forks.lock().unwrap(),
             4,
@@ -4888,6 +5130,64 @@ mod tests {
             event,
             EngineEvent::Note(note) if note.contains("review unavailable")
         )));
+
+        let mut resumed = FakeBaseSession::new(vec![]).with_fork_script(vec![
+            Some(r#"{"accepts":true}"#.into()),
+            Some(r#"{"accepts":true}"#.into()),
+            Some(r#"{"accepts":true}"#.into()),
+        ]);
+        let resumed_sent = resumed.sent_handle();
+        let resumed_outcome = run_block(&mut resumed, &options, &events, Phase::Research).await;
+        assert_eq!(
+            resumed_outcome,
+            RunOutcome::PausedAtGate(Gate::DocsConfirm),
+            "/continue retries the parked review and then opens its real gate"
+        );
+        assert!(
+            resumed_sent.lock().unwrap().is_empty(),
+            "operational resume does not re-run research/docs or source work"
+        );
+    }
+
+    #[tokio::test]
+    async fn docs_operational_resume_semantic_finding_never_reopens_writer_or_rereviews() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_docs(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Guarded,
+        );
+        let (events, _rec) = sink();
+        persist_state_impl(&options, Phase::Docs, "", Some(OPERATIONAL_REVIEW_DOCS));
+
+        let mut resumed = FakeBaseSession::new(vec![vec![done()]]).with_fork_script(vec![
+            Some(r#"{"accepts":false,"blocking":["missing API surface table"]}"#.into()),
+            Some(r#"{"accepts":true}"#.into()),
+            Some(r#"{"accepts":true}"#.into()),
+            // A buggy review-and-rework retry would consume these after writing.
+            Some(r#"{"accepts":true}"#.into()),
+            Some(r#"{"accepts":true}"#.into()),
+            Some(r#"{"accepts":true}"#.into()),
+        ]);
+        let sent = resumed.sent_handle();
+        let forks = resumed.forks_handle();
+
+        let outcome = run_block(&mut resumed, &options, &events, Phase::Research).await;
+        assert_eq!(
+            outcome,
+            RunOutcome::PausedAtGate(Gate::DocsConfirm),
+            "docs findings remain advisory but still open the explicit human gate"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "review-only continuation must not reopen the main writer"
+        );
+        assert_eq!(
+            *forks.lock().unwrap(),
+            3,
+            "the saved docs roster gets exactly one verdict round"
+        );
     }
 
     #[tokio::test]
@@ -4922,8 +5222,13 @@ mod tests {
         .await
         .expect("run must not hang on a wedged fork — the timeout must fire");
 
-        // The legacy gate still pauses normally; reviewer unavailability is surfaced.
-        assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
+        // The legacy gate is not opened on a missing verdict.
+        assert!(matches!(
+            outcome,
+            RunOutcome::PausedAtOperational { ref reason, .. }
+                if reason.contains("docs review incomplete")
+                    && reason.contains("review unavailable")
+        ));
         // Forks WERE attempted (one per seat), and no rework was injected.
         assert!(*forks.lock().unwrap() >= 1, "forks were attempted");
         assert_eq!(
@@ -5020,6 +5325,44 @@ mod tests {
         assert_eq!(
             d, expected,
             "no hidden inputs beyond firewall + role + artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_host_payload_mismatch_is_unavailable_before_reviewer_turn() {
+        let fork = FakeBaseSession::new(vec![]);
+        let sent = fork.sent_handle();
+        let artifacts = CriticArtifacts {
+            requirement: "review the login implementation",
+            code: "partial host payload",
+            coverage: ReviewPayloadCoverage {
+                declared_chars: 200,
+                supplied_chars: 20,
+                malformed: false,
+                requires_source: true,
+                substantive_source_chars: 20,
+            },
+            ..CriticArtifacts::default()
+        };
+
+        let verdict = review_one(
+            &crate::critics::QaCritic,
+            Ok(Box::new(fork)),
+            None,
+            artifacts,
+        )
+        .await;
+
+        assert_eq!(verdict.status(), ReviewStatus::Unavailable);
+        assert!(
+            verdict
+                .unavailable_reason()
+                .is_some_and(|reason| reason.contains("host supplied 20 of 200")),
+            "typed host coverage, not model prose, owns the outage diagnosis"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a malformed host payload stops before any reviewer/model turn"
         );
     }
 
@@ -5629,12 +5972,7 @@ mod tests {
     }
 
     #[test]
-    fn quality_blackboard_grounds_critics_with_real_file_listing() {
-        // GROUNDING: the Quality critics review on a fresh child with only the
-        // blackboard + a source digest, so they can hallucinate absent files. The
-        // review context must carry the ACTUAL relative paths of the real test +
-        // source (incl. backend) files so a critic SEES them and cannot claim
-        // absence.
+    fn quality_blackboard_carries_a_bounded_character_boundary_bundle() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src/api")).unwrap();
@@ -5655,50 +5993,91 @@ mod tests {
         let arts = bb.artifacts(&options.requirement);
 
         assert!(
-            arts.code.contains("Current workspace files"),
-            "quality critics must see the real file listing: {}",
+            arts.code.contains("# Review bundle manifest")
+                && arts.code.contains("sampling: bounded-character-boundary"),
+            "quality critics receive the bounded bundle contract: {}",
             arts.code
         );
-        // The listing separates tests from source, and shows the ACTUAL paths (not
-        // a bare count the critic can ignore) — the backend file is visible by its
-        // real path under the source bucket.
-        assert!(arts.code.contains("### Test files"), "{}", arts.code);
-        assert!(arts.code.contains("### Source files"), "{}", arts.code);
         assert!(arts.code.contains("src/api/server.py"), "{}", arts.code);
         assert!(arts.code.contains("tests/test_server.py"), "{}", arts.code);
+        assert!(
+            arts.code.chars().count() <= REVIEW_BUNDLE_MAX_CHARS,
+            "the bundle is below the smallest critic limit"
+        );
+        assert!(
+            arts.coverage.is_complete(),
+            "normal file-boundary sampling is a complete host contract"
+        );
     }
 
     #[test]
-    fn workspace_evidence_only_grounds_files_that_exist() {
-        // TRUTHFUL grounding: with source present but NO test files, the listing
-        // must NOT emit a "Test files" block — it never fabricates that tests exist,
-        // so a critic's legitimate "no tests" finding stays valid (nothing is
-        // suppressed).
+    fn sparse_huge_source_is_prefix_sampled_with_bounded_content_io() {
+        use std::io::Write;
+
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/app.py"), "def app():\n    return 1\n").unwrap();
+        let huge_path = root.join("src/huge.rs");
+        let mut huge = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&huge_path)
+            .unwrap();
+        huge.write_all(b"SHOULD_NEVER_ENTER_REVIEW_BUNDLE").unwrap();
+        huge.set_len(512 * 1024 * 1024).unwrap();
+        drop(huge);
 
-        let ctx = WorkspaceEvidence::read(root).to_review_context();
+        let options = opts(root, "review a large project", TrustMode::Auto);
+        let (bundle, bytes_read, substantive_source_chars) = source_digest_with_stats(&options);
+
         assert!(
-            ctx.contains("src/app.py"),
-            "lists the real source file: {ctx}"
+            bytes_read > 0 && bytes_read <= REVIEW_BUNDLE_MAX_READ_BYTES,
+            "a huge file contributes only one globally-bounded prefix: {bytes_read}"
         );
+        assert!(bundle.contains("src/huge.rs"), "{bundle}");
+        assert!(bundle.contains("prefix"), "{bundle}");
         assert!(
-            !ctx.contains("### Test files"),
-            "must NOT claim tests exist when none do: {ctx}"
+            bundle.contains("SHOULD_NEVER_ENTER_REVIEW_BUNDLE"),
+            "the bounded prefix gives the reviewer substantive implementation evidence"
         );
+        assert!(substantive_source_chars > 0);
+        assert!(bundle.chars().count() <= REVIEW_BUNDLE_MAX_CHARS);
     }
 
     #[test]
-    fn workspace_evidence_is_fail_open_on_unreadable_tree() {
-        // FAIL-OPEN: an unreadable / missing tree yields an EMPTY listing that
-        // injects nothing — never a panic, never a fabricated claim.
-        let missing = std::path::Path::new("/umadev-nonexistent-abcdef/definitely/not/here");
-        let ev = WorkspaceEvidence::read(missing);
+    fn a_manifest_only_code_bundle_is_not_complete_review_evidence() {
+        let coverage = ReviewPayloadCoverage::source_bundle(
+            "# Review bundle manifest\nincluded: 0\nomitted: 1\n",
+            0,
+        );
+        assert!(!coverage.is_complete());
+        assert!(coverage
+            .unavailable_reason()
+            .is_some_and(|reason| reason.contains("no substantive source")));
+    }
+
+    #[test]
+    fn large_unicode_source_is_sampled_on_a_character_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/large.rs"),
+            format!("fn 标题() {{}}\n{}", "let 消息 = \"你好\";\n".repeat(2_000)),
+        )
+        .unwrap();
+        let options = opts(root, "review a large project", TrustMode::Auto);
+
+        let (bundle, bytes_read, substantive_source_chars) = source_digest_with_stats(&options);
+
+        assert!(bundle.contains("fn 标题()"));
+        assert!(bundle.contains("bounded prefix"));
+        assert!(!bundle.contains('\u{fffd}'));
+        assert!(bytes_read <= REVIEW_BUNDLE_MAX_READ_BYTES);
+        assert!(substantive_source_chars > 0);
         assert!(
-            ev.to_review_context().is_empty(),
-            "an unreadable tree grounds nothing (fail-open)"
+            ReviewPayloadCoverage::source_bundle(&bundle, substantive_source_chars).is_complete()
         );
     }
 
@@ -5707,8 +6086,9 @@ mod tests {
         // NO post-hoc suppression / force-accept: the crude filter is gone. Even a
         // GLOBAL "no tests exist" blocking finding passes through `run_review_team`
         // verbatim — critic verdicts are advisory (invariant 2) and the
-        // deterministic floor governs loop control; the injected file listing (the
-        // grounding) is what prevents the hallucination, not verdict surgery.
+        // deterministic floor governs loop control. The bounded bundle reports
+        // its included/omitted files, but model prose is never rewritten after
+        // the fact.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("tests")).unwrap();

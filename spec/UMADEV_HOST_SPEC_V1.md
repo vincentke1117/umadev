@@ -508,12 +508,38 @@ verdicts. The team layer is bound by four hard invariants:
    mutate the workspace. It reviews artifacts on an isolated, fresh
    read-only child session that neither resumes nor branches the directing
    session's transcript; only the directing (main) session ever writes.
+   The reference filesystem lock assumes cooperating processes run under the
+   same OS identity with a stable per-user lock namespace, and the filesystem
+   supplies coherent advisory-lock semantics. Cross-identity operation is
+   unsupported and not safety-guaranteed. The workspace root path and every
+   alias used to enter it MUST remain stable for the run lifetime: the root
+   MUST NOT be renamed or replaced, and an entry symlink/junction MUST NOT be
+   retargeted. NFS/SMB additionally requires a verified cross-client lock
+   manager and an invariant `.umadev` namespace for the run lifetime because
+   the outer namespace guard is host-local.
 3. **No new endpoint.** A critic **MUST** run over the *same* borrowed base
    brain via the existing host-driver subprocess — no extra model endpoint
    and no extra API key.
-4. **Fail-open.** A critic that errors, cannot be forked, or returns
-   unparseable output **MUST** yield an empty verdict that accepts; an
-   absent critic can never block the base.
+4. **Explicit operational unavailability.** Once a review seat has been
+   convened as required for the current review boundary, a timeout, fork/start
+   failure, empty reply, or unparseable reply **MUST** yield a typed
+   `Unavailable` verdict and **MUST NOT** be converted into acceptance or a
+   product/code blocker. The host **MUST** checkpoint the live run as a
+   recoverable operational pause; it **MUST NOT** start source repair, Docker
+   or build work, an automatic review retry loop, completion rendering, or
+   automatic session termination in response to that outage. `/continue`
+   **MUST** retry the parked review boundary exactly once. When the QC-input
+   fingerprint (source/tests plus manifests, lockfiles, build/test configuration,
+   Docker and CI inputs) still matches the checkpoint, the host **MUST NOT**
+   replay completed source work or deterministic build/test checks; if that
+   fingerprint changed or the receipt is unavailable, deterministic verification
+   is conservatively re-established before review. The resumed verdict is a
+   read-only terminal boundary: pass settles it, another outage re-parks it, and
+   a semantic blocker settles it failed/blocked with retained evidence. It
+   **MUST NOT** reopen the writer or start an automatic repair/re-review cycle;
+   repair requires a fresh, explicitly writable request. A task whose
+   proportional route convenes no critic remains governed by the deterministic
+   floor and is not an `Unavailable` review.
 
 ### 4.8 Trust tiers + irreversible-action floor (`UD-FLOW-008`)
 
@@ -573,6 +599,35 @@ visible, answerable prompt (approvable by key **and** by typed text) rather
 than a silent headless deny while a live user is present. The classifier is
 a pure, deterministic function of the action — it introduces no new model
 endpoint and no randomness.
+
+### 4.9 Host-owned ordinary Git commit (`UD-FLOW-009`)
+
+> Level: **MUST**
+
+A fresh, explicit request for one ordinary local Git commit is a host
+transaction, not a product-build task. The host **MUST** recognize it before
+opening an AI base or entering the route/plan/team/QC pipeline. `plan` settles
+without mutation; `guarded` asks at most one confirmation for the current
+request; `auto` executes it directly.
+
+The transaction **MUST** freeze one canonical workspace identity, hold the
+cross-process writer lock, capture the repository baseline and index, stage the
+complete validated scope atomically, invoke Git with a fixed argument vector
+(never a shell), disable repository hooks, create at most one commit, and
+verify the exact postcondition. A failure **MUST** restore the captured index
+and report the failure without editing source files. A path outside the
+workspace, an internal/sensitive path, an unsafe option, history rewrite, push,
+or a compound commit-plus-test/edit/deploy command **MUST** fail closed.
+The transaction **MUST** also refuse while workspace recovery reports that the
+tree is parked at an earlier checkpoint.
+
+This host transaction **MUST NOT** start or resume a writer model, product plan,
+role critic, team review, QC/fix loop, Docker/build/test suite, or execution
+contract. Operational review failure is therefore impossible as a consequence
+of an ordinary commit. Commit-shaped requirements recovered from old workflow
+state, FIFO storage, redo/revise, or continue/resume context are not fresh
+authorization and **MUST NOT** be replayed; the host rejects them locally and
+asks for a new standalone commit request.
 
 ## 5. Layer 3 — Delivery artifacts
 
@@ -1215,8 +1270,17 @@ hard invariants of `UD-FLOW-007` and is organized along two axes:
   structured verdict each reviewer returns to the director (overall accept
   plus a list of blocking findings, advisory notes, and concrete
   evidence). Returned verdicts are appended by the coordinator to the team
-  ledger. An unavailable or empty advisory review is recorded/degraded; it
-  does not manufacture positive evidence or override the deterministic floor.
+  ledger. An unavailable or empty required review is recorded as typed
+  `Unavailable`; it does not manufacture positive evidence, a source-code
+  defect, or a clean gate. The director checkpoints a recoverable operational
+  pause without source repair, Docker/build work, automatic re-review, completion
+  rendering, or session termination. `/continue` retries that parked review
+  boundary once; with an unchanged QC-input fingerprint (including source/tests,
+  manifests/locks, tool configuration, Docker and CI inputs) it reuses the
+  settled deterministic QC receipt instead of replaying source work or
+  build/test. The retry is read-only and terminal: a semantic finding is retained
+  as failed/blocked evidence and never reopens the writer or triggers another
+  review without a fresh writable request.
 - **The director aggregates deterministically and drives bounded rework.**
   At each gate the director collects the reviewers' verdicts together with
   the deterministic floor — FR→task coverage, the frontend↔backend contract

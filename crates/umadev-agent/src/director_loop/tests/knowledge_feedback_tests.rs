@@ -27,6 +27,7 @@ fn sent_memory_outcome_requires_concrete_mechanical_evidence() {
         mechanical_build_test_passed_steps: vec!["test".into()],
         mechanical_build_test_failed_steps: Vec::new(),
         evidence: Vec::new(),
+        operational_unavailable: Vec::new(),
         raw_log: None,
     };
     assert_eq!(
@@ -47,6 +48,7 @@ fn sent_memory_outcome_requires_concrete_mechanical_evidence() {
         mechanical_build_test_passed_steps: Vec::new(),
         mechanical_build_test_failed_steps: vec!["test".into()],
         evidence: vec!["test: FAILED".into()],
+        operational_unavailable: Vec::new(),
         raw_log: None,
     };
     assert_eq!(memory_outcome_for_step_verdict(&failure), TurnOutcome::Fail);
@@ -183,6 +185,7 @@ async fn post_build_qc_next_clean_qc_passes_the_sent_memory() {
         "Built it. Done.",
         std::time::Instant::now() + Duration::from_secs(3_600),
         &context,
+        false,
         false,
     )
     .await;

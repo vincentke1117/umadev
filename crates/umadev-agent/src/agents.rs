@@ -25,11 +25,13 @@
 //! HARD INVARIANTS (identical to the built-in critic team — a custom seat is a
 //! pure governance UPGRADE, never a new risk surface):
 //!
-//! 1. **Fail-open by contract.** A missing `.umadev/agents/` dir, an unreadable
-//!    file, or a malformed file yields NO extra role (skipped) — the team works
-//!    exactly as it does today. A custom seat whose fork fails returns
-//!    [`RoleVerdict::empty`] (ACCEPT) through the same [`CriticConsult`] path the
-//!    built-ins use, so it can NEVER block the base.
+//! 1. **Fail-soft discovery, fail-explicit execution.** A missing
+//!    `.umadev/agents/` dir, an unreadable file, or a malformed file yields NO
+//!    extra role (skipped) — the team works exactly as it does today. Once a
+//!    valid custom seat is convened, a failed fork returns
+//!    [`RoleVerdict::empty`], whose status is `Unavailable`: it never fabricates
+//!    acceptance or a product blocker, and the coordinator may park a required
+//!    review for an operational retry.
 //! 2. **Advisory-only / deterministic floor governs.** A custom verdict is folded
 //!    into the SAME advisory aggregation as a built-in critic. It can never drive
 //!    loop termination and never bypasses a gate — the deterministic coverage /
@@ -131,8 +133,9 @@ impl RoleCritic for CustomCritic {
     ) -> RoleVerdict {
         let system = self.system_prompt();
         let user = build_review_body(artifacts);
-        // The SAME fail-open consult path the built-ins use: a fork that can't open
-        // / an offline brain / an unparseable reply -> RoleVerdict::empty (ACCEPT).
+        // The SAME explicit-unavailability path the built-ins use: a fork that
+        // cannot open, an offline brain, or an unparseable reply becomes
+        // `RoleVerdict::empty` (`ReviewStatus::Unavailable`), never ACCEPT.
         consult.judge(self.role(), &system, user).await
     }
 }

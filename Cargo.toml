@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.64"
+version = "1.0.65"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -87,6 +87,7 @@ similar = "2.7"
 regex = "1.10"
 sha2 = "0.10"
 getrandom = "0.2"
+fs2 = "0.4"
 
 # --- time ---
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

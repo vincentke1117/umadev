@@ -60,14 +60,14 @@ const RESEARCH_MAX_REVIEW_ROUNDS: usize = 1;
 /// cap and the quality-gate review→fix budget is untouched.
 const DOCS_MAX_REVIEW_ROUNDS: usize = 1;
 
-/// Default wall-clock budget for ONE **advisory** `consult` call (critic /
-/// judge / surfacer), in seconds. These calls are ALL fail-open and discardable
-/// — a missed verdict never sinks a hard gate — so they must NOT inherit the
-/// 600s generation-grade ceiling the *worker* calls use. Without this, a single
-/// review can hang for ten-plus minutes, and the critic teams run N of them
-/// serially, so the advisory layer alone could stall a run for half an hour. A
-/// short cap turns a slow/wedged judge into a fast fail-open `None`. Override
-/// via `UMADEV_ADVISORY_TIMEOUT_SECS` (>0). See [`advisory_timeout_secs`].
+/// Default wall-clock budget for ONE `consult` call (critic / judge / surfacer),
+/// in seconds. These bounded reads must NOT inherit the 600s generation-grade
+/// ceiling the *worker* calls use. Without this, a single review can hang for
+/// ten-plus minutes, and a critic team can stall a run for half an hour. A short
+/// cap turns a slow/wedged judge into `None`; optional surfacers may discard it,
+/// while a required review converts it to typed operational unavailability
+/// rather than acceptance. Override via `UMADEV_ADVISORY_TIMEOUT_SECS` (>0).
+/// See [`advisory_timeout_secs`].
 const ADVISORY_TIMEOUT_SECS: u64 = 120;
 
 /// Default wall-clock budget for ONE **heavy phase** (research / docs / spec /
@@ -118,8 +118,9 @@ fn parse_memory_upkeep_decision(reply: &str) -> Option<crate::lessons::Reconcile
 }
 
 /// Test-only millisecond override for the advisory-consult timeout — lets tests
-/// drive the fail-open path in milliseconds instead of waiting whole seconds,
-/// WITHOUT mutating the process-global env (which races under parallel tests).
+/// drive the optional-degradation or required-unavailability path in milliseconds
+/// instead of waiting whole seconds, WITHOUT mutating the process-global env
+/// (which races under parallel tests).
 /// `0` = unset (use the env / default). Same pattern as the retry-base override.
 #[cfg(test)]
 static ADVISORY_TIMEOUT_MS_TEST_OVERRIDE: std::sync::atomic::AtomicU64 =
@@ -201,11 +202,12 @@ where
 /// P1-2: the critic team runs many independent judge futures concurrently in ONE
 /// task via [`join_all_ordered`]. A panic in any one of them would otherwise
 /// unwind straight through the shared `poll_fn` and abort the WHOLE run —
-/// violating the invariant that a critic (advisory, read-only) can NEVER block or
-/// crash the base. Wrapping each critic future here turns "one buggy critic
-/// panicked" into "that one critic returned its fail-open empty verdict", exactly
-/// like every other critic failure mode (no brain / fork failed / unparseable
-/// reply). The `AssertUnwindSafe` is sound: on the panic path we discard the
+/// violating the invariant that a critic (advisory, read-only) can never crash
+/// the base. Wrapping each critic future here turns "one buggy critic panicked"
+/// into "that critic returned an unavailable empty verdict", exactly like every
+/// other critic failure mode (no brain / fork failed / unparseable reply). The
+/// caller may then park a required review for retry; it never invents a pass or
+/// source defect. The `AssertUnwindSafe` is sound: on the panic path we discard the
 /// (now-poisoned) future entirely and substitute a freshly-built fallback, so no
 /// torn state escapes. Dependency-free — the agent crate avoids the `futures`
 /// crate's `catch_unwind` combinator on purpose (see the dependency-light
@@ -1960,6 +1962,13 @@ impl<R: Runtime> AgentRunner<R> {
                 // way a gate pause does (`/continue` re-drives the remaining steps).
                 task.wait(&format!("paused at the time budget ({done}/{total} steps)"))
             }
+            crate::continuous::RunOutcome::PausedAtOperational {
+                reason,
+                done,
+                total,
+            } => task.wait(&format!(
+                "required review unavailable ({done}/{total} phases): {reason}"
+            )),
             crate::continuous::RunOutcome::Completed => {
                 task.succeed("continuous pipeline completed", Vec::new())
             }
@@ -4007,8 +4016,11 @@ impl<R: Runtime> AgentRunner<R> {
         // benefit, since the critics are independent read-only judges. Each
         // critic thinks on its OWN forked session (clean, no-resume, read-only) —
         // never the main writer session; if the base can't fork, it falls back to
-        // a fresh consult on the main runtime but STILL only reads. Fail-open: a
-        // broken/empty critic yields an accepting empty verdict and never blocks.
+        // a fresh consult on the main runtime but STILL only reads. A broken/empty
+        // critic yields an explicit unavailable verdict, never fabricated
+        // acceptance or a semantic source blocker. This legacy advisory projection
+        // returns only real semantic blockers; the continuous required-review path
+        // retains `Unavailable` separately and parks its review boundary.
         // The verdicts come back as owned values, so the ledger writes + Notes are
         // done sequentially AFTER the join — preserving deterministic team-order
         // output and ledger ordering regardless of which fork finished first.
@@ -4098,8 +4110,8 @@ impl<R: Runtime> AgentRunner<R> {
             team.len()
         )));
         // Run the critics CONCURRENTLY (each on its own isolated read-only fork) —
-        // same primitive as the docs team. Fail-open: a broken/empty critic yields
-        // an accepting empty verdict and never blocks.
+        // same primitive as the docs team. A broken/empty critic yields typed
+        // `Unavailable`, never fabricated acceptance or a semantic source blocker.
         let verdicts = self.run_critics_concurrently(&team, arts).await;
         let mut blocking: Vec<String> = Vec::new();
         for verdict in verdicts {
@@ -4344,7 +4356,8 @@ impl<R: Runtime> AgentRunner<R> {
         let mut blocking: Vec<String> = Vec::new();
         for critic in &team {
             // Each critic thinks on its OWN isolated forked session (clean,
-            // no-resume, read-only) — never the main writer session. Fail-open.
+            // no-resume, read-only) — never the main writer session. A failed
+            // consult returns typed `Unavailable`, never fabricated acceptance.
             let fork = self.runtime.fork();
             let consult: ForkedConsult<'_, R> = ForkedConsult {
                 runner: self,
@@ -6334,8 +6347,9 @@ impl<R: Runtime> AgentRunner<R> {
 /// clean, no-resume, read-only session that can never collide with or write
 /// through the main writer session (single-writer invariant). When the base
 /// can't fork, it falls back to a fresh consult on the MAIN runtime, which is
-/// still read-only (`consult` only reads + parses, never writes). Either way the
-/// path is fail-open: any failure yields [`crate::critics::RoleVerdict::empty`].
+/// still read-only (`consult` only reads + parses, never writes). Either way a
+/// failure yields [`crate::critics::RoleVerdict::empty`], which is explicitly
+/// `Unavailable`, never an accepting verdict.
 struct ForkedConsult<'a, R: Runtime> {
     runner: &'a AgentRunner<R>,
     fork: Option<&'a dyn umadev_runtime::Runtime>,
@@ -6345,8 +6359,9 @@ struct ForkedConsult<'a, R: Runtime> {
 impl<R: Runtime> crate::critics::CriticConsult for ForkedConsult<'_, R> {
     async fn judge(&self, role: &str, system: &str, user: String) -> crate::critics::RoleVerdict {
         // Prefer the isolated fork; fall back to the main runtime's read-only
-        // consult when the base can't fork. Fail-open to the empty (accepting)
-        // verdict so an absent / broken critic NEVER blocks.
+        // consult when the base can't fork. An absent or broken critic becomes an
+        // empty `Unavailable` verdict: it is neither acceptance nor a semantic
+        // source blocker.
         let runtime: &dyn umadev_runtime::Runtime = self.fork.unwrap_or(&self.runner.runtime);
         let parsed: Option<crate::critics::RoleVerdict> =
             self.runner.consult_on(runtime, system, user).await;
@@ -9964,8 +9979,8 @@ error TS2304: Cannot find name 'Foo'
         );
     }
 
-    // ── P1-2: a panicking critic must collapse to its empty verdict, never
-    //     unwind and abort the run ────────────────────────────────────────
+    // ── P1-2: a panicking critic must collapse to its unavailable empty
+    //     verdict, never unwind and abort the run ─────────────────────────
 
     #[tokio::test]
     async fn catch_unwind_future_returns_fallback_on_panic() {

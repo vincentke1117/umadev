@@ -111,6 +111,140 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> bool {
     complete
 }
 
+fn is_qc_input_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "cargo.toml"
+            | "cargo.lock"
+            | "package.json"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb"
+            | "deno.json"
+            | "deno.jsonc"
+            | "pyproject.toml"
+            | "poetry.lock"
+            | "pipfile"
+            | "pipfile.lock"
+            | "uv.lock"
+            | "pytest.ini"
+            | "tox.ini"
+            | "setup.cfg"
+            | "go.mod"
+            | "go.sum"
+            | "pom.xml"
+            | "makefile"
+            | "justfile"
+            | "dockerfile"
+            | "compose.yaml"
+            | "compose.yml"
+            | "docker-compose.yaml"
+            | "docker-compose.yml"
+            | ".env"
+            | ".npmrc"
+            | ".yarnrc"
+            | ".yarnrc.yml"
+    ) || name.starts_with("requirements")
+        || name.starts_with("dockerfile.")
+        || name.starts_with("tsconfig")
+        || name.starts_with("vite.config.")
+        || name.starts_with("vitest.config.")
+        || name.starts_with("jest.config.")
+        || name.starts_with("next.config.")
+        || name.starts_with("playwright.config.")
+        || name.starts_with("cypress.config.")
+        || name.starts_with("build.gradle")
+        || name.starts_with("settings.gradle")
+        || (path
+            .components()
+            .any(|component| component.as_os_str() == ".github")
+            && matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("yml" | "yaml")
+            ))
+}
+
+/// Add build/test inputs that are not ordinary source extensions.
+///
+/// Hidden vendor/runtime trees stay excluded, while `.github` is traversed
+/// because workflow changes can alter the exact verifier that produced a QC
+/// receipt. Metadata only; file contents and secrets are never read.
+fn collect_qc_inputs(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> bool {
+    if out.len() >= MAX_FINGERPRINT_FILES {
+        return false;
+    }
+    if depth > MAX_SOURCE_DEPTH {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    let mut complete = true;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match classify_no_follow(&path) {
+            EntryKind::Dir => {
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default();
+                if SKIP_DIRS.contains(&name)
+                    || (name.starts_with('.') && name != ".github" && name != ".cargo")
+                {
+                    continue;
+                }
+                if !collect_qc_inputs(&path, out, depth + 1) {
+                    complete = false;
+                }
+            }
+            EntryKind::File => {
+                if out.len() >= MAX_FINGERPRINT_FILES {
+                    return false;
+                }
+                if is_qc_input_file(&path) {
+                    out.push(path);
+                }
+            }
+            EntryKind::Skip => {}
+        }
+    }
+    complete
+}
+
+fn fingerprint_files(root: &Path, mut files: Vec<PathBuf>) -> String {
+    files.sort();
+    files.dedup();
+    let mut digest = String::with_capacity(files.len() * 48);
+    for file in &files {
+        let rel = file
+            .strip_prefix(root)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let (len, mtime) = match std::fs::metadata(file) {
+            Ok(metadata) => {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |duration| duration.as_nanos());
+                (metadata.len(), modified)
+            }
+            Err(_) => (0, 0),
+        };
+        digest.push_str(&format!("{rel}\u{1f}{len}\u{1f}{mtime}\n"));
+    }
+    format!("{:016x}-{}", fnv1a(digest.as_bytes()), files.len())
+}
+
 /// A fingerprint of the project's source tree — the identity of the exact code state a
 /// proof describes — or `None` when the tree is too large to fingerprint honestly.
 ///
@@ -140,32 +274,28 @@ pub fn workspace_fingerprint(root: &Path) -> Option<String> {
         );
         return None;
     }
-    files.sort();
-    // Fold each file's identity into one digest. Sorted first, so the fingerprint is
-    // independent of directory-read order (which is not stable across filesystems).
-    let mut digest = String::with_capacity(files.len() * 48);
-    for f in &files {
-        let rel = f
-            .strip_prefix(root)
-            .unwrap_or(f)
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
-        let (len, mtime) = match std::fs::metadata(f) {
-            Ok(m) => {
-                let secs = m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_nanos());
-                (m.len(), secs)
-            }
-            // A file we cannot stat still CONTRIBUTES its path: dropping it silently
-            // would let an unreadable file mask a real change.
-            Err(_) => (0, 0),
-        };
-        digest.push_str(&format!("{rel}\u{1f}{len}\u{1f}{mtime}\n"));
+    Some(fingerprint_files(root, files))
+}
+
+/// Fingerprint every input that can invalidate a final quality review receipt:
+/// source/test files plus manifests, lockfiles, verifier configs, containers,
+/// and CI workflows.
+///
+/// A final-review continuation may skip build/test only when this identity
+/// still matches. Unlike [`workspace_fingerprint`], changing `Cargo.toml`,
+/// `package.json`, a lockfile, or a test/CI config therefore expires the receipt.
+#[must_use]
+pub fn workspace_qc_fingerprint(root: &Path) -> Option<String> {
+    let mut files = Vec::new();
+    if !collect(root, &mut files, 0) || !collect_qc_inputs(root, &mut files, 0) {
+        tracing::warn!(
+            cap = MAX_FINGERPRINT_FILES,
+            root = %root.display(),
+            "QC input tree exceeds the freshness fingerprint cap; final review will re-run checks"
+        );
+        return None;
     }
-    Some(format!("{:016x}-{}", fnv1a(digest.as_bytes()), files.len()))
+    Some(fingerprint_files(root, files))
 }
 
 /// Whether a proof stamped with `recorded` is STALE against the project's source
@@ -234,6 +364,31 @@ mod tests {
         let deleted = workspace_fingerprint(root);
         assert_ne!(added, deleted, "a deletion must move the fingerprint");
         assert_eq!(deleted, edited, "and it returns to the pre-add identity");
+    }
+
+    #[test]
+    fn qc_fingerprint_changes_for_manifest_lock_and_ci_inputs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, "src/main.rs", "fn main() {}\n");
+        write(root, "Cargo.toml", "[package]\nname = \"demo\"\n");
+        let initial = workspace_qc_fingerprint(root);
+
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        let manifest = workspace_qc_fingerprint(root);
+        assert_ne!(initial, manifest);
+
+        write(root, "Cargo.lock", "version = 4\n");
+        let lockfile = workspace_qc_fingerprint(root);
+        assert_ne!(manifest, lockfile);
+
+        write(root, ".github/workflows/ci.yml", "jobs: {}\n");
+        let workflow = workspace_qc_fingerprint(root);
+        assert_ne!(lockfile, workflow);
     }
 
     #[test]

@@ -6939,7 +6939,12 @@ fn status_text_and_color(app: &App) -> Option<(String, Color)> {
         // bottom-right stays empty so there's no duplicate / lingering tool name.
         return None;
     }
-    let text = if app.budget_paused {
+    let text = if app.operational_pause_reason.is_some() {
+        format!(
+            "[paused] {}",
+            umadev_i18n::t(app.lang, "status.operational_paused")
+        )
+    } else if app.budget_paused {
         // A run parked at its wall-clock budget reads as `[paused]` DIRECTLY (never
         // `[aborted]`): the plan is saved and `/continue` finishes it. Checked before
         // `aborted`/`run_started` because the pause leaves `run_started` set.

@@ -1,3 +1,158 @@
+/// A QC result keeps product defects separate from reviewer infrastructure
+/// failures. Only `blocking` may ever become a source-repair directive.
+#[derive(Debug, Clone, Default)]
+pub(super) struct QcReport {
+    pub(super) blocking: Vec<String>,
+    pub(super) operational: Vec<String>,
+    pub(super) raw_failure_log: Option<String>,
+}
+
+impl QcReport {
+    pub(super) fn is_clean(&self) -> bool {
+        self.blocking.is_empty() && self.operational.is_empty()
+    }
+
+    pub(super) fn has_operational_failure(&self) -> bool {
+        !self.operational.is_empty()
+    }
+
+    pub(super) fn residual_evidence(&self) -> Vec<String> {
+        let mut evidence = self.blocking.clone();
+        evidence.extend(self.operational.iter().cloned());
+        evidence
+    }
+
+    #[cfg(test)]
+    pub(super) fn fix_directive(&self) -> String {
+        self.fix_directive_with_context("")
+    }
+
+    #[cfg(test)]
+    pub(super) fn fix_directive_with_context(&self, prefix: &str) -> String {
+        let mut tracker = crate::blocker::BlockerSetTracker::default();
+        let assessments = self.assess_blockers(&mut tracker, false);
+        self.fix_directive_with_assessments(prefix, &assessments)
+    }
+
+    pub(super) fn assess_blockers(
+        &self,
+        tracker: &mut crate::blocker::BlockerSetTracker,
+        workspace_progress: bool,
+    ) -> Vec<crate::blocker::BlockerAssessment> {
+        let mut evidence = self.blocking.clone();
+        if let Some(raw) = self
+            .raw_failure_log
+            .as_ref()
+            .filter(|raw| !raw.trim().is_empty())
+        {
+            evidence.push(raw.clone());
+        }
+        tracker.assess_all(&evidence, "objective QC", true, workspace_progress)
+    }
+
+    pub(super) fn fix_directive_with_assessments(
+        &self,
+        prefix: &str,
+        assessments: &[crate::blocker::BlockerAssessment],
+    ) -> String {
+        // Deliberately render only `blocking`: a mixed review may still contain
+        // actionable semantic findings, but its infrastructure failures can only
+        // require a re-review, never a source edit.
+        let mut body = String::new();
+        for b in &self.blocking {
+            body.push_str("- ");
+            body.push_str(b);
+            body.push('\n');
+        }
+        let lead = if prefix.trim().is_empty() {
+            String::new()
+        } else {
+            format!("{}\n\n", prefix.trim_end())
+        };
+        let raw = match self.raw_failure_log.as_deref().map(str::trim) {
+            Some(t) if !t.is_empty() => {
+                format!("\n\n## Raw failing build/test output (verbatim tail)\n```text\n{t}\n```")
+            }
+            _ => String::new(),
+        };
+        let diagnosis = assessments
+            .iter()
+            .take(8)
+            .map(crate::blocker::BlockerAssessment::prompt_block)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        format!(
+            "{lead}An objective check of what you just built surfaced problems that must be \
+             fixed (these are real facts read from disk / review, not your memory):\n\
+             {body}\n{diagnosis}\n\nFix the cause of each one yourself with your tools — edit/create \
+             the real files — then RUN the project's own build and tests to confirm \
+             they pass. When it is genuinely clean, end your turn and report honestly \
+             what you fixed.{raw}"
+        )
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ReviewEvidence {
+    pub(super) blocking: Vec<String>,
+    pub(super) operational: Vec<String>,
+}
+
+pub(super) fn split_review_evidence(review: &crate::director::ReviewResult) -> ReviewEvidence {
+    ReviewEvidence {
+        // Model-authored blocker text is always product evidence. Free text is
+        // not authority to reinterpret a semantic verdict as infrastructure.
+        blocking: review.blocking.clone(),
+        // Only the host-owned typed unavailable channel can pause a review.
+        operational: review
+            .unavailable
+            .iter()
+            .map(|item| format!("review unavailable: {item}"))
+            .collect(),
+    }
+}
+
+pub(super) fn operational_stop_note(operational: &[String]) -> String {
+    let evidence = operational
+        .iter()
+        .take(4)
+        .map(|item| item.chars().take(240).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "team · required review infrastructure unavailable — stopping incomplete without \
+         source rework (retry review; code edits/builds cannot repair this): {evidence}"
+    )
+}
+
+pub(super) fn operational_recheck_note(operational: &[String]) -> String {
+    let evidence = operational
+        .iter()
+        .take(4)
+        .map(|item| item.chars().take(240).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "team · semantic findings were sent for repair, but the required re-review \
+         was unavailable — the old findings are not asserted as still present; \
+         completion remains unverified: {evidence}"
+    )
+}
+
+pub(super) fn operational_mixed_note(operational: &[String]) -> String {
+    let evidence = operational
+        .iter()
+        .take(4)
+        .map(|item| item.chars().take(240).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "team · semantic findings are retained at this paused boundary, but no \
+         source repair starts while required reviewer infrastructure is unavailable; \
+         retry the complete review before acting on them: {evidence}"
+    )
+}
+
 pub(super) const DEFERRED_CRITIC_REVIEW_NOTE: &str =
     "team · deterministic blockers found — deferring critic review until the repaired candidate is clean";
 

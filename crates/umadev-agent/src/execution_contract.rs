@@ -340,7 +340,6 @@ fn normalize_claim(raw: &str) -> Option<String> {
     if path.is_empty()
         || path == "."
         || path.bytes().all(|byte| byte == b'*')
-        || path.contains(char::is_whitespace)
         || path.contains(char::is_control)
         || path.contains(':')
         || path.contains("//")
@@ -556,6 +555,18 @@ mod tests {
         assert!(contract
             .validate_changed_paths(["src\\api\\v1\\login.rs", "tests/login.rs"])
             .is_empty());
+    }
+
+    #[test]
+    fn exact_relative_paths_may_contain_unicode_and_spaces() {
+        let path = "docs/中文 文件.md";
+        let contract = ExecutionContract::from_route(
+            &route(RouteClass::QuickEdit, Depth::Fast, &[path]),
+            r#"提交git记录 "docs/中文 文件.md""#,
+        );
+        assert_eq!(contract.allowed_paths, [path]);
+        assert!(contract.validate_changed_paths([path]).is_empty());
+        assert!(!contract.validate_changed_paths(["other.txt"]).is_empty());
     }
 
     #[test]

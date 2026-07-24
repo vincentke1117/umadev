@@ -972,11 +972,9 @@ async fn explicit_read_only_request_stays_read_only_in_guarded_and_auto() {
     }
 }
 
-/// The reported bug: a read-only "find the repo" request used to be stranded — a
-/// low-confidence fallback verdict jailed the base in plan mode, where it could not use
-/// tools and re-planned forever. When model routing is unavailable, a low-confidence
-/// deterministic read-only guess deliberately stays on the writable resident sandbox;
-/// the base can use inspection tools without a plan-mode/ExitPlanMode deadlock.
+/// The reported bug: a read-only "find the repo" request used to be stranded.
+/// Read/search tools remain available in the base's Plan permission profile, so
+/// the answer runs on the routed read-only child without granting a writer lock.
 #[tokio::test]
 async fn find_the_repo_read_only_request_runs_and_is_not_stranded() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -985,7 +983,23 @@ async fn find_the_repo_read_only_request_runs_and_is_not_stranded() {
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
     // The base inspects with a read-only tool (Grep), then answers — a healthy "find X"
     // turn, NOT a stranded "I can't use tools this turn" dead-end.
-    let (fake, sent, _ended) = FakeChatSession::new(vec![vec![
+    let route = vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "explain",
+                "authorization": "read_only",
+                "kind": "light",
+                "complexity": "simple",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ];
+    let answer = vec![
         umadev_runtime::SessionEvent::ToolCall {
             name: "Grep".into(),
             input: serde_json::json!({ "pattern": "fn main" }),
@@ -999,9 +1013,11 @@ async fn find_the_repo_read_only_request_runs_and_is_not_stranded() {
             status: umadev_runtime::TurnStatus::Completed,
             usage: None,
         },
-    ]]);
+    ];
+    let (readonly, sent, _ended) = FakeChatSession::new(vec![route, answer]);
+    let (parent, parent_sent, _parent_ended) = FakeChatSession::new(Vec::new());
     let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::Primed(Box::new(fake)),
+        ResidentChat::Primed(Box::new(parent.with_fork(Box::new(readonly)))),
     )));
 
     drive_chat_session_turn(chat_turn(
@@ -1026,8 +1042,12 @@ async fn find_the_repo_read_only_request_runs_and_is_not_stranded() {
     }
     assert_eq!(
         sent.lock().unwrap().len(),
-        1,
-        "one resident turn, no reroute"
+        2,
+        "one read-only route consult plus one answer turn"
+    );
+    assert!(
+        parent_sent.lock().unwrap().is_empty(),
+        "the writable parent receives neither routing nor answer text"
     );
     assert!(
         !tmp.path().join(".umadev/run.lock").exists(),
@@ -1072,6 +1092,7 @@ async fn bash_heredoc_build_is_governed_by_the_reactive_engine() {
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(&target, "export const App = () => null;\n").unwrap();
     });
+    let writer = with_fallback_intent_and_clean_reviewers(writer);
     let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
         ResidentChat::Primed(Box::new(writer)),
     )));
@@ -1096,7 +1117,9 @@ async fn bash_heredoc_build_is_governed_by_the_reactive_engine() {
     let mut saw_build_card = false;
     while let Ok(event) = engine_rx.try_recv() {
         match event {
-            EngineEvent::Note(n) if n.contains("构建完成") => saw_qc = true,
+            EngineEvent::Note(n) if n.contains("构建执行已结束，尚未验收") => {
+                saw_qc = true;
+            }
             EngineEvent::IntentDecided { class, .. } if class == "build" => saw_build_card = true,
             _ => {}
         }
@@ -1482,9 +1505,10 @@ async fn preloaded_warm_session_is_used_without_a_cold_start() {
     ];
     drive_chat_session_turn(turn).await;
 
-    // The warm session was consumed and re-parked as `Primed` (alive, reusable).
+    // The warm session was consumed and re-parked as a mechanically read-only
+    // primed session (alive and reusable for the next routed answer).
     assert!(
-        matches!(*holder.lock().await, Some(ResidentChat::Primed(_))),
+        matches!(*holder.lock().await, Some(ResidentChat::ReadOnlyPrimed(_))),
         "a warm session becomes primed after its first turn"
     );
     assert!(
@@ -1915,8 +1939,8 @@ async fn unabsorbed_first_directive_failure_refeeds_the_transcript_on_the_next_t
         sent[1]
     );
     assert!(
-        matches!(*holder.lock().await, Some(ResidentChat::Primed(_))),
-        "a completed turn parks Primed as before"
+        matches!(*holder.lock().await, Some(ResidentChat::ReadOnlyPrimed(_))),
+        "a completed read-only turn parks a reusable read-only resident"
     );
 }
 

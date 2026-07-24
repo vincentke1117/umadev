@@ -7,7 +7,35 @@ use umadev_runtime::{
     TurnInput, TurnInputBlock, TurnInputBlockKind,
 };
 
+use crate::interaction_bridge::PendingAskHolder;
+
 use super::{RouteDecision, SubmittedTurn, TYPED_USER_INPUT_SLOT};
+
+/// Select the exact payload for one resident turn.
+///
+/// Base-native commands are out-of-band control frames: they retain their exact
+/// bytes and leave a pending model question untouched. Ordinary chat consumes
+/// that question and rewrites a sole text block only when it relays the answer.
+pub(super) async fn select_resident_turn_payload(
+    native_command: bool,
+    original_text: String,
+    input: TurnInput,
+    pending_ask: &PendingAskHolder,
+) -> (String, TurnInput) {
+    if native_command {
+        return (original_text, input);
+    }
+    let text = {
+        let pending = pending_ask.lock().await.take();
+        umadev_agent::ask_question_relay_or_passthrough(pending.as_ref(), &original_text)
+    };
+    let input = if input.sole_text() == Some(original_text.as_str()) && text != original_text {
+        TurnInput::text(text.clone())
+    } else {
+        input
+    };
+    (text, input)
+}
 
 pub(super) fn route_clarification_reply(question: &umadev_agent::ClarifyQuestion) -> String {
     let mut out = question.question.trim().to_string();
@@ -44,7 +72,7 @@ pub(super) fn capture_resident_tool_pitfall(
 pub(super) fn routed_turn_executes_read_only(
     native_command: bool,
     route: &RoutePlan,
-    source: Option<umadev_agent::RouteSource>,
+    _source: Option<umadev_agent::RouteSource>,
     explicit_read_only: bool,
     permissions: BasePermissionProfile,
 ) -> bool {
@@ -54,7 +82,7 @@ pub(super) fn routed_turn_executes_read_only(
     if explicit_read_only || permissions == BasePermissionProfile::Plan {
         return true;
     }
-    !route.class.mutates_workspace() && source == Some(umadev_agent::RouteSource::Brain)
+    !route.class.mutates_workspace()
 }
 
 pub(super) fn directive_turn_input(

@@ -470,9 +470,6 @@ async fn summon_parallel_seat(
     // Resolve the seat from the critic roster (the full 8-seat union) by id; an
     // unknown role has no craft to lend → bail to a fail-open accept.
     let critic = critic_for_role(role)?;
-    // Open a read-only fork (bounded by a timeout so a wedged handshake can't
-    // hang the director). A failed fork → ForkConsult fail-opens to accept.
-    let fork = continuous::fork_with_timeout(session).await;
     // Read the quality-surface blackboard so the parallel seat reviews the real
     // delivered code + the deterministic floor (same surface the review team sees).
     let bb = continuous::Blackboard::read(options, ReviewKind::Quality);
@@ -484,6 +481,13 @@ async fn summon_parallel_seat(
         format!("{}\n\n[director focus] {instruction}", options.requirement)
     };
     let arts = bb.artifacts(&focused);
+    if let Some(reason) = arts.coverage.unavailable_reason() {
+        return Some(RoleVerdict::unavailable(role, reason));
+    }
+    // Open a read-only fork only after the host proved that the artifact payload
+    // is complete. A truncated framework-owned surface is operationally
+    // unavailable and must never solicit a model blocker or source repair.
+    let fork = continuous::fork_with_timeout(session).await;
     // COLD-context seat (B2#1): an ADVERSARIAL seat (`critic.cold()` — QA /
     // security) under a host-scoped fresh judge surface reviews on that stateless
     // one-shot (no doer transcript), with the fork above kept as its fail-open
@@ -1481,6 +1485,10 @@ mod tests {
         // A Parallel summon of a known seat forks a read-only session, runs the
         // seat's review, and returns its verdict.
         let tmp = tempfile::TempDir::new().unwrap();
+        // The typed review payload now requires substantive source coverage.
+        // Give this seat a real artifact to review; an empty workspace is
+        // correctly operationally unavailable and is covered separately.
+        std::fs::write(tmp.path().join("api.ts"), "export const auth = true;\n").unwrap();
         let reply = r#"{"accepts": false, "blocking": ["缺鉴权"], "evidence": ["api.ts"]}"#;
         let mut sess = FakeSession::new(TurnStatus::Completed, true, reply);
         let o = opts(tmp.path());
@@ -1549,6 +1557,7 @@ mod tests {
         // A greenfield requirement convenes the quality team; the seats' blocking
         // findings come back deduped + seat-tagged.
         let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("app.ts"), "export const login = true;").unwrap();
         let reply = r#"{"accepts": false, "blocking": ["登录失败路径无测试"]}"#;
         let mut sess = FakeSession::new(TurnStatus::Completed, true, reply);
         let o = opts(tmp.path());
@@ -1568,6 +1577,7 @@ mod tests {
         // (here a frontend + QA pair), not a re-derived requirement classification.
         // Both seats raise the scripted blocking finding → it comes back seat-tagged.
         let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("app.ts"), "export const loading = false;").unwrap();
         let reply = r#"{"accepts": false, "blocking": ["按钮缺 loading 态"]}"#;
         let mut sess = FakeSession::new(TurnStatus::Completed, true, reply);
         let o = opts(tmp.path());
